@@ -1,0 +1,201 @@
+# perfcached.conf.example — every option, annotated (task S24).
+# Copy to /etc/perfcached/perfcached.conf, chmod 640, edit the secrets.
+# Defaults shown commented out; uncomment to change.
+
+[daemon]
+# worker threads serving client connections (the peer/cluster thread,
+# WAL writer and RDB walker are separate)
+workers = 4
+# crit | err | warn | notice | info | dbg
+log_level = notice
+
+[memory]
+# The arena each collection's cells live in, per daemon, and the HARD
+# ceiling on what this process holds: a write that would push past it is
+# REFUSED with `cache full` rather than growing the process.  There is no
+# eviction - nothing is thrown out to make room.
+#
+# It is also the huge-page reservation size.  Those were once different
+# things: past the reservation the arena carved from plain malloc, so a
+# node with arena_mb = 64 reached 348 MB of RSS while reporting
+# arena_free 0.  Sizing a fleet by this number now means something.
+#
+# Budget generously.  The bound covers the index as well as the data,
+# and slab classes leave slack, so the live payload that fits is well
+# under the figure here - watch stats.memory.arena_held against
+# arena_live rather than assuming.
+arena_mb = 1024
+# elastic ceiling; the arena may grow to this under pressure (0 = fixed
+# at arena_mb).  Set it and THIS becomes the hard ceiling instead.
+#arena_cap_mb = 0
+# own = the private-anonymous hugepage ladder (MAP_HUGETLB -> THP ->
+# 4K, in that order, per-chunk); heap = plain malloc, for debugging
+#backing = own
+# reclaim: chunks idle past quiet_s are given back to the kernel,
+# keeping at least reclaim_keep chunks; cooloff_s throttles the sweep
+#reclaim_keep = 4
+#reclaim_quiet_s = 300
+#reclaim_cooloff_s = 60
+#reclaim_giveback = 1
+
+[secrets]
+# Two DIFFERENT passwords - the daemon refuses to start when they are
+# equal.  Clients authenticate with the client secret; nodes seal the
+# datagram plane with the cluster secret.  Both are Argon2id-stretched
+# into Noise PSKs at startup, never kept in cleartext memory.
+# The client line may repeat (up to 4) for zero-downtime rotation.
+client = CHANGE-ME-client
+cluster = CHANGE-ME-cluster-DIFFERENT
+# Optional Redis AUTH password for a dedicated RESP listener (S33).
+# Stock Redis clients can only send a password, so this is the strongest
+# in-band control that dialect allows - and it crosses the wire IN THE
+# CLEAR, which is why it must differ from both secrets above (the daemon
+# refuses to start if it matches either).
+#resp = CHANGE-ME-resp-password
+
+[listen]
+# client listeners; both dialects (newline JSON-RPC and binary TLV) are
+# dialect is sniffed per message: JSON-RPC lines, binary frames, and
+# RESP2 (redis-cli / hiredis / rtpengine connect unmodified; RESP's
+# SELECT n lands on the collection NAMED "n", connections start on
+# "0" - name collections [collection 0], [collection 1]... to serve
+# Redis clients)
+tcp = 0.0.0.0:6479
+#unix = /run/perfcached/perfcached.sock
+# never = all client traffic runs the Noise channel; loopback = plain
+# dialects allowed on 127.0.0.1/::1/unix only (LAN stays encrypted)
+#plaintext = never
+
+# A DEDICATED RESP LISTENER (S33) - the way to let LAN Redis clients in.
+# It is RESP2 ONLY: the native dialects are refused on it, so the admin
+# verbs are unreachable from it by construction.  A Redis client cannot
+# speak the Noise channel, so this listener is plaintext - which is why
+# the guards below are not optional decoration:
+#   * off-box, resp_allow is REQUIRED or the daemon refuses to start;
+#   * without [secrets] resp it warns loudly at startup;
+#   * the traffic is UNENCRYPTED - put it on a trusted segment.
+# SELECT n maps onto the collection NAMED n, so declare [collection 0],
+# [collection 1] ... to serve Redis clients that expect db indices.
+#resp = 192.0.2.31:6379
+#resp_allow = 192.0.2.0/24, 198.51.100.5/32
+#resp_collections = 0, 1
+
+[wal]
+# comment the whole section out for a pure in-memory cache.
+# Under systemd, StateDirectory provides /var/lib/perfcached.
+dir = /var/lib/perfcached
+# storage probe at startup (write+fsync latency): auto | always | no.
+# It does two jobs: it recommends an fsync policy for THIS device, and
+# it sizes the ring below for fsync = always.  probe = no disables both,
+# and the daemon then says so rather than guessing.
+#probe = auto
+#probe_secs = 2
+# fsync policy: everysec (default, <=1s loss) | always | no.
+#
+# READ THIS BEFORE CHOOSING always.  The pump fsyncs once per drained
+# BATCH, so on storage whose fdatasync takes milliseconds it falls
+# behind the workers, the ring below fills, and a full ring DROPS the
+# record - after the client was told the write succeeded.  Measured
+# 2026-08-29 on ms-class storage: fsync = always lost 30-2601 of 20000
+# acknowledged writes in every one of six trials, while everysec and no
+# lost NOTHING in six each.  The most durable setting was the only lossy
+# one.
+#
+# That is fixed - the probe now sizes the ring for it, and a drop is
+# logged rather than only counted - but the shape of the trade stands:
+# always is for devices that can sustain it, and the startup log tells
+# you whether yours can.  everysec fsyncs on a timer, so the ring drains
+# freely between them and the question does not arise.
+#fsync = everysec
+#segment_mb = 64
+#segments = 8
+# per-thread WAL ring.  Appends NEVER block a worker, so an overrun
+# drops the record and counts it (`dropped` in stats, and logged) - and
+# a dropped record is a write the client was told succeeded.  The ring
+# does not have to hold the workload, only what arrives during ONE
+# drain+fsync cycle, which is why fsync latency is what governs its
+# depth.  Left unset with a probe available, fsync = always derives it
+# from the measured p99; set it here to pin it yourself.
+#ring_kb = 1024
+# RDB snapshot triggers, Redis-style "seconds changes", repeatable;
+# OR-ed.  "save = off" disables snapshots (WAL-only recovery).
+#save = 900 1
+#save = 300 10000
+# rate limit for the snapshot walker's writes
+#rdb_mb_s = 64
+
+#[cluster]
+# Membership is AUTOMATIC: every node with the same group + cluster
+# secret finds the fleet by itself - node ids are assigned by the
+# elected master, there is nothing per-node to configure.  The SAME
+# config file works on every node.
+#multicast = 239.68.68.1:6480
+# own unicast address (the data plane binds it); default = the
+# interface a route toward the group picks - set it on multi-homed hosts
+#advertise = 10.0.0.1
+# THE CLUSTER OWNS THE COLLECTION CONFIG (S30).  Declaring `collections`
+# here makes this description authoritative: ONE mode for the whole
+# cluster, over an EXHAUSTIVE set of collections.  Members then carry no
+# private collections, and a peer whose config differs is REFUSED at
+# join (loudly, naming both sides) instead of silently exchanging data
+# it will misinterpret - two nodes running one collection as store and
+# shard lost every write between them, in silence, before this existed.
+# Without `collections` the legacy per-collection form still parses and
+# warns: nothing checks that your peers agree.
+# A deployment needing two modes runs TWO clusters on distinct groups.
+#mode = shard                 ; store | proxy | shard
+#eager = 1                    ; mode = store only
+#collections = sessions, dialogs
+# how long a miss waits for a pull answer before reporting not-found
+#pull_timeout_ms = 200
+# a confirmed fleet-wide miss is remembered this long
+#negative_ms = 500
+# deletes shield against racing pulls this long
+#tombstone_ms = 2000
+# how many cluster requests may be PARKED at once, waiting on a peer.
+# This is backpressure, not a buffer: a forward or pull that cannot park
+# is REFUSED - a routing client is told -TRYAGAIN and should retry - so
+# this bounds how much state one pipelining client can make the daemon
+# hold while a peer is slow.
+#
+# A client that cannot compute the owner (any RESP client) forwards
+# nearly every key, so it parks far more than a cluster-aware one: 200
+# connections at pipeline 64 measured a peak of 2699 slots.  The default
+# of 8192 leaves headroom over that; the old 1024 refused such a client
+# outright.
+#
+# SIZE IT FROM MEASUREMENT, not from guessing - stats.cluster.pend_peak
+# is the high-water mark and pend_exhausted counts what a too-small
+# table refused.  peak at max with a nonzero refusal count means raise
+# it (or route the clients).  It costs memory in three places at once:
+# the parked table, a completion queue per worker, and a park table per
+# worker, so roughly 2.3 KB per slot per worker at the default.
+#max_pending = 8192
+
+# one section per collection; the name is what clients pass as "col"
+[collection sessions]
+buckets_log2 = 18
+# store mode + pull: a local miss fetches from peers and KEEPS a copy
+# (read-heavy shared data; every node converges on the working set)
+#pull = 1
+# eager store: the rebalancer's distributor pushes EVERY record to all
+# peers in the background (10s sweep, budgeted, idempotent retries;
+# rejoining nodes resync in full).  For keyspaces whose TTLs are too
+# short to ever converge via pull-on-miss.  Needs mode=store+[cluster].
+#eager = 1
+# proxy mode: keys live on exactly ONE node (placement by free memory),
+# reads are served through without storing, writes forward to the
+# holder, the 10s rebalancer keeps the fleet level - fleet capacity is
+# the sum of arenas.  Requires [cluster].
+#mode = proxy
+# shard mode: keys live on exactly ONE node chosen DETERMINISTICALLY
+# (rendezvous hashing over member addresses, CRUSH-style): no locator,
+# no placement races, an owner miss is authoritative and fast, and
+# counters serialize at the owner from any ingress.  Membership changes
+# reshard automatically (only the moving keys travel; reads fall back
+# to a broadcast during the move).  v1 assumes comparable arena sizes.
+# Requires [cluster].
+#mode = shard
+
+#[collection counters]
+#buckets_log2 = 14

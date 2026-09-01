@@ -1,0 +1,63 @@
+# perfcached CI (S55).  Public repo: GitHub-hosted runners are free,
+# unlimited minutes.  GitHub-hosted ONLY - never register project hosts
+# as self-hosted runners here; a fork PR could execute on them.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # The ratchet: "pushed = check-green" without human discipline.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+      - name: build
+        run: make -j"$(nproc)"
+      - name: make check
+        run: make check
+      - name: failing suites, if any
+        if: failure()
+        run: |
+          grep -oE "[a-z]+test: [0-9]+ passed, [0-9]+ failed" check.log \
+            2>/dev/null | grep -vE ", 0 failed$" || true
+
+  # Highest-value job (S55 ordering): the whole suite under ASan+UBSan.
+  # Same spelling as the local pre-push loop: `make check-asan`.
+  check-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+      - name: make check-asan
+        run: make check-asan
+
+  # GATING since the 2026-09-01 triage took the baseline to ZERO: a
+  # red tidy job now means a real finding, so it is allowed to gate.
+  clang-tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev clang-tidy bear
+      - name: compile_commands
+        run: make clean && bear -- make -j"$(nproc)"
+      - name: tidy
+        # -Wno-unused-command-line-argument: the Makefile compiles+links
+        # in one cc line, so libperfd.a rides the cli sources' compile
+        # commands and clang counts it as an ERROR without this
+        run: |
+          git ls-files 'src/*.c' 'lib/*.c' 'cli/*.c' \
+            | xargs clang-tidy -p . \
+              --extra-arg=-Wno-unused-command-line-argument \
+              2>/dev/null | tee tidy.log
+          echo "---- summary ----"
+          grep -cE "warning:|error:" tidy.log || echo "0 findings"

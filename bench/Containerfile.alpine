@@ -1,0 +1,33 @@
+# Containerfile.alpine — the perfcached bench/runtime image on Alpine
+# (musl).  Build context = the REPO ROOT:
+#
+#   podman build --platform linux/amd64 -f bench/Containerfile.alpine \
+#       --build-arg REV=$(git rev-parse --short HEAD) \
+#       -t perfcached:alpine .
+#   # or the same line with `docker build`
+#
+# Pin --platform explicitly: a poisoned multi-arch cache once produced
+# an arm/v7 image with x86 binaries inside.  The runtime stage carries
+# perfcached + perfcli + pcbench + natbench + stallprobe.py (python3),
+# so every
+# bench leg in bench/CONTAINERS.md runs INSIDE the container over its
+# own loopback - no host toolchain needed after the build.
+
+FROM docker.io/library/alpine:3.24 AS build
+RUN apk add --no-cache build-base libsodium-dev linux-headers
+COPY . /src
+WORKDIR /src
+ARG REV=unknown
+# clean first: the context may carry host-built (glibc) objects
+RUN make clean >/dev/null 2>&1 || true \
+ && make PC_BUILD_REV=$REV perfcached perfcli natbench \
+ && cc -O2 -std=gnu11 -Wall -Wextra -Werror -o bench/pcbench \
+        bench/pcbench.c -lpthread
+
+FROM docker.io/library/alpine:3.24
+RUN apk add --no-cache libsodium python3
+COPY --from=build /src/perfcached /src/perfcli /src/bench/pcbench \
+     /src/natbench /usr/local/bin/
+COPY --from=build /src/bench/stallprobe.py /usr/local/bin/stallprobe.py
+ENTRYPOINT ["perfcached"]
+CMD ["-f", "/etc/perfcached.conf"]
