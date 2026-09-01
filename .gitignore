@@ -1,0 +1,41 @@
+*.o
+*.so
+*.a
+
+# Build outputs.  Every one of these is a bare Makefile target, so it
+# lands at the repo ROOT - `make check` alone drops a dozen of them
+# there, and in a tree several sessions share, one stray binary reads
+# as "somebody left something uncommitted".
+perfcached
+perfcli
+selftest
+selftest_broken
+memprobe
+# test binaries
+asynctest
+clhisttest
+clmaptest
+clplacetest
+clseltest
+clsynctest
+cltermtest
+failovertest
+libtest
+noisetest
+slottest
+# bench clients.  bench/pcbench below is the CONTAINERFILE's output
+# path; the Makefile target builds ./pcbench at the root, so both.
+concbench
+insbench
+keysnative
+mmclient
+natbench
+pcbench
+policybench
+routebench
+/core
+core.[0-9]*
+*.log
+/build/
+bench/pcbench
+bench/results-*

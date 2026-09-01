@@ -1,0 +1,14 @@
+# build=87aa685 date=2026-08-27T11:28Z host=debian13-16vcpu keys=20000 val=200
+section	arm	rtt_set_s	pipe_set_s	recovered	recover_ms
+cost	memory	78649	1521063	n/a	n/a
+cost	wal-no	70435	1548389	20000	4574
+cost	wal-everysec	72144	1786633	20000	5598
+cost	wal-always	73855	1597125	20000	4978
+cost	wal-rdb	61125	1638581	20000	4369
+
+# part 2: held_before_kill / entries_after_restart / missing_of_20000 / recover_ms
+failover	store-nowal	20000	0	20000	2291
+failover	store-wal	20000	20000	0	2397
+failover	proxy-nowal	20000	0	20000	2288
+failover	proxy-wal	20000	20000	0	2447
+failover	shard-wal	6733	6733	0	2336

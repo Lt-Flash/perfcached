@@ -1,0 +1,64 @@
+# perfcached CI - private GitLab edition (S55).  This is the file
+# changes are PROVEN against; .github/workflows/ci.yml is ported from
+# here once a job shape works.  Any executor that can apt-get works;
+# the fullest coverage comes from a shell runner ON the build host
+# running as root (loop/dm fixture + real mlock) - with a docker
+# executor those tests announce SKIP and the rest still gates.
+# The deps line tolerates a read-only/preinstalled toolchain so the
+# same file drives both executor kinds.
+
+stages: [lint, check]
+
+.deps: &deps
+  - apt-get update -qq && apt-get install -y -qq gcc make libsodium-dev
+    libevent-dev >/dev/null
+    || echo "deps install failed - relying on preinstalled toolchain"
+
+# The ratchet: "pushed = check-green" without human discipline.
+# check and check-asan share a stage and run CONCURRENTLY when the
+# runner allows it (shell runner: concurrent=2 + netns-run.sh keeps
+# the suites' fixed ports and multicast group from colliding on the
+# shared host - without the namespace, concurrent=1 is mandatory).
+check:
+  stage: check
+  image: debian:13
+  timeout: 90m
+  before_script: *deps
+  script:
+    - make -j"$(nproc)"
+    - tools/netns-run.sh make check
+
+# Highest-value job (S55 ordering): the whole suite under ASan+UBSan,
+# same spelling as the local pre-push loop.
+check-asan:
+  stage: check
+  image: debian:13
+  timeout: 120m
+  before_script: *deps
+  script:
+    - tools/netns-run.sh make check-asan
+
+# GATING since the 2026-09-01 triage took the baseline to ZERO: a red
+# tidy job now means a real finding, so it gates - and it runs FIRST
+# (own stage): five minutes of lint fail-fasts the pipeline before an
+# hour of check+ASan is spent on a tree with a finding.
+clang-tidy:
+  stage: lint
+  image: debian:13
+  timeout: 45m
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq gcc make libsodium-dev
+      libevent-dev clang-tidy bear >/dev/null
+      || echo "deps install failed - relying on preinstalled toolchain"
+  script:
+    # clean first: on a shell runner the clone is shared across jobs,
+    # and bear records nothing from an up-to-date build
+    - make clean && bear -- make -j"$(nproc)"
+    # the Makefile compiles+links in one cc line, so the archive rides
+    # each source's compile command - without the -Wno, clang counts
+    # "libperfd.a: linker input unused" as an ERROR and tidy exits 1
+    - git ls-files 'src/*.c' 'lib/*.c' 'cli/*.c'
+      | xargs clang-tidy -p .
+      --extra-arg=-Wno-unused-command-line-argument 2>/dev/null
+      | tee tidy.log
+    - 'grep -cE "warning:|error:" tidy.log || echo "0 findings"'

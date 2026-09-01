@@ -1,0 +1,41 @@
+# Containerfile.debian — the perfcached bench/runtime image on Debian 13
+# (GLIBC).  Same contents as Containerfile.alpine; the base is the whole
+# point of it existing.
+#
+# Alpine's musl allocator SERIALISES the per-reply malloc in libperfd's
+# JSON path: measured 2026-08-30, a musl-built natbench peaks at TWO
+# threads and then goes BACKWARDS - 221,604 ops/s at 1 thread, 41,241 at
+# 8, against glibc's 321,010 -> 851,077 on the same host, same network,
+# same daemon.  A 20.6x gap at 8 threads that is nothing to do with the
+# dialect or the wire.  Any multithreaded JSON client wants this image;
+# the binary dialect is far less affected (1.4x -> 2.9x).
+#
+#   podman build --platform linux/amd64 -f bench/Containerfile.debian \
+#       --build-arg REV=$(git rev-parse --short HEAD) \
+#       -t perfcached:debian .
+#
+# Pin --platform explicitly: a poisoned multi-arch cache once produced
+# an arm/v7 image with x86 binaries inside.
+
+FROM docker.io/library/debian:13-slim AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential libsodium-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY . /src
+WORKDIR /src
+ARG REV=unknown
+# clean first: the context may carry host-built objects
+RUN make clean >/dev/null 2>&1 || true \
+ && make PC_BUILD_REV=$REV perfcached perfcli natbench \
+ && cc -O2 -std=gnu11 -Wall -Wextra -Werror -o bench/pcbench \
+        bench/pcbench.c -lpthread
+
+FROM docker.io/library/debian:13-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libsodium23 python3-minimal \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/perfcached /src/perfcli /src/bench/pcbench \
+     /src/natbench /usr/local/bin/
+COPY --from=build /src/bench/stallprobe.py /usr/local/bin/stallprobe.py
+ENTRYPOINT ["perfcached"]
+CMD ["-f", "/etc/perfcached.conf"]
