@@ -1,0 +1,106 @@
+# perfcached CI - private GitLab edition (S55).  This is the file
+# changes are PROVEN against; .github/workflows/ci.yml is ported from
+# here once a job shape works.  Any executor that can apt-get works;
+# the fullest coverage comes from a shell runner ON the build host
+# running as root (loop/dm fixture + real mlock) - with a docker
+# executor those tests announce SKIP and the rest still gates.
+# The deps line tolerates a read-only/preinstalled toolchain so the
+# same file drives both executor kinds.
+#
+# TIERED since 2026-09-02.  The full suite costs ~an hour of a shared
+# build host, which is too slow to sit between a developer and every
+# commit.  So:
+#   branch push -> lint + the FAST gate (~5 min): every unit binary
+#                  and the seconds-long suites, so a commit is still
+#                  individually accountable and a break bisects to one
+#                  commit rather than to a week of them
+#   TAG push    -> the whole ladder, natively and under ASan+UBSan.
+#                  A tag is how a feature set is declared ready, and
+#                  it is what release promises are made from.
+# The heavy jobs therefore key on $CI_COMMIT_TAG, not on a branch.
+
+stages: [lint, fast, full, arch]
+
+.deps: &deps
+  - apt-get update -qq && apt-get install -y -qq gcc make libsodium-dev
+    libevent-dev >/dev/null
+    || echo "deps install failed - relying on preinstalled toolchain"
+
+# GATING since the 2026-09-01 triage took the baseline to ZERO: a red
+# tidy job means a real finding, and it runs FIRST so five minutes of
+# lint fail-fasts the pipeline before anything expensive is spent.
+clang-tidy:
+  stage: lint
+  image: debian:13
+  timeout: 45m
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq gcc make libsodium-dev
+      libevent-dev clang-tidy bear >/dev/null
+      || echo "deps install failed - relying on preinstalled toolchain"
+  script:
+    # clean first: on a shell runner the clone is shared across jobs,
+    # and bear records nothing from an up-to-date build
+    - make clean && bear -- make -j"$(nproc)"
+    # the Makefile compiles+links in one cc line, so the archive rides
+    # each source's compile command - without the -Wno, clang counts
+    # "libperfd.a: linker input unused" as an ERROR and tidy exits 1
+    - git ls-files 'src/*.c' 'lib/*.c' 'cli/*.c'
+      | xargs clang-tidy -p .
+      --extra-arg=-Wno-unused-command-line-argument 2>/dev/null
+      | tee tidy.log
+    - 'grep -cE "warning:|error:" tidy.log || echo "0 findings"'
+
+# The ratchet on every commit: builds, and everything that can prove
+# itself in seconds actually runs.
+check-fast:
+  stage: fast
+  image: debian:13
+  timeout: 30m
+  before_script: *deps
+  script:
+    - make -j"$(nproc)"
+    - tools/netns-run.sh make check-fast
+
+# The full ladder: tags only.  check and check-asan share a stage and
+# run CONCURRENTLY where the runner allows it (shell runner:
+# concurrent=2 + netns-run.sh keeps the suites' fixed ports and
+# multicast group from colliding on the shared host).
+check:
+  stage: full
+  image: debian:13
+  timeout: 90m
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script: *deps
+  script:
+    - make -j"$(nproc)"
+    - tools/netns-run.sh make check
+
+# The four-arch matrix (S27), tag-only and AFTER the x86_64 suites pass
+# (S60).  The ordering is the whole point: emulated arm32 is 8-16x
+# slower, so spending 20+ minutes of it on a tree whose native suite is
+# already red tells us nothing we do not already know.  A separate stage
+# expresses that more plainly than a needs: graph.
+#
+# It runs on the shell runner because that is where podman and qemu-user
+# binfmt live; anywhere else the script announces a loud SKIP rather than
+# passing quietly, so a mis-scheduled job cannot masquerade as coverage.
+matrix:
+  stage: arch
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - tools/matrix.sh
+
+# Highest-value job (S55 ordering): the whole suite under ASan+UBSan,
+# same spelling as the local pre-push loop.
+check-asan:
+  stage: full
+  image: debian:13
+  timeout: 120m
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script: *deps
+  script:
+    - tools/netns-run.sh make check-asan
