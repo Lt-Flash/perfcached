@@ -1,0 +1,6 @@
+# build=87aa685 date=2026-08-27T08:25Z host=debian13-16vcpu clients=12 ops=400
+policy	spread_n1/n2/n3	distinct	ops_per_s	p50us	p99us
+failover	0/12/0	1	13463	67	141
+rr	7/2/3	3	12270	77	138
+leastconn	3/4/5	3	10828	86	164
+weighted	8/4/0	2	12029	74	161
