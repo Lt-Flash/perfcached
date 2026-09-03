@@ -1,0 +1,94 @@
+"""Drive one real call through rtpengine's ng control protocol.
+
+Wire: "<cookie> <bencoded dict>" over UDP; the reply is the same shape.
+offer -> answer -> delete is the full lifecycle, which is what makes
+rtpengine write, update and remove its Redis call state.
+"""
+import socket
+import sys
+
+NG = int(sys.argv[1])
+
+
+def be(o):
+    if isinstance(o, bytes):
+        return b"%d:%s" % (len(o), o)
+    if isinstance(o, str):
+        return be(o.encode())
+    if isinstance(o, int):
+        return b"i%de" % o
+    if isinstance(o, list):
+        return b"l" + b"".join(be(x) for x in o) + b"e"
+    if isinstance(o, dict):
+        out = b"d"
+        for k in sorted(o):
+            out += be(k) + be(o[k])
+        return out + b"e"
+    raise TypeError(o)
+
+
+def bdec(b, i=0):
+    c = chr(b[i])
+    if c == "i":
+        j = b.index(b"e", i)
+        return int(b[i + 1:j]), j + 1
+    if c == "l":
+        i += 1
+        out = []
+        while chr(b[i]) != "e":
+            v, i = bdec(b, i)
+            out.append(v)
+        return out, i + 1
+    if c == "d":
+        i += 1
+        out = {}
+        while chr(b[i]) != "e":
+            k, i = bdec(b, i)
+            v, i = bdec(b, i)
+            out[k.decode("latin1")] = v
+        return out, i + 1
+    j = b.index(b":", i)
+    n = int(b[i:j])
+    return b[j + 1:j + 1 + n], j + 1 + n
+
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(5)
+s.connect(("127.0.0.1", NG))
+seq = [0]
+
+
+def cmd(d):
+    seq[0] += 1
+    cookie = b"cap%d" % seq[0]
+    s.send(cookie + b" " + be(d))
+    r = s.recv(65535)
+    body = r.split(b" ", 1)[1]
+    return bdec(body)[0]
+
+
+SDP_OFF = ("v=0\r\n"
+           "o=- 1 1 IN IP4 127.0.0.1\r\n"
+           "s=-\r\n"
+           "c=IN IP4 127.0.0.1\r\n"
+           "t=0 0\r\n"
+           "m=audio 5000 RTP/AVP 0\r\n"
+           "a=rtpmap:0 PCMU/8000\r\n"
+           "a=sendrecv\r\n")
+SDP_ANS = SDP_OFF.replace("m=audio 5000", "m=audio 5002")
+
+CALL = "s29-capture-call-1"
+
+print("ping ->", cmd({"command": "ping"}))
+r = cmd({"command": "offer", "call-id": CALL, "from-tag": "ftag1",
+         "sdp": SDP_OFF})
+print("offer ->", r.get("result"))
+r = cmd({"command": "answer", "call-id": CALL, "from-tag": "ftag1",
+         "to-tag": "ttag1", "sdp": SDP_ANS})
+print("answer ->", r.get("result"))
+# a second offer on the same call = the re-invite/update write path
+r = cmd({"command": "offer", "call-id": CALL, "from-tag": "ftag1",
+         "to-tag": "ttag1", "sdp": SDP_OFF})
+print("reoffer ->", r.get("result"))
+r = cmd({"command": "delete", "call-id": CALL, "from-tag": "ftag1"})
+print("delete ->", r.get("result"))
