@@ -1,0 +1,16 @@
+perfcached (0.3.0~rc4-1) unstable; urgency=medium
+
+  * Backfill: walk from zero, whole cycle as sender (S81); a node that
+    arrived empty is not the backfill sender for the next one (S82).
+  * [daemon] state_dir: identity and term persist for a pure cache (S80).
+  * libperfd 0.2.1: a failed round trip no longer wedges the handle (S72).
+  * mode = eager replaces mode = store + eager = 1.
+  * stats.process, /stats on the HTTP door, the fleet-view page.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sat, 05 Sep 2026 12:00:00 +1000
+
+perfcached (0.3.0~rc3-1) unstable; urgency=medium
+
+  * Initial Debian packaging (S64 stage 2).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Thu, 03 Sep 2026 21:30:15 +1000
