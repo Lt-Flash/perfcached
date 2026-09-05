@@ -1,0 +1,27 @@
+Source: perfcached
+Section: net
+Priority: optional
+Maintainer: Yury Kirsanov <yury@kfi.net.au>
+Build-Depends: debhelper-compat (= 13),
+               libsodium-dev,
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: perfcached
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+Description: in-memory cache daemon with a durable write-ahead log
+ perfcached is a clustered in-memory cache and store: a lock-free read
+ path, a write-ahead log with real crash recovery, and periodic
+ snapshots.  It speaks its own JSON and binary dialects plus a
+ RESP-compatible surface, so existing Redis clients can talk to it
+ without changes.
+ .
+ Cluster modes are a property of the cluster, not of a node: store
+ (every node holds everything), proxy (placed single-copy) and shard
+ (ownership computed by rendezvous hashing).
+ .
+ Read PRODUCTION.md before a first deployment: the durability knobs
+ depend on what the storage actually measures, and the daemon reports
+ that at startup.
