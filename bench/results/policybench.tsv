@@ -1,0 +1,6 @@
+# build=2db7baf date=2026-09-03T23:45Z host=debian13-16vcpu clients=12 ops=400
+policy	spread	distinct	ops_per_s	p50us	p99us
+failover	node840:12	1	13808	66	129
+rr	node840:3,node482:4,node1:5	3	11099	84	163
+leastconn	node482:7,node1:5	2	11158	83	169
+weighted	node1:5,node840:5,node482:2	3	10729	88	161

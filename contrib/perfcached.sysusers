@@ -1,0 +1,18 @@
+# perfcached.sysusers — systemd-sysusers(8) declaration (task S46).
+#
+# perfcached.service runs as User=perfcached, and a unit that names a
+# user nothing creates fails to start with a message that points at
+# systemd rather than at the missing account.  Install this as
+# /usr/lib/sysusers.d/perfcached.conf and run:
+#
+#     systemd-sysusers
+#
+# A system account with no login shell and no home: the daemon needs
+# neither, and its state directory is created by the unit's
+# StateDirectory= (which also chowns it), not by a home directory.
+#
+# No tmpfiles.d file accompanies this on purpose - StateDirectory=
+# already creates /var/lib/perfcached 0700 and owns it to this user,
+# so a tmpfiles rule would be a second source of truth for the same
+# path and they would drift.
+u perfcached - "perfcached cache daemon" - -

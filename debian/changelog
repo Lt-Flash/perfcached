@@ -1,0 +1,43 @@
+perfcached (0.3.0~rc6-1) unstable; urgency=medium
+
+  * A late ack re-sends one batch, not the keyspace (S85).
+  * RESP door: redis_mode:cluster and INFO cluster from one truth (S74);
+    CLUSTER SLOTS/SHARDS cached per membership (S75).
+  * A fleet is uniform about the WAL; a mismatch is refused at the
+    join, by name (S73b).
+  * Connection log with dialect, channel and reason (S70); heartbeat
+    carries the HTTP door and uptime (S78); perfcli names the
+    mistake (S71).
+  * lib/NOTICE for libsodium (ISC); synctest on every push (S84).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Fri, 05 Sep 2026 20:30:00 +1000
+
+perfcached (0.3.0~rc5-1) unstable; urgency=medium
+
+  * Eager replicates on the write; the sweep is repair (S73a).
+  * Backfill armed from the ALIVE's start byte, not a record count (S81).
+  * query_log = off | all | sampled:N, keys no | hashed | full (S65).
+  * stats.native per dialect, a card each (S76).
+  * A refused HTTP client gets a 403 that names http_allow (S66).
+  * libperfd 0.2.2: no GPL header in the export; sync refuses a
+    licence crossing (S79).
+  * statfs f_type compared unsigned: the rc4 matrix on i386/arm32.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sat, 05 Sep 2026 17:00:00 +1000
+
+perfcached (0.3.0~rc4-1) unstable; urgency=medium
+
+  * Backfill: walk from zero, whole cycle as sender (S81); a node that
+    arrived empty is not the backfill sender for the next one (S82).
+  * [daemon] state_dir: identity and term persist for a pure cache (S80).
+  * libperfd 0.2.1: a failed round trip no longer wedges the handle (S72).
+  * mode = eager replaces mode = store + eager = 1.
+  * stats.process, /stats on the HTTP door, the fleet-view page.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sat, 05 Sep 2026 12:00:00 +1000
+
+perfcached (0.3.0~rc3-1) unstable; urgency=medium
+
+  * Initial Debian packaging (S64 stage 2).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Thu, 03 Sep 2026 21:30:15 +1000
