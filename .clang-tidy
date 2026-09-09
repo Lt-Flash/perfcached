@@ -1,0 +1,31 @@
+# Curated for a systems-C daemon full of INTENTIONAL patterns a default
+# profile would drown in: seqlock copy-outs that read torn data by
+# design, deliberately racy stats merges (CP-06), cast discipline.
+# Style families stay off; this file exists to find bugs (S55).
+# Disabled after the 2026-09-01 113-warning triage (every site read):
+#   suspicious-string-compare      17x implicit-boolean strcmp style, all correct
+#   multi-level-implicit-ptr-conv  13x void* callback/boundary idiom (C, not C++)
+#   performance-no-int-to-ptr       7x fd/epoll-data packing, by design
+#   optin.performance.Padding       4x struct layouts are deliberate cacheline work
+#   insecureAPI.strcpy              2x both sites strlen-guarded on the line above
+Checks: >
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-suspicious-string-compare,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -performance-no-int-to-ptr,
+  -clang-analyzer-optin.performance.Padding,
+  -clang-analyzer-security.insecureAPI.strcpy,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+WarningsAsErrors: ''
+# Newer clang-tidy (Ubuntu CI) flips WarnOnSizeOfPointerToAggregate
+# on: it then flags the CORRECT `n * sizeof *p` idiom wherever the
+# element type is itself a pointer (the overflow table stores chain
+# HEADS, the slowlog qsort sorts row POINTERS - all three flagged
+# sites verified right on 2026-09-01).  The rest of the check stays.
+CheckOptions:
+  bugprone-sizeof-expression.WarnOnSizeOfPointerToAggregate: 'false'
+HeaderFilterRegex: '(src|lib|cli)/.*'
