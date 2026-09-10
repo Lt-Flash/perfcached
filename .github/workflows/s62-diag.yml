@@ -1,0 +1,110 @@
+# S62 diagnostic — TEMPORARY.  Delete this file once the WAL
+# intermittent is understood.
+#
+# recoverytest's kill-9 storm and waltest's recycling phase fail on
+# GitHub-hosted runners and NOWHERE ELSE.  Six hypotheses have been
+# eliminated on the build host - the async-fsync race (immediate kill,
+# nothing lost), slow storage (dm-delay at 40ms/write, nothing lost),
+# ring drops (the "wal: DROPPED" line is absent from every failing log),
+# disk space (the WAL preallocates, so a short disk refuses to START),
+# core count (0 of 15 pinned to two CPUs), and the code itself (the same
+# commit passes on our own GitLab runner while failing here).
+#
+# So the remaining difference IS this environment, and approximating it
+# elsewhere has stopped paying.  This job reproduces it where it lives:
+# the storm in a loop, on a runner, with the daemon logs kept.
+#
+# manual only - it must never gate anything, and it must never run on a
+# push where somebody could read its red as the tree's.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "iterations of recoverytest"
+        default: "20"
+      also_waltest:
+        description: "run waltest too (the other intermittent)"
+        type: boolean
+        default: true
+
+name: s62-diag
+
+jobs:
+  storm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+      - name: build
+        run: make -j"$(nproc)" perfcached perfcli pcbench
+
+      # The environment itself is evidence: every local hypothesis was
+      # about one of these numbers being different here.
+      - name: environment
+        run: |
+          echo "== cpu";     nproc; lscpu | grep -E "Model name|MHz" || true
+          echo "== memory";  free -m
+          echo "== disk";    df -h / /var/tmp /tmp
+          echo "== fs";      findmnt -no FSTYPE,SOURCE,OPTIONS /var/tmp || true
+          echo "== io sched"; cat /sys/block/*/queue/scheduler 2>/dev/null || true
+          echo "== cgroup io"; cat /sys/fs/cgroup/io.max 2>/dev/null || echo "(none)"
+          echo "== fsync latency, 200 x 4KB O_DSYNC";
+          python3 - <<'PY'
+          import os, time
+          p = "/var/tmp/s62probe"
+          fd = os.open(p, os.O_CREAT | os.O_WRONLY | os.O_DSYNC, 0o600)
+          b = b"x" * 4096; ts = []
+          for _ in range(200):
+              t = time.perf_counter(); os.write(fd, b); os.fsync(fd)
+              ts.append((time.perf_counter() - t) * 1000)
+          os.close(fd); os.unlink(p)
+          ts.sort()
+          print("  min %.2fms  p50 %.2fms  p99 %.2fms  max %.2fms"
+                % (ts[0], ts[len(ts)//2], ts[int(len(ts)*0.99)], ts[-1]))
+          PY
+
+      # No `set -e` abort on a failing run: the whole point is to gather
+      # MANY outcomes, so each iteration is captured and counted.
+      - name: recoverytest x N
+        run: |
+          n="${{ github.event.inputs.runs }}"; n="${n:-20}"
+          mkdir -p /tmp/s62
+          fails=0
+          for i in $(seq 1 "$n"); do
+            if sh test/recoverytest.sh ./perfcached > "/tmp/s62/run$i.log" 2>&1; then
+              echo "run $i: ok"
+            else
+              fails=$((fails+1))
+              echo "run $i: FAIL"
+              sed 's/^/    /' "/tmp/s62/run$i.log" | tail -40
+            fi
+          done
+          echo "=== recoverytest failed $fails of $n ==="
+          echo "$fails" > /tmp/s62/failcount
+
+      - name: waltest x N
+        if: ${{ github.event.inputs.also_waltest != 'false' }}
+        run: |
+          n="${{ github.event.inputs.runs }}"; n="${n:-20}"
+          fails=0
+          for i in $(seq 1 "$n"); do
+            if sh test/waltest.sh ./perfcached > "/tmp/s62/wal$i.log" 2>&1; then
+              echo "run $i: ok"
+            else
+              fails=$((fails+1)); echo "run $i: FAIL"
+              sed 's/^/    /' "/tmp/s62/wal$i.log" | tail -30
+            fi
+          done
+          echo "=== waltest failed $fails of $n ==="
+
+      # d6903cf makes recoverytest keep a log per generation and dump
+      # them on failure; this keeps them off the runner too.
+      - name: keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s62-logs
+          path: /tmp/s62/
+          retention-days: 14
