@@ -1,0 +1,284 @@
+perfcached (0.3.0~rc26-1) unstable; urgency=medium
+
+  * rc25's daemon unchanged; two test suites made honest on a slow,
+    unprivileged runner - the leg walk settles the table before it walks,
+    and the growth suite skips its residency checks when a sanitizer has
+    intercepted the memory pin.  Library unchanged (0.2.7).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Thu, 10 Sep 2026 15:23:50 +1000
+
+perfcached (0.3.0~rc25-1) unstable; urgency=medium
+
+  * Collections are created, dropped, resized and renamed while the
+    daemon serves, persisted across a restart, carried in the WAL and
+    announced to the fleet; the RESP door maps a database index onto a
+    collection name, so a Redis-native monitor no longer reports a live
+    node as one empty database (S69).  The arena reserves its cap as
+    address space and commits by 2 MB group, so every byte up to the cap
+    is the same page tier (S97).  The cooperative walk budgets the
+    overflow leg instead of draining it whole in its final call (S121).
+    Library unchanged (0.2.7).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Thu, 10 Sep 2026 13:30:43 +1000
+
+perfcached (0.3.0~rc24-1) unstable; urgency=medium
+
+  * The doors report open connections per dialect beside the running
+    totals, and the totals can be reset - the reset_stats verb, RESP
+    CONFIG RESETSTAT, the page's reset button (POST /reset-stats) and
+    perfcli reset-stats; gauges untouched, /metrics monotonic (S123).
+    Two test suites made independent of the runner's privileges.
+    Library unchanged (0.2.7).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Wed, 09 Sep 2026 21:33:49 +1000
+
+perfcached (0.3.0~rc23-1) unstable; urgency=medium
+
+  * perfload and the restore verb: a dump loaded back with every
+    record's own version and absolute expiry through the write path,
+    into a fleet of any size or mode; policies newer, skip, overwrite;
+    resumable; the loader re-sends what the daemon names as belonging
+    elsewhere (S113).  The existence probe finds a record in the
+    overflow leg, so RESP EXISTS and TYPE, the binary exists and the
+    proxy-mode holder test answer for every present key (S122).
+    Library unchanged (0.2.7).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Wed, 09 Sep 2026 17:10:43 +1000
+
+perfcached (0.3.0~rc22-1) unstable; urgency=medium
+
+  * The trend cards carry axes and a pointer readout (S115); the sizes
+    column shows what is held, on every member (S116); the member cards
+    and the arena card agree on one ceiling-based headroom (S117); the
+    memory card's parts add up to held (S118); the reservation's
+    never-carved tail is given back, so resident memory follows held
+    (S119); a sizing recipe in the README and a memory budget card and
+    stats block (S120).  Every test suite kills its daemons by pid.
+    Library unchanged (0.2.7).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Wed, 09 Sep 2026 13:16:21 +1000
+
+perfcached (0.3.0~rc21-1) unstable; urgency=medium
+
+  * No shared lock on the eager write path: per-thread per-peer push
+    groups and a rate-limited flush broadcast (S110) - the eager write
+    ceiling moves from 349k to 1.04M SET/s on the build host.  The
+    failover test's exit trap covers both of its fleets.  Library
+    unchanged (0.2.7).  Six page and memory-accounting tasks filed from
+    the operator's evening on the fleet (S115-S120), not built.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Wed, 09 Sep 2026 10:43:45 +1000
+
+perfcached (0.3.0~rc20-1) unstable; urgency=medium
+
+  * The page's collection size is a walked figure with its age (S109);
+    held memory reports its structural and warm-free parts, and the
+    at-ceiling flag clears as soon as a carve would succeed (S114); the
+    close line counts every dialect's requests (S111); threads are named.
+    Library unchanged (0.2.7).  The eager write ceiling was measured (S110),
+    its remedy filed and not built.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Tue, 08 Sep 2026 18:26:27 +1000
+
+perfcached (0.3.0~rc19-1) unstable; urgency=medium
+
+  * rc18's tag pipeline failed twice: JSON.DEBUG HELP sent 55 bytes of a
+    53-byte literal (an abort under the sanitizer; literal replies now
+    take their length from the compiler), and stalebackfilltest asserted
+    one node's flag drop at the instant another's appeared (each polls
+    now).  No daemon behaviour or library change otherwise; rc18's batch.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Mon, 07 Sep 2026 18:41:16 +1000
+
+perfcached (0.3.0~rc18-1) unstable; urgency=medium
+
+  * An empty joiner pulls its own bootstrap from a ready peer and is
+    ready when the stream ends (S83); the write-path push coalesces into
+    one datagram per peer (S105, 289k -> 349k SET/s at depth 64).
+  * libperfd 0.2.7: a failover probes before adopting, members marked
+    down are re-dialled in the background, and the fleet's membership
+    pushes are acted on (S104, S107).  Four defects found by the S107
+    verification fixed, one of which left a push reaching only one
+    worker's clients.
+  * The RESP door speaks RedisJSON's JSON.* (S86); the JSON validator
+    is strict about primitives.
+  * Identity and term files are text, checked and refusing (S106); a
+    copied identity is refused again (S108) and a held join is held out
+    loud.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Mon, 07 Sep 2026 17:25:15 +1000
+
+perfcached (0.3.0~rc17-1) unstable; urgency=medium
+
+  * rc16's sanitized test job failed eagertest's empty-restart leg: it
+    sampled a zero entry count at the moment a peer's refill lands.  The
+    leg now asserts the node's own start kind ("cold") instead.  No
+    daemon or library change; otherwise rc16's batch.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Mon, 07 Sep 2026 12:17:28 +1000
+
+perfcached (0.3.0~rc16-1) unstable; urgency=medium
+
+  * rc15's pipeline failed on one assertion of the failover test's own
+    harness: its spread leg expected the main fleet to keep two live
+    nodes and the standby-kill cue leaves one.  The leg now uses the
+    fresh three-node fleet the routing leg starts.  No daemon or
+    library change; otherwise rc15's batch.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Mon, 07 Sep 2026 11:19:35 +1000
+
+perfcached (0.3.0~rc15-1) unstable; urgency=medium
+
+  * rc14 never compiled under the pipeline's -Werror: two writes of an
+    error string into the 64-byte member reason field lacked the bound
+    that says the truncation is meant.  Fixed; otherwise rc14's batch.
+  * Ledger: S107, background recovery of failed members and membership
+    pushed to every client, filed for later.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Mon, 07 Sep 2026 10:45:00 +1000
+
+perfcached (0.3.0~rc14-1) unstable; urgency=medium
+
+  * libperfd 0.2.4: TCP keepalive on every link, and an idle ping that
+    retires a standby that died while idle - marking its member down
+    with the reason - so a failover never adopts a dead connection.
+    Every link carries the time of its last accepted reply.
+  * libperfd 0.2.3: a handle can say what it found - the daemon's
+    version from the member list and each member's state from this
+    handle's own dials; the members reply carries version and rev.
+  * Ledger: S104 (failover onto dead standbys, with the operator's rule:
+    hold every member, use any live one, fail only when none is), S105
+    (the write-path coalescing buffer S73 decided on and never built),
+    S106 (a text node identity file).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Mon, 07 Sep 2026 10:07:00 +1000
+
+perfcached (0.3.0~rc13-1) unstable; urgency=medium
+
+  * A peer's record count and start kind are written only by its own
+    heartbeat.  The master's keepalive, a JOIN and an ASSIGN list know
+    neither and used to store zeros, so every non-master's view of the
+    master flapped once a second and the backfill sender election
+    sometimes saw the lowest id as empty and self-designated: two
+    senders for one backfill, in every CI run.
+  * members reports, per member, this node's view of its record count
+    and start kind - what the election reads.
+  * stalebackfilltest probes that view and waits one heartbeat after
+    a fill before judging it.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Mon, 07 Sep 2026 08:11:00 +1000
+
+perfcached (0.3.0~rc12-1) unstable; urgency=medium
+
+  * Test-only over rc11.  eagertest's quiet window opens on the restarted
+    node's own completion, from a line written after its restart, and
+    covers every node's counter - the wait it had was satisfied by an
+    older line and sampled a sender mid-cycle (rc10, rc11).
+  * stalebackfilltest waits out the cold window before restarting a
+    node, so only the lowest id is a sender, as the suite assumes.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sun, 06 Sep 2026 23:05:00 +1000
+
+perfcached (0.3.0~rc11-1) unstable; urgency=medium
+
+  * A stale backfill flag no longer fires when the ids reshuffle: a walk
+    starts only while its target still reports itself cold, and a flag
+    whose target is established is dropped.  This was rc10's red, and
+    the false "backfilled node N after its restart" seen on the fleet.
+  * A punched-out hugetlb group is secured before it is handed out again;
+    an empty pool refuses the re-commit instead of faulting (SIGBUS).
+  * The give-back no longer re-faults what it just released: a cold slot
+    has no header until it is re-committed.
+  * Give-back decides under the arena lock and punches without it, one
+    madvise per run of groups; bounded per tick by [memory] shrink_step_mb.
+  * The ceiling is a latched state (at_ceiling, at_ceiling_since) with a
+    red card; the overview counts the fleet's members, not this node's
+    peers.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sun, 06 Sep 2026 22:10:00 +1000
+
+perfcached (0.3.0~rc10-1) unstable; urgency=medium
+
+  * A founding node keeps the id its identity proposes: become_master()
+    asks the same allocator every joiner goes through instead of
+    stamping itself node 1, so a whole-fleet restart no longer
+    renumbers the fleet around whichever node booted first.
+  * The status page reports what the WAL and RDB are doing rather than
+    that they are "on"; the history graphs state the window they cover
+    and are twice as tall, ruled at the quarters.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sun, 06 Sep 2026 00:30:00 +1000
+
+perfcached (0.3.0~rc9-1) unstable; urgency=medium
+
+  * A backfill sender must hold something: the election skips a
+    candidate reporting zero records or reporting itself cold, at any
+    age.  The S82 holdoff was a timer standing in for a state.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sun, 06 Sep 2026 00:20:00 +1000
+
+perfcached (0.3.0~rc8-1) unstable; urgency=medium
+
+  * eagertest: open the post-backfill quiet window on the sender's
+    completion report, not on the record count - the tail of the
+    in-flight cycle was being read as an echo (rc5, rc7).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Fri, 05 Sep 2026 23:40:00 +1000
+
+perfcached (0.3.0~rc7-1) unstable; urgency=medium
+
+  * collections verb; keys over a collection glob, grouped and bounded;
+    a single-collection listing names its collection and its scope;
+    exit/quit in perfcli (S88).
+  * stats.listeners and a listeners card; a RESP client on the native
+    door is named in the log (S89).
+  * The query log line says hit, miss, ok or err (S65).
+  * stats.cluster.reserved_ids: a departed member's id is held for it (S90).
+  * Per-collection stored_bytes/stored_n/size_hist and the page's
+    estimate of memory held (S67).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Fri, 05 Sep 2026 22:40:00 +1000
+
+perfcached (0.3.0~rc6-1) unstable; urgency=medium
+
+  * A late ack re-sends one batch, not the keyspace (S85).
+  * RESP door: redis_mode:cluster and INFO cluster from one truth (S74);
+    CLUSTER SLOTS/SHARDS cached per membership (S75).
+  * A fleet is uniform about the WAL; a mismatch is refused at the
+    join, by name (S73b).
+  * Connection log with dialect, channel and reason (S70); heartbeat
+    carries the HTTP door and uptime (S78); perfcli names the
+    mistake (S71).
+  * lib/NOTICE for libsodium (ISC); synctest on every push (S84).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Fri, 05 Sep 2026 20:30:00 +1000
+
+perfcached (0.3.0~rc5-1) unstable; urgency=medium
+
+  * Eager replicates on the write; the sweep is repair (S73a).
+  * Backfill armed from the ALIVE's start byte, not a record count (S81).
+  * query_log = off | all | sampled:N, keys no | hashed | full (S65).
+  * stats.native per dialect, a card each (S76).
+  * A refused HTTP client gets a 403 that names http_allow (S66).
+  * libperfd 0.2.2: no GPL header in the export; sync refuses a
+    licence crossing (S79).
+  * statfs f_type compared unsigned: the rc4 matrix on i386/arm32.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sat, 05 Sep 2026 17:00:00 +1000
+
+perfcached (0.3.0~rc4-1) unstable; urgency=medium
+
+  * Backfill: walk from zero, whole cycle as sender (S81); a node that
+    arrived empty is not the backfill sender for the next one (S82).
+  * [daemon] state_dir: identity and term persist for a pure cache (S80).
+  * libperfd 0.2.1: a failed round trip no longer wedges the handle (S72).
+  * mode = eager replaces mode = store + eager = 1.
+  * stats.process, /stats on the HTTP door, the fleet-view page.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Sat, 05 Sep 2026 12:00:00 +1000
+
+perfcached (0.3.0~rc3-1) unstable; urgency=medium
+
+  * Initial Debian packaging (S64 stage 2).
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Thu, 03 Sep 2026 21:30:15 +1000
