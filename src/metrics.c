@@ -1,0 +1,364 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (c) 2026 Yury Kirsanov - see COPYING */
+/*
+ * metrics.c — S46: the OpenMetrics exposition.  See metrics.h for why
+ * the names in here are a contract rather than a convenience.
+ *
+ * Everything is read from the same accessors the stats verb uses, with
+ * the same tolerance for torn counters: an exposition is a trend, not
+ * a transaction, and taking locks to serialise a scrape would put a
+ * scraper in the path of the data plane - the exact failure this
+ * project exists to avoid.
+ */
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "daemon.h"
+#include "metrics.h"
+#include "version.h"
+#include "store.h"
+#include "wal.h"
+#include "cluster.h"
+#include "core/pcache_arena.h"
+#include "core/pcache_htable.h"
+
+static time_t started;
+
+void pc_metrics_mark_start(void)
+{
+	started = time(NULL);
+}
+
+long pc_metrics_uptime(void)
+{
+	return started ? (long)(time(NULL) - started) : 0;
+}
+
+/* a tiny append helper: every writer below is bounded by @cap */
+struct out {
+	char *b;
+	size_t cap, len;
+};
+
+static void emit(struct out *o, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+
+static void emit(struct out *o, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (o->len >= o->cap)
+		return;
+	va_start(ap, fmt);
+	/*
+	 * The newer clang-analyzer on the Ubuntu CI reports this as
+	 * "vsnprintf is called with an uninitialized va_list argument".
+	 * It is not: its own path trace goes line 47 -> this line and
+	 * never visits the va_start directly above, so the checker simply
+	 * does not model va_start as initialising `ap` - there is no note
+	 * claiming the va_start was conditionally skipped, because there
+	 * is no such path.  The early return above happens BEFORE the
+	 * va_start, so every path that reaches here has run it.
+	 *
+	 * Suppressed at the site rather than by disabling the check, so a
+	 * future va_list that really is uninitialised still gets caught -
+	 * this is the only va_list in the tree.
+	 */
+	/* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
+	n = vsnprintf(o->b + o->len, o->cap - o->len, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	if ((size_t)n >= o->cap - o->len)
+		o->len = o->cap;               /* truncated; stop writing */
+	else
+		o->len += (size_t)n;
+}
+
+/* a label value must not carry a quote or a backslash into the
+ * exposition - a collection name is operator-chosen, not ours */
+static void label_escape(const char *in, char *out, size_t cap)
+{
+	size_t i = 0;
+
+	while (*in && i + 2 < cap) {
+		if (*in == '"' || *in == '\\')
+			out[i++] = '\\';
+		out[i++] = *in++;
+	}
+	out[i] = 0;
+}
+
+size_t pc_metrics_render(char *buf, size_t cap)
+{
+	struct out o = { buf, cap, 0 };
+	struct pcache_arena_pressure pr;
+	struct pc_wal_stats ws;
+	unsigned long held, mx;
+	int i, n;
+
+	if (cap < 64)
+		return 0;
+
+	emit(&o, "# HELP perfcached_build_info the running build\n"
+		"# TYPE perfcached_build_info gauge\n"
+		"perfcached_build_info{version=\"%s\",rev=\"%s\"} 1\n",
+		PC_VERSION, PC_BUILD_REV);
+
+	emit(&o, "# HELP perfcached_uptime_seconds seconds since startup\n"
+		"# TYPE perfcached_uptime_seconds gauge\n"
+		"perfcached_uptime_seconds %ld\n",
+		started ? (long)(time(NULL) - started) : 0L);
+
+	/* S123: connections open right now, per door and dialect - gauges,
+	 * untouched by a counter reset */
+	emit(&o, "# HELP perfcached_connections_open connections open now, by door and dialect\n"
+		"# TYPE perfcached_connections_open gauge\n"
+		"perfcached_connections_open{door=\"resp\",dialect=\"resp\"} %u\n"
+		"perfcached_connections_open{door=\"native\",dialect=\"binary\"} %u\n"
+		"perfcached_connections_open{door=\"native\",dialect=\"json\"} %u\n"
+		"perfcached_connections_open{door=\"native\",dialect=\"resp\"} %u\n",
+		PC_RESP_READ(pc_resp_open), PC_RESP_READ(pc_nat_bin_open),
+		PC_RESP_READ(pc_nat_text_open), PC_RESP_READ(pc_nat_resp_open));
+
+	/* ---- memory: the S47 pressure surface ---------------------- */
+	pcache_arena_pressure(&pr);
+	held = pcache_arena_held_bytes();
+	mx = pcache_arena_max_bytes;
+
+	emit(&o, "# HELP perfcached_arena_held_bytes memory held from the host\n"
+		"# TYPE perfcached_arena_held_bytes gauge\n"
+		"perfcached_arena_held_bytes %lu\n", held);
+	emit(&o, "# HELP perfcached_arena_max_bytes the configured ceiling\n"
+		"# TYPE perfcached_arena_max_bytes gauge\n"
+		"perfcached_arena_max_bytes %lu\n", mx);
+	emit(&o, "# HELP perfcached_arena_live_bytes bytes in live records\n"
+		"# TYPE perfcached_arena_live_bytes gauge\n"
+		"perfcached_arena_live_bytes %llu\n",
+		(unsigned long long)pcache_arena_live_bytes());
+	emit(&o, "# HELP perfcached_arena_regions_bytes index regions held (bucket directories, hint tables, counters - carved at creation and on growth, never freed)\n"
+		"# TYPE perfcached_arena_regions_bytes gauge\n"
+		"perfcached_arena_regions_bytes %lu\n", pr.regions_bytes);
+	emit(&o, "# HELP perfcached_arena_warm_free_bytes free slots kept resident\n"
+		"# TYPE perfcached_arena_warm_free_bytes gauge\n"
+		"perfcached_arena_warm_free_bytes %lu\n", pr.warm_free_bytes);
+	emit(&o, "# HELP perfcached_arena_class_chunk_bytes chunks the size classes own (live records inside, free cells that belong to the class)\n"
+		"# TYPE perfcached_arena_class_chunk_bytes gauge\n"
+		"perfcached_arena_class_chunk_bytes %lu\n", pr.class_chunk_bytes);
+	emit(&o, "# HELP perfcached_arena_page_slack_bytes alignment slot of every shm page; regions + class chunks + warm free + page slack = held\n"
+		"# TYPE perfcached_arena_page_slack_bytes gauge\n"
+		"perfcached_arena_page_slack_bytes %lu\n", pr.page_slack_bytes);
+	emit(&o, "# HELP perfcached_arena_committed_bytes bytes of the reservation committed - the initial commit plus every 2 MB group a carve reached, less what the give-back punched; RSS follows this\n"
+		"# TYPE perfcached_arena_committed_bytes gauge\n"
+		"perfcached_arena_committed_bytes %lu\n", pr.committed_bytes);
+	emit(&o, "# HELP perfcached_arena_reserved_bytes the address space reserved for the arena: the cap\n"
+		"# TYPE perfcached_arena_reserved_bytes gauge\n"
+		"perfcached_arena_reserved_bytes %lu\n", pr.reserved_bytes);
+	/* a RATIO, not a percentage: Prometheus convention, and it keeps
+	 * an alert threshold readable as 0.05 rather than "5" */
+	emit(&o, "# HELP perfcached_arena_headroom_ratio free share of the ceiling\n"
+		"# TYPE perfcached_arena_headroom_ratio gauge\n"
+		"perfcached_arena_headroom_ratio %.4f\n",
+		mx ? (mx > held ? (double)(mx - held) / (double)mx : 0.0) : 1.0);
+	emit(&o, "# HELP perfcached_writes_refused_total writes refused, arena full\n"
+		"# TYPE perfcached_writes_refused_total counter\n"
+		"perfcached_writes_refused_total %lu\n", pr.refused);
+	emit(&o, "# HELP perfcached_hugetlb_pool_empty_total punched groups not re-committed, pool empty\n"
+		"# TYPE perfcached_hugetlb_pool_empty_total counter\n"
+		"perfcached_hugetlb_pool_empty_total %lu\n", pr.pool_empty);
+	emit(&o, "# HELP perfcached_arena_at_ceiling 1 while carves are being refused at the ceiling\n"
+		"# TYPE perfcached_arena_at_ceiling gauge\n"
+		"perfcached_arena_at_ceiling %d\n", pr.at_ceiling_since ? 1 : 0);
+	emit(&o, "# HELP perfcached_reclaim_tail_released_bytes_total the reservation's never-carved tail given back (inside released_bytes)\n"
+		"# TYPE perfcached_reclaim_tail_released_bytes_total counter\n"
+		"perfcached_reclaim_tail_released_bytes_total %lu\n", pr.tail_released_bytes);
+	emit(&o, "# HELP perfcached_reclaim_released_bytes_total memory given back\n"
+		"# TYPE perfcached_reclaim_released_bytes_total counter\n"
+		"perfcached_reclaim_released_bytes_total %lu\n",
+		pr.released_bytes);
+	emit(&o, "# HELP perfcached_reclaim_punch_calls_total madvise calls that punched memory out, one per run\n"
+		"# TYPE perfcached_reclaim_punch_calls_total counter\n"
+		"perfcached_reclaim_punch_calls_total %lu\n", pr.punch_calls);
+	emit(&o, "# HELP perfcached_reclaim_punch_groups_total 2 MB groups those calls covered\n"
+		"# TYPE perfcached_reclaim_punch_groups_total counter\n"
+		"perfcached_reclaim_punch_groups_total %lu\n", pr.punch_groups);
+	emit(&o, "# HELP perfcached_reclaim_shrink_step_bytes the most give-back one tick may do\n"
+		"# TYPE perfcached_reclaim_shrink_step_bytes gauge\n"
+		"perfcached_reclaim_shrink_step_bytes %lu\n", pr.shrink_step);
+	emit(&o, "# HELP perfcached_reclaim_giveback_disabled give-back latched off\n"
+		"# TYPE perfcached_reclaim_giveback_disabled gauge\n"
+		"perfcached_reclaim_giveback_disabled %d\n", pr.giveback_off);
+
+	/* ---- per collection ---------------------------------------- */
+	emit(&o, "# HELP perfcached_collection_entries live records\n"
+		"# TYPE perfcached_collection_entries gauge\n");
+	n = pc_store_count();
+	for (i = 0; i < n; i++) {
+		if (!pc_store_live(i))
+			continue;   /* S69: a dropped collection */
+		pcache_ht_totals_t t;
+		char esc[128];
+
+		pcache_ht_totals(pc_store_ht(i), &t);
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_entries{collection=\"%s\"} %lu\n",
+			esc, t.entries);
+	}
+	/* S131: the overflow leg, and what the walk across it costs.  A
+	 * table at its target load factor keeps the leg near empty; one
+	 * that has stopped growing puts everything there, and the walk
+	 * blocks every other maintenance duty for its whole duration.
+	 * Alert on the leg, not on entries. */
+	emit(&o, "# HELP perfcached_collection_overflow records in the overflow leg rather than in a bucket's slots\n"
+		"# TYPE perfcached_collection_overflow gauge\n");
+	for (i = 0; i < n; i++) {
+		char esc[128];
+
+		if (!pc_store_live(i))
+			continue;
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_overflow{collection=\"%s\"} %u\n",
+			esc, pcache_ht_overflow(pc_store_ht(i)));
+	}
+	emit(&o, "# HELP perfcached_collection_held_walk_seconds duration of the last held-bytes walk, which every other maintenance duty waits behind\n"
+		"# TYPE perfcached_collection_held_walk_seconds gauge\n");
+	for (i = 0; i < n; i++) {
+		char esc[128];
+
+		if (!pc_store_live(i))
+			continue;
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_held_walk_seconds{collection=\"%s\"} %.6f\n",
+			esc, pc_store_held_walk_us(i) / 1000000.0);
+	}
+	/* S120: the budget's parts per collection */
+	emit(&o, "# HELP perfcached_collection_index_bytes index regions carved for the collection's table (creation and growth), never freed\n"
+		"# TYPE perfcached_collection_index_bytes gauge\n");
+	for (i = 0; i < n; i++) {
+		if (!pc_store_live(i))
+			continue;   /* S69: a dropped collection */
+		char esc[128];
+
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_index_bytes{collection=\"%s\"} %lu\n",
+			esc, pc_store_index_bytes(i));
+	}
+	emit(&o, "# HELP perfcached_collection_record_bytes the records held as the cells they occupy (class-rounded), from the walk\n"
+		"# TYPE perfcached_collection_record_bytes gauge\n");
+	for (i = 0; i < n; i++) {
+		if (!pc_store_live(i))
+			continue;   /* S69: a dropped collection */
+		char esc[128];
+
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_record_bytes{collection=\"%s\"} %llu\n",
+			esc, pc_store_held_cells(i));
+	}
+	emit(&o, "# HELP perfcached_collection_held_bytes key and value bytes of the records held, from the maintenance thread's paced walk\n"
+		"# TYPE perfcached_collection_held_bytes gauge\n");
+	for (i = 0; i < n; i++) {
+		if (!pc_store_live(i))
+			continue;   /* S69: a dropped collection */
+		unsigned int age = 0;
+		unsigned long long hb = pc_store_held(i, &age);
+		char esc[128];
+
+		if (age == (unsigned int)-1)
+			continue;                  /* not walked yet: no sample */
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_held_bytes{collection=\"%s\"} %llu\n",
+			esc, hb);
+	}
+	emit(&o, "# HELP perfcached_collection_hits_total read hits\n"
+		"# TYPE perfcached_collection_hits_total counter\n");
+	for (i = 0; i < n; i++) {
+		if (!pc_store_live(i))
+			continue;   /* S69: a dropped collection */
+		pcache_ht_totals_t t;
+		char esc[128];
+
+		pcache_ht_totals(pc_store_ht(i), &t);
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_hits_total{collection=\"%s\"} %lu\n",
+			esc, t.hits);
+	}
+	emit(&o, "# HELP perfcached_collection_misses_total read misses\n"
+		"# TYPE perfcached_collection_misses_total counter\n");
+	for (i = 0; i < n; i++) {
+		if (!pc_store_live(i))
+			continue;   /* S69: a dropped collection */
+		pcache_ht_totals_t t;
+		char esc[128];
+
+		pcache_ht_totals(pc_store_ht(i), &t);
+		label_escape(pc_store_name(i), esc, sizeof esc);
+		emit(&o, "perfcached_collection_misses_total{collection=\"%s\"} %lu\n",
+			esc, t.misses);
+	}
+
+	/* ---- durability -------------------------------------------- */
+	pc_wal_get_stats(&ws);
+	emit(&o, "# HELP perfcached_wal_appended_total records written to the WAL\n"
+		"# TYPE perfcached_wal_appended_total counter\n"
+		"perfcached_wal_appended_total %llu\n", ws.appended);
+	/* the S58 metric: a ring-full drop is a record the barrier can
+	 * never cover, so it belongs on a dashboard, not only in a log */
+	emit(&o, "# HELP perfcached_wal_dropped_total records dropped, ring full\n"
+		"# TYPE perfcached_wal_dropped_total counter\n"
+		"perfcached_wal_dropped_total %llu\n", ws.dropped);
+	emit(&o, "# HELP perfcached_wal_last_seq newest sequence number\n"
+		"# TYPE perfcached_wal_last_seq gauge\n"
+		"perfcached_wal_last_seq %llu\n", ws.last_seq);
+	emit(&o, "# HELP perfcached_wal_synced_seq newest fsynced sequence\n"
+		"# TYPE perfcached_wal_synced_seq gauge\n"
+		"perfcached_wal_synced_seq %llu\n", ws.synced_seq);
+
+	/* ---- cluster ----------------------------------------------- */
+	if (pc_cluster_enabled()) {
+		struct pc_cl_stats cs;
+
+		pc_cluster_get_stats(&cs);
+		emit(&o, "# HELP perfcached_cluster_nodes nodes in the published map\n"
+			"# TYPE perfcached_cluster_nodes gauge\n"
+			"perfcached_cluster_nodes %d\n", cs.map_nodes);
+		emit(&o, "# HELP perfcached_cluster_map_valid the map is usable\n"
+			"# TYPE perfcached_cluster_map_valid gauge\n"
+			"perfcached_cluster_map_valid %d\n", cs.map_valid);
+		/* S125: replica lag.  A node falling behind on inbound copies
+		 * looks healthy from every other angle - it heartbeats, it
+		 * serves clients fast, it stays a member - so these are the
+		 * figures to alert on.  applied_total is a counter; the rest
+		 * are the daemon's own 1 Hz readings, published as gauges
+		 * rather than recomputed by the scraper, because the useful
+		 * rate is the one measured against the real elapsed tick. */
+		emit(&o, "# HELP perfcached_cluster_rx_applied_total replica records applied\n"
+			"# TYPE perfcached_cluster_rx_applied_total counter\n"
+			"perfcached_cluster_rx_applied_total %llu\n", cs.rx_applied);
+		emit(&o, "# HELP perfcached_cluster_rx_applied_per_second replica records applied per second\n"
+			"# TYPE perfcached_cluster_rx_applied_per_second gauge\n"
+			"perfcached_cluster_rx_applied_per_second %u\n", cs.rx_applied_ps);
+		emit(&o, "# HELP perfcached_cluster_rx_older_per_second replica copies refused as older per second\n"
+			"# TYPE perfcached_cluster_rx_older_per_second gauge\n"
+			"perfcached_cluster_rx_older_per_second %u\n", cs.rx_older_ps);
+		emit(&o, "# HELP perfcached_cluster_rx_drops_total datagrams the receive buffers could not hold\n"
+			"# TYPE perfcached_cluster_rx_drops_total counter\n"
+			"perfcached_cluster_rx_drops_total %llu\n", cs.rx_drops);
+		emit(&o, "# HELP perfcached_cluster_rx_drops_per_second datagrams dropped per second\n"
+			"# TYPE perfcached_cluster_rx_drops_per_second gauge\n"
+			"perfcached_cluster_rx_drops_per_second %u\n", cs.rx_drops_ps);
+		emit(&o, "# HELP perfcached_cluster_rx_queue_bytes bytes waiting in the cluster receive queues\n"
+			"# TYPE perfcached_cluster_rx_queue_bytes gauge\n"
+			"perfcached_cluster_rx_queue_bytes %u\n", cs.rx_queue);
+		emit(&o, "# HELP perfcached_cluster_rx_rcvbuf_bytes the effective receive buffer\n"
+			"# TYPE perfcached_cluster_rx_rcvbuf_bytes gauge\n"
+			"perfcached_cluster_rx_rcvbuf_bytes %u\n", cs.rx_rcvbuf);
+	}
+
+	if (o.len >= o.cap)
+		o.len = o.cap - 1;
+	buf[o.len] = 0;
+	return o.len;
+}
