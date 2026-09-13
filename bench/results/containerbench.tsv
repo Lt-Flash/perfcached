@@ -1,0 +1,278 @@
+# build=19a077b date=2026-09-04T00:35Z host=debian13-16vcpu runtime=podman cpus=16 workers=8 arena_mb=128 keys=20000 nbase=100000 val=200 reps=3 mtu=9000 cpuset_srv=none cpuset_cli=none mems_srv=none dialects=resp,json,bin nat_secs=5 nat_lat=1 cli_threads=8 n_max=4000000 base=debian redis_img=redis:8 route=1
+arm	clients	pipeline	set_rps	get_rps	set_p50ms	get_p50ms	set_p99ms	get_p99ms
+redis	1	1	13912	14411	0.063	0.055	0.111	0.111
+redis	4	1	49975	57110	0.063	0.063	0.135	0.119
+redis	16	1	74963	74981	0.191	0.183	0.391	0.343
+redis	50	1	84140	84157	0.543	0.527	1.079	1.023
+redis	200	1	88711	84122	2.039	2.207	4.455	4.247
+redis	500	1	72608	76075	6.495	6.223	10.335	11.951
+redis	1000	1	59154	61444	15.871	15.327	26.239	21.823
+redis	50	8	426099	440893	0.831	0.807	1.695	1.615
+redis	50	16	591628	638978	1.151	1.111	2.255	2.175
+redis	50	64	839983	938526	3.423	3.295	4.807	5.255
+perfcached-solo	1	1	16013	15980	0.055	0.055	0.095	0.103
+perfcached-solo	4	1	57110	57110	0.055	0.055	0.095	0.095
+perfcached-solo	16	1	199867	171331	0.055	0.063	0.175	0.183
+perfcached-solo	50	1	266489	266489	0.087	0.087	0.751	0.735
+perfcached-solo	200	1	319234	319489	0.239	0.247	3.135	3.047
+perfcached-solo	500	1	398804	398406	0.575	0.543	2.015	1.639
+perfcached-solo	1000	1	397614	397614	1.175	1.135	5.079	2.551
+perfcached-solo	50	8	1596806	1599200	0.135	0.127	1.095	1.007
+perfcached-solo	50	16	1774623	2283105	0.255	0.167	1.583	1.239
+perfcached-solo	50	64	2661344	3194888	0.879	0.431	3.535	1.311
+perfcached-solo-json	1	1	14261	13501	0.065	0.069	0.126	0.128
+perfcached-solo-json	4	1	56189	56125	0.068	0.067	0.114	0.120
+perfcached-solo-json	16	1	209482	183413	0.066	0.074	0.157	0.199
+perfcached-solo-json	50	1	317585	300167	0.102	0.112	0.791	0.777
+perfcached-solo-json	200	1	393284	359502	0.294	0.323	3.564	3.907
+perfcached-solo-json	500	1	421280	386289	0.764	0.846	5.427	5.762
+perfcached-solo-json	1000	1	458575	387700	1.583	1.808	6.284	7.964
+perfcached-solo-json	50	8	1309645	1217339	0.239	0.264	0.889	0.905
+perfcached-solo-json	50	16	1509330	1403266	0.443	0.488	1.291	1.410
+perfcached-solo-json	50	64	1710085	1652130	1.588	1.735	5.808	5.084
+perfcached-solo-bin	1	1	14170	14815	0.066	0.062	0.131	0.126
+perfcached-solo-bin	4	1	58284	59352	0.065	0.064	0.122	0.118
+perfcached-solo-bin	16	1	190947	197818	0.067	0.069	0.240	0.180
+perfcached-solo-bin	50	1	302477	301224	0.099	0.101	0.826	0.850
+perfcached-solo-bin	200	1	395793	396620	0.285	0.287	3.746	3.558
+perfcached-solo-bin	500	1	419030	430036	0.753	0.721	5.481	5.474
+perfcached-solo-bin	1000	1	472617	478667	1.504	1.428	6.297	6.550
+perfcached-solo-bin	50	8	1533149	1614569	0.187	0.169	0.958	1.032
+perfcached-solo-bin	50	16	1995715	2555560	0.326	0.250	1.017	0.795
+perfcached-solo-bin	50	64	2340004	3562040	1.136	0.732	3.484	2.298
+perfcached-store	1	1	15557	15083	0.055	0.055	0.103	0.111
+perfcached-store	4	1	57110	49975	0.055	0.063	0.103	0.111
+perfcached-store	16	1	171233	199867	0.063	0.063	0.223	0.167
+perfcached-store	50	1	266312	228441	0.095	0.103	0.863	0.823
+perfcached-store	200	1	318979	319489	0.271	0.271	3.199	1.743
+perfcached-store	500	1	398010	318471	0.615	0.647	1.927	1.775
+perfcached-store	1000	1	398010	317965	1.215	1.327	3.295	3.095
+perfcached-store	50	8	1420328	1420328	0.151	0.135	1.159	1.039
+perfcached-store	50	16	1773836	1998002	0.271	0.191	1.623	1.231
+perfcached-store	50	64	1997004	2661344	1.199	0.511	3.791	1.799
+perfcached-store-json	1	1	14307	14191	0.065	0.066	0.122	0.119
+perfcached-store-json	4	1	57497	54344	0.066	0.070	0.115	0.122
+perfcached-store-json	16	1	177794	168638	0.075	0.078	0.200	0.216
+perfcached-store-json	50	1	315402	305750	0.101	0.107	0.450	0.449
+perfcached-store-json	200	1	354523	354110	0.285	0.286	2.262	2.526
+perfcached-store-json	500	1	299047	290704	0.776	0.793	4.348	4.654
+perfcached-store-json	1000	1	254685	263424	1.812	1.764	6.796	7.341
+perfcached-store-json	50	8	1244196	1126028	0.196	0.226	0.966	0.966
+perfcached-store-json	50	16	1624546	1410246	0.313	0.346	1.288	1.982
+perfcached-store-json	50	64	2192552	1882807	0.914	1.123	3.458	4.399
+perfcached-store-bin	1	1	14617	14911	0.064	0.063	0.120	0.120
+perfcached-store-bin	4	1	59589	60729	0.063	0.062	0.116	0.113
+perfcached-store-bin	16	1	194635	201387	0.068	0.066	0.185	0.182
+perfcached-store-bin	50	1	349515	351601	0.091	0.090	0.400	0.365
+perfcached-store-bin	200	1	369333	355551	0.273	0.279	1.959	1.991
+perfcached-store-bin	500	1	331002	321718	0.706	0.726	3.899	3.893
+perfcached-store-bin	1000	1	296515	309930	1.567	1.482	6.170	6.233
+perfcached-store-bin	50	8	1582566	1703223	0.157	0.150	0.644	0.627
+perfcached-store-bin	50	16	2160220	2422785	0.231	0.212	0.858	0.804
+perfcached-store-bin	50	64	3089771	3711592	0.671	0.553	2.218	2.276
+perfcached-store-cold	1	1		11315		0.063		0.239
+perfcached-store-cold	4	1		44425		0.063		0.231
+perfcached-store-cold	16	1		149925		0.063		0.319
+perfcached-store-cold	50	1		228441		0.111		0.991
+perfcached-store-cold	200	1		266134		0.295		3.319
+perfcached-store-cold	500	1		265957		0.623		5.351
+perfcached-store-cold	1000	1		227661		1.351		8.087
+perfcached-store-cold	50	8		1278466		0.119		0.959
+perfcached-store-cold	50	16		1597444		0.183		1.167
+perfcached-store-cold	50	64		1996008		0.471		1.663
+perfcached-store-cold-json	1	1		8439		0.082		0.267
+perfcached-store-cold-json	4	1		45458		0.071		0.219
+perfcached-store-cold-json	16	1		164142		0.073		0.266
+perfcached-store-cold-json	50	1		237056		0.127		0.792
+perfcached-store-cold-json	200	1		321874		0.348		3.842
+perfcached-store-cold-json	500	1		327621		0.837		5.951
+perfcached-store-cold-json	1000	1		357871		1.729		7.911
+perfcached-store-cold-json	50	8		958225		0.269		0.939
+perfcached-store-cold-json	50	16		1099587		0.461		1.772
+perfcached-store-cold-json	50	64		1238293		1.729		5.356
+perfcached-store-cold-bin	1	1		8526		0.083		0.275
+perfcached-store-cold-bin	4	1		52369		0.064		0.209
+perfcached-store-cold-bin	16	1		184963		0.066		0.230
+perfcached-store-cold-bin	50	1		269852		0.099		0.928
+perfcached-store-cold-bin	200	1		364835		0.276		3.877
+perfcached-store-cold-bin	500	1		361191		0.701		5.873
+perfcached-store-cold-bin	1000	1		404622		1.390		7.152
+perfcached-store-cold-bin	50	8		1215642		0.180		1.288
+perfcached-store-cold-bin	50	16		1706333		0.253		1.454
+perfcached-store-cold-bin	50	64		2491549		0.736		3.162
+perfcached-eager	1	1	15716	14901	0.055	0.055	0.095	0.111
+perfcached-eager	4	1	57110	57110	0.055	0.055	0.095	0.095
+perfcached-eager	16	1	199867	199867	0.063	0.055	0.159	0.143
+perfcached-eager	50	1	266312	266489	0.095	0.095	0.887	0.839
+perfcached-eager	200	1	319234	319489	0.263	0.239	3.159	2.927
+perfcached-eager	500	1	398406	318979	0.639	0.695	3.927	3.023
+perfcached-eager	1000	1	397219	318725	1.191	1.295	5.303	4.359
+perfcached-eager	50	8	1420328	1598402	0.143	0.127	1.103	0.983
+perfcached-eager	50	16	1598082	2279202	0.287	0.183	1.719	1.231
+perfcached-eager	50	64	1996008	3192338	1.247	0.431	4.471	1.511
+perfcached-eager-json	1	1	14683	14084	0.062	0.064	0.116	0.122
+perfcached-eager-json	4	1	55492	56167	0.068	0.068	0.117	0.114
+perfcached-eager-json	16	1	173925	169841	0.075	0.079	0.207	0.217
+perfcached-eager-json	50	1	300554	300235	0.107	0.110	0.485	0.468
+perfcached-eager-json	200	1	384767	367274	0.255	0.273	2.480	2.437
+perfcached-eager-json	500	1	322667	324055	0.714	0.691	4.273	4.771
+perfcached-eager-json	1000	1	313878	301214	1.504	1.570	6.285	6.600
+perfcached-eager-json	50	8	1283138	1123028	0.186	0.223	1.253	1.052
+perfcached-eager-json	50	16	1676607	1397445	0.303	0.345	1.344	2.114
+perfcached-eager-json	50	64	2202432	1846667	0.918	1.126	3.730	4.501
+perfcached-eager-bin	1	1	14742	14600	0.063	0.064	0.122	0.120
+perfcached-eager-bin	4	1	61232	61438	0.061	0.062	0.108	0.108
+perfcached-eager-bin	16	1	187136	177588	0.071	0.071	0.208	0.234
+perfcached-eager-bin	50	1	343332	346841	0.093	0.092	0.390	0.419
+perfcached-eager-bin	200	1	344967	348945	0.292	0.286	2.089	2.244
+perfcached-eager-bin	500	1	316637	327902	0.729	0.697	4.205	3.992
+perfcached-eager-bin	1000	1	300217	299131	1.543	1.522	6.431	6.392
+perfcached-eager-bin	50	8	1554315	1682091	0.160	0.155	0.649	0.574
+perfcached-eager-bin	50	16	2132303	2406889	0.232	0.208	1.008	0.890
+perfcached-eager-bin	50	64	3220100	3908952	0.638	0.550	2.124	1.928
+perfcached-eager-cold	1	1		15218		0.055		0.103
+perfcached-eager-cold	4	1		57110		0.055		0.103
+perfcached-eager-cold	16	1		149925		0.071		0.295
+perfcached-eager-cold	50	1		319489		0.087		0.687
+perfcached-eager-cold	200	1		319489		0.271		1.967
+perfcached-eager-cold	500	1		318979		0.631		1.759
+perfcached-eager-cold	1000	1		317965		1.391		6.351
+perfcached-eager-cold	50	8		1598402		0.135		0.999
+perfcached-eager-cold	50	16		2281802		0.175		1.223
+perfcached-eager-cold	50	64		3194888		0.455		1.031
+perfcached-eager-cold-json	1	1		13441		0.065		0.121
+perfcached-eager-cold-json	4	1		51875		0.071		0.124
+perfcached-eager-cold-json	16	1		172947		0.072		0.178
+perfcached-eager-cold-json	50	1		247190		0.113		0.852
+perfcached-eager-cold-json	200	1		346434		0.305		3.738
+perfcached-eager-cold-json	500	1		352501		0.832		6.096
+perfcached-eager-cold-json	1000	1		366636		1.747		7.759
+perfcached-eager-cold-json	50	8		1050272		0.270		0.881
+perfcached-eager-cold-json	50	16		1215962		0.483		1.541
+perfcached-eager-cold-json	50	64		1442415		1.681		5.323
+perfcached-eager-cold-bin	1	1		14274		0.063		0.123
+perfcached-eager-cold-bin	4	1		57952		0.062		0.110
+perfcached-eager-cold-bin	16	1		195406		0.064		0.162
+perfcached-eager-cold-bin	50	1		288069		0.094		0.810
+perfcached-eager-cold-bin	200	1		395441		0.263		3.545
+perfcached-eager-cold-bin	500	1		392190		0.734		5.464
+perfcached-eager-cold-bin	1000	1		428624		1.467		6.924
+perfcached-eager-cold-bin	50	8		1332183		0.177		1.138
+perfcached-eager-cold-bin	50	16		1926139		0.271		1.055
+perfcached-eager-cold-bin	50	64		3098599		0.778		2.277
+perfcached-proxy	1	1	14541	14658	0.055	0.063	0.111	0.111
+perfcached-proxy	4	1	57110	57110	0.055	0.063	0.103	0.103
+perfcached-proxy	16	1	171331	171429	0.063	0.063	0.215	0.199
+perfcached-proxy	50	1	266312	266489	0.095	0.095	0.823	0.823
+perfcached-proxy	200	1	318725	319489	0.279	0.263	3.407	3.015
+perfcached-proxy	500	1	319234	318979	0.623	0.647	2.407	2.167
+perfcached-proxy	1000	1	397614	318218	1.199	1.247	5.375	3.423
+perfcached-proxy	50	8	1419698	1420959	0.151	0.127	1.231	1.103
+perfcached-proxy	50	16	1598721	1998002	0.335	0.183	1.631	1.343
+perfcached-proxy	50	64	1995012	3192338	1.319	0.439	4.047	1.775
+perfcached-proxy-json	1	1	14156	13895	0.065	0.067	0.125	0.124
+perfcached-proxy-json	4	1	56822	55210	0.067	0.068	0.119	0.124
+perfcached-proxy-json	16	1	191249	188101	0.071	0.075	0.166	0.197
+perfcached-proxy-json	50	1	316578	299892	0.104	0.112	0.804	0.767
+perfcached-proxy-json	200	1	380973	364403	0.302	0.317	3.754	3.831
+perfcached-proxy-json	500	1	404838	396302	0.797	0.811	5.485	5.758
+perfcached-proxy-json	1000	1	439073	419051	1.604	1.670	6.938	7.223
+perfcached-proxy-json	50	8	1309799	1245820	0.249	0.258	0.775	0.862
+perfcached-proxy-json	50	16	1479828	1494929	0.446	0.445	1.391	1.254
+perfcached-proxy-json	50	64	1675873	1699023	1.621	1.678	5.178	4.471
+perfcached-proxy-bin	1	1	14091	15353	0.066	0.061	0.127	0.114
+perfcached-proxy-bin	4	1	59647	61636	0.064	0.062	0.110	0.108
+perfcached-proxy-bin	16	1	216408	221158	0.063	0.062	0.169	0.162
+perfcached-proxy-bin	50	1	290847	312109	0.104	0.095	0.925	0.892
+perfcached-proxy-bin	200	1	428697	422412	0.284	0.266	3.515	3.692
+perfcached-proxy-bin	500	1	437987	443737	0.722	0.703	5.331	5.346
+perfcached-proxy-bin	1000	1	456863	492042	1.505	1.427	6.634	6.531
+perfcached-proxy-bin	50	8	1519426	1661500	0.199	0.165	0.681	1.015
+perfcached-proxy-bin	50	16	1844334	2697270	0.345	0.239	1.080	0.753
+perfcached-proxy-bin	50	64	2202536	3608785	1.176	0.720	4.062	2.384
+perfcached-proxy-cold	1	1		6213		0.151		0.247
+perfcached-proxy-cold	4	1		24988		0.143		0.247
+perfcached-proxy-cold	16	1		70555		0.207		0.407
+perfcached-proxy-cold	50	1		88830		0.471		1.095
+perfcached-proxy-cold	200	1		94007		1.999		3.295
+perfcached-proxy-cold	500	1		79888		3.119		6.071
+perfcached-proxy-cold	1000	1		79856		3.263		32.655
+perfcached-proxy-cold	50	8		98313		2.831		5.463
+perfcached-proxy-cold	50	16		112518		2.047		4.087
+perfcached-proxy-cold	50	64		83651		1.479		8.711
+perfcached-proxy-cold-json	1	1		5394		0.172		0.280
+perfcached-proxy-cold-json	4	1		21758		0.163		0.288
+perfcached-proxy-cold-json	16	1		61721		0.217		0.431
+perfcached-proxy-cold-json	50	1		77914		0.520		1.222
+perfcached-proxy-cold-json	200	1		91967		1.831		3.949
+perfcached-proxy-cold-json	500	1		97072		3.169		6.413
+perfcached-proxy-cold-json	1000	1		85651		3.411		8.891
+perfcached-proxy-cold-json	50	8		94557		2.976		5.301
+perfcached-proxy-cold-json	50	16		103253		2.860		6.062
+perfcached-proxy-cold-json	50	64		80152		3.468		65.535
+perfcached-proxy-cold-bin	1	1		5884		0.154		0.276
+perfcached-proxy-cold-bin	4	1		24521		0.147		0.256
+perfcached-proxy-cold-bin	16	1		69976		0.196		0.378
+perfcached-proxy-cold-bin	50	1		80977		0.506		1.176
+perfcached-proxy-cold-bin	200	1		97715		1.665		3.625
+perfcached-proxy-cold-bin	500	1		102045		2.908		5.670
+perfcached-proxy-cold-bin	1000	1		94006		3.202		8.411
+perfcached-proxy-cold-bin	50	8		104384		2.873		5.195
+perfcached-proxy-cold-bin	50	16		95920		2.995		6.339
+perfcached-proxy-cold-bin	50	64		74988		3.592		65.535
+perfcached-shard	1	1	7069	6993	0.143	0.143	0.263	0.271
+perfcached-shard	4	1	30750	28555	0.127	0.135	0.239	0.239
+perfcached-shard	16	1	99967	92251	0.135	0.159	0.327	0.375
+perfcached-shard	50	1	145296	133244	0.255	0.263	1.095	1.127
+perfcached-shard	200	1	177384	177226	0.711	0.719	4.119	3.967
+perfcached-shard	50	8	220553	216832	0.199	0.207	1.447	1.703
+perfcached-shard-json	1	1	14195	13448	0.065	0.069	0.128	0.123
+perfcached-shard-json	4	1	54776	54073	0.069	0.070	0.125	0.124
+perfcached-shard-json	16	1	169359	159810	0.079	0.081	0.223	0.258
+perfcached-shard-json	50	1	297787	288784	0.108	0.112	0.474	0.498
+perfcached-shard-json	200	1	356142	358955	0.280	0.271	2.257	2.667
+perfcached-shard-json	500	1	356236	344515	0.646	0.659	4.611	4.757
+perfcached-shard-json	1000	1	305875	300243	1.522	1.566	6.490	6.686
+perfcached-shard-json	50	8	1262559	1117385	0.199	0.220	0.940	1.033
+perfcached-shard-json	50	16	1583136	1437136	0.308	0.352	1.627	1.606
+perfcached-shard-json	50	64	1989242	1796306	1.022	1.204	3.936	4.626
+perfcached-shard-bin	1	1	15497	15815	0.058	0.057	0.111	0.108
+perfcached-shard-bin	4	1	61021	61447	0.061	0.062	0.110	0.107
+perfcached-shard-bin	16	1	199103	196208	0.068	0.067	0.180	0.195
+perfcached-shard-bin	50	1	323468	344546	0.101	0.095	0.500	0.372
+perfcached-shard-bin	200	1	378151	350126	0.275	0.288	1.878	2.057
+perfcached-shard-bin	500	1	332609	329104	0.691	0.709	4.012	3.717
+perfcached-shard-bin	1000	1	307115	308655	1.504	1.491	6.003	6.119
+perfcached-shard-bin	50	8	1544689	1611326	0.162	0.162	0.720	0.574
+perfcached-shard-bin	50	16	2251622	2452328	0.222	0.203	0.970	0.861
+perfcached-shard-bin	50	64	3092823	3779739	0.660	0.553	2.350	1.968
+perfcached-shard-cold	1	1		5142		0.175		0.359
+perfcached-shard-cold	4	1		21039		0.159		0.335
+perfcached-shard-cold	16	1		66622		0.207		0.511
+perfcached-shard-cold	50	1		76132		0.551		1.647
+perfcached-shard-cold	200	1		84104		1.991		6.375
+perfcached-shard-cold	500	1		66611		2.519		8.663
+perfcached-shard-cold	1000	1		53269		2.767		29.599
+perfcached-shard-cold	50	8		88200		0.631		2.527
+perfcached-shard-cold	50	16		86389		0.431		2.799
+perfcached-shard-cold	50	64		33145		0.855		2034.687
+perfcached-shard-cold-json	1	1		4756		0.189		0.379
+perfcached-shard-cold-json	4	1		18867		0.180		0.377
+perfcached-shard-cold-json	16	1		54916		0.232		0.547
+perfcached-shard-cold-json	50	1		68002		0.563		1.651
+perfcached-shard-cold-json	200	1		77844		2.051		5.883
+perfcached-shard-cold-json	500	1		77806		2.534		9.079
+perfcached-shard-cold-json	1000	1		58229		3.033		12.801
+perfcached-shard-cold-json	50	8		74554		2.634		9.806
+perfcached-shard-cold-json	50	16		66119		2.650		9.053
+perfcached-shard-cold-json	50	64		53864		3.250		65.535
+perfcached-shard-cold-bin	1	1		4868		0.182		0.380
+perfcached-shard-cold-bin	4	1		20271		0.168		0.359
+perfcached-shard-cold-bin	16	1		59964		0.210		0.511
+perfcached-shard-cold-bin	50	1		69194		0.557		1.668
+perfcached-shard-cold-bin	200	1		74321		2.109		6.171
+perfcached-shard-cold-bin	500	1		73158		2.607		9.190
+perfcached-shard-cold-bin	1000	1		61575		3.007		10.256
+perfcached-shard-cold-bin	50	8		72165		2.601		9.009
+perfcached-shard-cold-bin	50	16		64165		2.757		7.847
+perfcached-shard-cold-bin	50	64		47237		3.666		65.535
