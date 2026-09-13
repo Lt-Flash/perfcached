@@ -1,0 +1,37 @@
+THIRD-PARTY NOTICES for libperfd
+
+libperfd itself is MIT-licensed (see LICENSE beside this file).  The
+export uses one third-party library, and a copy or a statically linked
+binary that embodies it must carry this notice with it:
+
+libsodium - https://libsodium.org - used by pc_noise.c for the Noise
+handshake and the channel ciphers.  libsodium is distributed under the
+ISC License.  It is NOT MIT and NOT GPL.
+
+    ISC License
+
+    Copyright (c) 2013-2017 Frank Denis <j at pureftpd dot org>
+
+    Permission to use, copy, modify, and/or distribute this software for
+    any purpose with or without fee is hereby granted, provided that the
+    above copyright notice and this permission notice appear in all
+    copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+    WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+    AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+    DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+    PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+    TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+    PERFORMANCE OF THIS SOFTWARE.
+
+The copyright years above are those of the libsodium the daemon is
+built against (1.0.18); the authoritative text for any other version is
+the LICENSE file of that libsodium, or on Debian
+/usr/share/doc/libsodium23/copyright.
+
+Effective licence of a redistributed libperfd: MIT, plus this notice.
+When libperfd is linked dynamically against the system's libsodium the
+notice is a courtesy; when it is copied or linked statically it is an
+obligation.
