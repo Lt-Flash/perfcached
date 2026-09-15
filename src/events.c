@@ -1,0 +1,213 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (c) 2026 Yury Kirsanov - see COPYING */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <ctype.h>
+#include "compat/compat.h"
+#include "compat/dprint.h"
+#include "config.h"
+#include "store.h"
+#include "fnv1a.h"
+#include "events.h"
+
+unsigned int pc_ev_any;
+
+static unsigned int def_mask;
+static int def_rate = 100, def_hash;
+
+#define EV_KINDS 4
+static struct evslot {
+	unsigned int mask;
+	int tokens[EV_KINDS];          /* refilled to def_rate each tick */
+	unsigned int suppressed[EV_KINDS];
+} ev[PC_MAX_COLLECTIONS];
+
+static const char *const kind_name[EV_KINDS] = { "miss", "expired", "store", "remove" };
+
+static __thread const char *ev_door = "-";
+static __thread const char *ev_peer = "-";
+
+static void recompute_any(void)
+{
+	unsigned int any = 0;
+	int i;
+
+	for (i = 0; i < PC_MAX_COLLECTIONS; i++)
+		any |= ev[i].mask;
+	__atomic_store_n(&pc_ev_any, any, __ATOMIC_RELEASE);
+}
+
+int pc_ev_parse(const char *list, unsigned int *mask)
+{
+	char *dup, *tok, *save;
+	unsigned int m = 0;
+
+	*mask = 0;
+	if (!list || !*list)
+		return 0;
+	dup = strdup(list);
+	if (!dup)
+		return -1;
+	for (tok = strtok_r(dup, ", \t", &save); tok;
+	     tok = strtok_r(NULL, ", \t", &save)) {
+		if (!strcasecmp(tok, "miss"))         m |= PC_EV_MISS;
+		else if (!strcasecmp(tok, "expired")) m |= PC_EV_EXPIRED;
+		else if (!strcasecmp(tok, "store"))   m |= PC_EV_STORE;
+		else if (!strcasecmp(tok, "remove"))  m |= PC_EV_REMOVE;
+		else if (!strcasecmp(tok, "all"))     m |= PC_EV_ALL;
+		else if (!strcasecmp(tok, "none"))    m = 0;
+		else { free(dup); return -1; }
+	}
+	free(dup);
+	*mask = m;
+	return 0;
+}
+
+void pc_ev_set_default(unsigned int mask, int rate_per_s, int hash_keys)
+{
+	def_mask = mask;
+	def_rate = rate_per_s > 0 ? rate_per_s : 100;
+	def_hash = hash_keys;
+}
+
+void pc_ev_configure(int slot, unsigned int mask)
+{
+	int k;
+
+	if (slot < 0 || slot >= PC_MAX_COLLECTIONS)
+		return;
+	ev[slot].mask = mask == PC_EV_INHERIT ? def_mask : mask;
+	for (k = 0; k < EV_KINDS; k++) {
+		__atomic_store_n(&ev[slot].tokens[k], def_rate, __ATOMIC_RELAXED);
+		__atomic_store_n(&ev[slot].suppressed[k], 0u, __ATOMIC_RELAXED);
+	}
+	recompute_any();
+}
+
+void pc_ev_set_origin(const char *door, const char *peer)
+{
+	ev_door = door ? door : "-";
+	ev_peer = peer ? peer : "-";
+}
+
+/* the key as it goes on the line: bounded, printable, or a hash */
+static const char *fmt_key(const str *key, char *buf, size_t cap)
+{
+	size_t n, i;
+
+	if (def_hash) {
+		snprintf(buf, cap, "#%016llx",
+			(unsigned long long)fnv1a64(key->s, (size_t)key->len));
+		return buf;
+	}
+	n = (size_t)key->len;
+	if (n > 64)
+		n = 64;
+	if (n > cap - 4)
+		n = cap - 4;
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)key->s[i];
+		buf[i] = (c >= 0x20 && c < 0x7f && c != ' ') ? (char)c : '?';
+	}
+	if ((size_t)key->len > n) { buf[n++] = '.'; buf[n++] = '.'; buf[n++] = '.'; }
+	buf[n] = 0;
+	return buf;
+}
+
+/* one token, or one more suppressed.  Tokens go negative between ticks;
+ * the tick resets them, so nothing here needs a lock. */
+static int allow(int slot, int kind)
+{
+	if (__atomic_sub_fetch(&ev[slot].tokens[kind], 1, __ATOMIC_RELAXED) >= 0)
+		return 1;
+	__atomic_add_fetch(&ev[slot].suppressed[kind], 1u, __ATOMIC_RELAXED);
+	return 0;
+}
+
+static int slot_for(pcache_htable_t *ht, unsigned int want)
+{
+	int s = pc_store_slot_of(ht);
+
+	if (s < 0 || !(ev[s].mask & want))
+		return -1;
+	return s;
+}
+
+void pc_ev_miss(pcache_htable_t *ht, const str *key, int expired)
+{
+	char kb[80];
+	int s;
+
+	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
+		return;
+	if ((s = slot_for(ht, PC_EV_MISS)) < 0 || !allow(s, 0))
+		return;
+	LM_NOTICE("event=miss cause=%s col=%s key=%s door=%s peer=%s\n",
+		expired ? "expired" : "absent", pc_store_name(s),
+		fmt_key(key, kb, sizeof kb), ev_door, ev_peer);
+}
+
+void pc_ev_store(pcache_htable_t *ht, const str *key, unsigned int bytes,
+		unsigned int ttl)
+{
+	char kb[80];
+	int s;
+
+	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
+		return;
+	if ((s = slot_for(ht, PC_EV_STORE)) < 0 || !allow(s, 2))
+		return;
+	LM_NOTICE("event=store col=%s key=%s bytes=%u ttl=%u door=%s peer=%s\n",
+		pc_store_name(s), fmt_key(key, kb, sizeof kb), bytes, ttl,
+		ev_door, ev_peer);
+}
+
+void pc_ev_remove(pcache_htable_t *ht, const str *key)
+{
+	char kb[80];
+	int s;
+
+	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
+		return;
+	if ((s = slot_for(ht, PC_EV_REMOVE)) < 0 || !allow(s, 3))
+		return;
+	LM_NOTICE("event=remove col=%s key=%s door=%s peer=%s\n",
+		pc_store_name(s), fmt_key(key, kb, sizeof kb), ev_door, ev_peer);
+}
+
+void pc_ev_expired(int slot, const str *key)
+{
+	char kb[80];
+
+	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
+		return;
+	if (slot < 0 || slot >= PC_MAX_COLLECTIONS ||
+	        !(ev[slot].mask & PC_EV_EXPIRED) || !allow(slot, 1))
+		return;
+	LM_NOTICE("event=expired col=%s key=%s door=sweep peer=-\n",
+		pc_store_name(slot), fmt_key(key, kb, sizeof kb));
+}
+
+void pc_ev_tick(void)
+{
+	int s, k;
+
+	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
+		return;
+	for (s = 0; s < PC_MAX_COLLECTIONS; s++) {
+		if (!ev[s].mask)
+			continue;
+		for (k = 0; k < EV_KINDS; k++) {
+			unsigned int sup = __atomic_exchange_n(&ev[s].suppressed[k],
+				0u, __ATOMIC_RELAXED);
+
+			if (sup)
+				LM_NOTICE("event=%s col=%s suppressed=%u - over "
+					"log_events_rate (%d/s) in the last tick\n",
+					kind_name[k], pc_store_name(s), sup, def_rate);
+			__atomic_store_n(&ev[s].tokens[k], def_rate, __ATOMIC_RELAXED);
+		}
+	}
+}
