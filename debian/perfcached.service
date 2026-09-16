@@ -1,0 +1,75 @@
+# perfcached.service — systemd unit (task S24).
+#
+# Install:
+#   cp contrib/perfcached.service /etc/systemd/system/
+#   mkdir -p /etc/perfcached
+#   cp contrib/perfcached.conf.example /etc/perfcached/perfcached.conf
+#   chmod 640 /etc/perfcached/perfcached.conf
+#   (edit the secrets: client and cluster MUST differ - the daemon
+#    refuses equal secrets at startup, and warns on world-readable
+#    configs)
+#   systemctl daemon-reload && systemctl enable --now perfcached
+#
+# Hugepages: the arena takes MAP_HUGETLB pages when the pool has them
+# and degrades THP->4K otherwise, so the unit works with no pool at all.
+# To provision one, see contrib/sysctl-perfcached.conf - and READ BACK
+# HugePages_Total from /proc/meminfo after setting it; a live system
+# routinely under-delivers until caches are dropped and memory
+# compacted.
+
+[Unit]
+Description=perfcached clustered cache daemon
+Documentation=https://github.com/Lt-Flash/perfcached
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/perfcached -f /etc/perfcached/perfcached.conf
+Restart=on-failure
+RestartSec=1
+
+# a dedicated user; mlock pinning needs only the rlimit, no capability
+User=perfcached
+Group=perfcached
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+# CAP_NET_ADMIN buys exactly one thing: SO_RCVBUFFORCE on the cluster
+# socket, so the peer plane's receive buffer is the 8MB the daemon asks
+# for instead of whatever net.core.rmem_max allows.  It matters because
+# a dropped forward datagram is a REFUSED CLIENT WRITE (forwards have
+# no retry) - measured at the 208KB default, a pipelined burst of 120
+# 40KB writes lost 4-6 of them per run.
+#
+# Drop these two lines if your policy forbids the capability, and set
+# net.core.rmem_max = 8388608 instead (contrib/sysctl-perfcached.conf).
+# Either way the daemon WARNS at startup when the buffer is short and
+# reports the effective size as cluster.rcvbuf in `stats`.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# /var/lib/perfcached, created and owned for us - point [wal] dir there
+StateDirectory=perfcached
+StateDirectoryMode=0700
+
+# hardening - everything here is compatible with the daemon's needs
+# (own-backing arenas are private anonymous mappings, WAL/RDB live in
+# the state directory, logs go to stdout/journal)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/perfcached
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# never OOM-kill the cache first: it IS the memory consumer by design.
+# (Not MemoryDenyWriteExecute - harmless here, but off in case a future
+# arch-specific allocator wants it; nothing maps W+X today.)
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
