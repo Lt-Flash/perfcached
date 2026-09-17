@@ -1,0 +1,72 @@
+;
+; perfd.conf - func_perfd: PERFD_GET, PERFD_SET, PERFD_EXISTS, PERFD_DELETE
+;
+; One target.  The protocol, the servers, the credentials and the timeouts
+; are chosen here, never per call.  Apply a change with:
+;     module reload func_perfd
+; A refused file is logged with the setting and line, and a reload keeps
+; the running configuration.
+;
+; What the server side needs:
+;   binary - the secret below listed in [secrets] client on every perfcached
+;            node (the native door is encrypted off loopback)
+;   resp   - perfcached: [listen] resp = <ip:port>, resp_allow covering the
+;            Asterisk hosts, [secrets] resp = <password>
+;            Redis: a standalone server, or a master behind a VIP whose
+;            health check picks the master.  Redis Cluster, Sentinel
+;            discovery and TLS are not supported.
+;
+
+[general]
+; binary: perfcached's native door through libperfd - encrypted, and
+;         fleet-aware: it learns the members, fails over, and can route
+;         each key to its owner
+; resp:   RESP2, to perfcached's RESP door or a standalone Redis
+protocol = binary
+
+; Repeatable, tried in order: host:port, [v6]:port or unix:/path.
+; binary: a seed; the fleet is learned from whichever one answers.
+; resp:   after a failure, the next dial starts at the server AFTER the one
+;         that failed (with a single server line, the same address again).
+server = 192.0.2.10:6479
+;server = 192.0.2.11:6479
+
+; binary: a client secret.  Repeatable, tried in order, so rotating it is
+; "add the new one, then drop the old".  Required unless every server is
+; loopback or a unix socket.
+secret = change-me
+
+; resp: AUTH.  The password crosses the network in the clear.  username is
+; for Redis 6+ ACL users (AUTH <user> <password>); leave it out for older
+; Redis.  perfcached accepts both forms.
+;password = change-me
+;username = asterisk
+
+; Used when a function's collection argument is empty.  Against Redis this
+; is a database NUMBER: a name is refused with "invalid DB index".
+;collection = calls
+
+; Connections held open (1..64).  A call borrows one for its round trip.
+pool = 4
+; Per dial attempt.
+connect_timeout_ms = 1000
+; Per send and per receive.  A stalled server holds a call this long, and
+; libperfd's own default would be 5000.
+io_timeout_ms = 300
+; How long a call waits for a free connection before it is an ERROR.
+wait_timeout_ms = 300
+; Seconds; 0 = no expiry.  PERFD_SET's third argument overrides it.
+default_ttl = 0
+; Bytes.  A longer value is an ERROR, never truncated.  Inside ordinary
+; dialplan substitution Asterisk's own buffer ends at 4095 bytes anyway.
+max_value = 65536
+
+; binary only - libperfd's cluster awareness
+; failover | round_robin | least_conn | weighted
+;policy = failover
+; 0 = a standby connection to every other member; none = no fleet learned
+;spares = 0
+; yes = send each request to the node that owns its key
+;route_keys = no
+; TCP keepalive idle seconds; -1 = off
+;keepalive_s = 30
