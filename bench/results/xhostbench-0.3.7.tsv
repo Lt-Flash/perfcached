@@ -1,0 +1,6 @@
+# build=e58ee8e date=2026-09-15T17:17:49Z hosts=2 containers=podman/podman redis=8.10.1 redis-benchmark=8.10.1 mtu=9000 keys=20000 reqs=100000xP nmax=2000000 val=200 reps=3
+arm	clients	pipeline	set_per_s	get_per_s	set_p50ms	get_p50ms	set_p99ms	get_p99ms	set_reps
+redis	50	1	53879	50710	0.599	0.639	1.295	1.119	55432/43956/53879
+perfcached	50	1	47103	46361	0.575	0.623	0.967	0.903	44014/47103/49480
+redis	50	64	736106	948317	3.943	2.839	5.327	4.391	736106/693963/772499
+perfcached	50	64	1622060	1381216	1.311	1.335	2.671	2.015	1622060/1665279/1225490
