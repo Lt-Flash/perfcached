@@ -1,0 +1,15 @@
+# date=2026-09-17T19:23:08+10:00 host=ubuntu24.04-16vcpu cpus=16 srv_cpus=0-7 cli_cpus=8-15 reps=1 secs=8 val=64
+# perfcached=perfcached 0.4.0-rc3 (08b8d57) redis=v=8.10.1
+arm	cell	rep	pub_s	deliv_s	p50_us	p99_us	p999_us	max_us	lost	gaps	ooo	eof	errs	srv_cores	srv_ctxsw_s	drv_cores	busiest_thr
+# arm=pc-w4 comm=perfcached threads=7 Cpus_allowed_list:0-7
+pc-w4	s1-paced100k	1	92734	88703	184320	368640	376832	385024	0	0	0	0	0	1.98	14402	1.39	0.76
+pc-w4	s1-max	1	812217	96589	737280	819200	819200	819200	6364222	6363742	0	0	0	2.79	9209	1.81	0.76
+pc-w4	s64-paced20k	1	7327	387173	294912	3801088	4128768	4194304	0	0	0	0	0	3.90	317	4.10	0.85
+pc-w4	s64-max	1	7683	438802	409600	1867776	1998848	2228224	0	0	0	0	0	4.00	29	4.28	0.86
+# arm=pc-w4 after: published=8282721 delivered=10447376 queue_dropped=6364222 slow_kills=0
+# arm=pc-w1 comm=perfcached threads=4 Cpus_allowed_list:0-7
+pc-w1	s1-paced100k	1	89544	89551	4352	11008	14592	17920	0	0	0	0	0	1.00	13	0.84	0.73
+pc-w1	s1-max	1	85633	85634	1216	2880	3776	4352	0	0	0	0	0	1.00	14	0.88	0.71
+pc-w1	s64-paced20k	1	1352	86499	311296	753664	770048	786432	0	0	0	0	0	1.00	14	1.69	0.35
+pc-w1	s64-max	1	1356	86690	71680	217088	278528	286720	0	0	0	0	0	1.00	14	1.63	0.32
+# arm=pc-w1 after: published=1592583 delivered=3154983 queue_dropped=0 slow_kills=0
