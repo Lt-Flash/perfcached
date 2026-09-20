@@ -1,0 +1,1735 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (c) 2026 Yury Kirsanov - see COPYING */
+/*
+ * daemon.c — S6: the threading frame.
+ *
+ * Threads (identity = pc_worker_id(), over struct pc_thread):
+ *   0        main: init, signal handling, join, teardown
+ *   1..N     workers: one epoll each, own SO_REUSEPORT TCP listeners
+ *            (kernel balances accepts), the shared UNIX listener via
+ *            EPOLLEXCLUSIVE; S6 behavior on accept is a polite immediate
+ *            close - the protocol layer (S7) replaces the handler
+ *   N+1      maintenance: 1/s arena reclaim tick + per-collection sweep
+ *            and linear-hash growth (the single-splitter home)
+ *   N+2      WAL stub: parked until M3 fills it in
+ *
+ * Every thread owns an eventfd used for two things: waking it out of its
+ * wait, and delivering broadcast RPCs.  compat_set_broadcast() wires the
+ * shim's ipc_send_rpc_all (the arena hoard flush) to run the callback on
+ * EVERY live thread - inline on the caller, queued + eventfd-kicked on
+ * the rest.  Shutdown: SIGTERM/SIGINT set the stop flag and kick every
+ * eventfd (both async-signal-safe), main joins everything, tears down.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <poll.h>
+#include <pthread.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#include <netdb.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
+#include "compat/compat.h"
+#include "quiesce.h"
+#include "compat/dprint.h"
+#include "compat/timer.h"
+#include "compat/ipc.h"
+#include "core/pcache_mem.h"
+#include "core/pcache_arena.h"
+#include "core/pcache_htable.h"
+#include "proto.h"
+#include "pubsub.h"
+#include "store.h"
+#include "events.h"
+#include "storage.h"
+#include "walprobe.h"
+#include "wal.h"
+#include "rdb.h"
+#include "recover.h"
+#include "verbs.h"
+#include "cluster.h"
+#include "obs.h"
+#include "metrics.h"
+#include "daemon.h"
+
+/* the WAL directory's resolved storage identity, retained for the
+ * stats verb (class + chain belong next to the wal counters, not only
+ * in a startup log line) */
+static struct pc_st_id wal_sid;
+static int wal_id_valid;
+static struct pc_wal_probe wal_probe;
+
+const struct pc_st_id *pc_wal_identity(void)
+{
+	return wal_id_valid ? &wal_sid : NULL;
+}
+
+const struct pc_wal_probe *pc_wal_probe_result(void)
+{
+	return wal_probe.valid ? &wal_probe : NULL;
+}
+
+
+
+extern char *pcache_backing_policy;
+extern int pcache_arena_hugepage_mb;
+extern unsigned long pcache_arena_max_bytes;
+extern int pcache_arena_hugepage_cap_mb;
+extern int pcache_reclaim_keep, pcache_reclaim_quiet_s,
+	pcache_reclaim_cooloff_s, pcache_reclaim_giveback;
+
+#ifndef EPOLLEXCLUSIVE
+#define EPOLLEXCLUSIVE (1u << 28)
+#endif
+
+#define PC_RPCQ 8
+
+struct pc_thread {
+	pthread_t tid;
+	int efd;
+	int idx;                            /* this worker's index; also
+	                                     * handed to the vendored core
+	                                     * as process_no, see
+	                                     * compat_thread_register() */
+	/* tiny locked RPC queue - broadcast is rare control-plane traffic */
+	pthread_mutex_t mx;
+	ipc_rpc_f fn[PC_RPCQ];
+	void *arg[PC_RPCQ];
+	int head, tail;
+	int live;
+	struct pc_conn **conns;             /* S107: this worker's client
+	                                     * list - read on this worker */
+};
+
+struct pc_collection_rt {
+	const struct pc_collection *conf;
+	pcache_htable_t *ht;
+};
+
+static struct pc_thread threads[512 + 3];
+static int n_threads;
+static __thread struct pc_thread *self_slot;
+
+static struct pc_collection_rt cols[PC_MAX_COLLECTIONS];
+static int n_cols;
+
+static const struct pc_config *CFG;
+
+/* ---- RESP listener guards (task S33) ------------------------------------
+ * A RESP listener has no handshake - stock Redis clients cannot speak
+ * Noise - so its access control is entirely config: an allow-list
+ * checked at accept, and an optional Redis AUTH password checked before
+ * any data command.  Both live here because CFG does. */
+
+int pc_resp_password_set(void)
+{
+	return CFG && CFG->resp_password != NULL;
+}
+
+/* constant-time: the password crosses the wire in the clear, which is
+ * no reason to leak its prefix through timing as well */
+int pc_resp_password_ok(const char *p, size_t n)
+{
+	const char *want = CFG ? CFG->resp_password : NULL;
+	size_t wn, i;
+	unsigned char diff = 0;
+
+	if (!want)
+		return 0;
+	wn = strlen(want);
+	if (n != wn)
+		return 0;
+	for (i = 0; i < n; i++)
+		diff |= (unsigned char)(p[i] ^ want[i]);
+	return diff == 0;
+}
+
+/* S129: does @p match ANY configured enable secret?  Constant time per
+ * candidate, for the same reason the RESP password is: a privilege
+ * secret must not leak its prefix through timing.  Every candidate is
+ * compared even after a match, so the answer costs the same whichever
+ * entry of a rotation list matched - or none did.
+ *
+ * FAIL-CLOSED: no secret configured returns 0, so `enable` cannot
+ * succeed and the privileged verbs stay unreachable from the client
+ * door however `allow_create` is set. */
+int pc_enable_secret_ok(const char *p, size_t n)
+{
+	int i, ok = 0;
+
+	if (!CFG || !p)
+		return 0;
+	for (i = 0; i < CFG->n_enable_secrets; i++) {
+		const char *want = CFG->enable_secret[i];
+		size_t wn, j;
+		unsigned char diff = 0;
+
+		if (!want)
+			continue;
+		wn = strlen(want);
+		if (n != wn) {
+			diff = 1;
+		} else {
+			for (j = 0; j < n; j++)
+				diff |= (unsigned char)(p[j] ^ want[j]);
+		}
+		ok |= (diff == 0);
+	}
+	return ok;
+}
+
+int pc_enable_configured(void)
+{
+	return CFG && CFG->n_enable_secrets > 0;
+}
+
+int pc_resp_peer_allowed(const struct sockaddr_in *sa, unsigned int len)
+{
+	int i;
+
+	if (!CFG || !CFG->n_resp_allow)
+		return 1;              /* a LAN listener without a list was
+		                        * already refused at config validate */
+	if (len < sizeof *sa || sa->sin_family != AF_INET)
+		return 0;              /* v6 or unknown: not on the list */
+	for (i = 0; i < CFG->n_resp_allow; i++)
+		if ((sa->sin_addr.s_addr & CFG->resp_allow[i].mask) ==
+		        CFG->resp_allow[i].net)
+			return 1;
+	/* A turned-away client is invisible to it (we close before a byte
+	 * is read), so it has to be visible HERE or an operator debugging
+	 * "my Redis client just hangs up" has nothing to go on.  Rate-
+	 * limited: a port scan must not become a log flood. */
+	{
+		static __thread unsigned int shouted;
+
+		if (shouted < 10) {
+			shouted++;
+			LM_WARN("RESP connection from %s refused: not in "
+				"resp_allow%s\n", inet_ntoa(sa->sin_addr),
+				shouted == 10 ? " (further ones silent)" : "");
+		}
+	}
+	return 0;
+}
+
+/* S46: the same check for the metrics listener.  Separate list, same
+ * reasoning - and separate so an operator can let a scraper in without
+ * widening the RESP door, which reads and WRITES data. */
+int pc_http_peer_allowed(const struct sockaddr_in *sa, unsigned int len)
+{
+	int i;
+
+	if (!CFG || !CFG->n_http_allow)
+		return 1;              /* off-box without a list was refused
+		                        * at config validate */
+	if (len < sizeof *sa || sa->sin_family != AF_INET)
+		return 0;
+	for (i = 0; i < CFG->n_http_allow; i++)
+		if ((sa->sin_addr.s_addr & CFG->http_allow[i].mask) ==
+		        CFG->http_allow[i].net)
+			return 1;
+	{
+		static __thread unsigned int shouted;
+
+		if (shouted < 10) {
+			shouted++;
+			LM_WARN("http connection from %s refused: not in "
+				"http_allow%s\n", inet_ntoa(sa->sin_addr),
+				shouted == 10 ? " (further ones silent)" : "");
+		}
+	}
+	return 0;
+}
+
+/* S37: the HTTP door's token.  Compared in constant time by the
+ * caller for the same reason the RESP password is - it crosses the
+ * wire in the clear, which is no reason to leak its prefix through
+ * timing as well. */
+const char *pc_http_token(void)
+{
+	return CFG ? CFG->http_token : NULL;
+}
+
+/* ---- S89: the listeners, as facts stats can carry ---------------------- */
+static int listener_plaintext_ok(const struct pc_listener *l);
+
+int pc_listener_count(void)
+{
+	return CFG ? CFG->n_listen : 0;
+}
+
+const struct pc_listener *pc_listener_at(int i)
+{
+	return CFG && i >= 0 && i < CFG->n_listen ? &CFG->listen[i] : NULL;
+}
+
+int pc_listener_plaintext(const struct pc_listener *l)
+{
+	return l ? listener_plaintext_ok(l) : 0;
+}
+
+int pc_listener_allow(const struct pc_listener *l)
+{
+	if (!CFG || !l)
+		return 0;
+	return l->http ? CFG->n_http_allow : l->resp ? CFG->n_resp_allow : 0;
+}
+
+/* the first RESP door, for the wrong-port notice on the native one */
+const char *pc_resp_door(void)
+{
+	static char buf[128];
+	int i;
+
+	for (i = 0; CFG && i < CFG->n_listen; i++)
+		if (CFG->listen[i].resp && CFG->listen[i].type == PC_LISTEN_TCP) {
+			snprintf(buf, sizeof buf, "%s:%d", CFG->listen[i].addr,
+				CFG->listen[i].port);
+			return buf;
+		}
+	return NULL;
+}
+
+/* the optional collection allow-list for RESP clients: NULL = all */
+const char *pc_resp_collections(void)
+{
+	return CFG ? CFG->resp_collections : NULL;
+}
+static volatile sig_atomic_t stop_flag;
+static int unix_fd = -1;
+static struct pc_psk_ctx PSK;
+static int have_psk;
+
+/* the `probe` verb: re-measure on demand.  BLOCKS THE CALLER for the
+ * probe's duration (like sync), and the measurement I/O shares the WAL
+ * device with the live pump - expect perturbed fsync latency while it
+ * runs; that is inherent to re-measuring.  Updates the retained result
+ * (stats flips to cached:false) and the on-disk cache.  Concurrent
+ * stats readers may see a torn number mid-update - counters only,
+ * accepted like every other stats read. */
+int pc_wal_reprobe(int secs, struct pc_wal_policy *pol)
+{
+	if (!CFG || !CFG->wal_dir)
+		return -1;
+	if (pc_wal_probe_run(CFG->wal_dir, secs, &wal_probe) != 0)
+		return -1;
+	pc_wal_policy_from(&wal_probe, wal_id_valid ? &wal_sid : NULL, pol);
+	return 0;
+}
+
+/* ---- registry + broadcast --------------------------------------------- */
+
+static struct pc_thread *slot_init(int idx)
+{
+	struct pc_thread *t = &threads[n_threads++];
+
+	t->idx = idx;
+	t->efd = eventfd(0, EFD_NONBLOCK);
+	pthread_mutex_init(&t->mx, NULL);
+	return t;
+}
+
+/* S110: a thread carries its role in its name, so `top -H`, perf and a
+ * core say which of the daemon's threads is the busy one (measured: the
+ * eager write ceiling was suspected to be the single cluster thread, and
+ * nothing on the host could point at it by name).  15 bytes + NUL.
+ * prctl(PR_SET_NAME) names the calling thread on every Linux libc with
+ * no feature-test macro; pthread_setname_np is the GNU spelling of the
+ * same call and would need _GNU_SOURCE, which this tree keeps out of its
+ * files (see find_bytes in proto.c).  Elsewhere the threads go unnamed. */
+static void thread_name(const char *name)
+{
+#ifdef __linux__
+	char buf[16];
+
+	snprintf(buf, sizeof buf, "%s", name);
+	prctl(PR_SET_NAME, (unsigned long)buf, 0, 0, 0);
+#else
+	(void)name;
+#endif
+}
+
+static void slot_attach(struct pc_thread *t)
+{
+	self_slot = t;
+	t->tid = pthread_self();
+	compat_thread_register(t->idx);
+	pc_qs_attach();                     /* S150 B: a quiescence line */
+	__atomic_store_n(&t->live, 1, __ATOMIC_RELEASE);
+}
+
+/* the worker index, from the context this thread already carries */
+int pc_worker_id(void)
+{
+	return self_slot ? self_slot->idx : -1;
+}
+
+static void rpc_drain(struct pc_thread *t)
+{
+	ipc_rpc_f fn;
+	void *arg;
+
+	for (;;) {
+		pthread_mutex_lock(&t->mx);
+		if (t->head == t->tail) {
+			pthread_mutex_unlock(&t->mx);
+			return;
+		}
+		fn = t->fn[t->head % PC_RPCQ];
+		arg = t->arg[t->head % PC_RPCQ];
+		t->head++;
+		pthread_mutex_unlock(&t->mx);
+		fn(t->idx, arg);
+	}
+}
+
+static void pc_broadcast(void (*fn)(int sender, void *param), void *param)
+{
+	uint64_t one = 1;
+	int i;
+
+	for (i = 0; i < n_threads; i++) {
+		struct pc_thread *t = &threads[i];
+
+		if (!__atomic_load_n(&t->live, __ATOMIC_ACQUIRE))
+			continue;
+		if (t == self_slot) {
+			fn(t->idx, param);
+			continue;
+		}
+		pthread_mutex_lock(&t->mx);
+		if (t->tail - t->head < PC_RPCQ) {
+			t->fn[t->tail % PC_RPCQ] = fn;
+			t->arg[t->tail % PC_RPCQ] = param;
+			t->tail++;
+		}
+		pthread_mutex_unlock(&t->mx);
+		if (write(t->efd, &one, sizeof one) < 0) { /* wake is best-effort */ }
+	}
+}
+
+/* ---- S107: membership notifications to every client ------------------- */
+
+struct notify_msg {
+	int refs;                           /* one per queued worker */
+	size_t n;
+	char buf[];
+};
+
+static void notify_release(struct notify_msg *m)
+{
+	if (__atomic_sub_fetch(&m->refs, 1, __ATOMIC_ACQ_REL) == 0)
+		free(m);
+}
+
+/* the caller holds a reference for as long as this runs */
+static void notify_deliver(const struct notify_msg *m)
+{
+	/* The thread this runs on is the one whose queue it was put in,
+	 * and self_slot is that thread's slot.  NOT threads[idx]: a
+	 * worker's public idx is 1 + its slot (slot_init order), so that
+	 * lookup walked the NEXT worker's connection list from this
+	 * thread - and the last worker's landed on the maintenance
+	 * thread's empty slot.  Measured: a client sitting on worker 1 of
+	 * two never received a push; one on worker 2 received worker 1's
+	 * copy, written from the wrong thread. */
+	struct pc_thread *t = self_slot;
+
+	if (t && t->conns)
+		pc_conn_notify_all(*t->conns, m->buf, m->n);
+}
+
+/* a queued delivery owns the reference it was queued with */
+static void notify_rpc(int idx, void *arg)
+{
+	(void)idx;
+	notify_deliver(arg);
+	notify_release(arg);
+}
+
+void pc_clients_notify(const char *payload, size_t n)
+{
+	struct notify_msg *m = malloc(sizeof *m + n);
+	uint64_t one = 1;
+	int i;
+
+	if (!m)
+		return;
+	memcpy(m->buf, payload, n);
+	m->n = n;
+	m->refs = 1;                        /* the caller's, released below */
+	for (i = 0; i < n_threads; i++) {
+		struct pc_thread *t = &threads[i];
+
+		if (!__atomic_load_n(&t->live, __ATOMIC_ACQUIRE) || !t->conns)
+			continue;
+		if (t == self_slot) {
+			/* synchronous: the caller's reference covers it, so
+			 * no count moves and nothing can free it mid-loop */
+			notify_deliver(m);
+			continue;
+		}
+		pthread_mutex_lock(&t->mx);
+		if (t->tail - t->head < PC_RPCQ) {
+			__atomic_add_fetch(&m->refs, 1, __ATOMIC_ACQ_REL);
+			t->fn[t->tail % PC_RPCQ] = notify_rpc;
+			t->arg[t->tail % PC_RPCQ] = m;
+			t->tail++;
+		}
+		pthread_mutex_unlock(&t->mx);
+		if (write(t->efd, &one, sizeof one) < 0) { /* best effort */ }
+	}
+	notify_release(m);
+}
+
+/* ---- listeners --------------------------------------------------------- */
+
+/* Is something ALREADY listening on this address:port?
+ *
+ * Every TCP listener sets SO_REUSEPORT, because each worker binds its
+ * own socket and lets the kernel balance accepts across them.  The
+ * consequence is that a second perfcached on the same address:port does
+ * NOT get EADDRINUSE - it silently joins the load-balancing group and
+ * answers a share of the connections, with its own dataset and its own
+ * view of the cluster.  The symptom is intermittent wrong answers, or a
+ * fleet that reports one member when it has four, and it is invisible
+ * in the logs of either process.
+ *
+ * The only way to see an existing listener is to bind WITHOUT
+ * SO_REUSEPORT once, before the workers start.  This socket is closed
+ * immediately; the workers then bind normally.
+ *
+ * Only EADDRINUSE means "someone is already there".  EADDRNOTAVAIL
+ * means the address is not on this host - a VIP with
+ * net.ipv4.ip_nonlocal_bind=0 - which is a different fault with its own
+ * message, so everything but EADDRINUSE is left to the generic probe.
+ * (Checked both ways: ip_nonlocal_bind changes whether an absent
+ * address binds at all, and changes nothing about EADDRINUSE.)
+ */
+static int tcp_port_taken(const struct pc_listener *l)
+{
+	struct addrinfo hints, *res = NULL, *ai;
+	char port[16];
+	int taken = 0;
+
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+	snprintf(port, sizeof port, "%d", l->port);
+	if (getaddrinfo(strcmp(l->addr, "*") ? l->addr : NULL, port,
+	        &hints, &res) != 0 || !res)
+		return 0;                      /* the real bind will report it */
+	for (ai = res; ai; ai = ai->ai_next) {
+		int one = 1, fd = socket(ai->ai_family, ai->ai_socktype, 0);
+
+		if (fd < 0)
+			continue;
+		/* REUSEADDR yes (TIME_WAIT is not a conflict), REUSEPORT no -
+		 * omitting it is the entire point of this probe */
+		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+		if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0 &&
+		        errno == EADDRINUSE)
+			taken = 1;
+		close(fd);
+		if (taken)
+			break;
+	}
+	freeaddrinfo(res);
+	return taken;
+}
+
+static int tcp_listener_fd(const struct pc_listener *l)
+{
+	struct addrinfo hints, *res = NULL, *ai;
+	char port[16];
+	int fd = -1, one = 1;
+
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+	snprintf(port, sizeof port, "%d", l->port);
+
+	if (getaddrinfo(strcmp(l->addr, "*") ? l->addr : NULL, port,
+	        &hints, &res) != 0 || !res) {
+		LM_ERR("cannot resolve listener %s:%d\n", l->addr, l->port);
+		return -1;
+	}
+	for (ai = res; ai; ai = ai->ai_next) {
+		fd = socket(ai->ai_family, ai->ai_socktype, 0);
+		if (fd < 0)
+			continue;
+		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+		if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
+		        listen(fd, 511) == 0) {
+			fcntl(fd, F_SETFL, O_NONBLOCK);
+			break;
+		}
+		close(fd);
+		fd = -1;
+	}
+	freeaddrinfo(res);
+	if (fd < 0)
+		LM_ERR("cannot bind listener %s:%d (%s)\n", l->addr, l->port,
+			strerror(errno));
+	return fd;
+}
+
+static int unix_listener_fd(const char *path)
+{
+	struct sockaddr_un sa;
+	int fd, probe;
+
+	if (strlen(path) >= sizeof sa.sun_path) {
+		LM_ERR("unix socket path too long\n");
+		return -1;
+	}
+	memset(&sa, 0, sizeof sa);
+	sa.sun_family = AF_UNIX;
+	strcpy(sa.sun_path, path);
+
+	/* a stale socket file is normal after a crash; a LIVE one means
+	 * another instance - probe before unlinking */
+	probe = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (probe >= 0) {
+		if (connect(probe, (struct sockaddr *)&sa, sizeof sa) == 0) {
+			close(probe);
+			LM_ERR("%s is accepting connections - another perfcached "
+				"is running\n", path);
+			return -1;
+		}
+		close(probe);
+	}
+	unlink(path);
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0 ||
+	        listen(fd, 511) < 0) {
+		LM_ERR("cannot bind unix listener %s (%s)\n", path,
+			strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	fcntl(fd, F_SETFL, O_NONBLOCK);
+	return fd;
+}
+
+/* ---- worker ------------------------------------------------------------ */
+
+struct worker_arg {
+	struct pc_thread *slot;
+	int wid;
+};
+
+/* Plaintext eligibility per listener: only loopback/unix listeners under
+ * plaintext=loopback may speak the pre-Noise plaintext dialects.
+ *
+ * A RESP listener (S33) is the deliberate exception: it is plaintext BY
+ * CONSTRUCTION - a stock Redis client cannot speak the Noise channel, so
+ * requiring a handshake there would mean the listener could never serve
+ * anyone.  Its safety comes from being narrow instead: RESP2 only (no
+ * native dialects, no admin verbs), an allow-list the config REFUSES to
+ * start without off-box, an optional AUTH password, and an optional
+ * collection scope.  Without this, a LAN RESP listener silently fed
+ * every client's first command into the Noise responder and dropped the
+ * connection - which is exactly how it behaved before this line. */
+static int listener_plaintext_ok(const struct pc_listener *l)
+{
+	if (l->resp)
+		return 1;
+	/* S46: HTTP is plaintext by definition - a scraper cannot speak
+	 * Noise, exactly as a Redis client cannot.  Its safety is the
+	 * same narrowness: GET-only, two paths, an allow-list the config
+	 * refuses to start without off-box. */
+	if (l->http)
+		return 1;
+	if (CFG->plaintext != PC_PLAINTEXT_LOOPBACK)
+		return 0;
+	return l->loopback;
+}
+
+static void *worker_main(void *p)
+{
+	struct worker_arg *wa = p;
+	struct epoll_event ev, evs[32];
+	struct pc_conn *conns = NULL;
+	int ep, i, j, n, nlfd = 0;
+	int lfds[PC_MAX_LISTEN + 1], plok[PC_MAX_LISTEN + 1];
+	int lresp[PC_MAX_LISTEN + 1];
+	uint64_t junk;
+
+	slot_attach(wa->slot);
+	{
+		char wn[16];
+
+		snprintf(wn, sizeof wn, "pc-w%d", wa->wid);
+		thread_name(wn);
+	}
+	wa->slot->conns = &conns;           /* S107: read on this thread only */
+	pc_cluster_worker_register(wa->slot->idx, wa->slot->efd);
+	pc_pubsub_worker_register(wa->slot->idx, wa->slot->efd);   /* PS1 */
+	pc_conn_push_batching();
+	pc_pubsub_defer_wakes();
+	ep = epoll_create1(0);
+
+	/* epoll data tagging: fds (efd/listeners) ride data.u64 as small
+	 * ints; connections ride data.ptr - heap pointers are never < 64K */
+	ev.events = EPOLLIN;
+	ev.data.u64 = (uint64_t)wa->slot->efd;
+	epoll_ctl(ep, EPOLL_CTL_ADD, wa->slot->efd, &ev);
+
+	/* own SO_REUSEPORT socket per TCP listener - the kernel balances */
+	for (i = 0; i < CFG->n_listen; i++) {
+		if (CFG->listen[i].type != PC_LISTEN_TCP)
+			continue;
+		lfds[nlfd] = tcp_listener_fd(&CFG->listen[i]);
+		if (lfds[nlfd] < 0)
+			continue;                  /* failure already logged */
+		plok[nlfd] = listener_plaintext_ok(&CFG->listen[i]);
+		lresp[nlfd] = CFG->listen[i].http ? PC_LK_HTTP :
+			CFG->listen[i].resp ? PC_LK_RESP : PC_LK_NATIVE;
+		ev.events = EPOLLIN;
+		ev.data.u64 = (uint64_t)lfds[nlfd];
+		epoll_ctl(ep, EPOLL_CTL_ADD, lfds[nlfd], &ev);
+		nlfd++;
+	}
+	/* the single shared UNIX listener: EPOLLEXCLUSIVE avoids the herd */
+	if (unix_fd >= 0) {
+		lfds[nlfd] = unix_fd;
+		plok[nlfd] = 0;    /* default-deny; the loop below sets the
+		                    * configured value - the analyzer cannot see
+		                    * that unix_fd >= 0 implies the loop matches */
+		lresp[nlfd] = PC_LK_NATIVE;
+		                   /* the RESP door is TCP-only (S33); this was
+		                    * UNINITIALIZED - garbage nonzero would have
+		                    * served RESP on the unix socket at random
+		                    * (found by clang-analyzer CallAndMessage) */
+		for (i = 0; i < CFG->n_listen; i++)
+			if (CFG->listen[i].type == PC_LISTEN_UNIX)
+				plok[nlfd] = listener_plaintext_ok(&CFG->listen[i]);
+		ev.events = EPOLLIN | EPOLLEXCLUSIVE;
+		ev.data.u64 = (uint64_t)unix_fd;
+		epoll_ctl(ep, EPOLL_CTL_ADD, unix_fd, &ev);
+		nlfd++;
+	}
+
+	while (!stop_flag) {
+		/* an active cooperative walk (S40) must not sit behind a
+		 * blocking wait: poll, step the walks, wait again */
+		/* An open HTTP connection needs a bounded wait: its
+		 * request head may simply never arrive, and nothing else
+		 * would wake this worker to notice (S46). */
+		/* the last turn's pub/sub work, before it parks and waits: its
+		 * wakes to other workers, then its staged frames - every path
+		 * back to the wait passes here */
+		pc_conn_resume_paused();
+		pc_pubsub_flush_wakes();
+		pc_conn_flush_pushes();
+		pc_qs_exit();                  /* S150 B: parked across the wait */
+		/* PS5: a UDP push stream is probed and pruned on a clock too.
+		 * Both counts are read HERE, not kept from the sweeps: a
+		 * connection or stream opened by this turn's events must
+		 * shorten this wait - an idle HTTP connection accepted after
+		 * the sweep used to leave a quiet worker waiting forever, and
+		 * never closed */
+		n = epoll_wait(ep, evs, 32,
+			pc_enum_pending() ? 0
+			: pc_conn_paused_open() ? 50
+			: (pc_conn_http_open() || pc_conn_udp_open() ? 1000 : -1));
+		pc_qs_enter();                 /* the turn: events, drains, walks */
+		pc_conn_sweep_http(&conns, CFG->http_timeout_s);
+		pc_conn_sweep_udp(&conns);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		for (i = 0; i < n; i++) {
+			if (evs[i].data.u64 >= 65536) {
+				pc_conn_event(evs[i].data.ptr, evs[i].events);
+				continue;
+			}
+			if ((int)evs[i].data.u64 == wa->slot->efd) {
+				struct pc_pull_done done[16];
+				int nd, k;
+
+				while (read(wa->slot->efd, &junk, sizeof junk) > 0)
+					;
+				rpc_drain(wa->slot);
+				pc_pubsub_drain(wa->slot->idx);        /* PS1 */
+				while ((nd = pc_cluster_drain(wa->slot->idx,
+				        done, 16)) > 0)
+					for (k = 0; k < nd; k++) {
+						pc_proto_pull_complete(&done[k]);
+						free(done[k].val);
+					}
+				continue;
+			}
+			for (j = 0; j < nlfd; j++)
+				if (lfds[j] == (int)evs[i].data.u64) {
+					pc_conn_accept(ep, lfds[j], plok[j],
+						lresp[j],
+						have_psk ? &PSK : NULL, &conns);
+					break;
+				}
+		}
+		pc_enum_step();
+	}
+	pc_conn_destroy_all(&conns);
+	pc_qs_exit();
+	for (i = 0; i < nlfd; i++)
+		if (lfds[i] != unix_fd)
+			close(lfds[i]);
+	close(ep);
+	return NULL;
+}
+
+/* S131: the splitter's per-tick bound.  A CHUNK is one call into the
+ * core's grow loop; the SLICE is how long the maintenance thread will
+ * spend splitting one collection before moving on, because the expiry
+ * sweep, the arena reclaim and S69's resize tick all queue behind it.
+ * 20 ms a collection a second is 2% of this thread at the very worst,
+ * and a table that is not behind pays one call that splits nothing. */
+int pc_grow_at_pct = 75;                 /* S150: [daemon] grow_at_pct */
+int pc_shrink_at_pct = 18;               /* S150 D: [daemon] shrink_at_pct, resolved */
+int pc_shrink_cooloff_s = 60;            /* S150 D: [daemon] shrink_cooloff_s */
+/* S175: the overflow leg as a growth signal.  grow_at_pct alone decides
+ * how much of a keyspace lives in the leg - at six slots a bucket and a
+ * 75% target that is ~7% of records, each paying a chain walk under ONE
+ * lock on every lookup that misses its bucket - and no drain can move
+ * them, because their buckets are full.  Only a wider table can.  So a
+ * table whose leg stays occupied after a whole drain pass is widened
+ * past grow_at_pct, as far as the floor and no further; a table whose
+ * leg is quiet grows exactly as before. */
+int pc_grow_floor_pct = 50;              /* S175: [daemon] grow_floor_pct */
+int pc_leg_stuck_pct = 1;                /* S175: [daemon] leg_stuck_pct */
+#define PC_GROW_CHUNK     512
+/* S172: leg chains examined per tick.  16,384 chains, so a full pass
+ * takes ~16 s at 1 Hz - slow enough to be invisible beside the growth
+ * slice, fast enough that a bulk load's leg is gone in under a minute. */
+#define PC_DRAIN_CHAINS   1024
+#define PC_GROW_SLICE_US  20000
+
+/* ---- maintenance ------------------------------------------------------- */
+
+/* S153: the sweep names each reaped record; the event log may want it */
+static void ev_expired_cb(const str *key, void *ctx)
+{
+	pc_ev_expired((int)(long)ctx, key);
+}
+
+/* S150 D: the other half of the splitter.  A table that sits below
+ * shrink_at_pct of its slot capacity, and has neither split nor been
+ * resized nor started within the cool-off, is resized DOWN - by the S69
+ * migration, to the size that puts it midway between the two thresholds
+ * so one copy lands it where neither fires - and never below one
+ * segment, the floor a table always carves.  The old index then goes
+ * back to the arena (steps B and C).  Local, like the splitter: each node
+ * sizes what it holds. */
+static unsigned int col_quiet_since[PC_MAX_COLLECTIONS];
+static unsigned long long col_seen_pub[PC_MAX_COLLECTIONS];
+
+static void shrink_consider(int i, pcache_htable_t *cht, unsigned int now,
+		int grew)
+{
+	pcache_ht_totals_t tot;
+	unsigned long long pub = pc_store_pub_gen(i);
+	unsigned int nb, cur = 0, t;
+	int rs_t, made = pc_store_buckets_log2(i);
+	unsigned long long rs_m;
+	const char *name;
+
+	if (grew || !col_quiet_since[i] || col_seen_pub[i] != pub) {
+		/* a split, a first sighting, a new incarnation or a resize just
+		 * published: the cool-off starts (or restarts) here */
+		col_quiet_since[i] = now;
+		col_seen_pub[i] = pub;
+		return;
+	}
+	if (pc_shrink_at_pct <= 0 ||
+	    now - col_quiet_since[i] < (unsigned int)pc_shrink_cooloff_s ||
+	    pc_store_resizing(i, &rs_t, &rs_m))
+		return;
+	nb = pcache_ht_nbuckets(cht);
+	if (nb <= PCACHE_SEG_SIZE)
+		return;                    /* one segment: the floor */
+	pcache_ht_totals(cht, &tot);
+	if (tot.entries * 100 >=
+	    (unsigned long long)pc_shrink_at_pct * PCACHE_SLOTS * nb)
+		return;
+	while ((1U << cur) < nb)
+		cur++;                     /* what it has grown to, as a power */
+	for (t = PCACHE_SEG_BITS; t < cur; t++)
+		if (tot.entries * 100 <= (unsigned long long)
+		        ((pc_grow_at_pct + pc_shrink_at_pct) / 2) *
+		        PCACHE_SLOTS * (1ULL << t))
+			break;
+	if (t >= cur || (1ULL << (t + 1)) > nb)
+		return;                    /* less than a halving: not worth a copy */
+	name = pc_store_name(i);
+	if (pc_store_resize_start(name, strlen(name), (int)t) == 0) {
+		LM_NOTICE("collection '%s': %llu records in %u buckets (%llu%% of "
+			"the slots, made at 2^%d): shrinking to 2^%u\n", name,
+			(unsigned long long)tot.entries, nb,
+			(unsigned long long)tot.entries * 100 /
+				((unsigned long long)PCACHE_SLOTS * nb),
+			made, t);
+		col_quiet_since[i] = now;  /* the cool-off restarts on a shrink */
+	}
+}
+
+static void *maint_main(void *p)
+{
+	unsigned int last = 0, now;
+	int i;
+
+	slot_attach(p);
+	thread_name("pc-maint");
+	while (!stop_flag) {
+		pc_qs_exit();                  /* S150 B: parked across the sleep */
+		usleep(100 * 1000);
+		pc_qs_enter();
+		rpc_drain(self_slot);
+		now = get_ticks();
+		if (now == last)
+			continue;
+		last = now;
+		pc_obs_tick_1hz();
+		pc_store_held_tick();          /* S109: the paced walk */
+		/* fsync watchdog: a hung fsync on network-class storage is a
+		 * HANG, not an error - flag it loudly, workers never block */
+		{
+			long long st = pc_wal_fsync_start_us;
+
+			if (st) {
+				struct timespec _ts;
+				long long _now;
+
+				clock_gettime(CLOCK_MONOTONIC, &_ts);
+				_now = (long long)_ts.tv_sec * 1000000 +
+					_ts.tv_nsec / 1000;
+				if (_now - st > 5000000)
+					LM_CRIT("wal: an fsync has been stuck for %llds - "
+						"storage is stalled\n",
+						(_now - st) / 1000000);
+			}
+		}
+		/* the 1/s duties: reclaim, expiry, single-splitter growth */
+		pcache_arena_reclaim_tick();
+		pc_store_resize_tick();        /* S69: a migration in flight */
+		pc_store_retire_tick();        /* S150 B: what a resize left, once
+		                                * no thread can still hold it */
+		pc_ev_tick();                  /* S153: refill, report suppression */
+		/* S69: the REGISTRY, not the startup array - a collection
+		 * created at runtime needs its expiry sweep and its splitter
+		 * too, and a dropped one must not be swept at all */
+		for (i = 0; i < pc_store_count(); i++) {
+			unsigned long rg0;
+			pcache_htable_t *cht;
+
+			if (!pc_store_live(i))
+				continue;
+			rg0 = pcache_arena_regions_bytes();   /* S120 */
+			cht = pc_store_ht(i);
+			pcache_ht_sweep(cht, now, ev_expired_cb, (void *)(long)i);   /* S153 */
+			/* S131: the splitter's budget was a flat 128 splits a
+			 * tick whatever the deficit, so it could not keep up
+			 * with a burst and never caught up afterwards at any
+			 * useful speed.  MEASURED: 600,000 records written in
+			 * about a minute leaves a table needing ~146,000
+			 * splits to reach its target load factor, which at
+			 * 128 a second is nineteen minutes of ticking - and
+			 * the splitter was observed running at exactly its
+			 * cap, 115-129 buckets a second, for the whole of it.
+			 * Everything that did not fit six to a bucket went to
+			 * the overflow leg meanwhile.
+			 *
+			 * A count is the wrong bound anyway: what must be
+			 * bounded is the TIME this thread spends here, since
+			 * the expiry sweep, the arena reclaim and the resize
+			 * tick are all behind it.  So: split in chunks until
+			 * the table has caught up (a short chunk means the
+			 * loop's condition went false) or the slice is spent.
+			 * A caught-up table costs one chunk call that returns
+			 * 0, which is what it cost before. */
+			{
+				struct timespec g0, g1;
+				unsigned int did;
+				long long us = 0;
+
+				clock_gettime(CLOCK_MONOTONIC, &g0);
+				do {
+					did = pcache_ht_grow_at_leg(cht,
+						(unsigned int)pc_grow_at_pct,
+						(unsigned int)pc_grow_floor_pct,
+						(unsigned int)pc_leg_stuck_pct,
+						PC_GROW_CHUNK);        /* S150, S175 */
+					clock_gettime(CLOCK_MONOTONIC, &g1);
+					us = (long long)(g1.tv_sec - g0.tv_sec)
+						* 1000000LL +
+						(g1.tv_nsec - g0.tv_nsec) / 1000;
+				} while (did == PC_GROW_CHUNK &&
+					 us < PC_GROW_SLICE_US);
+			}
+			/* S172: put back what the leg caught while the table
+			 * was too small - a split makes the room but never
+			 * looks in the leg, so nothing else would */
+			pcache_ht_drain_leg(cht, PC_DRAIN_CHAINS);
+			if (pcache_arena_regions_bytes() > rg0)
+				pc_store_note_index(cht,
+					pcache_arena_regions_bytes() - rg0);
+			shrink_consider(i, cht, now,
+				pcache_arena_regions_bytes() > rg0);
+		}
+	}
+	return NULL;
+}
+
+/* ---- peer thread (spawned only when clustered) -------------------------- */
+
+static void *peer_main(void *p)
+{
+	slot_attach(p);
+	thread_name("pc-cluster");
+	pc_cluster_thread((volatile int *)&stop_flag);
+	return NULL;
+}
+
+/* the bulk migration thread: TCP transfers of records too big for the
+ * datagram plane (cluster principal Noise sessions, both directions) */
+static void *bulk_main(void *p)
+{
+	slot_attach(p);
+	thread_name("pc-bulk");
+	pc_bulk_thread((volatile int *)&stop_flag);
+	return NULL;
+}
+
+/* the heartbeat watchdog: keeps the node audible when the peer thread
+ * is heads-down in a long duty (emission only - see cluster.h) */
+static void *beat_main(void *p)
+{
+	slot_attach(p);
+	thread_name("pc-beat");
+	pc_cluster_beat_thread((volatile int *)&stop_flag);
+	return NULL;
+}
+/* PS11: a pub/sub relay receive thread */
+struct psrx_arg {
+	struct pc_thread *slot;
+	int idx;
+};
+static void *psrx_main(void *p)
+{
+	struct psrx_arg *a = p;
+
+	slot_attach(a->slot);
+	thread_name("pc-psrx");
+	pc_cluster_pubsub_rx_thread((volatile int *)&stop_flag, a->idx);
+	return NULL;
+}
+/* ---- RDB thread (spawned only with persistence on) --------------------- */
+
+static void *rdb_main(void *p)
+{
+	slot_attach(p);
+	thread_name("pc-rdb");
+	pc_rdb_thread((volatile int *)&stop_flag);
+	return NULL;
+}
+
+/* ---- WAL thread --------------------------------------------------------- */
+
+static void *wal_main(void *p)
+{
+	struct pollfd pf;
+	int timeout = 200;
+
+	slot_attach(p);
+	thread_name("pc-wal");
+	pc_wal_set_wakeup(self_slot->efd);
+	pf.fd = self_slot->efd;
+	pf.events = POLLIN;
+	while (!stop_flag) {
+		pc_wal_mark_sleeping(1);
+		poll(&pf, 1, timeout);
+		pc_wal_mark_sleeping(0);
+		if (pf.revents & POLLIN) {
+			uint64_t junk;
+
+			while (read(self_slot->efd, &junk, sizeof junk) > 0)
+				;
+		}
+		rpc_drain(self_slot);
+		timeout = pc_wal_pump();
+	}
+	pc_wal_shutdown();
+	return NULL;
+}
+
+/* ---- signals ----------------------------------------------------------- */
+
+static void on_signal(int sig)
+{
+	uint64_t one = 1;
+	int i;
+
+	(void)sig;
+	stop_flag = 1;
+	for (i = 0; i < n_threads; i++)
+		if (threads[i].efd >= 0)
+			if (write(threads[i].efd, &one, sizeof one) < 0) { /* best effort */ }
+}
+
+/* ---- the run ----------------------------------------------------------- */
+
+int pc_daemon_run(struct pc_config *cfg)
+{
+	struct worker_arg wargs[512];
+	struct pc_thread *mt, *wt, *rt = NULL, *ct = NULL, *bt = NULL;
+	struct pc_thread *hb = NULL;
+	struct psrx_arg psrx[16];               /* PS11 */
+	int npsrx = 0;
+	struct sigaction sa;
+	sigset_t blocked, old;
+	pthread_attr_t tattr;
+	int i, nw = cfg->workers;
+
+	CFG = cfg;
+
+	/* memory first: probe the ladder, size the arena from config */
+	if (cfg->huge_pages_off) {                  /* S167 */
+		pcache_mem_no_huge = 1;
+		/* the advice is not enough on `enabled = always`: the kernel
+		 * folds anonymous pages without being asked, so the process
+		 * says no once, here, before anything is mapped */
+		if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) != 0)
+			LM_WARN("huge_pages = off: the kernel refused "
+				"PR_SET_THP_DISABLE (%s) - the arena asks for "
+				"no huge pages, but THP may still fold it\n",
+				strerror(errno));
+	}
+	pcache_mem_probe();
+	LM_NOTICE("memory: probed tier = %s (hugetlb %lukB, thp %lukB)\n",
+		pcache_mem_tier_str(pcache_mem.tier), pcache_mem.hugetlb_kb,
+		pcache_mem.thp_pmd_kb);
+	pcache_backing_policy = "own";
+	pcache_arena_hugepage_mb = cfg->backing_heap ? 0 : cfg->arena_mb;
+	pcache_arena_hugepage_cap_mb = cfg->arena_cap_mb;
+	/* The HARD ceiling, which arena_mb alone never was: past the
+	 * huge-page reservation the arena carves from shm_malloc - plain
+	 * malloc here - so a node grew without any configured bound.
+	 * config.h has always said arena_cap_mb "0 = fixed at arena_mb";
+	 * this is what makes that true. */
+	pcache_arena_max_bytes = (unsigned long)(cfg->arena_cap_mb
+		? cfg->arena_cap_mb : cfg->arena_mb) << 20;
+	pcache_reclaim_keep = cfg->reclaim_keep;
+	pcache_reclaim_quiet_s = cfg->reclaim_quiet_s;
+	pcache_reclaim_cooloff_s = cfg->reclaim_cooloff_s;
+	pcache_reclaim_giveback = cfg->reclaim_giveback;
+	pcache_arena_floor_bytes = (unsigned long)cfg->reclaim_floor_mb << 20;
+	pcache_arena_shrink_step_bytes = (unsigned long)cfg->shrink_step_mb << 20;
+	if (pcache_arena_init() != 0) {
+		LM_ERR("arena init failed\n");
+		return 1;
+	}
+	/* S167: pinning is attempted on every start and degrades to a
+	 * warning, so a node can believe it is resident while it is
+	 * swappable.  `pin = require` makes that a refusal instead - said
+	 * with the limit, because RLIMIT_MEMLOCK is what refuses it, and an
+	 * unprivileged container's cap beats the unit's LimitMEMLOCK. */
+	if (cfg->pin_require) {
+		struct pcache_arena_pressure pr;
+		struct rlimit rl;
+
+		pcache_arena_pressure(&pr);
+		if (!pr.locked_bytes) {
+			getrlimit(RLIMIT_MEMLOCK, &rl);
+			LM_ERR("[memory] pin = require, but the arena is not "
+				"locked: RLIMIT_MEMLOCK is %lu MB and the arena "
+				"asks for %d MB. Raise it (systemd "
+				"LimitMEMLOCK=infinity; in an unprivileged "
+				"container the CONTAINER's limit is the one "
+				"that refuses), or set pin = auto to run "
+				"swappable.\n",
+				rl.rlim_cur == RLIM_INFINITY ? 0UL :
+				(unsigned long)(rl.rlim_cur >> 20),
+				cfg->arena_mb);
+			return 1;
+		}
+		LM_NOTICE("memory: %lu MB of the arena locked in RAM "
+			"(pin = require)\n", pr.locked_bytes >> 20);
+	}
+
+	/* S69: what a collection created at runtime inherits.  A fleet is
+	 * ONE mode over ONE collection set, so it takes the cluster's mode
+	 * rather than a per-collection variant nobody declared. */
+	pc_col_default_proxy = cfg->cl_mode == PC_MODE_PROXY;
+	pc_col_default_shard = cfg->cl_mode == PC_MODE_SHARD;
+	pc_col_default_eager = cfg->cl_eager;
+	pc_grow_at_pct = cfg->grow_at_pct;                     /* S150 */
+	/* S150 D: the shrink threshold sits a quarter of the way up unless
+	 * pinned, and never at or above the growth threshold - the two would
+	 * chase each other across every boundary */
+	pc_shrink_at_pct = cfg->shrink_at_pct ? cfg->shrink_at_pct
+		: cfg->grow_at_pct / 4;
+	if (pc_shrink_at_pct >= pc_grow_at_pct) {
+		LM_WARN("shrink_at_pct %d is not below grow_at_pct %d: shrinking "
+			"at half of it instead\n", pc_shrink_at_pct, pc_grow_at_pct);
+		pc_shrink_at_pct = pc_grow_at_pct / 2;
+	}
+	pc_shrink_cooloff_s = cfg->shrink_cooloff_s;
+	/* S175: a floor at or above the ordinary target asks for nothing,
+	 * and one at or below the shrink threshold would have the leg and
+	 * the shrinker pulling the same table in opposite directions */
+	pc_grow_floor_pct = cfg->grow_floor_pct;
+	pc_leg_stuck_pct = cfg->leg_stuck_pct;
+	if (pc_grow_floor_pct && pc_grow_floor_pct >= pc_grow_at_pct) {
+		LM_WARN("grow_floor_pct %d is not below grow_at_pct %d: the "
+			"overflow leg will not widen a table\n",
+			pc_grow_floor_pct, pc_grow_at_pct);
+		pc_grow_floor_pct = 0;
+	}
+	if (pc_grow_floor_pct && pc_grow_floor_pct <= pc_shrink_at_pct) {
+		LM_WARN("grow_floor_pct %d is not above shrink_at_pct %d: a "
+			"table widened for its leg would be shrunk again, so "
+			"the leg will not widen one\n",
+			pc_grow_floor_pct, pc_shrink_at_pct);
+		pc_grow_floor_pct = 0;
+	}
+	pc_col_default_pull = pc_col_default_proxy || pc_col_default_shard;
+
+	/* S151: workers are slots 1..n (slot_init(1 + i) at start), recovery
+	 * has just run on slot 0, and the peer rx thread will take n + 4.
+	 * Register the client range before the first table exists so every
+	 * table - config, runtime create, resize shadow - inherits it. */
+	/* S154: main is slot 0, workers 1..n, then maint, wal, rdb, peer, bulk
+	 * and beat at n+1..n+6.  Sixteen spare so a thread added later is
+	 * counted rather than silently dropped by the guard. */
+	pcache_ht_default_stat_slots((unsigned int)cfg->workers + 7 + 16);
+	pcache_ht_default_client_slots(1, 1 + (unsigned int)cfg->workers);
+	pc_ev_set_default(cfg->log_events, cfg->log_events_rate, cfg->log_events_hash);   /* S153 */
+	pc_ev_set_notify_default(cfg->notify_events);                                  /* PS8 */
+
+	for (i = 0; i < cfg->n_col; i++) {
+		unsigned long rg0 = pcache_arena_regions_bytes();   /* S120 */
+
+		cols[i].conf = &cfg->col[i];
+		cols[i].ht = pcache_htable_new((unsigned int)cfg->col[i].buckets_log2);
+		if (!cols[i].ht) {
+			LM_ERR("collection '%s': table creation failed\n",
+				cfg->col[i].name);
+			return 1;
+		}
+		pc_store_register(cfg->col[i].name, cols[i].ht,
+			cfg->col[i].pull,
+			cfg->col[i].mode == PC_MODE_PROXY,
+			cfg->col[i].mode == PC_MODE_SHARD,
+			cfg->col[i].eager, cfg->col[i].buckets_log2);
+		pc_store_note_index(cols[i].ht, pcache_arena_regions_bytes() - rg0);   /* S120 */
+		pc_ev_configure(i, cfg->col[i].has_log_events ? cfg->col[i].log_events
+			: PC_EV_INHERIT);                                    /* S153 */
+		pc_ev_configure_notify(i, cfg->col[i].has_notify_events
+			? cfg->col[i].notify_events : PC_EV_INHERIT);          /* PS8 */
+	}
+	n_cols = cfg->n_col;
+	/* S69: the collections a client created before the last restart,
+	 * BEFORE the replay and the snapshot import - both address
+	 * collections by name and drop records for a name they cannot
+	 * resolve, so a created collection has to exist first. */
+	if (pc_store_load(cfg->state_dir) != 0)
+		return 1;
+	pc_verb_set_allow_create(cfg->allow_create);
+
+	/* the shared UNIX listener (TCP ones are per-worker SO_REUSEPORT) */
+	for (i = 0; i < cfg->n_listen; i++)
+		if (cfg->listen[i].type == PC_LISTEN_UNIX) {
+			unix_fd = unix_listener_fd(cfg->listen[i].addr);
+			if (unix_fd < 0)
+				return 1;
+		}
+	pc_obs_qlog_config(cfg->query_log, cfg->query_log_keys);
+	if (cfg->query_log && cfg->log_level < L_INFO)
+		LM_WARN("query_log is on but log_level is below info: the lines "
+			"go through LM_INFO and will not appear - set log_level = "
+			"info while it is on\n");
+	if (pc_obs_init(cfg->workers, cfg->slowlog_usec) != 0) {
+		LM_ERR("observability init failed\n");
+		return 1;
+	}
+	pc_pubsub_init(cfg->workers + 8);             /* PS1: worker ids are 1-based */
+	pc_keepalive_s = cfg->keepalive_s;            /* PS2 */
+	pc_pubsub_set_queue_cap((size_t)cfg->pubsub_queue_mb << 20);
+	/*
+	 * S161: THE CLIENT LIMIT AND THE DESCRIPTORS BEHIND IT.  A node that
+	 * ran into the descriptor ceiling failed accept() with EMFILE and
+	 * said nothing; the client saw a hang or a reset.  Now the limit is
+	 * either configured or derived from the ceiling, the ceiling is
+	 * raised toward the hard limit when the configured value needs it
+	 * (as redis does), and a node that still cannot fit runs with the
+	 * limit it can afford and says so - a smaller limit is a degraded
+	 * node, not a wrong one.  The reserve is what the process needs open
+	 * beyond clients: the listeners, every thread's epoll and eventfd,
+	 * the cluster and bulk sockets, the WAL and RDB files, and a few
+	 * HTTP connections so /stats answers when the limit is hit.
+	 */
+	{
+		struct rlimit rl;
+		long reserve = 64 + 2L * (cfg->workers + 8) + cfg->n_listen
+			+ (cfg->cl_enabled ? 16 : 0) + 16;
+		long want = cfg->max_clients ? cfg->max_clients + reserve : 0;
+		long avail;
+
+		if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+			rl.rlim_cur = 1024;
+			rl.rlim_max = 1024;
+		}
+		if (want && (long)rl.rlim_cur < want) {
+			struct rlimit up = rl;
+
+			up.rlim_cur = (rlim_t)want > rl.rlim_max ? rl.rlim_max
+				: (rlim_t)want;
+			if (setrlimit(RLIMIT_NOFILE, &up) == 0 &&
+			    getrlimit(RLIMIT_NOFILE, &rl) != 0)
+				rl = up;
+		}
+		avail = (long)rl.rlim_cur - reserve;
+		if (avail < 16)
+			avail = 16;
+		if (cfg->max_clients && cfg->max_clients > avail) {
+			LM_WARN("max_clients %d needs %ld descriptors and the limit "
+				"is %ld: running with max_clients %ld\n",
+				cfg->max_clients, want, (long)rl.rlim_cur, avail);
+			pc_max_clients = (int)avail;
+		} else if (cfg->max_clients) {
+			pc_max_clients = cfg->max_clients;
+		} else {
+			pc_max_clients = (int)avail;
+		}
+		LM_NOTICE("clients: max_clients %d (%s), descriptor limit %ld, "
+			"reserve %ld\n", pc_max_clients,
+			cfg->max_clients ? "configured" : "derived",
+			(long)rl.rlim_cur, reserve);
+	}
+
+	/* fail fast if a TCP listener cannot bind at all, and - because
+	 * SO_REUSEPORT hides it - if one is already held by another
+	 * process */
+	for (i = 0; i < cfg->n_listen; i++)
+		if (cfg->listen[i].type == PC_LISTEN_TCP) {
+			int probe;
+
+			if (tcp_port_taken(&cfg->listen[i])) {
+				LM_ERR("%s:%d is already in use by another "
+					"process.  TCP listeners set "
+					"SO_REUSEPORT so the workers can share "
+					"the port, which means a second "
+					"perfcached would NOT be refused - it "
+					"would join the port and answer a "
+					"share of the connections with its own "
+					"data and its own cluster view.  "
+					"Refusing to start.  Stop the other "
+					"process, or give this one its own "
+					"address or port.\n",
+					cfg->listen[i].addr,
+					cfg->listen[i].port);
+				return 1;
+			}
+			probe = tcp_listener_fd(&cfg->listen[i]);
+			if (probe < 0)
+				return 1;
+			close(probe);
+		}
+	/* PS5: each native TCP door sends UDP pushes from its own address and
+	 * port, so a client's firewall admits them with one rule.  Nothing
+	 * is read from it; a port held elsewhere only turns the feature off
+	 * for that door. */
+	for (i = 0; cfg->pubsub_udp && i < cfg->n_listen; i++) {
+		const struct pc_listener *l = &cfg->listen[i];
+		struct addrinfo hints, *res = NULL;
+		char port[16];
+		int fd, small = 4096;
+
+		if (l->type != PC_LISTEN_TCP || l->resp || l->http)
+			continue;
+		memset(&hints, 0, sizeof hints);
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_DGRAM;
+		hints.ai_flags = AI_PASSIVE;
+		snprintf(port, sizeof port, "%d", l->port);
+		if (getaddrinfo(strcmp(l->addr, "*") ? l->addr : NULL, port,
+		        &hints, &res) != 0 || !res)
+			continue;                  /* IPv6-only door: no UDP pushes */
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (fd >= 0 && bind(fd, res->ai_addr, res->ai_addrlen) == 0) {
+			const struct sockaddr_in *sin =
+				(const struct sockaddr_in *)res->ai_addr;
+
+			setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+			pc_udp_door_add(sin->sin_addr.s_addr, (uint16_t)l->port, fd);
+			LM_NOTICE("pub/sub: UDP pushes leave from %s:%d/udp\n",
+				l->addr, l->port);
+		} else {
+			LM_WARN("pub/sub: cannot bind %s:%d/udp (%s) - no UDP pushes "
+				"from this door\n", l->addr, l->port, strerror(errno));
+			if (fd >= 0)
+				close(fd);
+		}
+		freeaddrinfo(res);
+	}
+	/* WAL storage: identity (the label) + probe (the measurement) at
+	 * startup; S13 consumes the numbers, S12 reports them honestly */
+	if (cfg->wal_dir) {
+		struct pc_wal_policy pol;
+		int ring_kb;
+		char rep[3072];
+
+		if (pc_storage_identity(cfg->wal_dir, &wal_sid) != 0) {
+			LM_ERR("wal dir %s is unusable\n", cfg->wal_dir);
+			return 1;
+		}
+		pc_storage_format(&wal_sid, rep, sizeof rep);
+		LM_NOTICE("%s", rep);
+
+		/* No cache, by decision (DESIGN 12am): it was keyed by device
+		 * id, and storage moves under a stable device number - a
+		 * hypervisor-side migration changes nothing the key can see,
+		 * so a cached entry serves numbers for storage that is gone.
+		 * That is not hypothetical: it happened twice in one day.
+		 * `auto` and `always` therefore both measure; the difference
+		 * is only the budget.  Costing ~1s per start buys never
+		 * lying, and `probe = no` remains the way to pay nothing. */
+		if (cfg->wal_probe == PC_WPROBE_ALWAYS)
+			pc_wal_probe_run(cfg->wal_dir, cfg->wal_probe_secs,
+				&wal_probe);
+		else if (cfg->wal_probe == PC_WPROBE_AUTO)
+			pc_wal_probe_run(cfg->wal_dir, 0, &wal_probe);
+		pc_wal_policy_from(wal_probe.valid ? &wal_probe : NULL, &wal_sid, &pol);
+		wal_id_valid = 1;
+		pc_wal_probe_format(wal_probe.valid ? &wal_probe : NULL, &pol, rep,
+			sizeof rep);
+		LM_NOTICE("%s", rep);
+
+		/* S13: bring the WAL up - explicit knobs win, the probe's
+		 * policy fills what the config left at 0 */
+		if (cfg->wal_fsync == 1 &&
+		        strcmp(pol.fsync_recommend, "always"))
+			LM_WARN("wal: fsync=always configured but the probe "
+				"recommends %s on this device\n", pol.fsync_recommend);
+		{
+			static const struct pc_rdb_rule defrules[] = {
+				{ 900, 1 }, { 300, 10 }, { 60, 10000 } };
+			const struct pc_rdb_rule *rr = cfg->n_rdb_rules < 0 ?
+				defrules : cfg->rdb_rules;
+			int nrr = cfg->n_rdb_rules < 0 ? 3 : cfg->n_rdb_rules;
+
+			if (pc_rdb_init(cfg->wal_dir, rr, nrr,
+			        cfg->rdb_mb_s,
+			        wal_probe.valid ? wal_probe.seq_mb_s : 0)
+			        != 0) {
+				LM_ERR("rdb: checkpoint engine failed to "
+					"init - refusing to run with the "
+					"durability the config promised "
+					"silently absent\n");
+				return 1;
+			}
+		}
+		/* S15: recovery BEFORE wal activation (activation claims the
+		 * next generation slot), and a fresh checkpoint BEFORE it too
+		 * (the clobbered oldest segment must already be covered).
+		 * The checkpoint stamps its marker with the WAL sequence, so
+		 * the WAL has to know where it left off BEFORE the walk -
+		 * hence the preload, which reads the WAL's own control file
+		 * rather than being handed a value. */
+		pc_wal_preload_seq(cfg->wal_dir, cfg->wal_segments);
+
+		{
+			struct pc_recover_stats rst;
+
+			/* A node with nothing of its own to bring back is
+			 * STARTING; one that restores something is RECOVERING
+			 * until the fleet settles it.  Which of the two it
+			 * really is, is ultimately the master's call from the
+			 * identity history - this is the node's own best
+			 * guess, and the map is what settles it. */
+			if (pc_recover(cfg->wal_dir, &rst) != 0) {
+				LM_ERR("recovery failed\n");
+				return 1;
+			}
+			/* before the checkpoint below, whose marker is
+			 * stamped with this sequence */
+			pc_wal_seq_atleast(rst.last_seq);
+			if (rst.rdb_records + rst.wal_applied > 0)
+				pc_node_state_set(PC_NST_RECOVERING);
+			if (rst.rdb_records + rst.wal_applied > 0 &&
+			        pc_rdb_save_sync() != 0) {
+				LM_ERR("the post-recovery checkpoint failed - refusing "
+					"to risk the replay window\n");
+				return 1;
+			}
+		}
+		/* fsync = always fsyncs once per drained batch, so the ring
+		 * must absorb everything that arrives while the pump sits in
+		 * fdatasync.  On ms-class storage the shipped 1 MB is not
+		 * enough and the overflow path DROPS acknowledged writes, so
+		 * take the depth the probe derived unless the operator pinned
+		 * one.  Measured before this existed: ~13% of acknowledged
+		 * writes absent after a restart, at 3 ms per fsync. */
+		ring_kb = cfg->wal_ring_kb;
+		if (cfg->wal_fsync == 1 && !cfg->wal_ring_kb_set &&
+		        pol.ring_kb_always > ring_kb) {
+			LM_NOTICE("wal: fsync = always on %lldus-p99 storage - "
+				"ring %d -> %d KB per writer so the pump's "
+				"fsync window cannot overflow it (set [wal] "
+				"ring_kb to override)\n",
+				pc_wal_probe_result() ?
+				pc_wal_probe_result()->fsync_p99_us : 0,
+				ring_kb, pol.ring_kb_always);
+			ring_kb = pol.ring_kb_always;
+		} else if (cfg->wal_fsync == 1 && !pol.ring_kb_always) {
+			LM_WARN("wal: fsync = always with no probe - the ring "
+				"depth CANNOT be sized for this device.  If "
+				"fdatasync here takes milliseconds the ring "
+				"will overflow under load and dropped records "
+				"are acknowledged writes that will be missing "
+				"after a restart.  Set [wal] probe = auto, or "
+				"raise ring_kb.\n");
+		}
+		if (cfg->wal_fsync == 1 && pol.fsync_recommend &&
+		        strcmp(pol.fsync_recommend, "always") != 0 &&
+		        pc_wal_probe_result()) {
+			LM_WARN("wal: fsync = always but this device measures "
+				"%s-class (%s).  Every drained batch pays an "
+				"fdatasync; sustained writes above ~%lld/s "
+				"will outrun it.\n",
+				pol.fsync_recommend, pol.note ? pol.note : "",
+				pol.max_durable_wps);
+		}
+		if (pc_wal_init(cfg->wal_dir,
+		        cfg->wal_fsync == 1 ? PC_WFSYNC_ALWAYS :
+		        cfg->wal_fsync == 2 ? PC_WFSYNC_NO : PC_WFSYNC_EVERYSEC,
+		        cfg->wal_segment_mb ? cfg->wal_segment_mb : pol.segment_mb,
+		        cfg->wal_segments, ring_kb,
+		        cfg->workers + 6) != 0) {
+			LM_ERR("wal init failed\n");
+			return 1;
+		}
+	}
+
+	/* derive the PSKs once (Argon2id is never paid per connection).
+	 * Needed whenever any listener is encryption-required. */
+	{
+		int need = 0;
+
+		for (i = 0; i < cfg->n_listen; i++)
+			if (!listener_plaintext_ok(&cfg->listen[i]))
+				need = 1;
+		if (cfg->cl_enabled)
+			need = 1;                  /* the peer plane seals with it */
+		if (need) {
+			memset(&PSK, 0, sizeof PSK);
+			for (i = 0; i < cfg->n_client_secrets; i++)
+				if (pc_psk_derive(cfg->client_secret[i],
+				        strlen(cfg->client_secret[i]), PC_PRIN_CLIENT,
+				        PSK.client[i]) != 0)
+					return 1;
+			PSK.n_client = cfg->n_client_secrets;
+			/* S158: optional standalone; absent, the door
+			 * refuses the cluster principal (have_cluster) */
+			if (cfg->cluster_secret) {
+				if (pc_psk_derive(cfg->cluster_secret,
+				        strlen(cfg->cluster_secret),
+				        PC_PRIN_CLUSTER, PSK.cluster) != 0)
+					return 1;
+				PSK.have_cluster = 1;
+			}
+			have_psk = 1;
+			LM_NOTICE("Noise PSKs derived (%d client + %d cluster)\n",
+				PSK.n_client, PSK.have_cluster);
+		}
+	}
+
+	/* S59: the PSKs are cached (or the secrets were never needed) -
+	 * the raw strings' job is done here, so their plaintext must not
+	 * live for the process lifetime.  The exit paths that never
+	 * reach this point are covered by pc_config_free wiping again. */
+	pc_config_wipe_secrets(cfg);
+
+	if (!cfg->cl_enabled)
+		pc_node_state_set(PC_NST_READY);   /* nothing to join */
+
+	if (cfg->cl_enabled) {
+		/* S80: identity and the mastership term live in the admin's
+		 * state_dir.  A [wal] dir without one keeps serving as it
+		 * always has, so an upgrade changes nothing; when state_dir
+		 * is later introduced beside a WAL, what the WAL dir already
+		 * holds is carried across once.  Neither set = ephemeral:
+		 * legal, and LOUD, because a node that presents as new after
+		 * every restart is what left a fleet renumbering itself on
+		 * every deploy. */
+		const char *sd = cfg->state_dir ? cfg->state_dir : cfg->wal_dir;
+		const char *legacy = (cfg->state_dir && cfg->wal_dir &&
+			strcmp(cfg->state_dir, cfg->wal_dir) != 0)
+			? cfg->wal_dir : NULL;
+
+		if (!sd)
+			LM_WARN("cluster: state_dir is not set - identity and "
+				"mastership term are EPHEMERAL, so this node "
+				"presents as NEW after every restart.  Set "
+				"[daemon] state_dir (the prefix's var/ is the "
+				"place)\n");
+		else if (!cfg->state_dir)
+			LM_NOTICE("cluster: state_dir not set - using the WAL "
+				"directory %s for identity and term (set "
+				"[daemon] state_dir to keep them apart)\n", sd);
+		/* before init: the identity is derived in there, and it has
+		 * to be settled before this node joins anything */
+		pc_cluster_set_site_salt(cfg->cl_site_salt);
+		if (pc_cluster_init(cfg->cl_mcast, cfg->cl_port,
+		        cfg->cl_advertise, PSK.cluster,
+		        cfg->cl_pull_timeout_ms, cfg->cl_negative_ms,
+		        cfg->cl_tombstone_ms, sd, legacy,
+		        cfg->cl_max_pending) != 0)
+			return 1;
+		/* PS11: relays on a port of their own, or stay on the cluster socket */
+		npsrx = pc_cluster_pubsub_rx_open(cfg->cl_ps_port, cfg->cl_ps_rx_threads);
+		pc_pubsub_set_interest(cfg->cl_ps_interested);   /* PS12 */
+		if (npsrx > 16)
+			npsrx = 16;
+		/* S30: what this node believes the clustered collections
+		 * ARE.  It rides every ALIVE, and a peer that disagrees is
+		 * refused rather than fed (see config_digest()). */
+		{
+			int cport = 0, rport = 0, k;
+			int hport = 0;             /* S78: the first HTTP door's port */
+
+			/* the first non-RESP TCP listener is where native
+			 * clients dial us; the first RESP one is where Redis
+			 * clients do.  Peers publish both, because the two
+			 * audiences cannot use each other's door: RESP has no
+			 * Noise handshake, and the native dialects are not
+			 * spoken on the RESP listener. */
+			for (k = 0; k < cfg->n_listen; k++)
+				if (cfg->listen[k].type == PC_LISTEN_TCP &&
+				        !cfg->listen[k].resp) {
+					cport = cfg->listen[k].port;
+					break;
+				}
+			for (k = 0; k < cfg->n_listen; k++)
+				if (cfg->listen[k].type == PC_LISTEN_TCP &&
+				        cfg->listen[k].resp) {
+					rport = cfg->listen[k].port;
+					break;
+				}
+			for (k = 0; k < cfg->n_listen; k++)
+				if (cfg->listen[k].type == PC_LISTEN_TCP &&
+				        cfg->listen[k].http) {
+					hport = cfg->listen[k].port;
+					break;
+				}
+			pc_cluster_set_config(cfg->n_cl_col ? (int)cfg->cl_mode
+				: (cfg->n_col ? (int)cfg->col[0].mode : 0),
+				cfg->cl_eager,
+				cfg->n_cl_col != 0, cport, rport, hport,
+				cfg->wal_dir != NULL,    /* S73b */
+				cfg->cl_replicas);       /* S127 */
+		}
+	}
+
+	compat_set_broadcast(pc_broadcast);
+
+	/* spawn with signals blocked (inherited); main alone handles them.
+	 * Explicit 1MB stacks: the cluster plane keeps ~65-130KB of
+	 * datagram/seal buffers in stack frames, fine on glibc's 8MB
+	 * default but PAST the 128KB default some other libcs use - a
+	 * worker-thread forward segfaulted on one until it was pinned. */
+	pthread_attr_init(&tattr);
+	pthread_attr_setstacksize(&tattr, 1024L * 1024);
+	sigemptyset(&blocked);
+	sigaddset(&blocked, SIGTERM);
+	sigaddset(&blocked, SIGINT);
+	pthread_sigmask(SIG_BLOCK, &blocked, &old);
+
+	for (i = 0; i < nw; i++) {
+		wargs[i].slot = slot_init(1 + i);
+		wargs[i].wid = i;
+		pthread_create(&wargs[i].slot->tid, &tattr, worker_main,
+			&wargs[i]);
+	}
+	mt = slot_init(nw + 1);
+	pthread_create(&mt->tid, &tattr, maint_main, mt);
+	wt = slot_init(nw + 2);
+	pthread_create(&wt->tid, &tattr, wal_main, wt);
+	if (cfg->wal_dir) {
+		rt = slot_init(nw + 3);
+		pthread_create(&rt->tid, &tattr, rdb_main, rt);
+	}
+	if (cfg->cl_enabled) {
+		ct = slot_init(nw + 4);
+		pthread_create(&ct->tid, &tattr, peer_main, ct);
+		bt = slot_init(nw + 5);
+		pthread_create(&bt->tid, &tattr, bulk_main, bt);
+		hb = slot_init(nw + 6);
+		pthread_create(&hb->tid, &tattr, beat_main, hb);
+		for (i = 0; i < npsrx; i++) {
+			psrx[i].slot = slot_init(nw + 7 + i);
+			psrx[i].idx = i;
+			pthread_create(&psrx[i].slot->tid, &tattr, psrx_main, &psrx[i]);
+		}
+	}
+	pthread_attr_destroy(&tattr);
+
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = on_signal;
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	signal(SIGPIPE, SIG_IGN);
+
+	pc_metrics_mark_start();       /* S46: uptime counts from HERE,
+	                                * not from exec - a slow recovery
+	                                * is not uptime */
+	LM_NOTICE("perfcached ready: %d workers, %d collections, %d "
+		"listeners, arena %s\n", nw, n_cols, cfg->n_listen,
+		cfg->backing_heap ? "heap" : "reserved");
+
+	for (i = 0; i < nw; i++)
+		pthread_join(wargs[i].slot->tid, NULL);
+	pthread_join(mt->tid, NULL);
+	pthread_join(wt->tid, NULL);
+	if (rt)
+		pthread_join(rt->tid, NULL);
+	if (ct)
+		pthread_join(ct->tid, NULL);
+	if (hb)
+		pthread_join(hb->tid, NULL);
+	for (i = 0; i < npsrx; i++)
+		pthread_join(psrx[i].slot->tid, NULL);
+	if (unix_fd >= 0) {
+		close(unix_fd);
+		for (i = 0; i < cfg->n_listen; i++)
+			if (cfg->listen[i].type == PC_LISTEN_UNIX)
+				unlink(cfg->listen[i].addr);
+	}
+	pcache_arena_destroy();
+	LM_NOTICE("perfcached: clean shutdown\n");
+	return 0;
+}
