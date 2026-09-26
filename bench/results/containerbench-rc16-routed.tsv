@@ -1,0 +1,26 @@
+# build=209642a date=2026-09-15T12:35Z host=ubuntu24.04-16vcpu runtime=podman cpus=16 workers=8 arena_mb=128 keys=20000 nbase=100000 val=200 reps=3 mtu=9000 cpuset_srv=none cpuset_cli=none mems_srv=none dialects=resp nat_secs=5 nat_lat=1 cli_threads=8 n_max=4000000 base=debian redis_img=redis:8 route=1 cell_min_s=10
+arm	clients	pipeline	set_rps	get_rps	set_p50ms	get_p50ms	set_p99ms	get_p99ms
+redis	50	1	74400	74394	0.615	0.607	1.207	1.199
+redis	50	16	463987	509471	1.551	1.439	3.151	2.823
+redis	50	64	778805	811250	3.839	3.559	5.231	6.623
+perfcached-solo	50	1	403975	384136	0.079	0.087	0.191	0.199
+perfcached-solo	50	16	2344353	2442002	0.231	0.183	0.631	0.383
+perfcached-solo	50	64	2699345	2751158	0.895	0.567	2.983	1.031
+perfcached-shard	50	1	183166	175800	0.199	0.215	0.871	0.943
+perfcached-shard	50	16	245942	207566	0.247	0.231	1.863	1.279
+perfcached-shard	50	64	155063	143885	1.175	1.087	3.143	2.127
+perfcached-shard-routed	50	1	280974	285133	0.127	0.119	0.511	0.463
+perfcached-shard-routed	50	16	2571413	2908750	0.239	0.199	0.879	0.711
+perfcached-shard-routed	50	64	4365587	5425932	0.575	0.431	1.751	1.439
+perfcached-shard-cold	50	1		181666		0.207		0.879
+perfcached-shard-cold	50	16		207598		0.223		1.039
+perfcached-shard-cold	50	64		143869		1.079		2.255
+perfcached-spread	50	1	319402	219553	0.087	0.143	0.679	0.943
+perfcached-spread	50	16	1420432	428977	0.479	0.239	1.415	1.471
+perfcached-spread	50	64	1719350	350820	1.551	0.551	5.247	1.271
+perfcached-spread-routed	50	1	259469	284080	0.143	0.127	0.543	0.455
+perfcached-spread-routed	50	16	1909546	2851709	0.359	0.199	1.223	0.823
+perfcached-spread-routed	50	64	2938075	5756621	0.911	0.407	4.847	1.471
+perfcached-spread-cold	50	1		366086		0.087		0.191
+perfcached-spread-cold	50	16		2546444		0.175		0.351
+perfcached-spread-cold	50	64		3021865		0.527		1.103
