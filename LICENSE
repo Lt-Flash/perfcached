@@ -1,0 +1,25 @@
+perfcached is licensed in two parts, on purpose.
+
+THE DAEMON - everything that links src/core/ (the server, its cluster
+plane, the CLI, the tests and benches) - is licensed under the GNU
+General Public License, version 2 or (at your option) any later
+version.  The full text is in COPYING.  src/core/ is shared with the
+OpenSIPS cachedb_perf module and carries its own GPL-2.0-or-later
+headers; the same terms cover the rest of the daemon.
+
+THE CLIENT LIBRARY - libperfd - is licensed under the MIT License (see
+lib/LICENSE), so it can be embedded in software under any license,
+proprietary included.  The MIT-licensed set is exactly:
+
+    lib/perfd.c  lib/perfd.h
+    src/json.c   src/json.h
+    src/pc_noise.c  src/pc_noise.h
+    src/pc_slot.h   src/pc_mix.h
+
+These files include nothing from src/core/ (verified, and kept that
+way: tools/sync-libperfd.sh exports precisely this set to consumers).
+
+Every file carries an SPDX-License-Identifier stating which side it is
+on; files without one are daemon-side, GPL-2.0-or-later.
+
+Copyright (c) 2026 Yury Kirsanov
