@@ -1,0 +1,31 @@
+arm	clients	pipeline	requests	set_ms	get_ms
+redis	50	1	879291	11007	10506
+redis	50	16	6758833	12772	11268
+redis	50	64	10323794	12025	10521
+perfcached-solo	50	1	4395601	13755	14009
+perfcached-solo	50	16	29294274	13766	12007
+perfcached-solo	50	64	35115723	13516	12514
+perfcached-store	50	1	4391221	14005	14008
+perfcached-store	50	16	29274774	14011	11510
+perfcached-store	50	64	43868388	17519	13763
+perfcached-store-cold	50	1	3514384		11003
+perfcached-store-cold	50	16	29255323		10755
+perfcached-store-cold	50	64	35115723		12766
+perfcached-eager	50	1	3517186	13008	11255
+perfcached-eager	50	16	29294274	19265	11005
+perfcached-eager	50	64	43912173	23525	15520
+perfcached-eager-cold	50	1	4395601		13258
+perfcached-eager-cold	50	16	29294274		12005
+perfcached-eager-cold	50	64	43868388		15017
+perfcached-proxy	50	1	3517186	11004	11005
+perfcached-proxy	50	16	29274774	15512	11755
+perfcached-proxy	50	64	35087712	15515	13516
+perfcached-proxy-cold	50	1	1099172		11255
+perfcached-proxy-cold	50	16	4000000		37566
+perfcached-proxy-cold	50	64	4000000		50094
+perfcached-shard	50	1	1758595	11256	11756
+perfcached-shard	50	16	4000000	16514	18268
+perfcached-shard	50	64	4000000	24795	27051
+perfcached-shard-cold	50	1	1758595		19508
+perfcached-shard-cold	50	16	4000000		42046
+perfcached-shard-cold	50	64	4000000		68863
