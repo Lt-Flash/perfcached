@@ -1,0 +1,39 @@
+# build=4d5b412 date=2026-09-15T11:16Z host=ubuntu24.04-16vcpu runtime=podman cpus=16 workers=8 arena_mb=128 keys=20000 nbase=100000 val=200 reps=3 mtu=9000 dialects=resp clients=50 pipes=1,16,64
+# reconstructed from the run's log: a later run's setup overwrote the harness's results file before it was copied out; the p50 columns were not logged and are empty.  The daemon source is identical to v0.3.7-rc16.
+arm	clients	pipeline	set_rps	get_rps	set_p50ms	get_p50ms	set_p99ms	get_p99ms
+redis	50	1	67995	69479			1.335	1.319
+redis	50	16	491205	544500			2.895	2.639
+redis	50	64	785162	857965			5.327	5.975
+perfcached-solo	50	1	382160	374030			0.199	0.199
+perfcached-solo	50	16	2210222	2390590			0.935	0.367
+perfcached-solo	50	64	2463984	2699632			3.503	1.015
+perfcached-store	50	1	397156	384136			0.199	0.191
+perfcached-store	50	16	2254387	2441798			0.935	0.375
+perfcached-store	50	64	2543424	2598972			3.095	1.015
+perfcached-store-cold	50	1		369741				0.247
+perfcached-store-cold	50	16		2548139				0.407
+perfcached-store-cold	50	64		3047663				0.959
+perfcached-eager	50	1	313859	382160			0.727	0.199
+perfcached-eager	50	16	1411025	2440377			1.743	0.407
+perfcached-eager	50	64	1694195	2656439			4.607	1.031
+perfcached-eager-cold	50	1		374030				0.199
+perfcached-eager-cold	50	16		2663922				0.391
+perfcached-eager-cold	50	64		2862855				1.015
+perfcached-proxy	50	1	399927	391042			0.231	0.199
+perfcached-proxy	50	16	2056531	2494154			1.095	0.367
+perfcached-proxy	50	64	2192954	2646851			3.239	1.063
+perfcached-proxy-cold	50	1		93024				0.895
+perfcached-proxy-cold	50	16		107921				9.871
+perfcached-proxy-cold	50	64		74278				50.975
+perfcached-shard	50	1	191093	179429			0.871	0.887
+perfcached-shard	50	16	235045	210327			1.551	1.783
+perfcached-shard	50	64	146515	135350			2.511	2.383
+perfcached-shard-cold	50	1		183074				0.823
+perfcached-shard-cold	50	16		218998				0.815
+perfcached-shard-cold	50	64		149237				2.087
+perfcached-spread	50	1	325504	234345			0.695	0.927
+perfcached-spread	50	16	1434194	428545			1.807	1.207
+perfcached-spread	50	64	1658636	352709			4.799	1.199
+perfcached-spread-cold	50	1		372164				0.207
+perfcached-spread-cold	50	16		2440377				0.391
+perfcached-spread-cold	50	64		2922175				1.087
