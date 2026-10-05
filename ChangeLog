@@ -1,0 +1,483 @@
+=========================== Release 0.4.6 ==============================
+
+2026-10-05  Yury Kirsanov
+        * [cluster] A forwarded hash READ is rendered on the asking node:
+          the owner sends the record, not a reply tree.  The reply tree
+          had to fit the forward ack (58,000 bytes) and the owner refused
+          a larger one silently, so a hash the store accepts - 16+16-byte
+          fields from 1,381, 1+1 from 4,833 - read on its owner and
+          answered "holder rejected" one hop away.  The record is at most
+          58,000 bytes by its own rule, so it always fits; the asking
+          node keeps the command's arguments and renders the same reply
+          the owner would have.  The new plane is used only when every
+          node in the fleet advertises it: a fleet with a 0.4.5 member
+          asks the old way, so 0.4.6 is a rolling restart.  Writes keep
+          the old plane.
+
+        * [cluster] A hash command over 58,000 bytes of arguments is
+          refused by name on the owner as well as through a forwarder,
+          with the same words; before, it ran on the owner and failed one
+          hop away.  An owner that cannot ship a reply now counts
+          fwd_reply_too_big in the cluster stats and logs a warning with
+          the size.
+
+        * [resp] A forwarded hash reply of 343 or more nils ("bad reply")
+          converts to RESP now: the sink sized its text buffer at twice
+          the tree, and a nil is one tree byte and five of RESP.
+
+        * [hash] Hash reads take the road GET takes - a seqlock copy-out,
+          no stripe mutex - and hash commands allocate nothing on their
+          path: the per-command copies and the two 58 KB write buffers
+          are gone (a per-thread edit scratch, taken once).  An HSET that
+          creates a hash over an expired key no longer inherits the stale
+          expiry that left the new hash expired-as-absent on its first
+          read.  A hash record over its ceiling is refused by the
+          validator wherever a record is read, and restore validates a
+          hash record before storing it.
+
+        * [cluster] The apply-thread stall detector stamped an item with
+          the clock from BEFORE the take blocked, so the first item after
+          an idle gap looked as old as the gap and a healthy ring read
+          STALLED; a stale wait stamp no longer outlives an empty ring.
+          The stats publish cluster.apply_rings[] (backlog, busy_ms,
+          wait_ms).
+
+        * [test] hashfwdtest (the forwarded reads, the ceiling, the
+          feature gate with a real 0.4.5.2 member and the rolling
+          restart), hashbench, clapplytest's stamp contract.
+
+=========================== Release 0.4.5.2 ============================
+
+2026-10-04  Yury Kirsanov
+        * [release] 0.4.5.1 went red in CI on two suites and is superseded
+          by this cut; the daemon is unchanged since 0.4.5.1.
+
+        * [perfcli] A jget prints the document raw again: the fragment
+          arrives as bytes of JSON text and the library's JSON edge rendered
+          it as an escaped string.
+
+        * [test] The suites that read frames by hand drop the moved stamp a
+          parked reply now carries.  The two partition suites wait for a
+          fresh fleet to be READY on every node before writing and name
+          refused writes - under a loaded CI runner a 4 s pause was not
+          enough, and seeing both peers is not READY yet - and reap
+          the previous fleet before starting the next: every listener is
+          SO_REUSEPORT, so a daemon started beside a dying one shares its
+          ports with the corpse.  fwdtest's crash leg waited for nothing
+          before killing the holder and compared the holder's own count
+          across the restart: after a burst the rebalancer sheds records
+          to the less-utilised peer a few MB per tick, so under a slow
+          sanitizer job the count was still falling - moves in flight,
+          read as crash loss.  The leg now waits for the rebalancer to
+          settle before the barrier and judges durability on the fleet.  keysbudgettest's sparse-walk ceiling (32 turns a
+          walk, calibrated natively) is 96 under a sanitizer build, where
+          a 250 us turn covers fewer buckets; bucket-stepping stays at 128
+          and is still proven every run.  walresidenttest paces its 64,000 writes on
+          the WAL's staged count instead of racing the pump, fails its
+          own positive control when a ring drop or a heal happened, and
+          detects the drain on "nothing staged" rather than two equal
+          byte counts - on a sanitizer runner the unpaced burst filled
+          the ring and the run read 23 MB with thousands refused.
+
+=========================== Release 0.4.5.1 ============================
+
+2026-10-04  Yury Kirsanov
+        * [release] 0.4.5 went red in CI and is superseded by this cut;
+          nothing of 0.4.5's content changed - see its entry below.
+
+        * [fix] A client whose fleet map was stale was no longer told so:
+          the "moved" stamp that lets libperfd re-learn the fleet rode
+          only the parked replies of the generic method frame, not those
+          of the fixed-layout data verbs the library now uses.  Every
+          parked reply carries it.
+
+        * [test] Suites that still expected the removed JSON dialect
+          (eventtest's door label, epochtest's rewritten last step,
+          statlint's writer patterns) and a unit test that read an
+          unzeroed structure (ptreetest) are corrected.
+
+=========================== Release 0.4.5 ==============================
+
+2026-10-04  Yury Kirsanov
+        * [upgrade] 0.4.5 is a whole-fleet step: stop every node, start
+          them all, and move every native-door client to libperfd 0.3.0
+          at the same time.  A 0.4.4 peer is refused by the cluster wire
+          epoch; a 0.2.x library cannot talk to a 0.4.5 daemon.  State
+          from 0.4.1 or later is kept.
+
+        * [protocol] The native door speaks one binary protocol.  The
+          JSON-RPC text dialect is removed: every method rides one
+          request verb with its parameters as a small typed tree and
+          answers a tree; a failed method is an error frame carrying the
+          message; values and keys are bytes (the base64 "enc"
+          convention is gone); notifications are frames.  JSON stays
+          where it is data: the JSON document type (RedisJSON on the
+          RESP door, the native j-methods), the HTTP /stats, /members and
+          /clients bodies, and perfcli's own input syntax.
+
+        * [libperfd] 0.3.0: binary only (perfd_opts.binary is gone),
+          needs perfcached 0.4.5 or later and says so when a daemon is
+          older; JSON text only at the API edge (perfd_command and the
+          pipeline/async forms convert it); new tree-level calls carry
+          bytes exactly - perfdump and perfload use them.
+
+        * [stats] Command rows are cmd:<method> and bin:<verb> (the
+          json: rows are gone); stats.native has binary and resp only;
+          /clients, /metrics, the status page and the Grafana
+          descriptions follow.
+
+        * [fix] `collections` emitted a stray separator when collection
+          slot 0 had been dropped (invalid JSON); the tree reply cannot.
+
+=========================== Release 0.4.3 ==============================
+
+2026-10-03  Yury Kirsanov
+        * [upgrade] From 0.4.1 or 0.4.2 a fleet can be upgraded one node
+          at a time; nothing in the cluster wire, the write-ahead log or
+          the snapshot changed.
+
+        * [wal] The write-ahead log keeps up with about 1,000,000 small
+          writes a second on a test host, where it used to drop
+          acknowledged writes at about 150,000 and send the node healing.
+          A producer that found its buffer full did not wake the log
+          writer, and the writer paused 20 ms after every batch even with
+          work waiting, so it ran on its own timer; it also made one
+          system call per record. It is now woken, drains again at once
+          while records wait, and writes up to 1,024 records per system
+          call. The records, their order and their checksums are
+          unchanged. A disk slower than the write rate, or a log that
+          fills before a snapshot completes, still sends the node healing.
+
+=========================== Release 0.4.2 ==============================
+
+2026-10-03  Yury Kirsanov
+        * [upgrade] From 0.4.1 a fleet can be upgraded one node at a time:
+          state and the cluster wire carry over, and a fleet of 0.4.1 and
+          0.4.2 nodes keeps its members, its cluster id and its data, and
+          elects a master either way round. The new unicast mode needs
+          every node on 0.4.2: switch a fleet between multicast and
+          unicast by stopping every node and starting them all with the
+          new config.
+
+        * [cluster] Unicast discovery, for networks with no multicast -
+          AWS, GCP, Azure, Kubernetes, or a LAN that filters it.
+          [cluster] discovery = unicast and seeds = host[:port], ... (DNS
+          names, re-resolved every 5 s): the membership traffic that went
+          to the multicast group goes to every known member by unicast,
+          and a node that knows only one seed learns the rest through it.
+          One heartbeat per node per peer per second: it suits a fleet of
+          a few dozen nodes. Tested in lab network namespaces (fragments
+          dropped, UDP blocked, seed names moved), not yet in a real cloud
+          deployment.
+
+        * [cluster] In unicast mode a frame larger than [cluster]
+          max_datagram (1,400 bytes) travels over a TCP frame lane
+          (lane_port, the cluster port + 2) instead of as IP fragments,
+          and a peer whose UDP is blocked but whose TCP works is kept and
+          switched to TCP with an ERROR (/stats cluster.lane) instead of
+          being declared dead.
+
+        * [cluster] [cluster] expect = N: on a cold start a node founds a
+          cluster only once it sees N blank nodes, so a fleet started all
+          at once forms one cluster. A second cluster heard on the same
+          group or seeds is an ERROR, /stats cluster.foreign_clusters and
+          a gauge - never a merge.
+
+        * [cluster] A slow node does not blame healthy ones (both modes): a
+          node whose own loop stalled - a paused VM, a starved container -
+          holds purges and elections for as long as it stalled
+          (cluster.self_late), and a member that loses only its own path
+          to the master asks the other members and waits up to 30 s
+          instead of starting an election (cluster.election_holds).
+
+        * [cluster] [cluster] identity_source = auto | dmi | mac | env |
+          file names where a node's identity comes from; a named source
+          that is missing refuses the start instead of falling back to an
+          identity a clone would share. env reads PERFCACHED_PLATFORM_KEY
+          (a Kubernetes pod uid), file the identity file in state_dir.
+
+        * [eager] Fixed: a node restarted after a crash could answer
+          "absent" for records the fleet holds, until the repair sweep
+          re-sent them - for every miss when a collection was declared
+          eager on its own ([collection] mode = eager, rather than in
+          [cluster]) or created at runtime, and in any eager fleet once 30
+          s had passed while the repair still had more to send (24,000
+          records of 1 KB take about a minute). An eager node now asks
+          its peers on a miss until it holds as many records as each of
+          them. Nothing was lost: the records were on the other nodes and
+          came back with the repair. Measured on 0.4.1.
+
+=========================== Release 0.4.1 ==============================
+
+2026-10-03  Yury Kirsanov
+        * [upgrade] State carries over from 0.4.0, the cluster wire does
+          not. Stop every node of a fleet, then start them all on 0.4.1; a
+          node-by-node roll leaves 0.4.0 and 0.4.1 nodes unable to hear each
+          other.
+
+        * [cluster] A cluster has an id, and two clusters never merge. The
+          node that founds a cluster mints a UUID (v7) and every member keeps
+          it in its state directory; every cluster datagram carries it in
+          its authenticated header, and a node ignores any other cluster's
+          frames and says so. [cluster] cluster_id pins it (a name or a
+          UUID), so staging and production cannot meet even on one group.
+
+        * [cluster] [cluster] multicast_ttl lets the cluster group cross a
+          multicast router (default 1, one segment).
+
+        * [cluster] The member limit is one consistent 256 everywhere, and a
+          full fleet refuses a new node out loud instead of ignoring it;
+          [cluster] max_members sets a lower limit.
+
+        * [eager] A miss on an eager collection is answered at once - no
+          node asks the fleet for a key every node would hold. A node still
+          asks while it is recovering, for 30 s after it starts or a peer
+          returns, and after it has refused a copy for lack of memory
+          (/stats cluster.eager_miss_final). A value over 58,000 bytes
+          reaches the other nodes by the repair sweep, ~10-20 s after the
+          write. The JSON mset verb now replicates its keys at once.
+
+        * [core] A KEYS walk takes a time budget per worker turn
+          ([daemon] keys_turn_us, default 250 us) rather than a fixed
+          1,024 buckets, so a sparse table no longer costs one turn per
+          1,024 empty buckets.
+
+        * [ops] A node waits up to [daemon] address_wait_s (30 s) for a
+          configured address to appear instead of failing its first bind;
+          two daemons can no longer share a state or WAL directory; the
+          members card says why a member left (goodbye, silent, forgotten);
+          /stats, the page and /metrics say whether the rebalancer has
+          anything to do; the WAL card's out-of-order count is labelled as
+          the harmless figure it is.
+
+=========================== Release 0.4.0 ==============================
+
+2026-09-30  Yury Kirsanov
+        * [upgrade] There is no upgrade path from 0.3.x. The write-ahead log,
+          the snapshot and the cluster wire changed in this line: 0.4.0 does
+          not take over a 0.3.x node's state or join a 0.3.x fleet, and
+          perfdump/perfload do not carry data across either. Deploy 0.4.0 with
+          an empty [wal] dir and snapshot directory and let the application
+          re-populate its keys.
+
+        * [security] The slow log stored the RESP password. An AUTH, or a
+          HELLO carrying AUTH, slower than slowlog_usec kept its arguments in
+          SLOWLOG GET, /stats and the status page; they are now stored as
+          (redacted). Affected: every release before 0.4.0. If a node's slow
+          log may hold an AUTH, run SLOWLOG RESET and consider rotating the
+          [secrets] resp password.
+
+        * [security] The status page could run what a key carried. Every
+          cache-fed string the page renders is escaped, and the page carries a
+          Content-Security-Policy that pins its one script by hash, so an
+          injected script does not run even if an escape is missed. Every HTTP
+          answer carries nosniff, no-referrer and no-framing headers.
+          Affected: every release before 0.4.0. Keep the HTTP door on a
+          trusted network either way (http_allow, [secrets] http).
+
+        * [security] A PSUBSCRIBE pattern could stall a node or read past its
+          buffer (exponential matching on '*'; an unclosed '[set]'). The
+          pattern matcher is replaced. Affected: pre-release candidates of
+          this line only; no earlier release has pub/sub.
+
+        * [pubsub] Redis pub/sub on every door and across the fleet:
+          SUBSCRIBE, PSUBSCRIBE, PUBLISH and PUBSUB with Redis's rules and
+          frames, the same verbs on the native doors and in libperfd. A
+          publish on any node reaches the subscribers on every node over a
+          relay port, optionally only the nodes that want it; pushes over UDP
+          for native subscribers; keyspace notifications (notify_events).
+
+        * [core] SET ... NX/XX everywhere: in a cluster one node decides each
+          key, so two callers cannot both win an NX lock; SETNX and SETXX on
+          the native doors and perfd_set_cond() in libperfd.
+
+        * [json] JSON documents are a type: GET on a document and JSON.GET on
+          a string answer as Redis 8 does, path updates keep the type, and
+          redis_types = strict | loose chooses per collection.
+
+        * [build] Two editions from one tree: 'make menuconfig' builds the
+          standalone cache - no cluster code, a third smaller - or the
+          clustered daemon.
+
+        * [wal] A node that loses WAL records heals itself instead of failing:
+          HEALING, a snapshot, READY again, every acknowledged write kept;
+          /stats wal.unhealed says what is still owed.
+
+        * [cluster] Restarts and outages: a returning node reconciles what it
+          replayed against a peer that stayed up, narrowed by slot digests;
+          cluster.restart says whether restarting a node now would be
+          witnessed; a privileged 'fleetstop' stops a fleet with clean
+          snapshots.
+
+        * [cluster] A fleet that cannot be confused by its own members: a
+          cluster wire epoch refuses a peer that would mis-execute frames, a
+          refused node can no longer take mastership, and a forwarded request
+          tells the client it is behind - a hint on the native doors, a real
+          -MOVED on RESP.
+
+        * [memory] autoscale = auto | warn | off per collection; memory handed
+          back after a mass expiry; the index's overflow area drained back;
+          WAL buffers sized by what each thread writes.
+
+        * [cluster] Fixed: a set and its delete crossing on the wire, a TTL
+          re-arm that stayed on one node, a delete landing where the key was
+          not, and a resize in the middle of a reconcile.
+
+        * [core] Fixed: SCAN, KEYS and dumps missing keys moved across a
+          resize or out of the overflow area.
+
+        * [libperfd] 0.2.8 -> 0.2.13.
+
+        * [docs] The README's measured tables are 0.3.7's and are labelled as
+          such; they are re-taken on the 0.4.0 daemon after the release.
+
+        * [known] In a shard cluster, a node killed with SIGKILL and restarted
+          at once is held out of the fleet for about 6 seconds, until the
+          master is sure the old instance is gone. Its keys can read as absent
+          through the other nodes during that window.
+
+        * [known] Every node of a cluster must be on one L2 segment: cluster
+          multicast is sent with a TTL of 1 and never crosses a router, so
+          multicast routing (PIM, an IGMP proxy) cannot extend it. AWS, GCP
+          and other public clouds do not carry multicast in a VPC, so a
+          cluster cannot form there yet; a single node runs anywhere.
+
+        * [known] spread mode has not yet carried production traffic. A
+          partition in an eager fleet can undo, when it heals, a delete made
+          on one side.
+
+
+=========================== Release 0.3.7 ==============================
+
+2026-09-15  Yury Kirsanov
+        * [cluster] mode = spread: K copies of each record on P nodes, placed
+          by rendezvous hashing over the stable advertise addresses; writes
+          push to the set, reads pull from a holder, and surplus copies are
+          dropped only on a holder's confirmation. libperfd 0.2.8 learns the
+          fleet from any node's 'members' reply and routes to the holders.
+
+        * [security] DDL behind a privileged connection ('enable', a second
+          secret): a client secret alone can no longer create, drop or resize
+          a collection.
+
+        * [stats] Per-key event logging, selected per collection; client and
+          peer told apart in the hit counters, and 'reach' - distinct keys
+          served; the durability card's staged / unsynced split; -LOADING as
+          Redis spells it.
+
+        * [core] An index that sizes itself both ways: grows at grow_at_pct,
+          shrinks at shrink_at_pct after shrink_cooloff_s, and hands the
+          retired table back to the arena once its readers have moved on; 68
+          bytes a bucket above the flat floor, was 192.
+
+        * [cluster] Fixed: a node that bounced inside another node's slot
+          grace was never re-placed to, and an empty node's "not found" could
+          delete the fleet's only copy. An online resize broadcast as a DROP;
+          'keys' bounded per collection.
+
+        * [docs] README reworked around a 'Start here' on-ramp; measurements
+          moved to bench/RESULTS.md; ten validated configurations in
+          contrib/CONFIGURATIONS.md; every RESP command with its parameters in
+          REDIS-COMMANDS.md.
+
+        * [known] A spread node that restarts empty is backfilled with the
+          whole keyspace and trimmed back to its share at about ten keys a
+          second. Nothing is lost, but the K-copies memory bound is exceeded
+          after a cold start for minutes to hours, depending on the keyspace.
+
+
+=========================== Release 0.3.6.1 ==============================
+
+2026-09-13  Yury Kirsanov
+        * [security] A heap buffer overflow in the write path. Upgrade from
+          0.3.6. A peer's write-gather buffer was sized from the first record
+          it ever held and never grown, while the guard before each append
+          checked the wire's ceiling rather than the allocation, so a small
+          first record followed by a larger one wrote past the end of the
+          block. Reachable on any node forwarding writes of mixed sizes. The
+          allocated size is now recorded and grown; a failed grow drops the
+          record rather than writing it. No wire change from 0.3.6.
+
+
+=========================== Release 0.3.6 ==============================
+
+2026-09-13  Yury Kirsanov
+        * [release] Withdrawn: use 0.3.6.1.
+
+        * [upgrade] A fleet on 0.3.5 must restart coordinated, not rolling,
+          and each node loses its stored identity. The FNV-1a offset basis was
+          one digit short; correcting it changes the membership digest carried
+          on the master's keepalive and the check on the node-term and
+          node-identity files. A node whose identity file fails its check
+          refuses to start rather than silently minting a new id; delete the
+          file to mint one deliberately.
+
+        * [cluster] The cluster plane split into fourteen modules, each with
+          its own unit tests. Fixed: a dangling collection pointer in the
+          pull-response path, a doubled release of a parked request, and a
+          heartbeat that re-armed the shard grace window.
+
+
+=========================== Release 0.3.5 ==============================
+
+2026-09-12  Yury Kirsanov
+        * [resp] The RESP door dispatches from a command table; the peer table
+          is read through one liveness predicate. No wire, config or metric
+          change.
+
+
+=========================== Release 0.3.0 ==============================
+
+2026-09-12  Yury Kirsanov
+        * [cluster] Ownership moved to the Redis slot (crc16(key) % 16384) and
+          the door answers CLUSTER SLOTS, CLUSTER SHARDS and CLUSTER KEYSLOT:
+          the first tag a stock Redis client can route against.
+
+        * [core] Collections at runtime: created, dropped, resized in either
+          direction and renamed while the daemon serves, with the RESP door
+          mapping a database index to a collection name.
+
+        * [cluster] A member joining an eager fleet empty pulls its bootstrap
+          before it reports READY; the write-path push coalesces into one
+          datagram per peer; a failover probes a standby before adopting it; a
+          joiner the master is holding hears JOIN_WAIT rather than silence.
+
+        * [resp] Refusals that say which one they are: TRYAGAIN for a forward
+          that cannot be parked, 'ERR holder timed out' for one parked and
+          never answered, -LOADING for a node still recovering.
+
+        * [memory] The arena is a ceiling on both carve paths: records and the
+          tables holding them are bounded, and create/resize price an index
+          before refusing it.
+
+        * [wal] wal/CONTROL is a durable record of the WAL's sequence and
+          spans, and a node that destroys an acknowledged write leaves service
+          instead of serving from a hole.
+
+        * [stats] A built-in fleet page, /stats on the HTTP door, per-dialect
+          and per-listener counters, replica-lag figures, a per-collection
+          memory budget, named threads, an optional query log, perfload and
+          perfdump, release tarballs per distribution and a Debian package.
+
+        * [json] RedisJSON on the door: JSON.SET, JSON.GET, JSON.DEL and
+          friends.
+
+
+=========================== Release 0.2.1 ==============================
+
+2026-09-01  Yury Kirsanov
+        * [cluster] An oversized write through a non-holder is refused, never
+          forked: a SET above the peer-forward ceiling (58,000 bytes) arriving
+          at a node that does not hold the key was stored as a divergent local
+          copy, so two nodes answered the same GET differently. Wire dialect
+          and config digest unchanged: 0.2.0 and 0.2.1 nodes interoperate.
+
+
+=========================== Release 0.2.0 ==============================
+
+2026-09-01  Yury Kirsanov
+        * [release] The daemon plus libperfd (C) and the RESP2 door for Redis
+          clients, four cluster modes (store / eager / proxy / shard), WAL +
+          RDB + recovery, Noise-encrypted transport, /metrics (OpenMetrics),
+          /health, a status page served by every node, and PRODUCTION.md, the
+          pre-deployment checklist.
