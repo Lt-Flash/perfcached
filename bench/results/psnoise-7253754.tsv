@@ -1,0 +1,18 @@
+# date=2026-09-17T20:58:35+10:00 host=ubuntu24.04-16vcpu cpus=16 perfcached=perfcached 0.4.0-rc3 (7253754) reps=2 secs=8 workers=4 server_cpus=0-7 client_cpus=8-15 door=native-json dialect via libperfd
+mode	cell	rep	subs	pub_s	deliv_s	expected_deliv_s	shortfall_pct	got_nothing	srv_cores	pub_client_cores	sub_client_cores	queue_dropped	publish_paused	slow_kills
+plain	s1-max	1	1	644905	644885	644905	0.0	0	3.28	1.5	0.4	0	0	0
+plain	s64-paced20k	1	64	20000	1279996	1280000	0.0	0	2.93	0.3	3.4	0	0	0
+plain	s64-max	1	64	346392	4993792	22169088	77.5	0	3.82	0.9	5.5	0	0	5
+plain	s8-max-1KB	1	8	75809	604932	606472	0.3	0	3.93	0.3	1.6	0	0	0
+noise	s1-max	1	1	514977	514925	514977	0.0	0	3.35	1.8	0.4	0	0	0
+noise	s64-paced20k	1	64	20087	1285492	1285568	0.0	0	3.50	0.4	3.7	0	0	0
+noise	s64-max	1	64	68445	4379503	4380480	0.0	0	3.72	0.4	3.6	0	0	0
+noise	s8-max-1KB	1	8	30209	237900	241672	1.6	0	2.35	0.2	1.0	0	486	0
+noise	s1-max	2	1	451250	451206	451250	0.0	0	3.31	1.7	0.4	0	0	0
+noise	s64-paced20k	2	64	20092	1285805	1285888	0.0	0	3.42	0.4	3.8	0	0	0
+noise	s64-max	2	64	66734	3576661	4270976	16.3	0	3.50	0.3	3.8	0	28	8
+noise	s8-max-1KB	2	8	35444	280115	283552	1.2	0	3.11	0.3	1.1	0	345	0
+plain	s1-max	2	1	612043	612034	612043	0.0	0	2.92	1.5	0.4	0	0	0
+plain	s64-paced20k	2	64	20000	1279982	1280000	0.0	0	2.90	0.3	3.7	0	0	0
+plain	s64-max	2	64	267222	5194188	17102208	69.6	0	3.80	0.8	5.5	0	0	17
+plain	s8-max-1KB	2	8	65629	524923	525032	0.0	0	3.61	0.3	1.4	0	6	0
