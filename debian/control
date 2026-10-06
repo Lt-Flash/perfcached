@@ -1,0 +1,51 @@
+Source: perfcached
+Section: net
+Priority: optional
+Maintainer: Yury Kirsanov <yury@kfi.net.au>
+Build-Depends: debhelper-compat (= 13),
+               libsodium-dev,
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: perfcached
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+Conflicts: perfcached-standalone
+Replaces: perfcached-standalone
+Description: in-memory cache daemon with a durable write-ahead log
+ perfcached is a clustered in-memory cache and store: a lock-free read
+ path, a write-ahead log with real crash recovery, and periodic
+ snapshots.  It speaks its own binary protocol plus a
+ RESP-compatible surface, so existing Redis clients can talk to it
+ without changes.
+ .
+ Cluster modes are a property of the cluster, not of a node: store
+ (every node holds everything), proxy (placed single-copy) and shard
+ (ownership computed by rendezvous hashing).
+ .
+ Read PRODUCTION.md before a first deployment: the durability knobs
+ depend on what the storage actually measures, and the daemon reports
+ that at startup.
+
+Package: perfcached-standalone
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+Conflicts: perfcached
+Replaces: perfcached
+Provides: perfcached
+Description: in-memory cache daemon with a durable write-ahead log (single node)
+ The standalone edition of perfcached, for a cache that will only ever
+ be one node: the same daemon, protocols, write-ahead log, snapshots,
+ RESP-compatible surface, tools (perfcli, perfdump, perfload) and client
+ library as the perfcached package, built without the cluster code.  The
+ binary is about a third smaller and its static memory smaller, and a
+ [cluster] section in the configuration is refused rather than ignored.
+ .
+ It installs the same files as the perfcached package, under the same
+ names, so the two replace each other.
+ .
+ Read PRODUCTION.md before a first deployment: the durability knobs
+ depend on what the storage actually measures, and the daemon reports
+ that at startup.
