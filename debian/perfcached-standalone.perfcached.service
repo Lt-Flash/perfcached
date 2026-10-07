@@ -1,0 +1,65 @@
+# perfcached.service — systemd unit (task S24).
+#
+# Install:
+#   cp contrib/perfcached.service /etc/systemd/system/
+#   mkdir -p /etc/perfcached
+#   cp contrib/perfcached.conf.example /etc/perfcached/perfcached.conf
+#   chmod 640 /etc/perfcached/perfcached.conf
+#   (edit the secrets: client and cluster MUST differ - the daemon
+#    refuses equal secrets at startup, and warns on world-readable
+#    configs)
+#   systemctl daemon-reload && systemctl enable --now perfcached
+#
+# Hugepages: the arena takes MAP_HUGETLB pages when the pool has them
+# and degrades THP->4K otherwise, so the unit works with no pool at all.
+# To provision one, see contrib/sysctl-perfcached.conf - and READ BACK
+# HugePages_Total from /proc/meminfo after setting it; a live system
+# routinely under-delivers until caches are dropped and memory
+# compacted.
+
+[Unit]
+Description=perfcached cache daemon (standalone edition)
+Documentation=https://github.com/Lt-Flash/perfcached
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/perfcached -f /etc/perfcached/perfcached.conf
+Restart=on-failure
+RestartSec=1
+
+# a dedicated user; mlock pinning needs only the rlimit, no capability
+User=perfcached
+Group=perfcached
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+# No capability: CAP_NET_ADMIN in the clustered unit is for the cluster
+# socket's receive buffer, and this edition has no cluster socket.
+CapabilityBoundingSet=
+
+# /var/lib/perfcached, created and owned for us - point [wal] dir there
+StateDirectory=perfcached
+StateDirectoryMode=0700
+
+# hardening - everything here is compatible with the daemon's needs
+# (own-backing arenas are private anonymous mappings, WAL/RDB live in
+# the state directory, logs go to stdout/journal)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/perfcached
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# never OOM-kill the cache first: it IS the memory consumer by design.
+# (Not MemoryDenyWriteExecute - harmless here, but off in case a future
+# arch-specific allocator wants it; nothing maps W+X today.)
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
