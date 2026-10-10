@@ -1,0 +1,101 @@
+# S250: the suites that apply to the STANDALONE edition - every make check suite
+# that needs no cluster (no [cluster] section, no multicast, no clustersim or
+# container fleet).  make check-standalone runs them in order, stopping at the
+# first failure.  Regenerate when a suite is added to make check.
+sh test/readmetest.sh
+sh test/maxclientstest.sh ./perfcached
+sh test/memguardtest.sh ./perfcached
+sh test/nativerefusetest.sh ./perfcached
+sh test/hsparktest.sh ./perfcached ./noisetest
+sh test/idlebuftest.sh ./perfcached
+sh test/sweepwalktest.sh ./perfcached
+sh test/pubsubtest.sh ./perfcached ./pubsubcli
+sh test/pushbatchtest.sh ./perfcached
+sh test/wiredraintest.sh ./perfcached
+sh test/expireleaktest.sh ./perfcached
+sh test/scanresizetest.sh ./perfcached
+sh test/refusedlogtest.sh ./perfcached
+sh test/prefetchtest.sh ./perfcached
+sh test/pubsubpressuretest.sh ./perfcached ./rpsbench
+sh test/psnotifytest.sh ./perfcached
+sh test/jdeltest.sh ./perfcached
+sh test/xsstest.sh ./perfcached
+sh test/plaintextdoortest.sh ./perfcached ./perfcli
+sh test/udppushtest.sh ./perfcached ./udppushcli
+sh test/httpidletest.sh ./perfcached
+sh test/cmdstatstest.sh ./perfcached
+sh test/clientstest.sh ./perfcached
+sh test/daemontest.sh ./perfcached
+sh test/prototest.sh ./perfcached
+sh test/verbtest.sh ./perfcached
+sh test/httptest.sh ./perfcached
+sh test/unknowntest.sh ./perfcached
+sh test/pintest.sh ./perfcached
+sh test/slowredacttest.sh ./perfcached
+sh test/synctest.sh
+sh test/asyncbin.sh ./perfcached ./asyncbintest
+sh test/statlint.sh
+sh test/pressuretest.sh ./perfcached
+sh test/ceilingtest.sh ./perfcached
+sh test/tailtest.sh ./perfcached
+sh test/dumpresizetest.sh ./perfcached ./perfcli ./perfdump
+sh test/probetest.sh ./perfcached
+sh test/openstatstest.sh ./perfcached ./perfcli
+sh test/legwalktest.sh ./perfcached
+sh test/growtest.sh ./perfcached
+sh test/splitkeeptest.sh ./perfcached
+sh test/enabletest.sh ./perfcached
+sh test/eventtest.sh ./perfcached ./perfcli
+sh test/indexceiltest.sh ./perfcached
+sh test/hugetlbtest.sh ./perfcached
+sh test/noiseinterop.sh ./perfcached
+sh test/scantest.sh ./perfcached
+sh test/keysyieldtest.sh ./perfcached
+sh test/keysretiretest.sh ./perfcached ./perfcli
+sh test/keysbudgettest.sh ./perfcached
+sh test/shrinktest.sh ./perfcached ./perfcli
+sh test/grafanatest.sh ./perfcached
+sh test/storagetest.sh ./perfcached
+sh test/walprobetest.sh ./perfcached
+sh test/waltest.sh ./perfcached
+sh test/waldroptest.sh ./perfcached ./pcbench ./perfcli
+sh test/rdbtest.sh ./perfcached
+sh test/recoverytest.sh ./perfcached
+sh test/walctrltest.sh ./perfcached
+sh test/healtest.sh ./perfcached ./syncfailshim.so
+sh test/rdbkilltest.sh ./perfcached
+sh test/walsizetest.sh ./perfcached
+sh test/walresidenttest.sh ./perfcached
+sh test/pinbothtest.sh ./perfcached
+sh test/walringsizetest.sh ./perfcached
+sh test/colstattest.sh ./perfcached
+sh test/walordertest.sh ./perfcached
+sh test/expirereaptest.sh ./perfcached
+sh test/emptywraptest.sh ./perfcached
+sh test/autoscaletest.sh ./perfcached ./perfcli
+sh test/walobstest.sh ./perfcached
+sh test/waldisktest.sh ./perfcached
+sh test/vertest.sh ./perfcached
+sh test/aheadtest.sh ./perfcached
+sh test/addrwaittest.sh ./perfcached
+sh test/dirlocktest.sh ./perfcached
+sh test/legdraintest.sh ./perfcached
+sh test/bigvaltest.sh ./perfcached
+sh test/loadfactortest.sh ./perfcached
+sh test/pagejstest.sh ./perfcached
+sh test/winmaxtest.sh ./perfcached
+sh test/utf8statstest.sh ./perfcached
+sh test/snaptriggertest.sh ./perfcached
+sh test/resplistener.sh ./perfcached
+sh test/upstreamtest.sh ./perfcached
+sh test/setnxtest.sh ./perfcached
+sh test/typestest.sh ./perfcached
+sh test/jsontest.sh ./perfcached
+sh test/clitest.sh ./perfcached ./perfcli
+sh test/libtest.sh ./perfcached ./libtest
+sh test/fuzztest.sh ./perfcached
+sh test/wedgetest.sh ./perfcached ./wedgetest
+sh test/admintest.sh ./perfcached
+sh test/asynctest.sh ./perfcached ./asynctest
+sh test/jsonalloctest.sh ./perfcached ./allocshim.so
+sh test/liballoctest.sh ./perfcached ./liballoc ./allocshim.so
