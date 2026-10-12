@@ -1,0 +1,38 @@
+# Containerfile.alpine — perfcached on Alpine (musl), the small image.
+# Supported from 0.5.0 (DESIGN 12hd).  The Debian image stays the
+# measurement base for the numbers this directory publishes; results
+# from this image are quoted as Alpine/musl ones.
+#
+# musl was dropped on 2026-09-02 because its allocator serialised us:
+# a malloc per reply in libperfd and, in the daemon, a 256 KB buffer and
+# a document copy per JSON command (JSON.SET 50-130x slower).  S283 and
+# S284 removed those allocations from both, and the collapse went with
+# them - musl with its own malloc now serves JSON.SET at glibc's rate.
+#
+#   podman build --platform linux/amd64 -f bench/Containerfile.alpine \
+#       --build-arg REV=$(git rev-parse --short HEAD) \
+#       -t perfcached:alpine .
+#
+# Pin --platform explicitly: a poisoned multi-arch cache once produced
+# an arm/v7 image with x86 binaries inside.
+
+FROM docker.io/library/alpine:3.24 AS build
+RUN apk add --no-cache build-base libsodium-dev linux-headers
+COPY . /src
+WORKDIR /src
+ARG REV=unknown
+# S250: the edition - clustered (default) or standalone
+ARG EDITION=clustered
+# clean first: the context may carry host-built objects
+RUN make clean >/dev/null 2>&1 || true \
+ && make PC_BUILD_REV=$REV PC_EDITION=$EDITION perfcached perfcli natbench \
+ && cc -O2 -std=gnu11 -Wall -Wextra -Werror -o bench/pcbench \
+        bench/pcbench.c -lpthread
+
+FROM docker.io/library/alpine:3.24
+RUN apk add --no-cache libsodium python3
+COPY --from=build /src/perfcached /src/perfcli /src/bench/pcbench \
+     /src/natbench /usr/local/bin/
+COPY --from=build /src/bench/stallprobe.py /usr/local/bin/stallprobe.py
+ENTRYPOINT ["perfcached"]
+CMD ["-f", "/etc/perfcached.conf"]
