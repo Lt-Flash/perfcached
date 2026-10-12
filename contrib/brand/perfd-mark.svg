@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="libperfd">
+  <title>libperfd / perfcli - the compass</title>
+  <desc>A four-point compass in a ring with four cells at the points: the north point of the needle is red, as on every real compass; the lit cell at north is the record found, the three grey cells are where it is kept.  The anchor's sibling: same four cells, same lit north.</desc>
+  <style>
+    .ink { stroke: #1b1f24; }
+    .inkfill { fill: #1b1f24; }
+    .kept { fill: #9aa4b2; }
+    .found { fill: #2f6df6; }
+    .north { fill: #d6453d; }
+    .plate { fill: #ffffff; stroke: #d9dee5; }
+    @media (prefers-color-scheme: dark) {
+      .ink { stroke: #e6e9ee; }
+      .inkfill { fill: #e6e9ee; }
+      .kept { fill: #6b7482; }
+      .plate { fill: #14181d; stroke: #2a313a; }
+    }
+  </style>
+  <rect class="plate" x="0.5" y="0.5" width="119" height="119" rx="24" stroke-width="1"/>
+  <circle class="ink" cx="60" cy="64" r="44" fill="none" stroke-width="4"/>
+  <path class="inkfill" d="M60 64 L68 56 L96 64 L68 72 L60 100 L52 72 L24 64 L52 56 Z"/>
+  <path class="north" d="M60 28 L68 56 L60 64 L52 56 Z"/>
+  <rect class="found" x="50" y="10" width="20" height="20" rx="5"/>
+  <rect class="kept" x="94" y="54" width="20" height="20" rx="4"/>
+  <rect class="kept" x="50" y="98" width="20" height="20" rx="4"/>
+  <rect class="kept" x="6" y="54" width="20" height="20" rx="4"/>
+</svg>
