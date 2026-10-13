@@ -1,0 +1,33 @@
+# Contributor: Yury Kirsanov <yury@kfi.net.au>
+# Maintainer: Yury Kirsanov <yury@kfi.net.au>
+#
+# S370 (perfcached 0.5.8): libperfd, the perfcached client library, as Alpine
+# packages - libperfd (the shared library) and libperfd-dev (header, static
+# archive, .so link, pkg-config file).  Built from a perfcached source
+# tarball with `make install-lib`; signed with the perfcached release key
+# (contrib/alpine/keys/*.rsa.pub goes in /etc/apk/keys).  See README.md here.
+pkgname=libperfd
+pkgver=0.6.0
+_pcver=0.6.3
+pkgrel=0
+pkgdesc="Client library for perfcached - Noise, fleet awareness, typed verbs (MIT)"
+url="https://github.com/Lt-Flash/perfcached"
+arch="all"
+license="MIT"
+depends_dev="libsodium-dev"
+makedepends="libsodium-dev linux-headers"
+subpackages="$pkgname-dev"
+source="perfcached-$_pcver.tar.gz"
+builddir="$srcdir/perfcached-$_pcver"
+# the library's suites need a running daemon; the release build runs them
+options="!check"
+
+build() {
+	make PC_BUILD_REV="${PC_BUILD_REV:-$_pcver}" libperfd.a libperfd.so
+}
+
+package() {
+	make PC_BUILD_REV="${PC_BUILD_REV:-$_pcver}" install-lib \
+		DESTDIR="$pkgdir" PREFIX=/usr
+	install -Dm644 lib/LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+}
