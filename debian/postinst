@@ -1,0 +1,18 @@
+#!/bin/sh
+# perfcached.service runs User=perfcached.  systemd processes
+# /usr/lib/sysusers.d at boot, so without this the account would not
+# exist until then - and a unit started before that fails with a
+# systemd-shaped error that says nothing about a missing user.
+set -e
+
+case "$1" in
+configure)
+	if command -v systemd-sysusers >/dev/null 2>&1; then
+		systemd-sysusers /usr/lib/sysusers.d/perfcached.conf || true
+	fi
+	;;
+esac
+
+#DEBHELPER#
+
+exit 0
