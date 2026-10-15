@@ -1,0 +1,51 @@
+# date=2026-09-17T19:17:25+10:00 host=ubuntu24.04-16vcpu cpus=16 srv_cpus=0-7 cli_cpus=8-15 reps=2 secs=8 val=64
+# perfcached=perfcached 0.4.0-rc3 (e9b7fdb) redis=v=8.10.1
+arm	cell	rep	pub_s	deliv_s	p50_us	p99_us	p999_us	max_us	lost	gaps	ooo	eof	errs	srv_cores	srv_ctxsw_s	drv_cores	busiest_thr
+# arm=redis-io1 comm=redis-server threads=6 Cpus_allowed_list:0-7
+redis-io1	s1-paced100k	1	100000	100001	192	432	592	1088	0	0	0	0	0	1.00	6	1.17	0.51
+redis-io1	s1-max	1	572272	572272	248	496	672	1472	0	0	0	0	0	1.00	4	0.80	0.32
+redis-io1	s64-paced20k	1	20001	1279987	1376	2048	2688	4352	0	0	0	0	0	1.00	4	1.40	0.27
+redis-io1	s64-max	1	57867	3703551	2624	4608	6528	8448	0	0	0	0	0	1.00	4	1.08	0.20
+# arm=redis-io1 after: client_output_buffer_limit_disconnections:0
+# arm=redis-io4 comm=redis-server threads=9 Cpus_allowed_list:0-7
+redis-io4	s1-paced100k	1	100000	99999	126	236	440	816	0	0	0	0	0	3.06	44017	1.74	0.71
+redis-io4	s1-max	1	837103	837103	148	296	496	1024	0	0	0	0	0	2.83	42267	1.37	0.52
+redis-io4	s64-paced20k	1	20000	1279968	1824	3200	4864	7552	0	0	0	0	0	2.96	2878	1.55	0.27
+redis-io4	s64-max	1	63199	4045015	2688	4096	4864	6912	0	0	0	0	0	1.23	2922	1.19	0.21
+# arm=redis-io4 after: client_output_buffer_limit_disconnections:0
+# arm=pc-w4 comm=perfcached threads=7 Cpus_allowed_list:0-7
+pc-w4	s1-paced100k	1	99995	99996	144	360	544	800	0	0	0	0	0	1.84	24989	1.37	0.59
+pc-w4	s1-max	1	983714	983707	208	480	640	1472	0	0	0	0	0	3.12	31069	1.46	0.59
+pc-w4	s64-paced20k	1	19999	1280063	360	816	1088	2496	0	0	0	0	0	2.54	4350	2.40	0.45
+pc-w4	s64-max	1	202475	12958319	1280	3200	3968	5376	0	0	0	0	0	3.93	3524	3.17	0.60
+# arm=pc-w4 after: published=11707232 delivered=138087752 queue_dropped=0 slow_kills=0
+# arm=pc-w1 comm=perfcached threads=4 Cpus_allowed_list:0-7
+pc-w1	s1-paced100k	1	99999	99999	220	488	736	1152	0	0	0	0	0	1.00	14	1.18	0.52
+pc-w1	s1-max	1	553568	553572	336	528	720	1952	0	0	0	0	0	1.00	13	0.84	0.35
+pc-w1	s64-paced20k	1	19999	1280027	1376	2240	2752	3520	0	0	0	0	0	1.00	14	1.52	0.29
+pc-w1	s64-max	1	74570	4772552	2496	3520	4096	5632	0	0	0	0	0	1.00	14	1.46	0.27
+# arm=pc-w1 after: published=6733852 delivered=60243784 queue_dropped=0 slow_kills=0
+# arm=pc-w1 comm=perfcached threads=4 Cpus_allowed_list:0-7
+pc-w1	s1-paced100k	2	100001	100002	224	408	592	1472	0	0	0	0	0	1.00	14	1.14	0.51
+pc-w1	s1-max	2	532567	532571	344	576	784	1664	0	0	0	0	0	1.00	14	0.84	0.35
+pc-w1	s64-paced20k	2	20000	1279994	1408	2688	3584	4608	0	0	0	0	0	1.00	15	1.45	0.26
+pc-w1	s64-max	2	74491	4767952	2496	3520	4032	5248	0	0	0	0	0	1.00	13	1.46	0.27
+# arm=pc-w1 after: published=6550344 delivered=60008112 queue_dropped=0 slow_kills=0
+# arm=pc-w4 comm=perfcached threads=7 Cpus_allowed_list:0-7
+pc-w4	s1-paced100k	2	100000	99994	132	328	464	800	0	0	0	0	0	1.95	32943	1.30	0.51
+pc-w4	s1-max	2	923950	923943	240	688	976	1504	0	0	0	0	0	2.81	9663	1.29	0.56
+pc-w4	s64-paced20k	2	20001	1279969	384	832	1024	1984	0	0	0	0	0	2.89	3801	2.72	0.53
+pc-w4	s64-max	2	201748	12911750	1216	2496	3328	6656	0	0	0	0	0	3.92	3917	3.24	0.61
+# arm=pc-w4 after: published=11160732 delivered=137030952 queue_dropped=0 slow_kills=0
+# arm=redis-io4 comm=redis-server threads=9 Cpus_allowed_list:0-7
+redis-io4	s1-paced100k	2	99999	99999	132	252	608	4224	0	0	0	0	0	3.05	42418	1.76	0.72
+redis-io4	s1-max	2	812831	812841	152	320	504	4352	0	0	0	0	0	2.84	40608	1.34	0.52
+redis-io4	s64-paced20k	2	20002	1280083	2176	6528	9984	17408	0	0	0	0	0	2.81	2197	1.27	0.23
+redis-io4	s64-max	2	52890	3385552	3264	4736	6272	7808	0	0	0	0	0	1.20	2329	1.07	0.20
+# arm=redis-io4 after: client_output_buffer_limit_disconnections:0
+# arm=redis-io1 comm=redis-server threads=6 Cpus_allowed_list:0-7
+redis-io1	s1-paced100k	2	100000	99999	232	472	640	1504	0	0	0	0	0	1.00	4	1.08	0.47
+redis-io1	s1-max	2	574091	574103	256	488	672	1568	0	0	0	0	0	1.00	3	0.77	0.30
+redis-io1	s64-paced20k	2	20000	1280104	1664	2880	3904	6400	0	0	0	0	0	1.00	3	1.23	0.22
+redis-io1	s64-max	2	54459	3485363	2880	3712	5248	6784	0	0	0	0	0	1.00	3	1.08	0.20
+# arm=redis-io1 after: client_output_buffer_limit_disconnections:0
