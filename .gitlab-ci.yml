@@ -1,0 +1,262 @@
+# perfcached CI - private GitLab edition (S55).  This is the file
+# changes are PROVEN against; .github/workflows/ci.yml is ported from
+# here once a job shape works.  Any executor that can apt-get works;
+# the fullest coverage comes from a shell runner ON the build host
+# running as root (loop/dm fixture + real mlock) - with a docker
+# executor those tests announce SKIP and the rest still gates.
+# The deps line tolerates a read-only/preinstalled toolchain so the
+# same file drives both executor kinds.
+#
+# TIERED since 2026-09-02.  The full suite costs ~an hour of a shared
+# build host, which is too slow to sit between a developer and every
+# commit.  So:
+#   branch push -> lint + the FAST gate (~5 min): every unit binary
+#                  and the seconds-long suites, so a commit is still
+#                  individually accountable and a break bisects to one
+#                  commit rather than to a week of them
+#   TAG push    -> the whole ladder, natively and under ASan+UBSan.
+#                  A tag is how a feature set is declared ready, and
+#                  it is what release promises are made from.
+# The heavy jobs therefore key on $CI_COMMIT_TAG, not on a branch.
+#
+# 2026-10-14 (the operator: "we need to speed up CI checks", releases are
+# soaked candidates - only an RC tag is judged):
+#   - an rc tag (vX.Y.Z-rcN) runs the whole ladder, every job at once
+#     (needs: []) - no stage waits on lint and the fast gate first, and the
+#     arch matrix no longer waits for the x86_64 suites; a red lint or fast
+#     job still fails the pipeline.  Measured before: 70 min, 100 with the
+#     matrix, 18 of them before any full job started
+#   - a FINAL tag (vX.Y.Z) runs nothing: it is put on the commit of the rc
+#     that soaked, whose pipeline already judged that exact tree
+#   - a branch push runs lint and the fast gate side by side
+#   - core is split in two (core1, core2): it was the longest job
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG !~ /-rc[0-9]+$/
+      when: never
+    - when: always
+
+stages: [lint, fast, full, arch, nightly]
+
+.deps: &deps
+  - apt-get update -qq && apt-get install -y -qq gcc make libsodium-dev
+    libevent-dev libcurl4-openssl-dev libmicrohttpd-dev openssl >/dev/null
+    || echo "deps install failed - relying on preinstalled toolchain"
+
+# GATING since the 2026-09-01 triage took the baseline to ZERO: a red
+# tidy job means a real finding, and it runs FIRST so five minutes of
+# lint fail-fasts the pipeline before anything expensive is spent.
+clang-tidy:
+  stage: lint
+  image: debian:13
+  timeout: 45m
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq gcc make libsodium-dev
+      libevent-dev clang-tidy bear >/dev/null
+      || echo "deps install failed - relying on preinstalled toolchain"
+  script:
+    # clean first: on a shell runner the clone is shared across jobs,
+    # and bear records nothing from an up-to-date build
+    - make clean && bear -- make -j"$(nproc)"
+    # the Makefile compiles+links in one cc line, so the archive rides
+    # each source's compile command - without the -Wno, clang counts
+    # "libperfd.a: linker input unused" as an ERROR and tidy exits 1
+    - git ls-files 'src/*.c' 'lib/*.c' 'cli/*.c'
+      | xargs clang-tidy -p .
+      --extra-arg=-Wno-unused-command-line-argument 2>/dev/null
+      | tee tidy.log
+    - 'grep -cE "warning:|error:" tidy.log || echo "0 findings"'
+
+# The ratchet on every commit: builds, and everything that can prove
+# itself in seconds actually runs.
+check-fast:
+  stage: fast
+  needs: []                     # beside lint, not after it
+  image: debian:13
+  timeout: 30m
+  before_script: *deps
+  script:
+    - make -j"$(nproc)"
+    - tools/netns-run.sh make check-fast
+
+# The full ladder: tags only - as SEVEN suite GROUPS (Makefile CHECK_GROUPS,
+# `make check-g-<group>`), each its own job, plain and under ASan+UBSan.
+# 2026-10-03: the single check had grown to ~90 min (its 90m ceiling was
+# already raised to 150 after rc65 took 90 and a 0.4.0 re-point was killed
+# at exactly 90) and check-asan to ~95, and one red suite cost a full
+# rerun.  Groups are balanced to ~13-17 min under ASan; the shell runner
+# takes six jobs at once (concurrent = 6 since 2026-10-03) and
+# netns-run.sh gives each job its own loopback, so the suites' fixed ports
+# and multicast groups cannot collide.  A red group is retried alone.
+#
+# CHECK_GROUPS (comma-separated, e.g. "repl1,cluster2") runs only those
+# groups - on a manual pipeline, or `git push -o ci.variable=CHECK_GROUPS=
+# repl1` to run chosen groups on a branch push.  Unset: every group.
+.groups: &groups
+  parallel:
+    matrix:
+      - GROUP: [core1, core2, durability, cluster1, cluster2, repl1, repl2, repl3]
+
+.group-filter: &group-filter
+  - case ",$CHECK_GROUPS," in ",,"|*",$GROUP,"*) ;; *) echo "group $GROUP not in CHECK_GROUPS=$CHECK_GROUPS - skipped"; exit 0;; esac
+
+check:
+  stage: full
+  needs: []
+  image: debian:13
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CHECK_GROUPS
+  <<: *groups
+  before_script: *deps
+  script:
+    - *group-filter
+    - make -j"$(nproc)"
+    - tools/netns-run.sh make check-g-$GROUP
+
+# UP7c (DESIGN 12ns): the roll under load - three loopback members, 2,500
+# keys pre-filled and 500 deleted, rollload through libperfd for the whole
+# roll, perfcli upgrade with the switch hook; no error, no lost key, no
+# resurrection, on every node.  Tag-only, beside the other full jobs.
+roll:
+  stage: full
+  needs: []
+  image: debian:13
+  timeout: 30m
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script: *deps
+  script:
+    - make -j"$(nproc)"
+    - tools/netns-run.sh make check-roll
+
+# The epoll backend under the fleet suites (2026-10-16): CI runs everything
+# over io_uring (the runners' kernels have it) while PROD runs io = epoll,
+# which only iobusytest exercised.  PERFCACHED_URING_DENY=1 makes every
+# daemon in the job fall back to epoll; the groups without an io_uring
+# assertion (cluster1 holds iobusytest and iostattest, which assert the
+# default) and the roll under load.  Tag-only.
+check-epoll:
+  stage: full
+  needs: []
+  image: debian:13
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_TAG
+  parallel:
+    matrix:
+      - GROUP: [cluster2, repl1, repl2, repl3, roll]
+  before_script: *deps
+  script:
+    - make -j"$(nproc)"
+    - export PERFCACHED_URING_DENY=1
+    - if [ "$GROUP" = roll ]; then tools/netns-run.sh make check-roll; else tools/netns-run.sh make check-g-$GROUP; fi
+
+# S250: the standalone edition - no cluster code, its own gate
+check-standalone:
+  stage: full
+  needs: []
+  image: debian:13
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script: *deps
+  script:
+    - make clean
+    - make PC_EDITION=standalone -j"$(nproc)"
+    - ./perfcached -V | grep -q standalone
+    - tools/netns-run.sh make PC_EDITION=standalone check-standalone
+
+# S285: Alpine - musl and gcc 15 - a supported runtime from 0.5.0.  Both
+# editions compile, the standalone edition runs check-standalone, all
+# inside an alpine container (podman here - the runner is the build host).
+# Tag-only, beside the other full-ladder jobs.
+alpine:
+  stage: full
+  needs: []
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - tools/alpine-check.sh
+    # PD-11: the packages - abuild, apk add, the services through OpenRC
+    - tools/alpine-pkg-check.sh
+
+# S413 part 1 (DESIGN 12no): the admin image - perfcached-dashboard, perfcli
+# and nginx - built with podman on the shell runner, proven to answer, and
+# kept as a tar beside the release artifacts.  Tag-only, like the tarballs.
+# (named admin-image: a job called `image` is read as the global image:
+# keyword - "image name should be a string", and the pipeline is created
+# failed with no jobs, 2026-10-16)
+admin-image:
+  stage: full
+  needs: []
+  timeout: 40m
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - tools/image-admin.sh /var/tmp/pcrel-image
+    - mkdir -p image && cp /var/tmp/pcrel-image/perfcached-admin-*.tar image/ 2>/dev/null || true
+  artifacts:
+    paths: [image/]
+    expire_in: 14 days
+
+# The four-arch matrix (S27), tag-only.  Until 2026-10-14 it ran AFTER the
+# x86_64 suites passed (S60), so emulated arm32's 20+ minutes were never
+# spent on a red tree - and added 27 minutes to the end of every green
+# one.  An rc is a release decision, so the matrix now runs beside the
+# suites (needs: []): a red rc costs its CPU, a green one no longer waits.
+#
+# It runs on the shell runner because that is where podman and qemu-user
+# binfmt live; anywhere else the script announces a loud SKIP rather than
+# passing quietly, so a mis-scheduled job cannot masquerade as coverage.
+matrix:
+  stage: arch
+  needs: []
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - tools/matrix.sh
+
+# Highest-value job (S55 ordering): the whole suite under ASan+UBSan,
+# same spelling as the local pre-push loop - per group, as check above.
+check-asan:
+  stage: full
+  needs: []
+  image: debian:13
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CHECK_GROUPS
+  <<: *groups
+  before_script: *deps
+  script:
+    - *group-filter
+    - tools/netns-run.sh make check-asan-g-$GROUP
+
+# S55 item 4: memcheck, NIGHTLY and LOCAL - "slow, not CI material".
+# It runs here because this runner IS the build host, and only on a
+# schedule: never on a push, so it cannot sit between a developer and a
+# commit.  Create the schedule in GitLab (CI/CD -> Schedules); without
+# one this job simply never runs.
+#
+# Scope is the UNIT binaries, not `make check` wholesale.  Memcheck
+# costs ~20x, and the integration suites start a real daemon behind
+# fixed startup waits - under valgrind those time out, so a full-suite
+# nightly would report timeouts instead of findings and train everyone
+# to ignore red.  That is the same argument this section uses to defer
+# TSan, and it applies here.  The unit binaries are also where the
+# class this job exists for lives: uninitialised reads, which ASan does
+# not see and MSan cannot reach.
+valgrind:
+  stage: nightly
+  timeout: 120m
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  before_script: *deps
+  script:
+    - apt-get install -y -qq valgrind >/dev/null || true
+    - tools/nightly-valgrind.sh
