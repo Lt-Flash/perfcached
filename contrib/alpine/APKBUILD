@@ -1,0 +1,104 @@
+# Contributor: Yury Kirsanov <yury@kfi.net.au>
+# Maintainer: Yury Kirsanov <yury@kfi.net.au>
+#
+# perfcached for Alpine (PD-11, DESIGN 12nr; S370 began it with libperfd
+# alone).  One source tarball, six packages:
+#   perfcached             the clustered daemon, perfcli, perfdump, perfload,
+#                          the OpenRC service (not enabled), the example config
+#   perfcached-standalone  the standalone edition under the same names
+#                          (one daemon per host: apk del perfcached, then add it)
+#   perfcached-dashboard   the status page as its own service, its own account
+#   libperfd               the client library (.so.0)
+#   libperfd-dev           perfd.h, libperfd.a, the .so link, pkg-config
+#   perfcached-doc         GUIDE, PRODUCTION, the ChangeLog
+# Built from the release tarball with the tree's own Makefile; signed with
+# the perfcached release key (keys/*.rsa.pub goes in /etc/apk/keys).  See
+# README.md here.  Both daemon packages write INSTALL-MODE = package, so
+# the daemon's upgrade_stage refuses (PD-9): apk upgrades the daemon.
+pkgname=perfcached
+pkgver=0.7.1
+pkgrel=0
+pkgdesc="Clustered in-memory cache and store with a durable write-ahead log"
+url="https://github.com/Lt-Flash/perfcached"
+arch="all"
+license="MIT"
+depends="libsodium"
+makedepends="libsodium-dev linux-headers libmicrohttpd-dev curl-dev"
+install="$pkgname.pre-install $pkgname-standalone.pre-install $pkgname-dashboard.pre-install"
+subpackages="$pkgname-doc $pkgname-standalone:standalone $pkgname-dashboard:dashboard
+	libperfd:lib libperfd-dev:dev"
+source="perfcached-$pkgver.tar.gz perfcached.initd perfcached-dashboard.initd"
+builddir="$srcdir/perfcached-$pkgver"
+# the suites need a running fleet, ports and namespaces; the release build runs them
+options="!check"
+
+_rev="${PC_BUILD_REV:-$pkgver}"
+
+build() {
+	# the clustered edition, the dashboard and the library, installed into a
+	# staging tree; then the tree cleaned and built again as the standalone
+	# edition (the edition is a compile-time choice - debian/rules does the same)
+	make PC_BUILD_REV="$_rev" PC_DASH=yes PC_MAIL=libcurl \
+		perfcached perfcli perfdump perfload perfcached-dashboard libperfd.a libperfd.so
+	make PC_BUILD_REV="$_rev" PC_DASH=yes PC_MAIL=libcurl install \
+		DESTDIR="$builddir/_cl" PREFIX=/usr
+	make clean
+	make PC_BUILD_REV="$_rev" PC_EDITION=standalone PC_MAIL=libcurl \
+		perfcached perfcli perfdump perfload libperfd.a libperfd.so
+	./perfcached -V | head -1 | grep -q ' standalone$' || return 1
+	make PC_BUILD_REV="$_rev" PC_EDITION=standalone PC_DASH=no PC_MAIL=libcurl install \
+		DESTDIR="$builddir/_sa" PREFIX=/usr
+}
+
+# a daemon package from a staging tree: drop what systemd and the /opt
+# upgrade helper own, add the OpenRC service and the install-mode marker
+_daemon_tree() { # <staging tree> <destination>
+	mkdir -p "$2"
+	cp -a "$1"/. "$2"/
+	rm -rf "$2"/etc/systemd "$2"/usr/lib/sysusers.d "$2"/usr/sbin \
+		"$2"/etc/perfcached/upgrade.conf.example
+	install -Dm755 "$srcdir"/perfcached.initd "$2"/etc/init.d/perfcached
+	install -Dm644 /dev/null "$2"/usr/share/perfcached/INSTALL-MODE
+	echo package > "$2"/usr/share/perfcached/INSTALL-MODE
+}
+
+package() {
+	_daemon_tree "$builddir/_cl" "$pkgdir"
+	install -Dm755 "$srcdir"/perfcached-dashboard.initd "$pkgdir"/etc/init.d/perfcached-dashboard
+	install -Dm644 "$builddir"/LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+	install -Dm644 "$builddir"/GUIDE.md "$pkgdir"/usr/share/doc/$pkgname/GUIDE.md
+	install -Dm644 "$builddir"/PRODUCTION.md "$pkgdir"/usr/share/doc/$pkgname/PRODUCTION.md
+	install -Dm644 "$builddir"/ChangeLog "$pkgdir"/usr/share/doc/$pkgname/ChangeLog
+}
+
+standalone() {
+	pkgdesc="$pkgdesc - the standalone edition (no cluster)"
+	depends="libsodium"
+	replaces="$pkgname"
+	mkdir -p "$subpkgdir"
+	_daemon_tree "$builddir/_sa" "$subpkgdir"
+	rm -rf "$subpkgdir"/usr/lib "$subpkgdir"/usr/include
+}
+
+dashboard() {
+	pkgdesc="perfcached dashboard - the status page served over libperfd"
+	depends="libperfd libmicrohttpd"
+	mkdir -p "$subpkgdir"
+	amove usr/bin/perfcached-dashboard etc/perfcached/perfcached-dashboard.conf.example \
+		etc/init.d/perfcached-dashboard
+}
+
+lib() {
+	pkgdesc="Client library for perfcached - Noise, fleet awareness, typed verbs"
+	depends="libsodium"
+	mkdir -p "$subpkgdir"
+	amove usr/lib/libperfd.so.*
+}
+
+dev() {
+	pkgdesc="Client library for perfcached - header, static archive, pkg-config"
+	depends="libperfd libsodium-dev"
+	mkdir -p "$subpkgdir"
+	amove usr/lib/libperfd.so usr/lib/libperfd.a usr/lib/pkgconfig usr/include
+	install -Dm644 "$builddir"/lib/LICENSE "$subpkgdir"/usr/share/licenses/libperfd/LICENSE
+}
