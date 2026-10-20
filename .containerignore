@@ -1,0 +1,16 @@
+# the admin image's build context (contrib/docker/admin/Dockerfile): the
+# sources, not the history, objects or the bench rigs
+.git
+*.o
+*.a
+*.so
+*.so.*
+perfcached
+perfcli
+perfdump
+perfload
+perfcached-dashboard
+bench/
+doc/
+.gitlab-ci.yml
+.github/

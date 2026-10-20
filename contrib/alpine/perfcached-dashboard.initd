@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+# perfcached-dashboard - the status page as its own OpenRC service
+# (DESIGN 12no, PD-11).  A client of the fleet's native door through
+# libperfd: nothing ties it to the perfcached service (S415).  Shipped not
+# enabled: one dashboard shows the whole fleet - rc-update add
+# perfcached-dashboard where the page should be served.
+description="perfcached dashboard (the status page, served over libperfd)"
+command=/usr/bin/perfcached-dashboard
+cfgfile=${cfgfile:-/etc/perfcached/perfcached-dashboard.conf}
+command_args="-f $cfgfile"
+command_user="perfcached-dashboard:perfcached-dashboard"
+command_background=yes
+pidfile=/run/perfcached-dashboard.pid
+output_log=/var/log/perfcached-dashboard.log
+error_log=/var/log/perfcached-dashboard.log
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	[ -s "$cfgfile" ] || { eerror "$cfgfile is missing - copy /etc/perfcached/perfcached-dashboard.conf.example and set the seeds and the secret"; return 1; }
+	checkpath -f -m 0640 -o perfcached-dashboard:perfcached-dashboard /var/log/perfcached-dashboard.log
+}
