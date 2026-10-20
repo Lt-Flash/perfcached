@@ -1,0 +1,24 @@
+# perfcached-upgrade.path - UP5 (DESIGN 12nf): starts the root helper when
+# the daemon asks for a build.  NOT enabled by the install; opting in is
+#   systemctl enable --now perfcached-upgrade.path
+#
+# PathExists names <state_dir>/upgrade/request.  The default is the unit's
+# StateDirectory; where [daemon] state_dir is elsewhere (the prefix's var/
+# behind a link, say) override it in a drop-in:
+#   systemctl edit perfcached-upgrade.path
+#   [Path]
+#   PathExists=
+#   PathExists=/opt/perfcached/var/upgrade/request
+# and set the same state_dir in /etc/perfcached/upgrade.conf if the
+# configuration does not name it.
+
+[Unit]
+Description=perfcached upgrade requests (the root helper's trigger)
+Documentation=https://github.com/Lt-Flash/perfcached
+
+[Path]
+PathExists=/var/lib/perfcached/upgrade/request
+Unit=perfcached-upgrade.service
+
+[Install]
+WantedBy=multi-user.target
