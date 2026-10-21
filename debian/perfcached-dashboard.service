@@ -1,0 +1,63 @@
+# perfcached-dashboard.service - the status page as its own process
+# (DESIGN 12no, 0.6.6).
+#
+# The dashboard is a CLIENT of the fleet's native door through libperfd,
+# like perfcli: nothing in the daemon knows it exists, and nothing here
+# ties this unit to perfcached.service - no After, Requires, BindsTo or
+# PartOf in either direction (S415).  It runs on a separate machine, a
+# jump host, a container or a node; a member that is not up yet is shown
+# down and dialled again.  This unit failing, restarting or being
+# restarted never touches a daemon.
+#
+# It is shipped DISABLED.  One dashboard shows the whole fleet through the
+# member list; give its config several seeds.  Enable it where the page
+# should be served:
+#
+#     systemctl enable --now perfcached-dashboard
+#
+# It binds 127.0.0.1:8090 unless /etc/perfcached/perfcached-dashboard.conf
+# says otherwise.  TLS, HTTP/2 and anything facing a network belong to a
+# reverse proxy in front of it (nginx, HAProxy, Caddy) - see GUIDE.md.
+
+[Unit]
+Description=perfcached dashboard (the status page, served over libperfd)
+Documentation=https://github.com/Lt-Flash/perfcached
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/perfcached-dashboard -f /etc/perfcached/perfcached-dashboard.conf
+Restart=on-failure
+RestartSec=2
+# a crash loop stops here rather than at the daemon's door
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# its own account (contrib/perfcached-dashboard.sysusers), so the client
+# secret in its config is readable by it alone
+User=perfcached-dashboard
+
+# a dashboard under attack costs the host this slice and the daemon nothing
+MemoryMax=256M
+CPUQuota=100%
+TasksMax=64
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
