@@ -1,0 +1,15 @@
+# /etc/perfcached/upgrade.conf - the root helper's settings (UP5).  Read as
+# key = value lines, never sourced.  Every key is optional; the defaults:
+#unit = perfcached
+#link = /opt/perfcached
+#conf = /etc/perfcached/perfcached.conf
+# where the daemon keeps upgrade/ (request, node, staged): the
+# configuration's [daemon] state_dir, which upgrades need - set here only
+# to override what the helper reads from the configuration
+#state_dir =
+# how long a started build has to report READY, then the same again for
+# the previous one after a switch back
+#ready_s = 600
+# root's own: the copies it verifies, and result-<request id>
+#results = /var/lib/perfcached-upgrade
+#systemctl = systemctl
