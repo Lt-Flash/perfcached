@@ -1,0 +1,20 @@
+# perfcached-upgrade.service - UP5 (DESIGN 12nf): installs the signed build
+# a node asked for, switches to it, and switches back if it is not READY.
+# Started by perfcached-upgrade.path; see @SBINDIR@/perfcached-upgrade for
+# what it trusts and /etc/perfcached/upgrade.conf for its settings.
+#
+# It runs as root because it installs into /opt and restarts a unit.  It
+# reads the request and the artifact by COPYING them into
+# /var/lib/perfcached-upgrade first, and verifies the copy with the build
+# already installed - the daemon's own directory is never written by it.
+
+[Unit]
+Description=perfcached upgrade helper (installs a signed build a node asked for)
+Documentation=https://github.com/Lt-Flash/perfcached
+
+[Service]
+Type=oneshot
+ExecStart=@SBINDIR@/perfcached-upgrade
+# a snapshot may load in minutes (ready_s, twice: forward and back) - but a
+# helper must never hang for ever on a request it cannot finish
+TimeoutStartSec=45min
