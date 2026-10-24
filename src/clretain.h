@@ -1,0 +1,97 @@
+/*
+ * clretain.h - S238: RETAINED TOMBSTONES.
+ *
+ * The negative cache holds a tombstone for tombstone_ms (2 s): long enough
+ * for a set and its delete crossing on the wire (S209), nothing like long
+ * enough for a partition.  Measured (DESIGN S238): after a heal, a
+ * returning peer's repair sweep re-sent keys the other side had deleted,
+ * and a read that missed locally pulled a stale copy back - 50 of 50
+ * deletes made during the split came back, on every node.
+ *
+ * This table remembers every tombstone this node plants - its own
+ * deletes and those applied from peers - for `retain_s` (a Cassandra
+ * gc_grace), capped at `max` entries, oldest out first.  pc_neg_ver()
+ * falls back to it, so every receive path that already refused a copy
+ * older than a 2-s tombstone refuses one older than a retained one; and
+ * the per-peer sweep replays it to a peer coming back (cluster.c).
+ *
+ * Memory is malloc'd OUTSIDE the arena (arena_mb stays the record
+ * bound), counted in bytes and reported.  In memory only: a restart is
+ * B4's reconcile's case, a heal is this one's.  Sharded, one mutex per
+ * shard: planted on workers, looked up on the apply and peer threads.
+ */
+#ifndef PC_CLRETAIN_H
+#define PC_CLRETAIN_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+struct clretain_stats {
+	unsigned long long entries;        /* held now */
+	unsigned long long bytes;          /* what they cost, headers in */
+	unsigned long long dropped_early;  /* evicted by the cap before retain_s */
+	unsigned long long noted;          /* tombstones ever planted here */
+	unsigned long long local;          /* S405: of entries, this node's own
+	                                    * drops - refused, never replayed */
+	/* S443: the share that are EXPIRIES (S392: a key an eager collection
+	 * reaped, noted at its version) rather than deletes - of the entries
+	 * held, of the early drops and of the notes.  A TTL workload fills
+	 * the table with them, and the figures above alone read as deletes */
+	unsigned long long expiries;
+	unsigned long long dropped_early_expiries;
+	unsigned long long noted_expiries;
+	unsigned int retain_s, max;
+	unsigned int oldest_age_s;         /* 0 when empty */
+};
+
+/* 0 = off (retain_s 0), else the table exists - call once, before use */
+void clretain_init(unsigned int retain_s, unsigned int max);
+int clretain_enabled(void);
+
+/* remember a tombstone at @now_s (the highest version wins, the time is
+ * refreshed) */
+void clretain_note(const char *col, size_t cn, const char *key, size_t kn,
+		uint64_t ver, unsigned int now_s);
+/* S405: the same for a drop this node made for ITSELF - a write-through
+ * record dropped on Redis's invalidation, a startup flush, a mark found
+ * alone (AR1, S404): it refuses an older copy as any retained delete does,
+ * but the per-peer sweep never replays it - the peers heard the same
+ * invalidation themselves, or must not be touched at all.  A real delete
+ * noted later for the key makes the entry a replayed one again */
+void clretain_note_local(const char *col, size_t cn, const char *key,
+		size_t kn, uint64_t ver, unsigned int now_s);
+
+/* S443: the same for a key an eager collection's sweep reaped (S392) -
+ * held and replayed as any delete, counted apart so the figures can say
+ * how much of the table is expiries.  A delete noted later for the key
+ * makes the entry a delete */
+void clretain_note_expiry(const char *col, size_t cn, const char *key,
+		size_t kn, uint64_t ver, unsigned int now_s);
+
+/* the retained version for the key, 0 when none (or older than retain_s) */
+uint64_t clretain_get(const char *col, size_t cn, const char *key, size_t kn,
+		unsigned int now_s);
+
+/* call @cb for every retained tombstone planted in (@since_s, @upto_s];
+ * returns how many.  @cb runs under a shard lock: it must not call back in.
+ * S446: @expiry says the entry stands for an expiry, so a replay can say
+ * so to the peer */
+unsigned int clretain_each(unsigned int since_s, unsigned int upto_s,
+		void (*cb)(const char *col, size_t cn, const char *key, size_t kn,
+			uint64_t ver, int expiry, void *ctx), void *ctx);
+
+/* drop what is older than retain_s (1 Hz) */
+void clretain_expire(unsigned int now_s);
+
+void clretain_get_stats(struct clretain_stats *out, unsigned int now_s);
+unsigned long long clretain_dropped_early(void);
+
+/* S392: every delete planted AFTER the returned second (the clock
+ * clretain_note was given) is still held - none expired, none evicted
+ * early, none lost to memory.  UINT_MAX when the table is off.  It says
+ * nothing of deletes planted before this process started: the caller
+ * bounds by its own boot. */
+unsigned int clretain_complete_since(unsigned int now_s);
+unsigned int clretain_retain_s(void);    /* as configured */
+
+#endif
