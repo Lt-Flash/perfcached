@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: perfcached
+Source: https://github.com/Lt-Flash/perfcached
+
+Files: *
+Copyright: 2026 Yury Kirsanov <yury@kfi.net.au>
+License: see COPYING in the source tree
