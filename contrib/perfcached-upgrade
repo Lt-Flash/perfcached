@@ -1,0 +1,269 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 Yury Kirsanov - see COPYING
+#
+# perfcached-upgrade - UP5 (DESIGN 12nf): the privileged half of a node's
+# upgrade.  perfcached-upgrade.service runs it when the daemon writes
+# <state_dir>/upgrade/request; the daemon itself never gains a privilege
+# (it keeps NoNewPrivileges and writes only its own state directory).
+#
+# A request is a wish from an unprivileged process, never an instruction to
+# trust.  This installs the one build it names, and only if the INSTALLED
+# binary verifies the copy this script took (perfcached -K):
+#   1. the request and the artifact are copied into a directory only root
+#      writes (work) - READ AS THE DAEMON'S USER (setpriv), no symlink
+#      followed, no FIFO waited on, sizes capped - so a request can lead
+#      only where the daemon could read already, nothing there is read
+#      twice, and root writes nothing in the daemon's directory;
+#   2. its sha256 must be the request's, its signature good by the
+#      installed binary (the release key, [upgrade] trusted_keys);
+#   3. it is unpacked beside the live prefix (one top directory,
+#      perfcached-<something>, nothing outside it), its stamp read, and the
+#      live configuration checked with it (-C);
+#   4. stop; the state carried into the new prefix when it lives there
+#      (state_dir under the link); the link switched; start;
+#   5. READY from the NEW process: <state_dir>/upgrade/node naming a live
+#      pid other than the old one, the new revision, state=ready - within
+#      ready_s, or stop, switch back, start, and say so;
+#   6. <results>/result-<request id>: status ok | rolled-back | refused,
+#   (UP7b) a request with op=revert and to=<prefix> skips 1-3: the prefix
+#      must be the one this helper's newest ok result switched FROM; then
+#      4-5 as for a switch, back to it, with the same ready wait and the
+#      same switch-forward if the previous build does not come up.
+#      the reason, from and to.
+# A previous prefix is never deleted.
+#
+# Settings, /etc/perfcached/upgrade.conf (key = value lines - READ, never
+# sourced), each optional:
+#   unit      = perfcached                  the systemd unit
+#   link      = /opt/perfcached             the prefix link ExecStart runs through
+#   conf      = /etc/perfcached/perfcached.conf
+#   state_dir = (the config's [daemon] state_dir)
+#   ready_s   = 600                         a big snapshot loads in minutes
+#   results   = /var/lib/perfcached-upgrade root's: the work and the results
+#   systemctl = systemctl
+set -u
+umask 022
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CONFF=${PCUPG_CONF:-/etc/perfcached/upgrade.conf}
+UNIT=perfcached LINK=/opt/perfcached CONF=/etc/perfcached/perfcached.conf
+STATE= READY_S=600 RES=/var/lib/perfcached-upgrade SYSTEMCTL=systemctl
+ARTMAX=1073741824
+
+log() { echo "perfcached-upgrade: $*"; }
+die() { log "$*"; exit 2; }
+
+if [ -e "$CONFF" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in ''|'#'*) continue;; esac
+		k=$(printf '%s' "${line%%=*}" | tr -d ' \t')
+		v=$(printf '%s' "${line#*=}" | sed 's/^[ \t]*//; s/[ \t]*$//')
+		case "$k" in
+		unit) UNIT=$v;; link) LINK=$v;; conf) CONF=$v;;
+		state_dir) STATE=$v;; ready_s) READY_S=$v;; results) RES=$v;;
+		systemctl) SYSTEMCTL=$v;;
+		*) die "$CONFF: unknown key '$k'";;
+		esac
+	done < "$CONFF"
+fi
+case "$READY_S" in ''|*[!0-9]*) die "ready_s '$READY_S' is not a number of seconds";; esac
+[ -x "$LINK/bin/perfcached" ] || die "$LINK/bin/perfcached is not there - is link right?"
+if [ -z "$STATE" ]; then
+	STATE=$("$LINK/bin/perfcached" -f "$CONF" -E 2>/dev/null | sed -n 's/^state_dir = //p' | head -1)
+	[ -n "$STATE" ] || die "the configuration has no [daemon] state_dir - set state_dir in $CONFF"
+fi
+UPG=$STATE/upgrade
+# the daemon's directory is the daemon's: what is read there is read as its
+# owner, and every check is the open itself (nofollow, nonblock) - never a
+# test followed by an open a compromised daemon could race
+# -L: a state_dir that is itself a link (root's, as links are) names its
+# TARGET's owner - without it the drop below was silently skipped
+DU=$(stat -L -c %u "$STATE" 2>/dev/null) DG=$(stat -L -c %g "$STATE" 2>/dev/null)
+[ -n "$DU" ] || die "cannot stat $STATE"
+if [ "$(id -u)" = 0 ] && [ "$DU" != 0 ] && ! command -v setpriv > /dev/null; then
+	die "setpriv (util-linux) is needed to read $UPG as its owner - not installed"
+fi
+asd() { # asd <command...> - as the state directory's owner, when that is not us
+	if [ "$(id -u)" = 0 ] && [ "$DU" != 0 ]; then
+		setpriv --reuid="$DU" --regid="$DG" --clear-groups -- "$@"
+	else
+		"$@"
+	fi
+}
+# copyin <path under UPG> <max bytes> <seconds>: the file's bytes on stdout,
+# read as the owner, refusing a symlink (nofollow) and never waiting on a FIFO
+copyin() {
+	asd timeout "$3" dd if="$UPG/$1" bs=65536 count=$(( ($2 + 65535) / 65536 )) \
+		iflag=nofollow,nonblock status=none 2>/dev/null
+}
+mkdir -p "$RES" && chmod 755 "$RES" || die "cannot create $RES"
+W=$RES/work
+rm -rf "$W" && mkdir -m 700 "$W" || die "cannot create $W"
+trap 'rm -rf "$W"' EXIT
+trap 'exit 1' INT TERM   # a TERM with no trap kills the script before the EXIT trap runs
+
+ID= FROM= TO=
+result() { # result <status> <reason>
+	t=$RES/.result.$$
+	{
+		echo "id=$ID"; echo "status=$1"; echo "reason=$2"
+		echo "from=$FROM"; echo "to=$TO"; echo "at=$(date +%s)"
+	} > "$t" && chmod 644 "$t" && mv -f "$t" "$RES/result-$ID"
+	log "request ${ID:-?}: $1 - $2"
+	# the last 20 results are plenty to answer the daemon
+	ls -t "$RES" | grep '^result-' | sed -n '21,$p' | while read -r o; do rm -f "$RES/$o"; done
+}
+refuse() { result refused "$1"; exit 1; }
+
+# ---- 1. the request, then the artifact, into root's directory ---------------------
+asd test -e "$UPG/request" || asd test -L "$UPG/request" || { log "no request in $UPG"; exit 0; }
+copyin request 4096 10 > "$W/request"; rc=$?
+asd rm -f "$UPG/request"                    # taken: the path unit may fire again
+[ $rc -eq 0 ] || { ID=unreadable; refuse "the request is not a regular file"; }
+SHA= ART= VER= OP=switch REVTO=
+while IFS= read -r line || [ -n "$line" ]; do
+	case "$line" in
+	id=*) ID=${line#id=};; artifact=*) ART=${line#artifact=};;
+	sha256=*) SHA=${line#sha256=};; version=*) VER=${line#version=};;
+	op=*) OP=${line#op=};; to=*) REVTO=${line#to=};;
+	esac
+done < "$W/request"
+case "$ID" in ''|*[!0-9A-Za-z_-]*) ID=invalid; refuse "the request's id is missing or not [0-9A-Za-z_-]";; esac
+[ ${#ID} -le 64 ] || { ID=invalid; refuse "the request's id is longer than 64"; }
+case "$OP" in switch|revert) ;; *) refuse "op '$OP' is not switch or revert";; esac
+if [ "$OP" = revert ]; then
+	# ---- UP7b: back to the prefix this helper switched away from last.  The
+	# daemon names it; root believes only its own records: the newest result
+	# with status=ok must say from=<that prefix>.
+	OPT=$(readlink -f "$(dirname "$LINK")")
+	case "$REVTO" in "$OPT"/perfcached-*) ;; *) refuse "to '$REVTO' is not a prefix under $OPT";; esac
+	case "$REVTO" in *[!0-9A-Za-z./+_-]*|*..*) refuse "to '$REVTO' has odd characters";; esac
+	prev=$(for r in "$RES"/result-*; do [ -f "$r" ] || continue; grep -q '^status=ok$' "$r" || continue; printf '%s %s\n' "$(sed -n 's/^at=//p' "$r" | head -1)" "$(sed -n 's/^from=//p' "$r" | head -1)"; done | sort -n | tail -1 | cut -d' ' -f2-)
+	[ -n "$prev" ] || refuse "no switch on record here - nothing to revert to"
+	[ "$REVTO" = "$prev" ] || refuse "to '$REVTO' is not the prefix the last switch left ($prev)"
+	[ -x "$REVTO/bin/perfcached" ] || refuse "$REVTO/bin/perfcached is not there any more"
+	NEW=$REVTO
+	FROM=$(readlink -f "$LINK")
+	TO=$NEW
+	[ "$FROM" = "$NEW" ] && { result ok "already running $NEW"; exit 0; }
+	V=$("$NEW/bin/perfcached" -V 2>&1 | head -1)
+	NREV=$(printf '%s' "$V" | sed -n 's/^perfcached [^ ]* (\([0-9a-zA-Z]*\).*/\1/p')
+	[ -n "$NREV" ] || refuse "$NEW/bin/perfcached does not say its revision ('$V')"
+	if ! "$NEW/bin/perfcached" -C -f "$CONF" > "$W/check" 2>&1; then
+		refuse "the previous build refuses the live configuration: $(grep -E 'ERROR|CRIT|invalid' "$W/check" | head -1 | cut -c 1-200)"
+	fi
+	log "request $ID: revert $FROM -> $NEW ($V)"
+else
+case "$SHA" in *[!0-9a-f]*) refuse "sha256 is not lowercase hex";; esac
+[ ${#SHA} -eq 64 ] || refuse "sha256 is not 64 hex characters"
+[ "$ART" = "staged/$SHA.tar.gz" ] || refuse "artifact must be staged/<sha256>.tar.gz"
+case "$VER" in ''|*[!0-9A-Za-z.+_-]*) refuse "version is missing or not [0-9A-Za-z.+_-]";; esac
+copyin "$ART" $((ARTMAX + 1)) 600 > "$W/a.tar.gz" || refuse "$ART is not a regular file the daemon can read"
+n=$(wc -c < "$W/a.tar.gz"); [ $((n)) -le $ARTMAX ] || refuse "the artifact is over 1 GB"
+if asd test -e "$UPG/$ART.sig" || asd test -L "$UPG/$ART.sig"; then
+	copyin "$ART.sig" 200 10 > "$W/a.tar.gz.sig" || refuse "$ART.sig is not a regular file the daemon can read"
+fi
+
+# ---- 2. the copy's sha256 and signature, by the INSTALLED binary --------------------
+got=$(sha256sum "$W/a.tar.gz" | cut -c 1-64)
+[ "$got" = "$SHA" ] || refuse "sha256 mismatch - the artifact is not the build requested"
+if ! out=$("$LINK/bin/perfcached" -f "$CONF" -K "$W/a.tar.gz" 2>&1); then
+	refuse "the installed build refuses the signature: $(printf '%s\n' "$out" | grep 'signature:' | sed 's/^ *//')"
+fi
+log "request $ID: $(printf '%s\n' "$out" | grep 'signature:' | sed 's/^ *//')"
+
+# ---- 3. unpacked beside the live prefix, its stamp, the live config ------------------
+tar -tzf "$W/a.tar.gz" > "$W/list" 2>/dev/null || refuse "the artifact is not a gzip tarball"
+TOP=$(sed -n '1s|^\./||; 1s|/.*||p' "$W/list")
+case "$TOP" in perfcached-*) ;; *) refuse "the tarball's top directory '$TOP' is not perfcached-*";; esac
+case "$TOP" in *[!0-9A-Za-z.+_-]*) refuse "the tarball's top directory has odd characters";; esac
+# a fixed-string prefix test: TOP's dots and pluses are not a pattern
+if awk -v t="$TOP" '{ sub(/^\.\//, ""); if ($0 != t && index($0, t "/") != 1) bad = 1 }
+	END { exit !bad }' "$W/list"; then
+	refuse "the tarball holds entries outside $TOP/"
+fi
+grep -q -E '(^|/)\.\.(/|$)' "$W/list" && refuse "the tarball holds a '..' entry"
+# canonical on both sides: a link above /opt must not make the live prefix
+# look like another (and be moved aside as an earlier copy of the new one)
+OPT=$(readlink -f "$(dirname "$LINK")")
+NEW=$OPT/$TOP
+FROM=$(readlink -f "$LINK")
+TO=$NEW
+[ "$FROM" = "$NEW" ] && { result ok "already running $NEW"; exit 0; }
+STG=$OPT/.perfcached-stage-$ID
+rm -rf "$STG" && mkdir -p "$STG" || refuse "cannot create $STG"
+tar -xzf "$W/a.tar.gz" -C "$STG" --no-same-owner 2>"$W/tar.err" || { rm -rf "$STG"; refuse "unpack failed: $(head -1 "$W/tar.err")"; }
+[ -x "$STG/$TOP/bin/perfcached" ] || { rm -rf "$STG"; refuse "the tarball has no $TOP/bin/perfcached"; }
+V=$("$STG/$TOP/bin/perfcached" -V 2>&1 | head -1)
+case "$V" in "perfcached $VER "*) ;; *) rm -rf "$STG"; refuse "the binary says '$V', the request $VER";; esac
+NREV=$(printf '%s' "$V" | sed -n 's/^perfcached [^ ]* (\([0-9a-zA-Z]*\).*/\1/p')
+if ! "$STG/$TOP/bin/perfcached" -C -f "$CONF" > "$W/check" 2>&1; then
+	rm -rf "$STG"
+	refuse "the new build refuses the live configuration: $(grep -E 'ERROR|CRIT|invalid' "$W/check" | head -1 | cut -c 1-200)"
+fi
+if [ -e "$NEW" ]; then
+	mv "$NEW" "$NEW.replaced-$ID" || { rm -rf "$STG"; refuse "cannot move the earlier $NEW aside"; }
+	log "request $ID: an earlier $NEW kept as $NEW.replaced-$ID"
+fi
+mv "$STG/$TOP" "$NEW" && rmdir "$STG" || refuse "cannot place $NEW"
+log "request $ID: staged $NEW ($V)"
+fi
+
+# ---- 4. the switch -----------------------------------------------------------------
+nodef() { # nodef <key> - from the node file the daemon writes, read as its owner
+	copyin node 4096 5 | sed -n "s/^$1=//p" | head -1
+}
+OLDPID=$(nodef pid)
+OREV=$(nodef rev)
+case "$STATE" in "$LINK"/*) CARRY=${STATE#"$LINK"/};; *) CARRY=;; esac
+$SYSTEMCTL stop "$UNIT" || refuse "systemctl stop $UNIT failed - nothing changed"
+if [ -n "$CARRY" ]; then
+	# the state lives in the prefix: carry it, and prove the identity came along
+	mkdir -p "$NEW/$CARRY" && cp -a "$FROM/$CARRY/." "$NEW/$CARRY/" &&
+		chown "$(stat -c %u:%g "$FROM/$CARRY")" "$NEW/$CARRY" &&
+		chmod "$(stat -c %a "$FROM/$CARRY")" "$NEW/$CARRY" || {
+		$SYSTEMCTL start "$UNIT"
+		refuse "the state could not be carried into $NEW/$CARRY - the old build started again"
+	}
+	for f in node-identity node-term cluster-id collections; do
+		[ -e "$FROM/$CARRY/$f" ] || continue
+		asd timeout 10 cmp -s "$FROM/$CARRY/$f" "$NEW/$CARRY/$f" || {
+			$SYSTEMCTL start "$UNIT"
+			refuse "$CARRY/$f differs after the copy - the old build started again"
+		}
+	done
+	rm -f "$NEW/$CARRY/upgrade/node"
+fi
+ln -sfn "$NEW" "$LINK" || { $SYSTEMCTL start "$UNIT"; refuse "cannot switch $LINK"; }
+log "request $ID: $LINK -> $NEW, starting $UNIT"
+
+# ---- 5. READY from the new process ---------------------------------------------------
+ready() { # ready <rev> <seconds> - the node file names a new live pid of <rev>, ready
+	i=0
+	while [ $i -lt "$2" ]; do
+		p=$(nodef pid)
+		if [ -n "$p" ] && [ "$p" != "$OLDPID" ] && kill -0 "$p" 2>/dev/null &&
+		   [ "$(nodef rev)" = "$1" ] && [ "$(nodef state)" = ready ]; then
+			return 0
+		fi
+		sleep 1; i=$((i + 1))
+	done
+	return 1
+}
+$SYSTEMCTL start "$UNIT" || log "request $ID: systemctl start $UNIT failed"
+if ready "$NREV" "$READY_S"; then
+	result ok "$NEW ready (pid $(nodef pid), rev $NREV)"
+	exit 0
+fi
+why="the new build was not ready in ${READY_S}s (node file: state $(nodef state), rev $(nodef rev))"
+log "request $ID: $why - rolling back to $FROM"
+OLDPID=$(nodef pid)
+$SYSTEMCTL stop "$UNIT"
+ln -sfn "$FROM" "$LINK"
+$SYSTEMCTL start "$UNIT"
+if ready "$OREV" "$READY_S"; then
+	result rolled-back "$why; $FROM is running again"
+else
+	result rolled-back "$why; $FROM was started again but is not ready either - look at $UNIT now"
+fi
+exit 1
