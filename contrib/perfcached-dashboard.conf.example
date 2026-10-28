@@ -1,0 +1,80 @@
+# perfcached-dashboard.conf.example - the dashboard's settings (DESIGN
+# 12no, 0.6.6).  Copy to /etc/perfcached/perfcached-dashboard.conf, make
+# it readable by the perfcached-dashboard user only (chown
+# perfcached-dashboard, chmod 600) and set the secret.
+#
+# The dashboard is a client of the fleet's native door through libperfd,
+# with the same client secret perfcli uses; the page it serves is the
+# daemon's status page, read from whichever member is selected.  Nothing
+# in it is sent to a daemon's HTTP door, and no daemon is changed by it.
+# Privileged actions (check, upfill, stop, reset stats) ask the operator
+# for the fleet's ENABLE secret once per browser page; it is never in this
+# file.
+
+[dashboard]
+# where the page is served.  Loopback by default: TLS, HTTP/2 and a
+# network-facing port belong to a reverse proxy in front (nginx, HAProxy,
+# Caddy).  [::]:8090 listens dual-stack; an address, not a name.
+listen = 127.0.0.1:8090
+
+# one or more members' NATIVE doors (the [listen] tcp of perfcached.conf),
+# comma-separated.  One is enough: the member list it answers names the
+# rest, and every member gets its own connection.
+seed = 127.0.0.1:6479
+
+# the client secret ([secrets] client in perfcached.conf).  Leave it EMPTY
+# only for a daemon's loopback door with `plaintext = loopback`: such a door
+# never runs the Noise handshake, so a secret there fails every dial.
+secret = change-me
+
+# how long a node's /stats, /members and /clients answer is reused before
+# the node is asked again (the page polls every 3 s)
+#cache_ms = 1000
+
+# how often the member list is read again
+#refresh_ms = 3000
+
+# the largest POST body accepted (the bodies are a few dozen bytes)
+#body_max = 4096
+# a build posted to /stage (the page's "stage a build") may be this many MB
+#stage_max_mb = 64
+
+# a request slower than this is dropped
+#timeout_s = 10
+
+# wrong enable secrets from one address before it is locked out, and for
+# how long
+#lockout_after = 5
+#lockout_s = 60
+
+# a privileged session's token is valid this long after it was issued; the
+# page then asks for the enable secret again
+#session_s = 1800
+
+# several dashboards behind one load balancer (S415): instances sharing
+# this key accept each other's session tokens, so no stickiness is needed
+# - the token carries the session (encrypted under this key), the servers
+# hold nothing.  32 random bytes as 64 hex characters:
+#     head -c 32 /dev/urandom | xxd -p -c 32
+# Unset, an instance uses a random key from its start: a single dashboard
+# needs nothing here.
+#session_key =
+
+# connections held at once, and from one address
+#connections = 64
+#connections_per_address = 16
+
+# behind HAProxy or nginx (contrib/haproxy-perfcached-dashboard.cfg,
+# contrib/nginx-perfcached-dashboard.conf): the proxies' addresses, comma
+# separated.  A connection from one of them is counted and locked out by
+# the LAST address of its X-Forwarded-For header - the client the proxy
+# saw - instead of the proxy's own; any other peer's header is ignored.
+#trusted_proxy =
+
+# TLS in the tool itself (S414), for a bare install with no proxy in front:
+# a certificate and its key, PEM.  libmicrohttpd's own TLS (GnuTLS) - the
+# tool refuses to start when its library was built without it.  The
+# proxy pattern (contrib/haproxy-perfcached-dashboard.cfg, nginx-...) is
+# the default; this is for the host that has no proxy at all.
+#tls_cert = /etc/perfcached/dashboard.crt
+#tls_key = /etc/perfcached/dashboard.key

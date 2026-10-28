@@ -1,0 +1,14 @@
+# build=e58ee8e date=2026-10-01T16:26Z host=debian13-16vcpu runtime=podman cpus=16 workers=8 arena_mb=128 keys=20000 nbase=100000 val=200 reps=3 mtu=9000 cpuset_srv=none cpuset_cli=none mems_srv=none dialects=resp nat_secs=5 nat_lat=1 cli_threads=8 n_max=4000000 base=debian redis_img=redis:8 route=1 cell_min_s=10
+arm	clients	pipeline	set_rps	get_rps	set_p50ms	get_p50ms	set_p99ms	get_p99ms
+redis	50	1	71217	72770	0.647	0.623	1.319	1.271
+redis	50	16	552784	604488	1.287	1.207	2.599	2.399
+redis	50	64	824247	916228	3.511	3.255	5.551	5.775
+perfcached-spread	50	1	275728	192638	0.087	0.151	0.967	1.023
+perfcached-spread	50	16	1451642	446665	0.463	0.199	1.439	1.167
+perfcached-spread	50	64	1790288	365417	1.591	0.471	4.887	1.719
+perfcached-spread-routed	50	1	268625	309154	0.135	0.103	0.591	0.535
+perfcached-spread-routed	50	16	1995306	3190172	0.311	0.175	1.327	0.727
+perfcached-spread-routed	50	64	3094323	6207353	0.767	0.343	5.327	1.583
+perfcached-spread-cold	50	1		303020		0.087		0.839
+perfcached-spread-cold	50	16		2492282		0.183		0.503
+perfcached-spread-cold	50	64		2863088		0.543		1.095
