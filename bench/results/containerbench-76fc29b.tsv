@@ -1,0 +1,59 @@
+# build=76fc29b date=2026-09-11T16:49Z host=debian13-16vcpu runtime=podman cpus=16 workers=8 arena_mb=128 keys=20000 nbase=100000 val=200 reps=3 mtu=9000 cpuset_srv=none cpuset_cli=none mems_srv=none dialects=resp,bin nat_secs=5 nat_lat=1 cli_threads=8 n_max=4000000 base=debian redis_img=redis:8 route=1 cell_min_s=10
+arm	clients	pipeline	set_rps	get_rps	set_p50ms	get_p50ms	set_p99ms	get_p99ms
+redis	50	1	79885	83694	0.583	0.543	1.167	1.079
+redis	50	16	529193	599827	1.367	1.199	2.783	2.375
+redis	50	64	858531	981260	3.335	3.175	5.135	4.399
+perfcached-solo	50	1	319564	313770	0.079	0.079	0.767	0.831
+perfcached-solo	50	16	2128018	2439768	0.223	0.175	1.543	0.687
+perfcached-solo	50	64	2598090	2806119	0.839	0.543	3.703	1.039
+perfcached-solo-bin	50	1	341574	361500	0.084	0.084	0.803	0.704
+perfcached-solo-bin	50	16	2224610	2872114	0.296	0.234	0.784	0.730
+perfcached-solo-bin	50	64	2495298	3862957	1.104	0.706	3.311	2.141
+perfcached-store	50	1	313547	313480	0.079	0.079	0.767	0.863
+perfcached-store	50	16	2089414	2543422	0.223	0.167	1.623	1.015
+perfcached-store	50	64	2504048	3187417	0.951	0.479	3.463	1.079
+perfcached-store-bin	50	1	386603	376714	0.084	0.086	0.312	0.309
+perfcached-store-bin	50	16	2447033	2739228	0.215	0.182	0.750	0.701
+perfcached-store-bin	50	64	3356422	4202499	0.608	0.485	2.106	1.743
+perfcached-store-cold	50	1		319402		0.079		0.807
+perfcached-store-cold	50	16		2720161		0.159		0.607
+perfcached-store-cold	50	64		2750727		0.535		1.023
+perfcached-store-cold-bin	50	1		300689		0.087		0.783
+perfcached-store-cold-bin	50	16		2192658		0.215		1.212
+perfcached-store-cold-bin	50	64		2986244		0.660		2.733
+perfcached-eager	50	1	270386	312500	0.087	0.079	0.999	0.879
+perfcached-eager	50	16	1520596	2661907	0.455	0.159	1.663	0.719
+perfcached-eager	50	64	1866618	2829394	1.543	0.543	4.807	1.103
+perfcached-eager-bin	50	1	309543	380256	0.085	0.086	0.786	0.360
+perfcached-eager-bin	50	16	1404177	2736766	0.336	0.190	1.927	0.723
+perfcached-eager-bin	50	64	1846908	4178683	1.275	0.506	4.656	1.714
+perfcached-eager-cold	50	1		331543		0.079		0.767
+perfcached-eager-cold	50	16		2440174		0.183		0.495
+perfcached-eager-cold	50	64		2921250		0.519		1.055
+perfcached-eager-cold-bin	50	1		299314		0.088		0.753
+perfcached-eager-cold-bin	50	16		2294008		0.219		1.005
+perfcached-eager-cold-bin	50	64		3378243		0.703		2.627
+perfcached-proxy	50	1	319628	319599	0.079	0.079	0.767	0.807
+perfcached-proxy	50	16	1887235	2490411	0.279	0.175	1.623	0.663
+perfcached-proxy	50	64	2261537	2596016	1.295	0.575	3.599	1.079
+perfcached-proxy-bin	50	1	360169	325963	0.091	0.092	0.692	0.766
+perfcached-proxy-bin	50	16	1904888	2846147	0.363	0.226	0.997	0.727
+perfcached-proxy-bin	50	64	2106369	3788786	1.338	0.713	4.362	2.114
+perfcached-proxy-cold	50	1		97661		0.439		1.111
+perfcached-proxy-cold	50	16		106479		6.999		10.207
+perfcached-proxy-cold	50	64		79850		37.663		47.455
+perfcached-proxy-cold-bin	50	1		89305		0.455		1.077
+perfcached-proxy-cold-bin	50	16		104716		6.526		11.019
+perfcached-proxy-cold-bin	50	64		58356		49.135		65.535
+perfcached-shard	50	1	156236	149591	0.239	0.247	1.031	1.095
+perfcached-shard	50	16	242219	218962	0.255	0.239	1.951	2.143
+perfcached-shard	50	64	161323	147869	1.119	1.023	2.967	1.951
+perfcached-shard-bin	50	1	381215	411307	0.085	0.079	0.371	0.327
+perfcached-shard-bin	50	16	2457923	2858912	0.215	0.182	0.755	0.656
+perfcached-shard-bin	50	64	3296256	4188213	0.609	0.495	2.427	1.617
+perfcached-shard-cold	50	1		90147		0.463		1.471
+perfcached-shard-cold	50	16		95134		3.495		5.375
+perfcached-shard-cold	50	64		58086		26.671		33.599
+perfcached-shard-cold-bin	50	1		76560		0.502		1.495
+perfcached-shard-cold-bin	50	16		65768		8.664		20.002
+perfcached-shard-cold-bin	50	64		36351		60.462		65.535
