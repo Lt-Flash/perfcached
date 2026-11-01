@@ -1,0 +1,57 @@
+# compose.yml - two perfcached-admin replicas behind one nginx (DESIGN
+# 12no, S416; nginx throughout, as the operator chose).  podman compose / docker compose, from this directory:
+#
+#   cp pcd.secret.example pcd.secret   # the fleet's client secret, one line
+#   mkdir tls && cp ... tls/dashboard.pem tls/dashboard.key   # the certificate and its key
+#   PCD_SEEDS=10.0.0.1:6479,10.0.0.2:6479 PCD_SESSION_KEY=$(openssl rand -hex 32) \
+#       podman compose up -d
+#
+# Why two services rather than `replicas`: each engine resolves a scaled
+# service's instances differently; two named services are the same on both
+# and the front names them.  A third is a copy of `dashboard2`.
+#
+# The replicas hold no state: the fleet's state is in the daemons, and
+# the session token the browser holds is sealed under PCD_SESSION_KEY,
+# which the replicas share - so the front needs no stickiness.  Open-source
+# nginx checks passively: a replica that fails or answers 503 (one that sees
+# no member) is retried on the other and skipped for a while.
+# TLS and HTTP/2 end at the front; inside the network it is HTTP/1.1 to each
+# replica's nginx on 8080, which reaches its dashboard on loopback.
+# PCD_FRONT_PROXY=yes makes that nginx pass X-Forwarded-For through, so the
+# dashboard's lockout counts the browser the front saw.  Only the front
+# publishes a port.
+
+x-dashboard: &dashboard
+  image: perfcached-admin:0.7.0      # tools/image-admin.sh builds it from this tree
+  restart: unless-stopped
+  environment:
+    PCD_SEEDS: ${PCD_SEEDS:?comma-separated host:port of one or more members}
+    PCD_SESSION_KEY: ${PCD_SESSION_KEY:?64 hex - shared by the replicas}
+    PCD_SECRET_FILE: /run/secrets/pcd
+    PCD_FRONT_PROXY: "yes"
+  secrets:
+    - pcd
+  expose:
+    - "8080"
+
+services:
+  dashboard1:
+    <<: *dashboard
+  dashboard2:
+    <<: *dashboard
+  front:
+    image: docker.io/library/nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - dashboard1
+      - dashboard2
+    ports:
+      - "8443:8443"
+      - "8080:8080"
+    volumes:
+      - ./nginx-compose.conf:/etc/nginx/nginx.conf:ro
+      - ./tls:/etc/nginx/certs:ro
+
+secrets:
+  pcd:
+    file: ./pcd.secret
