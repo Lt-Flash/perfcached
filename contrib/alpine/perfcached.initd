@@ -1,0 +1,34 @@
+#!/sbin/openrc-run
+# perfcached - the OpenRC service (PD-11).  The same shape as
+# contrib/perfcached.service: its own account, the state directory, the
+# DMI uuid copied where a non-root daemon can read it (S326), the memlock
+# and descriptor limits.  Not enabled by default: rc-update add perfcached.
+description="perfcached cache daemon"
+command=/usr/bin/perfcached
+cfgfile=${cfgfile:-/etc/perfcached/perfcached.conf}
+command_args="-f $cfgfile"
+command_user="perfcached:perfcached"
+command_background=yes
+pidfile=/run/perfcached/perfcached.pid
+output_log=/var/log/perfcached.log
+error_log=/var/log/perfcached.log
+rc_ulimit="-l unlimited -n 1048576"
+start_stop_daemon_args="--env RUNTIME_DIRECTORY=/run/perfcached"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	[ -s "$cfgfile" ] || { eerror "$cfgfile is missing - copy /etc/perfcached/perfcached.conf.example and set the secrets"; return 1; }
+	checkpath -d -m 0700 -o perfcached:perfcached /var/lib/perfcached || return 1
+	checkpath -d -m 0755 -o perfcached:perfcached /run/perfcached || return 1
+	checkpath -f -m 0640 -o perfcached:perfcached /var/log/perfcached.log || return 1
+	# S326: the identity comes from the machine's DMI uuid, 0400 root; an
+	# empty copy (a container, no DMI) lets the daemon fall back to the MAC
+	cat /sys/class/dmi/id/product_uuid > /run/perfcached/dmi-product-uuid 2>/dev/null || : > /run/perfcached/dmi-product-uuid
+	chown perfcached:perfcached /run/perfcached/dmi-product-uuid
+	# the daemon's own config check, so a bad config fails here with its reason
+	$command -C -f "$cfgfile" > /dev/null 2>&1 || { $command -C -f "$cfgfile" 2>&1 | grep -E 'ERROR|CRIT' | head -5 | while read -r l; do eerror "$l"; done; return 1; }
+}

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="perfcached">
+  <title>perfcached - the anchor</title>
+  <desc>An anchor drawn as strokes with four cells: one lit cell at the ring (found), three grey cells at the arm tips and the crown (kept).  Upright and still by decision: speed lives in the wordmark, not the mark.</desc>
+  <style>
+    .ink { stroke: #1b1f24; }
+    .kept { fill: #9aa4b2; }
+    .found { fill: #2f6df6; }
+    .plate { fill: #ffffff; stroke: #d9dee5; }
+    @media (prefers-color-scheme: dark) {
+      .ink { stroke: #e6e9ee; }
+      .kept { fill: #6b7482; }
+      .plate { fill: #14181d; stroke: #2a313a; }
+    }
+  </style>
+  <rect class="plate" x="0.5" y="0.5" width="119" height="119" rx="24" stroke-width="1"/>
+  <line class="ink" x1="60" y1="30" x2="60" y2="100" stroke-width="4" stroke-linecap="round"/>
+  <line class="ink" x1="34" y1="44" x2="86" y2="44" stroke-width="4" stroke-linecap="round"/>
+  <path class="ink" d="M60 104 Q36 108 24 88" fill="none" stroke-width="4" stroke-linecap="round"/>
+  <path class="ink" d="M60 104 Q84 108 96 88" fill="none" stroke-width="4" stroke-linecap="round"/>
+  <rect class="found" x="50" y="10" width="20" height="20" rx="5"/>
+  <rect class="kept" x="8" y="68" width="20" height="20" rx="4"/>
+  <rect class="kept" x="92" y="68" width="20" height="20" rx="4"/>
+  <rect class="kept" x="50" y="94" width="20" height="20" rx="4"/>
+</svg>

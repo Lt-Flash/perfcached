@@ -1,0 +1,19 @@
+# build=2db7baf date=2026-09-04T05:52Z host=debian13-16vcpu keys=20000 val=200
+section	arm	rtt_med	rtt_lo	rtt_hi	pipe_med	pipe_lo	pipe_hi	rounds	recovered	recover_ms	dropped
+cost	memory	66606	62241	75776	1188647	807040	1390452	7	n/a	n/a	n/a
+cost	wal-no	62784	61219	63585	1067214	818684	1347086	7	20000	1466	0
+cost	wal-everysec	62859	59260	67811	1128256	913277	1280065	7	20000	1374	0
+cost	wal-always	66830	61460	69463	1265242	788879	1644216	7	16724	1577	3276
+cost	wal-rdb	62068	54256	63500	1212583	1028879	1360140	7	20000	1461	0
+cost	#resolution	pipe_widest_arm_spread_pct=67	rounds=7
+cost	!SUSPECT	memory=1188647	best_wal=1265242
+
+# part 2 columns: arm / held_before_kill / entries_after_restart / \
+missing_of_20000 / recover_ms
+failover	store-nowal	20000	0	20000	3164	0/0
+failover	store-wal	20000	20000	0	2906	0/0
+failover	eager-nowal	20000	0	0	2971	17826/20000
+failover	eager-wal	20000	20000	0	3114	19814/20000
+failover	proxy-nowal	20000	0	20000	2991	0/0
+failover	proxy-wal	20000	20000	0	2955	0/0
+failover	shard-wal	6824	6824	0	3474	6409/6767
