@@ -1,0 +1,9 @@
+# perfcached-dashboard.sysusers - systemd-sysusers(8) declaration (DESIGN
+# 12no).  perfcached-dashboard.service runs as User=perfcached-dashboard:
+# its own account, not the daemon's, so the client secret in
+# /etc/perfcached/perfcached-dashboard.conf is readable by the dashboard
+# alone and a compromised dashboard owns nothing of the daemon's.
+# Install as /usr/lib/sysusers.d/perfcached-dashboard.conf and run:
+#
+#     systemd-sysusers
+u perfcached-dashboard - "perfcached dashboard" - -

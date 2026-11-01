@@ -1,0 +1,23 @@
+#!/bin/sh
+# perfcached.service runs User=perfcached.  systemd processes
+# /usr/lib/sysusers.d at boot, so without this the account would not
+# exist until then - and a unit started before that fails with a
+# systemd-shaped error that says nothing about a missing user.
+set -e
+
+case "$1" in
+configure)
+	if command -v systemd-sysusers >/dev/null 2>&1; then
+		systemd-sysusers /usr/lib/sysusers.d/perfcached.conf || true
+	fi
+	# PD-10: an upgrade leaves the running daemon on the previous build
+	if [ -n "$2" ] && [ -d /run/systemd/system ] && systemctl is-active --quiet perfcached 2>/dev/null; then
+		echo "perfcached: the running daemon keeps the previous build until you restart it -" >&2
+		echo "perfcached: restart members first and the master last, one at a time (PRODUCTION.md, section 8)." >&2
+	fi
+	;;
+esac
+
+#DEBHELPER#
+
+exit 0
