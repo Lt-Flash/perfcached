@@ -1,0 +1,6 @@
+/* S370: libperfd.so exports its API and nothing else - the json, tree, Noise
+ * and log helpers it is built from stay inside it */
+{
+	global: perfd_*;
+	local: *;
+};
