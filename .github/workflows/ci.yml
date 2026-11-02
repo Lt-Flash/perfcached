@@ -1,0 +1,182 @@
+# perfcached CI (S55).  Public repo: GitHub-hosted runners are free,
+# unlimited minutes.  GitHub-hosted ONLY - never register project hosts
+# as self-hosted runners here; a fork PR could execute on them.
+name: ci
+
+on:
+  push:
+    # dev-* : a development line's snapshot gets the same verdict before
+    # it is a release (0.6.0 on dev-060, the operator 2026-10-11: "push to
+    # github, let it work there for now") - master stays release-shaped
+    branches: [master, 'dev-*']
+    # release CANDIDATES carry their own visible test run (2026-10-14:
+    # only an rc is judged; a final tag goes on the soaked rc's commit,
+    # whose run already judged that tree, so it starts none)
+    tags: ['v*-rc*']
+  pull_request:
+
+jobs:
+  # The ratchet: "pushed = check-green" without human discipline.
+  # As SEVEN suite groups (Makefile CHECK_GROUPS), one job each, as on
+  # GitLab (2026-10-03: the single check took 87.5 of its 90 minutes on
+  # v0.4.1 and outgrew it on 0.4.2).  fail-fast off: every group reports.
+  # S361: the GitLab runner (a shell executor on Debian 13, kernel 6.12)
+  # runs every suite on the io_uring backend - check and check-asan both.
+  # Here the startup check is told to refuse it, so the same suites run
+  # on the epoll fallback: each release is green on BOTH backends.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PERFCACHED_URING_DENY: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core1, core2, durability, cluster1, cluster2, repl1, repl2, repl3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+      - name: build
+        run: make -j"$(nproc)"
+      - name: make check-g-${{ matrix.group }}
+        run: make check-g-${{ matrix.group }}
+
+  # The fault suites (Makefile check-fault), each group its own job.  A
+  # suite that cannot run says SKIPPED; PC_SKIP_FAILS=1 makes that a
+  # failure here, never a green that tested nothing.
+  # fault3, fault4: loopback daemons, plain and under ASan+UBSan, as root -
+  # shardhandovertest puts a node's WAL on a dm-delay disk (losetup,
+  # dmsetup, mount).
+  check-fault:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [fault3, fault4]
+        build: [check, check-asan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+          sudo modprobe dm-delay || true
+      - name: make ${{ matrix.build }}-g-${{ matrix.group }}
+        run: sudo env PC_SKIP_FAILS=1 PATH="$PATH" make ${{ matrix.build }}-g-${{ matrix.group }}
+
+  # fault1, fault2: the container fleet - bench/containers-up.sh's three
+  # perfcached:debian nodes on a bridge, built from this tree, and root for
+  # the partitions (iptables inside each container's namespace).  A VM per
+  # job, so the fleet's fixed names cannot collide.
+  check-fleet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [fault1, fault2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+      - name: build
+        run: make -j"$(nproc)" perfcached perfcli
+      - name: the container fleet
+        run: |
+          docker build -f bench/Containerfile.debian --build-arg REV=$(git rev-parse --short HEAD) -t perfcached:debian .
+          sudo env RUNTIME=docker sh bench/containers-up.sh
+      - name: make check-g-${{ matrix.group }}
+        run: sudo env PC_SKIP_FAILS=1 RUNTIME=docker PATH="$PATH" make check-g-${{ matrix.group }}
+
+  # make check runs unprivileged here, so the suites that build network
+  # namespaces SKIP inside it; run them once, as root, with the multicast
+  # router mcastttltest needs (its system service off - the test runs its
+  # own router in a namespace)
+  check-root:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+      - name: build
+        run: make -j"$(nproc)"
+      - name: root-only suites (netns, multicast router)
+        run: |
+          sudo apt-get install -y smcroute
+          sudo systemctl disable --now smcroute || true
+          sudo sh test/addrwaittest.sh ./perfcached
+          sudo sh test/mcastttltest.sh ./perfcached
+          sudo sh test/dnsseedtest.sh ./perfcached
+          sudo sh test/lanetest.sh ./perfcached
+          sudo sh test/udpblocktest.sh ./perfcached
+      - name: failing suites, if any
+        if: failure()
+        run: |
+          grep -oE "[a-z]+test: [0-9]+ passed, [0-9]+ failed" check.log \
+            2>/dev/null | grep -vE ", 0 failed$" || true
+
+  # S250: the standalone edition - no cluster code, its own gate
+  check-standalone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+      - name: build (standalone)
+        run: make PC_EDITION=standalone -j"$(nproc)" && ./perfcached -V | grep -q standalone
+      - name: make check-standalone
+        run: make PC_EDITION=standalone check-standalone
+
+  # S285: Alpine (musl, gcc 15), a supported runtime from 0.5.0.  Runs
+  # the alpine container through the runner's container engine rather
+  # than as the job container: JavaScript actions (checkout) cannot run
+  # inside Alpine, their node is built for glibc.
+  alpine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: alpine check (both editions build; standalone suites)
+        run: sh tools/alpine-check.sh
+
+  # Highest-value job (S55 ordering): the whole suite under ASan+UBSan,
+  # per group as check above (`make check-asan` still runs them all).
+  check-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core1, core2, durability, cluster1, cluster2, repl1, repl2, repl3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+      - name: make check-asan-g-${{ matrix.group }}
+        run: make check-asan-g-${{ matrix.group }}
+
+  # GATING since the 2026-09-01 triage took the baseline to ZERO: a
+  # red tidy job now means a real finding, so it is allowed to gate.
+  clang-tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev clang-tidy bear
+      - name: compile_commands
+        run: make clean && bear -- make -j"$(nproc)"
+      - name: tidy
+        # -Wno-unused-command-line-argument: the Makefile compiles+links
+        # in one cc line, so libperfd.a rides the cli sources' compile
+        # commands and clang counts it as an ERROR without this
+        run: |
+          git ls-files 'src/*.c' 'lib/*.c' 'cli/*.c' \
+            | xargs clang-tidy -p . \
+              --extra-arg=-Wno-unused-command-line-argument \
+              2>/dev/null | tee tidy.log
+          echo "---- summary ----"
+          grep -cE "warning:|error:" tidy.log || echo "0 findings"
