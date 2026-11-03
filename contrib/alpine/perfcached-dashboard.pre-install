@@ -1,0 +1,5 @@
+#!/bin/sh
+# its own account, so the client secret in its config is readable by it alone
+addgroup -S perfcached-dashboard 2>/dev/null
+adduser -S -D -H -h /nonexistent -s /sbin/nologin -G perfcached-dashboard -g perfcached-dashboard perfcached-dashboard 2>/dev/null
+exit 0
