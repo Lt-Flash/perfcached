@@ -1,0 +1,21 @@
+# build=570067a date=2026-10-01T11:09Z host=debian13-16vcpu runtime=podman cpus=16 workers=8 arena_mb=128 keys=20000 nbase=100000 val=200 reps=3 mtu=9000 cpuset_srv=none cpuset_cli=none mems_srv=none dialects=resp,bin nat_secs=5 nat_lat=1 cli_threads=8 n_max=4000000 base=debian redis_img=redis:8 route=1 cell_min_s=10
+arm	clients	pipeline	set_rps	get_rps	set_p50ms	get_p50ms	set_p99ms	get_p99ms
+redis	50	1	73247	76429	0.623	0.607	1.271	1.215
+redis	50	16	541585	590946	1.319	1.239	2.623	2.463
+redis	50	64	858294	972850	3.351	3.087	4.967	5.031
+perfcached-eager	50	1	278944	337967	0.079	0.079	0.999	0.823
+perfcached-eager	50	16	1540669	2252540	0.423	0.175	1.799	0.487
+perfcached-eager	50	64	2050705	2540410	1.247	0.567	4.575	1.047
+perfcached-eager-bin	50	1	307162	384590	0.084	0.084	0.834	0.343
+perfcached-eager-bin	50	16	1469631	2850139	0.302	0.182	1.829	0.686
+perfcached-eager-bin	50	64	1964453	4367856	1.191	0.474	4.289	1.893
+perfcached-eager-cold	50	1		351507		0.079		0.727
+perfcached-eager-cold	50	16		2253867		0.183		0.335
+perfcached-eager-cold	50	64		2538500		0.575		1.023
+perfcached-eager-cold-bin	50	1		327641		0.083		0.707
+perfcached-eager-cold-bin	50	16		2369110		0.228		0.939
+perfcached-eager-cold-bin	50	64		3566180		0.747		1.811
+perfcached-proxy	50	1	344645	344591	0.071	0.071	0.743	0.783
+perfcached-proxy	50	16	2343978	2298220	0.191	0.175	0.391	0.343
+perfcached-proxy	50	64	2434700	2540410	0.631	0.575	1.103	0.999
+perfcached-proxy-bin	50	1	356006	381124	0.085	0.082	0.738	0.715
