@@ -1,0 +1,16 @@
+# build=2db7baf date=2026-09-03T23:43Z host=debian13-16vcpu keys=20000 val=200
+section	arm	threads	dialect	ops_per_s	per_conn	p50us	p99us	spread
+scaling	noise	1	json	14112	14112	64	120	12921-14408
+scaling	noise	1	binary	15803	15803	57	105	15602-16232
+scaling	noise	2	json	26196	13098	69	116	25288-27260
+scaling	noise	2	binary	30062	15031	57	103	27360-30523
+scaling	noise	4	json	49249	12312	72	122	48052-49976
+scaling	noise	4	binary	56917	14229	61	102	46608-59204
+scaling	noise	8	json	92474	11559	74	123	91864-97766
+scaling	noise	8	binary	99214	12401	62	105	87602-102407
+overhead	libperfd+noise	4	json	51065	12766	67	115	48256-52887
+overhead	libperfd+noise	4	binary	58810	14702	57	102	49432-61338
+overhead	libperfd+plain	4	json	59300	14825	58	103	58796-60301
+overhead	libperfd+plain	4	binary	66938	16734	52	93	66469-67049
+overhead	rawwire	4	json	71641	17910	53	92	69274-77450
+overhead	rawwire	4	binary	76209	19052	50	83	75265-77565

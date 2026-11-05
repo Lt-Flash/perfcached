@@ -1,0 +1,5 @@
+php-perfcached (0.1.0-1) unstable; urgency=medium
+
+  * First package (PE-6): the PHP extension over libperfd, for PHP 8.3 NTS.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Thu, 05 Nov 2026 17:00:00 +1100

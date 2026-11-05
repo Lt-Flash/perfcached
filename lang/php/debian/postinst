@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+	if [ -e /usr/lib/php/php-maintscript-helper ]; then
+		. /usr/lib/php/php-maintscript-helper
+		php_invoke enmod 8.3 ALL perfcached || exit 1
+	else
+		phpenmod -v 8.3 perfcached
+	fi
+fi
+#DEBHELPER#
+exit 0
