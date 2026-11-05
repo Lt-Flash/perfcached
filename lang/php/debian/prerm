@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+# off and on again on an upgrade, as dh_php does: the priority may change
+if [ "$1" = upgrade ] && [ -e /usr/lib/php/php-maintscript-helper ]; then
+	. /usr/lib/php/php-maintscript-helper
+	php_invoke dismod 8.3 ALL perfcached || exit 1
+fi
+#DEBHELPER#
+exit 0

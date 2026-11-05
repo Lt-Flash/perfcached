@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+if [ "$1" = remove ] && [ -e /usr/lib/php/php-maintscript-helper ]; then
+	. /usr/lib/php/php-maintscript-helper
+	php_invoke dismod 8.3 ALL perfcached || exit 1
+fi
+if [ "$1" = purge ]; then
+	find /etc/php/8.3 -xtype l 2>/dev/null | while read -r l; do
+		if [ "$(basename "$(readlink -m "$l")")" = perfcached.ini ]; then
+			rm -f "$l"
+		fi
+	done
+fi
+#DEBHELPER#
+exit 0
