@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+# php8.3-perfcached (PE-6): a source package of its own, because perfcached's must
+# build on a host without Sury's PHP.  DEB_BUILD_OPTIONS=nocheck is not needed: CI runs the suites.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+PHPAPI = 20230831
+EXTDIR = $(shell php-config8.3 --extension-dir)
+PKG = debian/php8.3-perfcached
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	test "$$(php-config8.3 --phpapi)" = $(PHPAPI)
+	phpize8.3
+	./configure --with-php-config=php-config8.3
+
+override_dh_auto_build:
+	$(MAKE)
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 0644 modules/perfcached.so $(PKG)$(EXTDIR)/perfcached.so
+	install -D -m 0644 debian/perfcached.ini $(PKG)/etc/php/8.3/mods-available/perfcached.ini
+
+override_dh_auto_clean:
+	if [ -f Makefile ]; then $(MAKE) distclean; fi
+	phpize8.3 --clean

@@ -1,0 +1,14 @@
+# build=2db7baf date=2026-09-04T07:26:11Z host=debian13-16vcpu conns=50 depth=32 secs=5 keys=20000 val=200 reps=3
+mode	route	rep	get_per_s	pulls	fwds	note
+store	0	1	1766461	14320	0	ok
+store	1	1	2447670	0	0	ok
+store	0	2	1750568	0	0	ok
+store	1	2	2424342	0	0	ok
+store	0	3	1629038	0	0	ok
+store	1	3	2547918	0	0	ok
+shard	0	1	266911	928884	0	ok
+shard	1	1	2533690	0	0	ok
+shard	0	2	275782	942661	0	ok
+shard	1	2	2579164	0	0	ok
+shard	0	3	275312	954091	0	ok
+shard	1	3	2697674	0	0	ok
