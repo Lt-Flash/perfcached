@@ -1,0 +1,25 @@
+Source: php-perfcached
+Section: php
+Priority: optional
+Maintainer: Yury Kirsanov <yury@kfi.net.au>
+Build-Depends: debhelper-compat (= 13),
+               libperfd-dev,
+               php8.3-dev,
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: php8.3-perfcached
+Architecture: any
+Depends: libperfd0 (>= 0.7.4.4~),
+         php8.3-common,
+         phpapi-20230831,
+         ${shlibs:Depends},
+         ${misc:Depends},
+Description: PHP client for perfcached, over libperfd
+ A PHP 8.3 extension on perfcached's native door: the Noise handshake,
+ encryption by default, a list of seeds, and failover and spreading across
+ the fleet's members with no proxy beside it.  One handle a worker, kept
+ across requests under PHP-FPM.
+ .
+ For Symfony's cache contracts, the composer package perfcached/symfony-cache
+ builds on it.
