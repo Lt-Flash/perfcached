@@ -342,6 +342,9 @@ all_down() { i=0
 		[ $up = 0 ] && break
 		sleep 0.2; i=$((i+1))
 	done; }
+# node 3 admitted: a queued joiner already follows the map but is in no peer table, so node 1's
+# fleet stop would not ask it
+joined3() { [ "$(cl 17341 peers_up)" = 2 ] && case "$(cl 17343 role)" in member|master) true;; *) false;; esac; }
 split_fleet() { # split_fleet <binary>: nodes 1+2, then 3 with term 50
 	for n in 1 2 3; do stop_kill $n; done
 	rm -rf "$D"/wal1 "$D"/wal2 "$D"/wal3 "$D"/n1.log "$D"/n2.log "$D"/n3.log "$D"/*.readies
@@ -351,14 +354,16 @@ split_fleet() { # split_fleet <binary>: nodes 1+2, then 3 with term 50
 	# check = FNV-1a over the term's four LE bytes (clterm.c's format)
 	printf 'perfcached-node-term 1\nterm 50\ncheck 8d700e0ae6ddc407\n' > "$D/wal3/node-term"
 	start 3 "$1" || return 1
-	# node 3 must follow the fleet's map before the stop (the split is a claim above a map it
-	# follows); a fixed sleep raced a slow runner
+	# node 3 must follow the fleet's map (the split is a claim above a map it follows) and be
+	# admitted; a fixed sleep raced a slow runner
 	i=0
-	while [ $i -lt 100 ]; do
+	while [ $i -lt 225 ]; do
 		m=$(mapterm 17343)
-		[ "$m" != "?" ] && [ "$m" -ge 1 ] && [ "$m" -lt 50 ] && break
+		[ "$m" != "?" ] && [ "$m" -ge 1 ] && [ "$m" -lt 50 ] && joined3 && return 0
 		sleep 0.2; i=$((i+1))
 	done
+	echo "   node 3 not admitted in 45 s: map term $(mapterm 17343), role $(cl 17343 role), node 1 peers up $(cl 17341 peers_up)" >&2
+	return 1
 }
 s233() { # s233 <binary> <label>: prints "<split ok> <stop ok> <lost ok>"
 	split_fleet "$1" || { echo "0 0 0"; return; }
@@ -405,7 +410,9 @@ stuck_fleet() { # nodes 1+2 on this build, node 3 on the reverted one
 	sleep 3
 	printf 'perfcached-node-term 1\nterm 50\ncheck 8d700e0ae6ddc407\n' > "$D/wal3/node-term"
 	start 3 "$D/perfcached.s233old" || return 1
-	sleep 4
+	i=0
+	while [ $i -lt 225 ] && ! joined3; do sleep 0.2; i=$((i+1)); done
+	joined3 || { echo "   node 3 not admitted in 45 s: role $(cl 17343 role), node 1 peers up $(cl 17341 peers_up)" >&2; return 1; }
 }
 asks() { grep -c "FLEET STOP - asking" "$D/n1.log" 2>/dev/null; }
 cli7() { # cli7 <perfcli> <label>: prints "<pipe ok> <oneshot ok>"

@@ -91,12 +91,19 @@ EOF2
 chmod 755 "$D/hook.sh"
 node 1; node 2; node 3
 start 1; start 2; start 3
-# wait for READY (the nodes pull a bootstrap first) and for a live peer: a node alone owns every
-# slot and would store a shard write locally
-rdy() {
-	i=0; while [ $i -lt 150 ] && pyn "$1" peek | grep -q 'not READY'; do sleep 0.2; i=$((i+1)); done
-	i=0; while [ $i -lt 150 ] && [ "$(python3 -c 'import json,sys,urllib.request
-print(json.load(urllib.request.urlopen("http://127.0.0.8%s:1772%s/stats" % (sys.argv[1], sys.argv[1]), timeout=5))["cluster"]["peers_up"])' "$1" 2>/dev/null)" != 2 ]; do sleep 0.2; i=$((i+1)); done
+# every node ready past admission (member or master, one master) and seeing both peers: a joiner
+# refuses writes while CONNECTING, and a node alone owns every slot
+st() { python3 -c 'import json,sys,urllib.request
+s = json.load(urllib.request.urlopen("http://127.0.0.8%s:1772%s/stats" % (sys.argv[1], sys.argv[1]), timeout=5))
+print(s["state"], s["cluster"]["peers_up"], s["cluster"].get("role"))' "$1" 2>/dev/null; }
+formed() {
+	m=0
+	for n in 1 2 3; do
+		set -- $(st $n)
+		[ "${1:-} ${2:-}" = "ready 2" ] && [ "${3:-joining}" != joining ] || return 1
+		[ "${3:-}" = master ] && m=$((m + 1))
+	done
+	[ $m = 1 ]
 }
 # pcnative over the native door of node <n>: fill, delete, verify
 pyn() { python3 - "$@" <<'PY' 2>&1
@@ -138,7 +145,9 @@ elif what == "verify":
     print("lost=%d wrong=%d resurrected=%d wlost=%d written=%d" % (lost, wrong, res, wlost, written.count("1")))
 PY
 }
-rdy 1; rdy 2; rdy 3
+i=0; while [ $i -lt 225 ] && ! formed; do sleep 0.2; i=$((i+1)); done
+formed && ok "the fleet formed: three nodes ready, one master" \
+	|| bad "the fleet did not form in 45 s: $(for n in 1 2 3; do printf 'node %s: %s; ' $n "$(st $n)"; done)"
 [ "$(pyn 1 fill)" = filled ] && ok "2,500 keys written on node 1" || bad "fill: $(pyn 1 fill)"
 i=0; while [ $i -lt 100 ] && [ "$(pyn 3 peek)" != "p1999=p1999 d499=d499" ]; do sleep 0.2; i=$((i+1)); done
 [ "$(pyn 3 peek)" = "p1999=p1999 d499=d499" ] && ok "replicated to node 3" || bad "node 3 holds: $(pyn 3 peek)"

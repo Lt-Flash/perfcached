@@ -34,9 +34,9 @@ dir = $D/wal$1
 fsync = everysec
 segment_mb = 64
 segments = 4
-ring_kb = ${FWD_RING_KB:-8192}
-                 # the crash-durability check needs the whole forward burst in the WAL: an overflowed ring
-                 # drops records; FWD_RING_KB=1024 under 'taskset -c 0,1' shows the drop check firing
+ring_kb = ${FWD_RING_KB:-16384}
+                 # the holder logs forwards on its peer thread, which drops after 200 ms on a full ring: the
+                 # whole burst (100000 x ~120 B) fits; FWD_RING_KB=1024 under 'taskset -c 0,1' fires the check
 [cluster]
 multicast = 239.255.77.35:17135
 advertise = 127.0.0.3$1
@@ -83,7 +83,7 @@ python3 - "$FIRST_SETTLE" <<'EOF'
 import json, pcnative, socket, sys, time
 s = socket.create_connection(("127.0.0.1", 17041), timeout=60)
 f = pcnative.wrap(s)
-val = "V" * 256; n = 100000; acked = 0
+val = "V" * 64; n = 100000; acked = 0
 stored = 0; refused = 0; foreign = 0; errors = 0; sample = None
 def take(r):
     global stored, refused, foreign, errors, sample
