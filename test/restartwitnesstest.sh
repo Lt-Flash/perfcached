@@ -168,12 +168,14 @@ W2=$(st 2 'json.dumps(c["restart"])'); W3=$(st 3 'json.dumps(c["restart"])')
 	|| bad "6a. node 1 witnesses_live $(st 1 'c.get("reconcile_witnesses_live")'): node 2 $W2, node 3 $W3 (want 2, waits_for [] on both)"
 stop1 2; start 2 3 || exit 1
 ready3
-i=0; while [ $i -lt 40 ] && [ "$(st 3 'json.dumps(c["restart"].get("waits_for"))')" != "[$N1]" ]; do sleep 0.25; i=$((i+1)); done
+# the four settle a beat or two apart: wait for all of them, and report what the last look read
+s6b() { echo "$(st 1 'c.get("reconcile_witnesses_live")') $(st 3 'c["restart"]["safe"]') $(st 3 'json.dumps(c["restart"].get("waits_for"))') $(st 2 'json.dumps(c["restart"].get("waits_for"))')"; }
+i=0; while [ $i -lt 40 ] && [ "$(s6b)" != "1 False [$N1] []" ]; do sleep 0.25; i=$((i+1)); done
+S6=$(s6b)
 W2=$(st 2 'json.dumps(c["restart"])'); W3=$(st 3 'json.dumps(c["restart"])')
-[ "$(st 1 'c.get("reconcile_witnesses_live")')" = 1 ] && [ "$(st 3 'c["restart"]["safe"]')" = False ] \
-	&& [ "$(st 3 'c["restart"]["waits_for"]')" = "[$N1]" ] && [ "$(st 2 'c["restart"]["waits_for"]')" = "[]" ] \
+[ "$S6" = "1 False [$N1] []" ] \
 	&& ok "6b. node 2 restarted: node 3 is node 1's LAST witness - NOT safe, waits for node $N1 ($W3); node 2 waits for nobody" \
-	|| bad "6b. after node 2's restart: node 1 witnesses_live $(st 1 'c.get("reconcile_witnesses_live")'), node 3 $W3, node 2 $W2 (want 1; node 3 safe false waits_for [$N1]; node 2 [])"
+	|| bad "6b. after node 2's restart: node 1 witnesses_live, node 3 safe, node 3 waits_for, node 2 waits_for read '$S6' (want '1 False [$N1] []'); node 3 $W3, node 2 $W2"
 # 6c: the members view carries it - node 3 lists node 1 reconciling with
 # node 3 as its sole witness (what the status page's chips read)
 N3=$(nid 3)

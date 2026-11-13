@@ -51,7 +51,7 @@ C
 done
 for i in 1 2 3; do
 	k=0; while [ $k -lt 150 ] && ! grep -q "perfcached ready" "$D/n$i.log"; do sleep 0.1; k=$((k+1)); done
-	grep -q "perfcached ready" "$D/n$i.log" || { bad "node $i did not start: $(tail -2 "$D/n$i.log" | tr '\n' ' ')"; exit 1; }
+	grep -q "perfcached ready" "$D/n$i.log" || { bad "node $i did not start: $(tail -2 "$D/n$i.log" | command tr '\n' ' ')"; exit 1; }
 done
 tr() { # tr <i> <python expr over t = cluster.tombstones_retained, c = cluster>
 	python3 - "$1" "$2" <<'PY' 2>/dev/null
@@ -119,7 +119,7 @@ H=$(tr 1 't["numbered"]')
 kill -CONT $P3
 [ "${H:-0}" -ge 150 ] 2>/dev/null &&
 	ok "3. node 3 frozen 10 s (purged at 6, still a member): node 1 kept the $H deletes it has not confirmed" ||
-	bad "3. node 3 frozen 10 s: node 1 holds ${H:-?} numbered entries (want 150 or more - 20 a second): $(grep -m2 'went silent\|purged' "$D/n1.log" | tr '\n' ' ')"
+	bad "3. node 3 frozen 10 s: node 1 holds ${H:-?} numbered entries (want 150 or more - 20 a second): $(grep -m2 'went silent\|purged' "$D/n1.log" | command tr '\n' ' ')"
 
 # 4. back: it gets them, confirms, the tables shrink
 wait $DP; DP=
@@ -186,7 +186,7 @@ set -- $F0 $G
 
 for i in 1 2 3; do
 	grep -q "CRIT" "$D/n$i.log" &&
-		bad "node $i logged CRIT: $(grep -m2 'CRIT' "$D/n$i.log" | tr '\n' ' ' | cut -c1-220)"
+		bad "node $i logged CRIT: $(grep -m2 'CRIT' "$D/n$i.log" | command tr '\n' ' ' | cut -c1-220)"
 done
 echo "tombforgettest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

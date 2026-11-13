@@ -81,7 +81,6 @@ trap 'part_heal_all >/dev/null 2>&1; $RT start pcnode3 >/dev/null 2>&1' \
  EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
 
-R=rs$(date +%s)
 echo "=== reshardtest ($RT, $N keys, collection $COL) ==="
 
 # ---- 0. baseline ----------------------------------------------------
@@ -91,6 +90,8 @@ B1=$(peers 1); B2=$(peers 2); B3=$(peers 3)
 	|| { bad "fleet unhealthy before the test (n1=$B1 n2=$B2 n3=$B3)"
 	     echo "reshardtest: $pass passed, $fail failed"; exit 1; }
 
+attempt() { # steps 1-5 on a fresh key prefix: sets R, L0, L1, LOST and the inventory's counts
+R=rs$(date +%s)
 # ---- 1. shrink to {1,2} ---------------------------------------------
 # long enough for both survivors to purge node3 (PEER_UP_MS 10000), or the rejoin would move nothing
 echo "  stopping pcnode3 and waiting for the fleet to shrink"
@@ -202,6 +203,16 @@ V() { /bin/grep "^$1 " /tmp/reshard-verdict.$$ | awk '{print $2}'; }
 DUP=$(V DUP); FORK=$(V FORK); STALE=$(V STALE)
 SURV=$(V SURVIVORS); MISS=$(V MISSING)
 echo "  survivors=$SURV missing=$MISS duplicated=$DUP forked=$FORK stale-v1=$STALE"
+}
+# node1 can hand its keys to node3 outside the mute (between node3's ready and the cut): then nothing
+# failed and the arm proves nothing - again on fresh keys, three tries at most; a duplicate ends it
+A=1
+while :; do
+	attempt
+	[ "$LOST" -gt 0 ] 2>/dev/null || [ "${MISS:-0}" -gt 0 ] 2>/dev/null || [ "${DUP:-0}" != 0 ] || [ $A -ge 3 ] && break
+	echo "  attempt $A: node1 gave nothing up under the mute and no key went missing - again on fresh keys"
+	A=$((A + 1))
+done
 
 # ---- 6. the fault must have been REAL ---------------------------------
 # node1's migrate_lost, or keys simply gone (no TTLs here); both zero means the mute did not bite
