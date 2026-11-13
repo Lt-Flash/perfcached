@@ -1,17 +1,6 @@
 #!/bin/sh
-# winmaxtest.sh - S197: the window's MAX covers the same slots as the
-# window's CALLS.
-#
-# w_calls is a difference against the oldest SNAPSHOT - the calls since that
-# snapshot was taken - while w_max scanned every slot of the ring, including
-# the slot that snapshot closed.  The two spans differed by one slot, so a
-# verb last called six minutes ago reported win_calls=0 beside
-# win_max_us=250: no calls in the window, and a slowest call in it.  The
-# status page sorts on that column, so silent verbs sorted above busy ones
-# on an all-time slowest call.
-#
-# The roll is once a minute (PC_OBS_WIN x 60 s), so this suite WAITS for one.
-# Usage: test/winmaxtest.sh [./perfcached]
+# winmaxtest.sh - the window's max covers the same slots as its calls, so a verb silent in the window
+# shows no slowest call; waits out one minute's roll.  Usage: test/winmaxtest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcwm.XXXXXX)
@@ -67,9 +56,8 @@ def rows():
     d = json.load(urllib.request.urlopen("http://127.0.0.1:17815/stats", timeout=10))
     return {c.get("verb") or c.get("name"): c for c in d.get("commands", [])}
 
-# EXPIRE is called exactly once, at the start, and never again: after the
-# roll its calls sit before the oldest snapshot, so the window holds none
-# of them.  SET keeps going, so the run has a control that must stay live.
+# EXPIRE is called once, at the start: after the roll the window holds none of its
+# calls; SET keeps going, a control that must stay live
 cmd("SET", "k", "v")
 cmd("EXPIRE", "k", "600")
 r = rows()

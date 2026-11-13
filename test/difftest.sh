@@ -1,26 +1,11 @@
 #!/bin/sh
-# difftest.sh - S317's gate (DESIGN 12if): the 0.4.5 daemon, which speaks
-# the binary protocol only, answers every native method the same as the
-# last daemon with the JSON-RPC door did.  Two single-node daemons from
-# ONE config, the reference on JSON lines and the new one on CMD frames,
-# one corpus of requests (test/difftest.py), replies compared as decoded
-# values after the documented shape changes are normalised.
-#
-# Fail-first: against the reference binary on BOTH sides the corpus
-# matches trivially; against a 0.4.5 daemon that still differs anywhere
-# a line names the method and both replies.
-#
-# Usage: test/difftest.sh <new-perfcached> <reference-perfcached>
+# difftest.sh - the binary-only daemon answers every native method as the last JSON-RPC daemon did, one corpus
+# (test/difftest.py) compared as decoded values.  Usage: test/difftest.sh <new-perfcached> <reference-perfcached>
 set -u
 NEW=${1:-./perfcached}
 REF=${2:-${PC_REF:-/var/tmp/perfcached-044-ref}}
-# The reference is a build of the last tree with the JSON door (p044,
-# 01f3180), pinned OUTSIDE this tree: on each GitLab runner host (224, 225)
-# it lives at /var/tmp/perfcached-044-ref; a runner without one (GitHub)
-# cannot run the gate and says so rather than passing it.  Under GitLab CI
-# a missing reference is a FAILURE (0.7.1-rc1: runner 225 had none, the
-# suite skipped there, and two stats additions passed unseen until rc2 ran
-# on 224) - copy it from another runner (same sha256 c625ba34...)
+# the reference is a build of the last tree with the JSON door, pinned outside this tree; without it
+# the gate says so rather than pass, and under GitLab CI fails
 if [ ! -x "$REF" ]; then
 	if [ -n "${GITLAB_CI:-}" ]; then
 		echo "difftest: FAILED - no reference daemon at $REF on GitLab runner $(hostname) - every GitLab runner must carry it (PC_REF=<path>)"

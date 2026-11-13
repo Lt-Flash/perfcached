@@ -1,17 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * cluster.c — the peer plane (tasks S16-S18).  See cluster.h.
- * Membership is AUTOMATIC (S16 as designed, the clusterer_controller
- * shape): multicast JOIN_REQ -> the master assigns node ids and returns
- * the member list; no master within the join window -> defer to a
- * higher-address simultaneous joiner, else found the cluster; 1/s ALIVE
- * keepalives carry free-MB (the placement feed); sticky master;
- * split-brain prevention (join defer) + cure (member-count rank).
- * The session-key/KEY_GRANT layer of the module is deliberately absent:
- * every datagram here is already sealed with the Argon2id cluster PSK.
- * Multicast is CONTROL ONLY - all data stays unicast.
- */
+/* cluster.c - the peer plane: automatic membership, placement, replication.  Every datagram is
+ * sealed with the cluster PSK (no session-key layer); multicast carries control only. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,11 +18,8 @@
 #include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
-/* statfs.f_type is __fsword_t: long on 64-bit, plain int on i386 and
- * arm32, where RAMFS_MAGIC does not fit and the comparison is a
- * signed/unsigned mismatch under -Werror (the rc4 matrix caught it).
- * Compare the low 32 bits as unsigned, and carry the two constants here
- * with the U suffix rather than trust linux/magic.h's types. */
+/* statfs.f_type is int on 32-bit targets: compare the low 32 bits as unsigned, against our own
+ * U-suffixed constants, so the tmpfs test is no signed/unsigned mismatch */
 #define PC_TMPFS_MAGIC 0x01021994u
 #define PC_RAMFS_MAGIC 0x858458f6u
 #include <netinet/in.h>
@@ -42,7 +29,7 @@
 #include "iostat.h"
 #include "compat/dprint.h"
 #include "quiesce.h"
-#include "psindex.h"                 /* PS12: the fleet pattern index */
+#include "psindex.h"                 /* the fleet pattern index */
 #include "pubsub.h"
 #include "compat/pt.h"
 #include "compat/timer.h"
@@ -50,15 +37,14 @@
 #include "core/pcache_arena.h"
 #include "config.h"                    /* PC_MAX_COLLECTIONS */
 #include "store.h"
-#include "colname.h"
-#include "winctr.h"                     /* S351 */
-#include "upstream.h"                   /* S348 */
-#include "version.h"                /* UP1: the version fact */
-#include "upgrade.h"                /* UP6n */
+#include "winctr.h"
+#include "upstream.h"
+#include "version.h"
+#include "upgrade.h"
 #include <sodium.h>
 #include "cluster.h"
-#include "alerts.h"                     /* S465: the link in the ALIVE */
-#include "clrpt.h"                      /* S469 */
+#include "alerts.h"                     /* the link in the ALIVE */
+#include "clrpt.h"
 #include "clcodec.h"                 /* the LE wire codec */
 #include "fnv1a.h"                   /* the one FNV-1a */
 #include "clmig.h"                   /* the migration in-flight window */
@@ -67,8 +53,8 @@
 #include "pc_slot.h"                  /* pc_key_slot(): placement input */
 #include "pc_mix.h"                   /* pc_hrw_mix(): the rendezvous weight */
 #include "daemon.h"                  /* pc_worker_id() */
-#include "ptree.h"                   /* S317: the membership push is a tree */
-#include "compat/ipc.h"               /* ipc_send_rpc_all(): the flush RPC (S110) */
+#include "ptree.h"                   /* the membership push is a tree */
+#include "compat/ipc.h"               /* ipc_send_rpc_all(): the flush RPC */
 #include "clmap.h"
 #include "clterm.h"
 #include "clplace.h"
@@ -78,48 +64,47 @@
 #include "clsync.h"
 #include "clpend.h"
 #include "clloc.h"
-#include "clretain.h"                       /* S238 */
-#include "clorder.h"                        /* S461 */
+#include "clretain.h"
+#include "clorder.h"
 #include "clrp.h"
-#include "clres.h"                   /* S90: the id reservations */
-#include "wal.h"                     /* S215: PC_WAL_SHED_*, pc_wal_on_shed() */
-#include "rdb.h"                     /* AT-3b: pc_rdb_safe_marker() */
-#include "ackstate.h"                /* 12ny AT-3b: the watermarks */
-#include "clapply.h"                 /* S217: apply sharded by key hash */
+#include "clres.h"                   /* the id reservations */
+#include "wal.h"                     /* PC_WAL_SHED_*, pc_wal_on_shed() */
+#include "rdb.h"                     /* pc_rdb_safe_marker() */
+#include "ackstate.h"                /* the watermarks */
+#include "clapply.h"                 /* apply sharded by key hash */
 #include "clplat.h"                  /* platform-derived identity */
-#include "clcid.h"                   /* S302: the cluster id */
-#include "clmesh.h"                  /* S36: discovery = unicast */
-#include "clane.h"                   /* S36 step b: the frame lane */
+#include "clcid.h"                   /* the cluster id */
+#include "clmesh.h"                  /* discovery = unicast */
+#include "cladmit.h"
+#include "clddl.h"                   /* the collection DDL */
+#include "clfound.h"
+#include "clane.h"                   /* the frame lane */
 #include "clmemb.h"                  /* the keepalive frame layouts */
-#include "proto.h"                      /* S160: the door gauges */
+#include "proto.h"                      /* the door gauges */
 #include "clpull.h"                  /* the PULL plane frame layouts */
-#include "crc32c.h"                   /* S439: a pull answer's value checksum */
-#include "clhold.h"                   /* S394: the hold-check frames */
-#include "clrecon.h"                    /* the reconcile's pacing (wave 1) */
-#include "clepoch.h"                     /* the wire epoch (wave 1) */
+#include "crc32c.h"                   /* a pull answer's value checksum */
+#include "clhold.h"                   /* the hold-check frames */
+#include "clrecon.h"                    /* the reconcile's pacing */
+#include "clepoch.h"                     /* the wire epoch */
 #include "respmap.h"
 #include "clcol.h"                   /* the collection-announce frame */
-#include "clunk.h"                   /* S165: unknown commands, fleet-wide */
-#include "obs.h"                     /* S165: this node's table */
+#include "clunk.h"                   /* unknown commands, fleet-wide */
+#include "obs.h"                     /* this node's table */
 #include "clboot.h"
 #include "clpush.h"
 #include "clwire.h"
-#include "clreplay.h"                  /* CH-1 */
+#include "clreplay.h"
 #include "clbulk.h"
-#include "pubsub.h"                     /* PS3: the relay */
-#include "psrelay.h"                    /* PS7: the relay's sequence accounting */
-#include "events.h"                     /* PS8: applied-here notifications */
+#include "pubsub.h"                     /* the relay */
+#include "psrelay.h"                    /* the relay's sequence accounting */
+#include "events.h"                     /* applied-here notifications */
 #include "clstate.h"
-#include "logrl.h"                     /* CH-17 */
+#include "logrl.h"
 #include "clpeers.h"
 #include "core/pcache_mem.h"
 
-/* The watchdog re-sends the last keepalive if the peer thread stalls,
- * and clwire_beat_store() SILENTLY RETURNS when a frame will not fit -
- * so a keepalive that outgrew its buffer would freeze the watchdog's
- * copy at the last frame that did fit, with nothing said.  On
- * MASTER_ALIVE that is a stale mastership claim being re-broadcast
- * while the real one is gone.  Caught at compile time instead. */
+/* the watchdog re-sends the last stored keepalive and clwire_beat_store() silently drops one that
+ * does not fit, so an outgrown frame would re-broadcast a stale claim: caught at compile time */
 _Static_assert(CLMEMB_ALIVE_MAX <= sizeof ((struct clwire *)0)->alive,
 	"ALIVE outgrew clwire's beat buffer - clwire_beat_store would drop it");
 _Static_assert(PC_CFGSIG_MAX == CLMEMB_CFG_MAX,
@@ -127,141 +112,87 @@ _Static_assert(PC_CFGSIG_MAX == CLMEMB_CFG_MAX,
 _Static_assert(CLMEMB_MALIVE_LEN <= sizeof ((struct clwire *)0)->malive,
 	"MASTER_ALIVE outgrew clwire's beat buffer - it would be dropped");
 
-#define SHARD_GRACE_S  30              /* after a membership change (and
-                                        * self-extending while reshard
-                                        * migrations still flow), shard
-                                        * owner-misses fall back to a
-                                        * broadcast pull - data may not
-                                        * have moved yet */
+#define SHARD_GRACE_S  30              /* after a membership change (extended while reshard
+                                        * migrations flow), owner-misses broadcast-pull */
 
-#include "clmsg.h"                  /* M14: the datagram types */
-#include "clsend.h"                  /* M14: the send path */
-#include "clps.h"                    /* M16: the pub/sub relay plane */
-#include "clspread.h"                /* M17: spread's decisions */
+#include "clmsg.h"                  /* the datagram types */
+#include "clsend.h"                  /* the send path */
+#include "clps.h"                    /* the pub/sub relay plane */
+#include "clspread.h"                /* spread's decisions */
+#include "clrecv.h"                  /* replication receive/apply */
+#include "cltomb.h"                  /* tombstones+acks */
+#include "clsgmix.h"                 /* the sweep gate's digest term */
 
-#define COL_RESYNC_BEATS 5   /* S69: the created set re-announced this often */
+#define COL_RESYNC_BEATS 5   /* the created set re-announced this often */
 #define JOIN_WAIT_MS    2000
-#define JOIN_DEFER_MS   1000
-#define JOIN_DEFER_MAX  4
-#define JOIN_HOLD_MS    5000   /* S108: how much one JOIN_WAIT extends the
-                                * joiner's deadline; repeated every retry
-                                * while the master keeps holding, so a
-                                * master that dies mid-hold lets the
-                                * deadline expire naturally */
-#define MASTER_DEAD_MS  8000   /* 8 beats of margin at 1 Hz.  3000 was
-                                * three: two legitimately stretched
-                                * intervals (the 1 Hz block runs AFTER
-                                * loop duties) plus receiver jitter
-                                * crossed it under instrumentation with
-                                * nobody mute and nobody deaf - a false
-                                * promotion needs no fault at 3 beats.
-                                * Redis Cluster ships 15000 here.  The
-                                * data plane serves on the last map
-                                * throughout, so slower failover costs
-                                * only map-publication latency. */
+#define JOIN_HOLD_MS    5000   /* one JOIN_WAIT extends the joiner's deadline this
+                                * much, per retry: a master dying mid-hold lets it lapse */
+#define MASTER_DEAD_MS  8000   /* 8 beats at 1 Hz: two stretched beats plus jitter
+                                * must not promote; slower failover only delays the map */
 #define CLMAP_PUB_MS    5000   /* map re-publication interval */
-/* Buckets per scan call.  S263: a call is never stopped part-way - a
- * stopped call leaves the cursor at the START of its window, and the
- * next tick asked again about every key the window had already asked
- * about (2,752 probes for 2,000 keys).  So the budget is checked
- * between calls, and one tick may overshoot it by at most one window's
- * keys; the window is small to keep that overshoot small. */
+/* buckets per scan call; a call is never stopped part-way (a stopped call re-asks its window), so
+ * a tick may overshoot its budget by one small window */
 #define RECONCILE_BUCKETS  16
 /* how long a staged change waits for the standby's ack.  One unicast
  * round trip on a LAN; generous, because abandoning burns a sequence. */
 #define CLSYNC_ACK_MS   1000
-/* S277: a standby that let a staged change time out is passed over for
- * this long.  Without it pick_backup() names the same silent peer on the
- * very next stage - it is live, it has the lowest id - and publication
- * stalls behind it for as long as it stays silent.  Six re-publication
- * intervals: long enough that a peer which cannot hear the master is not
- * retried every five seconds, short enough that a recovered one is back
- * as standby within the half minute. */
+/* a standby that let a staged change time out is passed over this long, or pick_backup() names the
+ * same silent peer again; six re-publication intervals */
 #define CLSYNC_PASS_OVER_MS  30000
-/* CH-9: a handover the named member has not taken by then is given up */
+/* a handover the named member has not taken by then is given up */
 #define HANDOVER_GIVEUP_MS   20000
-/* S82: a peer that arrived EMPTY is not trusted to hold the data for
- * this long after it did - three sweeps, enough for its own backfill
- * of an ordinary keyspace to have landed.  A holdoff rather than the
- * flag alone because backfill[] only clears on the node that ran the
- * backfill; on every other node it goes stale, and after a cold start
- * (everyone joins empty) that would make every node skip every peer
- * and self-designate for good - N senders, the very thing one
- * designated sender exists to prevent. */
+/* a peer that arrived EMPTY is not trusted as sender for three sweeps: a holdoff, because
+ * backfill[] clears only where the backfill ran and would leave every node self-designating */
 #define BACKFILL_SENDER_HOLDOFF_MS 30000
-/* S83: the bootstrap PULL.  A node that joins an eager fleet holding
- * nothing asks ONE ready peer for a full walk over the bulk TCP plane
- * and reports ready only when the stream has ended - so "ready" means
- * complete, which no push from a sender could say.  The request rides
- * as a record count no batch can have; a build before it closes on
- * that count and the joiner falls back to the push. */
+/* the bootstrap PULL: a joiner holding nothing asks ONE ready peer for a full bulk-TCP walk, ready
+ * when it ends; the ask is a record count no batch can have, and an older peer just closes */
 #define BOOT_MAGIC      0xFFFFFFFFu
 #define BOOT_KIND_PULL  1
 #define BOOT_BUF        (512u * 1024u)
-/* What a node says about how it STARTED - an additive tail byte on the
- * ALIVE (S81).  A peer decides whether to backfill a node from this, never
- * from its record count: a steady sweep can land a couple of records before
- * the first heartbeat is read, and a count of 2 was being taken for
- * "recovered from a WAL" (measured: a 480-record refill stalled at 2).
- * 0 is what a build older than the byte sends. */
+/* how a node STARTED: an additive tail byte on the ALIVE, 0 from an older build */
 #define PC_START_UNKNOWN     0
 #define PC_START_COLD        1   /* replayed nothing, within its first holdoff */
 #define PC_START_RECOVERED   2   /* replayed a WAL: owed a diff, not a push */
 #define PC_START_ESTABLISHED 3   /* past its first holdoff */
-/* S90: a departed member's binding - address and identity to id - is
- * RESERVED for a window, so a returning identity or a replacement at the
- * same address gets the id back and a newcomer cannot be handed it
- * meanwhile.  Every node records the departures it sees, so a node that
- * becomes master inside the window already holds them - no sync needed.
- * Bounded (CLRES_MAX, soonest-to-lapse evicted) and expiring
- * (RESERVE_MS), so ids return to the pool.  The table and its five rules
- * are clres.h; the WINDOW stays here because it is policy - and keeping
- * it a parameter is what lets the suite put the expiry boundary exactly
- * on it instead of waiting an hour. */
-/* A WEEK, not an hour.  This is a GUARANTEE window - it stops a
- * newcomer being handed a departed node's id - and rejoining was never
- * time-limited by it: a node back after a month is admitted, keeps its
- * identity, and re-derives the same proposed id.  An hour only meant the
- * guarantee lapsed while a machine was out for maintenance. */
+/* a departed member's address/identity -> id binding is RESERVED, so it gets its id back and no
+ * newcomer is handed it; every node records departures, so no sync (table: clres.h) */
+/* a week: the window only keeps the id from newcomers, rejoining is never limited by it */
 #define RESERVE_MS  604800000LL
 static struct clres reserved;
 static int self_start_kind(void);
-static int any_live_peer_cold(void);         /* S152, defined with reconcile_tick */
-static int reconcile_witness_live(void);     /* S223, defined with reconcile_tick */
+static int any_live_peer_cold(void);
+static int reconcile_witness_live(void);
 static void handle_tomb_req(const unsigned char *pt, size_t n,
-		const pc_addr *from);     /* S392, the witness's half */
+		const pc_addr *from);     /* the witness's half */
 static void fp_replay_tick(void);
-static void acks_forget_tick(unsigned int now_s);       /* 12ny AT-5 */
-static void acks_gap_tick(long long now);               /* 12ny AT-6 */
-static void acks_back_check(struct peer *p, uint64_t member,
-		long long was, long long now);                  /* 12ny AT-8 */
-static void acks_rebuild_tick(long long now);           /* 12ny AT-8 */
 static void handle_rebuild(const unsigned char *pt, size_t n, const pc_addr *from);
-static int came_back_empty(void);                       /* 12ny AT-7 */
-static void handle_gap_req(const unsigned char *pt, size_t n, const pc_addr *from);
-static void handle_gap_floor(const unsigned char *pt, size_t n, const pc_addr *from);
+static void spread_note_placeable(const struct pc_clmap *m);
+static int addr_eq(const pc_addr *a, const pc_addr *b);
+static void join_again(const pc_addr *to);
+static void spread_reclaim_tick(void);
+static void spread_missed_tick(void);
+static int admitted_peer_live(long long now);
 static void bulk_bind_self(int fd);
-static int rec_sole_witness(void);           /* 0.5.7.1, beside it */
+static int rec_sole_witness(void);
 static void handle_upg_switch(const unsigned char *pt, size_t n,
-		const pc_addr *from);     /* UPS, with handle_tomb_req */
+		const pc_addr *from);
 static void handle_upg_ack(const unsigned char *pt, size_t n,
 		const pc_addr *from);
 static void upg_msg_tick(void);
 static int rec_witness_count(int *id);
-static int rec_held(unsigned int wtick);      /* S245, defined before apply_rec */
-/* S260: the digest-gated sweep's two messages (defined with the sweep) */
+static int rec_held(unsigned int wtick);
+/* the digest-gated sweep's two messages (defined with the sweep) */
 static void handle_sweep_dig(const unsigned char *pt, size_t n,
 		const pc_addr *from);
 static void handle_sweep_dig_r(const unsigned char *pt, size_t n);
-/* S261: the reconcile's digest round (defined with the sweep's) */
+/* the reconcile's digest round (defined with the sweep's) */
 static int reconcile_digest_step(void);
 static const unsigned char *reconcile_digest_filter(int c);
 static int reconcile_digest_same(const unsigned char *diff, const str *key);
 static void rdg_drop(void);
-static void beat_pump(void);           /* S263: from the reconcile walk */
-/* S73: the eager sweep runs every this many beats.  It is REPAIR behind
- * the write-path push, not delivery, and its "dying soon" skip is
- * derived from this - never a fixed number, or the two drift apart. */
+static void beat_pump(void);           /* called from the reconcile walk */
+/* the eager sweep runs every this many beats, repair behind the write-path push; its "dying soon"
+ * skip derives from this, never a fixed number */
 #define REPL_SWEEP_BEATS 10
 #define PEER_PURGE_MS   6000
 
@@ -269,21 +200,17 @@ static void beat_pump(void);           /* S263: from the reconcile walk */
 
 #define MIG_BATCH_CAP  ((4 << 20) + (64 << 10))
 #define MIG_WINDOW     3           /* 3 x ~56KB fits a default rmem */
-/* S85: a batch whose ack is late is re-sent, up to MIG_RETX times, one
- * per MIG_RETX_MS.  Before this a single late ack dirtied the whole
- * cycle and the sender re-walked the entire keyspace, passive copies
- * included - a lost datagram repaired by re-pushing everything the
- * peer already held.  The bytes are still in migb until the slice
- * ends, so the repair is one datagram, never the keyspace. */
+/* a batch whose ack is late is re-sent up to MIG_RETX times, one per MIG_RETX_MS; the bytes stay
+ * in migb until the slice ends, so a lost datagram costs one datagram, not a re-walk */
 #define MIG_RETX       2
 #define MIG_RETX_MS    1500
 #define MIG_GATHER_CAP 56000       /* gathered group payload cap */
-/* S105: the write-path push's per-peer group - flushed when this full,
+/* the write-path push's per-peer group - flushed when this full,
  * when this old at the next append, or by the cluster loop's timer */
 #define REPL_GROUP_FLUSH_BYTES 48000
 #define REPL_FLUSH_MS 3
 #define MIG_GHDR       9           /* type+req4+node2+count2 */
-#define MIG_RHDR      20           /* per record: ttl4+cn1+klen2+vlen4+ver8+flags1 (S280) */
+#define MIG_RHDR      20           /* per record: ttl4+cn1+klen2+vlen4+ver8+flags1 */
 
 static struct {
 	int enabled;
@@ -292,243 +219,182 @@ static struct {
 	unsigned char self_ident[16];  /* persisted; stable across restarts */
 	char self_ident_hex[33];
 	unsigned int self_incarn;      /* fresh every process start */
-	/* 12ny AT-2: the last delete this incarnation numbered - its
+	/* the last delete this incarnation numbered - its
 	 * numbering space is (identity hash, incarnation), seq from 1 */
 	unsigned long long tomb_seq;
 	long long ready_ms;            /* first READY heartbeat; 0 = not yet */
 	int ident_durable;             /* 0 = nothing to persist to */
-	char state_dir[512];           /* S80: in use; empty = ephemeral */
-	int state_tmpfs;               /* S80: said loudly at startup */
+	char state_dir[512];           /* in use; empty = ephemeral */
+	int state_tmpfs;               /* said loudly at startup */
 	int proposed_id;               /* derived from the identity */
 	uint8_t psk[PC_NOISE_KEYLEN];
-	struct clwire wr;              /* sealed frames + the beat pair (M6) */
+	struct clwire wr;              /* sealed frames + the beat pair */
 	struct clpeers pt;
 	int pull_timeout_ms, negative_ms, tombstone_ms;
-	struct clpend pd;              /* parked requests + the CQs (M2) */
+	struct clpend pd;              /* parked requests + the CQs */
 	uint32_t next_req;
-	struct clloc lc;               /* locator + negative cache (M3) */
+	struct clloc lc;               /* locator + negative cache */
 	struct pc_cl_stats st;
 	struct pc_proxy_stats px;
-	/* the migration batch (S22 pacing fix): victims are stubbed and
-	 * their sealed payloads COLLECTED during the scan, then sent
-	 * through an ack-gated window - a raw burst overran the peer's UDP
-	 * receive buffer and silently dropped transfers (caught by
-	 * proxytest's conservation check: 8 of 149 keys lost on one run) */
-	struct clmig_buf migb;         /* the gather buffer (M10 slice 2) */
-	/* the in-flight window is clmig's (M10 slice 1); losses are
-	 * accounted in RECORDS there, because one gathered group carries
-	 * many and a lost datagram must not read as one lost record */
+	/* the migration batch: payloads collected during the scan go through an ack-gated
+	 * window - a raw burst overruns the peer's UDP receive buffer */
+	struct clmig_buf migb;         /* the gather buffer */
+	/* the in-flight window; losses count in RECORDS, since one gathered group carries many */
 	struct clmig mig;
 	/* automatic membership (peer thread writes, workers read node_id
 	 * and peers[] - int/ptr-free fields, release/acquire on .node) */
 	int mfd;                       /* multicast rx socket */
 	int rcvbuf;                    /* EFFECTIVE unicast SO_RCVBUF (read
 	                                * back: the kernel clamps silently) */
-	/* S125: what the receive plane is doing, sampled once a beat.  The
-	 * cluster thread owns all of this; workers read only the published
-	 * copy in C.st, which the same thread fills. */
+	/* the receive plane, sampled once a beat: the cluster thread owns it, workers
+	 * read only the copy it publishes in C.st */
 	struct {
 		long long at_ms;               /* the previous sample */
 		unsigned long long applied, older, drops;
 	} rxs;
-	/* SO_RXQ_OVFL delivers a 32-bit count of datagrams this socket has
-	 * dropped, stamped on each datagram AT THE MOMENT IT WAS QUEUED -
-	 * so it lags by the queue depth, which at a 1 Hz sample does not
-	 * matter, and it wraps, which is why the running total is kept
-	 * here as 64 bits.  One slot per receive socket: unicast, mcast. */
+	/* SO_RXQ_OVFL's 32-bit drop count is stamped at queue time (lags by the queue
+	 * depth) and wraps, hence the 64-bit total; one slot per socket: unicast, mcast */
 	struct {
 		unsigned int last;             /* last 32-bit value seen */
 		int seen;                      /* a value has been seen at all */
 	} ovfl[2];
 	unsigned long long rxq_drops;      /* the 64-bit running total */
-	/* S30: the interchange-relevant config this node runs, and who we
+	/* the interchange-relevant config this node runs, and who we
 	 * have already shouted about (once per peer, not once per second) */
 	int cfg_mode, cfg_eager, cfg_authoritative;
-	int cfg_replicas;              /* S127: K under spread, else 0 */
+	int cfg_replicas;              /* K under spread, else 0 */
 	const char *cfg_site_salt;      /* [cluster] site_salt */
 	long long pend_log_ms;         /* rate limit for the FULL shout */
-	int cfg_client_port;           /* S34: where CLIENTS reach this node
-	                                * (the peer plane speaks its own
-	                                * port; a client needs the listener) */
-	int cfg_http_port;             /* S78: this node's HTTP door, 0 = none */
-	int cfg_wal;                   /* S73b: 1 = this node logs a WAL */
-	int cfg_resp_port;             /* S49: this node's RESP door.  The
-	                                * CLUSTER family must advertise RESP
-	                                * ports - the native door is Noise
-	                                * off-box, so pointing a Redis
-	                                * client at it strands the client. */
+	int cfg_client_port;           /* where CLIENTS reach this node, not the peer port */
+	int told_self_state;           /* this node's state its clients were told */
+	int cfg_http_port;             /* this node's HTTP door, 0 = none */
+	int cfg_wal;                   /* 1 = this node logs a WAL */
+	int cfg_resp_port;             /* this node's RESP door: CLUSTER replies advertise
+	                                * it, since the native door is Noise off-box */
 	struct in_addr cfg_shouted[PC_CL_MAXPEER];
 	unsigned long long cfg_refused;
 	pc_addr mcast_dst;  /* group:port */
 	pc_addr self_addr;  /* advertised unicast addr */
-	unsigned int last_change_tick; /* membership/reshard activity - a
-	                                * 32-bit tick so worker reads are
-	                                * tear-free on every arch (the
-	                                * ILP32 rule: no cross-thread u64) */
+	unsigned int last_change_tick; /* membership/reshard activity; 32-bit so worker
+	                                * reads are tear-free on ILP32 (no cross-thread u64) */
 	int role;                      /* PC_ROLE_* */
-	/* the map this node currently believes, and whether it has one.
-	 * A master builds its own; everyone else adopts what arrives, and
-	 * only ever forwards - see clmap_adopt(). */
+	/* the map this node believes: a master builds its own, everyone else adopts
+	 * what arrives and only forwards (clmap_adopt()) */
 	struct pc_clmap map;
 	int map_valid;
 	long long map_pub_ms;          /* last publication, master side */
 	unsigned long long map_pub_n, map_rx_n, map_stale_n, map_bad_n;
-	unsigned long long map_unadmitted_n;   /* S241 */
-	/* the map may be used for placement: its placeable set matches
-	 * what this node currently sees as live.  Cached rather than
-	 * recomputed per lookup - placement is on the request path. */
+	unsigned long long map_unadmitted_n;
+	/* the map's placeable set matches what this node sees as live; cached, since
+	 * placement is on the request path */
 	int map_usable;
-	/* B4: a reconcile pass is running, with its resumable position */
-	/* The master's record of which identities this cluster has seen.
-	 * It is what separates a NEW node from a RETURNING one, and it is
-	 * not a judgement a node can make about itself - one whose state
-	 * directory was wiped sincerely believes it is new. */
+	/* the master's record of identities this cluster has seen: NEW vs RETURNING is
+	 * no judgement a node can make about itself (a wiped state dir believes it is new) */
 	struct pc_clhist hist;
 	int backup_id;                 /* the master's chosen standby, 0 = none */
 	struct pc_clsync sync;         /* master side: stage -> ack -> publish */
 	struct pc_clmap staged;        /* built and staged, not yet published */
 	long long staged_deadline_ms;
 	unsigned long long stage_timeout_n;
-	/* S277: the standby that last let a stage time out, and until when
+	/* the standby that last let a stage time out, and until when
 	 * pick_backup() passes it over */
 	int passed_over_id;
 	long long passed_over_until_ms;
-	/* backup side: control state held ON BEHALF of a master, and the
-	 * epoch it covers.  Held, never adopted - the map this node places
-	 * from is whatever arrived on the broadcast. */
+	/* backup side: control state held ON BEHALF of a master, never adopted - this
+	 * node places from the broadcast map */
 	struct pc_clhist held_hist;
 	struct pc_clmap held_map;      /* so a promotion can republish it */
 	int held_valid;
 	uint32_t held_term, held_seq;
 	unsigned long long sync_sent_n, sync_rx_n, sync_ack_n, sync_bad_n;
 	int reconcile_on;
-	/* S245: the tick recovery finished at.  While reconcile_on, a record
-	 * whose write tick is at or below it is one this node brought back
-	 * from its snapshot or WAL and the fleet has not yet ruled on - or,
-	 * after a rebuild was asked (12ny AT-8), one it stored before the
-	 * absence the asker saw */
+	/* the tick recovery finished at: while reconcile_on, a record written at or below
+	 * it is unruled recovered data (after a rebuild ask: stored before the absence) */
 	unsigned int rec_tick;
-	/* 12ny AT-8: the boundary of the last rebuild pass started - an ask
+	/* the boundary of the last rebuild pass started - an ask
 	 * at or below it is covered by it */
 	unsigned int rb_cover;
-	/* S245: the hold is on - reconcile is asking, OR its answers are
-	 * still due.  Retaken each tick (reconcile_tick), so a record's
-	 * check is one load, not a walk of the pending table. */
+	/* the hold is on: reconcile is asking or its answers are due; retaken each tick,
+	 * so a record's check is one load */
 	int rec_hold;
-	/* S455: the pass is a REBUILD (12ny AT-8) - back without a restart,
-	 * so the fleet was up through the absence by definition */
+	/* the pass is a REBUILD: back without a restart, so the fleet was up through the absence */
 	int rec_rebuild;
-	int rec_floored;                   /* S463: a floor's pass - never S455's */
-	/* S455: a resync - the records in question dropped by a sliced walk
-	 * (rec_col/rec_cursor; the hold stays on while it runs), then the
-	 * fleet's state pulled as a joiner's bootstrap; resync_floor makes
-	 * AT-7's floors apply to that pull as to a node that came back empty */
+	int rec_floored;                   /* a floor's pass, never a rebuild's */
+	/* a resync: the records in question dropped by a sliced walk (hold on), then the
+	 * fleet's state pulled as a bootstrap; resync_floor gives it an empty node's floors */
 	int resync_on;
 	int resync_floor;
 	unsigned long long resync_dropped_now;  /* this resync's drops */
-	/* S222: when this node raises its own SIGTERM (0 = not scheduled).
-	 * Written by a worker (the fleetstop verb) or by the cluster thread
-	 * (a peer's M_FLEETSTOP), read by the cluster thread's tick. */
+	/* when this node raises its own SIGTERM (0 = not scheduled): written by a worker
+	 * or the cluster thread, read by the cluster thread's tick */
 	long long stop_self_at_ms;
 	int rec_col;
 	unsigned int rec_cursor;
-	long long rec_start_ms;        /* S212: the pass's first probe */
-	struct clrecon_fp fp;          /* S392: the fast path's state */
-	struct clrecon recon;          /* the walk's pacing (S393, S395, ST8) */
-	unsigned long long last_run_scanned;   /* S212: run_migration's last walk */
+	long long rec_start_ms;        /* the pass's first probe */
+	struct clrecon_fp fp;          /* the fast path's state */
+	struct clrecon recon;          /* the walk's pacing */
+	unsigned long long last_run_scanned;   /* run_migration's last walk */
 	unsigned long long place_map_n, place_hrw_n;
 	int master_id;
 	pc_addr master_addr;
 	long long master_seen_ms;
-	/* S216: the cluster thread's progress clock - stamped by that
-	 * thread, read by the heartbeat thread (all atomics; see
-	 * stall_check) */
+	/* the cluster thread's progress clock: stamped by that thread, read by the
+	 * heartbeat thread (all atomics; see stall_check) */
 	long long prog_ms;
 	int prog_what;
 	long long stall_since_ms, stall_last_ms;
 	int apply_stall_ms;            /* config; 0 = the detector is off */
-	struct clapply ap;             /* S217: the apply rings; ap.n = 0 inline */
+	struct clapply ap;             /* the apply rings; ap.n = 0 inline */
 	int apply_threads_cfg;
 	uint64_t join_tok;
-	long long join_deadline_ms, join_last_ms, higher_joiner_ms;
-	int join_defers;
-	int join_held;                 /* S108: said "held" once this join */
-	/* the bulk TCP plane (records above the datagram ceiling): the
-	 * peer thread's tick fills a batch + target, the bulk thread owns
-	 * every socket */
+	long long join_deadline_ms, join_last_ms;
+	int join_held;                 /* said "held" once this join */
+	/* the bulk TCP plane (records above the datagram ceiling): the peer thread's
+	 * tick fills a batch and target, the bulk thread owns every socket */
 	int blfd;                      /* TCP listener on advertise:port */
-	struct clbulk bk;              /* framing + the batch handoff (M7) */
+	struct clbulk bk;              /* framing + the batch handoff */
 	unsigned char *bulkb;          /* tick-side collect buffer */
 	size_t bulkb_len;
 	unsigned int bulk_recs;
-	/* S83: the bootstrap pull, handed to the bulk thread under bmx */
-	struct clboot bt;              /* the S83 bootstrap decision (M4) */
-	struct clpush wp;              /* per-thread write-path groups (M5) */
+	/* the bootstrap pull, handed to the bulk thread under bmx */
+	struct clboot bt;              /* the bootstrap decision */
+	struct clpush wp;              /* per-thread write-path groups */
 	int boot_done;                 /* pulled a full walk this incarnation */
 	int boot_rounds;               /* candidate lists tried so far */
 	int boot_round_failed;         /* set by the bulk thread: re-pick */
 } C;
 
-/* AR11: the settings this node holds that the fleet must agree on - set
- * once before the threads start (daemon.c), read by them after; the
- * keepalive and the members reply both carry them.  UP1: the facts that
- * follow them (put_facts, self_features - with the keepalive below) */
+/* the settings the fleet must agree on: set once before the threads start, read by them after;
+ * the keepalive and the members reply carry them, with the facts (put_facts, self_features) */
 static struct pc_cfgsig cfgsig[PC_CFGSIG_MAX];
 static int ncfgsig;
 static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int features);
 static int self_features(void);
-/* S432: PERFCACHED_TEST_NO_RESPMAP - this member announces no RESPMAP bit,
- * as a build before 0.7.1 would not, so a suite can see the map verb
- * refused while such a member is in the fleet */
+/* PERFCACHED_TEST_NO_RESPMAP: announce no RESPMAP bit, as an older build, so a suite sees the map
+ * verb refused */
 static int self_no_respmap;
-/* S436: PERFCACHED_TEST_NO_AUTOSCALE - this member announces no AUTOSCALE
- * bit and no digest, takes none of the fleet's modes and its verb sets a
- * mode here alone, as a build before 0.7.2 does.
- * PERFCACHED_TEST_AUTOSCALE_DEAF - it advertises both and ignores the
- * fleet's modes (an announce lost for good), so a suite can see the digests
- * differ and the member named */
+/* PERFCACHED_TEST_NO_AUTOSCALE: no AUTOSCALE bit, no digest, no fleet modes (an older build);
+ * PERFCACHED_TEST_AUTOSCALE_DEAF: advertise both but ignore the fleet's modes */
 static int self_no_autoscale, self_as_deaf;
-/* 12ny AT-4/AT-10: PERFCACHED_TEST_NO_ACKS - this member sends the keepalive
- * a build before 0.7.3 sends (no features word, no marks), so a suite can
- * see the fleet's gate name it and its marks cleared */
+/* PERFCACHED_TEST_NO_ACKS: send an older build's keepalive (no features word, no marks), so a
+ * suite sees the fleet's gate name it */
 static int self_no_acks;
-/* 12ny AT-11: PERFCACHED_TEST_FREEZE_MARKS - this member announces each
- * space's mark as it first announced it, for ever, while it applies and
- * confirms as usual: a stuck member, on demand, for the alert's suite;
- * PERFCACHED_TEST_ACKS_STUCK_MS - how long a mark must stand still first */
+/* PERFCACHED_TEST_FREEZE_MARKS: announce each space's first mark for ever while applying as usual;
+ * PERFCACHED_TEST_ACKS_STUCK_MS: how long a mark must stand still to be stuck */
 static int self_freeze_marks;
-/* S473: PERFCACHED_TEST_GAP_NO_COPIES - this member re-sends no copy of another
- * origin's deletes, as past its time rule (a 10 s tick): tombdeadtest's peers */
+/* PERFCACHED_TEST_GAP_NO_COPIES: re-send no copy of another origin's deletes, as past its time
+ * rule (a 10 s tick) */
 static int self_gap_no_copies;
 static long long acks_stuck_ms = 30000;    /* a stuck mark: still 30 s */
-static struct { uint64_t oid; uint32_t incarn; uint64_t mark; } frozen[64];
-static int nfrozen;
-
-static uint64_t freeze_mark(uint64_t oid, uint32_t incarn, uint64_t mark)
-{
-	int i;
-
-	for (i = 0; i < nfrozen; i++)
-		if (frozen[i].oid == oid && frozen[i].incarn == incarn)
-			return frozen[i].mark;
-	if (nfrozen < 64) {
-		frozen[nfrozen].oid = oid;
-		frozen[nfrozen].incarn = incarn;
-		frozen[nfrozen++].mark = mark;
-	}
-	return mark;
-}
 _Static_assert(CLACKF_MEMBERS == PC_CL_MAXMEMBERS,
 	"clackf holds every member a fleet can have");
-/* S394: PERFCACHED_TEST_NO_HOLDQ - this member announces no HOLDQ bit and
- * drops M_HOLD_Q, as a build before 0.7.2 does, so a suite can see a fleet
- * with such a member walk with pulls */
+/* PERFCACHED_TEST_NO_HOLDQ: announce no HOLDQ bit and drop M_HOLD_Q, as an older build, so a suite
+ * sees such a fleet walk with pulls */
 static int self_no_holdq;
-/* CH-19: PERFCACHED_TEST_NO_PROMOTE - this member never takes mastership
- * (it beats and follows as any member), so a suite can stand up the higher
- * address the bounded deferral exists for */
+/* PERFCACHED_TEST_NO_PROMOTE: never take mastership, so a suite can stand up the higher address
+ * the bounded deferral exists for */
 static int self_no_promote;
-/* CH-19: a member's election defers to a live higher address; since when,
+/* a member's election defers to a live higher address; since when,
  * and to which.  Cleared by a master beacon followed, and by promoting */
 static long long elect_defer_ms;
 static pc_addr elect_defer_to;
@@ -542,7 +408,7 @@ static long long now_ms(void)
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* S467: the same clock, coarse - a few ns through the vDSO, at most a
+/* the same clock, coarse - a few ns through the vDSO, at most a
  * jiffy behind now_ms(); for the write path's "anything to clear?" */
 static long long now_ms_coarse(void)
 {
@@ -554,17 +420,14 @@ static long long now_ms_coarse(void)
 
 /* ---- sealed datagrams -------------------------------------------------- */
 
-/* The sealed datagram lives in clwire (M6) and the send path in clsend
- * (M14), which was handed C.fd and C.psk once, at init.  This name stays
- * so the 31 call sites here read as they did; new code outside cluster.c
- * calls clsend directly. */
+/* the send path is clsend's, handed C.fd and C.psk at init */
 static int seal_send(const pc_addr *to, const unsigned char *pt,
 		size_t n)
 {
-	return clsend_seal(to, pt, n);         /* M14: clsend owns the path */
+	return clsend_seal(to, pt, n);
 }
 
-/* S36: [cluster] discovery = unicast - set before pc_cluster_init */
+/* [cluster] discovery = unicast - set before pc_cluster_init */
 static int cl_unicast;
 static const char *cl_seeds;
 static unsigned long long mesh_hints_sent, mesh_hints_recv;
@@ -578,141 +441,34 @@ void pc_cluster_set_discovery(int unicast, const char *seeds)
 }
 
 static int cl_max_dgram, cl_lane_port;
-static int cl_expect;                          /* S36c */
+static int cl_expect;
 
 void pc_cluster_set_expect(int n)
 {
 	cl_expect = n;
 }
 
-/* S343: collection names peers announced that break the rule - refused,
- * never created */
-static unsigned long long cl_bad_col_names;
-
-unsigned long long pc_cluster_bad_col_names(void)
-{
-	return __atomic_load_n(&cl_bad_col_names, __ATOMIC_RELAXED);
-}
-
-static int col_name_refused(const char *what, const char *s, size_t n)
-{
-	unsigned long long c;
-	char pb[4 * PC_COL_NAME_MAX + 1];
-
-	if (pc_col_name_held_ok(s, n))
-		return 0;
-	c = __atomic_add_fetch(&cl_bad_col_names, 1, __ATOMIC_RELAXED);
-	if (c <= 8 || !(c & (c - 1)))          /* the first eight, then rarely */
-		LM_WARN("collection '%s' %s by a peer refused: %s (%llu refused "
-			"so far)\n", pc_col_name_print(pb, sizeof pb, s, n), what,
-			PC_COL_NAME_RULE, c);
-	return 1;
-}
-
-/* S341: the page's header counts the fleet against it */
+/* the page's header counts the fleet against it */
 int pc_cluster_expect(void)
 {
 	return cl_expect;
 }
 
-static int cl_id_source;                       /* S143: PC_IDSRC_* */
+static int cl_id_source;                       /* PC_IDSRC_* */
 
 void pc_cluster_set_identity_source(int src)
 {
 	cl_id_source = src;
 }
 
-/* S36 step c: the founding rule for a BLANK cold start in unicast mode
- * (Akka Cluster Bootstrap's): the joiners this node hears, so it founds
- * only when that set has been stable FOUND_STABLE_MS, it sees `expect`
- * blank nodes (itself included), and no live joiner has a higher
- * address (the highest founds - the rule multicast already used, here
- * without the cap on deferring: a cap is how two founders happen). */
-#define FOUND_STABLE_MS  5000
-#define JOINER_LIVE_MS   3000
-#define JOINER_MAX       64
-static int addr_cmp(const pc_addr *a, const pc_addr *b);
-static struct { pc_addr a; long long ms; } joiner[JOINER_MAX];
-static int joiner_n;
-static long long joiner_change_ms;
-static long long found_said_ms;
-static const char *found_said_why;
-
-static void joiner_note(const pc_addr *a, long long now)
-{
-	int i;
-
-	for (i = 0; i < joiner_n; i++)
-		if (pc_addr_eq(&joiner[i].a, a)) {
-			joiner[i].ms = now;
-			return;
-		}
-	if (joiner_n < JOINER_MAX) {
-		joiner[joiner_n].a = *a;
-		joiner[joiner_n++].ms = now;
-		joiner_change_ms = now;
-	}
-}
-
-/* live joiners (expired ones leave, which is a change too); @higher
- * set when one of them outranks this node */
-static int joiner_live(long long now, int *higher)
-{
-	int i, n = 0;
-
-	*higher = 0;
-	for (i = 0; i < joiner_n; ) {
-		if (now - joiner[i].ms >= JOINER_LIVE_MS) {
-			joiner[i] = joiner[--joiner_n];
-			joiner_change_ms = now;
-			continue;
-		}
-		n++;
-		if (addr_cmp(&joiner[i].a, &C.self_addr) > 0)
-			*higher = 1;
-		i++;
-	}
-	return n;
-}
-
-/* 1 = this blank node must not found yet (and says why, now and then) */
-static int found_gate_blocks(long long now)
-{
-	unsigned char c[16];
-	int live, higher;
-	const char *why = NULL;
-
-	if (!cl_unicast || pc_cid_get(c) != CLWIRE_CID_NONE)
-		return 0;                      /* not blank: it has its cluster */
-	if (!joiner_change_ms)
-		joiner_change_ms = now;
-	live = joiner_live(now, &higher);
-	if (now - joiner_change_ms < FOUND_STABLE_MS)
-		why = "the joiners it hears are still changing";
-	else if (cl_expect && live + 1 < cl_expect)
-		why = "fewer blank nodes than [cluster] expect";
-	else if (higher)
-		why = "a joiner with a higher address will found";
-	if (!why)
-		return 0;
-	/* said when the reason changes, and every 30 s while it holds */
-	if (why != found_said_why || now - found_said_ms >= 30000) {
-		LM_NOTICE("cluster: not founding yet - %s (%d other joiner(s) "
-			"heard, expect %d)\n", why, live, cl_expect);
-		found_said_ms = now;
-		found_said_why = why;
-	}
-	return 1;
-}
-
 void pc_cluster_set_lane(int max_dgram, int lane_port)
 {
 	cl_max_dgram = max_dgram;
 	cl_lane_port = lane_port;
-	clrp_set_tcp_min(max_dgram > 0 ? (size_t)max_dgram : 0);  /* S469 */
+	clrp_set_tcp_min(max_dgram > 0 ? (size_t)max_dgram : 0);
 }
 
-/* S329: a forced lane is not for ever - see lane_retry_tick */
+/* a forced lane is not for ever - see lane_retry_tick */
 static long long cl_lane_retry_ms = 30000;
 static unsigned long long lane_restored;
 
@@ -726,11 +482,8 @@ unsigned long long pc_cluster_lane_restored(void)
 	return lane_restored;
 }
 
-/* S36: a CONTROL frame to the fleet - the multicast group, or in
- * unicast mode one sealed copy to every address of the target set
- * (clmesh.h).  The seven group sends come through here and nothing
- * else does: every data plane is unicast already.  0 if a copy left
- * (or there was nobody to send to), -1 if every send failed. */
+/* a CONTROL frame to the fleet: the multicast group, or in unicast mode one sealed copy per target
+ * (clmesh.h); data never comes here.  0 if a copy left (or no target), -1 if every send failed */
 static int ctl_send(const unsigned char *pt, size_t n)
 {
 	static __thread pc_addr tgt[CLMESH_MAX_SEEDS * 8 +
@@ -747,10 +500,7 @@ static int ctl_send(const unsigned char *pt, size_t n)
 	return !k || ok ? 0 : -1;
 }
 
-/* ---- the pub/sub relay plane: clps.c (M16) ------------------------------
- * PS3's fan-out, PS7's receive windows, PS11's relay port and PS12's
- * interest exchange live in clps.c.  What stays is what speaks: the relay
- * port's open and its probes decide there and are SAID here (rule 4). */
+/* ---- the pub/sub relay plane: decided in clps.c, said here ---------------- */
 
 int pc_cluster_pubsub_rx_open(int port, int threads)
 {
@@ -799,7 +549,7 @@ static void ps_probe_tick(long long now)
 				p->node, (unsigned)p->ps.port);
 			break;
 		}
-		/* S461: replication's own answer on the same port */
+		/* replication's own answer on the same port */
 		switch (clrp_probe_peer(p, now)) {
 		case CLPS_EV_DIRECT:
 			LM_NOTICE("cluster: replication to node %d now uses its relay "
@@ -850,13 +600,8 @@ void pc_cluster_repl_plane_figures(int *peers_direct,
 	*rx_refused = f.rx_refused;
 }
 
-/* ---- S165: unknown commands, fleet-wide ------------------------------
- * Every node keeps its own table (obs.c) and sends it whole to every live
- * peer; each keeps the latest table per peer and folds them with its own
- * for /stats.  The tables are small and change rarely, so whole-table
- * replacement beats deltas: a lost datagram costs nothing the next send
- * does not repair.  Peer thread writes, any /stats reader folds, under
- * unk_mx - the error path never takes it. */
+/* ---- unknown commands, fleet-wide: each node sends its whole obs.c table to every live peer,
+ * a lost one repaired by the next; the peer thread writes, /stats folds, under unk_mx ---- */
 #define UNK_REFRESH_MS 30000
 #define UNK_STALE_MS   (3 * UNK_REFRESH_MS + 5000)
 struct unk_peer {
@@ -882,10 +627,8 @@ static void unk_tick(long long now)
 
 	if (!C.node_id || now - unk_sent_ms < 1000)
 		return;
-	/* the live set as a signature: a peer that became live since the
-	 * last send has not heard us - a node's first send can go out before
-	 * it sees anyone, and waiting 30 s for the refresh would leave it
-	 * "not reporting" on every page for that long */
+	/* the live set as a signature: a peer that became live since the last send has
+	 * not heard us, and must not wait 30 s for the refresh */
 	for (i = 0; i < C.pt.n_peers; i++) {
 		struct peer *p = &C.pt.peers[i];
 		int node = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
@@ -986,24 +729,16 @@ void pc_cluster_unknown_figures(unsigned long long *recv,
 	*recv = __atomic_load_n(&unk_recv, __ATOMIC_RELAXED);
 	*bad = __atomic_load_n(&unk_bad, __ATOMIC_RELAXED);
 }
-/* S302: the header of the datagram this thread is dispatching, so a
- * handler can read the sender's cluster id and flags (handle_assign
- * adopts it, handle_master_alive yields to it) */
+/* the header of the datagram this thread is dispatching, so a handler can read the sender's
+ * cluster id and flags (handle_assign adopts it, handle_master_alive yields to it) */
 static __thread const unsigned char *rx_hdr;
-/* ...a COPY of it (magic, version, id, flags - what the handlers read),
- * never the receive buffer itself: that is drain_one_fd's stack, and a
- * pointer to it outlives the call (gcc 14's -Wdangling-pointer caught it
- * on 224).  rx_hdr points here while a datagram is dispatched, NULL
- * otherwise. */
+/* ...a COPY of it, never the receive buffer (drain_one_fd's stack); rx_hdr points here while a
+ * datagram is dispatched, NULL otherwise */
 static __thread unsigned char rx_hdr_copy[19];
 static unsigned long long cid_foreign_seen;
 
-/* S36 step d: every OTHER established cluster this node hears - the
- * alarm a second cluster on the same seeds (or group) must raise.  S302
- * already refuses its frames and counts them; this says WHICH, from
- * where and how recently: /stats cluster.foreign_clusters, /metrics, and
- * an ERROR the first time an id is seen (the fleet health gate reads
- * ERRORs).  Never a merge.  Written by the cluster thread, read by /stats. */
+/* every OTHER established cluster this node hears (same seeds or group): which, from where, how
+ * recently, and an ERROR the first time; never a merge.  Cluster thread writes, /stats reads */
 #define FOREIGN_MAX     16
 #define FOREIGN_KEEP_MS (5 * 60 * 1000)
 static pthread_mutex_t foreign_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -1054,6 +789,39 @@ static void foreign_note(const unsigned char *cid, const unsigned char *mine,
 		a, b);
 }
 
+/* the last datagram each sender had refused as another cluster's: UDP reaches us from it, so a
+ * silence it shows is no blocked path (a cold-start race), and the lane is not forced for it */
+#define FRX_MAX 16
+static pthread_mutex_t frx_mx = PTHREAD_MUTEX_INITIALIZER;
+static struct { pc_addr a; long long ms; } frx[FRX_MAX];
+static int frx_n;
+
+static void frx_note(const pc_addr *a, long long now)
+{
+	int i, old = 0;
+
+	pthread_mutex_lock(&frx_mx);
+	for (i = 0; i < frx_n && !addr_eq(&frx[i].a, a); i++)
+		if (frx[i].ms < frx[old].ms)
+			old = i;
+	if (i == frx_n)
+		i = frx_n < FRX_MAX ? frx_n++ : old;
+	frx[i].a = *a;
+	frx[i].ms = now;
+	pthread_mutex_unlock(&frx_mx);
+}
+
+static int frx_since(const pc_addr *a, long long since)
+{
+	int i, r = 0;
+
+	pthread_mutex_lock(&frx_mx);
+	for (i = 0; i < frx_n && !r; i++)
+		r = addr_eq(&frx[i].a, a) && frx[i].ms >= since;
+	pthread_mutex_unlock(&frx_mx);
+	return r;
+}
+
 int pc_cluster_foreign_list(char *ids, int cap_ids, char addrs[][24],
 		long long *ago_ms, unsigned long long *frames, int cap)
 {
@@ -1076,25 +844,15 @@ int pc_cluster_foreign_list(char *ids, int cap_ids, char addrs[][24],
 	return n;
 }
 
-/* S302: the id a node with NONE last heard on a live member's beat, so
- * that if it must found it founds INTO that cluster rather than minting
- * a stranger's id (a no-state_dir node restarted inside MASTER_DEAD_MS:
- * no master answers yet, and a new id would be refused by the very
- * members it left).  Written only while this node has no id, so the
- * lock costs nothing in steady state. */
+/* the id a node with NONE last heard on a live member's beat, so it founds INTO that cluster, not
+ * under an id its old members would refuse; written only while id-less, so the lock is free */
 static pthread_mutex_t cid_heard_mx = PTHREAD_MUTEX_INITIALIZER;
 static unsigned char cid_heard[CLWIRE_CID_LEN];
 static long long cid_heard_ms;
 #define CID_HEARD_FRESH_MS 3000
 
-/* S302: may this datagram be handled at all?  See clcid.h:
- *   - no id yet: everything (this node is joining or founding)
- *   - the same id: everything
- *   - a zero id (a node that has joined nothing): the bootstrap types
- *   - a foreign id: refused - except a foreign MASTER's keepalive while
- *     this node holds a PROVISIONAL id and is a master or joining, which
- *     is what lets two founders of one cold start settle into one
- *     cluster (a member follows its own master, never a foreign one) */
+/* may this datagram be handled (clcid.h)?  No id yet or the same id: all; zero id: no authority
+ * kinds; foreign: refused, but a provisional non-member hears a foreign master (cold start) */
 static int cid_admit(const unsigned char *buf, int type,
 		const pc_addr *from)
 {
@@ -1117,18 +875,8 @@ static int cid_admit(const unsigned char *buf, int type,
 	}
 	if (!memcmp(theirs, mine, 16))
 		return 1;
-	/* A zero id is a node that has joined nothing yet - typically one
-	 * just restarted with no state directory, still owning keys under
-	 * the fleet's map until it rejoins.  It is not ANOTHER cluster, and
-	 * its data plane must flow: refusing its forward ack, or the write a
-	 * client sent it and it forwarded to the key's owner, turned
-	 * acknowledged writes into "not stored" (failovertest's bounce, red
-	 * on GitHub for v0.4.1).  What it must not carry is AUTHORITY - a
-	 * blank node is never a master: it founds or joins, and so holds an
-	 * id, first.  Refused from a zero id: master beats, maps, join
-	 * answers, control-state sync, demotion, fleet stop, collection
-	 * DDL, a stats reset and an alert relay.  None of the admitted kinds
-	 * can merge two clusters. */
+	/* a zero id is a node that has joined nothing (restarted without state, still
+	 * owning keys): its data plane flows, but a blank node is never a master */
 	if (!memcmp(theirs, z, 16))
 		return type != M_MASTER_ALIVE && type != M_CLMAP &&
 			type != M_ASSIGN && type != M_JOIN_REJ &&
@@ -1139,13 +887,23 @@ static int cid_admit(const unsigned char *buf, int type,
 	if (st == CLWIRE_CID_PROVISIONAL && C.role != PC_ROLE_MEMBER &&
 	        type == M_MASTER_ALIVE)
 		return 1;
+	/* our provisional cluster's master now speaks for another: it yielded inside its grace, and
+	 * a member left behind would wait for ever in a cluster nobody else is in - follow it */
+	if (st == CLWIRE_CID_PROVISIONAL && C.role == PC_ROLE_MEMBER &&
+	        (type == M_ALIVE || type == M_MASTER_ALIVE) && addr_eq(from, &C.master_addr)) {
+		pc_cid_str(theirs, a);
+		LM_WARN("cluster: master %s now speaks for cluster %s - it yielded while ours was "
+			"provisional; re-joining through it\n", pc_addr_str(from), a);
+		pc_cid_drop();
+		C.master_id = 0;               /* a member there now: the winner's beacon is joined */
+		C.master_seen_ms = 0;
+		join_again(NULL);
+		return 0;
+	}
 	__atomic_fetch_add(&cid_foreign_seen, 1, __ATOMIC_RELAXED);
-	/* S36: in unicast mode a refused PROVISIONAL founder is still
-	 * learned and passed to the master - a member that joined one
-	 * founder of a cold start is otherwise the only node that hears the
-	 * other, and without multicast the two founders never meet to
-	 * settle into one (S302's rule needs them to hear each other).  An
-	 * established foreigner is not: clusters never merge. */
+	frx_note(from, now_ms());
+	/* in unicast mode a refused PROVISIONAL founder is still passed to the master, or
+	 * two founders of a cold start never meet; never an established foreigner */
 	if (cl_unicast && (CLWIRE_HDR_FLAGS(buf) & CLWIRE_F_PROVISIONAL))
 		mesh_note(from, type, 1);
 	/* once a minute per sender, and only between established clusters:
@@ -1154,10 +912,7 @@ static int cid_admit(const unsigned char *buf, int type,
 	        st != CLWIRE_CID_ESTABLISHED)
 		return 0;
 	now = now_ms();
-	foreign_note(theirs, mine, from, now);         /* S36 step d */
-	/* CH-17: the shared limit, once a minute per sender.  This kept a
-	 * table of its own, 32 senders overwritten at now % 32, so a 33rd
-	 * rotating source said a line per datagram */
+	foreign_note(theirs, mine, from, now);
 	if (!pc_logrl_ok(LRL_FOREIGN_CID, from))
 		return 0;
 	pc_cid_str(theirs, a);
@@ -1169,14 +924,8 @@ static int cid_admit(const unsigned char *buf, int type,
 	return 0;
 }
 
-/* S302: about to join the sender of the datagram being handled.  If it
- * is ANOTHER cluster - only a provisional node that is not a member ever
- * hears one (cid_admit), in a cold-start race - give the provisional id
- * up, so the join carries none and that cluster's master admits it.  A
- * step-down or re-join inside this cluster (a higher term, a map that
- * outranks ours, a lost master) keeps it: dropping it there made a master
- * that could not reach its successor re-found under a NEW id, which its
- * own members then refused as foreign. */
+/* about to join this datagram's sender: drop a provisional id only if it is ANOTHER cluster (a
+ * cold-start race); a step-down inside this one keeps it, or its own members refuse a new id */
 static void cid_follow_foreign(void)
 {
 	unsigned char mine[CLWIRE_CID_LEN];
@@ -1197,7 +946,7 @@ void pc_cluster_cid_info(char out[37], const char **state,
 	*foreign = __atomic_load_n(&cid_foreign_seen, __ATOMIC_RELAXED);
 }
 
-/* CH-7: a rotation's other secret, opened with and never sealed with */
+/* a rotation's other secret, opened with and never sealed with */
 static uint8_t psk_accept[PC_NOISE_KEYLEN];
 static int have_psk_accept;
 
@@ -1216,58 +965,19 @@ static int open_dgram(unsigned char *buf, size_t n, unsigned char *pt,
 }
 
 
-/* one sealed datagram to every live peer, in peer-table order */
-static void broadcast_live(const unsigned char *msg, size_t n, long long now)
-{
-	(void)clsend_live(&C.pt, msg, n, now);  /* M14 */
-}
-
-/* ---- the heartbeat watchdog (the donor-starvation fix) ------------------
- * PEER_UP_MS reads silence as death, and the peer thread's long duties
- * used to leave the node mute for up to the SAME 5 seconds: a migration
- * tick's ack window polls to a 5000ms deadline and a big victim walk
- * was unbounded, so a busy donor was evicted as dead MID-MIGRATION,
- * rejoined as a fresh identity, and the fleet churned through
- * elections (ASan's 2-3x slowdown exposed it; natively the margin was
- * zero, not merely thin).  Two layers, both EMISSION-ONLY - membership
- * decisions stay in membership_tick on the peer thread:
- *   - beat_pump(): called from inside the known long duties on the
- *     peer thread itself, builds and sends real current frames;
- *   - pc_cluster_beat_thread(): a watchdog for stalls nobody foresaw.
- *     When nothing has been emitted for BEAT_OVERDUE_MS it re-seals
- *     the LAST frames the peer thread built (free-MB and lamport up to
- *     ~2s stale - staleness this plane tolerates by design; every
- *     seal_send draws a fresh random nonce, so the re-send is a new
- *     sealed datagram, not a wire replay).  The frames cross threads
- *     under a seqlock; the sends share the UDP socket, which is safe -
- *     datagram sendto is atomic, C.psk and C.mcast_dst are immutable
- *     after init. */
+/* ---- the heartbeat watchdog: keeps a busy node audible (silence reads as death); emission only.
+ * The frames cross threads under a seqlock; sendto is atomic, C.psk/C.mcast_dst fixed at init */
 #define BEAT_OVERDUE_MS 1600
 
-/* ---- S216: the progress clock, and who reads it --------------------------
- * The watchdog above keeps a node AUDIBLE while the cluster thread is
- * heads-down - which is right for a long duty, and is also exactly how a
- * thread that has wedged for good stays a healthy-looking member: the
- * last frame it built says READY, and the watchdog re-sends it for ever.
- *
- * The cluster thread stamps this clock wherever it demonstrably moves:
- * the top of its loop (10 Hz when idle - the poll timeout is 100 ms),
- * each datagram it handles, and beat_pump(), which the known long duties
- * call precisely to say "still here".  The heartbeat thread reads it.  No
- * stamp for apply_stall_ms = STALLED (see cluster.h): the overlay goes
- * up, and the frames the watchdog re-sends are PATCHED to say so - the
- * one thread still running is the only one that can tell anybody.  The
- * overlay lifts after a full apply_stall_ms without a stall, so a thread
- * that limps does not flap the fleet's view of it.
- *
- * Emission-only still holds: nothing here decides membership. */
+/* ---- the progress clock: stamped wherever the cluster thread moves, read by the heartbeat
+ * thread; no stamp for apply_stall_ms is STALLED, patched into the re-sent frames ---------- */
 #define PC_PROG_LOOP    0
 #define PC_PROG_TICK    1              /* the 1 Hz duties */
 #define PC_PROG_REBAL   2              /* the rebalance / repair sweep */
 #define PC_PROG_DGRAM   3              /* handling a datagram */
 #define PC_PROG_FLUSH   4              /* flushing a push group */
 #define PC_PROG_PUMP    5              /* a long duty, saying so */
-#define PC_PROG_APPLY   6              /* S217: an apply thread, not the receiver */
+#define PC_PROG_APPLY   6              /* an apply thread, not the receiver */
 
 static void prog(int what)
 {
@@ -1293,23 +1003,7 @@ void pc_cluster_set_apply_stall_ms(int ms)
 	C.apply_stall_ms = ms;
 }
 
-/* ---- S217: the apply threads ------------------------------------------ */
-static int apply_rec(const struct clapply_rec *r, void *ht_or_null);
-
-/* What a group's ack counts.  apply_rec: 1 stored, 2 refused because
- * this node already has that version or newer, or a newer delete of it,
- * 0 anything else (no such collection, no memory).  A migration batch
- * credits only what was STORED (migrated_out).  S253: a push group's ack
- * is what lets the sender drop a non-holder's copy, and the question it
- * answers is "does the holder have this version or newer" - so a 2
- * counts there too.  Without it, two of the sender's workers writing one
- * key inside a flush interval made the later version land first and the
- * earlier group ack short: 15-18% of non-holder copies kept on 223. */
-static int apply_counts(int rc, uint32_t req)
-{
-	return rc == 1 || (rc == 2 && (req & CLPUSH_ACK_TAG));
-}
-
+/* ---- the apply threads ------------------------------------------------- */
 void pc_cluster_set_apply_threads(int n)
 {
 	C.apply_threads_cfg = n;
@@ -1318,26 +1012,6 @@ void pc_cluster_set_apply_threads(int n)
 int pc_cluster_apply_threads(void)
 {
 	return C.ap.n;
-}
-
-static volatile int *apply_stop;
-
-/* daemon.c runs one of these per thread, idx 0..n-1, each with a thread
- * slot of its own (the WAL ring a migration lands in is the slot's) */
-void pc_cluster_apply_thread(volatile int *stop, int idx)
-{
-	struct clapply_item it;
-
-	apply_stop = stop;
-	pc_qs_enter();                     /* tables in hand between waits */
-	while (clapply_take(&C.ap, idx, stop, &it, now_ms())) {
-		int rc = apply_rec(&it.r, NULL);
-
-		if (it.grp && apply_counts(rc, it.grp->req))
-			__atomic_fetch_add(&it.grp->stored, 1, __ATOMIC_RELAXED);
-		clapply_done(&C.ap, idx, &it);
-	}
-	pc_qs_exit();
 }
 
 /* heartbeat thread, 4 Hz.  Returns 1 while the overlay is up. */
@@ -1351,19 +1025,15 @@ static int stall_check(long long now)
 
 	if (limit <= 0 || !seen)
 		return 0;                  /* off, or the thread has not started */
-	/* This thread wakes 4 times a second.  If IT has just been away for
-	 * over a second, the whole process was stopped - SIGSTOP, a VM
-	 * pause, a live migration - and the cluster thread's clock is old
-	 * for the same reason this one's is: that is not a wedged thread.
-	 * Give it a second to stamp before reading anything into the gap. */
+	/* this thread wakes at 4 Hz: if IT was away over a second, the whole process was
+	 * stopped (SIGSTOP, VM pause), not wedged - give the cluster thread a second */
 	if (last_check_ms && now - last_check_ms > 1000)
 		grace_until_ms = now + 1000;
 	last_check_ms = now;
 	if (now < grace_until_ms)
 		return pc_node_stalled();
-	/* S217: an apply thread that has been on ONE item for the limit is
-	 * a stall of 1/N of the keyspace, and must be as visible as a stall
-	 * of all of it */
+	/* an apply thread on ONE item for the limit stalls 1/N of the keyspace, and must
+	 * be as visible as a stall of all of it */
 	{
 		int i;
 
@@ -1380,12 +1050,8 @@ static int stall_check(long long now)
 				seen = b;
 				what = PC_PROG_APPLY;
 			}
-			/* or a backlog it has not touched: stamp the first
-			 * sighting, the consumer clears it on every take.  An
-			 * empty ring clears it too: the backlog counts the item
-			 * being applied, so a sighting can land after the take's
-			 * clear and would otherwise survive any idle period and
-			 * fire on the next record. */
+			/* or an untouched backlog: stamp the first sighting; every take
+			 * and an empty ring clear it, as a sighting can land after a take */
 			if (clapply_backlog(&C.ap, i) == 0) {
 				if (w)
 					__atomic_store_n(&rg->wait_since_ms, 0LL,
@@ -1449,7 +1115,7 @@ void pc_cluster_beat_thread(volatile int *stop)
 
 		nanosleep(&ts, NULL);
 		stalled = stall_check(now_ms());
-		/* S216: the beat that says STALLED goes out NOW, not when
+		/* the beat that says STALLED goes out NOW, not when
 		 * the overdue window next comes round */
 		if (now_ms() - clwire_sent_ms(&C.wr) < BEAT_OVERDUE_MS &&
 		        !(stalled && !was))
@@ -1457,33 +1123,25 @@ void pc_cluster_beat_thread(volatile int *stop)
 		clwire_beat_take(&C.wr, a, &alen, ma, &mlen);
 		if (!alen)
 			continue;              /* nothing built yet (joining) */
-		/* S216: the frame is the LAST one the cluster thread built,
-		 * and it says what the node was then.  The state and the
-		 * reason are this thread's to correct - through the same
-		 * overlay everything else reads, so a node that is not
-		 * READY underneath keeps its own state. */
+		/* the LAST frame the cluster thread built; this thread corrects only
+		 * the state, through the same overlay, so a node not READY keeps its own */
 		if (stalled)
 			(void)clmemb_alive_patch_state(a, alen, pc_node_state(),
 				pc_node_reason());
-		ctl_send(a, alen);                 /* S36 */
-		/* S218: a stalled MASTER's claim is not re-sent.  Its ALIVE
-		 * says stalled; its MASTER_ALIVE would say "still yours" and
-		 * hold the fleet to a master that admits nobody and issues
-		 * nothing.  Silence here is what lets MASTER_DEAD_MS elect. */
+		ctl_send(a, alen);
+		/* a stalled MASTER's claim is not re-sent: it would hold the fleet to a master
+		 * that admits nobody; silence lets MASTER_DEAD_MS elect */
 		if (mlen && !stalled)
 			ctl_send(ma, mlen);
 		C.st.hb_watchdog++;
-		/* say so, rate-limited: a silent watchdog is the ONE
-		 * discriminator between "the peer thread starved its beats"
-		 * (these lines appear) and "the beats flowed but a peer went
-		 * deaf" (they do not) */
+		/* rate-limited: these lines tell "the peer thread starved its beats" from "the
+		 * beats flowed but a peer went deaf" */
 		{
 			static long long logged_ms;
 			long long nl = now_ms();
 
-			/* !logged_ms: the clock counts from boot, so the
-			 * interval alone silenced the first line on a host
-			 * up less than 10 s, as RV-13's sizing warning was) */
+			/* !logged_ms: the clock counts from boot, so the interval
+			 * alone would silence the first line */
 			if (!logged_ms || nl - logged_ms >= 10000) {
 				logged_ms = nl;
 				LM_NOTICE("cluster: heartbeat watchdog "
@@ -1496,25 +1154,21 @@ void pc_cluster_beat_thread(volatile int *stop)
 	}
 }
 
-/* ---- the node's lifecycle state (B1) ------------------------------------ */
+/* ---- the node's lifecycle state ---------------------------------------- */
 
-/* The heartbeat carries this byte and the map encodes the same values,
- * so the two definitions cannot be allowed to drift: a node reporting
- * "ready" as 2 to a peer that reads 2 as "reconciling" would be told to
- * hold traffic it should be serving. */
 _Static_assert(PC_NST_STARTING == PC_CLMAP_ST_STARTING &&
                PC_NST_RECOVERING == PC_CLMAP_ST_RECOVERING &&
                PC_NST_READY == PC_CLMAP_ST_READY &&
                PC_NST_DRAINING == PC_CLMAP_ST_DRAINING &&
                PC_NST_FAILED == PC_CLMAP_ST_FAILED &&
                PC_NST_STALLED == PC_CLMAP_ST_STALLED &&
-               PC_NST_HEALING == PC_CLMAP_ST_HEALING,
+               PC_NST_HEALING == PC_CLMAP_ST_HEALING &&
+               PC_NST_CONNECTING == PC_CLMAP_ST_CONNECTING,
                "node state values must match the map's wire encoding");
 
 
 /* ---- LE helpers -------------------------------------------------------- */
-/* The six moved to clcodec.h so the modules can reach them; these keep
- * the short names the 199 call sites below already use. */
+/* clcodec.h's LE helpers, under the short names used below */
 #define p16 pc_p16
 #define p32 pc_p32
 #define p64 pc_p64
@@ -1522,12 +1176,7 @@ _Static_assert(PC_NST_STARTING == PC_CLMAP_ST_STARTING &&
 #define g32 pc_g32
 #define g64 pc_g64
 
-/* ---- negative cache ---------------------------------------------------- */
-
-/* ---- the locator and negative caches -----------------------------------
- * Both tables live in clloc now (M3).  These wrappers keep the shape
- * cluster.h publishes and proto.c and verbs.c call; the module takes the
- * clock as an argument, so the wrapper is where now_ms() is read. */
+/* ---- the locator and negative caches: clloc's, the wrappers read now_ms() --- */
 
 int pc_neg_hit(const char *col, size_t cn, const char *key, size_t kn)
 {
@@ -1542,19 +1191,16 @@ void pc_neg_set(const char *col, size_t cn, const char *key, size_t kn,
 
 void pc_neg_clear(const char *col, size_t cn, const char *key, size_t kn)
 {
-	/* S467: every negative entry has expired - the write skips the key's
-	 * hash and its slot (2.3% of a SET's CPU on a fleet that never
-	 * misses); 20 ms covers the coarse clock's lag */
+	/* every negative entry has expired: the write skips the key's hash and slot; 20 ms
+	 * covers the coarse clock's lag */
 	if (now_ms_coarse() > __atomic_load_n(&C.lc.neg_until_ms,
 	        __ATOMIC_ACQUIRE) + 20)
 		return;
 	clloc_neg_clear(&C.lc, col, cn, key, kn);
 }
 
-/* S209: the delete's version rides the negative entry (clloc).  S238:
- * and every versioned one is RETAINED past it (clretain.h) - its own
- * deletes and the ones applied from peers alike, since all of them pass
- * through here */
+/* the delete's version rides the negative entry, and every versioned one is RETAINED past it
+ * (clretain.h): local deletes and those applied from peers all pass here */
 void pc_neg_set_ver(const char *col, size_t cn, const char *key, size_t kn,
 		int ms, unsigned long long ver)
 {
@@ -1564,7 +1210,7 @@ void pc_neg_set_ver(const char *col, size_t cn, const char *key, size_t kn,
 	clretain_note(col, cn, key, kn, ver, (unsigned int)(now / 1000));
 }
 
-/* 12ny AT-5: a numbered delete - planted as any, retained with its number
+/* a numbered delete - planted as any, retained with its number
  * so the members' marks can forget it */
 static void neg_set_ver_num(const char *col, size_t cn, const char *key,
 		size_t kn, int ms, unsigned long long ver,
@@ -1577,10 +1223,8 @@ static void neg_set_ver_num(const char *col, size_t cn, const char *key,
 		num->oid, num->incarn, num->seq);
 }
 
-/* S446: a replayed EXPIRY - planted as any tombstone, retained as the
- * expiry the peer kept (it was retained here as a delete: S443's split
- * under-counted on every node that took a replay, and the entry was
- * replayed onward as a delete) */
+/* a replayed EXPIRY: planted as any tombstone, retained as the expiry the peer kept - never as a
+ * delete, which would be replayed onward as one */
 static void neg_set_ver_expiry(const char *col, size_t cn, const char *key,
 		size_t kn, int ms, unsigned long long ver, int keep)
 {
@@ -1588,14 +1232,11 @@ static void neg_set_ver_expiry(const char *col, size_t cn, const char *key,
 
 	clloc_neg_set_ver(&C.lc, col, cn, key, kn, now, ms, ver);
 	clretain_note_expiry(col, cn, key, kn, ver, (unsigned int)(now / 1000),
-		keep);                         /* AT-5 (c): kept as the peer kept it */
+		keep);
 }
 
-/* S405: a local drop's mark.  The first build of 0.6.4 retained it like a
- * delete, and the per-peer sweep replayed a restarted node's startup
- * flush - every record it had written through - to the peers as deletes:
- * the fleet's write-through cache emptied on every restart (staging,
- * 2026-10-14, 3,603 replayed to each peer) */
+/* a local drop's mark: retained apart from deletes, or the per-peer sweep would replay a restarted
+ * node's startup flush to the peers as deletes */
 void pc_neg_set_ver_local(const char *col, size_t cn, const char *key,
 		size_t kn, int ms, unsigned long long ver)
 {
@@ -1605,10 +1246,8 @@ void pc_neg_set_ver_local(const char *col, size_t cn, const char *key,
 	clretain_note_local(col, cn, key, kn, ver, (unsigned int)(now / 1000));
 }
 
-/* S238: when the 2-s entry has lapsed (or never held a version), the
- * retained table answers - so every receive path that refuses a copy
- * older than a tombstone (a push, a sweep, a bulk batch, a pull answer)
- * refuses one older than a retained delete, for tombstone_retain_s */
+/* when the 2-s entry has lapsed (or held no version) the retained table answers, so every receive
+ * path refuses a copy older than a retained delete, for tombstone_retain_s */
 int pc_neg_ver(const char *col, size_t cn, const char *key, size_t kn,
 		unsigned long long *ver)
 {
@@ -1616,7 +1255,7 @@ int pc_neg_ver(const char *col, size_t cn, const char *key, size_t kn,
 	uint64_t v = 0, rv;
 	int r = clloc_neg_ver(&C.lc, col, cn, key, kn, now, &v);
 
-	/* OM2-15: the later of the two - a cached version can lag the retained one */
+	/* the later of the two - a cached version can lag the retained one */
 	if ((rv = clretain_get(col, cn, key, kn, (unsigned int)(now / 1000))) > v) {
 		*ver = rv;
 		return 1;
@@ -1631,7 +1270,7 @@ void pc_cluster_set_acks(int on)
 		self_no_acks = 1;
 }
 
-/* S455: [cluster] resync_after_s (a day by default; 0 = never by time) */
+/* [cluster] resync_after_s (a day by default; 0 = never by time) */
 static long long resync_after_ms = 86400000LL;
 
 void pc_cluster_set_resync_after(int s)
@@ -1639,7 +1278,7 @@ void pc_cluster_set_resync_after(int s)
 	resync_after_ms = s > 0 ? (long long)s * 1000 : 0;
 }
 
-/* 12ny AT-9: [cluster] data_multicast (auto, the default) */
+/* [cluster] data_multicast (auto, the default) */
 static int cl_data_mcast = 1;
 
 void pc_cluster_set_data_multicast(int on)
@@ -1669,24 +1308,8 @@ void pc_loc_clear(const char *col, size_t cn, const char *key, size_t kn)
 	clloc_clear(&C.lc, col, cn, key, kn);
 }
 
-/* ---- shard mode: deterministic ownership (rendezvous hashing) ----------
- * HRW over the members' STABLE advertise addresses - runtime node ids
- * churn on rejoin and must not decide placement.  Minimal disruption
- * on membership change: only keys whose argmax member changed move.
- * v1 is unweighted (assumes comparable arenas; weighted rendezvous is
- * the recorded follow-up). */
-
-/* ---- S30: the cluster's config identity -------------------------------
- * Every ALIVE carries a digest of the INTERCHANGE-RELEVANT config - the
- * mode, its parameters and the clustered collection SET - so two nodes
- * that disagree about what a collection IS can never quietly exchange
- * data.  Node-local sizing (buckets_log2, arena) is deliberately NOT in
- * it: members may tune those freely.
- *
- * Demonstrated before this existed: node A running collection 'c' as
- * store and node B running it as shard joined the same cluster happily,
- * writes through either vanished for the other, and NOTHING was logged.
- */
+/* ---- the config identity: every ALIVE carries a digest of the interchange config (mode, its
+ * parameters, the collection SET); disagreeing nodes never exchange.  Local sizing is not in it */
 static uint64_t config_digest(void)
 {
 	const char *names[PC_MAX_COLLECTIONS];
@@ -1694,24 +1317,18 @@ static uint64_t config_digest(void)
 	struct clinit_digest_in in;
 	int i, n = pc_store_count();
 
-	/* the module carries its own bound; a mismatch would silently fold
-	 * a different number of collections on one side of an upgrade and
-	 * refuse every join */
+	/* a mismatch would fold a different number of collections on one side of an
+	 * upgrade and refuse every join */
 	_Static_assert(CLINIT_MAX_NAMES == PC_MAX_COLLECTIONS,
 		"clinit's name bound must match the store's");
 
-	/* zeroed first: every field is assigned below today, but an
-	 * unset field here is not a wrong digest, it is a RANDOM one -
-	 * the node would refuse every join and the cause would look
-	 * like a network fault.  Adding `replicas` to this struct did
-	 * exactly that to clinittest's golden values (2026-09-13). */
+	/* zeroed first: an unset field is not a wrong digest but a RANDOM one - every
+	 * join refused, looking like a network fault */
 	memset(&in, 0, sizeof in);
 	if (n > PC_MAX_COLLECTIONS)
 		n = PC_MAX_COLLECTIONS;
-	/* S348: upstream_writes = refuse is part of what members must agree
-	 * on - a member taking writes the others refuse is the hole the flag
-	 * closes - so a refusing collection's name is digested as <name>!ro.
-	 * Without the flag anywhere the digest is what it always was. */
+	/* upstream_writes = refuse must be agreed on, so a refusing collection is
+	 * digested as <name>!ro; without the flag the digest is unchanged */
 	for (i = 0; i < n; i++) {
 		const char *nm = pc_store_name(i);
 
@@ -1755,14 +1372,8 @@ int pc_cluster_eager(void)
 	return C.cfg_eager;
 }
 
-/* S314 / S313 (DESIGN 12ic): may this fleet hold a record type that
- * needs @feat?  0.4.3 and earlier mask every record to the JSON bit on
- * every path - a rate-limit or hash record reaching one is kept as plain
- * bytes with its type lost, and stays that way after the node upgrades.
- * So the new types are refused until EVERY live member advertises the
- * feature in its ALIVE; a member not heard from yet counts as not
- * having it.  Returns 0 = refuse (and the node id of one that lacks it in
- * *@lacking), 1 = allowed.  Outside a cluster, always allowed. */
+/* may the fleet hold a record type needing @feat?  Only if every live member advertises it (an
+ * older one keeps it as untyped bytes for good); 0 sets *@lacking; outside a cluster, always 1 */
 _Static_assert(PC_FEAT_TYPES2 == CLMEMB_FEAT_TYPES2,
 	"the verbs' feature bit and the ALIVE's must be the same bit");
 _Static_assert(PC_FEAT_HREAD == CLMEMB_FEAT_HREAD,
@@ -1798,13 +1409,8 @@ int pc_cluster_fleet_has(int feat, int *lacking)
 	return 1;
 }
 
-/* 12ny AT-10: may an origin forget by the members' marks?  Only while this
- * node counts them and every live member announces them - a member that
- * does not (an older build) has confirmed nothing, and the time rule
- * stays.  A feature bit, not a wire epoch: an older member ignores every
- * new byte safely and blocks the forgetting by its silence (S221's rule;
- * the S394 precedent).  Returns 1, or 0 with up to @max nodes lacking it
- * in @lack (*nlack how many in all) */
+/* may an origin forget by the members' marks?  Only while every live member announces them - a
+ * feature bit, so an older member blocks it by silence; 0 lists up to @max lacking in @lack */
 int pc_cluster_acks_gate(int *lack, int max, int *nlack)
 {
 	long long now = now_ms();
@@ -1867,11 +1473,11 @@ int pc_cluster_authoritative(void)
 
 static unsigned int self_free_mb(void);
 static unsigned int self_total_mb(void);
-static unsigned int self_entries(void);      /* defined with the ALIVE */
-static void self_cols(struct clmemb_col *cols, int *ncols, int *ntotal);   /* S163, same place */
-static int any_eager(void);                  /* S83, defined with the tick */
+static unsigned int self_entries(void);
+static void self_cols(struct clmemb_col *cols, int *ncols, int *ntotal);
+static int any_eager(void);
 
-/* S103: the start kind as a word, for members and the page */
+/* the start kind as a word, for members and the page */
 const char *pc_start_kind_name(int kind)
 {
 	switch (kind) {
@@ -1882,9 +1488,9 @@ const char *pc_start_kind_name(int kind)
 	}
 }
 
-/* S34: the fleet as a CLIENT needs to see it - address, client port,
+/* the fleet as a CLIENT needs to see it - address, client port,
  * id, role and load per member, self included.  Returns the count. */
-const char *pc_cluster_gone_reason(int why)               /* S293 */
+const char *pc_cluster_gone_reason(int why)
 {
 	return clres_why_name(why);
 }
@@ -1900,7 +1506,7 @@ int pc_cluster_members(struct pc_member *out, int max)
 	out[n].resp_port = C.cfg_resp_port;
 	out[n].http_port = C.cfg_http_port;
 	out[n].uptime_s = (long)pc_metrics_uptime();
-	pc_alerts_link_state(&out[n].link_pct, &out[n].link_level);   /* S465 */
+	pc_alerts_link_state(&out[n].link_pct, &out[n].link_level);
 	out[n].entries = (long)self_entries();
 	out[n].start = pc_start_kind_name(self_start_kind());
 	out[n].node = C.node_id;
@@ -1910,8 +1516,8 @@ int pc_cluster_members(struct pc_member *out, int max)
 		C.map.backup_id == (uint16_t)C.node_id;
 	out[n].mem_tier = (int)pcache_mem.tier;
 	out[n].state = pc_node_state();
-	out[n].reason = pc_node_reason();               /* S186 */
-	out[n].reconciling = C.rec_hold && C.cfg_eager; /* 0.5.7.1 */
+	out[n].reason = pc_node_reason();
+	out[n].reconciling = C.rec_hold && C.cfg_eager;
 	if (out[n].reconciling) {
 		int wid, wn = rec_witness_count(&wid);
 
@@ -1919,9 +1525,9 @@ int pc_cluster_members(struct pc_member *out, int max)
 			: CLMEMB_SOLEWIT_MANY;
 	} else
 		out[n].sole_witness = CLMEMB_SOLEWIT_MANY;
-	out[n].gone_s = -1;                             /* S192: present */
-	out[n].live = 1;                                /* S352c */
-	out[n].gone_why = 0;                            /* S293 */
+	out[n].gone_s = -1;                             /* present */
+	out[n].live = 1;
+	out[n].gone_why = 0;
 	out[n].gone_silent_s = 0;
 	out[n].held_s = 0;
 	out[n].free_mb = (int)self_free_mb();
@@ -1929,21 +1535,21 @@ int pc_cluster_members(struct pc_member *out, int max)
 	out[n].has_ident = 1;
 	memcpy(out[n].ident, C.self_ident, 16);
 	out[n].incarn = C.self_incarn;
-	out[n].cl_reported = 1;                         /* S160 */
+	out[n].cl_reported = 1;
 	out[n].cl_open = (long)PC_RESP_READ(pc_clients_open);
 	out[n].cl_resp = (long)PC_RESP_READ(pc_resp_open);
 	out[n].cl_bin = (long)PC_RESP_READ(pc_nat_bin_open);
 	out[n].cl_nresp = (long)PC_RESP_READ(pc_nat_resp_open);
-	out[n].cols_reported = 1;                        /* S163 */
-	out[n].relay_port = clps_rx_port();                  /* PS11 */
+	out[n].cols_reported = 1;
+	out[n].relay_port = clps_rx_port();
 	out[n].relay_direct = 0;
 	self_cols(out[n].cols, &out[n].ncols, &out[n].ncols_total);
-	out[n].ncfg = ncfgsig;                          /* AR11 */
+	out[n].ncfg = ncfgsig;
 	for (i = 0; i < ncfgsig; i++) {
 		out[n].cfg_name[i] = cfgsig[i].name_h;
 		out[n].cfg_val[i] = cfgsig[i].val_h;
 	}
-	out[n].ncfg = put_facts(out[n].cfg_name, out[n].cfg_val,   /* UP1 */
+	out[n].ncfg = put_facts(out[n].cfg_name, out[n].cfg_val,
 		out[n].ncfg, PC_CFGSIG_MAX, self_features());
 	n++;
 	for (i = 0; i < C.pt.n_peers && n < max; i++) {
@@ -1958,7 +1564,7 @@ int pc_cluster_members(struct pc_member *out, int max)
 		out[n].resp_port = p->resp_port;
 		out[n].http_port = p->http_port;
 		out[n].uptime_s = p->boot_ms ? (long)((now_ms() - p->boot_ms) / 1000) : -1;
-		out[n].link_pct = p->link_pct;                       /* S465 */
+		out[n].link_pct = p->link_pct;
 		out[n].link_level = p->link_level;
 		out[n].entries = (long)p->entries;
 		out[n].start = pc_start_kind_name(p->start_kind);
@@ -1968,24 +1574,24 @@ int pc_cluster_members(struct pc_member *out, int max)
 		out[n].is_backup = C.map_valid &&
 			C.map.backup_id == (uint16_t)p->node;
 		out[n].state = p->nstate;
-		out[n].reason = p->nreason;             /* S186 */
-		out[n].reconciling = p->reconciling;    /* 0.5.7.1 */
+		out[n].reason = p->nreason;
+		out[n].reconciling = p->reconciling;
 		out[n].sole_witness = p->sole_witness;
-		out[n].gone_s = -1;                     /* S192 */
-		out[n].live = clpeers_live(p, now_ms());   /* S352c */
-		out[n].gone_why = 0;                    /* S293 */
+		out[n].gone_s = -1;
+		out[n].live = clpeers_live(p, now_ms());
+		out[n].gone_why = 0;
 		out[n].gone_silent_s = 0;
 		out[n].held_s = 0;
 		out[n].mem_tier = p->mem_tier;
-		out[n].cl_reported = p->cl_reported;            /* S160 */
+		out[n].cl_reported = p->cl_reported;
 		out[n].cl_open = (long)p->cl_open;
 		out[n].cl_resp = (long)p->cl_resp;
 		out[n].cl_bin = (long)p->cl_bin;
 		out[n].cl_nresp = (long)p->cl_nresp;
-		out[n].cols_reported = p->cols_reported;        /* S163 */
+		out[n].cols_reported = p->cols_reported;
 		out[n].relay_port = __atomic_load_n(&p->ps.port, __ATOMIC_ACQUIRE);
-		out[n].relay_direct = psr_path_direct(&p->ps, now_ms());   /* PS11 */
-		out[n].relay_interest = __atomic_load_n(&p->pv_mode, __ATOMIC_ACQUIRE);   /* PS12 */
+		out[n].relay_direct = psr_path_direct(&p->ps, now_ms());
+		out[n].relay_interest = __atomic_load_n(&p->pv_mode, __ATOMIC_ACQUIRE);
 		out[n].ncols = p->ncols;
 		out[n].ncols_total = p->ncols_total;
 		memcpy(out[n].cols, p->cols, (size_t)p->ncols * sizeof p->cols[0]);
@@ -1994,30 +1600,13 @@ int pc_cluster_members(struct pc_member *out, int max)
 		out[n].has_ident = p->has_ident;
 		memcpy(out[n].ident, p->ident, 16);
 		out[n].incarn = p->incarn;
-		out[n].ncfg = p->ncfg;                  /* AR11 */
+		out[n].ncfg = p->ncfg;
 		memcpy(out[n].cfg_name, p->cfg_name, sizeof out[n].cfg_name);
 		memcpy(out[n].cfg_val, p->cfg_val, sizeof out[n].cfg_val);
 		n++;
 	}
-	/* S192: and the members that have LEFT recently.  A node that says
-	 * goodbye is purged from the peer table - its slot's id is zeroed -
-	 * so it disappeared from this list and its card vanished from every
-	 * other node's fleet view: a rolling restart read as a fleet that
-	 * had shrunk, with no way to tell it from a departure.  The
-	 * reservation table is what remembers, so it is what answers.
-	 *
-	 * FOR AS LONG AS THE RESERVATION LASTS, which is the operator's
-	 * correction to a first version of this: the window was an invented
-	 * two minutes, and the honest lifetime is the one the fleet already
-	 * keeps.  While the id is held nothing else can be that node, and
-	 * that is worth seeing - a decommissioned node shows as holding an
-	 * id until the reservation lapses, which is exactly when an
-	 * operator would want to know.
-	 *
-	 * Not the master's MAP, which was the other candidate:
-	 * clmap_build() skips any peer that is not live, so the map drops a
-	 * departed node at the next build and following it would reproduce
-	 * the vanishing card. */
+	/* and the members that LEFT, for as long as their reservation holds the id: purged from the
+	 * peer table and dropped by the map's next build, only the reservation remembers them */
 	{
 		long long now = now_ms();
 		int r, k;
@@ -2040,18 +1629,18 @@ int pc_cluster_members(struct pc_member *out, int max)
 			out[n].node = e->id;
 			out[n].addr = e->addr;
 			out[n].state = PC_NST_STARTING;   /* not reporting */
-			out[n].reconciling = 0;             /* 0.5.7.1 */
+			out[n].reconciling = 0;
 			out[n].sole_witness = -1;
 			out[n].gone_s = (int)(left_ms / 1000);
 			/* and how much longer the id is held, so the card
 			 * says when it will go of its own accord */
 			out[n].held_s = (int)((e->until_ms - now) / 1000);
-			out[n].gone_why = e->why;         /* S293 */
+			out[n].gone_why = e->why;
 			out[n].gone_silent_s = e->silent_s;
 			out[n].has_ident = e->has_ident;
 			memcpy(out[n].ident, e->ident, 16);
 			out[n].uptime_s = -1;
-			out[n].link_pct = -1;                      /* S465 */
+			out[n].link_pct = -1;
 			n++;
 		}
 	}
@@ -2074,14 +1663,9 @@ static void shout_mismatch(const pc_addr *from, int their_mode,
 	if (slot >= 0)
 		C.cfg_shouted[slot] = from->in4.sin_addr;
 	else if (!pc_logrl_ok(LRL_CFG_MISMATCH, from))
-		return;                /* CH-17: the table full - it said two
-		                        * ERRs a datagram from then on */
-	/* S242: the keepalive carries the peer's mode and eager only, so
-	 * print ALL of our digest inputs - the operator compares them with
-	 * this same line on the other node - and when mode and eager match,
-	 * say the difference is in one of the others.  On 245-247 the only
-	 * visible difference was our "placement=", a red herring; the real
-	 * one, the WAL, was not printed at all. */
+		return;                /* table full: the shared rate limit */
+	/* the keepalive carries only the peer's mode and eager, so print ALL our digest inputs to
+	 * compare with this line on the other node */
 	{
 		char cols[256];
 		int i, n = pc_store_count(), off = 0;
@@ -2126,7 +1710,7 @@ static void shout_mismatch(const pc_addr *from, int their_mode,
 		C.cfg_authoritative ? "" :
 		"  (neither side declares [cluster] collections - without it "
 		"nothing can be checked beyond this digest)",
-		/* S73b: when the peer said its posture and it is the
+		/* when the peer said its posture and it is the
 		 * difference, say so - the digest alone cannot */
 		!their_wal || (their_wal == 2) == (C.cfg_wal != 0) ? "" :
 		C.cfg_wal
@@ -2150,8 +1734,8 @@ int pc_shard_owner(const char *col, size_t cn, const char *key, size_t kn)
 	return pc_shard_owner_slot(pc_key_slot(key, kn));
 }
 
-/* S157: a warning when `replicas` exceeds the live members - the
- * reading and when to say it are clspread's (M17), the words are here */
+/* a warning when `replicas` exceeds the live members - the
+ * reading and when to say it are clspread's, the words are here */
 static struct clspread_short replicas_short = CLSPREAD_SHORT_INIT;
 
 static void replicas_short_tick(long long now)
@@ -2214,17 +1798,8 @@ static void post_done(int worker, uint32_t req, int found,
 
 /* ---- placement (power-of-two on free-MB, self-preference band) ---------- */
 
-/* S117: the figures the beat carries - and the member cards divide -
- * are the CEILING's: what this node can still take before it refuses a
- * write, over the ceiling.  They used to be the slot pool's, and the
- * pool's free share rose when records were freed and FELL when the
- * give-back returned their pages to the host: the one event that makes
- * room on the box read as a loss of headroom (245-247, 2026-09-08:
- * 64 % after the sweep, 31 % after the give-back, beside an arena card
- * saying 60 %).  Placement and rebalancing read the same two numbers,
- * and capacity-to-the-ceiling is what they were after all along - a
- * punched page is re-faulted by the next carve.  Without a ceiling
- * (no arena) the pool's figures stand, as before. */
+/* the beat's free/total figures are the CEILING's (what this node takes before refusing a write):
+ * the pool's free share falls when give-back returns pages.  No arena: the pool's */
 static unsigned int self_free_mb(void)
 {
 	unsigned long total = 0, used = 0, freeb = 0, mx, held;
@@ -2250,17 +1825,8 @@ static unsigned int self_total_mb(void)
 	return (unsigned int)(total >> 20);
 }
 
-/* How many records this node holds, across every collection.  live_kb
- * cannot answer "is it empty": it is KILOBYTES, so a node that recovered
- * a handful of small records still reports 0 and would be mistaken for a
- * node that came back with nothing - which is exactly the case the
- * backfill gate has to tell apart. */
-/* S163: one collection's block as this node counts it - its OWN client
- * hits and misses (pcache_ht_totals_client), entries, stores, removes,
- * expired, named by hash.  S164: stores and removes are the client range
- * too.  A replicated apply, a kept pull and a recovery replay all store,
- * so the all-origin count put one eager client write on every member
- * (245: 8,663 stores = ~2,992 client + 3,870 applied + the boot replay). */
+/* one collection's block as this node counts it, named by hash: stores and removes are the client
+ * range too, or one eager write would count on every member */
 static void col_fill(int i, struct clmemb_col *c)
 {
 	pcache_ht_totals_t t, ct;
@@ -2276,8 +1842,7 @@ static void col_fill(int i, struct clmemb_col *c)
 	c->expired = t.expired;
 }
 
-/* the first CLMEMB_COLS_MAX live collections */
-/* S469: a beat carries a window of a peer's collections - each kept by
+/* a beat carries a window of a peer's collections - each kept by
  * hash until it has gone unsaid for COLS_STALE_MS */
 #define COLS_STALE_MS 5000
 static void cols_merge(struct peer *p, const struct clmemb_col *c, int n,
@@ -2322,14 +1887,8 @@ static void self_cols(struct clmemb_col *cols, int *ncols, int *ntotal)
 	*ntotal = tot;
 }
 
-/* S164: the fleet's figures for one collection.  Live peers only - a dead
- * peer's last block would hold the fleet's count up after it left.  A peer
- * that gossips no block for the hash (a build before S163, or past its
- * first CLMEMB_COLS_MAX collections) is a member but not reporting. */
-/* S351: one member's counters for a collection, replaced by what they did
- * in the last five minutes - keyed by the member and the collection, so a
- * member that restarted counts from its new start (winctr.h).  0 when any
- * of them has no baseline yet. */
+/* one member's counters for a collection, replaced by its last five minutes, keyed by member and
+ * collection (winctr.h); 0 when any has no baseline yet */
 static int col_win(struct clmemb_col *c, const char *who, int from_zero)
 {
 	static const char *const nm[5] = { "hits", "misses", "stores",
@@ -2367,7 +1926,7 @@ int pc_cluster_col_fleet(int store, int basis, struct pc_col_fleet *out)
 	if (!C.enabled)
 		return 0;
 	col_fill(store, &own);
-	clfleet_begin(&a, basis, &own);        /* M15: the rules are clfleet's */
+	clfleet_begin(&a, basis, &own);        /* the rules are clfleet's */
 	wown = own;
 	wok = col_win(&wown, "self", 1);
 	clfleet_begin(&aw, basis, &wown);
@@ -2411,7 +1970,7 @@ static unsigned int self_entries(void)
 
 	for (i = 0; i < pc_store_count(); i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		pcache_ht_totals_t t;
 
 		pcache_ht_totals(pc_store_ht(i), &t);
@@ -2425,11 +1984,8 @@ static unsigned int self_live_kb(void)
 	return (unsigned int)(pcache_arena_live_bytes() >> 10);
 }
 
-/* live-data PER-MILLE of the arena - the proportional leveling metric.
- * Per-mille on KB, not percent on MB: stacked integer floors at
- * percent/MB granularity ate a whole rig-scale imbalance (measured:
- * 6MB on a 64MB donor truncated to exactly the band edge, self_per_mille 7 vs
- * mean+5 = 7 - and nothing ever moved). */
+/* live-data PER-MILLE of the arena (the leveling metric), on KB: percent-on-MB integer floors
+ * swallow a small node's whole imbalance */
 static unsigned int live_per_mille(unsigned int live_kb, unsigned int total_mb)
 {
 	unsigned long long t = (unsigned long long)total_mb << 10;
@@ -2446,8 +2002,8 @@ static struct peer *peer_by_node(int node)
 	return clpeers_by_id_live(&C.pt, node, now_ms());
 }
 
-/* CH-9: the member the operator named to take over (master_prefer), 0 =
- * none; held by this master until it hands over, gives up, or the node goes */
+/* the member named to take over (master_prefer), 0 = none; held by this
+ * master until it hands over, gives up, or the node goes */
 static int prefer_id;
 static long long prefer_ms;
 
@@ -2476,9 +2032,7 @@ const char *pc_cluster_master_prefer(int node)
 	return NULL;
 }
 
-/* ---- completion queues -------------------------------------------------
- * The queues live in clpend now (M2).  These keep the shape their callers
- * and cluster.h already know. */
+/* ---- completion queues (clpend) ---------------------------------------- */
 
 void pc_cluster_worker_register(int worker, int efd)
 {
@@ -2508,11 +2062,8 @@ int pc_cluster_drain(int worker, struct pc_pull_done *out, int max)
 
 /* ---- pending table ------------------------------------------------------ */
 
-/* Free a parked slot.  clpend owns the table; this is still the ONLY way
- * one is released, so that occupancy is exact, and it is idempotent - one
- * caller frees a slot that was answered earlier.
- *
- * The clpend lock must be held. */
+/* the ONLY release of a parked slot, so occupancy is exact; idempotent.  The clpend lock
+ * must be held */
 static void pend_release(struct pending *p)
 {
 	clpend_release_locked(&C.pd, p);
@@ -2539,7 +2090,7 @@ int pc_cluster_pend_free(void)
 	return f > 0 ? f : 0;
 }
 
-/* G8: see cluster.h */
+/* see cluster.h */
 static __thread long long pend_cap_ms;
 
 void pc_pull_cap_deadline(long long at_ms)
@@ -2572,7 +2123,7 @@ static uint32_t pend_alloc(int kind, int expect, int extra_ms,
 	int reason;
 	long long now = now_ms();
 
-	if (pend_cap_ms) {                 /* G8: not past the mget's deadline */
+	if (pend_cap_ms) {                 /* not past the mget's deadline */
 		long long room = pend_cap_ms - now - C.pull_timeout_ms;
 
 		if (extra_ms > room)
@@ -2583,10 +2134,8 @@ static uint32_t pend_alloc(int kind, int expect, int extra_ms,
 	if (!req) {
 		unsigned long long n = clpend_exhausted(&C.pd);
 
-		/* Loud, but not once per refusal: this fires under exactly
-		 * the load that caused it, so a line per event would be a
-		 * flood on the hot path.  Once, then at most every 10s,
-		 * carrying the running total so the gap is visible. */
+		/* once, then at most every 10 s with the running total: it fires under the
+		 * very load that caused it */
 		if (n == 1 || now - C.pend_log_ms >= 10000) {
 			C.pend_log_ms = now;
 			LM_ERR("cluster: parked-request table FULL (%d slots) "
@@ -2611,33 +2160,13 @@ static size_t build_pull_req(unsigned char *msg, uint32_t req,
 	return clpull_req_frame(msg, req, C.node_id, col, collen, key, klen);
 }
 
-/*
- * S146: ask ONE designated holder whether it actually HAS @key.
- *
- * The wire is the ordinary pull - "do you have col/key" is exactly what
- * M_PULL_REQ asks - so this adds no message type and raises no
- * compatibility question.  Only the completion KIND differs, and with
- * it what the answer is allowed to mean.
- *
- * Every outcome except a positive leaves the record alone: a negative
- * completes as an ordinary miss, and an expiry posts a kind no worker
- * handles.  Silence and "no" are both NOT-KNOWN, and neither may
- * delete - S144's rule, mirrored.
- */
+/* ask ONE designated holder whether it HAS @key, over the ordinary pull with its own completion
+ * kind; only a positive counts - silence and "no" are NOT-KNOWN and never delete */
 static uint32_t possess_probe(const char *col, size_t collen,
 		const char *key, size_t klen, int holder_node);
 
-/* ---- S253: a non-holder's copy goes when the holder acks its group -----
- * S247 queued each such write for a possess probe a second later; at a
- * real write rate the 8,192-entry queue overflowed (28.9M of ~29M writes
- * kept on 223's 3-node spread bench) and the copies it was meant to drop
- * stayed.  The keys now ride beside their records in the push group
- * (clpush_append_nh), the group goes with a request id, and the holder's
- * ack - after it applied the group - is the confirmation.  Only a full
- * ack drops.  A record the holder already has at this version or newer,
- * or has a newer delete of, counts as held (apply_counts); one it could
- * not take at all (no collection, no memory) leaves the whole group's
- * copies to reclaim, as does an ack that never comes. */
+/* ---- a non-holder's copy goes when the holder acks its group (keys ride with the records):
+ * only a full ack drops; an unapplied record or a missing ack leaves the group's copies */
 #define SPREAD_ACK_WAIT_MS 2000
 
 static void spread_ack_drop(struct clpush_ack *a, unsigned int stored)
@@ -2679,7 +2208,7 @@ static void spread_ack_drop(struct clpush_ack *a, unsigned int stored)
 		k.s = (char *)key;
 		k.len = (int)klen;
 		/* version-guarded under the bucket lock, and from the table
-		 * a resize is filling too - both as S247's answer arm */
+		 * a resize is filling too */
 		if (sh)
 			(void)pcache_ht_remove_below(sh, &k, ver + 1);
 		if (pcache_ht_remove_below(ht, &k, ver + 1) == 1) {
@@ -2722,6 +2251,28 @@ static uint32_t possess_probe(const char *col, size_t collen,
 	return req;
 }
 
+/* the live holders of @slot, in peer order: the first (@after 0) or the one after @after; 0 = none
+ * left, -1 = @after is no holder now */
+static int spread_next_holder(unsigned int slot, int k, int after)
+{
+	long long now = now_ms();
+	int i, seen = !after;
+
+	for (i = 0; i < C.pt.n_peers; i++) {
+		struct peer *p = &C.pt.peers[i];
+		int id = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
+
+		if (!id || id == C.node_id || !clpeers_live(p, now) ||
+		        !pc_spread_in_set(slot, id, k))
+			continue;
+		if (seen)
+			return id;
+		if (id == after)
+			seen = 1;
+	}
+	return seen ? 0 : -1;
+}
+
 /* ---- forwarded writes (proxy mode: the holder serializes) --------------- */
 
 static size_t build_fwd_op(unsigned char *msg, uint32_t req, int op,
@@ -2733,40 +2284,19 @@ static size_t build_fwd_op(unsigned char *msg, uint32_t req, int op,
 		collen, key, klen, val, vlen);
 }
 
-/* ---- S73: replicate on the write ------------------------------------------ */
+/* ---- replicate on the write ---------------------------------------------- */
 
-/* Every write in an eager collection goes to every live peer NOW, from
- * the worker that took it - fire-and-forget, the forward plane's shape:
- * one seal_send per peer and return.  The write grows by an enqueue,
- * never by a round trip.  No TTL filter: a 1 s key gets its copy, which
- * is what redundancy for short-lived data means (S73, the operator's
- * decision; the sweep's 60 s "dying soon" rule left every liveness
- * beacon on one node).  The periodic sweep is repair behind this - a
- * peer that was down, a datagram that was lost - not delivery.
- *
- * On the wire this is one M_REPL_MANY group holding one record, with
- * req 0: the receiver stores it PASSIVE and off the WAL as it does any
- * replica, and does not ack it.  Only records this node authored are
- * pushed; the callers guarantee that. */
-/* S110: the write-path push group, per THREAD per peer.  Every thread
- * that pushes (a worker for its client writes) keeps its own open
- * M_REPL_MANY group for each live peer and touches nothing shared: it
- * appends without a lock, seals and sends the group it fills, and
- * flushes its own aged groups when the cluster loop asks - the ask is
- * an RPC handled on the thread itself.  The peer's mutex that used to
- * serialise four workers through one group per peer was the eager
- * write ceiling: 57% of every worker's time in futex, 350k records/s
- * flat from 50 to 400 clients, +52% with one peer instead of two
- * (§12ci, step 3).  Groups are a quarter as full at the same rate and
- * the datagram count rises accordingly; the 3 ms bound on a lone
- * write holds, since the flush RPC rides the loop's 3 ms poll. */
+/* every write in an eager collection goes to every live peer NOW, fire-and-forget (req 0, stored
+ * PASSIVE, unacked); no TTL filter; the sweep is repair, not delivery; own records only */
+/* the push group is per THREAD per peer: appended without a lock, sent by its thread when full or
+ * aged, flushed on the cluster loop's RPC - a shared per-peer group serialised the workers */
 
 /* runs ON the thread whose groups these are (an RPC, or the thread
  * itself): any of its groups older than REPL_FLUSH_MS goes out now */
 static void repl_flush_mine(long long now)
 {
 	clpush_flush_mine(&C.wp, pc_worker_id(), now, cl_wgroup_send_cb, NULL);
-	clrpt_flush();                     /* S469: what this thread queued by TCP */
+	clrpt_flush();                     /* what this thread queued by TCP */
 }
 
 static void repl_flush_rpc(int sender, void *arg)
@@ -2775,10 +2305,8 @@ static void repl_flush_rpc(int sender, void *arg)
 	repl_flush_mine(now_ms());
 }
 
-/* S105: the cluster loop's timer - any group older than REPL_FLUSH_MS
- * goes out now, so a lone write is never held for more than that.
- * S110: the groups belong to their threads, so the loop asks every
- * thread to flush its own, at most once per REPL_FLUSH_MS. */
+/* the cluster loop's timer: the groups are their threads', so it asks every thread to flush its
+ * own, at most once per REPL_FLUSH_MS - a lone write waits no longer */
 static void repl_flush_due(long long now)
 {
 	static long long last;
@@ -2789,233 +2317,6 @@ static void repl_flush_due(long long now)
 		return;
 	last = now;
 	ipc_send_rpc_all(repl_flush_rpc, NULL);
-}
-
-/* S73 / S105: the write-path push.  One record, appended to the open
- * M_REPL_MANY group of every live peer - the coalescing buffer S73
- * decided on: the write's cost grows by an append, not by a seal and a
- * syscall per peer.  S110: the group is THIS THREAD's (no lock): sent
- * by this thread when it fills it or finds it older than REPL_FLUSH_MS
- * on the next append, or when the cluster loop's flush RPC lands here.
- * A record too large for a group goes alone. */
-/* S255: the repeats of a RESIZE announce.  Idempotent at the receiver -
- * the generation is the same, and pc_store_resize_request ignores one
- * older than the newest it applied and finds the size already right on a
- * repeat - so repeating costs a datagram per live peer and nothing else. */
-#define RZ_AGAIN 8
-static struct rz_again {
-	char name[PC_COL_NAME_MAX];
-	size_t nlen;
-	int bl, left;
-	unsigned long long gen;
-	long long due;
-} rz_again[RZ_AGAIN];
-static pthread_mutex_t rz_again_mx = PTHREAD_MUTEX_INITIALIZER;
-static const int rz_again_ms[] = { 1000, 2000, 4000 };   /* +1, +3, +7 s */
-
-static void rz_again_arm(const char *name, size_t nlen, int bl,
-		unsigned long long gen, long long now)
-{
-	int i, pick = 0;
-
-	pthread_mutex_lock(&rz_again_mx);
-	for (i = 0; i < RZ_AGAIN; i++) {
-		if (rz_again[i].left && rz_again[i].nlen == nlen &&
-		        !memcmp(rz_again[i].name, name, nlen)) {
-			pick = i;                  /* the newer resize replaces it */
-			break;
-		}
-		if (!rz_again[i].left || rz_again[i].due < rz_again[pick].due)
-			pick = i;
-	}
-	memcpy(rz_again[pick].name, name, nlen);
-	rz_again[pick].nlen = nlen;
-	rz_again[pick].bl = bl;
-	rz_again[pick].gen = gen;
-	rz_again[pick].left = 3;
-	rz_again[pick].due = now + rz_again_ms[0];
-	pthread_mutex_unlock(&rz_again_mx);
-}
-
-static size_t col_ann_build(unsigned char *msg, size_t cap, const char *name,
-		size_t nlen, int bl, int op, unsigned long long gen)
-{
-	struct clcol_ann a;
-
-	memset(&a, 0, sizeof a);
-	a.op = (unsigned char)op;
-	a.buckets_log2 = bl;
-	a.gen = gen;
-	a.name = name;
-	a.nlen = (unsigned int)nlen;
-	return clcol_write(msg, cap, M_COL_SET, &a);
-}
-
-/* heartbeat thread */
-static void rz_again_tick(long long now)
-{
-	unsigned char msg[16 + PC_COL_NAME_MAX];
-	int i;
-
-	pthread_mutex_lock(&rz_again_mx);
-	for (i = 0; i < RZ_AGAIN; i++) {
-		struct rz_again *r = &rz_again[i];
-
-		if (!r->left || r->due > now)
-			continue;
-		broadcast_live(msg, col_ann_build(msg, sizeof msg, r->name,
-			r->nlen, r->bl, CLCOL_OP_RESIZE, r->gen), now);
-		r->left--;
-		if (r->left)
-			r->due = now + rz_again_ms[3 - r->left];
-	}
-	pthread_mutex_unlock(&rz_again_mx);
-}
-
-/* S69 */
-/*
- * @op is a CLCOL_OP_* value, and it is SENT AS ITSELF.
- *
- * This parameter used to be an int named `drop`, folded through
- * `a.op = drop ? CLCOL_OP_DROP : CLCOL_OP_SET`.  Every caller already
- * passed the op rather than a flag, so create (0) and drop (1) came out
- * right by coincidence - and RESIZE (3), being merely truthy, was
- * broadcast to the fleet AS A DROP.  An online resize therefore deleted
- * the collection on every peer, and the originator lost it too as their
- * drops converged back.  Found on 245-247 on 2026-09-15 resizing an
- * EMPTY collection; had it held records, that was fleet-wide data loss
- * from a call that returned {"resizing":true}.
- *
- * handle_col_set() has always understood CLCOL_OP_RESIZE.  The sender
- * simply could not express it.
- */
-unsigned long long pc_cluster_col_announce(const char *name, size_t nlen,
-		int buckets_log2, int op)
-{
-	unsigned char msg[16 + PC_COL_NAME_MAX];
-	unsigned long long gen;
-	long long now = now_ms();
-
-	if (!C.enabled || nlen == 0 || nlen >= PC_COL_NAME_MAX)
-		return 0;
-	/* refuse an op this function cannot express rather than degrading
-	 * it to something destructive: a rename needs two names and goes
-	 * through pc_cluster_col_announce2 */
-	if (op != CLCOL_OP_SET && op != CLCOL_OP_DROP &&
-	        op != CLCOL_OP_RESIZE) {
-		LM_ERR("cluster: refusing to announce collection '%.*s' with "
-			"op %d - not a one-name op\n", (int)nlen, name, op);
-		return 0;
-	}
-	/* S255: a resize TICKS for its generation - two resizes read off an
-	 * idle clock could carry the same one, and the order between them is
-	 * what lets a receiver drop the older */
-	gen = op == CLCOL_OP_RESIZE ? pc_lamport_tick() : pc_lamport_now();
-	broadcast_live(msg, col_ann_build(msg, sizeof msg, name, nlen,
-		buckets_log2, op, gen), now);
-	if (op == CLCOL_OP_RESIZE)
-		rz_again_arm(name, nlen, buckets_log2, gen, now);
-	return gen;
-}
-
-/* S69: a rename, which needs both names in the one datagram */
-void pc_cluster_col_announce2(const char *from, size_t flen, const char *to,
-		size_t tlen)
-{
-	unsigned char msg[16 + 2 * PC_COL_NAME_MAX];
-	unsigned long long gen = pc_lamport_now();
-	long long now = now_ms();
-	struct clcol_ann a;
-
-	memset(&a, 0, sizeof a);
-	if (!C.enabled || flen == 0 || flen >= PC_COL_NAME_MAX ||
-	        tlen == 0 || tlen >= PC_COL_NAME_MAX)
-		return;
-	a.op = CLCOL_OP_RENAME;
-	a.gen = gen;
-	a.name = from;
-	a.nlen = (unsigned int)flen;
-	a.to = to;
-	a.tlen = (unsigned int)tlen;
-	broadcast_live(msg, clcol_write(msg, sizeof msg, M_COL_SET, &a), now);
-}
-
-/* S432: one RESP map override to one peer - only one that reads it: a build
- * before S432 reads CLCOL_OP_MAP as a SET and would create a collection
- * named after the index */
-static void respmap_send(struct peer *p, int index, const char *col,
-		uint64_t gen, int set)
-{
-	unsigned char msg[16 + 2 * PC_COL_NAME_MAX];
-	char ix[8];
-	struct clcol_ann a;
-
-	if (!(p->features & CLMEMB_FEAT_RESPMAP))
-		return;
-	snprintf(ix, sizeof ix, "%d", index);
-	memset(&a, 0, sizeof a);
-	a.op = CLCOL_OP_MAP;
-	a.buckets_log2 = set ? 1 : 0;
-	a.gen = gen;
-	a.name = ix;
-	a.nlen = (unsigned int)strlen(ix);
-	if (set && col && *col) {
-		a.to = col;
-		a.tlen = (unsigned int)strlen(col);
-	}
-	seal_send(&p->addr, msg, clcol_write(msg, sizeof msg, M_COL_SET, &a));
-}
-
-void pc_cluster_respmap_announce(int index, const char *col, uint64_t gen,
-		int set)
-{
-	long long now = now_ms();
-	int i;
-
-	if (!C.enabled)
-		return;
-	for (i = 0; i < C.pt.n_peers; i++)
-		if (clpeers_live(&C.pt.peers[i], now))
-			respmap_send(&C.pt.peers[i], index, col, gen, set);
-}
-
-static void respmap_sync_cb(int index, const char *col, uint64_t gen, int set,
-		void *ctx)
-{
-	respmap_send(ctx, index, col, gen, set);
-}
-
-/* S436: one collection's autoscale mode to one peer - only one that reads
- * it (see CLCOL_OP_AUTOSCALE) */
-static void autoscale_send(struct peer *p, const char *name, size_t nlen,
-		int mode, unsigned long long gen)
-{
-	unsigned char msg[16 + PC_COL_NAME_MAX];
-	struct clcol_ann a;
-
-	if (!(p->features & CLMEMB_FEAT_AUTOSCALE) || self_no_autoscale ||
-	        nlen == 0 || nlen >= PC_COL_NAME_MAX)
-		return;
-	memset(&a, 0, sizeof a);
-	a.op = CLCOL_OP_AUTOSCALE;
-	a.buckets_log2 = mode;
-	a.gen = gen;
-	a.name = name;
-	a.nlen = (unsigned int)nlen;
-	seal_send(&p->addr, msg, clcol_write(msg, sizeof msg, M_COL_SET, &a));
-}
-
-void pc_cluster_autoscale_announce(const char *name, size_t nlen, int mode,
-		unsigned long long gen)
-{
-	long long now = now_ms();
-	int i;
-
-	if (!C.enabled)
-		return;
-	for (i = 0; i < C.pt.n_peers; i++)
-		if (clpeers_live(&C.pt.peers[i], now))
-			autoscale_send(&C.pt.peers[i], name, nlen, mode, gen);
 }
 
 /* ---- tombstones --------------------------------------------------------- */
@@ -3030,14 +2331,8 @@ static void tomb_send_num(const char *col, size_t collen, const char *key,
 
 	if (!C.enabled || collen > 255 || klen > 4096)
 		return;
-	/* S209: the delete takes a version of its own - a fresh tick, so it
-	 * is newer than every write this node has made, the one it is
-	 * deleting included.  The write-path push batches for up to
-	 * REPL_FLUSH_MS while this datagram goes at once, so a set and its
-	 * delete closer than the flush arrive at the peers in the WRONG
-	 * order; the version is what lets the peer tell the set it should
-	 * refuse from a write that genuinely came later.  Planted here too,
-	 * so this node refuses the same set if a peer pushes it back. */
+	/* the delete takes a fresh tick, newer than every write here: the push batches
+	 * while this goes at once, so a peer needs it to refuse an overtaken set */
 	if (!ver)
 		ver = pc_lamport_tick();
 	neg_set_ver_num(col, collen, key, klen, C.tombstone_ms, ver, num);
@@ -3051,14 +2346,8 @@ static void tomb_send_num(const char *col, size_t collen, const char *key,
 	__atomic_fetch_add(&C.st.tomb_sent, 1, __ATOMIC_RELAXED);
 	if (!n)
 		return;
-	/* 12ny AT-9: on a multicast fleet, ONCE to the group - while the
-	 * fleet confirms: every live member then counts marks, so a copy the
-	 * group lost is a hole that member asks for (AT-6) and the origin
-	 * re-sends, unicast.  One datagram at most: a group frame past it
-	 * fragments, and one lost fragment loses it for every receiver - a
-	 * long key goes one copy a peer, as does every delete on a unicast
-	 * fleet, with data_multicast = off, or while a member confirms
-	 * nothing (an older build, tombstone_acks = no). */
+	/* while the fleet confirms, ONCE to the group (a lost copy is a hole the member
+	 * asks for); else one copy a peer: unicast, data_multicast off, or it would fragment */
 	if (!cl_unicast && cl_data_mcast && num &&
 	    n + HDR_LEN + CLWIRE_TAG <= (size_t)(cl_max_dgram > 0 ?
 	        cl_max_dgram : 1400) &&
@@ -3074,12 +2363,8 @@ static void tomb_send_num(const char *col, size_t collen, const char *key,
 				__ATOMIC_RELAXED);
 }
 
-/* 12ny AT-2/AT-3b: a delete this node originates.  Numbered in its space
- * (identity hash, incarnation - every receiver before AT-3b ignores the 20
- * bytes), logged WITH the numbering whether or not a copy went here (the
- * replay rebuilds the marks from those records: a seq without one is a
- * hole), counted in this node's own marks, then sent.  Without a cluster,
- * or past the frame's bounds, the plain record as before. */
+/* a delete this node originates: numbered in its space (identity hash, incarnation), logged WITH
+ * the number (replay rebuilds the marks), counted in its own marks, then sent */
 void pc_delete_originate(const char *col, size_t collen, const char *key,
 		size_t klen, unsigned long long ver, int removed)
 {
@@ -3092,7 +2377,7 @@ void pc_delete_originate(const char *col, size_t collen, const char *key,
 		return;
 	}
 	if (!ver)
-		ver = pc_lamport_tick();       /* S209: see tomb_send_num */
+		ver = pc_lamport_tick();       /* see tomb_send_num */
 	num.oid = fnv1a64(C.self_ident, sizeof C.self_ident);
 	num.incarn = C.self_incarn;
 	num.seq = __atomic_add_fetch(&C.tomb_seq, 1, __ATOMIC_RELAXED);
@@ -3105,14 +2390,8 @@ void pc_delete_originate(const char *col, size_t collen, const char *key,
 /* ---- the peer thread ---------------------------------------------------- */
 
 
-/* the pull's answer: what this node holds for the key, found or absent.
- * 12nt (0.7.1): in shard mode a through key this node OWNS answers from
- * the fetched copy too (the shadow, read here on purpose), and when it
- * holds nothing the owner fetches it from Redis first - @deferred is that
- * answer, on the cluster thread, once the fetch is done. */
-/* 12nt (0.7.1): does @key's through copy belong HERE - this node owns it
- * (shard) or is one of its K holders (spread)?  Eager and store: no, every
- * node fetches for itself and a pull never fetches. */
+/* does @key's through copy belong HERE - owner (shard) or one of its K holders (spread)?  Eager
+ * and store: no, every node fetches for itself */
 static int through_here(pcache_htable_t *ht, const char *col, size_t collen,
 		const char *key, size_t klen)
 {
@@ -3134,7 +2413,7 @@ static void pull_serve(const pc_addr *from, uint32_t req,
 	unsigned long long ver = 0;
 	struct clpull_rsp out;
 	unsigned int exp = 0;
-	unsigned char rfl = 0;                 /* S280: the record's type */
+	unsigned char rfl = 0;                 /* the record's type */
 	str k, v;
 	size_t rn;
 	int found = 0, rc;
@@ -3145,16 +2424,12 @@ static void pull_serve(const pc_addr *from, uint32_t req,
 	if (ht) {
 		k.s = (char *)key;
 		k.len = (int)klen;
-		/* value and version from ONE read: a second lookup for the
-		 * version could pair these bytes with a LATER write's number,
-		 * and the receiver would then refuse that write as older */
+		/* value and version from ONE read: a second lookup could pair these bytes with a
+		 * LATER write's number, and the receiver would refuse that write */
 		rc = pcache_ht_fetch_full(ht, &k, &v, &exp, &rfl, &ver);
 		found = rc == 0;
-		/* S245: a recovered record the fleet has not ruled on yet is
-		 * not an answer - a pull would carry it to the asker exactly
-		 * as the sweep would (see mig_cb).  Silence, as a RECOVERING
-		 * node gives: the asker's slot is inconclusive, and a peer
-		 * that holds the key answers instead. */
+		/* a recovered record the fleet has not ruled on is no answer: silence, as
+		 * RECOVERING gives, leaves the slot inconclusive for a holder */
 		if (found && C.rec_hold && C.cfg_eager) {
 			unsigned long long mv;
 			unsigned int wt = 0;
@@ -3166,13 +2441,10 @@ static void pull_serve(const pc_addr *from, uint32_t req,
 				return;
 			}
 		}
-		if (!found && pc_upstream_through(col, collen) &&
-		    pc_upstream_allowed(col, collen, key, klen) &&
+		if (!found && pc_upstream_allowed(col, collen, key, klen) &&
 		    through_here(ht, col, collen, key, klen)) {
-			/* 12nt: the OWNER's (shard) or a HOLDER's (spread)
-			 * fetched copy, else its fetch.  A pull that reaches any
-			 * other node (the reshard grace broadcasts) is answered
-			 * absent: the node the key belongs to fetches */
+			/* the OWNER's (shard) or a HOLDER's (spread) fetched copy, else its
+			 * fetch; any other node a pull reaches answers absent */
 			pcache_ht_shadow_reads(1);
 			rc = pcache_ht_fetch_full(ht, &k, &v, &exp, &rfl, &ver);
 			pcache_ht_shadow_reads(0);
@@ -3192,23 +2464,20 @@ static void pull_serve(const pc_addr *from, uint32_t req,
 
 		out.ttl_left = found && exp ? (exp > now ? exp - now : 1) : 0;
 	}
-	/* Too big for the datagram plane: reported as ABSENT.  Decided here
-	 * rather than in the codec, and note what does NOT happen - ttl_left
-	 * keeps the value computed above, exactly as the pre-extraction code
-	 * left it when it zeroed found, vlen and ver in place. */
+	/* too big for the datagram plane: reported ABSENT, ttl_left as computed */
 	if (found && (size_t)v.len > MAX_DGRAM - CLPULL_RHDR)
 		found = 0;
 	out.found = found;
 	out.vlen = found ? (uint32_t)v.len : 0;
 	out.ver = found ? ver : 0;
-	out.flags = (unsigned char)(rfl & PCACHE_F_CARRY);      /* S280 */
+	out.flags = (unsigned char)(rfl & PCACHE_F_CARRY);
 	out.val = v.s;
 	rn = clpull_rsp_write(rsp, sizeof rsp, M_PULL_RSP, &out);
 	free(v.s);
 	seal_send(from, rsp, rn);
 }
 
-/* 12nt: the pulls whose fetch is done - answered here, on the cluster
+/* the pulls whose fetch is done - answered here, on the cluster
  * thread, each beat */
 static void pull_answer_tick(void)
 {
@@ -3228,7 +2497,7 @@ static void pull_answer_tick(void)
 	}
 }
 
-/* 12nt TC-2: the acks of forwarded ops the master decided, sent from here -
+/* the acks of forwarded ops the master decided, sent from here -
  * the only sender on the cluster socket */
 static void fwd_ack_tick(void)
 {
@@ -3256,35 +2525,8 @@ static void handle_pull_req(const unsigned char *pt, size_t n,
 
 	if (!clpull_req_parse(pt, n, &q))
 		return;
-	/*
-	 * A NODE STILL REPLAYING ITS OWN WAL MUST NOT ANSWER.
-	 *
-	 * Its table is not yet the truth: a key it genuinely holds reads
-	 * as absent until replay reaches it, and a "not found" from here is
-	 * taken by the asker as AUTHORITATIVE.  The reconcile path drops a
-	 * replayed record when every peer says no - "it was deleted while I
-	 * was down" - so during a simultaneous restart three nodes answer
-	 * each other's probes from half-loaded tables and the fleet deletes
-	 * records that every one of them holds.  Measured on a three-node
-	 * fleet: 400 keys in, 272 out on all three, repeatably.
-	 *
-	 * Silence is the correct answer, not a negative.  The asker's slot
-	 * times out, which is INCONCLUSIVE and drops nothing; a confirmed
-	 * absence needs an answer from a node whose store is complete.
-	 *
-	 * S152 found the OTHER way to hold nothing - a node that replayed
-	 * nothing never enters RECOVERING at all, and one that gave up on
-	 * its bootstrap reports READY on purpose - and the first two fixes
-	 * tried to close it HERE, by keeping such a node silent.  Both were
-	 * wrong, and instructively so: this handler cannot know WHY it is
-	 * being asked.  A reconcile probe wants "nobody has it" to mean
-	 * DELETE; a probe-before-place wants exactly the same answer to
-	 * mean PLACE THE WRITE.  Silencing a cold node's "no" starved the
-	 * second (proxytest: 0 of 120 writes landed in a fresh fleet) to
-	 * protect the first.  The purpose lives in the ASKER's slot, so the
-	 * fix lives there - reconcile_tick() and CLPEND_ANS_RECONCILE - and
-	 * this handler answers what it holds, as it always did.
-	 */
+	/* RECOVERING must not answer: its "absent" is AUTHORITATIVE to a reconcile, silence
+	 * INCONCLUSIVE.  A cold node answers: why it is asked is the asker's slot's affair */
 	if (pc_node_state() == PC_NST_RECOVERING)
 		return;
 	C.st.pull_served++;
@@ -3312,9 +2554,8 @@ static void send_demote(int loser_node, int winner_node, const char *col,
 	C.px.demotes_sent++;
 }
 
-/* S69: a delete reaches the table a resize is filling as well as the live
- * one - the copier has already carried some keys across, and a key deleted
- * after it passed would come back at the swap. */
+/* a delete reaches the table a resize is filling as well as the live one, or a key the copier
+ * already carried comes back at the swap */
 static int store_remove(pcache_htable_t *ht, const str *k)
 {
 	pcache_htable_t *sh = pc_store_resize_shadow(ht);
@@ -3325,7 +2566,7 @@ static int store_remove(pcache_htable_t *ht, const str *k)
 }
 
 /* as store_remove, with the delete's version stamped under the live
- * table's bucket lock (S234) - for a remove a tombstone follows */
+ * table's bucket lock - for a remove a tombstone follows */
 static int store_remove_ver(pcache_htable_t *ht, const str *k,
 		unsigned long long *ver)
 {
@@ -3337,7 +2578,7 @@ static int store_remove_ver(pcache_htable_t *ht, const str *k,
 }
 
 /* a birth race: two holders at different versions - the loser demoted in
- * favour of the winner.  From a pull's answers and a hold-check's (S394) */
+ * favour of the winner.  From a pull's answers and a hold-check's */
 static void birth_race(const struct clpend_ans_out *a)
 {
 	LM_WARN("cluster: birth race on a key - node %d and node %d "
@@ -3348,26 +2589,18 @@ static void birth_race(const struct clpend_ans_out *a)
 	pc_loc_set(a->col, a->collen, a->key, a->klen, a->winner);
 }
 
-/*
- * B4.  Nobody in the fleet has this key, and in eager mode everyone holds
- * everything - so it was DELETED while this node was down, and replay
- * brought it back.  Drop it, and log the delete so a second restart does
- * not resurrect it.  From a pull's answers and a hold-check's (S394).
- *
- * Done here rather than posted to a worker: nothing is waiting for this
- * answer, and the answer carries the key it asked about.
- */
+/* nobody in the fleet has this key and eager holds everything: it was DELETED while this node was
+ * down and replay revived it - drop it and log the delete, here: nothing waits on it */
 static void reconcile_drop(const struct clpend_ans_out *a)
 {
 	pcache_htable_t *ht = pc_store_find(a->col, a->collen);
 	str k;
 
-	/* S152: the pass waited for the fleet to be established, but a
-	 * peer can restart between the probe and its answers.  A "no"
-	 * that may have come from an empty store authorises nothing. */
+	/* a peer can restart between the probe and its answers: a "no" that may
+	 * come from an empty store authorises nothing */
 	if (any_live_peer_cold() || !reconcile_witness_live()) {
-		C.st.reconcile_deferred++;     /* S152, S223 */
-		C.recon.unruled++;             /* S471 */
+		C.st.reconcile_deferred++;
+		C.recon.unruled++;
 		return;
 	}
 	if (ht) {
@@ -3376,7 +2609,7 @@ static void reconcile_drop(const struct clpend_ans_out *a)
 
 		k.s = (char *)a->key;
 		k.len = (int)a->klen;
-		/* AT-8: written again since the probe - the write is the
+		/* written again since the probe - the write is the
 		 * truth now, not the fleet's "no" about the old record */
 		{
 			unsigned long long v;
@@ -3424,14 +2657,11 @@ static void handle_pull_rsp(const unsigned char *pt, size_t n)
 		return;
 	pc_lamport_observe(ver);
 
-	/* what the reply MEANS is clpend's; every side effect below is
-	 * this file's.  The decision returns with the lock released and
-	 * everything it hands back COPIED out of the slot - which is why
-	 * the reconcile arm can touch the store safely. */
+	/* what the reply MEANS is clpend's, the side effects this file's; it returns unlocked with
+	 * everything COPIED out of the slot, so the reconcile arm can touch the store */
 	switch (clpend_answer(&C.pd, req, found, from, ver,
-			/* S439: the bytes answered, so equal versions with
-			 * different values read as the race they are; never 0
-			 * when a value came (0 = none) */
+			/* the bytes answered, so equal versions with different values
+			 * read as the race they are; never 0 when a value came */
 			found && vlen ? pc_crc32c(0, r.val, vlen) | 1u : 0,
 			/* only the probe transform uses it, and only a
 			 * positive can transform - so a miss pays nothing */
@@ -3463,10 +2693,8 @@ static void handle_pull_rsp(const unsigned char *pt, size_t n)
 	case CLPEND_ANS_HIT: {
 		unsigned long long tv;
 
-		/* S238: a copy older than a delete this node remembers is the
-		 * stale holder answering - a peer that missed the delete (a
-		 * partition).  Stored, it undid the delete on the first read
-		 * after a heal.  Answered as a miss instead. */
+		/* a copy older than a remembered delete is a stale holder that missed it:
+		 * stored, it would undo the delete after a heal - answered as a miss */
 		if (a.collen && pc_neg_ver(a.col, a.collen, a.key, a.klen, &tv) &&
 		    tv && ver <= tv) {
 			__atomic_fetch_add(&C.px.recv_tombstoned, 1,
@@ -3477,17 +2705,15 @@ static void handle_pull_rsp(const unsigned char *pt, size_t n)
 		}
 	}
 		C.st.pull_hits++;
-		/* S280: a pull's newval carries the record's type */
+		/* a pull's newval carries the record's type */
 		post_done_ex(a.worker, req, PC_DONE_PULL, 1, 1,
 			(long long)(r.flags & PCACHE_F_CARRY), from,
 			ttl_left, (const unsigned char *)r.val, (int)vlen, 0, 0, ver, 0);
 		return;
 
 	case CLPEND_ANS_SAME:
-		/* two holders at the same version: the ordinary eager state.
-		 * Counted, not logged - it happens on every multi-holder
-		 * pull and a log line per key drowned the journal after a
-		 * fleet restart. */
+		/* two holders at the same version: the ordinary eager state -
+		 * counted, never logged per key */
 		C.st.pull_hits++;
 		return;
 
@@ -3511,38 +2737,33 @@ static void handle_pull_rsp(const unsigned char *pt, size_t n)
 		return;
 
 	case CLPEND_ANS_POSSESS: {
-		/*
-		 * S146.  A designated holder confirmed it has this record,
-		 * so our surplus copy may finally go.  Done here rather
-		 * than posted to a worker for the same reason the reconcile
-		 * arm is: nothing is waiting on it, and the answer carries
-		 * the key it asked about.
-		 *
-		 * A plain remove, never a tombstone - a tombstone would
-		 * delete the record from the holder that just told us it
-		 * has it, which is the exact opposite of reclaiming a
-		 * surplus copy.
-		 */
+		/* every holder confirmed it has this record, so our surplus copy goes - a plain
+		 * remove: a tombstone would delete the holders' copies too */
 		pcache_htable_t *ht = pc_store_find(a.col, a.collen);
 		str k;
 
 		if (ht && a.klen) {
 			extern void pc_wal_del(const char *, const char *, int);
 			char colz[64];
+			int kk = pc_cluster_replicas(), next = kk ? spread_next_holder(
+				pc_key_slot(a.key, a.klen), kk, a.from_node) : 0;
+
+			/* one holder's copy may be PASSIVE, which no sweep re-sends: ask the next
+			 * holder too, and only the last one's yes drops ours */
+			if (next) {
+				if (next > 0 && possess_probe(a.col, a.collen, a.key, a.klen, next))
+					C.px.spread_possess_sent++;
+				else
+					C.px.spread_possess_kept++;
+				return;
+			}
 
 			k.s = a.key;
 			k.len = (int)a.klen;
-			/* S247: only if the holder's copy is at least as new as
-			 * ours - a holder that has the KEY at an older version
-			 * would otherwise have us drop the only copy of the
-			 * newer write.  The version compare is under our bucket
-			 * lock (remove_below), so a write landing here since
-			 * the question was asked is kept too. */
-			/* and from the table a resize is filling (S69): the
-			 * copier may already have carried this record across,
-			 * and a drop from the live table alone came back at the
-			 * swap - resizefleettest, spread: 26 keys read stale
-			 * through the node that took them, until reclaim */
+			/* only if the holder's copy is at least as new as ours, compared under our
+			 * bucket lock (remove_below), so a newer write landing here is kept */
+			/* and from the table a resize is filling: the copier may already
+			 * have carried this record across */
 			pcache_htable_t *sh = pc_store_resize_shadow(ht);
 
 			if (ver && sh)
@@ -3616,9 +2837,8 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 
 		k.s = (char *)fkey;
 		k.len = (int)kn;
-		/* 12nt TC-2 (0.7.1): a through key this node owns - the master
-		 * decides, the read-back is stored here, the ack follows from
-		 * fwd_ack_tick; -1 is a refusal here (queue full), acked now */
+		/* a through key this node owns: the master decides, the read-back is stored
+		 * here and acked from fwd_ack_tick; -1 is a refusal (queue full), acked now */
 		th = pc_upstream_fwd_through(colz, cn, op, fkey, kn, fval, vlen,
 			ttl_rel, delta, from->in4.sin_addr.s_addr, from->in4.sin_port, req);
 		if (th > 0) {
@@ -3634,7 +2854,7 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 			v.len = (int)vlen;
 			ok = pcache_ht_store(ht, &k, &v, exp) == 0;
 			if (ok) {
-				pc_ev_applied(ht, &k);          /* PS8: the holder */
+				pc_ev_applied(ht, &k);          /* the holder */
 				pc_wal_upsert(colz, k.s, k.len, v.s, v.len, exp,
 				pcache_last_ver);
 				pc_neg_clear(colz, cn, k.s, (size_t)kn);
@@ -3642,15 +2862,10 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 		} else if (op == 1) {
 			ok = store_remove_ver(ht, &k, &dver) == 1;
 			if (ok) {
-				/* AT-3b: logged below - numbered where it is sent */
+				/* logged below - numbered where it is sent */
 				pc_neg_set(colz, cn, k.s, kn, C.tombstone_ms);
-				/* RV-11: shard and proxy keep ONE copy, so the
-				 * remove above was the whole delete.  Store,
-				 * eager and spread keep several: the holder the
-				 * asking node found tombstones the rest, under
-				 * its own clock - which has observed the
-				 * record's version, so the tombstone is newer
-				 * than every copy of it, in flight or landed. */
+				/* shard and proxy keep ONE copy: the remove was the
+				 * delete; else this holder's clock tombstones the rest */
 				if (!pc_store_shard_enabled(ht) &&
 				    !pc_store_proxy_enabled(ht))
 					pc_delete_originate(colz, cn, k.s, kn,
@@ -3659,13 +2874,12 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 					pc_wal_del(colz, k.s, k.len);
 			}
 		} else if (op == 2) {
-			/* ttl_rel PCACHE_EXP_PRESERVE = the Redis INCR
-			 * contract riding the forward plane: keep the
+			/* PCACHE_EXP_PRESERVE = the Redis INCR contract: keep the
 			 * holder's existing expiry, WAL the effective one */
 			unsigned int eff = exp;
 			unsigned char tfl = 0;
 
-			/* S280: INCR on a document is WRONGTYPE at the holder too */
+			/* INCR on a document is WRONGTYPE at the holder too */
 			if (pc_store_types_strict(ht) &&
 			        pcache_ht_getflags(ht, &k, &tfl) == 0 &&
 			        (tfl & PCACHE_F_TYPES)) {
@@ -3683,16 +2897,12 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 				pcache_last_ver);
 			}
 		} else if (op == 3) {
-			/* S213: a re-arm forwarded by the node that took it -
-			 * the same adopt/WAL/push as a local expire, so a
-			 * spread holder carries it on to the other holders */
+			/* a re-arm forwarded by the node that took it: the same adopt/WAL/push
+			 * as a local expire, so a spread holder carries it on */
 			ok = pc_op_expire_apply(colz, cn, k.s, (size_t)kn, exp) == 1;
 		} else if (op == 4 || op == 5) {
-			/* S279: SET NX (4) / XX (5) - this node is the key's
-			 * deciding node; ok = decided, newval = stored.  An
-			 * older node has no branch for these and acks ok 0,
-			 * which the asking node reports as a refusal - never
-			 * as a plain store. */
+			/* SET NX (4) / XX (5): this node decides; ok = decided, newval = stored.
+			 * An older node acks ok 0, reported as a refusal, never as a store */
 			int r = pc_op_setcond_apply(colz, cn, k.s, (size_t)kn,
 				fval, vlen,
 				ttl_rel == PCACHE_EXP_PRESERVE ? 0 : (long long)ttl_rel,
@@ -3701,11 +2911,8 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 			ok = r >= 0;
 			newval = r == 1;
 		} else if (op >= 6 && op <= 9) {
-			/* S297: SET IFEQ (6) / IFNE (7), DELEX IFEQ (8) / IFNE
-			 * (9) - decided here, as SET NX is.  The value is
-			 * [cmplen u32 LE][cmp][new value].  An older node has no
-			 * branch for these and acks ok 0: the asking node says
-			 * "holder rejected", never "stored" or "deleted". */
+			/* SET IFEQ (6) / IFNE (7), DELEX IFEQ (8) / IFNE (9): value is
+			 * [cmplen u32 LE][cmp][new]; an older node acks ok 0 = "holder rejected" */
 			uint32_t cl = vlen >= 4 ? (uint32_t)(unsigned char)fval[0] |
 				(uint32_t)(unsigned char)fval[1] << 8 |
 				(uint32_t)(unsigned char)fval[2] << 16 |
@@ -3749,395 +2956,18 @@ static void handle_fwd_ack(const unsigned char *pt, size_t n)
 		ok = a.ok;
 		newval = a.newval;
 	}
-	/* only_unanswered: a probe transformed into a forward completes on
-	 * the holder's ack, so a stray second ack must not complete it
-	 * twice */
+	/* only_unanswered: a probe turned forward completes on the holder's ack, so a
+	 * stray second ack must not complete it twice */
 	if (clpend_retire(&C.pd, req, 1, &worker, &kind))
 		post_done_ex(worker, req, kind, 0, ok, newval, 0, 0, NULL, 0, 0,
 			0, 0, 0);
 }
 
-/* migration: the receiver becomes the holder */
-static void handle_migrate(const unsigned char *pt, size_t n,
-		const pc_addr *from)
-{
-	extern void pc_wal_upsert(const char *, const char *, int,
-		const char *, int, unsigned int, unsigned long long);
-	pcache_htable_t *ht;
-	unsigned char ack[CLMIG_ACK_LEN];
-	struct clmig_single sg;
-	uint32_t req, ttl_left;
-	unsigned int cn, kn, vlen, exp = 0;
-	int ok = 0;
-	str k, v;
-	char colz[256];
-
-	/* MIG_RHDR, deliberately: this frame's own header is 14, but the
-	 * pre-extraction code required 19 here and that is the behaviour a
-	 * peer sees.  Preserved rather than quietly relaxed. */
-	if (n < MIG_RHDR || !clmig_single_parse(pt, n, &sg))
-		return;
-	req = sg.req;
-	ttl_left = sg.ttl_left;
-	cn = sg.collen;
-	kn = sg.klen;
-	vlen = sg.vlen;
-	memcpy(colz, sg.col, cn);
-	colz[cn] = 0;
-
-	ht = pc_store_find(colz, cn);
-	if (ht) {
-		k.s = (char *)sg.key;
-		k.len = (int)kn;
-		v.s = (char *)sg.val;
-		v.len = (int)vlen;
-		if (ttl_left)                   /* S449: as apply_rec's */
-			exp = pc_upstream_copy_exp(sg.col, cn, ttl_left);
-		ok = pcache_ht_store(ht, &k, &v, exp) == 0;
-		if (ok) {
-			pc_wal_upsert(colz, k.s, k.len, v.s, v.len, exp,
-				pcache_last_ver);
-			pc_loc_clear(colz, cn, k.s, kn);   /* we hold it now */
-			C.px.migrated_in++;
-			if (pc_store_shard_enabled(ht))
-				shard_note_change();
-		}
-	}
-	seal_send(from, ack,
-		clmig_ack_write(ack, sizeof ack, M_MIGRATE_ACK, req, ok, NULL));
-}
-
-/* the gathered variant: one datagram, many records, one ack carrying
- * the stored-count.  Kept alongside single M_MIGRATE (still valid on
- * the wire; future single-record moves may prefer it). */
-
-/* S217: ONE record of a migration or eager-replication group, applied
- * wherever it lands - on the receiver when apply_threads is 1, on the
- * thread its key hashes to otherwise.  Everything it touches is already
- * shared with the workers and the bulk and pull planes (the tables are
- * bucket-locked, the negative cache is written from the workers' delete
- * path, the counters are read atomically), which is why sharding it was
- * a hand-off and not a redesign.  Returns 1 = stored. */
-/* S245: a record this node recovered and the fleet has not yet ruled on.
- * EAGER ONLY, as reconcile_tick() is: reconcile_on is armed for any node
- * that recovered data, but only an eager node ever runs the pass that
- * clears it - gating on the flag alone silenced a SHARD node's pulls for
- * every key it had recovered, for ever (restartsharetest: 267 of 267 of
- * the restarted owner's keys unreadable through its peers). */
+/* a record this node recovered and the fleet has not ruled on - EAGER ONLY: only an eager node
+ * runs the pass that clears reconcile_on, so a shard node would be silenced for ever */
 static int rec_held(unsigned int wtick)
 {
 	return C.rec_hold && C.cfg_eager && wtick <= C.rec_tick;
-}
-
-/* S278: the version each dropped copy was dropped FOR.  A drop frees a
- * cell, and the next copy to arrive takes it - which can be an OLDER one:
- * a repair-sweep batch or a push built before the overwrite and applied
- * after it.  With no copy left there was nothing to compare it against,
- * and it landed and was served (rc57 GitLab check-asan, ceilingreplicatest:
- * 22 of 2,500 dropped keys answered the old value, still 30 s later).
- *
- * Lossy and never expired, on purpose.  A copy older than a version this
- * fleet has already written is stale whatever else happens to the key -
- * later writes only carry higher versions - so an entry can never refuse
- * a current copy, and one overwritten by a colliding key only falls back
- * to the behaviour before it.  Direct-mapped on the locator hash, 1 MB of
- * zero pages touched only as drops happen; a fleet that never drops pays
- * one relaxed load per record. */
-#define DROPFLOOR_SLOTS  65536
-static struct { uint64_t h, ver; } dropfloor[DROPFLOOR_SLOTS];
-static int dropfloor_any;
-
-static void dropfloor_note(const char *col, size_t cn, const str *k,
-		unsigned long long ver)
-{
-	uint64_t h = clloc_hash(col, cn, k->s, (size_t)k->len) | 1;
-	size_t i = (size_t)(h & (DROPFLOOR_SLOTS - 1));
-
-	if (__atomic_load_n(&dropfloor[i].h, __ATOMIC_ACQUIRE) == h &&
-	        __atomic_load_n(&dropfloor[i].ver, __ATOMIC_ACQUIRE) >= ver)
-		return;
-	/* ver cleared first: a reader that sees the new h with the old
-	 * key's version re-reads h after it, and a 0 floor refuses nothing */
-	__atomic_store_n(&dropfloor[i].ver, 0, __ATOMIC_RELEASE);
-	__atomic_store_n(&dropfloor[i].h, h, __ATOMIC_RELEASE);
-	__atomic_store_n(&dropfloor[i].ver, (uint64_t)ver, __ATOMIC_RELEASE);
-	__atomic_store_n(&dropfloor_any, 1, __ATOMIC_RELEASE);
-}
-
-/* 1 = @ver is older than a copy this node dropped for a newer one */
-static int dropfloor_refuses(const char *col, size_t cn, const char *key,
-		size_t kn, unsigned long long ver)
-{
-	uint64_t h, v;
-	size_t i;
-
-	if (!__atomic_load_n(&dropfloor_any, __ATOMIC_RELAXED))
-		return 0;
-	h = clloc_hash(col, cn, key, kn) | 1;
-	i = (size_t)(h & (DROPFLOOR_SLOTS - 1));
-	if (__atomic_load_n(&dropfloor[i].h, __ATOMIC_ACQUIRE) != h)
-		return 0;
-	v = __atomic_load_n(&dropfloor[i].ver, __ATOMIC_ACQUIRE);
-	if (__atomic_load_n(&dropfloor[i].h, __ATOMIC_ACQUIRE) != h)
-		return 0;
-	if (!v || ver >= v)
-		return 0;
-	__atomic_fetch_add(&C.px.recv_below_dropped, 1, __ATOMIC_RELAXED);
-	return 1;
-}
-
-/* S244: a peer's copy refused at this node's arena ceiling.  Say so,
- * and drop the OLDER copy of the key if this node holds one: storing
- * nothing left it serving that copy for ever - measured, an eager
- * replica at its ceiling answered the old value for 5,000 of 5,000
- * overwritten keys through 12 repair cycles.  Without it a read misses
- * and pulls the current value from a holder (and the freed cell takes
- * the next copy).  Never a delete: no tombstone, nothing sent. */
-static void nomem_drop(pcache_htable_t *ht, const char *col, size_t cn,
-		const str *k, unsigned long long ver)
-{
-	__atomic_fetch_add(&C.px.recv_nomem, 1, __ATOMIC_RELAXED);
-	if (pcache_ht_drop_older(ht, k, ver)) {
-		__atomic_fetch_add(&C.px.recv_stale_dropped, 1,
-			__ATOMIC_RELAXED);
-		dropfloor_note(col, cn, k, ver);   /* S278 */
-	}
-}
-
-/* S209: a tombstone NEWER than the copy means the copy is the set the
- * delete superseded, arriving after it - counted apart from "older" */
-static int apply_refuse(void *arg, unsigned long long ver)
-{
-	const struct clapply_rec *r = arg;
-	unsigned long long tv;
-
-	if (pc_neg_ver((const char *)r->col, r->collen, (const char *)r->key,
-	        r->klen, &tv) && tv && ver <= tv) {
-		__atomic_fetch_add(&C.px.recv_tombstoned, 1, __ATOMIC_RELAXED);
-		return 1;
-	}
-	/* S278: older than a copy dropped at the ceiling - resolved */
-	return dropfloor_refuses((const char *)r->col, r->collen,
-		(const char *)r->key, r->klen, ver);
-}
-
-static unsigned long long apply_tomb(void *arg)
-{
-	const struct clapply_rec *r = arg;
-	unsigned long long tv;
-
-	return pc_neg_ver((const char *)r->col, r->collen, (const char *)r->key,
-		r->klen, &tv) ? tv : 0;
-}
-
-static int apply_rec(const struct clapply_rec *r, void *ht_or_null)
-{
-	extern void pc_wal_upsert(const char *, const char *, int,
-		const char *, int, unsigned int, unsigned long long);
-	pcache_htable_t *ht = ht_or_null;
-	const char *col = (const char *)r->col;
-	str k, v;
-	unsigned int exp;
-	int rc;
-
-	/* S219: the collection, RESOLVED ONCE.  An apply thread receives
-	 * only the record's bytes and must look it up (the context it is
-	 * given is NULL); the inline caller has already looked it up for
-	 * its prefetch peek and passes that handle, where S217's refactor
-	 * left it scanning the registry a second time per record.
-	 *
-	 * Nothing below needs the name NUL-terminated except the WAL, which
-	 * only an authored record reaches - so the copy happens there and
-	 * not on every record either. */
-	/* the sender's clock is at least this far along.  The store folds
-	 * it in too, but only for records that reach a collection - this
-	 * covers the ones dropped before that. */
-	pc_lamport_observe(r->ver);
-	if (!ht)
-		ht = pc_store_find(col, r->collen);
-	/* S127: DO NOT add a "refuse a replica we are not a holder for"
-	 * test here.  It was tried on 2026-09-13 and reverted: a receiver
-	 * whose membership view has not converged refuses copies it SHOULD
-	 * hold, and the fleet measured 212 where placement owed 240 -
-	 * under-replicated, which is worse than the surplus it was meant
-	 * to prevent.  Surplus is a RECLAMATION problem and belongs in a
-	 * settled-only local pass, not in the receive path where no node
-	 * can know whether its view or the sender's is the stale one. */
-	if (!ht)
-		return 0;
-	k.s = (char *)r->key;
-	k.len = (int)r->klen;
-	/* S397: a replicated write is work on this node too - it is the apply
-	 * thread a hot key pins (GUIDE: "a hot key pins one thread") */
-	pc_store_hot_note(ht, k.s, (size_t)k.len);
-	v.s = (char *)r->val;
-	v.len = (int)r->vlen;
-	/* S449: a copy of an upstream-bound collection's record never
-	 * outlives its key - one tick under what it arrived with */
-	exp = pc_upstream_copy_exp(col, r->collen, r->ttl_left);
-	/* PASSIVE for an eager replica (it never re-propagates) and off the
-	 * WAL (the author persists it; a restarted replica resyncs).  Both
-	 * kinds carry the SENDER's version and both refuse a copy older
-	 * than the one already held. */
-	rc = clorder_set(ht, &k, &v, exp,
-		(unsigned char)((r->passive ? PCACHE_F_PASSIVE : 0) |
-		(r->flags & PCACHE_F_CARRY)), r->ver,           /* S280: the type */
-		&(struct clorder_tomb){ apply_refuse, apply_tomb, (void *)r });
-	if (rc == CLORDER_REFUSED)
-		return 2;              /* S253: a newer delete supersedes it */
-	if (rc == CLORDER_TAKEN) {
-		__atomic_fetch_add(&C.px.recv_tombstoned, 1, __ATOMIC_RELAXED);
-		return 2;
-	}
-	if (rc == PCACHE_E_OLDER) {
-		__atomic_fetch_add(&C.px.recv_older, 1, __ATOMIC_RELAXED);
-		return 2;              /* S253: this version or newer is here */
-	}
-	if (rc == -2)
-		nomem_drop(ht, col, r->collen, &k, r->ver);
-	if (rc != 0)
-		return 0;
-	pc_upstream_note_copy(col, r->collen, k.s, (size_t)k.len, exp, r->ver);  /* S418 */
-	/* PS8: an eager replica applied here notifies here; a migrated
-	 * record (a placement move) does not */
-	if (r->passive)
-		pc_ev_applied(ht, &k);
-	if (!r->passive) {
-		char colz[PC_COL_NAME_MAX + 1];
-
-		/* the WAL takes the name NUL-terminated and nothing else here
-		 * does, so this is the one copy, on the authored path only.
-		 * The bound cannot be exceeded: @ht was found, so the name
-		 * matched a REGISTERED collection, and those are bounded -
-		 * checked rather than assumed, and never at the cost of
-		 * reporting a stored record as not stored. */
-		if (r->collen <= PC_COL_NAME_MAX) {
-			memcpy(colz, col, r->collen);
-			colz[r->collen] = 0;
-			pc_wal_upsert_fl(colz, k.s, k.len, v.s, v.len, exp,
-				pcache_last_ver, r->flags);
-		}
-		pc_loc_clear(col, r->collen, k.s, r->klen);
-		if (pc_store_shard_enabled(ht))
-			shard_note_change();
-	}
-	__atomic_fetch_add(&C.px.migrated_in, 1, __ATOMIC_RELAXED);
-	return 1;
-}
-
-/* S217: a group's ack, sent by whichever thread applied its last record
- * (the receiver itself with apply_threads = 1).  seal_send is safe from
- * any thread: the socket is shared, datagram sendto is atomic, the key
- * is immutable, and every seal draws a fresh nonce. */
-static void ack_group(const struct clapply_grp *g, void *ctx)
-{
-	unsigned char ack[8];
-	unsigned int st = __atomic_load_n(&g->stored, __ATOMIC_RELAXED);
-
-	(void)ctx;
-	seal_send(&g->from, ack, clmig_ack_write(ack, sizeof ack,
-		M_MIGRATE_ACK, g->req, st > 0, &st));
-}
-
-/* @here: apply every record on this thread - a relay receive thread is
- * not the apply rings' one producer (S461) */
-static void handle_migrate_many(const unsigned char *pt, size_t n,
-		const pc_addr *from, int passive, int here)
-{
-	struct clapply_grp *g = NULL;
-	uint32_t req;
-	unsigned int cnt, i, stored = 0;
-	size_t off = MIG_GHDR;
-	pcache_htable_t *ht;
-
-	if (n < MIG_GHDR)
-		return;
-	req = clmig_group_req(pt);
-	cnt = clmig_group_count(pt);
-	/* req 0 is a write-path push (S73): fire-and-forget by design, so
-	 * there is nobody to ack.  A sweep batch always carries a nonzero
-	 * req and gets its ack as before - after its LAST record is applied,
-	 * whichever thread that is (S217). */
-	if (req && C.ap.n)
-		g = clapply_open(&C.ap, from, req);
-	for (i = 0; i < cnt; i++) {
-		struct clmig_rec r;
-		struct clapply_rec ar;
-		unsigned int cn;
-
-		/* a truncated record stops the walk rather than reading past
-		 * the datagram; what was stored is still acked */
-		if (!clmig_rec_parse(pt, n, &off, &r))
-			break;
-		cn = r.collen;
-		ar.col = (const unsigned char *)r.col;
-		ar.collen = cn;
-		ar.key = (const unsigned char *)r.key;
-		ar.klen = r.klen;
-		ar.val = (const unsigned char *)r.val;
-		ar.vlen = r.vlen;
-		ar.ttl_left = r.ttl_left;
-		ar.ver = r.ver;
-		ar.passive = passive;
-		ar.flags = (unsigned char)(r.flags & PCACHE_F_CARRY);   /* S280 */
-		/* S217: hand it to the thread its key hashes to.  The refusal
-		 * (a record the ring can never hold, or shutdown) is applied
-		 * here, in order, because this thread is still the only one
-		 * that has seen it. */
-		if (C.ap.n && !here && clapply_push(&C.ap, &ar, g) >= 0)
-			continue;
-		/* S219: resolved ONCE - for the peek below and for the apply */
-		ht = pc_store_find(r.col, cn);
-		/* S126 item 3: the bucket touch inside the store is a cold
-		 * miss per record (store_impl 23.5% + find_slot 13.8% in the
-		 * apply profile).  Peek at the record AFTER this one - the
-		 * parse is pointer arithmetic over a datagram already hot in
-		 * cache, and it does NOT consume, so the truncation break
-		 * below still sees exactly what it did - and start its bucket
-		 * on the way while this record's cell_alloc and two memcpys
-		 * run.  Only when the next record names the SAME collection,
-		 * which is the normal case for a group and costs a warm
-		 * memcmp instead of a second registry lookup. */
-		if (ht && i + 1 < cnt) {
-			size_t poff = off;
-			struct clmig_rec nx;
-
-			if (clmig_rec_parse(pt, n, &poff, &nx) &&
-			        nx.collen == cn &&
-			        memcmp(nx.col, r.col, cn) == 0) {
-				str nk;
-
-				nk.s = (char *)nx.key;
-				nk.len = (int)nx.klen;
-				pcache_ht_prefetch(ht, &nk);
-			}
-		}
-		if (apply_counts(apply_rec(&ar, ht), req)) {
-			stored++;
-			if (g)
-				__atomic_fetch_add(&g->stored, 1, __ATOMIC_RELAXED);
-		}
-	}
-	if (g) {
-		clapply_close(&C.ap, g);   /* the last record out sends the ack */
-		return;
-	}
-	if (!req)
-		return;
-	{
-		unsigned char ack[8];
-		unsigned int st = (unsigned int)stored;
-
-		seal_send(from, ack, clmig_ack_write(ack, sizeof ack,
-			M_MIGRATE_ACK, req, stored > 0, &st));
-	}
-}
-
-/* S461: a write-path group from the relay port, gated there (clrp_rx) */
-void cl_repl_apply_group(const unsigned char *pt, size_t n,
-		const pc_addr *from)
-{
-	handle_migrate_many(pt, n, from, 1, 1);
 }
 
 /* the birth-race loser drops its copy and records the winner */
@@ -4164,11 +2994,8 @@ static void handle_demote(const unsigned char *pt, size_t n)
 		if (ht) {
 			k.s = (char *)fk.key;
 			k.len = (int)kn;
-			/* CH-16: the copy the race found, and nothing newer - a
-			 * write that reached this node since the race, or the
-			 * winner's own copy replicated here, is not the loser's;
-			 * a late or replayed demote leaves it.  0 is an older
-			 * sender or an answer without a version: as before */
+			/* the copy the race found and nothing newer: a later write or the winner's
+			 * own replica stays; ver 0 (an older sender) removes unconditionally */
 			if (ver) {
 				str lv;
 				unsigned int le;
@@ -4190,8 +3017,8 @@ static void handle_demote(const unsigned char *pt, size_t n)
 	}
 }
 
-/* 1 when it removed this node's copy (S392's replay logs that to the WAL);
- * 0 for a numbered one, which is logged here (AT-3b) */
+/* 1 when it removed this node's copy (the caller logs that to the WAL);
+ * 0 for a numbered one, which is logged here */
 static int handle_tombstone(const unsigned char *pt, size_t n)
 {
 	pcache_htable_t *ht;
@@ -4210,16 +3037,14 @@ static int handle_tombstone(const unsigned char *pt, size_t n)
 		cn = fk.collen;
 		kn = fk.klen;
 		C.st.tomb_applied++;
-		/* S209: keep the delete's version with the negative entry, so
-		 * the set it superseded is refused when its batch lands after
-		 * this datagram (handle_migrate_many and the bulk and pull
-		 * applies check it).  0 is an older sender: apply as before. */
+		/* keep the delete's version with the negative entry, so the set it
+		 * superseded is refused when its batch lands later; 0 is an older sender */
 		if (ver)
 			pc_lamport_observe(ver);
-		if (tf & CLFWD_TOMB_F_EXPIRY)           /* S446 */
+		if (tf & CLFWD_TOMB_F_EXPIRY)
 			neg_set_ver_expiry(fk.col, cn, fk.key, kn, C.tombstone_ms,
-				ver, (tf & CLFWD_TOMB_F_KEEP) != 0);   /* AT-5 (c) */
-		else if (num.seq)                       /* AT-5 */
+				ver, (tf & CLFWD_TOMB_F_KEEP) != 0);
+		else if (num.seq)
 			neg_set_ver_num(fk.col, cn, fk.key, kn, C.tombstone_ms,
 				ver, &num);
 		else
@@ -4231,9 +3056,8 @@ static int handle_tombstone(const unsigned char *pt, size_t n)
 			removed = clorder_del(ht, pc_store_resize_shadow(ht), &k,
 				ver);
 		}
-		/* 12ny AT-3b: a numbered delete is logged with its numbering
-		 * and counted - applied whether or not a copy went, since a
-		 * newer write or no copy at all is this node holding it */
+		/* a numbered delete is logged with its number and counted whether or not a
+		 * copy went: a newer write or no copy is still this node holding it */
 		if (num.seq) {
 			char colz[256];
 			unsigned long long ws;
@@ -4249,28 +3073,20 @@ static int handle_tombstone(const unsigned char *pt, size_t n)
 	}
 }
 
-/* The pending table's timeouts, every PEND_SWEEP_MS while a request
- * waits (the loop's poll is capped to it then).  The sweep sat in the 1 s
- * beat until 0.7.2, so a pull was given up anywhere from pull_timeout_ms
- * to a second past it - 80 ms meant up to 1,080 (G8's first CI run: 300
- * read as 803-1,103).  The walk is O(max_pending), an empty slot one load,
- * and skipped while nothing waits. */
+/* the pending table's timeouts, every PEND_SWEEP_MS while a request waits (the loop's poll is
+ * capped to it), so a pull gives up close to pull_timeout_ms; skipped while nothing waits */
 #define PEND_SWEEP_MS 25
 
 static void expire_pending(void)
 {
 	C.st.pull_timeouts += clpend_expire(&C.pd, now_ms());
-	C.recon.unruled += C.pd.reconcile_expired;   /* S471 */
+	C.recon.unruled += C.pd.reconcile_expired;
 	C.pd.reconcile_expired = 0;
 }
 
-/* ---- automatic membership (S16 as designed) ----------------------------
- * All functions here run on the peer thread ONLY.  Workers read
- * C.node_id (relaxed int) and peers[] entries; .node is the publish
- * field: written LAST with release, read FIRST with acquire. */
+/* ---- automatic membership: the peer thread ONLY ------------------------- */
 
-/* (ip,port) order - the election's total order over nodes (IP6-1:
- * pc_addr_cmp keeps IPv4's order exactly) */
+/* (ip,port): the election's total order over nodes; pc_addr_cmp keeps IPv4's order exactly */
 static int addr_cmp(const pc_addr *a, const pc_addr *b)
 {
 	return pc_addr_cmp(a, b);
@@ -4283,27 +3099,18 @@ static int addr_eq(const pc_addr *a, const pc_addr *b)
 
 static void ident_hex(const unsigned char *id, char *out);
 
-/* S107: tell this node's clients that a member joined or was expelled -
- * the event, where to dial it, its id and identity, and how many
- * members there are now, so a client can check its next member list
- * against it.  Every node tells its OWN clients when its own view
- * changes, which the master's decisions reach within a beat; a client
- * dialled to a non-master hears it from that node.
- *
- * S317: the push is a tree map (ptree.h) that rides a NOTIFY frame -
- * the flat seven keys the JSON line carried, in its order, so a client
- * that rendered the line sees the same document: {notify: "membership",
- * event, addr, port, node, identity, members}.  pc_clients_notify
- * relays the encoded bytes to every worker unchanged. */
-static void clients_membership(const char *event, struct peer *p, int node)
+/* tell this node's OWN clients a member joined or left; "members" lets a client check its next
+ * member list.  A ptree map in a NOTIFY frame, keys in the JSON line's order. */
+static void clients_tell(const char *event, const pc_addr *addr, int port, int node,
+		const unsigned char *ident, int state)
 {
 	unsigned char buf[256];
 	char hx[33];
 	struct pc_tw w;
 	int members = clpeers_count_live(&C.pt, now_ms()) + 1;
 
-	if (p->has_ident)
-		ident_hex(p->ident, hx);
+	if (ident)
+		ident_hex(ident, hx);
 	else
 		hx[0] = 0;
 	pc_tw_init(&w, buf, sizeof buf);
@@ -4313,53 +3120,63 @@ static void clients_membership(const char *event, struct peer *p, int node)
 	pc_tw_key(&w, "event");
 	pc_tw_str(&w, event);
 	pc_tw_key(&w, "addr");
-	pc_tw_str(&w, pc_addr_str(&p->addr));
+	pc_tw_str(&w, pc_addr_str(addr));
 	pc_tw_key(&w, "port");
-	pc_tw_i64(&w, p->client_port);
+	pc_tw_i64(&w, port);
 	pc_tw_key(&w, "node");
 	pc_tw_i64(&w, node);
 	pc_tw_key(&w, "identity");
 	pc_tw_str(&w, hx);
 	pc_tw_key(&w, "members");
 	pc_tw_i64(&w, members);
-	pc_tw_key(&w, "state");                /* S462 */
-	pc_tw_str(&w, pc_node_state_name(p->nstate));
+	pc_tw_key(&w, "state");
+	pc_tw_str(&w, pc_node_state_name(state));
 	pc_tw_end(&w);
 	if (pc_tw_done(&w) == 0) {
 		pc_clients_notify((const char *)w.b, w.n);
 		LM_INFO("cluster: telling this node's clients that node %d %s "
 			"(%s:%d, %d member(s) now)\n", node, event,
-			pc_addr_str(&p->addr), p->client_port, members);
+			pc_addr_str(addr), port, members);
 	}
 }
 
-/* a member is gone from this node's view: purged, said goodbye, or
- * forgotten.  Reserves its binding (S90), tells the clients (S107),
- * and clears the slot. */
+static void clients_membership(const char *event, struct peer *p, int node)
+{
+	clients_tell(event, &p->addr, p->client_port, node,
+		p->has_ident ? p->ident : NULL, p->nstate);
+}
+
+/* a client linked to this node hears no peer report this node's state: tell it ourselves,
+ * each beat, rather than leave it to its refresh */
+static void self_state_tick(void)
+{
+	int st = pc_node_state();
+
+	if (st == C.told_self_state || !C.cfg_client_port || !C.node_id)
+		return;
+	C.told_self_state = st;
+	clients_tell("state", &C.self_addr, C.cfg_client_port, C.node_id, C.self_ident, st);
+}
+
+/* a member left this node's view (purged, goodbye or forgotten): reserve its id, tell the
+ * clients, clear the slot */
 static void peer_gone(struct peer *p, int why)
 {
 	long long now = now_ms();
 	int silent_s = (int)((now - p->last_seen_ms) / 1000);
 
-	/* S329: a peer that left takes its forced lane with it - whatever
-	 * comes back at that address starts on UDP, and the detector forces
-	 * it again if UDP really is blocked.  0.4.6 kept the force for the
-	 * life of this process, so a rebooted peer was never heard by UDP
-	 * again from here. */
+	/* a departed peer's forced lane goes: whatever returns at that address starts on UDP,
+	 * and the detector forces it again if UDP really is blocked */
 	if (clane_forced(&p->addr))
 		clane_force(&p->addr, 0);
 	if (p->node && p->node == __atomic_load_n(&prefer_id, __ATOMIC_RELAXED))
-		prefer_clear();                /* CH-9: it left before the handover */
+		prefer_clear();                /* it left before the handover */
 
 	if (p->clients_told) {
 		p->clients_told = 0;
 		clients_membership("expelled", p, p->told_node);
 	}
-	/* S90.  The log stays on this side: clres holds no opinion about
-	 * what is worth saying, and p->node must be read before the store
-	 * below clears it.  S293: and the line says WHY - a node that went
-	 * silent is not one that said goodbye, and only one of the two is
-	 * an operator's doing. */
+	/* logged here, not in clres, and before the store below clears p->node */
 	if (clres_note(&reserved, p->node, p->addr.in4.sin_addr, p->ident,
 			p->has_ident, now, RESERVE_MS)) {
 		clres_why(&reserved, p->node, why, silent_s);
@@ -4377,17 +3194,16 @@ static void peer_gone(struct peer *p, int why)
 				"reserved for it for %lld s\n", p->node,
 				pc_addr_str(&p->addr), RESERVE_MS / 1000);
 	}
-	/* S127: stamp BEFORE clearing the id - the spread grace reads this
+	/* stamp BEFORE clearing the id - the spread grace reads this
 	 * to keep the departed node's placement slots for a while longer */
 	p->gone_ms = now_ms();
-	clps_forget(p);                        /* PS12: the slot may be reused */
+	clps_forget(p);                        /* the slot may be reused */
 	__atomic_store_n(&p->node, 0, __ATOMIC_RELEASE);
 	shard_note_change();
 }
 
-/* S30: drop a peer we refuse to federate with (config mismatch).  Same
- * shape as GOODBYE - the slot stays, the node id goes to 0, which is
- * what every read path treats as "not a member". */
+/* drop a peer we refuse to federate with (config mismatch): like GOODBYE, the slot stays and
+ * node goes to 0, which every read path treats as "not a member" */
 static void peer_forget(const pc_addr *from)
 {
 	struct peer *p = clpeers_by_addr(&C.pt, from);
@@ -4396,7 +3212,7 @@ static void peer_forget(const pc_addr *from)
 		peer_gone(p, CLRES_GONE_FORGOTTEN);
 }
 
-static struct peer *peer_upsert(const pc_addr *addr)
+struct peer *peer_upsert(const pc_addr *addr)
 {
 	struct peer *p;
 	int created;
@@ -4408,17 +3224,7 @@ static struct peer *peer_upsert(const pc_addr *addr)
 }
 
 /* ---- node identity (persisted) + incarnation (per process start) -------
- * Two facts the node id cannot carry.  The identity is written once into
- * the state directory and read back on every start, so it survives a
- * restart; the incarnation is fresh each start.  A peer seeing the same
- * identity with a NEW incarnation knows the node restarted and lost its
- * memory, and must be resent everything - which is the whole point,
- * because the master hands a rejoiner ITS OLD NODE ID and the id alone
- * therefore looks unchanged.
- *
- * The identity is PER INSTANCE, not per machine: several nodes commonly
- * share a host (every test rig here runs three), so anything derived
- * from /etc/machine-id, a DMI UUID or a MAC would collide among them. */
+ * Same identity, NEW incarnation = restarted empty (yet given its old id back): resend all */
 
 static void ident_hex(const unsigned char *id, char *out)
 {
@@ -4432,39 +3238,22 @@ static void ident_hex(const unsigned char *id, char *out)
 	out[32] = 0;
 }
 
-/* An id DERIVED from the identity, so a node proposes the same one every
- * time it starts.  It is only a proposal: 1023 slots collide at around
- * 38 nodes by the birthday bound, so the master still arbitrates and
- * assigns something else when the proposal is taken. */
-#define ident_proposed_id clinit_proposed_id   /* M13 */
+/* the proposed id is derived from the identity, so stable across starts; only a proposal -
+ * 1023 slots collide early (birthday bound), so the master still arbitrates */
+#define ident_proposed_id clinit_proposed_id
 
-/* S106: the identity file is TEXT - a version line, the identity as the
- * same 32 hex characters every log line and stats field shows, and a
- * check value - so an operator can read it, correlate it, and be TOLD
- * when it is damaged instead of having a fresh identity minted
- * underneath (S80's id churn by another door, and a silent one):
- *
- *   perfcached-node-identity 1
- *   identity 59bf87e400f2056b0615b69a55ee452f
- *   check 4b1d0f8a9c2e7d31
- *
- * The check is FNV-1a over the sixteen bytes.  It is not a tamper guard
- * - the 0600 mode is the guard, and the one number an operator might
- * want to change (the node id) is not in the file at all - it is a
- * torn-write and typo detector.  The legacy form, the bare sixteen
- * bytes, is read once and rewritten. */
+/* the identity file is text: a version line, the 32-hex identity and an FNV-1a check of the 16
+ * bytes (a torn-write/typo detector; 0600 is the guard).  Legacy raw bytes are rewritten. */
 #define IDENT_FILE   "node-identity"
 #define IDENT_HEADER "perfcached-node-identity 1"
 
-#define fnv1a64 clinit_fnv1a64      /* moved to clinit (M13) */
+#define fnv1a64 clinit_fnv1a64
 
 /* @n bytes from 2n hex characters; -1 on anything that is not hex */
-#define hex2bin clinit_hex2bin      /* moved to clinit (M13) */
+#define hex2bin clinit_hex2bin
 
-/* Written through a temp file, fsync, rename and a directory fsync -
- * the term's discipline - because the old truncate-then-write left an
- * EMPTY file behind a crash, and an empty file used to mean "mint a
- * new one".  0 written, -1 failed with errno set. */
+/* temp file, fsync, rename, directory fsync: a crash never leaves an empty or torn file.
+ * 0 written, -1 failed with errno set. */
 static int ident_store(const char *dir, const unsigned char *id)
 {
 	char hex[33], fin[600], tmp[620], buf[128];
@@ -4502,23 +3291,16 @@ static int ident_store(const char *dir, const unsigned char *id)
 	return 0;
 }
 
-/* What the file holds.  1 = the text form, valid, @id filled; 0 = the
- * legacy form (exactly sixteen raw bytes), @id filled; -1 = it does not
- * validate and @why says how.  Strict: three lines, nothing else - a
- * file an editor has been through (a fourth line, a CRLF) is refused,
- * not guessed at. */
+/* 1 = text form valid, 0 = legacy 16 raw bytes (@id filled either way), -1 = invalid (@why).
+ * Strict: three lines exactly - an edited file (a fourth line, a CRLF) is refused, not guessed */
 static int ident_parse(const unsigned char *buf, size_t len,
 		unsigned char *id, char *why, size_t wlen)
 {
 	return clinit_ident_parse(buf, len, id, why, wlen);
 }
 
-/* S80: carry one small state file from @from_dir into @to_dir if it is
- * absent there - the once-only migration when an admin introduces
- * [daemon] state_dir beside a WAL that had been serving as the state
- * directory.  Written temp + fsync + rename + directory fsync: a
- * half-carried term is not a smaller term, it is an arbitrary one.
- * 1 carried, 0 nothing to do, -1 failed (and logged). */
+/* carry state file @name from @from_dir (a WAL dir that served as state_dir) into @to_dir if
+ * absent; temp + fsync + rename + dir fsync.  1 carried, 0 nothing to do, -1 failed (logged). */
 static int carry_file(const char *from_dir, const char *to_dir,
 		const char *name)
 {
@@ -4531,11 +3313,11 @@ static int carry_file(const char *from_dir, const char *to_dir,
 		return 0;
 	snprintf(dst, sizeof dst, "%s/%s", to_dir, name);
 	if (access(dst, F_OK) == 0)
-		return 0;                      /* already there */
+		return 0;
 	snprintf(src, sizeof src, "%s/%s", from_dir, name);
 	in = open(src, O_RDONLY);
 	if (in < 0)
-		return 0;                      /* nothing to carry */
+		return 0;
 	snprintf(tmp, sizeof tmp, "%s.carry", dst);
 	out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (out < 0) {
@@ -4574,15 +3356,8 @@ static int carry_file(const char *from_dir, const char *to_dir,
 	return 1;
 }
 
-/* S326: the salt auto derives with when no site_salt is configured - 32
- * random bytes minted ONCE into the state directory (node-salt, 0600) and
- * carried with it (S80's carry, from a WAL directory that served as the
- * state directory).  Per instance, so two daemons on one machine are two
- * members; stable, so a moved or carried state directory keeps its
- * identity; and a disk clone on another VM copies the salt but not the
- * platform, so it derives another identity - the point.  0 = @key holds
- * it; -1 = a damaged salt (refuse: a regenerated one would silently make
- * a new member); -2 = it cannot be kept (derive nothing this start). */
+/* auto's salt when no site_salt is set: 32 random bytes minted once per instance (node-salt); a
+ * cloned disk copies it but not the platform, so derives anew.  0 ok, -1 damaged, -2 unkeepable */
 #define SALT_FILE "node-salt"
 static int node_salt(const char *state_dir, const char *legacy_dir,
 		unsigned char key[32])
@@ -4641,9 +3416,7 @@ static int node_salt(const char *state_dir, const char *legacy_dir,
 	return 0;
 }
 
-/* S326: is @name in the state directory - after S80's once-only carry
- * from the WAL directory that served as one, so a carried identity or
- * salt counts as present. */
+/* is @name in the state directory, counting one carried from the legacy WAL directory */
 static int state_has(const char *state_dir, const char *legacy_dir,
 		const char *name)
 {
@@ -4655,9 +3428,8 @@ static int state_has(const char *state_dir, const char *legacy_dir,
 	return access(path, F_OK) == 0;
 }
 
-/* 0, or -1 when the persisted identity does not validate: that refuses
- * startup (S106) - never a guess, never a fresh mint over a damaged
- * file.  The remedy is in the message. */
+/* identity_init: 0, or -1 when the persisted identity does not validate - refuse to start,
+ * never mint a fresh one over a damaged file */
 void pc_cluster_set_site_salt(const char *salt)
 {
 	C.cfg_site_salt = salt;            /* the config owns the storage */
@@ -4669,24 +3441,15 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 	unsigned char buf[256];
 	unsigned char plat[16];
 	int fd, got = 0, form = -1, derived = 0;
-	int soft = 0, plat_src = CLPLAT_NONE;         /* S326 */
-	int keep_src = CLPLAT_NONE;                   /* S326: kept, not derived */
+	int soft = 0, plat_src = CLPLAT_NONE;
+	int keep_src = CLPLAT_NONE;                   /* kept, not derived */
 	ssize_t n;
 
 	C.ident_durable = 0;
-	/* PLATFORM FIRST.  A file is copied by any disk clone; a hypervisor
-	 * regenerates the UUID (VMs) or the NIC MAC (LXC) when it clones,
-	 * so deriving from those makes a clone a DIFFERENT member by
-	 * construction instead of relying on catching it later.  Needs a
-	 * site salt: without one, two fleets on one hypervisor would derive
-	 * the same identities. */
-	/* S143: identity_source names ONE source and refuses to start
-	 * without it - a pod that silently fell through to the file (or a
-	 * random mint) looked fine until a clone of it joined as the same
-	 * member.  env = $PERFCACHED_PLATFORM_KEY (a Deployment's
-	 * metadata.uid: a rescheduled pod is a new member, as it should
-	 * be); file = the identity file alone (a StatefulSet's PVC keeps
-	 * it).  auto is the cascade below, as before. */
+	/* platform first: a disk clone copies the file, but a hypervisor regenerates the UUID (VM)
+	 * or MAC (LXC), so a clone derives a NEW identity; the salt keeps two fleets apart */
+	/* a named identity_source refuses to start without it: env = $PERFCACHED_PLATFORM_KEY (a
+	 * rescheduled pod is a new member), file = the identity file alone, auto = the cascade */
 	if (cl_id_source == PC_IDSRC_DMI || cl_id_source == PC_IDSRC_MAC ||
 	        cl_id_source == PC_IDSRC_ENV) {
 		char pkey[CLPLAT_KEY_MAX];
@@ -4698,7 +3461,7 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 		if (want == CLPLAT_DMI) {
 			const char *ctr;
 
-			if (clplat_in_container(&ctr))         /* S326 */
+			if (clplat_in_container(&ctr))
 				LM_WARN("cluster: identity_source = dmi inside a "
 					"container (%s) - its DMI uuid is the HOST's, so "
 					"every container on that host derives the same "
@@ -4718,20 +3481,15 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 	} else if (cl_id_source == PC_IDSRC_AUTO &&
 	        ((C.cfg_site_salt && *C.cfg_site_salt) ||
 	         (state_dir && *state_dir))) {
-		/* S326: auto derives from the platform by DEFAULT, not only
-		 * with a site_salt - a Proxmox VM's node was minted at random
-		 * while its UUID and MAC sat there, unique.  Without a
-		 * configured salt the node's own salt (node_salt) is the key,
-		 * and no state directory means nothing to derive for (the
-		 * identity is ephemeral anyway). */
+		/* auto derives from the platform by default: without a site_salt the node salt is
+		 * the key; with no state directory there is nothing to derive for */
 		char pkey[CLPLAT_KEY_MAX];
 		const char *pwhy = "";
 		int src = clplat_probe(pkey, sizeof pkey, &pwhy);
 
 		if (src != CLPLAT_NONE) {
-			/* held aside: the file load below writes into
-			 * C.self_ident, and the derived value has to survive
-			 * that to be able to override it */
+			/* held aside: the file load below writes C.self_ident, and the derived
+			 * value must survive it to override it */
 			if (C.cfg_site_salt && *C.cfg_site_salt) {
 				clplat_derive((const unsigned char *)C.cfg_site_salt,
 					strlen(C.cfg_site_salt), pkey, plat);
@@ -4739,14 +3497,8 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 				plat_src = src;
 			} else if (!state_has(state_dir, legacy_dir, SALT_FILE) &&
 			        state_has(state_dir, legacy_dir, IDENT_FILE)) {
-				/* S326: the node salt is what marks an identity
-				 * THIS scheme derived.  One on disk with no salt
-				 * beside it came from before - minted (v7), the
-				 * legacy sixteen bytes (any version nibble), or
-				 * derived under a site_salt since removed - and is
-				 * kept (continuity, S80): becoming a new member is
-				 * not an upgrade's call.  No salt is minted for it,
-				 * so the next start decides the same way. */
+				/* no node salt beside an identity on disk = it predates derivation:
+				 * kept (no new member on upgrade), and no salt is minted for it */
 				keep_src = src;
 			} else {
 				unsigned char dk[32];
@@ -4774,9 +3526,7 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 	}
 	if (state_dir && *state_dir) {
 		snprintf(path, sizeof path, "%s/" IDENT_FILE, state_dir);
-		/* S80: an identity already persisted in the WAL directory
-		 * is carried across once when state_dir is introduced
-		 * beside it, so the node stays itself */
+		/* a WAL-directory identity is carried once into a new state_dir */
 		if (legacy_dir)
 			carry_file(legacy_dir, state_dir, IDENT_FILE);
 		fd = open(path, O_RDONLY);
@@ -4818,9 +3568,7 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 			return -1;
 		}
 		if (keep_src != CLPLAT_NONE && got) {
-			/* S326: continuity (S80) - the identity on disk is kept
-			 * under the default (see the salt check above).  Say
-			 * what it costs and how to switch. */
+			/* the identity kept above: say what it costs and how to switch */
 			char was[33];
 
 			ident_hex(C.self_ident, was);
@@ -4838,10 +3586,8 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 				LM_NOTICE("cluster: identity derived from the "
 					"platform (%s%s)\n", clplat_src_name(plat_src),
 					soft ? ", with this node's salt" : "");
-			/* The platform is the authority; the file is a cache.
-			 * Compare what the file gave (now in C.self_ident, if
-			 * it had one) against the derived value BEFORE
-			 * overwriting, so the mismatch can be reported. */
+			/* the platform is the authority, the file a cache: compare BEFORE
+			 * overwriting so a mismatch (a clone) is reported */
 			if (got && memcmp(C.self_ident, plat, 16) != 0) {
 				char was[33];
 
@@ -4869,26 +3615,21 @@ static int identity_init(const char *state_dir, const char *legacy_dir)
 		C.ident_durable = got;
 	}
 	if (derived && !(state_dir && *state_dir)) {
-		/* S326: derived with nowhere to cache it - the file block above
-		 * never ran, so the derived value is the identity as it stands
-		 * (it left the identity unset before) */
+		/* derived with nowhere to cache it: the derived value is the identity */
 		memcpy(C.self_ident, plat, 16);
 		if (plat_src != CLPLAT_NONE)
 			LM_NOTICE("cluster: identity derived from the platform "
 				"(%s)\n", clplat_src_name(plat_src));
 	}
 	if (!C.ident_durable && !derived) {
-		/* Nothing to persist to.  Regenerating each start is the
-		 * CORRECT answer rather than a fallback: a node with no
-		 * durable store has nothing to bring back, so it should
-		 * present to the fleet as a new member. */
+		/* nothing to persist to: a fresh identity each start is correct - with no
+		 * durable store the node has nothing to bring back, so it is a new member */
 		clplat_random_v7(C.self_ident, (uint64_t)now_ms());
 	}
 	do {
 		randombytes_buf(&C.self_incarn, sizeof C.self_incarn);
 	} while (!C.self_incarn);           /* 0 means "not reported" */
-	/* PS7: a receiver tells this process's relay sequence from the last
-	 * one's by it (psrelay.h) */
+	/* a receiver tells this process's relay sequence from the last one's by it */
 	clps_new_epoch();
 	ident_hex(C.self_ident, C.self_ident_hex);
 	C.proposed_id = ident_proposed_id(C.self_ident);
@@ -4935,22 +3676,12 @@ int pc_cluster_state_tmpfs(void)
 	return C.state_tmpfs;
 }
 
-/* the paths that learn a peer from something other than its own
- * heartbeat (an ASSIGN member list, a MASTER_ALIVE) carry no identity;
- * they pass this and keep the node-id behaviour until the peer's own
- * ALIVE arrives with the real thing */
+/* for paths that learn a peer other than by its own ALIVE (ASSIGN list, MASTER_ALIVE): no
+ * identity, so node-id behaviour holds until its ALIVE brings the real one */
 static const unsigned char pd_noident[16];
 
-/* S442: a member back from a silence, or READY again, may hold copies of
- * keys this node remembers ANOTHER holder for - a partition's fork (both
- * sides took a write for one new key), or records it replayed from its own
- * disk.  The demoter that heals a fork fires only when one lookup collects
- * two positive answers, and a remembered holder is asked alone: a node that
- * learned one side's holder before the other side answered served that
- * side for good, and the fork never healed (splitbraintest, GitHub
- * 39959849797: node 2 read node 1's copy through all 30 rounds while node
- * 3 served its own, and no node logged a birth race).  Forgetting costs one
- * fleet-wide probe for each key read next - the locator's cost when cold. */
+/* a returning member may hold copies of keys remembered at another holder (a fork); a fork heals
+ * only when one lookup gets two answers, and a remembered holder is asked alone: forget them */
 static void holders_forget(int node, const char *why)
 {
 	unsigned long n = clloc_forget_holders(&C.lc);
@@ -4961,7 +3692,7 @@ static void holders_forget(int node, const char *why)
 			node, why, n);
 }
 
-static void peer_publish(struct peer *p, int node, unsigned int free_mb,
+void peer_publish(struct peer *p, int node, unsigned int free_mb,
 		unsigned int total_mb, unsigned int live_kb,
 		const unsigned char *ident, unsigned int incarn,
 		unsigned int entries, int start)
@@ -4973,31 +3704,21 @@ static void peer_publish(struct peer *p, int node, unsigned int free_mb,
 		p->total_mb = total_mb;
 		p->live_kb = live_kb;
 	}
-	/* S238: a silence of more than 3 s may have swallowed a delete's
-	 * broadcast - the heartbeat is 1 Hz - so note where it began; the
-	 * catch-up tick replays the retained deletes from there.  Seen HERE,
-	 * not at the tick: the tick runs every REPL_SWEEP_BEATS and a short
-	 * cut falls between two of them. */
+	/* a silence over 3 s may have swallowed a delete broadcast: note where it began for the
+	 * catch-up replay - here, as a short cut can fall between two sweep ticks */
 	{
 		long long nowh = now_ms();
 
 		if (p->last_seen_ms && nowh - p->last_seen_ms > 3000) {
 			unsigned int from = (unsigned int)(p->last_seen_ms / 1000);
 
-			holders_forget(node, "is back from a silence");   /* S442 */
+			holders_forget(node, "is back from a silence");
 
 			from = from > 2 ? from - 2 : 0;
 			if (!p->tomb_gap_from || from < p->tomb_gap_from)
 				p->tomb_gap_from = from ? from : 1;
-			/* S248: under spread a silence is a REPAIR EVENT too.
-			 * Pushes to this peer during it went nowhere and are
-			 * never retried, and set repair is armed only by a
-			 * holder-set change - which a short cut, inside the
-			 * slot grace, never makes (spread_repaired stayed 0 on
-			 * all three nodes; holders kept versions 733 and 586
-			 * of one key through a fleet restart).  Every holder
-			 * re-places what it shares with this peer; the
-			 * receiver keeps the newer version. */
+			/* under spread a silence is a repair event: pushes during it are lost,
+			 * and a cut inside the slot grace never changes the holder set */
 			if (pc_cluster_replicas()) {
 				memset(p->setrepair, 1, sizeof p->setrepair);
 				memset(p->repl_cursor, 0, sizeof p->repl_cursor);
@@ -5011,26 +3732,10 @@ static void peer_publish(struct peer *p, int node, unsigned int free_mb,
 	}
 	p->last_seen_ms = now_ms();
 
-	/* Has this peer's MEMORY gone?  The node id cannot answer it: the
-	 * master hands a rejoiner its old id back, so a node that was
-	 * kill -9'd and came back empty looked unchanged and was never
-	 * resent anything (measured: an eager fleet left it at 0 entries
-	 * for 120 seconds while its peers held 20000).  The incarnation
-	 * answers it directly - it is regenerated every process start.
-	 *
-	 * S103: the record count and the start kind are known ONLY to the
-	 * peer's own ALIVE, which is the call that carries an incarnation.
-	 * The other callers - a JOIN, an ASSIGN list, a MASTER_ALIVE - know
-	 * neither and used to store zeros here anyway, so on every
-	 * non-master node the master's slot flapped at 1 Hz between what
-	 * its heartbeat said and (0 records, unknown start).  Read at the
-	 * wrong phase by lowest_live_sender(), the lowest id looked empty,
-	 * the reader self-designated, and two senders walked one backfill:
-	 * every CI run of eagertest and stalebackfilltest, never the build
-	 * host, where the two datagrams happened to land the other way
-	 * round.  What a caller does not know it does not write. */
+	/* the incarnation (new each start) tells a restart; entries and start kind come ONLY with
+	 * its own ALIVE: JOIN, ASSIGN and MASTER_ALIVE callers know neither, so write neither */
 	if (incarn) {
-		p->entries = entries;          /* S82: state, not a timer */
+		p->entries = entries;          /* state, not a timer */
 		p->start_kind = (unsigned char)start;
 		fresh = !p->has_ident || p->incarn != incarn ||
 			memcmp(p->ident, ident, 16) != 0;
@@ -5043,84 +3748,24 @@ static void peer_publish(struct peer *p, int node, unsigned int free_mb,
 		fresh = __atomic_load_n(&p->node, __ATOMIC_RELAXED) != node;
 	}
 	if (fresh) {
-		/* Assume its memory is gone and resync from zero - mark AND
-		 * cursor, or the resumed cycle would skip the head of the
-		 * table. */
+		/* assume its memory is gone: reset mark AND cursor, or the resumed cycle
+		 * skips the head of the table */
 		memset(p->repl_mark, 0, sizeof p->repl_mark);
 		memset(p->repl_cursor, 0, sizeof p->repl_cursor);
 		memset(p->repl_dirty, 0, sizeof p->repl_dirty);
 		memset(p->repl_bfcycle, 0, sizeof p->repl_bfcycle);
-		/* Resetting the mark is NOT enough on its own.  The steady
-		 * sweep sends only records this node AUTHORED, because
-		 * re-sending a copy it merely received would echo the
-		 * keyspace around the fleet for ever.  A node that came back
-		 * empty therefore gets nothing from peers holding only
-		 * copies - which is exactly the case that left an eager
-		 * fleet with one node at 0 entries indefinitely.  So arm a
-		 * ONE-SHOT pass that includes the copies; it is bounded by a
-		 * single clean cycle and cannot become an echo. */
-		/* Arm it from what the node SAYS about its start (the ALIVE
-		 * tail byte), never from its record count - see PC_START_*.
-		 *
-		 * COLD        - replayed nothing and still young: backfill.
-		 * RECOVERED   - replayed a WAL.  It holds most of what it is
-		 *               owed and a blind push of everything is the
-		 *               wrong tool: the receive path refuses a copy
-		 *               older than the one held, so the push would not
-		 *               corrupt, only waste.  What it IS owed is a diff
-		 *               (S73b), filed, not built.
-		 * ESTABLISHED - past its first holdoff: nothing to do.  This is
-		 *               what a node that just started sees of a running
-		 *               fleet, so it is silent.
-		 * UNKNOWN     - an older build: judged by its count as before,
-		 *               so a rolling upgrade keeps working.
-		 *
-		 * And COLD arms only for a restart this node WITNESSED (it knew
-		 * the previous incarnation) or when this node is itself past
-		 * its cold window.  A node that just started first-sights a
-		 * whole fleet that may still be young - with S73's write-path
-		 * push a test fleet converges in a second and a restart within
-		 * 30 s of start is ordinary - and it has nothing to give them:
-		 * measured, the restarted node (lowest id, so the designated
-		 * sender) pushed its 280 passive copies at both peers, the echo
-		 * the passive flag exists to prevent. */
+		/* the sweep sends only AUTHORED records (copies would echo), so an empty node needs
+		 * a ONE-SHOT pass that includes copies, bounded to one clean cycle */
+		/* armed by the start kind it reports (PC_START_*), never its count; COLD arms only
+		 * on a restart this node witnessed or once this node is past its own cold window */
 		if (incarn && ((start == PC_START_COLD &&
 		        (known || self_start_kind() != PC_START_COLD)) ||
 		        (start == PC_START_UNKNOWN && !entries))) {
 			memset(p->backfill, 1, sizeof p->backfill);
 			p->fresh_ms = p->last_seen_ms;
 			p->cold_fresh = 1;
-			/*
-			 * S147: UNDER SPREAD A COLD MEMBER IS A REPAIR EVENT,
-			 * whether or not the holder set changed.
-			 *
-			 * The backfill above goes through the lowest-id sender
-			 * election, which is right for eager - every peer holds
-			 * every record, one sender suffices.  Under spread that
-			 * sender holds K of P and the rest was meant to come
-			 * from setrepair, which every holder walks - but
-			 * setrepair is armed ONLY by a change in the holder-set
-			 * fingerprint, and a node that bounces at the same
-			 * address inside another node's PEER_SLOT_GRACE_MS
-			 * never changes that node's fingerprint: it never
-			 * stopped being a holder from there, so it is never
-			 * re-placed to, and it came back with nothing.
-			 *
-			 * Measured on 224 under concurrent=2 (v0.3.7-rc8): the
-			 * departure grace expired on two survivors 2-3 s before
-			 * the node returned and never on the third.  That third
-			 * logged "started cold - backfilling it", deferred to
-			 * the lowest id, dropped its backfill as stale once the
-			 * node reported established, and never walked a
-			 * copies-included cycle toward it.  The node received 79
-			 * of the 107 a full re-placement delivers and stayed 18
-			 * short of its share.  A supervisor restart inside 30 s
-			 * at the same address is the ORDINARY production case.
-			 *
-			 * So arm setrepair here too.  Duplicates are bounded by
-			 * K and discarded by the receiver's version compare, the
-			 * same argument the set-change path already relies on.
-			 */
+			/* under spread a cold member is a repair event: one sender holds only K
+			 * of P, and a bounce inside the slot grace never arms setrepair */
 			if (pc_cluster_replicas()) {
 				memset(p->setrepair, 1, sizeof p->setrepair);
 				memset(p->repl_cursor, 0, sizeof p->repl_cursor);
@@ -5132,20 +3777,8 @@ static void peer_publish(struct peer *p, int node, unsigned int free_mb,
 				: "");
 		} else if (incarn && start == PC_START_RECOVERED &&
 		        pc_cluster_replicas()) {
-			/* S246: UNDER SPREAD, A RECOVERED MEMBER IS A REPAIR EVENT
-			 * TOO.  Its copies are off its WAL, so what it recovered
-			 * of them came from its last SNAPSHOT - and a copy
-			 * overwritten after that snapshot comes back OLD, with the
-			 * count right.  Nothing re-sent the newer one: eager's
-			 * authors do (the mark reset above resends what each
-			 * AUTHORED), spread's repair is set-repair, and the set
-			 * did not change.  Measured (restartsharetest): a holder
-			 * restarted from a snapshot plus a WAL tail served the
-			 * snapshot's value for 34 of the 100 keys overwritten
-			 * after it, read through the fleet as 49, for as long as
-			 * anyone watched.  The same walk a cold member gets: every
-			 * holder re-places its share, the receiver keeps the
-			 * newer of two versions, duplicates bounded by K. */
+			/* under spread a recovered member is a repair event too: its copies are
+			 * off the WAL, so one overwritten after its snapshot comes back old */
 			memset(p->setrepair, 1, sizeof p->setrepair);
 			memset(p->repl_cursor, 0, sizeof p->repl_cursor);
 			LM_NOTICE("cluster: node %d restarted holding %u recovered "
@@ -5161,13 +3794,8 @@ static void peer_publish(struct peer *p, int node, unsigned int free_mb,
 				"%u records - NOT backfilling (judged by its count: a "
 				"recovered node needs a diff)\n", node, entries);
 	}
-	/* S83: a peer that restarted cold and now says it is complete - it
-	 * pulled its bootstrap, or the push finished it - no longer earns
-	 * the resync of this node's AUTHORED records from mark zero that
-	 * its fresh incarnation set up: the pull carried them, and anything
-	 * written since went by the write-path push.  This is a LATER
-	 * heartbeat of the same incarnation, so it cannot live in the block
-	 * above (boottest: 2000 duplicates at a node that had just pulled). */
+	/* a cold peer now ESTABLISHED (pulled, or the push finished it) no longer needs the resync
+	 * from mark zero: the pull carried it, and later writes went by the write-path push */
 	if (incarn && start == PC_START_ESTABLISHED && p->cold_fresh) {
 		int c;
 
@@ -5182,39 +3810,16 @@ static void peer_publish(struct peer *p, int node, unsigned int free_mb,
 		int was = __atomic_load_n(&p->node, __ATOMIC_RELAXED);
 
 		__atomic_store_n(&p->node, node, __ATOMIC_RELEASE);
-		/*
-		 * Only a REAL change re-arms the reshard grace.  This used to
-		 * fire unconditionally, and peer_publish() runs on EVERY
-		 * heartbeat - so `get_ticks() - last_change_tick` never
-		 * reached SHARD_GRACE_S and pc_shard_grace() was permanently
-		 * true.  An owner's miss is supposed to be authoritative;
-		 * instead every miss broadcast to all peers and a share of
-		 * them waited out pull_timeout_ms.
-		 *
-		 * Measured on a 3-host shard cluster, 2026-09-12: with ~22%
-		 * of reads missing, 5.3M misses produced 10.7M pull datagrams
-		 * and 460k timeouts, and aggregate GET fell to 155k/s.  An
-		 * idle cluster with stable membership still broadcast a lone
-		 * miss (pull_sent +2) minutes after the last change.
-		 *
-		 * `fresh` is the signal the function already computes for the
-		 * replication reset; a node-id change is the other real one.
-		 */
+		/* only a REAL change re-arms the reshard grace: this runs every heartbeat, and an
+		 * always-on grace makes every owner's miss broadcast instead of authoritative */
 		if (fresh || was != node)
 			shard_note_change();
 	}
 }
 
-/* order-independent membership digest over (node,ip) - the module's
- * MASTER_ALIVE digest shape.
- *
- * FNV-1a's constants, but a field goes in a WORD at a time rather than a
- * byte, so this is NOT FNV-1a and matches no published vector.  It does
- * not have to be: it only has to be stable across the fleet and
- * independent of peer order.  Deliberately left in that shape when the
- * basis was corrected - reshaping it too would be a second wire change
- * for nothing. */
-static uint64_t member_digest(void)
+/* order-independent membership digest over (node,ip): FNV-1a constants fed a word at a time, so
+ * NOT FNV-1a - it need only be fleet-stable, and reshaping it would change the wire */
+uint64_t member_digest(void)
 {
 	uint64_t d = 0;
 	long long now = now_ms();
@@ -5246,33 +3851,28 @@ static void send_join_req(const pc_addr *to)
 
 	memset(&j, 0, sizeof j);
 	j.tok = C.join_tok;
-	/* S30: the joiner states its collection config UP FRONT, so a
-	 * master that runs something else never assigns it an id - the
-	 * join is refused rather than half-completed */
+	/* the collection config goes UP FRONT: a master running another one refuses the
+	 * join rather than assign an id and half-complete it */
 	j.mode = C.cfg_mode;
 	j.eager = C.cfg_eager;
 	j.cfg_digest = config_digest();
-	/* the id this node would LIKE, derived from its identity so it is
-	 * the same every start.  A proposal only - the master rejects it
-	 * if taken, which is what keeps two identities that happen to hash
-	 * alike from ending up on one id. */
+	/* a proposal only: the master rejects it if taken (two identities may hash alike) */
 	j.ident = C.self_ident;
 	j.proposed = C.proposed_id;
-	/* the incarnation too: identity alone cannot tell "the member you
-	 * already know, re-joining" from "a second process claiming to be
-	 * it", and only the first of those is ordinary traffic */
+	/* identity alone cannot tell a member re-joining from a second process claiming
+	 * to be it; the incarnation can */
 	j.incarn = C.self_incarn;
-	/* S73b: the WAL posture, so a refusal can NAME it.  1 = no WAL,
+	/* the WAL posture, so a refusal can NAME it.  1 = no WAL,
 	 * 2 = logs one; a build before the byte sends 41 and reads as unknown */
 	j.wal = C.cfg_wal ? 2 : 1;
-	j.epoch = pc_cluster_epoch();            /* S221; 12nu: what the fleet speaks */
+	j.epoch = pc_cluster_epoch();            /* what the fleet speaks */
 	{
 		size_t jn = clmemb_joinreq_write(msg, sizeof msg, M_JOIN_REQ, &j);
 
 		if (to)
 			seal_send(to, msg, jn);
 		else {
-			/* S36: no target - the group, or every seed and known
+			/* no target: the group, or every seed and known
 			 * address; a seed that moved is re-resolved now */
 			if (cl_unicast)
 				clmesh_resolve_soon();
@@ -5283,18 +3883,14 @@ static void send_join_req(const pc_addr *to)
 	C.st.joins++;
 }
 
-/* S81: how this node started, for the ALIVE tail.  COLD lasts one sender
- * holdoff past READY - long enough for every peer to read a heartbeat and
- * arm the one-shot backfill, short enough that a node restarting later does
- * not take a running fleet for a roomful of newcomers.  ready_ms is stamped
- * lazily here, on the cluster thread, at the first heartbeat after READY. */
+/* the ALIVE's start kind: COLD lasts one sender holdoff past READY, enough for peers to arm the
+ * backfill; ready_ms is stamped lazily on the cluster thread at the first beat after READY */
 static int self_start_kind(void)
 {
 	if (pc_recovered_records() > 0)
 		return PC_START_RECOVERED;
-	/* S83: a node that pulled its bootstrap KNOWS it is complete - no
-	 * holdoff, nothing for a peer to push; the flags they armed on our
-	 * cold heartbeat drop as stale at their next tick */
+	/* a node that pulled its bootstrap KNOWS it is complete; flags peers armed on our
+	 * cold beat drop as stale at their next tick */
 	if (clboot_done(&C.bt) &&
 	        pc_node_state() >= PC_NST_READY)
 		return PC_START_ESTABLISHED;
@@ -5307,11 +3903,10 @@ static int self_start_kind(void)
 		? PC_START_COLD : PC_START_ESTABLISHED;
 }
 
-/* S352c: this node can mail (pc_cluster_set_can_mail, from the alert tick) */
+/* this node can mail (pc_cluster_set_can_mail, from the alert tick) */
 static int self_can_mail;
 
-/* AR11: cfgsig/ncfgsig are defined with C, above - the members reply
- * reads them too */
+/* cfgsig/ncfgsig are defined with C, above: the members reply reads them too */
 void pc_cluster_set_cfgsig(const struct pc_cfgsig *e, int n)
 {
 	if (n < 0)
@@ -5328,7 +3923,7 @@ int pc_cluster_cfgsig(const struct pc_cfgsig **e)
 	return ncfgsig;
 }
 
-/* UP1: this node's facts, after its settings, in @name/@val from @at; returns the new count */
+/* this node's facts, after its settings, in @name/@val from @at; returns the new count */
 static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int features)
 {
 	if (at + PC_CL_NFACTS > cap)
@@ -5337,12 +3932,12 @@ static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int feature
 	val[at++] = (uint32_t)PC_VERSION_TWEAK << 24 | (uint32_t)PC_VERSION_MAJOR << 16 |
 		(uint32_t)PC_VERSION_MINOR << 8 | (uint32_t)PC_VERSION_PATCH;
 	name[at] = PC_FACT_EPOCHS;
-	val[at++] = (uint32_t)PC_CL_EPOCH_MIN << 8 | (uint32_t)pc_cluster_epoch_max();   /* 12nu: the range */
+	val[at++] = (uint32_t)PC_CL_EPOCH_MIN << 8 | (uint32_t)pc_cluster_epoch_max();
 	name[at] = PC_FACT_FEATURES;
 	val[at++] = (uint32_t)features;
-	name[at] = PC_FACT_UPGRADE;                    /* UPS: a cached word */
+	name[at] = PC_FACT_UPGRADE;                    /* a cached word */
 	val[at++] = pc_upg_fact();
-	/* S436: in a SPARE slot only (see PC_FACT_AUTOSCALE) */
+	/* in a SPARE slot only (see PC_FACT_AUTOSCALE) */
 	if (at < cap && (features & CLMEMB_FEAT_AUTOSCALE)) {
 		name[at] = PC_FACT_AUTOSCALE;
 		val[at++] = pc_store_autoscale_sig(NULL);
@@ -5352,20 +3947,20 @@ static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int feature
 
 static int self_features(void)
 {
-	int f = CLMEMB_FEAT_TYPES2 | CLMEMB_FEAT_HREAD |      /* S314, S319 */
-		CLMEMB_FEAT_SLOCK | CLMEMB_FEAT_STAGE;         /* S170a, UP6n */
+	int f = CLMEMB_FEAT_TYPES2 | CLMEMB_FEAT_HREAD |
+		CLMEMB_FEAT_SLOCK | CLMEMB_FEAT_STAGE;
 
-	/* S432, a statement of its own: symlocktest and hashfwdtest build
-	 * their old-member variants by editing the line above as text */
-	if (!self_no_respmap)                          /* the test flag */
+	/* a statement of its own: symlocktest and hashfwdtest build their
+	 * old-member variants by editing the line above as text */
+	if (!self_no_respmap)
 		f |= CLMEMB_FEAT_RESPMAP;
-	if (!self_no_holdq)                            /* S394, the test flag */
+	if (!self_no_holdq)
 		f |= CLMEMB_FEAT_HOLDQ;
-	if (!self_no_autoscale)                        /* S436, the test flag */
+	if (!self_no_autoscale)
 		f |= CLMEMB_FEAT_AUTOSCALE;
 
 	if (__atomic_load_n(&self_can_mail, __ATOMIC_RELAXED))
-		f |= CLMEMB_FEAT_MAILER;                       /* S352c */
+		f |= CLMEMB_FEAT_MAILER;
 	return f;
 }
 
@@ -5381,14 +3976,13 @@ int pc_member_fact(const struct pc_member *m, uint32_t key, uint32_t *val)
 	return 0;
 }
 
-static void send_alive(void)
+void send_alive(void)
 {
 	unsigned char msg[CLMEMB_ALIVE_MAX];
 	struct clmemb_alive a;
 	size_t len;
 
-	/* 12ny AT-3b: the durable point, every beat - what AT-4 announces
-	 * from this frame is confirmed against it */
+	/* the durable point, every beat: the marks this frame announces are confirmed against it */
 	pc_ack_synced(pc_wal_durable_seq(pc_rdb_safe_marker()));
 
 	memset(&a, 0, sizeof a);
@@ -5396,31 +3990,28 @@ static void send_alive(void)
 	a.free_mb = self_free_mb();
 	a.total_mb = self_total_mb();
 	a.live_kb = self_live_kb();
-	/* S30 trailer: what this node believes the cluster's collections
-	 * ARE.  A peer that disagrees is refused rather than fed. */
+	/* what this node believes the collections ARE: a peer that disagrees is refused, not fed */
 	a.mode = C.cfg_mode;
 	a.eager = C.cfg_eager;
 	a.cfg_digest = config_digest();
-	a.client_port = C.cfg_client_port;              /* S34 */
-	/* identity + incarnation, then everything after them, are additive
-	 * tail fields: a peer built before one reads the prefix it knows and
-	 * ignores the rest.  The gates that make that work are clmemb's. */
+	a.client_port = C.cfg_client_port;
+	/* identity, incarnation and all after them are additive tail fields: an older peer reads
+	 * the prefix it knows and ignores the rest (clmemb's gates) */
 	a.ident = C.self_ident;
 	a.incarn = C.self_incarn;
 	a.entries = self_entries();
-	/* the Lamport clock rides the heartbeat: at 1 Hz every node folds in
-	 * every other node's value, so the fleet converges continuously with
-	 * no clock agreement and no extra traffic */
+	/* the Lamport clock rides the heartbeat: every node folds in every other's at 1 Hz,
+	 * so the fleet converges with no extra traffic */
 	a.lamport = pc_lamport_now();
-	a.nstate = pc_node_state();                     /* B1 */
-	a.epoch = pc_cluster_epoch();                         /* S221; 12nu */
-	a.sole_witness = rec_sole_witness();            /* 0.5.7.1 */
-	a.features = self_features();          /* S314, S319, S170a, S352c */
-	/* S465: the group always goes, for the link; ACKS and marks only below */
+	a.nstate = pc_node_state();
+	a.epoch = pc_cluster_epoch();
+	a.sole_witness = rec_sole_witness();
+	a.features = self_features();
+	/* the ext group always goes, for the link; ACKS and marks only below */
 	a.ext = 1;
 	a.features32 = (uint32_t)a.features;
 	pc_alerts_link_state(&a.link_pct, &a.link_level);
-	/* 12ny AT-4: the features word and this beat's slice of the marks */
+	/* the features word and this beat's slice of the marks */
 	if (!self_no_acks && pc_ack_enabled()) {
 		uint64_t o[CLMEMB_MARKS_MAX], m[CLMEMB_MARKS_MAX];
 		uint32_t in[CLMEMB_MARKS_MAX];
@@ -5437,25 +4028,21 @@ static void send_alive(void)
 				freeze_mark(o[i], in[i], m[i]) : m[i];
 		}
 	}
-	/* S186 put the byte in the frame and the words in one place, and
-	 * nothing ever filled the byte or kept it on arrival - so no node
-	 * has shown ANOTHER node's reason, which is the view S186 was for
-	 * (found by S216's gate: A listed B as stalled, reason ""). */
 	a.nreason = pc_node_reason();
 	a.mem_tier = pcache_mem.tier;   /* the arena's ACTUAL tier; 0 = none */
-	a.resp_port = C.cfg_resp_port;                  /* S49 */
-	a.start_kind = self_start_kind();               /* S81: PC_START_* */
-	a.http_port = C.cfg_http_port;                  /* S78 */
+	a.resp_port = C.cfg_resp_port;
+	a.start_kind = self_start_kind();
+	a.http_port = C.cfg_http_port;
 	a.uptime_s = (uint32_t)pc_metrics_uptime();
-	/* S160: open clients ride the heartbeat, so the page sums the map
+	/* open clients ride the heartbeat, so the page sums the map
 	 * and never fetches another node */
 	a.cl_open = PC_RESP_READ(pc_clients_open);
 	a.cl_resp = PC_RESP_READ(pc_resp_open);
 	a.cl_bin = PC_RESP_READ(pc_nat_bin_open);
 	a.cl_nresp = PC_RESP_READ(pc_nat_resp_open);
-	{                                               /* S163 */
+	{
 		struct clmemb_col all[CLMEMB_COLS_MAX];
-		static unsigned rot;                   /* S469: a window a beat */
+		static unsigned rot;                   /* a window a beat */
 		int n, k;
 
 		self_cols(all, &n, &a.ncols_total);
@@ -5465,17 +4052,17 @@ static void send_alive(void)
 		a.ncols = k;
 		rot++;
 	}
-	a.ps_port = clps_rx_port();                         /* PS11 */
-	a.ps_interest = pc_pubsub_interest_version();   /* PS12 */
+	a.ps_port = clps_rx_port();
+	a.ps_interest = pc_pubsub_interest_version();
 	{
-		int k;                                  /* AR11 */
+		int k;
 
 		a.ncfg = ncfgsig;
 		for (k = 0; k < ncfgsig; k++) {
 			a.cfg_name[k] = cfgsig[k].name_h;
 			a.cfg_val[k] = cfgsig[k].val_h;
 		}
-		a.ncfg = put_facts(a.cfg_name, a.cfg_val, a.ncfg,      /* UP1 */
+		a.ncfg = put_facts(a.cfg_name, a.cfg_val, a.ncfg,
 			CLMEMB_CFG_MAX, a.features);
 	}
 	len = clmemb_alive_write(msg, sizeof msg, M_ALIVE, &a);
@@ -5490,19 +4077,12 @@ static void send_alive(void)
 }
 
 /* ---- the cluster map (control plane, additive) --------------------------
- * The master builds a map from what it can see and broadcasts it; every
- * other node adopts it if the epoch is newer.  NOTHING READS IT FOR
- * PLACEMENT YET - shard ownership still runs through hrw_mix below.
- * This exists so the plumbing can be exercised on a live fleet before
- * anything depends on it.
- */
+ * The master builds and broadcasts it; every other node adopts it if the epoch is newer. */
 
 static int pick_backup(void);
 static void clsync_send(const struct pc_clmap *m);
 
-/* Only the master builds one.  A member that built its own would be
- * publishing an opinion, and two opinions at one epoch is the ambiguity
- * the term exists to remove. */
+/* master only: two maps at one epoch is the ambiguity the term exists to remove */
 static int clmap_build(struct pc_clmap *m)
 {
 	long long now = now_ms();
@@ -5514,12 +4094,8 @@ static int clmap_build(struct pc_clmap *m)
 	m->term = pc_term_current();
 	m->seq = C.map_valid ? C.map.seq + 1 : 1;
 	m->master_id = (uint16_t)C.node_id;
-	/* The standby is named in the SAME publication as everything else,
-	 * so the fleet learns master and backup atomically.  Observing them
-	 * separately leaves a window in which nodes disagree about who the
-	 * standby is, and a second failure in that window has no answer.
-	 * clmap_stage() picked it, before deciding whether this change
-	 * waits for an ack - so the map names the node that acks it. */
+	/* the backup rides the same publication, so the fleet learns master and backup atomically;
+	 * clmap_stage() picked it, so the map names the node that acks it */
 	m->backup_id = (uint16_t)C.backup_id;
 	m->mode = (uint8_t)C.cfg_mode;
 	m->eager = (uint8_t)(C.cfg_eager ? 1 : 0);
@@ -5547,19 +4123,13 @@ static int clmap_build(struct pc_clmap *m)
 		if (!id || !clpeers_live(p, now))
 			continue;
 		if (id == C.node_id)
-			continue;      /* never list ourselves twice: a
-			                * duplicate id makes the map refuse
-			                * to decode on every receiver */
-		/* A node joins the map once it is READY and is not dropped
-		 * again for a transient state - only by going away.  A peer
-		 * still JOINING reports STARTING, and recording that
-		 * publishes a map that node cannot be placed from until it
-		 * is reissued. */
+			continue;      /* a duplicate id makes every receiver refuse the map */
+		/* a node enters the map once READY and leaves only by going away: a
+		 * JOINING peer listed as STARTING could not be placed until a reissue */
 		if (p->nstate != PC_NST_READY &&
 		        !pc_clmap_find(&C.map, (uint16_t)id))
 			continue;
-		/* the master remembers every identity it places in a map:
-		 * that record is what will tell a returning node from a new
+		/* the master records every identity it maps: it tells a returning node from a new
 		 * one, and a promoted backup cannot rebuild it */
 		if (p->has_ident)
 			pc_clhist_note(&C.hist, p->ident, (uint16_t)id);
@@ -5571,10 +4141,8 @@ static int clmap_build(struct pc_clmap *m)
 		nd->client_port = (uint16_t)p->client_port;
 		nd->state = (uint8_t)p->nstate;
 		nd->master_pref = 0;
-		/* uniform for now.  That is not a placeholder: uniform
-		 * weights place identically to the unweighted HRW this
-		 * fleet already uses, so the day placement switches over,
-		 * not one key moves. */
+		/* uniform weights place exactly as the unweighted HRW does, so switching
+		 * placement to the map moves no key */
 		nd->cap_weight = PC_CLMAP_W_NOMINAL;
 		nd->admin_weight = PC_CLMAP_W_UNSET;
 		m->nnodes++;
@@ -5582,68 +4150,20 @@ static int clmap_build(struct pc_clmap *m)
 	return 0;
 }
 
-/*
- * May the map decide placement yet?
- *
- * Only when the set it says is placeable matches what this node sees as
- * live.  Map-based placement LAGS fleet formation - a peer sends its
- * first ALIVE while still JOINING, so it reports STARTING, and until the
- * master notices it becoming READY and reissues, the map is short a
- * node.  Placing from a short map hands one node nothing at all
- * (measured: a three-node fleet splitting 0/152/148) and moves keys
- * again when the map catches up, forking re-writes.
- *
- * Falling back does not split placement, which is the usual objection.
- * The map is published with uniform weights, so weighted rendezvous over
- * it selects IDENTICALLY to the unweighted argmax over the same nodes -
- * a node using the map and a node using its own liveness agree whenever
- * their sets agree, and disagree only when they do not, which is
- * precisely when this check sends both to the fallback.
- */
-/* ---- B4: reconcile a recovered keyspace against the live fleet -------
- *
- * A node that comes back with a WAL replays everything it logged,
- * including keys the fleet DELETED while it was down.  Nothing
- * remembers those deletes - tombstones live seconds, and after a real
- * outage the fleet's current contents are the only truth left.  So the
- * node asks: does anyone still have this?
- *
- * EAGER MODE ONLY, and that restriction is load-bearing.  Eager
- * replicates every record to every node, so a key nobody has was
- * deleted.  In plain store mode peers legitimately lack keys they never
- * pulled, and "absent means deleted" would destroy live data.
- *
- * What it costs: a key this node authored, logged, and never managed to
- * replicate to anyone is indistinguishable from a deleted one, and is
- * dropped.  That is a real loss, bounded by the last unreplicated
- * writes before death, and it is the price of not resurrecting deletes.
- * A key that WAS replicated is safe even if this node holds a newer
- * value - peers still have it, so the probe finds it and the newer
- * local copy stands (that is rejointest's obligation 1).
- *
- * The node keeps serving throughout.  The window in which a resurrected
- * key is visible shrinks from for ever to the length of this pass; it
- * does not close entirely, which would need the node to withhold
- * service until it finished.
- */
-/* ---- S394: the hold-check - "held, and at which version?" for a batch of
- * keys, never a value (clmsg.h's M_HOLD_Q / M_HOLD_A; the frames are
- * clhold.c's) ------------------------------------------------------------ */
+/* ---- reconcile a replayed keyspace against the live fleet: EAGER ONLY ---
+ * (a key no peer holds was deleted); the cost is a write this node never replicated. */
+/* ---- the hold-check: "held, and at which version?" for a batch of keys,
+ * never a value (M_HOLD_Q / M_HOLD_A; the frames are clhold.c's) ---------- */
 
-/* a key's slot is timed from when it joins the batch (pull_timeout_ms, 80
- * by default): a batch that waited for more keys while the walk skipped
- * matching slots (S263: one tick may walk most of a table) would let its
- * first slots expire unsent - inconclusive, and a key deleted meanwhile
- * kept.  So it goes this soon after its first key, whatever it holds */
+/* a key's slot times from when it joins the batch (pull_timeout_ms): a batch must go this
+ * soon after its first key, or a slow walk lets its first slots expire unsent */
 #define HQ_HOLD_MS 10
 
 static unsigned char hq_msg[CLHOLD_MAX];   /* the batch the walk is filling */
 static struct clhold_qw hq;
 static long long hq_t0;                /* when its first key joined */
 
-/* the batch to every live peer - when full, when the next key is another
- * collection's, and when the walk's slice ends: a batch never outlives its
- * slice or spans two collections */
+/* the batch to every live peer: a batch never outlives the walk's slice or spans two collections */
 static void hq_flush(void)
 {
 	size_t n;
@@ -5655,10 +4175,8 @@ static void hq_flush(void)
 	hq.n = 0;
 }
 
-/* one key into the batch, with its own pending slot as a pull's probe has
- * (pc_pull_begin_kind): its answers are clpend's, its outcome the same.  1
- * asked; 0 not - no live peer, or no slot (the pending table is full: the
- * key is kept, as an unasked pull's is) */
+/* one key in, with its own pending slot as a pull's probe has (same outcome).  1 asked; 0 not:
+ * no live peer or no slot (a full pending table keeps the key, as for an unasked pull) */
 static int hq_add(const char *col, size_t collen, const char *key,
 		size_t klen)
 {
@@ -5691,9 +4209,8 @@ static int hq_add(const char *col, size_t collen, const char *key,
 	return 1;
 }
 
-/* a peer's hold-check: each key this node can speak for, held or not and
- * at which version, read as pull_serve reads it - a key it cannot speak for
- * is left out (the asker's slot then times out, and keeps the key) */
+/* answer a hold-check as pull_serve reads; a key this node cannot speak for is left out
+ * (the asker's slot times out and keeps the key) */
 static void handle_hold_q(const unsigned char *pt, size_t n,
 		const pc_addr *from)
 {
@@ -5706,7 +4223,7 @@ static void handle_hold_q(const unsigned char *pt, size_t n,
 	uint32_t req;
 
 	if (self_no_holdq || clhold_q_open(&q, pt, n) != 0)
-		return;                    /* the test flag: as a build before */
+		return;                    /* the test flag: as an older build */
 	/* a RECOVERING node's store is incomplete: silence, as its pulls get
 	 * (handle_pull_req) - a "no" from it would authorise a drop */
 	if (pc_node_state() == PC_NST_RECOVERING)
@@ -5725,8 +4242,7 @@ static void handle_hold_q(const unsigned char *pt, size_t n,
 		 * the value; an expired record reads as absent there too */
 		if (ht && pcache_ht_getmeta(ht, &k, &ver, &wt) == 0) {
 			held = 1;
-			/* S245: a recovered record the fleet has not ruled on
-			 * yet is no answer */
+			/* a recovered record the fleet has not ruled on yet is no answer */
 			if (C.rec_hold && C.cfg_eager && rec_held(wt)) {
 				C.st.pull_held_recovered++;
 				continue;
@@ -5774,13 +4290,13 @@ static void handle_hold_a(const unsigned char *pt, size_t n)
 }
 
 struct rec_ctx {
-	pcache_htable_t *ht;               /* AT-8: whose records are walked */
+	pcache_htable_t *ht;               /* whose records are walked */
 	const char *col;
 	size_t collen;
 	int budget;
-	const unsigned char *diff;     /* S261: only these slots, or NULL */
-	unsigned int seen;             /* S263: records walked this tick */
-	int hold;                      /* S394: asked by hold-check, not pull */
+	const unsigned char *diff;     /* only these slots, or NULL */
+	unsigned int seen;             /* records walked this tick */
+	int hold;                      /* asked by hold-check, not pull */
 };
 
 static int reconcile_cb(const str *key, const str *val, unsigned int exp,
@@ -5790,11 +4306,9 @@ static int reconcile_cb(const str *key, const str *val, unsigned int exp,
 
 	(void)val;
 	(void)exp;
-	C.st.reconcile_walked++;           /* S395: skipped ones too */
-	/* AT-8: only a record in question - one written at or before
-	 * rec_tick (recovered, or from before a rebuilt member's absence);
-	 * one written since is this node's own, and nobody else holding it
-	 * yet is no evidence of a delete */
+	C.st.reconcile_walked++;           /* skipped ones too */
+	/* only a record written at or before rec_tick is in question: a newer one is this node's
+	 * own, and nobody else holding it yet is no evidence of a delete */
 	{
 		unsigned long long v;
 		unsigned int wt;
@@ -5803,58 +4317,36 @@ static int reconcile_cb(const str *key, const str *val, unsigned int exp,
 		    !rec_held(wt))
 			return 0;
 	}
-	/* S263: no budget stop here - the walk finishes its window.  Keys
-	 * skipped on matching digests cost no budget, so one tick can walk
-	 * most of a large table: keep the node's beat going as it does. */
+	/* no budget stop: digest-skipped keys cost none, so one tick may walk most of a table -
+	 * keep the beat going meanwhile */
 	if ((r->seen++ & 511) == 511) {
-		hq_flush();                /* S394: not held across the pump */
+		hq_flush();                /* not held across the pump */
 		beat_pump();
 	}
-	/* S261: a slot the witness holds identically has nothing to ask */
+	/* a slot the witness holds identically has nothing to ask */
 	if (r->diff && reconcile_digest_same(r->diff, key)) {
 		C.st.reconcile_dig_skipped++;
 		return 0;
 	}
-	/* S394: by hold-check when every live member answers one - the
+	/* by hold-check when every live member answers one - the
 	 * same slot and outcome as a pull's probe, without the value */
 	if (r->hold ? hq_add(r->col, r->collen, key->s, (size_t)key->len) :
 	    pc_pull_begin_kind(r->col, r->collen, key->s, (size_t)key->len,
 	        PC_DONE_RECONCILE) != 0) {
-		if (!C.rec_start_ms)            /* S212: the first probe, */
-			C.rec_start_ms = now_ms();     /* or S261's question */
+		if (!C.rec_start_ms)
+			C.rec_start_ms = now_ms();
 		C.st.reconcile_probed++;
 		if (r->hold)
 			C.st.reconcile_holdq++;
 	} else {
-		C.recon.unruled++;             /* S471: no slot, so not asked */
+		C.recon.unruled++;             /* no slot, so not asked */
 	}
-	r->budget--;                       /* S471: or a full table burns the rounds */
+	r->budget--;                       /* even unasked, or a full table burns the rounds */
 	return 0;
 }
 
-/*
- * S152: is any live peer still COLD - replayed nothing and inside its
- * backfill holdoff - or of provenance this node has not heard yet?
- *
- * A reconcile drop rests on "every node said no".  A node that came
- * back EMPTY says no to everything, and it is not in RECOVERING (that
- * state is only entered by a node that replayed something) so nothing
- * keeps it quiet.  Measured on the CI runner, three nodes killed with
- * only the writer's WAL populated: the writer replayed all 400 records
- * and then deleted exactly the 64 its two empty peers had denied -
- * tombstoned, so the loss survived every later restart.  Under I/O
- * pressure the same run lost 384 of 400.
- *
- * The answerer cannot fix this, because it cannot tell a reconcile
- * probe from a probe-before-place - the request carries no purpose -
- * and keeping a cold node silent starves the second to protect the
- * first.  The asker knows the purpose, and it knows every peer's
- * provenance from the ALIVE tail byte (S81).  So the pass WAITS until
- * no live peer is cold, and each drop re-checks, since a peer can
- * restart mid-pass.  COLD is bounded by BACKFILL_SENDER_HOLDOFF_MS, so
- * the wait is at most that; UNKNOWN is a peer heard but not yet placed,
- * and is treated as cold rather than trusted.
- */
+/* a peer back EMPTY (COLD, or UNKNOWN not yet heard) says no to everything, so the pass waits
+ * until none is live, and each drop re-checks; COLD ends within BACKFILL_SENDER_HOLDOFF_MS */
 static int any_live_peer_cold(void)
 {
 	long long now = now_ms();
@@ -5872,68 +4364,12 @@ static int any_live_peer_cold(void)
 	return 0;
 }
 
-/*
- * S223: WAS ANYBODY WATCHING WHILE THIS NODE WAS AWAY?
- *
- * The reconcile drops a replayed key when every live peer says it does
- * not have it, reading that as "it was deleted while I was down".  The
- * reading is only sound if some peer was UP throughout that time - then
- * it saw the delete, and in eager mode its "no" is the fleet's.  After a
- * whole-fleet outage nobody was: every peer is back off its own WAL with
- * its own share only (replicas do not persist the copies they receive),
- * so each truthfully denies what the others hold.  Measured before this:
- * 600 of 900 keys deleted after a simultaneous restart, and a node that
- * rejoined one-by-one deleting all 300 of its own records in 15 s.
- *
- * So the pass needs a WITNESS: a live peer that booted before this node
- * died.  Both halves are local and already known -
- *  - every peer's boot time is derived from the uptime_s in its ALIVE
- *    (p->boot_ms, S78), in the monotonic clock;
- *  - this node's time of death is the later of the newest write in its
- *    storage directory and the alive stamp below, both wall clock,
- *    turned into a DURATION at startup and so into the same clock.
- *
- * rejoin to a fleet that stayed up: the survivor booted long before ->
- *   witness, the pass runs at once, B4 behaves exactly as it always did;
- * fleet killed together: everybody booted after everybody died -> no
- *   witness, the pass is skipped, nothing is deleted;
- * fleet killed, back ONE BY ONE: each node already back booted after
- *   the later ones died -> no witness either;
- * a STAGGERED failure - one node dies and reboots before the rest go -
- *   the early riser booted before the others died but had not been
- *   re-sent their records yet: the grace below refuses it as a witness.
- *
- * WHAT WAS FILED INSTEAD, and why it is not this.  The filed design put
- * a purpose on the probe and had a peer that had not completed a repair
- * cycle answer "not authoritative", plus a rule that a node may not ASK
- * until it has re-shared its own records.  Built, and measured three
- * ways wrong: without the asker rule the last node back in a staggered
- * restart deleted its own 100 records (its peers HAD completed a cycle
- * and truthfully lacked them); with it, the returning node's repair
- * sweep RE-SENT a key the fleet had deleted, and the fleet then
- * confirmed it - a resurrection, which is B4's whole job to prevent.
- * The question was never "has that peer re-shared" but "did it see what
- * happened while I was gone", and that needs no wire change at all.
- *
- * Every error here falls toward KEEPING: an estimate that makes the
- * outage look longer finds fewer witnesses; a peer that does not report
- * its uptime (boot_ms 0) is never one; no storage timestamp at all
- * means no witness can be proven.
- */
+/* the pass needs a WITNESS: a live peer up since before this node died (after a whole-fleet
+ * outage every peer denies the others' keys).  Every clock error here falls toward KEEPING. */
 #define ALIVE_STAMP_FILE   "alive"
 #define ALIVE_STAMP_BEATS  10          /* ~10 s: bounds the error on death */
-/* A witness must have been up for THREE repair-sweep periods before
- * this node went down - not merely up.  Being up is not being complete:
- * in a staggered power failure node 1 dies, reboots holding only its own
- * share, and node 2 dies a few seconds later.  Node 1 booted before node
- * 2 died, but it had not yet been re-sent node 2's records, so its "no"
- * about them is exactly the false evidence this whole check exists to
- * refuse.  Three sweep periods is long enough to have been re-sent
- * everything a sweep slice covers; for a table far larger than that it is
- * a proxy rather than a proof, and snapshots are the answer (the startup
- * warning for eager without `save` already says so).  Every other error
- * in these clocks falls the safe way - uptime_s truncates, so boot_ms
- * reads LATE; the death estimate is a last write, so it reads EARLY. */
+/* a witness must have been up THREE sweep periods before we died - up is not complete: in a
+ * staggered failure an early riser had not yet been re-sent the others' records */
 #define WITNESS_GRACE_MS   (3LL * REPL_SWEEP_BEATS * 1000)
 
 static long long alive_stamp_mtime_ms(void)
@@ -5949,12 +4385,8 @@ static long long alive_stamp_mtime_ms(void)
 	return (long long)sb.st_mtim.tv_sec * 1000 + sb.st_mtim.tv_nsec / 1000000;
 }
 
-/* An idle eager node writes nothing, so without this its last WAL write
- * could predate its death by hours and it would find no witness on an
- * ordinary rejoin - B4 switched off on exactly the lightly-written
- * fleets where a delete-while-down is rare but real.  Three syscalls
- * every ten beats, eager only, best effort: a stamp that cannot be
- * written only makes the reconcile keep more. */
+/* an idle eager node writes nothing: without this stamp its death estimate could be hours early
+ * and no witness found.  Best effort - a failed stamp only makes the reconcile keep more. */
 static void alive_stamp_touch(void)
 {
 	char path[600];
@@ -5988,21 +4420,16 @@ static int is_witness(const struct peer *p)
 	return clrecon_is_witness(&C.recon, p->boot_ms, WITNESS_GRACE_MS);
 }
 
-/* Is a witness still among the live peers?  Asked on every tick of the
- * pass and again at the moment of every drop, because the one that
- * started the pass can die during it - and then the only peers left to
- * answer may be ones that came back with us, whose "no" is exactly the
- * false evidence this refuses.  The same shape as S152's re-check. */
+/* asked every tick and at every drop: the witness that started the pass can die, leaving only
+ * peers that came back with us */
 static int reconcile_witness_live(void)
 {
 	return clrecon_first_witness(&C.recon, &C.pt, now_ms(),
 		WITNESS_GRACE_MS, NULL) != NULL;
 }
 
-/* 0.5.7.1: what this node's keepalive says about its open reconcile's
- * witnesses - 0 none live, the one's node id, or CLMEMB_SOLEWIT_MANY for
- * two or more (also when no reconcile is open: then nobody is needed).
- * A peer reads it to refuse a restart only when it is the last one. */
+/* the keepalive's sole_witness: 0 none live, the one's node id, or CLMEMB_SOLEWIT_MANY (two or
+ * more, or no reconcile open); a peer refuses a restart only of the last witness */
 static int rec_witness_count(int *id)        /* no side effects */
 {
 	return clrecon_witnesses(&C.recon, &C.pt, now_ms(), WITNESS_GRACE_MS, id);
@@ -6021,19 +4448,8 @@ static int rec_sole_witness(void)
 	return n == 0 ? 0 : n == 1 ? id : CLMEMB_SOLEWIT_MANY;
 }
 
-/*
- * S274: the same predicate, asked of a restart that has NOT happened.
- * The rc54 roll took 246 down 25 s after 247 - inside the grace - and its
- * reconcile was skipped: no live peer had been up long enough to have
- * seen the outage.  The roll script waits by hand; an operator doing it
- * by hand has nothing to wait on.  Every node now says whether a restart
- * of it NOW would be witnessed, and when it would be.
- *
- * Conservative by the errors the real rule has: a peer's boot reads up
- * to a second late (uptime_s truncates) and this node's death reads up
- * to one alive-stamp period early - so a peer counts only once it has
- * been up for the grace plus both.
- */
+/* would a restart of this node NOW be witnessed, and when: a peer counts once up for the grace
+ * plus both clock errors (uptime_s truncation, one alive-stamp period) */
 #define RESTART_WITNESS_MS \
 	(WITNESS_GRACE_MS + ALIVE_STAMP_BEATS * 1000LL + 1000LL)
 
@@ -6046,42 +4462,20 @@ static void restart_witness_note(void)
 		sizeof o.waits_for[0] * (size_t)o.waits_n);
 	C.st.restart_witnesses = o.witnesses;
 	C.st.restart_waits_n = o.waits_n;
-	/* only an eager node reconciles; a lone one has nothing to ask.  ST8:
-	 * and not while a peer's reconcile is open - this node may be the only
-	 * witness it has left (a rolling restart that went on regardless left
-	 * the first node's pass waiting for good: 2026-10-10) */
+	/* only an eager node reconciles, a lone one has nothing to ask; and not while a peer's
+	 * reconcile is open - this node may be the only witness it has left */
 	C.st.restart_safe = (!C.cfg_eager || !o.live || o.witnesses > 0) &&
 		!o.waits_n;
 	C.st.restart_safe_in_ms = C.st.restart_safe ? 0 : o.waits_n ? -1 :
 		o.wait_ms;
 }
 
-/* S303: an eager miss is final only on a node that holds every record,
- * and READY does not say that.  A node that has just started (its WAL
- * holds only what it authored - copies are off it) or just heard a peer
- * come back (a restart, a rejoin, a healed partition) lacks whatever the
- * sweep has not re-sent yet - outagetest's staggered outage read 202 of
- * 300 keys through such a node.  So the same three sweep periods S223
- * trusts a witness after: the miss is final once this node has been up,
- * for WITNESS_GRACE_MS.  Set once, at this node's start (0 = not yet
- * ticked); a peer coming back opens S464's doubt of it alone, below. */
+/* an eager miss is final only on a node holding every record, which READY does not say: not
+ * before this node has been up WITNESS_GRACE_MS (set once at start; 0 = not yet ticked) */
 static long long eager_settle_ms;
 
-/* S305: ...and a node that started holds every record only once it has
- * caught up, which a fixed 30 s does not say.  Its received copies are
- * off its WAL, so after a crash it lacks all of them, and the authors
- * re-send at most 4 MB per peer per collection per sweep: 30,000 keys of
- * 1 KB through one author outlast the window (eagerrestarttest part 2),
- * and every miss after it answered "absent" for a record the fleet holds.
- * Caught up = this node holds at least as many records as every live
- * READY peer says it does (the ALIVE's count: every eager node holds
- * every record).  Latched once per process: in steady state deletes and
- * expiries move the counts both ways, and re-testing would bring back
- * the pulls S303 removed.  Only when every live collection is eager -
- * the count is a total, and a store collection's records are not on
- * every node; otherwise the 30 s window alone, as before.  A peer that
- * holds records nobody else does keeps this node asking - a pull's cost,
- * never a wrong answer. */
+/* nor before it has caught up: holds at least the record count of every live READY peer. Latched
+ * once per process (counts move both ways later); only when every live collection is eager */
 static int eager_caught_up;
 
 static int all_live_eager(void)
@@ -6129,11 +4523,8 @@ static void eager_catchup_tick(long long now)
 		"live peer; an eager miss here is final from now on\n", mine);
 }
 
-/* S464: a peer that comes back is doubted alone - and only when it may
- * hold what this node lacks: it kept running cut off (the same incarnation)
- * or replayed a WAL tail (RECOVERED); back cold or bootstrapped from the
- * fleet, it holds nothing new.  Also inside this node's own start window:
- * a peer back 5 s after it is doubted 30 s from then (outagetest 4) */
+/* a returning peer is doubted alone, and only if it may hold what this node lacks: it ran on
+ * cut off (same incarnation) or replayed a WAL tail (RECOVERED) */
 #define DOUBT_MAX 64
 static struct { int node; unsigned int incarn; unsigned char live, seen, young;
 	long long doubt_ms; } dq[DOUBT_MAX];
@@ -6194,8 +4585,8 @@ static void eager_doubt_tick(long long now, int own)
 			young |= dq[k].young;
 		}
 	}
-	/* one peer alone only for a node that was complete when it came back:
-	 * a young one asked node 3 for node 1's keys (outagetest 4) */
+	/* ask one peer alone only if this node was complete when it came back: a young
+	 * node would ask that peer for another's keys */
 	__atomic_store_n(&eager_doubt_node, n == 1 && !young ? one : 0,
 		__ATOMIC_RELAXED);
 	__atomic_store_n(&eager_doubt_n, n, __ATOMIC_RELEASE);
@@ -6205,9 +4596,9 @@ static void eager_settle_tick(long long now)
 {
 	long long t = __atomic_load_n(&eager_settle_ms, __ATOMIC_RELAXED);
 
-	if (!t)                                /* S305: this node's own start */
+	if (!t)                                /* this node's own start */
 		__atomic_store_n(&eager_settle_ms, (t = now), __ATOMIC_RELAXED);
-	eager_doubt_tick(now, now - t < WITNESS_GRACE_MS);    /* S464 */
+	eager_doubt_tick(now, now - t < WITNESS_GRACE_MS);
 	eager_catchup_tick(now);
 }
 
@@ -6222,8 +4613,8 @@ int pc_cluster_eager_miss_final(void)
 		__atomic_load_n(&C.px.recv_nomem, __ATOMIC_RELAXED) == 0;
 }
 
-/* S464: the one peer a miss asks while only it is doubted; 0 = ask all -
- * as a node not yet caught up does (S305), or it asked one peer for another's */
+/* the one peer a miss asks while only it is doubted; 0 = ask all - as a node
+ * not yet caught up does, or it would ask one peer for another's keys */
 int pc_cluster_eager_doubt_one(void)
 {
 	long long t = __atomic_load_n(&eager_settle_ms, __ATOMIC_RELAXED);
@@ -6234,35 +4625,11 @@ int pc_cluster_eager_doubt_one(void)
 	return __atomic_load_n(&eager_doubt_node, __ATOMIC_RELAXED);
 }
 
-/* Only reached once the S152 guard has passed - not joining, every live
- * peer's provenance heard - so the live set is the fleet as it now is. */
-/* ---- S455: a resync - the fleet's state instead of a ruling ------------
- * A returning node whose records the fleet cannot rule on one by one drops
- * what it stored before its absence and pulls the fleet's state as a
- * joiner does (Galera's state transfer, beside the reconcile's increment).
- * RECOVERING throughout: a client is refused rather than served what it
- * holds, and the hold keeps the records off the pulls and sweeps until the
- * drop has passed them.  When: (1) away longer than [cluster]
- * resync_after_s, from a source that can stand for the fleet
- * (resync_source), whoever could rule - a node back after a week, the
- * fleet rolled to a new build meanwhile, has no witness at all; (2) a
- * REBUILD (back from a split, no restart) with no witness: the peers were
- * up through it (S455's first sight: tombrebuildtest, peers ~10 s old at
- * the cut, the rebuild skipped and node 3 kept all 200 deleted keys).  A
- * RESTART with no witness inside resync_after_s still SKIPS (S223),
- * keeping everything: boot times cannot tell a fleet that rolled while
- * this node was away (complete) from the one survivor of a staggered
- * failure (incomplete - outagetest's fourth scenario), and a resync from
- * that one drops records only this node holds.  Kept is the safe side
- * there; the time rule bounds how long it can be wrong (v0.7.3-rc8
- * tombrestoretest: a restore 3 s after the starts kept the 200 deleted
- * keys, and they reached the peers - that skip, as designed). */
+/* ---- resync: drop what was stored before the absence, pull the fleet's state (RECOVERING) --
+ * When away > resync_after_s, or a rebuild with no witness; a restart with none keeps all. */
 
-/* a live READY peer holding records that can stand for the fleet: up
- * WITNESS_GRACE_MS (three sweeps - re-sent what it lacked), and not younger
- * than this node by more than that (a peer that restarted while this node
- * ran may hold only its own WAL - the staggered failure above).  The most
- * records wins. */
+/* a live READY peer that can stand for the fleet: up WITNESS_GRACE_MS and not younger than this
+ * node by more (a peer restarted meanwhile may hold only its own WAL); most records wins */
 static struct peer *resync_source(long long now)
 {
 	long long self_boot = now - (long long)pc_metrics_uptime() * 1000;
@@ -6344,17 +4711,15 @@ static void resync_pull(void)
 	C.reconcile_on = 0;
 	C.rec_rebuild = 0;
 	C.rec_floored = 0;
-	C.resync_floor = 1;                /* AT-7's floors, in boot_request */
+	C.resync_floor = 1;                /* the floors, in boot_request */
 	clrecon_walk_stop(&C.recon);
 	clboot_rearm(&C.bt, now_ms());
 	LM_NOTICE("cluster: resync - dropped %llu record(s) stored before the "
 		"absence; pulling the fleet's state now\n", C.resync_dropped_now);
 }
 
-/* a slice of the drop, ~2 ms - from the loop, as the walk's slices are.
- * A plain removal: no tombstone (the fleet deleted them, or holds them and
- * the pull brings them back) and no refusal mark (the pull's copy of a
- * live key is the very version dropped here) */
+/* a ~2 ms slice of the drop.  No tombstone (the fleet deleted them, or the pull brings them
+ * back) and no refusal mark (the pull's copy of a live key is the version dropped here) */
 static void resync_step(long long now)
 {
 	struct rs_ctx r;
@@ -6401,7 +4766,7 @@ static int reconcile_find_witness(void)
 	struct peer *src = resync_source(now);
 	struct peer *p;
 
-	/* S455: away longer than resync_after_s - the fleet's whole state,
+	/* away longer than resync_after_s - the fleet's whole state,
 	 * whoever could rule on the records one by one */
 	if (resync_after_ms && src && !C.rec_floored &&
 	    C.recon.death_mono != LLONG_MIN &&
@@ -6429,10 +4794,8 @@ static int reconcile_find_witness(void)
 			pc_recovered_records());
 		return 1;
 	}
-	/* S455: back from a split with no witness - the peers were up
-	 * through it, none long enough before it to rule on each record: the
-	 * fleet's state is pulled instead.  A RESTART with none skips, below
-	 * (see the section's head) */
+	/* back from a split with no witness (peers up through it, none long enough before it):
+	 * pull the fleet's state.  A RESTART with none skips, below */
 	if (live && src && C.rec_rebuild) {
 		resync_begin(src, "no peer was up long enough before this "
 			"absence to witness it");
@@ -6451,22 +4814,10 @@ static int reconcile_find_witness(void)
 	return 0;
 }
 
-/* ---- S392: the reconcile's fast path, the returning node's half ---------
- * What a restart brings back that the fleet has deleted is the deletes
- * this node had not persisted: an eager replica writes no WAL record for
- * a copy or a delete it receives, so after a restart it holds its last
- * snapshot plus its own writes since.  Each of those deletes was planted,
- * when it was made, in every live peer's retained table (S238).  So
- * rather than ask the fleet about every replayed key, ask a witness for
- * every delete planted since the snapshot BEGAN; when it vouches that its
- * table is whole over that window and all of its replay has arrived, the
- * pass is over.  No snapshot, a window older than the witness's table,
- * the cap dropping inside it, a witness that does not answer (a build
- * before 0.6.4), a replay that keeps arriving short: the walk runs as
- * before (DESIGN 12nd).
- */
+/* ---- the reconcile's fast path, the returning node's half ------------------
+ * A witness replays the deletes planted since the snapshot BEGAN; if whole, no walk is needed. */
 static int pc_reconcile_fast = 1;      /* [cluster] reconcile_fast */
-static int pc_reconcile_rate_max = RECONCILE_PER_TICK_MAX;   /* S393 */
+static int pc_reconcile_rate_max = RECONCILE_PER_TICK_MAX;
 
 void pc_cluster_set_reconcile_rate_max(int n)
 {
@@ -6478,15 +4829,8 @@ void pc_cluster_set_reconcile_fast(int on)
 	pc_reconcile_fast = on ? 1 : 0;
 }
 
-/* An expiry is not a delete - no tombstone travels, each node reaps its
- * own copy - so the retained table never held one, and an older copy of
- * a key the fleet re-set with a shorter TTL, which then expired, came
- * back from a restart: the walk was all that stood in front of it
- * (expirerejointest's t keys).  The expiry is remembered here as a
- * delete at the reaped record's version: the replay then drops the older
- * copy, and every receive path refuses one, as it refuses a copy older
- * than a retained delete.  Eager collections only - the reconcile's.
- * The maintenance thread's sweep; clretain locks per shard. */
+/* an expiry sends no tombstone: retain it as a delete at the reaped version, so an older copy is
+ * refused on replay and receive.  Eager only; maintenance thread, clretain locks per shard */
 void pc_cluster_note_expired(int slot, const char *key, int klen,
 		unsigned long long ver, int keep)
 {
@@ -6500,11 +4844,9 @@ void pc_cluster_note_expired(int slot, const char *key, int klen,
 	if (!ht || !pc_store_eager_enabled(ht))
 		return;
 	col = pc_store_name(slot);
-	/* S443: counted as an expiry - a TTL workload's notes read as
-	 * deletes otherwise (245-247, 2026-10-23: 12.4 million "deletes
-	 * dropped" that were a 60-s-TTL benchmark expiring) */
+	/* counted as an expiry, or a TTL workload's notes read as deletes */
 	clretain_note_expiry(col, strlen(col), key, (size_t)klen, ver,
-		(unsigned int)(now_ms() / 1000), keep);    /* AT-5 (c) */
+		(unsigned int)(now_ms() / 1000), keep);
 }
 
 static void fp_put32(unsigned char *p, uint32_t v)
@@ -6554,7 +4896,7 @@ static void fp_ask(struct peer *w, unsigned int age)
 	fp_put32(m + 5, age);
 	(void)seal_send(&w->addr, m, sizeof m);
 	if (!C.rec_start_ms)
-		C.rec_start_ms = now;          /* S212: the pass's clock */
+		C.rec_start_ms = now;          /* the pass's clock */
 	LM_NOTICE("cluster: reconcile - asking node %d for every delete made "
 		"since this node's snapshot began (%u s ago), instead of asking "
 		"the fleet about %ld replayed record(s) one by one%s\n",
@@ -6632,7 +4974,7 @@ static void fp_finish(void)
 
 	C.reconcile_on = 0;
 	clrecon_walk_stop(&C.recon);
-	rdg_drop();                        /* S261: nothing was asked */
+	rdg_drop();                        /* nothing was asked */
 	C.st.reconcile_ms = C.rec_start_ms ?
 		(unsigned long long)(now - C.rec_start_ms) : 0;
 	C.st.reconcile_fast = 1;
@@ -6660,9 +5002,8 @@ static void handle_tomb_rpl(const unsigned char *pt, size_t n,
 		return;
 	req = fp_get32(pt + 1);
 	seq = fp_get32(pt + 5);
-	/* a peer's versioned delete is applied whatever became of the
-	 * request, as a broadcast of it would be - and logged, as the
-	 * walk's drops are, so a second restart does not bring it back */
+	/* applied whatever became of the request, as a broadcast would be, and logged
+	 * so a second restart does not bring it back */
 	if (handle_tombstone(pt + 9, n - 9)) {
 		struct clfwd_key fk;
 		uint64_t ver;
@@ -6714,7 +5055,7 @@ static void handle_tomb_done(const unsigned char *pt, size_t n,
 			"dropped deletes made since this node's snapshot",
 			C.fp.node);
 		break;
-	case TOMBFP_BEHIND:                 /* 12ny AT-12 (f): it said "older" */
+	case TOMBFP_BEHIND:                 /* it said "older" */
 		snprintf(why, sizeof why, "node %d forgot deletes made since this "
 			"node's snapshot once all members confirmed them, and this "
 			"node's marks are below them (an older state)", C.fp.node);
@@ -6729,7 +5070,7 @@ static void handle_tomb_done(const unsigned char *pt, size_t n,
 	fp_fall_back(why);
 }
 
-/* ---- S393: the probe budget; S395: how far the walk has got ---------- */
+/* ---- the probe budget, and how far the walk has got -------------------- */
 
 /* the slice's probes (clrecon): the pending table's room and its refusals
  * and timeouts in, the second's budget out to the stats when renewed */
@@ -6761,9 +5102,8 @@ static void reconcile_walk_total(void)
 	C.st.reconcile_walk_total = t ? t : 1;
 }
 
-/* S471: "finished asking" is not "ruled".  A peer silent past the slot's
- * deadline, or a drop S152/S223 refused, keeps the key, and only a walk asks
- * again; the hold stays on through it.  1 = the pass goes on */
+/* "finished asking" is not "ruled": a key kept by a silent peer or a refused drop is asked
+ * only by another walk; the hold stays on through it.  1 = the pass goes on */
 static int reconcile_walk_again(void)
 {
 	switch (clrecon_walk_end(&C.recon,
@@ -6794,22 +5134,18 @@ static int reconcile_walk_again(void)
 	}
 }
 
-/* The walk: one slice of probes (S393).  From the beat, once it has
- * checked everything reconcile_tick checks, and from reconcile_pump
- * between beats while the beat's verdict stands. */
+/* one slice of probes: from the beat after reconcile_tick's checks, and from reconcile_pump
+ * between beats while the beat's verdict stands */
 static void reconcile_walk(void)
 {
 	struct rec_ctx r;
-	/* S394: a member that does not answer hold-checks (a build before
-	 * 0.7.2) would leave every slot without its "no" - the fleet keeps
-	 * the pull while one is live */
+	/* a member that cannot answer hold-checks would leave every slot without its "no":
+	 * pull while one is live */
 	int hold_ok = pc_cluster_fleet_has(CLMEMB_FEAT_HOLDQ, NULL);
 
-	reconcile_walk_total();           /* S395 */
-	/* S393: a scan call finishes its window (S263), so a slice can
-	 * overshoot; the overshoot is owed by the next slice, which keeps
-	 * the second's rate the budget (GitLab 110410: 64/s slices walked
-	 * ~92/s, sweepclocktest) */
+	reconcile_walk_total();
+	/* a scan call finishes its window, so a slice can overshoot: the next slice owes it,
+	 * keeping the per-second rate at the budget */
 	r.budget = clrecon_slice_take(&C.recon, reconcile_slice_budget(now_ms()));
 	if (r.budget <= 0)
 		return;
@@ -6820,30 +5156,19 @@ static void reconcile_walk(void)
 		r.ht = ht;
 		r.col = pc_store_name(C.rec_col);
 		r.collen = strlen(r.col);
-		r.diff = reconcile_digest_filter(C.rec_col);   /* S261 */
-		/* S394: not a through collection - a pull of its key is
-		 * answered by a fetch from Redis there (pull_serve), which a
-		 * hold-check does not do */
-		r.hold = hold_ok && !pc_upstream_through(r.col, r.collen);
-		/* S262: only an EAGER collection has copies to ask about.  The
-		 * pass is armed by the fleet's mode, but a legacy config
-		 * ([cluster] mode = eager, no `collections`) leaves each
-		 * collection a plain store that was never replicated: every
-		 * peer answered "absent", truthfully, and the node deleted
-		 * everything it had recovered. */
+		r.diff = reconcile_digest_filter(C.rec_col);
+		/* not for a read-through collection: a pull there fetches from Redis (pull_serve),
+		 * which a hold-check does not */
+		r.hold = hold_ok && pc_upstream_binds(r.col, r.collen) != 1;
+		/* only an EAGER collection has copies to ask about: a legacy eager-mode config
+		 * leaves plain stores, where every peer truthfully answers "absent" */
 		if (!ht || !pc_store_eager_enabled(ht)) {
 			C.rec_col++;
 			C.rec_cursor = 0;
 			continue;
 		}
-		/* S275: through the store, whose cursor carries the table's
-		 * generation.  pcache_ht_scan's is a bucket index into THIS
-		 * table, and a resize is a migration and a swap: a cursor from
-		 * before it indexed another shape and the pass skipped keys -
-		 * the safe way (a skipped key is kept), but a key deleted
-		 * during the outage then outlived the pass.  Across a swap the
-		 * walk restarts: a key may be asked twice, never not asked.
-		 * Keys only - the callback never reads the value. */
+		/* the store's cursor carries the table generation: across a resize the walk
+		 * restarts, so a key may be asked twice but never skipped.  Keys only. */
 		pc_store_scan(ht, &C.rec_cursor, RECONCILE_BUCKETS,
 			PCACHE_SCAN_NOVAL, reconcile_cb, &r);
 		if (!C.rec_cursor) {
@@ -6851,24 +5176,21 @@ static void reconcile_walk(void)
 			continue;
 		}
 		if (r.budget <= 0) {
-			clrecon_owe(&C.recon, r.budget);   /* S393: owed */
-			hq_flush();        /* S394: the slice's last batch */
+			clrecon_owe(&C.recon, r.budget);
+			hq_flush();        /* the slice's last batch */
 			return;            /* out of budget mid-collection */
 		}
 	}
-	hq_flush();                        /* S394: before "finished asking" */
+	hq_flush();                        /* before "finished asking" */
 	if (C.rec_col >= pc_store_count()) {
 		if (reconcile_walk_again())
-			return;            /* S471 */
+			return;
 		C.reconcile_on = 0;
-		clrecon_walk_stop(&C.recon);        /* S393 */
-		rdg_drop();                /* S261 */
+		clrecon_walk_stop(&C.recon);
+		rdg_drop();
 		C.st.reconcile_ms = C.rec_start_ms ? (unsigned long long)
-			(now_ms() - C.rec_start_ms) : 0;      /* S212 */
-		/* Probes ISSUED, not resolved.  The answers arrive over the
-		 * next round trips and each drop logs itself, so counting
-		 * drops here would always report zero and read as "nothing
-		 * was wrong". */
+			(now_ms() - C.rec_start_ms) : 0;
+		/* probes ISSUED, not resolved: each drop logs itself as its answer arrives */
 		LM_NOTICE("cluster: reconcile pass finished asking - %llu "
 			"key(s) probed; any that nobody still has are dropped "
 			"as their answers arrive\n", C.st.reconcile_probed);
@@ -6877,24 +5199,19 @@ static void reconcile_walk(void)
 
 static void reconcile_tick(void)
 {
-	/* S393: the beat decides afresh whether the slices may walk */
+	/* the beat decides afresh whether the slices may walk */
 	clrecon_walk_stop(&C.recon);
-	C.st.reconcile_open = C.reconcile_on && C.cfg_eager;   /* S395 */
+	C.st.reconcile_open = C.reconcile_on && C.cfg_eager;
 	clrecon_progress(&C.recon, now_ms(), C.st.reconcile_open,
 		C.fp.state == FPS_WALK, C.st.reconcile_walked,
 		C.st.reconcile_walk_total, &C.st.reconcile_rate,
 		&C.st.reconcile_eta_s);
-	/* S245: "finished asking" is not "ruled".  The answers land over
-	 * the next round trips, and a record the sweep pushes meanwhile
-	 * reaches a peer that has ALREADY answered "absent" - the key is
-	 * then dropped here and kept there.  Measured: 5 of node 3's own
-	 * replayed keys, immortal on node 2 alone, in 2 kill -9 runs of 9
-	 * under load.  So the hold outlives the pass until the last
-	 * reconcile answer is in. */
+	/* the hold outlives the pass until the last answer is in: a record the sweep pushes
+	 * meanwhile reaches a peer that already answered "absent" - dropped here, kept there */
 	C.rec_hold = C.reconcile_on ||
 		clpend_used_kind(&C.pd, PC_DONE_RECONCILE) > 0;
-	clwire_set_reconciling(C.rec_hold && C.cfg_eager);   /* ST8 */
-	/* S455: a resync is over once its pull has made this node READY */
+	clwire_set_reconciling(C.rec_hold && C.cfg_eager);
+	/* a resync is over once its pull has made this node READY */
 	if (C.st.resyncing && !C.resync_on &&
 	    pc_node_state() >= PC_NST_READY)
 		C.st.resyncing = 0;
@@ -6904,17 +5221,17 @@ static void reconcile_tick(void)
 		return;
 	}
 	if (C.resync_on)
-		return;                    /* S455: the drop runs (reconcile_pump) */
+		return;                    /* the drop runs (reconcile_pump) */
 	if (C.role == PC_ROLE_JOINING)
 		return;                    /* nobody to ask yet */
 	if (any_live_peer_cold())
-		return;                    /* S152: their "no" is not evidence yet */
+		return;                    /* their "no" is not evidence yet */
 	if (!C.recon.witness) {
 		if (!reconcile_find_witness())
-			return;            /* S223: nobody was watching */
+			return;            /* nobody was watching */
 	} else if (!reconcile_witness_live()) {
 		C.st.reconcile_deferred++;
-		/* ST8: and no other peer saw the outage either - every one
+		/* and no other peer saw the outage either - every one
 		 * restarted since.  Nothing here can end that: say so once */
 		if (clrecon_nowit(&C.recon, now_ms(),
 		        &C.st.reconcile_no_witness_s))
@@ -6925,13 +5242,11 @@ static void reconcile_tick(void)
 				"it can finish.  Restart THIS node: its peers have "
 				"been up long enough to witness that\n",
 				C.st.reconcile_no_witness_s);
-		return;                    /* S223: the witness left mid-pass */
+		return;                    /* the witness left mid-pass */
 	}
 	clrecon_nowit_end(&C.recon);
 	C.st.reconcile_no_witness_s = 0;
-	/* S392: first the fast path - a witness's replay of every delete
-	 * since this node's snapshot began.  When it holds the pass, wait;
-	 * when it ended the pass, finish; when it cannot, walk as before */
+	/* the fast path first: wait while it holds the pass, finish when it ended it, else walk */
 	if (fp_step())
 		return;
 	if (C.fp.state == FPS_DONE) {
@@ -6939,19 +5254,18 @@ static void reconcile_tick(void)
 		return;
 	}
 	if (!reconcile_digest_step())
-		return;                    /* S261: the witness's digests first */
-	/* S393: the beat's slice now, the rest between beats (reconcile_pump) */
+		return;                    /* the witness's digests first */
+	/* the beat's slice now, the rest between beats (reconcile_pump) */
 	clrecon_walk_start(&C.recon, now_ms());
 	reconcile_walk();
 }
 
-/* S393: between beats, the walk's further slices - only while the beat's
- * verdict stands (C.recon.may_walk); a drop re-checks the witness when its
- * answer lands in any case */
+/* the walk's further slices between beats, only while the beat's verdict stands
+ * (C.recon.may_walk); a drop re-checks the witness when its answer lands anyway */
 static void reconcile_pump(long long now)
 {
 	if (C.resync_on) {
-		resync_step(now);          /* S455 */
+		resync_step(now);
 		return;
 	}
 	if (!clrecon_pump_due(&C.recon, now, C.reconcile_on))
@@ -6959,17 +5273,8 @@ static void reconcile_pump(long long now)
 	reconcile_walk();
 }
 
-/*
- * Pick the standby.  Highest master_preference wins, then (CH-2) the
- * highest (ip, port) - the node the election promotes when the master
- * dies, so the one that takes over is the one holding the synced state.
- *
- * KEYED ON LIVENESS, NOT ON NODE STATE.  Holding the control plane has
- * nothing to do with whether a node's DATA is complete: the state is
- * small and synced, and a node still recovering its keyspace can carry
- * it perfectly well.  Excluding recovering nodes would shrink the
- * candidate pool exactly when the cluster is most likely to need one.
- */
+/* the standby: preferred first, then the highest (ip,port) - whom the election promotes. Keyed
+ * on liveness, not state: a node still recovering its keyspace can hold the small control state */
 static int pick_backup(void)
 {
 	long long now = now_ms();
@@ -6982,13 +5287,13 @@ static int pick_backup(void)
 	for (i = 0; i < (unsigned int)C.pt.n_peers; i++) {
 		struct peer *p = &C.pt.peers[i];
 		int id = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
-		int pref = id == __atomic_load_n(&prefer_id, __ATOMIC_RELAXED);  /* CH-9 */
+		int pref = id == __atomic_load_n(&prefer_id, __ATOMIC_RELAXED);
 
-		if (!id || id == C.node_id || !clpeers_live(p, now) ||
+		if (!id || id == C.node_id || !clpeers_usable(p, now) ||
 		    p->nstate == PC_NST_STALLED)   /* the election skips it too */
 			continue;
 		if (id == C.passed_over_id && now < C.passed_over_until_ms)
-			continue;          /* S277: it let a stage time out */
+			continue;          /* it let a stage time out */
 		if (pref > best_pref || (pref == best_pref &&
 		        (!best || addr_cmp(&p->addr, best_addr) > 0))) {
 			best_pref = pref;
@@ -7028,21 +5333,8 @@ static void clmap_recheck_usable(void)
 		(ok == (unsigned int)pc_clmap_placeable_count(&C.map));
 }
 
-/* Has the set the map should contain changed since it was published?
- * A peer becoming READY counts - without it the map is never reissued,
- * that peer stays absent, and the map never becomes usable at all.
- *
- * A member's STATE counts too, and used not to.  The map is reissued on
- * a timer anyway (CLMAP_PUB_MS), so a node going FAILED did reach
- * clients - but up to five seconds late, and every one of those seconds
- * is a client still picking a node that has stopped taking writes.  The
- * timer is a catch-up for lost datagrams, not the mechanism; membership
- * moves publish IMMEDIATELY because "ownership follows the map and a
- * stale one keeps routing at a node that has gone", and a node that has
- * FAILED is the same sentence with a different verb.
- *
- * Self is checked separately: the loop skips this node, so a master
- * that fails would otherwise go on publishing itself as READY. */
+/* a peer turning READY or any member's state change republishes at once (the timer only
+ * covers lost datagrams); self is checked apart, or a failing master stays READY in it */
 static int clmap_membership_moved(void)
 {
 	long long now = now_ms();
@@ -7074,29 +5366,8 @@ static int clmap_membership_moved(void)
 	return want != C.map.nnodes;       /* or someone went away */
 }
 
-/*
- * Staging a map change past the standby.
- *
- * The order is: build, STAGE, hand it to the standby, and broadcast only
- * once the standby has acknowledged holding it.  That buys one property
- * nothing downstream then has to enforce - the standby is never BEHIND
- * the fleet, only ever equal or one committed change ahead - and it
- * holds in every window the master can die in.  Dying before the ack
- * loses the change and leaves standby and fleet agreeing on the old map.
- * Dying after it leaves the standby holding something the fleet has not
- * seen, which it publishes on promotion; that is correct, because the
- * change was committed the moment it was acked.
- *
- * With no standby, changes publish immediately and are counted as
- * unsynced.  Refusing would mean a node cannot JOIN while the cluster is
- * already short a controller, turning a degraded state into a stuck one.
- *
- * A standby that never answers must not wedge the control plane either,
- * so a staged change has a deadline and is abandoned past it.  Its
- * SEQUENCE IS NOT REUSED: the standby may have acked with only the ack
- * lost, and a different map published at the same epoch is exactly the
- * ambiguity the epoch exists to remove.
- */
+/* build, stage to the standby, broadcast only once it acked: the standby is never BEHIND the
+ * fleet.  No standby = publish at once; a hung stage is abandoned and its seq never reused. */
 static void clmap_stage(void)
 {
 	uint32_t seq = 0;
@@ -7110,10 +5381,7 @@ static void clmap_stage(void)
 	}
 	if (C.sync.state != PC_CLSYNC_IDLE)
 		return;                    /* one in flight already */
-	/* S277: pick FIRST.  have_backup used to come from the standby the
-	 * PREVIOUS build named, and the build then re-picked: a change could
-	 * wait on an ack from a node the map did not name, or publish unsynced
-	 * with a standby named in it. */
+	/* pick FIRST, so the change waits on the ack of the standby this map names */
 	C.backup_id = pick_backup();
 	pc_clsync_set_backup(&C.sync, C.backup_id != 0);
 	if (pc_clsync_stage(&C.sync, &seq) != 0)
@@ -7144,6 +5412,7 @@ static void clmap_publish(void)
 	if (ctl_send(msg, (size_t)n + 1) != 0)
 		return;                    /* retry on the next tick */
 	pc_clsync_published(&C.sync);
+	spread_note_placeable(&C.staged);
 	C.map = C.staged;
 	C.map_valid = 1;
 	C.map_pub_ms = now_ms();
@@ -7161,13 +5430,8 @@ static void clmap_tick(long long now)
 	        now >= C.staged_deadline_ms) {
 		pc_clsync_abort(&C.sync);
 		C.stage_timeout_n++;
-		/* S277: pass it over, so the next stage - due at once, the
-		 * membership has usually moved - goes to another live peer, or
-		 * publishes unsynced when there is none.  Re-picking the same
-		 * silent node stalled publication for as long as it stayed
-		 * silent: in CI a restarted standby left the master's map one
-		 * member short, and a member placing from it answered a third
-		 * of the keyspace wrong. */
+		/* pass it over: the next stage (due at once) goes to another live peer or
+		 * publishes unsynced, rather than stall on the same silent node */
 		if (C.passed_over_id != C.backup_id ||
 		        now >= C.passed_over_until_ms)
 			LM_WARN("cluster: the standby (node %d) has not "
@@ -7210,19 +5474,8 @@ static void clsync_send(const struct pc_clmap *m)
 		C.sync_sent_n++;
 }
 
-/*
- * S241: is @from a node this fleet ADMITS - a member we know by id, or
- * the master we follow?  A map and a standby sync are control state, and
- * rule 3 makes a map's term binding; a node refused at the doors (config
- * digest, epoch - both peer_forget() it on every beat it sends) must not
- * reach past them through the map plane.  Measured on 245-247: a node
- * restarted without its [wal] was refused by every member, founded alone,
- * and its maps still made the real master step down; each re-promotion
- * outranked the other and the terms ran 111 -> 180 in five minutes.  A
- * legitimate new master is never cut off by this: it sends its keepalive
- * before it stages its first map (become_master), and the keepalive is
- * what admits it.
- */
+/* @from is admitted: a member by id, or the master we follow.  A node refused at the doors must
+ * not bind the fleet via a map's term; a new master's keepalive precedes its map and admits it */
 static int sender_admitted(const pc_addr *from)
 {
 	struct peer *p = clpeers_by_addr(&C.pt, from);
@@ -7232,21 +5485,8 @@ static int sender_admitted(const pc_addr *from)
 	return C.master_id && addr_eq(from, &C.master_addr);
 }
 
-/* CH-12: the types only an admitted node sends, refused from anyone else
- * before their handler runs.  A node joins by JOIN_REQ and is admitted by
- * the master's ASSIGN (or, after a failover or a merge, by its ALIVE), so
- * nothing below is lost to a node on its way in: a joiner's collection
- * DDL (COL_SET) is re-sent every five seconds and lands once it is
- * admitted; reconcile's hold-checks (HOLD_Q), the sweep digests and the
- * master probes (MPROBE) are sent by members only, and an unanswered one
- * is a timeout each caller already treats as "no answer" - a key kept, a
- * sweep run, an election not held off.  An MPROBE_R answers a member we
- * asked; a CLSYNC_ACK comes from the backup the master chose, by its id.
- * The data plane (pulls, forwards, migrations, replication, tombstones,
- * publishes, demotes) needs only an address this node knows: S302's
- * bounce sends exactly those from a node with no id yet - restarted with
- * no state, its slot still here - and a node just admitted announces
- * itself to every member before its first pull (handle_assign). */
+/* admission-gated types are re-sent (COL_SET) or member-only with a timeout as "no answer"; the
+ * data plane needs only a known address, as a node restarted without state has no id yet */
 static int sender_known(const pc_addr *from)
 {
 	return clpeers_by_addr(&C.pt, from) != NULL ||
@@ -7255,13 +5495,8 @@ static int sender_known(const pc_addr *from)
 
 static int sender_gate(int type, const pc_addr *from)
 {
-	/* 12ny AT-9: the group loops a node's OWN delete back to it, from its
-	 * own address - which no peer slot holds, so the data-plane rule below
-	 * refused it (sender_refused, and a refusal notice, for every delete
-	 * on the group) unless this node was the master.  It is let through
-	 * to be counted (tomb_own) and nothing else: the dispatch applies no
-	 * tombstone from this node's address (v0.7.3-rc7 tombmcasttest: own
-	 * copies 0 on a member) */
+	/* the group loops this node's own delete back from its address, which no slot
+	 * holds: let through only to be counted at the dispatch (tomb_own) */
 	if (type == M_TOMBSTONE && addr_eq(from, &C.self_addr))
 		return 1;
 	switch (type) {
@@ -7274,18 +5509,14 @@ static int sender_gate(int type, const pc_addr *from)
 	case M_CLSYNC_ACK:
 		return C.backup_id &&
 			clpeers_by_id_from(&C.pt, (unsigned)C.backup_id, from) != NULL;
-	/* CH-14: the lane's asks come from a peer whose UDP to us failed - it
-	 * may be heard over the lane before its first ALIVE is, so admission
-	 * is too strict: a slot at the address will do, the one a purge or a
-	 * goodbye leaves included, or the master.  A stranger's forced a lane
-	 * to its address, or drew a UDP answer (LANE_PROBE) */
+	/* a lane ask may arrive before the peer's first ALIVE: a slot at the address (even
+	 * a purged one's) or the master will do; a stranger could force a lane or draw UDP */
 	case M_LANE_FORCE:
 	case M_LANE_PROBE:
 	case M_LANE_PROBE_R:
 		return C.role == PC_ROLE_JOINING || sender_known(from);
-	/* CH-12/CH-14: the data plane, from an address this node knows (see
-	 * above) - a stranger's PULL_REQ drew the value back to whatever
-	 * address it named, many times its own size */
+	/* the data plane, from a known address: a stranger's PULL_REQ would send the
+	 * value, many times its own size, to any address it named */
 	case M_PULL_REQ:
 	case M_FWD_OP:
 	case M_FWD_JSON:
@@ -7295,24 +5526,16 @@ static int sender_gate(int type, const pc_addr *from)
 	case M_TOMBSTONE:
 	case M_PUBLISH:
 	case M_DEMOTE:
-		/* ... except on a node on its way in: restarted at once (kill -9,
-		 * inside the purge window) it knows nobody yet, while the fleet's
-		 * map still names it the owner of its keys and forwards their
-		 * writes to it - S302's bounce, whose data plane must flow.
-		 * Refused, each of those writes would time out at the node that
-		 * forwarded it.  Admitted, it has every member from the ASSIGN */
+		/* ... except on a joiner: restarted inside the purge window it knows nobody,
+		 * yet the map still forwards its keys' writes to it; refused, each times out */
 		return C.role == PC_ROLE_JOINING || sender_known(from);
 	default:
 		return 1;
 	}
 }
 
-/* CH-12: a live slot at ANOTHER address holds this identity and this
- * incarnation (or it is this node's own, seen from elsewhere).  A process
- * is at one address, so the frame is a replay or a forgery from a second
- * one - a replayed ALIVE made the sender an admitted member under the id
- * it claimed.  A restart or a clone carries a new incarnation, and a node
- * whose source address changes is answered once its old slot is purged. */
+/* a live slot at another address holds this identity and incarnation: one process has one
+ * address, so the frame is a replay or forgery (a restart or clone has a new incarnation) */
 static int ident_elsewhere(const unsigned char *ident, unsigned int incarn,
 		const pc_addr *from)
 {
@@ -7346,7 +5569,7 @@ static void handle_clsync(const unsigned char *pt, size_t n,
 
 	if (n < CLSYNC_ENV_HDR)
 		return;
-	if (!sender_admitted(from)) {      /* S241 */
+	if (!sender_admitted(from)) {
 		C.map_unadmitted_n++;
 		return;
 	}
@@ -7358,23 +5581,18 @@ static void handle_clsync(const unsigned char *pt, size_t n,
 	if (pc_clhist_decode(hp, hl, &C.held_hist, &why) != 0)
 		goto bad;
 
-	/* Held, not adopted.  This is a copy kept ON BEHALF of the master
-	 * for the moment it is needed; the map this node PLACES from is
-	 * still whatever arrived on the broadcast.  Conflating the two
-	 * would let a standby act on state the fleet has not been told. */
+	/* held, not adopted: a copy kept for a failover; this node still places from the
+	 * broadcast map, so a standby never acts on state the fleet has not been told */
 	C.held_valid = 1;
 	C.held_map = m;
 	C.held_term = m.term;
 	C.held_seq = m.seq;
-	/* what we have acked and not yet seen published is OWED to the
-	 * fleet: it was committed the moment we acked it, so if this node
-	 * is promoted before the master broadcasts it, publishing it is
-	 * this node's job. */
+	/* acked but not yet seen published is OWED: if this node is promoted before
+	 * the master broadcasts it, publishing it is this node's job */
 	pc_clsync_hold(&C.sync, m.term, m.seq);
 
-	/* Acked only after it is stored.  Acking first and storing after
-	 * would let the master publish a change this node then failed to
-	 * keep - which is the one thing the ordering exists to prevent. */
+	/* acked only after it is stored, so the master never
+	 * publishes a change this node failed to keep */
 	seal_send(from, ack,
 		clsync_ack_write(ack, sizeof ack, M_CLSYNC_ACK, m.term, m.seq));
 	return;
@@ -7393,26 +5611,34 @@ static void handle_clsync_ack(const unsigned char *pt, size_t n)
 	pc_clsync_ack(&C.sync, term, seq);
 }
 
-/* Give up mastership and re-join through @to.  ONE demotion path, on
- * purpose: a second one that forgot the join token or the deadline
- * would leave a node that is no longer master and never becomes a
- * member either.  Callers differ only in why they decided. */
-static void yield_mastership(const pc_addr *to)
+/* JOINING again through @to, with a fresh token and deadline */
+static void join_again(const pc_addr *to)
 {
-	prefer_clear();                        /* CH-9: handed over, or moot */
 	C.role = PC_ROLE_JOINING;
-	C.st.demotions++;
+	/* a joiner sends no ALIVE, so the watchdog would re-send these for ever:
+	 * the old claim held members and joiners to a master that admits nobody */
+	clwire_beat_store(&C.wr, CLWIRE_ALIVE, NULL, 0);
+	clwire_beat_store(&C.wr, CLWIRE_MALIVE, NULL, 0);
 	C.join_tok = 0;
 	randombytes_buf(&C.join_tok, 8);
 	C.join_deadline_ms = now_ms() + JOIN_WAIT_MS;
+	clfound_window_open(now_ms());
 	C.join_held = 0;
-	C.join_defers = 0;
-	cid_follow_foreign();
 	send_join_req(to);
 }
 
-/* S452 (2): a master that yields to a beacon follows its sender at once,
- * rather than name itself until the winner's next beacon */
+/* give up mastership and re-join through @to: the ONE demotion path, so none can forget the
+ * join token or deadline and leave a node neither master nor member */
+static void yield_mastership(const pc_addr *to)
+{
+	prefer_clear();                        /* handed over, or moot */
+	C.st.demotions++;
+	cid_follow_foreign();
+	join_again(to);
+}
+
+/* a master that yields to a beacon follows its sender at once, rather than name itself until the
+ * winner's next beacon */
 static void yield_follow(const pc_addr *from, int their_id)
 {
 	yield_mastership(from);
@@ -7429,14 +5655,10 @@ static void handle_clmap(const unsigned char *pt, size_t n,
 
 	if (n < 2)
 		return;
-	/* our own multicast comes back to us.  Skipping it keeps received
-	 * and stale meaning what they say - without this a lone master
-	 * reports receiving and rejecting a map every publication, which
-	 * reads like a fleet arguing with itself. */
+	/* our own multicast comes back to us: skipped, so received/stale counts stay honest */
 	if (addr_eq(from, &C.self_addr))
 		return;
-	/* S241: before the decode and before the term is observed - a
-	 * refused node's term must not even raise ours */
+	/* before the decode and the term observe: a refused node's term must not even raise ours */
 	if (!sender_admitted(from)) {
 		if (++C.map_unadmitted_n % 100 == 1)
 			LM_WARN("cluster: ignoring a cluster map from %s - it is "
@@ -7454,11 +5676,8 @@ static void handle_clmap(const unsigned char *pt, size_t n,
 			LM_WARN("cluster: refusing a cluster map (%s)\n", why);
 		return;
 	}
-	/* CH-12: only a master publishes a map, stamped with its own id
-	 * (clmap_build); one naming another master is not a map its sender
-	 * made.  The sender's id is its slot's, or the master's when it is
-	 * the master's address - not an address compare against the map's
-	 * node list, which a wildcard-bound source need not match */
+	/* only a master publishes a map, stamped with its own id; the sender's id is its slot's
+	 * (or the master's), not from the map's node list: a wildcard bind need not match it */
 	{
 		struct peer *sp = clpeers_by_addr(&C.pt, from);
 		int sid = sp ? __atomic_load_n(&sp->node, __ATOMIC_ACQUIRE) : 0;
@@ -7475,12 +5694,8 @@ static void handle_clmap(const unsigned char *pt, size_t n,
 			return;
 		}
 	}
-	/* the term is a peer's claim, so it goes through the jump guard -
-	 * and a map the guard refuses is not adopted.  It was: the result
-	 * went unread, so one map at an implausible term made a master step
-	 * down below and was then the map every real one compared stale
-	 * against - the fleet pinned to it, what PC_TERM_MAX_JUMP exists to
-	 * prevent (clterm.h) */
+	/* the term is a peer's claim: a map the jump guard refuses is not adopted, or one
+	 * implausible term demotes a master and pins the fleet to it (clterm.h) */
 	if (!pc_term_plausible(m.term)) {
 		if (++C.map_bad_n % 100 == 1)
 			LM_WARN("cluster: refusing a cluster map at term %u - "
@@ -7497,44 +5712,17 @@ static void handle_clmap(const unsigned char *pt, size_t n,
 	}
 	if (pc_term_must_stepdown(C.role == PC_ROLE_MASTER, C.map.term,
 	        m.term)) {
-		/*
-		 * RULE 3 (clterm.h): a master that observes a HIGHER term
-		 * steps down immediately and unconditionally - no merge, no
-		 * member count, no negotiation.  That is what bounds split
-		 * brain to one detection interval rather than to a
-		 * reconciliation timer, and it is what makes promoting a
-		 * backup aggressively safe in the first place.
-		 *
-		 * Compared against the term of the map WE PUBLISHED, not
-		 * against pc_term_current(): the current term is the highest
-		 * this node has SEEN, and pc_term_observe() a few lines above
-		 * has just folded the arriving one into it - so comparing
-		 * with it asks whether a term beats itself, and no master
-		 * would ever step down.  Our own map's term is the one we are
-		 * asserting mastership under, and that is the thing being
-		 * outranked.  (This is why the old logging-only version could
-		 * never have fired as written.)
-		 *
-		 * Unconditional means unconditional: this deliberately does
-		 * NOT consult the member count that handle_master_alive
-		 * weighs.  A term is issued once and totally ordered; a
-		 * member count is a local observation that two partitioned
-		 * nodes can hold different views of at the same instant.
-		 * Where the two disagree the term is the one that is right.
-		 *
-		 * The rule is CALLED, not re-spelled: pc_term_must_stepdown
-		 * is what clterm.h documents and what test/clustersim.c
-		 * exercises across thousands of schedules, and a second copy
-		 * of the comparison here is a second thing to keep in step.
-		 */
+		/* rule 3 (clterm.h): a master seeing a higher term steps down at once, no member
+		 * count; compared with our published map's term - pc_term_current() holds theirs */
 		LM_WARN("cluster: stepping down - a map at term %u outranks "
 			"our own term %u (master is node %u)\n",
 			m.term, C.map.term, m.master_id);
 		yield_mastership(from);
 	}
+	spread_note_placeable(&m);
 	C.map = m;
 	C.map_valid = 1;
-	if (cl_unicast) {                      /* S36 */
+	if (cl_unicast) {
 		long long nw = now_ms();
 		unsigned int mi;
 
@@ -7549,18 +5737,16 @@ static void handle_clmap(const unsigned char *pt, size_t n,
 		}
 	}
 	clmap_recheck_usable();
-	/* the fleet has reached this epoch, so nothing is owed at or below
-	 * it - and a LATER TERM clears the debt just as surely, since
-	 * whatever we held belonged to a master that no longer exists */
+	/* nothing is owed at or below the fleet's epoch, and a later term clears
+	 * the debt too: whatever we held belonged to a master that is gone */
 	pc_clsync_saw(&C.sync, m.term, m.seq);
 	if (C.map_rx_n == 1 || !(C.map_rx_n % 60))
 		LM_NOTICE("cluster: holding map epoch (%u,%u), %u node(s), "
 			"master %u\n", m.term, m.seq, m.nnodes, m.master_id);
 }
 
-/* @to NULL: the fleet (group or target set) and the beat watchdog's
- * copy; else that one address - S36: a master told of a joiner answers
- * it at once, inside the joiner's JOIN_WAIT_MS */
+/* @to NULL: the fleet and the beat watchdog's copy; else that one address - a master
+ * told of a joiner answers it inside the joiner's JOIN_WAIT_MS */
 static void send_master_alive_to(const pc_addr *to)
 {
 	unsigned char msg[CLMEMB_MALIVE_LEN];
@@ -7574,27 +5760,16 @@ static void send_master_alive_to(const pc_addr *to)
 	m.free_mb = self_free_mb();
 	m.total_mb = self_total_mb();
 	m.live_kb = self_live_kb();
-	/* S30: MASTER_ALIVE admits peers too, so it carries the config
-	 * identity as well - otherwise a refused joiner still learns the
-	 * master through it and the refusal is one-sided (measured) */
+	/* MASTER_ALIVE admits peers too, so it carries the config identity, or a
+	 * refused joiner still learns the master and the refusal is one-sided */
 	m.mode = C.cfg_mode;
 	m.eager = C.cfg_eager;
 	m.cfg_digest = config_digest();
-	/* The TERM we are asserting mastership under.  It rides the
-	 * keepalive rather than only the map because the keepalive is what
-	 * the split-brain decision is actually made on: MASTER_ALIVE flows
-	 * every second, a map only on a membership change, so a rank-based
-	 * cure reading this message resolves the argument long before a map
-	 * could arrive.  Measured: with the term only on the map, the
-	 * member-count/address cure seated a stale term-1 master over a
-	 * legitimate term-2 one, every time.
-	 *
-	 * Appended, so a peer that stops reading at 35 is unaffected -
-	 * the same length-gated extension this handler already uses for
-	 * the config digest. */
+	/* the term rides the 1 Hz keepalive, not only the map: the split-brain cure reads
+	 * this message.  Appended, so a peer that stops reading at 35 is unaffected */
 	m.term = pc_term_current();
-	m.epoch = pc_cluster_epoch();                /* S221; 12nu */
-	m.committed = pc_cluster_epoch();            /* 12nu: the fleet's epoch */
+	m.epoch = pc_cluster_epoch();
+	m.committed = pc_cluster_epoch();            /* the fleet's epoch */
 	len = clmemb_malive_write(msg, sizeof msg, M_MASTER_ALIVE, &m);
 	if (to) {
 		seal_send(to, msg, len);
@@ -7609,14 +5784,11 @@ static void send_master_alive(void)
 	send_master_alive_to(NULL);
 }
 
-/* Peer-thread-only 1 Hz emitter for long duties: a migration tick's
- * ack windows and the victim walk call this as they grind, so the node
- * keeps saying "alive" (and a master keeps saying "master") while it
- * works.  Emission only - no membership decisions, no draining - so it
- * is safe anywhere on the peer thread, including from a walk callback. */
+/* peer-thread-only 1 Hz emitter for long duties (migration ack windows, the victim walk):
+ * emission only, no membership decisions, so safe anywhere on the peer thread */
 static void beat_pump(void)
 {
-	prog(PC_PROG_PUMP);                /* S216: a long duty, still moving */
+	prog(PC_PROG_PUMP);                /* a long duty, still moving */
 	if (now_ms() - clwire_sent_ms(&C.wr)
 	        < 1000)
 		return;
@@ -7641,7 +5813,7 @@ static int id_taken(int id)
 
 	if (id == C.node_id)
 		return 1;
-	if (clres_holds(&reserved, id, now_ms()))   /* S90: held for a departed member */
+	if (clres_holds(&reserved, id, now_ms()))   /* held for a departed member */
 		return 1;
 	for (i = 0; i < C.pt.n_peers; i++)
 		if (C.pt.peers[i].node == id)
@@ -7649,16 +5821,8 @@ static int id_taken(int id)
 	return 0;
 }
 
-/* Allocate a node id, honouring the joiner's PROPOSAL when it is free.
- * The proposal is derived from the joiner's identity, so a node that
- * restarts asks for - and normally gets - the id it had before, without
- * the master having to remember anything.
- *
- * It stays a proposal because 1023 slots collide at around 38 nodes by
- * the birthday bound: two unrelated identities can hash alike, and if
- * both were simply granted their proposal they would SHARE an id.  The
- * master is the arbiter, so overlap is impossible rather than unlikely.
- * @preferred 0 = no proposal (an older joiner). */
+/* honour the joiner's proposal (derived from its identity) when free: 1023 slots collide near 38
+ * nodes, so the master arbitrates and two identities never share an id.  @preferred 0 = none */
 static int alloc_node_id(int preferred)
 {
 	int id;
@@ -7674,87 +5838,22 @@ static int alloc_node_id(int preferred)
 	return 0;
 }
 
-/* master: unicast ASSIGN (echoing @tok) with the full member list */
-static void send_assign(const pc_addr *to, uint64_t tok,
-		int your_id)
+static void send_assign(const pc_addr *to, uint64_t tok, int your_id)
 {
-	unsigned char msg[16 + PC_CL_MAXPEER * 20 + 20];
-	long long now = now_ms();
-	size_t off;
-	int i, n = 0;
-
-	{
-		struct clmemb_assign h;
-
-		h.tok = tok;
-		h.your_id = your_id;
-		h.master_id = C.node_id;
-		h.count = 0;           /* patched below: the walk decides it */
-		off = clmemb_assign_hdr_write(msg, sizeof msg, M_ASSIGN, &h);
-	}
-	/* self first, then every live peer except the addressee */
-	{
-		struct clmemb_member m;
-
-		memset(&m, 0, sizeof m);
-		m.node = C.node_id;
-		m.addr = C.self_addr.in4.sin_addr;
-		m.port = C.self_addr.in4.sin_port;
-		m.free_mb = self_free_mb();
-		m.total_mb = self_total_mb();
-		m.live_kb = self_live_kb();
-		off += clmemb_member_write(msg + off, sizeof msg - off, &m);
-	}
-	n = 1;
-	for (i = 0; i < C.pt.n_peers; i++) {
-		struct clmemb_member m;
-
-		if (!clpeers_live(&C.pt.peers[i], now) ||
-		        addr_eq(&C.pt.peers[i].addr, to))
-			continue;
-		memset(&m, 0, sizeof m);
-		m.node = C.pt.peers[i].node;
-		m.addr = C.pt.peers[i].addr.in4.sin_addr;
-		m.port = C.pt.peers[i].addr.in4.sin_port;
-		m.free_mb = C.pt.peers[i].free_mb;
-		m.total_mb = C.pt.peers[i].total_mb;
-		m.live_kb = C.pt.peers[i].live_kb;
-		off += clmemb_member_write(msg + off, sizeof msg - off, &m);
-		n++;
-	}
-	clmemb_assign_count_set(msg, n);
-	seal_send(to, msg, off);
+	send_member_list(M_ASSIGN, to, tok, your_id);
 	C.st.assigns++;
 }
 
 static void become_master(int founded)
 {
-	/*
-	 * S92: found under the id this identity has always proposed.
-	 *
-	 * A joiner's proposal is honoured by whoever is master
-	 * (alloc_node_id), so an id already survives a restart back into a
-	 * LIVE cluster.  The founder was the one node that threw its own
-	 * proposal away and stamped itself 1 - which makes a whole-fleet
-	 * restart, where every identity file is intact, precisely the case
-	 * that churned the ids: whichever node happened to boot first
-	 * became node 1 and the fleet re-numbered around it.  Two
-	 * partitions that each found are worse still, both claiming 1 for
-	 * two different identities, to be told apart on the merge.
-	 *
-	 * A founder has no peers and no reservations, so nothing is taken
-	 * and this yields the proposal itself.  A node with no durable
-	 * identity proposes 0 and still falls out of the scan as 1,
-	 * exactly as before.
-	 */
+	/* found under the id this identity always proposes, so a whole-fleet restart
+	 * keeps its ids; with no durable identity the proposal is 0 and the scan gives 1 */
 	if (!C.node_id)
 		C.node_id = alloc_node_id(C.proposed_id);
 	if (!C.node_id)
 		C.node_id = 1;
-	/* S302: a master with no cluster id founds one - before its first
-	 * map or keepalive, which carry it - unless it can hear live
-	 * members of a cluster: then it founds into theirs, which is what
-	 * joining it would have done had a master answered */
+	/* a master with no cluster id founds one before its first map or keepalive (which
+	 * carry it), unless it hears live members of one: then it founds into theirs */
 	{
 		unsigned char h[CLWIRE_CID_LEN];
 		long long t, now = now_ms();
@@ -7768,16 +5867,14 @@ static void become_master(int founded)
 		pc_cid_mint(now);              /* no-op if it now has one */
 	}
 	C.role = PC_ROLE_MASTER;
-	/* founding or winning an election settles membership.  B4 will put
-	 * a node with data to settle into RECOVERING first. */
+	cladmit_master_begin(now_ms());        /* the admission gate counts from here */
+	/* founding or winning an election settles membership */
 	if (founded && any_eager() && !self_entries() &&
 	        pc_recovered_records() == 0 &&
 	        !clboot_done(&C.bt) &&
 	        clpeers_count_live(&C.pt, now_ms()) > 0) {
-		/* S83: a founder WITH live peers - a master that restarted
-		 * faster than its death was noticed, so nobody answered its
-		 * join - holds nothing they hold.  It pulls like a joiner
-		 * before it serves; a founder alone has nobody to pull from. */
+		/* a founder with live peers (restarted before its death was noticed) holds
+		 * nothing they hold: it pulls like a joiner before it serves */
 		pc_node_state_set(PC_NST_RECOVERING);
 		clboot_arm(&C.bt, now_ms());
 		LM_NOTICE("cluster: founding with %d live peer(s) while holding "
@@ -7788,20 +5885,14 @@ static void become_master(int founded)
 	C.master_id = C.node_id;
 	C.master_addr = C.self_addr;
 	C.st.elections++;
-	/* Claim a term, above everything this node has SEEN rather than
-	 * above its own last: a node that was away has seen less than the
-	 * fleet, and claiming from its own history reissues a term someone
-	 * else already used.  It is persisted before it is returned, so a
-	 * master that publishes and dies cannot come back and reissue the
-	 * same term with different content behind it. */
+	/* claim a term above everything this node has SEEN, not its own last; persisted
+	 * before returned, so a master that dies cannot reissue it with other content */
 	{
 		uint32_t t = pc_term_claim();
 
 		if (!t) {
-			/* Nowhere to write it.  This node still serves as
-			 * master for everything that worked before - it just
-			 * publishes no map, because a map under a term we
-			 * cannot remember is one we could contradict. */
+			/* nowhere to write it: serve as master, but publish no map - a map
+			 * under a term we cannot remember is one we could contradict */
 			LM_CRIT("cluster: could not persist a mastership term "
 				"- serving as master WITHOUT publishing a "
 				"cluster map (check the state directory)\n");
@@ -7809,18 +5900,8 @@ static void become_master(int founded)
 			uint32_t owed_t = 0, owed_s = 0;
 			int owed = pc_clsync_owed(&C.sync, &owed_t, &owed_s);
 
-			/*
-			 * A promoted standby starts from what it was handed,
-			 * not from nothing.
-			 *
-			 * The identity history is the piece that matters and
-			 * the piece it could not rebuild: only a master ever
-			 * learns which identities this cluster has seen, so a
-			 * promotion without it would call every returning node
-			 * NEW - backfilling nodes that only needed
-			 * reconciling, and losing the STARTING/RECOVERING
-			 * distinction entirely.
-			 */
+			/* a promoted standby starts from the identity history it was handed:
+			 * without it every returning node looks NEW and is backfilled */
 			if (C.held_valid) {
 				C.hist = C.held_hist;
 				LM_NOTICE("cluster: promoted holding the "
@@ -7834,20 +5915,14 @@ static void become_master(int founded)
 					"it once\n");
 			}
 
-			/* the staging machine issues under this term: a
-			 * sequence carried over from the previous one would
-			 * be ordered against maps that no longer matter */
+			/* the staging machine issues under this term: a sequence carried
+			 * over would be ordered against maps that no longer matter */
 			pc_clsync_init(&C.sync, t, 0);
 
-			/*
-			 * A change acked but never seen published was
-			 * COMMITTED, and the fleet has never been told.  It is
-			 * republished here under the NEW term rather than the
-			 * old one - the term it was staged under belongs to a
-			 * master that no longer exists, and reissuing it would
-			 * put two maps at one epoch.
-			 */
+			/* acked but never published = COMMITTED: republished under the NEW
+			 * term, since reissuing the old one would put two maps at one epoch */
 			if (owed) {
+				spread_note_placeable(&C.held_map);
 				C.map = C.held_map;
 				C.map_valid = 1;
 				LM_NOTICE("cluster: republishing a change the "
@@ -7867,8 +5942,8 @@ static void become_master(int founded)
 	clmap_stage();
 }
 
-/* CH-9: once the published map names the operator's member standby (it
- * acked the sync), tell it to promote; this master steps down on its beacon */
+/* once the published map names the preferred standby (it acked the sync), tell it to promote;
+ * this master steps down on its beacon */
 static void handover_tick(long long now)
 {
 	static long long sent_ms;
@@ -7916,19 +5991,8 @@ static void handle_handover(const unsigned char *pt, size_t n,
 	become_master(0);
 }
 
-/* Is this identity currently claimed by a member that is still ALIVE?
- *
- * Liveness is the whole test - NOT the address.  A clone can appear from
- * anywhere, and a node that genuinely failed can come back on the same
- * address or a different one; what separates them is whether the holder
- * of that identity is still heartbeating.  If the node really died the
- * master stops hearing it, the slot ages out, and the identity is free
- * for it to reclaim.
- *
- * The address is deliberately NOT consulted.  An earlier version
- * exempted a joiner arriving from the same address as the incumbent,
- * which let a clone in whenever it happened to reuse the address, and
- * treated "same box" as proof of "same node". */
+/* is this identity claimed by a member still ALIVE?  Liveness is the test, never the address:
+ * a clone can come from any address, and a dead node's slot ages out to free the identity */
 static int ident_claimed_live(const unsigned char *ident,
 		unsigned int incarn, const pc_addr *from)
 {
@@ -7949,21 +6013,8 @@ static int ident_claimed_live(const unsigned char *ident,
 			continue;              /* not up: the claim has lapsed */
 		if (memcmp(ident, p->ident, 16))
 			continue;
-		/* Identity matches a live member - but is that member the
-		 * JOINER ITSELF?  A known member re-joins as ordinary
-		 * traffic, every time mastership moves, and refusing that
-		 * deadlocks the fleet: the restarted node founds its own
-		 * cluster, then rejects the survivor for "already holding"
-		 * an identity that is genuinely its own.
-		 *
-		 * The incarnation settles it, and the ADDRESS deliberately
-		 * does not: incarnation is regenerated per process start and
-		 * never persisted, so a clone of the identity file cannot
-		 * carry it.  Same identity AND same incarnation is the same
-		 * running process; a different one is a new process, which
-		 * is either a fast restart or a clone - and those two are
-		 * told apart by waiting, not by where the datagram came
-		 * from. */
+		/* a member re-joins on every mastership move, and refusing it deadlocks the fleet:
+		 * same identity and incarnation (per process, unpersisted) = the same process */
 		if (incarn && p->incarn == incarn)
 			continue;
 		return 1;
@@ -7971,20 +6022,6 @@ static int ident_claimed_live(const unsigned char *ident,
 	return 0;
 }
 
-/* "Alive now" and "died a moment ago" are indistinguishable for about
- * one purge window, so a duplicate is not condemned on sight: a node
- * that restarts faster than its predecessor ages out would otherwise be
- * shot for impersonating itself.  The master simply says NOTHING while
- * the answer is ambiguous - the joiner retries anyway - and only rejects
- * once the incumbent has gone on heartbeating right through the window,
- * which a dead node cannot do.
- *
- * So: a genuine restart is delayed at most until its predecessor lapses,
- * and a real clone is refused, without either outcome resting on where
- * the datagram came from. */
-
-/* S90/S108: where an identity with a live reservation last lived, without
- * consuming the reservation.  1 = found, *@home filled. */
 static void send_join_rej(const pc_addr *to, uint64_t tok,
 		int reason)
 {
@@ -7994,9 +6031,8 @@ static void send_join_rej(const pc_addr *to, uint64_t tok,
 		clmemb_rej_write(msg, sizeof msg, M_JOIN_REJ, tok, reason));
 }
 
-/* S108: "your join is held" - the one answer that is neither an id nor a
- * refusal.  Sent on every retry the master holds, so the joiner's
- * patience is renewed only while the master is alive to renew it. */
+/* "your join is held": a duplicate is not condemned while the incumbent may just have died,
+ * only once it heartbeats through a purge window; each held retry renews the joiner's patience */
 static void send_join_wait(const pc_addr *to, uint64_t tok)
 {
 	unsigned char msg[CLMEMB_TOK_LEN];
@@ -8008,13 +6044,20 @@ static void send_join_wait(const pc_addr *to, uint64_t tok)
 static void handle_join_wait(const unsigned char *pt, size_t n,
 		const pc_addr *from)
 {
+	struct clmemb_wait w;
 	uint64_t tok;
 	long long until;
 
-	if (C.role != PC_ROLE_JOINING || !clmemb_tok_parse(pt, n, &tok))
+	if (C.role != PC_ROLE_JOINING || !clmemb_wait_parse(pt, n, &tok, &w))
 		return;
 	if (tok != C.join_tok)
 		return;                        /* not our join */
+	if (w.reason == CLMEMB_WAIT_QUEUED || w.reason == CLMEMB_WAIT_ELECTING) {
+		until = clfound_wait(&w, from, now_ms());   /* the settle window restarts */
+		if (until > C.join_deadline_ms)
+			C.join_deadline_ms = until;
+		return;
+	}
 	until = now_ms() + JOIN_HOLD_MS;
 	if (until > C.join_deadline_ms)
 		C.join_deadline_ms = until;
@@ -8027,17 +6070,9 @@ static void handle_join_wait(const unsigned char *pt, size_t n,
 	}
 }
 
-/* The master has refused us outright.  A duplicate identity means two
- * nodes would claim to BE each other, and everything built on identity -
- * knowing a node restarted, deciding who to backfill, not resending a
- * keyspace twice - stops meaning anything.  Serving on regardless would
- * hand clients stale data under a name that belongs to someone else, so
- * this is the one case the daemon does stop for.  (Its standing posture
- * elsewhere is the opposite: a peer that fails AUTH is quarantined and
- * counted, never fatal - a cache node serving local traffic beats a dead
- * one.  A clone is different in kind: the damage is to the cluster's
- * shared state, not to this node's own traffic.) */
-static int join_over_limit(const pc_addr *from, int *limit);  /* S299 */
+/* a duplicate-identity refusal stops the daemon: a clone corrupts the cluster's shared state,
+ * unlike a failed AUTH, which is quarantined and never fatal */
+static int join_over_limit(const pc_addr *from, int *limit);
 
 static void handle_join_rej(const unsigned char *pt, size_t n,
 		const pc_addr *from)
@@ -8047,13 +6082,12 @@ static void handle_join_rej(const unsigned char *pt, size_t n,
 
 	if (!clmemb_rej_parse(pt, n, &tok, &reason, &have_reason))
 		return;
-	/* CH-15: a refusal answers a join - a member or a master shut itself
-	 * down on any JOIN_REJ carrying the token it joined with, which a
-	 * holder of the secret could read off its JOIN_REQ */
+	/* a refusal answers a join only: a member or master must not shut down on a JOIN_REJ
+	 * carrying its old token, which a holder of the secret could read off its JOIN_REQ */
 	if (C.role != PC_ROLE_JOINING)
 		return;
 	if (tok != C.join_tok)
-		return;                        /* not our join */
+		return;
 	if (have_reason && reason == PC_REJ_DUP_IDENT) {
 		LM_ERR("cluster: the master at %s REFUSED this node - its "
 			"identity %s is already held by a live member, so "
@@ -8074,13 +6108,12 @@ static void handle_join_rej(const unsigned char *pt, size_t n,
 			"(reason %d).  Shutting down.\n",
 			pc_addr_str(from), reason);
 	}
-	/* the ordinary shutdown path: the main thread joins the workers and
-	 * tears down cleanly, rather than this thread calling exit() under
-	 * everyone else's feet */
+	/* the ordinary shutdown path: the main thread joins the workers and tears
+	 * down, rather than this thread calling exit() under them */
 	kill(getpid(), SIGTERM);
 }
 
-static void handle_join_req(const unsigned char *pt, size_t n,
+void handle_join_req(const unsigned char *pt, size_t n,
 		const pc_addr *from)
 {
 	struct clmemb_joinreq jq;
@@ -8095,13 +6128,8 @@ static void handle_join_req(const unsigned char *pt, size_t n,
 		proposed = jq.proposed;    /* derived from its identity */
 	if (jq.have & CLMEMB_J_INCARN)
 		j_incarn = jq.incarn;
-	/*
-	 * S221: the wire epoch, checked BEFORE the config digest, because a
-	 * peer that means something different by these bytes cannot be
-	 * reasoned with about collections.  An absent epoch is 0 and is
-	 * refused like any other (the epoch-1 grandfather rule expired
-	 * with S317's bump).
-	 */
+	/* the wire epoch, before the config digest: a peer that means something else by
+	 * these bytes cannot be reasoned with about collections; absent = 0, refused */
 	if (!epoch_ok((jq.have & CLMEMB_J_EPOCH) ? jq.epoch : 0, from, "join")) {
 		C.st.epoch_refused++;
 		peer_forget(from);
@@ -8111,7 +6139,7 @@ static void handle_join_req(const unsigned char *pt, size_t n,
 		uint64_t theirs = jq.cfg_digest;
 
 		if (theirs != config_digest() && C.cfg_authoritative) {
-			/* S30: refuse the JOIN itself - no id is assigned, so
+			/* refuse the JOIN itself - no id is assigned, so
 			 * the node never becomes a member at all */
 			shout_mismatch(from, jq.mode, jq.eager, theirs,
 				(jq.have & CLMEMB_J_WAL) ? jq.wal : 0);
@@ -8124,13 +6152,12 @@ static void handle_join_req(const unsigned char *pt, size_t n,
 		struct peer *p;
 		int id, lim;
 
-		/* S299: a fleet at its ceiling REFUSES a new member, out loud,
-		 * to the joiner too.  It used to log here and answer NOTHING,
-		 * and a joiner reads silence as "no master" and founds its own
-		 * cluster - a full fleet grew a second master. */
-		/* CH-12: a JOIN_REQ whose identity and incarnation a live member
-		 * at another address holds is a replay or a forgery - answered,
-		 * it made a member slot at its source and drew an ASSIGN there */
+		if (cladmit_hold(pt, n, from, tok))   /* in turn, told its place meanwhile */
+			return;
+		/* a fleet at its ceiling refuses a joiner out loud: a joiner reads
+		 * silence as "no master" and founds a second cluster */
+		/* identity and incarnation live at another address: a replay or forgery,
+		 * which answered would make a slot at its source and draw an ASSIGN there */
 		if ((jq.have & CLMEMB_J_IDENT) &&
 		    ident_elsewhere(jq.ident, j_incarn, from)) {
 			C.st.sender_refused++;
@@ -8154,27 +6181,14 @@ static void handle_join_req(const unsigned char *pt, size_t n,
 			C.st.joins_rejected++;
 			return;
 		}
-		/* The identity rides at byte 19 (send_join_req); it was read
-		 * from 21 from the day the check was written, two bytes of a
-		 * field the erasure-coded mode's removal had taken out of
-		 * the message, so a clone's claim could never match a live
-		 * member's identity and every clone was admitted - see S108.
-		 * The suite that proves the refusal was not in `make check`. */
 		if ((jq.have & CLMEMB_J_IDENT) &&
 				ident_claimed_live(jq.ident, j_incarn, from)) {
 			char hx[33];
 
 			ident_hex(jq.ident, hx);
 			if (!clpeers_dup_persisted(&C.pt, from, now_ms())) {
-				/* ambiguous: its predecessor may simply not
-				 * have aged out yet.  Say so - S108: this used
-				 * to answer NOTHING, and a joiner reads two
-				 * seconds of silence as "no master" and founds
-				 * its own cluster, so a clone became a second
-				 * master under a duplicate identity.  A held
-				 * joiner keeps retrying; if the incumbent really
-				 * did die the claim lapses and the next attempt
-				 * is assigned normally. */
+				/* ambiguous: the predecessor may not have aged out; held,
+				 * not ignored - silence makes a joiner found its own cluster */
 				if (pc_logrl_ok(LRL_JOIN_HELD, from))
 					LM_WARN("cluster: join from %s claims identity "
 						"%s, still held by a live member - "
@@ -8199,23 +6213,17 @@ static void handle_join_req(const unsigned char *pt, size_t n,
 		}
 		clpeers_dup_forget(&C.pt, from);
 		id = p->node;
+		if (id && (id == C.node_id || clpeers_id_elsewhere(&C.pt, id, from, now_ms())))
+			id = 0;                /* a merge left it two holders: this one gets another */
 		if (!id) {
-			/* S90: a returning identity, or a replacement at the same
-			 * address, gets the reserved id back - overstamping the
-			 * proposal - unless a live member holds it meanwhile */
+			/* a returning identity, or a replacement at its address, gets the
+			 * reserved id back over its proposal, unless a live member holds it */
 			const char *how = "";
 			struct in_addr home;
 			int rid;
 
-			/* S108: TWO claimants of one lapsed identity - the node
-			 * restarting at its own address and a copy of its file at
-			 * another - are told apart by the address after all: the
-			 * one at the identity's last home is the restart, and it
-			 * was held (dup_seen) while the old entry was live.  The
-			 * other is held until the home claimant is in, when the
-			 * ordinary duplicate refusal takes it.  Found by clonetest:
-			 * the copy's retry landed first after the lapse and took the
-			 * reserved id. */
+			/* of two claimants to a lapsed identity, the one at its last home is the
+			 * restart; the other is held, then refused as a duplicate */
 			if ((jq.have & CLMEMB_J_IDENT) &&
 			        clres_home(&reserved, jq.ident, now_ms(), &home) &&
 			        home.s_addr != from->in4.sin_addr.s_addr &&
@@ -8252,10 +6260,33 @@ static void handle_join_req(const unsigned char *pt, size_t n,
 		send_assign(from, tok, id);
 		return;
 	}
-	if (C.role == PC_ROLE_JOINING && addr_cmp(from, &C.self_addr) > 0)
-		C.higher_joiner_ms = now_ms();   /* defer to the higher addr */
+	if (C.role == PC_ROLE_MEMBER)
+		cladmit_electing(from, tok, C.master_seen_ms);   /* a fleet without a master */
 	if (C.role == PC_ROLE_JOINING)
-		joiner_note(from, now_ms());     /* S36c */
+		clfound_note(from, jq.have & CLMEMB_J_IDENT ? jq.ident : NULL, now_ms());
+}
+
+/* an eager member holding nothing pulls the keyspace first - READY means complete */
+int cl_will_bootstrap(void)
+{
+	return any_eager() && !self_entries() && pc_recovered_records() == 0 && !clboot_done(&C.bt);
+}
+
+/* a member at last: RECOVERING for a bootstrap, or READY */
+void joined_state(int members)
+{
+	/* the candidates come from heartbeats not all sent yet: picked on the tick, bounded */
+	if (cl_will_bootstrap()) {
+		pc_node_state_set(PC_NST_RECOVERING);
+		clboot_arm(&C.bt, now_ms());
+		LM_NOTICE("cluster: joined as node %d (master is node %d, "
+			"%d member(s)) holding nothing - pulling a bootstrap "
+			"before reporting ready\n", C.node_id, C.master_id, members);
+	} else {
+		pc_node_state_set(PC_NST_READY);
+		LM_NOTICE("cluster: joined as node %d (master is node %d, "
+			"%d member(s))\n", C.node_id, C.master_id, members);
+	}
 }
 
 static void handle_assign(const unsigned char *pt, size_t n,
@@ -8267,23 +6298,19 @@ static void handle_assign(const unsigned char *pt, size_t n,
 
 	if (!clmemb_assign_parse(pt, n, &as))
 		return;
-	/* CH-15: an ASSIGN answers a join, so only a JOINING node takes one.
-	 * It was refused only by a master - a stale one from a pre-promotion
-	 * join would clobber the identity - so a member took any ASSIGN that
-	 * carried its token: a retry's late duplicate, a rival master's
-	 * during a split, or a replay, each resetting node_id, master_id and
-	 * master_addr (the last to the sender's address) and bringing back
-	 * the join-time member list.  A member never re-joins; a yielded
-	 * master is JOINING again, with a fresh token. */
-	if (C.role != PC_ROLE_JOINING)
+	/* an ASSIGN answers a join, so only a JOINING node takes one: a late duplicate,
+	 * a rival master's or a replay would reset a member's ids and master address */
+	if (C.role != PC_ROLE_JOINING) {
+		cladmit_assign_part(pt, n, &as, from);   /* a later part of its own */
 		return;
+	}
 	if (as.tok != C.join_tok)
 		return;
 	/* a master hands out 1..PC_CL_NODE_MAX (alloc_node_id); an id outside
 	 * that is not an assignment it made - 0 reads as "no id" everywhere */
 	if (as.your_id < 1 || as.your_id > PC_CL_NODE_MAX)
 		return;
-	/* S302: the cluster this node now belongs to is the master's */
+	/* the cluster this node now belongs to is the master's */
 	if (rx_hdr)
 		pc_cid_adopt(CLWIRE_HDR_CID(rx_hdr), now_ms());
 	C.node_id = as.your_id;
@@ -8302,7 +6329,7 @@ static void handle_assign(const unsigned char *pt, size_t n,
 		if (addr_eq(&pa, &C.self_addr))
 			continue;
 		if (cl_unicast)
-			clmesh_heard(&pa, now_ms(), 0);   /* CH-12: the master's word */
+			clmesh_heard(&pa, now_ms(), 0);   /* the master's word */
 		p = peer_upsert(&pa);
 		if (p)
 			peer_publish(p, mr.node, mr.free_mb,
@@ -8310,36 +6337,27 @@ static void handle_assign(const unsigned char *pt, size_t n,
 				pd_noident, 0, 0, PC_START_UNKNOWN);
 	}
 	if (C.role != PC_ROLE_MEMBER) {
+		struct clmemb_trailer t;
+
 		C.role = PC_ROLE_MEMBER;
-		/* S83: an eager member that holds NOTHING is not ready until
-		 * it has pulled the keyspace - "ready" has to mean complete.
-		 * The candidates come from heartbeats the fleet may not have
-		 * sent us yet, so the pick is made on the tick, bounded. */
-		if (any_eager() && !self_entries() &&
-		        pc_recovered_records() == 0 &&
-		        !clboot_done(&C.bt)) {
-			pc_node_state_set(PC_NST_RECOVERING);
-			clboot_arm(&C.bt, now_ms());
-			LM_NOTICE("cluster: joined as node %d (master is node %d, "
-				"%d member(s)) holding nothing - pulling a bootstrap "
-				"before reporting ready\n", C.node_id, C.master_id,
-				as.count + 1);
+		if (clmemb_trailer_parse(pt, n, as.count, &t) && (t.flags & CLMEMB_ASSIGN_CONNECT)) {
+			/* admitted, and every path to every member proved before it serves */
+			pc_node_state_set(PC_NST_CONNECTING);
+			cladmit_connect_begin(now_ms(), as.tok);
+			LM_NOTICE("cluster: admitted as node %d (master is node %d, %d member(s), part %d "
+				"of %d) - CONNECTING: proving every link before it serves\n", C.node_id,
+				C.master_id, as.count + 1, t.part + 1, t.parts);
 		} else {
-			pc_node_state_set(PC_NST_READY);
-			LM_NOTICE("cluster: joined as node %d (master is node %d, "
-				"%d member(s))\n", C.node_id, C.master_id, as.count + 1);
+			joined_state(as.count + 1);
 		}
 	}
-	/* CH-15: admitted - the token answered its join and is spent; a
-	 * fresh random one (never 0, which a forged reply could carry)
-	 * matches nothing until a yield makes this node join again */
+	/* the token is spent: a fresh random one (never 0, which a forged reply could
+	 * carry) matches nothing until a yield makes this node join again */
 	do
 		randombytes_buf(&C.join_tok, sizeof C.join_tok);
 	while (!C.join_tok);
-	/* CH-12: announced at once, not on the next beat - a member takes this
-	 * node's pulls and forwards only once it has a slot for it, and in
-	 * unicast mode it learns the address from this ALIVE (its targets now
-	 * hold every member the ASSIGN named) */
+	/* announced at once, not on the next beat: members take this node's pulls and
+	 * forwards only once they hold its slot, which this ALIVE makes */
 	send_alive();
 }
 
@@ -8351,16 +6369,14 @@ static void handle_alive(const unsigned char *pt, size_t n,
 
 	if (addr_eq(from, &C.self_addr) || !clmemb_alive_parse(pt, n, &a))
 		return;
-	/* S221: an ALIVE is the other door into a fleet - a node that never
-	 * sends a JOIN_REQ because it was already a member still arrives
-	 * here.  Same rule, same refusal. */
+	/* an ALIVE is the other door into a fleet (a member never re-sends JOIN_REQ): same rule */
 	if (!epoch_ok((a.have & CLMEMB_A_EPOCH) ? a.epoch : 0, from, "keepalive")) {
 		C.st.epoch_refused++;
 		peer_forget(from);
 		return;
 	}
 	C.st.hb_seen++;
-	/* CH-12: an ALIVE comes from a member or a master, and every one holds
+	/* an ALIVE comes from a member or a master, and every one holds
 	 * an id a master handed out; and its identity is at one address */
 	if (a.node < 1 || a.node > PC_CL_NODE_MAX ||
 	    ((a.have & CLMEMB_A_IDENT) && ident_elsewhere(a.ident, a.incarn, from))) {
@@ -8373,11 +6389,8 @@ static void handle_alive(const unsigned char *pt, size_t n,
 				"its identity is live at another address");
 		return;
 	}
-	/* CH-12: an id a live member at another address holds - counted and
-	 * said, not refused.  Two halves of a split can each admit a joiner
-	 * under one id, and that ends in a map no node decodes (clmap.c,
-	 * "dup"); refusing here would only make the nodes disagree silently.
-	 * It is also what a forged ALIVE claiming a member's id looks like */
+	/* an id live at another address is counted and logged, not refused: the halves
+	 * of a split can each admit one under it, and refusing would hide that */
 	{
 		struct peer *q = clpeers_by_id_live(&C.pt, a.node, now_ms());
 
@@ -8392,17 +6405,8 @@ static void handle_alive(const unsigned char *pt, size_t n,
 	}
 	if (a.have & CLMEMB_A_CFG) {
 		if (a.cfg_digest != config_digest() && C.cfg_authoritative) {
-			/* S30: a peer whose collection config differs is NOT
-			 * admitted.  Both sides refuse each other, so the
-			 * fleet splits along config lines and says so - a
-			 * visible split beats a silent one.
-			 *
-			 * Gated on THIS node being cluster-authoritative (it
-			 * declared [cluster] collections).  A legacy config
-			 * cannot prove what its peers should look like - it
-			 * may legitimately carry node-local collections - so
-			 * it keeps today's behaviour and is told to migrate
-			 * instead of being broken by an upgrade. */
+			/* differing collection config is not admitted, so the fleet splits visibly;
+			 * only a node that declared [cluster] collections can enforce it */
 			shout_mismatch(from, a.mode, a.eager, a.cfg_digest, 0);
 			C.cfg_refused++;
 			peer_forget(from);
@@ -8414,8 +6418,17 @@ static void handle_alive(const unsigned char *pt, size_t n,
 				"build) - its collection config CANNOT be checked\n",
 				pc_addr_str(from));
 	}
+	/* this node's id at another address: two halves of a merge each handed it out.
+	 * The higher identity re-joins for a new one; a master keeps its own */
+	if (a.node == C.node_id && C.role == PC_ROLE_MEMBER && (addr_eq(from, &C.master_addr) ||
+	    ((a.have & CLMEMB_A_IDENT) && memcmp(C.self_ident, a.ident, 16) > 0))) {
+		LM_WARN("cluster: node %d is claimed by %s too - re-joining for an id "
+			"of this node's own\n", a.node, pc_addr_str(from));
+		join_again(&C.master_addr);
+	}
 	p = peer_upsert(from);
 	if (p) {
+		p->alive_ms = now_ms();            /* before the publish, which may admit */
 		peer_publish(p, a.node, a.free_mb,
 			(a.have & CLMEMB_A_MEM) ? a.total_mb : 0,
 			(a.have & CLMEMB_A_MEM) ? a.live_kb : 0,
@@ -8427,30 +6440,28 @@ static void handle_alive(const unsigned char *pt, size_t n,
 		if (a.have & CLMEMB_A_LAMPORT)
 			pc_lamport_observe(a.lamport);
 		if (a.have & CLMEMB_A_CLIPORT)
-			p->client_port = a.client_port;   /* S34 */
-		/* B1: a peer that predates the field reads as READY - which
+			p->client_port = a.client_port;
+		/* a peer that predates the field reads as READY - which
 		 * is exactly how it behaves, since it has no state to be in */
 		{
 			int ns = (a.have & CLMEMB_A_STATE) ? a.nstate
 				: PC_NST_READY;
 
-			/* S442: and when it turns READY - a RECOVERING member
-			 * stays silent on pulls, so a lookup while it recovered
-			 * learned the other holder only */
+			/* a RECOVERING member is silent on pulls, so lookups meanwhile learned
+			 * only the other holder: forget them when it turns READY */
 			if (ns == PC_NST_READY && p->nstate != PC_NST_READY)
 				holders_forget(a.node, "is ready");
 			p->nstate = ns;
 		}
-		/* ST8: an older build never sets the bit - reads as not */
+		/* an older build never sets the bit - reads as not */
 		p->reconciling = rx_hdr &&
 			(CLWIRE_HDR_FLAGS(rx_hdr) & CLWIRE_F_RECONCILING) != 0;
-		/* 0.5.7.1: a 0.5.7 member says it reconciles but not who
-		 * its witnesses are - unknown, so a restart waits for it */
+		/* a member that says it reconciles but not who its witnesses
+		 * are is unknown (-1), so a restart waits for it */
 		p->sole_witness = (a.have & CLMEMB_A_SOLEWIT)
 			? a.sole_witness : -1;
-		/* 12ny AT-4: its marks belong to its incarnation (a new one
-		 * forgets what the old said); a keepalive without them - an
-		 * older build - confirms nothing, so its marks are cleared */
+		/* its marks belong to its incarnation; a keepalive without them (an older
+		 * build) confirms nothing, so its marks are cleared */
 		p->acks = (a.have & CLMEMB_A_FEAT32) &&
 			(a.features32 & CLMEMB_F32_ACKS);
 		if (a.have & CLMEMB_A_IDENT) {
@@ -8460,8 +6471,8 @@ static void handle_alive(const unsigned char *pt, size_t n,
 			int rs = pc_ack_fleet_member(mo, a.incarn);
 			long long now = now_ms(), was;
 
-			/* AT-8: silent for a purge or more and back with its
-			 * incarnation - cut off, not restarted (that is S392's) */
+			/* silent for a purge or more and back with its incarnation:
+			 * cut off, not restarted (a restart is the reconcile's case) */
 			was = rs >= 0 ? pc_ack_fleet_heard(mo, now) : 0;
 			if (rs == 0 && p->acks && C.cfg_eager && was &&
 			    now - was >= PEER_PURGE_MS)
@@ -8478,7 +6489,7 @@ static void handle_alive(const unsigned char *pt, size_t n,
 							C.st.acks_lowered++;
 			}
 		}
-		/* AR11: its settings; none from a build before 0.6.5 */
+		/* its settings; absent from older builds */
 		p->ncfg = (a.have & CLMEMB_A_CFGSIG) ? a.ncfg : 0;
 		if (p->ncfg) {
 			int lo, hi;
@@ -8487,9 +6498,8 @@ static void handle_alive(const unsigned char *pt, size_t n,
 				(size_t)p->ncfg * sizeof p->cfg_name[0]);
 			memcpy(p->cfg_val, a.cfg_val,
 				(size_t)p->ncfg * sizeof p->cfg_val[0]);
-			/* 12nu: a member that cannot speak the fleet's epoch is
-			 * refused by name - it joined before the commit, or it is
-			 * an old build coming back */
+			/* a member that cannot speak the fleet's committed epoch is refused by
+			 * name: it joined before the commit, or an old build is back */
 			if (peer_speaks(p, pc_cluster_epoch(), &lo, &hi) == 0) {
 				LM_ERR("cluster: REFUSING node %d (%s) - it speaks wire "
 					"epochs %d..%d and the fleet is committed to %d; "
@@ -8504,27 +6514,27 @@ static void handle_alive(const unsigned char *pt, size_t n,
 		p->mem_tier = (a.have & CLMEMB_A_TIER)
 			? a.mem_tier : 0;                   /* 0 = not reported */
 		p->resp_port = (a.have & CLMEMB_A_RESPPORT)
-			? a.resp_port : 0;                  /* S49 */
+			? a.resp_port : 0;
 		p->features = (a.have & CLMEMB_A_FEATURES)
-			? (unsigned char)a.features : 0;    /* S314 */
-		p->http_port = (a.have & CLMEMB_A_HTTP) ? a.http_port : 0; /* S78 */
+			? (unsigned char)a.features : 0;
+		p->http_port = (a.have & CLMEMB_A_HTTP) ? a.http_port : 0;
 		p->boot_ms = (a.have & CLMEMB_A_HTTP)
 			? p->last_seen_ms - (long long)a.uptime_s * 1000 : 0;
-		p->cl_reported = !!(a.have & CLMEMB_A_CLIENTS);   /* S160 */
+		p->cl_reported = !!(a.have & CLMEMB_A_CLIENTS);
 		p->link_pct = (a.have & CLMEMB_A_LINK) ? (signed char)a.link_pct : -1;
 		p->link_level = (a.have & CLMEMB_A_LINK) ? (unsigned char)a.link_level : 0;
 		p->cl_open = p->cl_reported ? a.cl_open : 0;
 		p->cl_resp = p->cl_reported ? a.cl_resp : 0;
 		p->cl_bin = p->cl_reported ? a.cl_bin : 0;
 		p->cl_nresp = p->cl_reported ? a.cl_nresp : 0;
-		p->cols_reported = !!(a.have & CLMEMB_A_COLS);    /* S163 */
+		p->cols_reported = !!(a.have & CLMEMB_A_COLS);
 		p->ncols_total = p->cols_reported ? (unsigned char)a.ncols_total : 0;
 		if (p->cols_reported)
 			cols_merge(p, a.cols, a.ncols, p->last_seen_ms);
 		else
 			p->ncols = 0;
 		{
-			/* PS11/PS12: its relay port and what it wants relayed -
+			/* its relay port and what it wants relayed -
 			 * a new or withdrawn port starts unproven (clps) */
 			uint16_t np = (a.have & CLMEMB_A_PSRELAY) ? (uint16_t)a.ps_port : 0;
 
@@ -8536,12 +6546,8 @@ static void handle_alive(const unsigned char *pt, size_t n,
 					"relay port - relays to it use the cluster "
 					"socket\n", p->node);
 		}
-		/* S107: the first heartbeat with a door to dial is when a
-		 * client can act on it - said once per membership.  A node
-		 * restarted at the SAME address under a new identity lands
-		 * in the same slot with a new id, and no purge ever runs
-		 * for the old one - so the id the clients were told is
-		 * retired first, and the one that replaced it announced. */
+		/* clients hear of a member once per membership; a restart under a new identity
+		 * reuses the slot with no purge, so the id clients were told is retired first */
 		{
 			int now_id = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
 
@@ -8549,17 +6555,20 @@ static void handle_alive(const unsigned char *pt, size_t n,
 				p->clients_told = 0;
 				clients_membership("expelled", p, p->told_node);
 			}
-			if (!p->clients_told && p->client_port && now_id) {
+			if (!p->clients_told && p->client_port && now_id &&
+			        p->nstate != PC_NST_CONNECTING) {   /* once it is ONLINE */
 				p->clients_told = 1;
 				p->told_node = now_id;
 				p->told_state = p->nstate;
 				clients_membership("joined", p, now_id);
 			} else if (p->clients_told && p->told_state != p->nstate) {
-				p->told_state = p->nstate;      /* S462 */
+				p->told_state = p->nstate;
 				clients_membership("state", p, now_id);
 			}
 		}
 	}
+	if (C.role == PC_ROLE_MASTER)
+		cladmit_alive(now_ms());       /* one in flight arrived */
 }
 
 static void handle_master_alive(const unsigned char *pt, size_t n,
@@ -8571,10 +6580,8 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 
 	if (addr_eq(from, &C.self_addr) || !clmemb_malive_parse(pt, n, &m))
 		return;
-	/* CH-12: a master holds an id a master handed out (or a founder's 1).
-	 * CH-19: and counts itself and its live peers - 1 to PC_CL_MAXPEER +
-	 * 1.  The count decides who yields to whom, and was ranked as
-	 * claimed: 0, or 65535 from a forged beacon, made a real master yield */
+	/* a master holds an id a master handed out and counts 1..PC_CL_MAXPEER + 1:
+	 * the count decides who yields, and a forged 0 or 65535 made a real one yield */
 	if (m.node < 1 || m.node > PC_CL_NODE_MAX ||
 	    m.members < 1 || m.members > PC_CL_MAXPEER + 1) {
 		C.st.sender_refused++;
@@ -8584,25 +6591,18 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 				pc_addr_str(from), m.node, m.members);
 		return;
 	}
-	/* S221, and this door is why the gate is a FLEET test.  A master
-	 * keepalive admits a peer on its own - epochtest caught a refused
-	 * node entering membership through here while both of the other
-	 * doors were shut against it.  Checked before the config digest,
-	 * as in handle_join_req: the epoch is the coarser question. */
+	/* a master keepalive admits a peer on its own, so the epoch is checked here
+	 * too, before the config digest: the coarser question first */
 	if (!epoch_ok((m.have & CLMEMB_M_EPOCH) ? m.epoch : 0, from,
 			"master keepalive")) {
 		C.st.epoch_refused++;
 		peer_forget(from);
 		return;
 	}
-	/* 12nu: the fleet's committed epoch rides the master's keepalive; a
-	 * member adopts it (and persists it: it may be the next master).  One
-	 * this build cannot speak is a fleet it cannot stay in. */
-	/* CH-19: from the map's master - any master beacon's commit was
-	 * adopted and persisted, and a replayed old one rolled the epoch
-	 * back.  Before a map there is no master to compare with; after a
-	 * failover the new master beacons the epoch it adopted as a member,
-	 * so nothing waits for its map */
+	/* a member adopts and persists the committed epoch the master beacons (it may be
+	 * the next master); one this build cannot speak is a fleet it cannot stay in */
+	/* only from the map's master, or a replayed old beacon rolls the epoch back; a
+	 * new master beacons the epoch it adopted as a member, so nothing waits for its map */
 	if ((m.have & CLMEMB_M_COMMIT) && m.committed != pc_cluster_epoch() &&
 	    C.role != PC_ROLE_MASTER &&
 	    (!C.map_valid || m.node == (int)C.map.master_id)) {
@@ -8635,11 +6635,8 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 	}
 	their_id = m.node;
 	their_count = m.members;
-	/* S302: a FOREIGN master reaches here only while this node is a
-	 * provisional master (cid_admit).  An established foreign cluster
-	 * always wins - this one was founded seconds ago in a cold-start
-	 * race; a provisional one falls through to the ordinary rules
-	 * below, which pick exactly one of the two. */
+	/* a foreign master gets here only while this node is provisional (cid_admit): an
+	 * established foreign cluster wins; a provisional one falls to the rules below */
 	if (rx_hdr && C.role == PC_ROLE_MASTER) {
 		unsigned char mine_c[16];
 
@@ -8660,20 +6657,8 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 		/* split-brain cure: rank (member count, then address) */
 		int mine = clpeers_count_live(&C.pt, now_ms()) + 1;
 
-		/*
-		 * RULE 3 FIRST, and this ordering is the whole point.  A term
-		 * is issued once and totally ordered; a member count is a
-		 * local observation, and an address is arbitrary.  Where they
-		 * disagree the term is the one that is right - so it is
-		 * checked before them, on the message they are checked on.
-		 *
-		 * Wiring rule 3 into the map handler alone was not enough:
-		 * this cure fires on a 1 Hz keepalive and had already
-		 * resolved the argument by the time any map arrived, seating
-		 * a term-1 master over a term-2 one on address alone.
-		 * Length-gated so a peer that predates the field simply falls
-		 * through to the old ranking.
-		 */
+		/* rule 3 first: a term is totally ordered, a member count is local and an
+		 * address arbitrary; a beacon without a term falls to the count/address rank */
 		if (m.have & CLMEMB_M_TERM) {
 			uint32_t theirs_t = m.term;
 			/* a promoted master's map is the last master's until its first
@@ -8681,9 +6666,8 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 			uint32_t mine_t = C.sync.term > C.map.term ?
 				C.sync.term : C.map.term;
 
-			/* rule 3 obeys any higher term, so an implausible one
-			 * is refused before it - the beacon with it (counted
-			 * in term_rejected, as the map's guard counts) */
+			/* rule 3 obeys any higher term, so an implausible one is refused first,
+			 * with the beacon (counted in term_rejected, as the map's guard counts) */
 			if (!pc_term_plausible(theirs_t)) {
 				if (pc_term_rejected % 100 == 1)
 					LM_WARN("cluster: ignoring node %d's "
@@ -8692,16 +6676,8 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 						theirs_t, pc_term_current());
 				return;
 			}
-			/* S440: SEEN, so the next claim is above it.  A master
-			 * yields here a beat before any map from the winner
-			 * reaches it, and only maps used to raise the term: a
-			 * node that yielded and then had to promote before one
-			 * arrived claimed its OWN last term + 1 - the very term
-			 * it had yielded to (dualclaimtest, GitHub 2026-10-23,
-			 * twice: the node stepdowntest had just stepped down
-			 * promoted at the dead master's term 3).  Rule 3 below
-			 * compares the term this master asserts, not the current
-			 * one, so observing first leaves it as it was. */
+			/* seen, so a later claim is above it: it yields here before any map from
+			 * the winner arrives, and must not promote at the term it yielded to */
 			pc_term_observe(theirs_t);
 			if (pc_term_must_stepdown(1, mine_t, theirs_t)) {
 				LM_WARN("cluster: stepping down - node %d holds "
@@ -8710,28 +6686,8 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 				yield_follow(from, their_id);
 				return;
 			}
-			/*
-			 * A LOWER term never outranks us, whatever it counts
-			 * or wherever it lives.  Without this the ordering is
-			 * not an ordering: rule 3 makes us yield UP the term,
-			 * and the member/address cure below could still make
-			 * us yield DOWN it to the very node that just stepped
-			 * aside - clterm.h rule 1, "a map whose term is below
-			 * ours is REFUSED", applied to the keepalive that
-			 * carries the same claim.
-			 *
-			 * The first cut of this shipped without the guard and
-			 * passed its test by luck: the loser stopped beaconing
-			 * a beat before the winner could act on the stale
-			 * keepalive still in flight.
-			 *
-			 * EQUAL terms fall through on purpose.  Two nodes that
-			 * promoted from the same seen term hold the same one,
-			 * and rule 3's strict inequality has nothing to say -
-			 * so the member count, then the address, breaks the
-			 * tie.  That is a total order and it is what already
-			 * resolves a double promotion (measured: ~2s).
-			 */
+			/* a LOWER term never outranks us (clterm.h rule 1 on the keepalive);
+			 * EQUAL terms fall through to the count, then the address: a total order */
 			if (pc_term_cmp(mine_t, theirs_t) == PC_TERM_STALE)
 				return;
 		}
@@ -8745,14 +6701,8 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 		return;
 	}
 	/* the keepalive is the authoritative master-identity signal */
-	/* CH-12: a member follows the master it follows, or one it knows by
-	 * that id at that address.  A new master after a failover was a
-	 * member, its slot holding its id; a rival master in a merge sends
-	 * its ALIVE before its MASTER_ALIVE every beat, so it is known from
-	 * the next one.  A replayed beacon from an address no member holds
-	 * moved master_addr to it, which sender_admitted then trusted.  A
-	 * JOINING node follows any (it joins the announcer: hint answers are
-	 * MASTER_ALIVE only, and another cluster is refused in cid_admit). */
+	/* a member follows only its master or a node it knows by that id at that address,
+	 * so a replayed beacon cannot move master_addr; a JOINING node follows any */
 	if (C.role == PC_ROLE_MEMBER && !addr_eq(from, &C.master_addr) &&
 	    !clpeers_by_id_from(&C.pt, (unsigned)their_id, from)) {
 		C.st.sender_refused++;
@@ -8763,48 +6713,37 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 				pc_addr_str(&C.master_addr), their_id);
 		return;
 	}
-	/* S452 (1), CH-3: no beacon below the map's term is followed (clterm.h
-	 * rule 1) - the loser's last one moved a member's master for a beat */
+	/* no beacon below the map's term is followed (clterm.h rule 1): the loser's
+	 * last one would move a member's master for a beat */
 	if (C.role == PC_ROLE_MEMBER && (m.have & CLMEMB_M_TERM) &&
 	    pc_term_cmp(C.map.term, m.term) == PC_TERM_STALE) {
 		C.st.sender_refused++;
 		return;
 	}
-	/* S440: the term of the master followed is seen, as its map's is - a
+	/* the term of the master followed is seen, as its map's is - a
 	 * member that must promote before its first map claims above it */
 	if ((m.have & CLMEMB_M_TERM) && pc_term_plausible(m.term))
 		pc_term_observe(m.term);
 	C.master_id = their_id;
 	C.master_addr = *from;
 	C.master_seen_ms = now_ms();
-	elect_defer_ms = 0;                    /* CH-19: a master is followed */
+	elect_defer_ms = 0;                    /* a master is followed */
 	p = peer_upsert(from);
 	if (p)
 		peer_publish(p, their_id, m.free_mb,
 			(m.have & CLMEMB_M_MEM) ? m.total_mb : 0,
 			(m.have & CLMEMB_M_MEM) ? m.live_kb : 0,
 			pd_noident, 0, 0, PC_START_UNKNOWN);
+	if (C.role == PC_ROLE_MEMBER)
+		cladmit_members_check(m.member_digest, from);
 	if (C.role == PC_ROLE_JOINING) {
-		cid_follow_foreign();          /* S302 */
+		cid_follow_foreign();
 		send_join_req(from);           /* fast path: join the announcer */
 	}
 }
 
-/*
- * S222: A FLEET STOP.
- *
- * Every node stops the same way it does on SIGTERM - drains, sends its
- * goodbye, and (S222's other half) takes a snapshot on the way down - so
- * this only has to decide whether to believe the request and then raise
- * that signal.  Believed only from a peer that is a member right now and
- * not from an older term than ours: the datagram is sealed with the
- * cluster secret, but a captured one should not be able to stop a fleet
- * that has since moved on.
- *
- * The stop is a moment later rather than at once: the originator sends
- * three copies, and a node that is already exiting cannot tell anyone it
- * heard the first.
- */
+/* a fleet stop: believed only from a live member not below our term, it raises SIGTERM a moment
+ * later (the originator sends three copies; an exiting node cannot answer the first) */
 static void schedule_self_stop(long long delay_ms)
 {
 	long long at = now_ms() + delay_ms, cur = 0;
@@ -8813,12 +6752,8 @@ static void schedule_self_stop(long long delay_ms)
 		__ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
 
-/* S358: a fleet-wide stats reset.  The page's reset-stats resets its own
- * node and sends this to every live peer, which resets with the SENDER's
- * time - so the fleet's figures all count from one moment and every
- * member reports the same since.reset_at.  Sent twice (the lane when it is
- * up, UDP otherwise); the time de-duplicates.  Applied by the daemon's
- * callback (verbs), so this file stays free of it. */
+/* a fleet-wide stats reset: every live peer resets with the SENDER's time, so all count from one
+ * moment; sent twice (lane, else UDP) and de-duplicated by the time */
 static void (*stats_reset_cb)(long long at);
 static long long stats_reset_seen;     /* the cluster thread's only */
 
@@ -8866,27 +6801,11 @@ static void handle_statsreset(const unsigned char *pt, size_t n,
 		stats_reset_cb((long long)at);
 }
 
-/* S352c (DESIGN 12le): alerts go to a member that can mail.  A node with
- * [mail] says so in its ALIVE (CLMEMB_FEAT_MAILER) - one bit, no secrets -
- * and a node without one sends its alert there (M_ALERT_RELAY) instead of
- * holding a copy of somebody else's SMTP password.  The alert engine
- * (alerts.c) decides what to send and what a relayed alert becomes; this
- * file only carries it, through the callback the daemon registers. */
+/* alerts go to a member that can mail: a node with [mail] advertises CLMEMB_FEAT_MAILER, and one
+ * without relays its alert there (M_ALERT_RELAY) rather than hold another's SMTP password */
 void pc_cluster_set_can_mail(int can)
 {
 	__atomic_store_n(&self_can_mail, can ? 1 : 0, __ATOMIC_RELAXED);
-}
-
-void pc_cluster_replay_counts(unsigned long long *dup, unsigned long long *old,
-		unsigned long long *incarn, unsigned long long *full)
-{
-	unsigned long long c[CLREPLAY_NCOUNT];
-
-	clreplay_counts(c);
-	*dup = c[CLREPLAY_DUP];
-	*old = c[CLREPLAY_OLD];
-	*incarn = c[CLREPLAY_INCARN];
-	*full = c[CLREPLAY_FULL];
 }
 
 unsigned long long pc_cluster_rx_drops(void)
@@ -8894,9 +6813,8 @@ unsigned long long pc_cluster_rx_drops(void)
 	return __atomic_load_n(&C.rxq_drops, __ATOMIC_RELAXED);
 }
 
-/* the lowest node id among the live, READY members, this node included,
- * that can mail.  Every node computes it from its own view the same way,
- * so a fleet that agrees on its membership agrees on the mailer. */
+/* the lowest live READY member id that can mail, this node included: computed alike everywhere,
+ * so a fleet agreeing on membership agrees on the mailer */
 int pc_cluster_mailer(int *is_self)
 {
 	long long now = now_ms();
@@ -9026,7 +6944,7 @@ static void handle_alertrelay(const unsigned char *pt, size_t n,
 	relay_field(r.text, sizeof r.text, pt + o, tl);
 	for (i = 0; i < 32; i++)
 		if (relay_seen[i].node == node && relay_seen[i].seq == r.seq)
-			return;                /* the second copy */
+			return;
 	relay_seen[relay_seen_i].node = node;
 	relay_seen[relay_seen_i].seq = r.seq;
 	relay_seen_i = (relay_seen_i + 1) % 32;
@@ -9042,22 +6960,12 @@ static void handle_fleetstop(const unsigned char *pt, size_t n,
 	int node;
 
 	if (n < 7 || !p || !__atomic_load_n(&p->node, __ATOMIC_ACQUIRE))
-		return;                    /* not a member we know: ignored */
+		return;
 	node = (pt[1] << 8) | pt[2];
 	their_term = ((uint32_t)pt[3] << 24) | ((uint32_t)pt[4] << 16) |
 		((uint32_t)pt[5] << 8) | pt[6];
-	/*
-	 * S233: against the term of the map this node FOLLOWS, not its own
-	 * claim.  The two part company after a partition heals: an isolated
-	 * node that promoted claims a term (persisted) its map never carried
-	 * when it could not publish, yields to the majority's master on the
-	 * tie, and follows a map one term BELOW its own claim.  Judged by the
-	 * claim, its own master's stop looked like a stale one from "a fleet
-	 * that has since moved on" and was ignored - RV-5's fault run, where
-	 * that node alone stayed up and then led the restarted fleet.  A
-	 * replayed stop from a fleet that really moved on is still refused:
-	 * its term is below the current map's.
-	 */
+	/* against the term of the map this node FOLLOWS, not its own claim, which a healed
+	 * isolated node holds above it; a replayed stop is still below the current map's */
 	ours = C.map_valid ? C.map.term : pc_term_current();
 	if (pc_term_cmp(ours, their_term) == PC_TERM_STALE) {
 		if (pc_logrl_ok(LRL_FLEETSTOP, from))
@@ -9073,10 +6981,8 @@ static void handle_fleetstop(const unsigned char *pt, size_t n,
 	schedule_self_stop(300);
 }
 
-/* S233: the node ids that said GOODBYE, newest last - what a fleet stop
- * reads to call a peer STOPPED rather than merely gone from the live set.
- * One writer (the peer thread), readers on workers: the id is stored
- * before the count is released. */
+/* the node ids that said GOODBYE, newest last, so a fleet stop calls a peer STOPPED, not gone;
+ * one writer (the peer thread): the id is stored before the count is released */
 static int bye_ids[PC_CL_MAXPEER];
 static unsigned int bye_n;
 
@@ -9116,13 +7022,8 @@ static void handle_goodbye(const unsigned char *pt, size_t n,
 		p = &C.pt.peers[i];
 		if (addr_eq(&p->addr, from)) {
 			node = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
-			/* CH-13: the node at this address, in this run - not
-			 * a goodbye some earlier one sent, captured and sent
-			 * again from here, which expelled whatever ran there
-			 * now (the master included: an election at once).  An
-			 * older build names its id but not its incarnation; a
-			 * slot whose incarnation is not known yet cannot be
-			 * compared either way */
+			/* only the node at this address in this run: a replayed goodbye would
+			 * expel whatever runs there now; an unknown incarnation cannot compare */
 			if (!node || said != node ||
 			    (have_incarn && p->incarn && incarn != p->incarn)) {
 				C.st.goodbye_refused++;
@@ -9138,10 +7039,8 @@ static void handle_goodbye(const unsigned char *pt, size_t n,
 		C.master_seen_ms = 0;          /* master left: elect at once */
 }
 
-/* S83: is there anything to pull?  Eager is a property of a collection
- * ([collection x] mode = eager) as much as of the fleet ([cluster] mode
- * = eager, which is C.cfg_eager); the pull serves every collection that
- * is eager, so this asks the collections. */
+/* is there anything to pull?  Eager is a collection's property as much as the fleet's, and the
+ * pull serves every eager collection, so this asks the collections */
 static int any_eager(void)
 {
 	int c;
@@ -9152,87 +7051,13 @@ static int any_eager(void)
 	return 0;
 }
 
-/* S83: who to pull the bootstrap from - live, READY, holding records
- * ahead of holding none, lowest id first - handed to the bulk thread.
- * 1 = a pull is on its way, 0 = nobody qualifies yet. */
-/* 12ny AT-7: a node that came back with nothing takes what the fleet holds,
- * and every delete a source had confirmed before the pull began is
- * reflected in what it sends - so, space by space, the lowest mark the
- * candidate sources announced is this node's floor (clack_floor): their
- * prefixes, forgotten before this node was a member, are never asked for.
- * The lowest, since the pull may fall back to another candidate; a space a
- * candidate has not announced gets none */
-struct bfl { uint64_t oid; uint32_t incarn; uint64_t lo; int n; };
-static struct bfl bflv[CLACK_SPACES];
-static int bfln;
-static uint64_t bfl_members[BOOT_MAX_CAND];
-static int bfl_nmem;
-
-static int bfl_cb(uint64_t member, uint32_t incarn, uint64_t oid,
-		uint32_t sincarn, uint64_t mark, void *ctx)
-{
-	int i, k;
-
-	(void)incarn; (void)ctx;
-	for (k = 0; k < bfl_nmem && bfl_members[k] != member; k++)
-		;
-	if (k == bfl_nmem)
-		return 0;
-	for (i = 0; i < bfln; i++)
-		if (bflv[i].oid == oid && bflv[i].incarn == sincarn)
-			break;
-	if (i == bfln) {
-		if (bfln == CLACK_SPACES)
-			return 0;
-		bflv[i].oid = oid;
-		bflv[i].incarn = sincarn;
-		bflv[i].lo = mark;
-		bflv[i].n = 0;
-		bfln++;
-	}
-	if (mark < bflv[i].lo)
-		bflv[i].lo = mark;
-	bflv[i].n++;
-	return 0;
-}
-
-static void acks_boot_floors(const int *ids, int n)
-{
-	int i, k;
-
-	/* S455: a resync's pull is a joiner's: what this node held of the
-	 * spaces before it is gone, its sources' marks are the floor */
-	if (!(came_back_empty() || C.resync_floor) || !pc_ack_enabled() ||
-	    self_no_acks)
-		return;
-	bfl_nmem = 0;
-	for (i = 0; i < n && bfl_nmem < BOOT_MAX_CAND; i++) {
-		struct peer *p = peer_by_node(ids[i]);
-
-		if (p && p->has_ident && p->acks)
-			bfl_members[bfl_nmem++] = fnv1a64(p->ident, sizeof p->ident);
-	}
-	if (bfl_nmem < n)
-		return;                        /* a candidate announces no marks */
-	bfln = 0;
-	pc_ack_fleet_each(bfl_cb, NULL);
-	for (k = 0; k < bfln; k++)
-		if (bflv[k].n == bfl_nmem && bflv[k].lo &&
-		    pc_ack_floor(bflv[k].oid, bflv[k].incarn, bflv[k].lo) ==
-		        CLACK_NEW)
-			C.st.acks_floors++;
-	if (C.st.acks_floors)
-		LM_NOTICE("cluster: %s - %llu numbering space(s) floored at "
-			"what the bootstrap's sources confirmed\n", C.resync_floor
-			? "resynced" : "came back empty", C.st.acks_floors);
-	C.resync_floor = 0;                /* S455: once, at the pick */
-}
-
+/* who to pull the bootstrap from: live, READY, holding records ahead of none, lowest id first,
+ * handed to the bulk thread.  1 = a pull is on its way, 0 = nobody qualifies yet */
 static int boot_request(void)
 {
 	long long now = now_ms();
 	pc_addr addr[BOOT_MAX_CAND];
-	int id[BOOT_MAX_CAND], n = 0, i, j;
+	int id[BOOT_MAX_CAND], n = 0, i, j, held_unready = 0;
 	unsigned int ent[BOOT_MAX_CAND];
 
 	for (i = 0; i < C.pt.n_peers; i++) {
@@ -9240,6 +7065,8 @@ static int boot_request(void)
 		int pid = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
 		unsigned int pe = p->entries;
 
+		if (pid && clpeers_live(p, now) && p->nstate != PC_NST_READY && pe)
+			held_unready = 1;      /* still replaying, or not admitted yet */
 		if (!pid || !clpeers_live(p, now) ||
 		        p->nstate != PC_NST_READY)
 			continue;
@@ -9264,9 +7091,11 @@ static int boot_request(void)
 		if (n < BOOT_MAX_CAND)
 			n++;
 	}
-	if (!n)
+	/* empty ready peers say nothing while one not ready yet holds records: after a whole-fleet
+	 * restart only the authors' WALs hold the keyspace, and done here, nobody backfills us */
+	if (!n || (!ent[0] && held_unready))
 		return 0;
-	acks_boot_floors(id, n);               /* 12ny AT-7 */
+	acks_boot_floors(id, n);
 	if (!ent[0])
 		return 2;                      /* every ready peer holds nothing:
 		                                * there is nothing to pull */
@@ -9277,16 +7106,13 @@ static int boot_request(void)
 	return 1;
 }
 
-/* S83: the bootstrap decision, on the tick, for a member and a master
- * alike - a founder with live peers holding records pulls too.  The
- * arithmetic is clboot's; what stays here is the peer scan it needs, the
- * three messages an operator reads when a bootstrap gives up, and the
- * node-state change that follows each. */
+/* the bootstrap decision on the tick, for a member and a master alike (a founder with live
+ * peers pulls too); the arithmetic is clboot's, the peer scan and messages are here */
 static void boot_tick(long long now)
 {
 	int pending, failed_round, act;
 
-	/* S83: a joiner that is still waiting to pull - the first
+	/* a joiner that is still waiting to pull - the first
 	 * heartbeats may not have reached it at ASSIGN time */
 	if (pc_node_state() != PC_NST_RECOVERING || clboot_done(&C.bt))
 		return;
@@ -9315,55 +7141,8 @@ static void boot_tick(long long now)
 	}
 }
 
-/* the 1s membership cadence + the join FSM (called from the thread) */
-/* S69: the created set to one peer - every runtime name this node knows,
- * live or tombstoned, each with the generation that last moved it.  Sent
- * once per peer, the first time it is seen, which is what carries a
- * create across a node's downtime. */
-static void col_sync_peer(struct peer *p)
-{
-	unsigned char msg[16 + PC_COL_NAME_MAX];
-	struct clcol_ann a;
-	const char *name;
-	unsigned long long gen;
-	int i, bl, live;
-
-	for (i = 0; i < pc_store_count(); i++) {
-		size_t nl;
-
-		if (pc_store_entry(i, &name, &bl, &gen, &live) != 0)
-			continue;              /* not a runtime name */
-		nl = strlen(name);
-		if (nl == 0 || nl >= PC_COL_NAME_MAX)
-			continue;
-		memset(&a, 0, sizeof a);
-		a.op = live ? CLCOL_OP_SET : CLCOL_OP_DROP;
-		a.buckets_log2 = bl;
-		a.gen = gen;
-		a.name = name;
-		a.nlen = (unsigned int)nl;
-		seal_send(&p->addr, msg,
-			clcol_write(msg, sizeof msg, M_COL_SET, &a));
-	}
-	/* S432: and the RESP map's overrides, tombstones too, to a peer that
-	 * reads them - the same anti-entropy carries a map across a downtime */
-	pc_respmap_each(respmap_sync_cb, p);
-	/* S436: and the autoscale modes set at runtime: a member that was
-	 * down, restarted or simply lost the announce takes the fleet's */
-	for (i = 0; i < pc_store_count(); i++) {
-		int m;
-
-		if (pc_store_autoscale_entry(i, &name, &m, &gen) == 0)
-			autoscale_send(p, name, strlen(name), m, gen);
-	}
-}
-
-/* S125: bytes sitting in a receive queue right now.  SO_MEMINFO's first
- * word is sk_rmem_alloc, the bytes charged to the queue - measured: 0
- * empty, 23,040 with ten 1,400-byte datagrams waiting, 66,816 under a
- * flood.  FIONREAD cannot be used for this: on a Linux UDP socket it
- * answers the size of the FIRST datagram (measured 1,400 with 23,040
- * queued), so it reads as a flat number while a node drowns. */
+/* bytes in a receive queue now: SO_MEMINFO's first word (sk_rmem_alloc); FIONREAD on a Linux
+ * UDP socket answers only the FIRST datagram's size, flat while a node drowns */
 static unsigned int rx_queue_bytes(int fd)
 {
 	unsigned int mi[16];
@@ -9375,38 +7154,8 @@ static unsigned int rx_queue_bytes(int fd)
 	return mi[0];
 }
 
-/* S125: the receive plane's rates, sampled ON READ by whichever thread is
- * answering the operator - not on any periodic tick.
- *
- * Both candidate ticks are starved by exactly the load these figures
- * exist to report, which was measured rather than assumed:
- *
- *   The CLUSTER thread is the subject of the measurement.  It is the one
- *   that falls behind, its 1 Hz duties run late when it does, and the
- *   tree already carries a heartbeat watchdog whose job is covering for
- *   it when it goes heads-down.  A sampler there goes quiet at the moment
- *   a node starts lagging.
- *
- *   The MAINTENANCE thread looked like the right home - it is where
- *   pc_obs_tick_1hz() takes the daemon's other per-second figures - and
- *   it is not.  Measured on a two-node eager pair under a three-writer
- *   drive: pc-maint stopped completing an iteration for minutes at a
- *   time, stuck in the S109 held-bytes walk contending with the applier
- *   on the overflow leg's single lock, and every 1 Hz duty behind it
- *   stopped with it - the splitter included, which is why the table sat
- *   at 8,832 buckets holding 1.26M entries.  The gauges froze at a stale
- *   reading while the node kept applying, which is the exact failure this
- *   task exists to prevent.  Filed as its own defect.
- *
- * What is NOT starved is the thread serving the operator: a lagging
- * node's client door stays fast, which is the whole premise of the task.
- * So the sample is taken by the reader, and the published rate is "since
- * the last read" measured against real elapsed milliseconds.  A floor of
- * RX_SAMPLE_MIN_MS keeps two readers arriving together from computing a
- * rate over a sliver; below it the previous reading is served again.
- *
- * The mutex makes the sample atomic between concurrent readers.  It is
- * off every hot path - only stats, /metrics and the status page take it. */
+/* rx rates are sampled on read by the stats reader: the cluster and maintenance ticks starve
+ * under the load they report; below RX_SAMPLE_MIN_MS the last reading is served again */
 #define RX_SAMPLE_MIN_MS 500
 
 static pthread_mutex_t rx_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -9445,47 +7194,61 @@ static void rx_sample(void)
 	pthread_mutex_unlock(&rx_mx);
 }
 
-/* S36 step e2 (memberlist's TCP fallback probe): before a peer whose
- * UDP went silent is purged, or a master declared dead, ask whether TCP
- * still reaches it.  An established lane says yes; otherwise one probe
- * connect, given LANE_PROBE_MS.  Alive on TCP = UDP is blocked or lost
- * on this path, not a dead node: an ERROR once, every frame to it by
- * the lane, and M_LANE_FORCE so it sends everything back by TCP too -
- * its beats then arrive and it is live again.  Unicast with a lane only. */
+/* before a peer silent on UDP is purged or a master declared dead, ask whether TCP still reaches
+ * it; alive on TCP means UDP is blocked on this path: force the lane both ways (unicast only) */
 #define LANE_PROBE_MS 3000
-static struct { pc_addr a; long long ms; } lane_probe[64];
+/* TCP alone may be a new process on the old address: a UDP probe answered inside this says so */
+#define LANE_ASK_MS 1500
+struct lprobe { pc_addr a; long long ms, ask_ms, heard_ms; };
+static struct lprobe lane_probe[64];
 static int lane_probe_n;
 static unsigned long long lane_saves;
 
-static long long *lane_probe_slot(const pc_addr *a)
+/* the cluster thread's only; NULL when @a has none and @make is 0 */
+static struct lprobe *lane_probe_slot(const pc_addr *a, int make)
 {
 	int i;
 
 	for (i = 0; i < lane_probe_n; i++)
 		if (pc_addr_eq(&lane_probe[i].a, a))
-			return &lane_probe[i].ms;
+			return &lane_probe[i];
+	if (!make)
+		return NULL;
 	i = lane_probe_n < 64 ? lane_probe_n++ : (int)(lane_saves % 64);
+	memset(&lane_probe[i], 0, sizeof lane_probe[i]);
 	lane_probe[i].a = *a;
-	lane_probe[i].ms = 0;
-	return &lane_probe[i].ms;
+	return &lane_probe[i];
 }
 
 /* 1 = TCP says it lives (or may - the probe is still out): keep it */
 static int lane_keeps(const pc_addr *a, long long silent_ms,
 		long long now)
 {
-	long long age, *pm;
+	long long age;
+	struct lprobe *pm;
 	int st;
 
-	if (!cl_unicast || cl_max_dgram <= 0)
+	if (!cl_unicast || cl_max_dgram <= 0 || frx_since(a, now - silent_ms))
 		return 0;
 	st = clane_tcp_state(a, &age);
-	pm = lane_probe_slot(a);
+	pm = lane_probe_slot(a, 1);
 	if (st == CLANE_TCP_UP) {
-		*pm = 0;
+		pm->ms = 0;
 		if (!clane_forced(a)) {
 			unsigned char m = M_LANE_FORCE;
 
+			/* asked inside this silence and answered by UDP: the path works, the silence
+			 * is the incarnation we knew - it is gone, whatever now listens on TCP */
+			if (pm->ask_ms >= now - silent_ms && pm->heard_ms >= pm->ask_ms)
+				return 0;
+			if (pm->ask_ms < now - silent_ms) {
+				m = M_LANE_PROBE;
+				pm->ask_ms = now;
+				(void)clsend_seal_udp(a, &m, 1);
+				return 1;
+			}
+			if (now - pm->ask_ms < LANE_ASK_MS)
+				return 1;
 			clane_force(a, 1);
 			seal_send(a, &m, 1);       /* forced: it goes by the lane */
 			lane_saves++;
@@ -9498,24 +7261,20 @@ static int lane_keeps(const pc_addr *a, long long silent_ms,
 		}
 		return 1;
 	}
-	if (!*pm) {
-		*pm = now;                     /* ask once */
+	if (!pm->ms) {
+		pm->ms = now;                  /* ask once */
 		clane_probe(a);
 		return 1;
 	}
-	return now - *pm < LANE_PROBE_MS && st == CLANE_TCP_PENDING;
+	return now - pm->ms < LANE_PROBE_MS && st == CLANE_TCP_PENDING;
 }
 
-/* S329: whether the frame being dispatched came by the TCP lane - set by
+/* whether the frame being dispatched came by the TCP lane - set by
  * drain_lane around its dispatch, so a lane frame never counts as UDP */
 static int rx_via_lane;
 
-/* S329: every lane_retry_s, ask each peer this node forced its lane to
- * whether UDP works again - one empty datagram, by UDP whatever the lane
- * says.  Its answer comes by UDP too, so it arriving proves both
- * directions, and only then is the force lifted (lane_probe_r).  A peer
- * that forced ITS lane to us asks for itself.  A block that holds simply
- * loses the probe or the answer, and nothing changes. */
+/* every lane_retry_s, probe each peer this node forced to the lane by plain UDP; the answer comes
+ * by UDP too, proving both directions, and only then is the force lifted (lane_probe_r) */
 static void lane_retry_tick(long long now)
 {
 	static long long last;
@@ -9540,6 +7299,12 @@ static void handle_lane_probe(const pc_addr *from)
 
 static void handle_lane_probe_r(const pc_addr *from)
 {
+	struct lprobe *pm;
+
+	if (!rx_via_lane && (pm = lane_probe_slot(from, 0)))
+		pm->heard_ms = now_ms();
+	if (!rx_via_lane)
+		cladmit_probe_answered(clpeers_by_addr(&C.pt, from), now_ms());
 	if (rx_via_lane || !clane_forced(from))
 		return;
 	clane_force(from, 0);
@@ -9565,13 +7330,8 @@ unsigned long long pc_cluster_lane_saves(void)
 	return lane_saves;
 }
 
-/* S36 step e3 (SWIM's indirect probe): a member whose master went
- * silent asks up to MPROBE_ASK live peers whether THEY hear it before
- * electing.  If one heard it within MPROBE_FRESH_MS, only this node's
- * path to the master is broken - promoting would split the fleet - so
- * it holds, re-asking every tick, for at most MPROBE_HOLD_MS; then it
- * elects as before (the probe removes false failovers, it never wedges
- * a fleet without a master). */
+/* a member whose master went silent asks up to MPROBE_ASK peers if they hear it; if one does,
+ * only this node's path is broken and it holds the election, at most MPROBE_HOLD_MS */
 #define MPROBE_ASK      3
 #define MPROBE_FRESH_MS 2000
 #define MPROBE_HOLD_MS  30000
@@ -9673,7 +7433,7 @@ unsigned long long pc_cluster_mprobe_holds(void)
 	return mprobe_holds;
 }
 
-#define SELF_LATE_MS 2000                  /* S36 e1 */
+#define SELF_LATE_MS 2000
 static long long self_late_until;
 static unsigned long long self_late_n;
 
@@ -9687,14 +7447,8 @@ static void membership_tick(void)
 	long long now = now_ms();
 	int i;
 
-	/* S69: the created set to every live peer - at once when a peer is
-	 * first seen, and again every COL_RESYNC_BEATS seconds.  The
-	 * announcement a create sends is one fire-and-forget datagram, so a
-	 * peer that was restarting, partitioned or simply unlucky misses it
-	 * and would otherwise stay short a collection for ever; this is the
-	 * anti-entropy behind it, the same posture the repair sweep has
-	 * behind the write-path push.  A handful of ~20-byte datagrams per
-	 * peer per interval, and idempotent by generation at the receiver. */
+	/* the created set to every live peer: when first seen, then every COL_RESYNC_BEATS
+	 * beats, behind the create's one fire-and-forget datagram; idempotent by generation */
 	{
 		static int col_beat;
 		int resync = ++col_beat % COL_RESYNC_BEATS == 0;
@@ -9707,17 +7461,13 @@ static void membership_tick(void)
 			}
 	}
 
-	pc_cid_tick(now);                      /* S302: provisional -> established */
-	eager_settle_tick(now);                /* S303 */
-	mesh_hint_tick(now);                   /* S36 */
-	lane_retry_tick(now);                  /* S329 */
+	pc_cid_tick(now);                      /* provisional -> established */
+	eager_settle_tick(now);
+	mesh_hint_tick(now);
+	lane_retry_tick(now);
 
-	/* S36 step e1 (Lifeguard's local health): a node whose OWN loop ran
-	 * late - stopped, starved of CPU, a paused VM - wakes with its
-	 * peers' beats still unread in its socket, and would purge every
-	 * one of them as silent and elect itself.  So after its own stall it
-	 * holds purges and master-dead decisions for as long as the stall
-	 * lasted (2 s at least), while the fresh beats arrive. */
+	/* after its OWN loop ran late (starved, a paused VM) a node holds purges and elections
+	 * for as long as the stall (2 s at least): its peers' beats are still unread */
 	{
 		static long long last_tick;
 
@@ -9739,34 +7489,29 @@ static void membership_tick(void)
 	for (i = 0; i < C.pt.n_peers && now >= self_late_until; i++)
 		if (C.pt.peers[i].node &&
 		        now - C.pt.peers[i].last_seen_ms >= PEER_PURGE_MS &&
-		        !lane_keeps(&C.pt.peers[i].addr,                 /* S36 e2 */
+		        !lane_keeps(&C.pt.peers[i].addr,
 		                now - C.pt.peers[i].last_seen_ms, now))
 			peer_gone(&C.pt.peers[i], CLRES_GONE_SILENT);
 
 	switch (C.role) {
 	case PC_ROLE_JOINING:
-		if (now >= C.join_deadline_ms && found_gate_blocks(now)) {
-			/* S36c: a blank unicast node waits - re-announcing */
+		if (now >= C.join_deadline_ms && clfound_gate_blocks(now)) {
+			/* a blank unicast node waits - re-announcing */
 			C.join_deadline_ms = now + 1000;
 			send_join_req(NULL);
 		} else if (now >= C.join_deadline_ms && C.master_id &&
 		           C.master_seen_ms && now - C.master_seen_ms < MASTER_DEAD_MS) {
-			/* a master beacons: wait for its answer - founding beside it took
-			 * mastership back after a handover (handovertest, ASan: term 3) */
+			/* a master beacons: wait for its answer - founding beside it
+			 * would take mastership back after a handover */
 			C.join_deadline_ms = now + 1000;
 			send_join_req(&C.master_addr);
 		} else if (now >= C.join_deadline_ms) {
-			if (now - C.higher_joiner_ms < 2000 &&
-			        C.join_defers < JOIN_DEFER_MAX) {
-				C.join_defers++;
-				C.join_deadline_ms = now + JOIN_DEFER_MS;
-				send_join_req(NULL);
-				LM_INFO("cluster: higher-address joiner active - "
-					"deferring (%d/%d)\n", C.join_defers,
-					JOIN_DEFER_MAX);
-			} else {
+			long long at = clfound_settle_at(now);     /* lowest identity founds */
+
+			if (now >= at)
 				become_master(1);
-			}
+			else
+				C.join_deadline_ms = at;   /* re-announcing meanwhile, below */
 		} else if (now - C.join_last_ms >= 1000) {
 			send_join_req(NULL);       /* re-announce while waiting */
 		}
@@ -9775,31 +7520,45 @@ static void membership_tick(void)
 		send_alive();
 		boot_tick(now);
 		if (now - C.master_seen_ms < MASTER_DEAD_MS)
-			mprobe_first_ms = 0;          /* S36 e3: heard again */
-		/* S329: master_seen_ms 0 is the master's GOODBYE - "elect at
-		 * once".  It is not silence, and the lane must not be asked:
-		 * the departing master's TCP lane is often still up while it
-		 * finishes stopping, and "silent" was then now - 0, the time
-		 * since THIS machine booted - the PROD AU fleet forced its lane
-		 * to a master that was only rebooting, and never let go. */
-		if (now - C.master_seen_ms >= MASTER_DEAD_MS &&
-		        now >= self_late_until &&             /* S36 e1 */
+			mprobe_first_ms = 0;          /* heard again */
+		/* never admitted, so no candidate: an admitted member elects the next master, which
+		 * checks this node again; with none left it waited for ever - a joiner again founds */
+		if (pc_node_state() == PC_NST_CONNECTING &&
+		        now - C.master_seen_ms >= MASTER_DEAD_MS && now >= self_late_until &&
 		        (C.master_seen_ms == 0 ||
-		         !lane_keeps(&C.master_addr,          /* S36 e2 */
+		         !lane_keeps(&C.master_addr, now - C.master_seen_ms, now)) &&
+		        !admitted_peer_live(now)) {
+			LM_NOTICE("cluster: master %d lost while this node was CONNECTING - "
+				"joining again\n", C.master_id);
+			C.master_id = 0;
+			C.master_seen_ms = 0;
+			join_again(NULL);
+			break;
+		}
+		/* master_seen_ms 0 is the master's GOODBYE: elect at once, without asking the
+		 * lane - a stopping master's lane is often still up, and now - 0 is no silence */
+		if (now - C.master_seen_ms >= MASTER_DEAD_MS &&
+		        now >= self_late_until &&
+		        (C.master_seen_ms == 0 ||
+		         !lane_keeps(&C.master_addr,
 		                now - C.master_seen_ms, now)) &&
-		        !mprobe_holds_election(now) &&        /* S36 e3 */
-		        !self_no_promote) {                   /* CH-19: a test flag */
+		        !mprobe_holds_election(now) &&
+		        pc_node_state() != PC_NST_CONNECTING &&   /* not admitted yet */
+		        (!cladmit_online_ms() || now - cladmit_online_ms() >= MASTER_DEAD_MS) &&
+		        !self_no_promote) {                   /* a test flag */
 			/* the highest live (ip,port) self-promotes; stickiness
 			 * holds because a live master never reaches this path */
 			int best = 1;
 			struct peer *higher = NULL, *sb = NULL;
 
-			/* CH-9: the map's standby holds the synced state - a live
+			/* the map's standby holds the synced state - a live
 			 * one is the candidate, itself or the one deferred to */
+			/* a CONNECTING one cannot promote (its own election waits for ONLINE): named
+			 * in the map the moment it was admitted, deferring to it only ran out the bound */
 			if (C.map_valid && C.map.backup_id && C.map.backup_id != C.node_id &&
 			    (sb = peer_by_node(C.map.backup_id)) &&
 			    (now - sb->last_seen_ms >= MASTER_DEAD_MS ||
-			     sb->nstate == PC_NST_STALLED))
+			     sb->nstate == PC_NST_STALLED || sb->nstate == PC_NST_CONNECTING))
 				sb = NULL;
 			if (sb) {
 				best = 0;
@@ -9808,25 +7567,17 @@ static void membership_tick(void)
 			for (i = 0; i < C.pt.n_peers; i++)
 				if (C.pt.peers[i].node &&
 				        now - C.pt.peers[i].last_seen_ms < MASTER_DEAD_MS &&
-				        /* S218: a STALLED peer is live - its
-				         * watchdog beats - and is not a
-				         * candidate: it is not running this
-				         * election and could not serve if it
-				         * won.  Deferring to it deferred for
-				         * ever. */
+				        /* a STALLED peer is live (its watchdog beats) but not
+				         * a candidate: deferring to it deferred for ever */
 				        C.pt.peers[i].nstate != PC_NST_STALLED &&
+				        C.pt.peers[i].nstate != PC_NST_CONNECTING &&
 				        addr_cmp(&C.pt.peers[i].addr, &C.self_addr) > 0) {
 					best = 0;
 					higher = &C.pt.peers[i];
 					break;
 				}
-			/* CH-19: deferred to one higher address, live but never
-			 * beaconing as master, for longer than its own probe hold
-			 * and a master's death could explain - it is not running
-			 * this election (a replayed ALIVE from that address looks
-			 * exactly so), and the fleet would wait for ever.  Two
-			 * masters, if that is what follows, settle as always: term,
-			 * then members, then address */
+			/* deferred longer than a probe hold plus a master's death to a higher
+			 * address that never beacons: it is not electing, so this node promotes */
 			if (!best && higher) {
 				if (!elect_defer_ms ||
 				        !addr_eq(&elect_defer_to, &higher->addr)) {
@@ -9854,16 +7605,12 @@ static void membership_tick(void)
 	case PC_ROLE_MASTER:
 		send_alive();
 		send_master_alive();
-		boot_tick(now);                /* S83: a founder may be pulling */
-		/* Publish whatever the standby has already acknowledged, and
-		 * abandon anything it has left hanging.  Then stage the next
-		 * change: every few seconds rather than only on change, so a
-		 * node that missed a datagram catches up without anyone
-		 * tracking who has what, and immediately when the membership
-		 * has moved, because ownership follows the map and a stale
-		 * one keeps routing at a node that has gone. */
+		boot_tick(now);                /* a founder may be pulling */
+		cladmit_tick(now);
+		/* publish what the standby acked and drop what it left hanging; restage every few
+		 * seconds so a missed map heals, and at once when membership moves */
 		clmap_tick(now);
-		handover_tick(now);            /* CH-9 */
+		handover_tick(now);
 		if (now - C.map_pub_ms >= CLMAP_PUB_MS ||
 		        clmap_membership_moved())
 			clmap_stage();
@@ -9871,12 +7618,11 @@ static void membership_tick(void)
 	default:
 		break;
 	}
-	/* liveness moves without a map arriving, so the verdict is retaken
-	 * every tick rather than only when one does - a stale "usable" is
-	 * how the two bases end up disagreeing and forking a re-write */
+	/* liveness moves without a map, so the verdict is retaken every tick: a stale
+	 * "usable" lets the two bases disagree and fork a re-write */
 	clmap_recheck_usable();
 	reconcile_tick();
-	restart_witness_note();                /* S274 */
+	restart_witness_note();
 	C.st.node_id = C.node_id;
 	C.st.role = C.role;
 	C.st.state = pc_node_state();
@@ -9890,9 +7636,8 @@ static void membership_tick(void)
 	C.st.map_stale = C.map_stale_n;
 	C.st.map_bad = C.map_bad_n;
 	C.st.map_unadmitted = C.map_unadmitted_n;
-	/* the published answer, not this node's local variable: a member
-	 * has no opinion of its own and would otherwise report "no standby"
-	 * for a cluster that has one */
+	/* the published standby, not this node's own variable: a member has none and would report
+	 * "no standby" for a cluster that has one */
 	C.st.backup_id = C.map_valid ? C.map.backup_id : C.backup_id;
 	C.st.hist_n = C.hist.n;
 	C.st.held_valid = C.held_valid;
@@ -9914,147 +7659,12 @@ static void handle_fwd_json(const unsigned char *pt, size_t n,
 		const pc_addr *from);
 static void handle_fwd_jack(const unsigned char *pt, size_t n);
 
-/* drain and dispatch every queued datagram (peer thread only).  Also
- * the migration pump's wait step: acks arriving here open the send
- * window.  Returns the number of datagrams handled. */
-/* Fairness bound on a single socket's drain.  A firehose on one
- * socket - migration ingest, where the donor's ack window refills it
- * continuously and every record costs a store - must not keep this
- * loop from the OTHER socket and the 1 Hz membership tick: an
- * observer that reads data for longer than MASTER_DEAD_MS convicts a
- * live master of death and promotes over it (the RECEIVER-DEAF half
- * of the donor-starvation pathology; the emit half has beat_pump and
- * the watchdog thread, whose silence in the daemon logs is what
- * convicted this half).  Poll is level-triggered - pending data
- * re-wakes the loop instantly - so the cap costs nothing in
- * throughput; it only guarantees the loop breathes. */
+/* cap one socket's drain: a firehose (migration ingest) must not starve the other socket and the
+ * 1 Hz tick, or a live master is convicted dead; poll is level-triggered, so the cap is free */
 #define DRAIN_BATCH 64
 
-/* S69: a collection created or dropped elsewhere in the fleet.  Applied
- * whatever this node's own allow_create says - the gate governs who may
- * ORIGINATE, and a collection set that differs per node is the failure
- * S69 exists to remove.  Idempotent: the generation orders the create
- * and the drop of one name, so a re-announce never undoes a later drop. */
-static void handle_col_set(const unsigned char *pt, size_t n)
-{
-	char name[PC_COL_NAME_MAX];
-	struct clcol_ann a;
-	unsigned long long gen;
-	size_t nl;
-	int bl, drop;
-
-	if (!clcol_parse(pt, n, &a))
-		return;
-	drop = a.op == CLCOL_OP_DROP;
-	bl = a.buckets_log2;
-	gen = a.gen;
-	nl = a.nlen;
-	/* the NAME BOUND is this file's: clcol refuses what will not fit the
-	 * datagram, PC_COL_NAME_MAX is what the store will accept */
-	if (nl >= PC_COL_NAME_MAX)
-		return;
-	memcpy(name, a.name, nl);
-	name[nl] = 0;
-	pc_lamport_observe(gen);
-	if (a.op == CLCOL_OP_MAP) {        /* S432: the RESP map, by generation */
-		char col[PC_COL_NAME_MAX] = "", was[PC_COL_NAME_MAX] = "";
-		char *end;
-		long idx = strtol(name, &end, 10);
-		int set = a.buckets_log2 ? 1 : 0;
-
-		if (*end || idx < 0 || idx >= PC_RESPMAP_MAX)
-			return;
-		if (set) {
-			if (!a.to || !a.tlen || a.tlen >= PC_COL_NAME_MAX)
-				return;
-			memcpy(col, a.to, a.tlen);
-			col[a.tlen] = 0;
-		}
-		if (pc_respmap_apply((int)idx, col, strlen(col), gen, set, was,
-		        sizeof was) == 1) {
-			pc_respmap_persist();
-			if (set)
-				LM_NOTICE("resp: DB index %ld mapped to collection "
-					"'%s' by the fleet (was '%s')\n", idx, col,
-					was[0] ? was : "-");
-			else
-				LM_NOTICE("resp: DB index %ld unmapped by the fleet "
-					"(was '%s'): it answers as resp_collections "
-					"maps it\n", idx, was[0] ? was : "-");
-		}
-		return;
-	}
-	if (a.op == CLCOL_OP_AUTOSCALE) {  /* S436: a mode, by generation */
-		int was = -1;
-
-		/* the test flags: an older build, or deaf to the fleet's */
-		if (self_no_autoscale || self_as_deaf)
-			return;
-		/* a collection not here yet is skipped: the resync sends the
-		 * mode again once the create has reached this node */
-		if (pc_store_autoscale_apply(name, nl, a.buckets_log2, gen,
-		        &was) == 1)
-			LM_NOTICE("collection '%s': autoscale = %s, set by the "
-				"fleet (was %s)\n", name,
-				pc_autoscale_name(a.buckets_log2),
-				pc_autoscale_name(was));
-		return;
-	}
-	if (a.op == CLCOL_OP_RENAME) {     /* S69: a rename, two names */
-		char to[PC_COL_NAME_MAX];
-		size_t tl = a.tlen;
-
-		if (tl >= PC_COL_NAME_MAX)
-			return;
-		memcpy(to, a.to, tl);
-		to[tl] = 0;
-		if (col_name_refused("as a new name", to, tl))
-			return;
-		if (pc_store_find(name, nl) && !pc_store_find(to, tl)) {
-			(void)pc_store_rename(name, nl, to, tl, gen);
-			LM_NOTICE("collection '%s' renamed to '%s' by the "
-				"fleet\n", name, to);
-		}
-		return;
-	}
-	if (drop) {
-		if (pc_store_find(name, nl))
-			pc_store_drop_gen(name, nl, gen);
-		else
-			pc_store_note_drop(name, nl, gen);
-	} else if (a.op == CLCOL_OP_RESIZE) {   /* S69: resize to bl */
-		/* S255: ordered by the announce's generation, and HELD while a
-		 * resize runs here - it used to be refused, unsaid, and this
-		 * node kept the old size while the fleet moved on */
-		if (pc_store_find(name, nl) &&
-		        pc_store_resize_request(name, nl, bl, gen) == 2)
-			LM_NOTICE("collection '%s': the fleet's resize to 2^%d "
-				"is held until the one running here finishes\n",
-				name, bl);
-	} else if (!pc_store_find(name, nl)) {
-		int rc;
-
-		if (col_name_refused("announced", name, nl))
-			return;
-		rc = pc_store_create_gen(name, nl, bl, gen);
-
-		if (rc == 0)
-			LM_NOTICE("collection '%s' created by the fleet: "
-				"2^%d buckets\n", name, bl);
-		else if (rc != -4)
-			LM_ERR("collection '%s' announced by a peer could not "
-				"be created here (%d)\n", name, rc);
-	}
-	pc_store_persist();
-}
-
-/* S125: the per-socket drop count that rode in with a datagram.  The
- * kernel stamps each skb with sk_drops as it is QUEUED, so the value
- * reported is the drops that had happened by then - it lags by whatever
- * is still in the queue, which at a 1 Hz sample is nothing, and it is
- * exact rather than the host-wide RcvbufErrors a second daemon on the
- * same box would pollute.  It is 32 bits and wraps; the delta is taken in
- * 32-bit arithmetic and accumulated into a 64-bit total. */
+/* the socket's drop count stamped on a datagram as it was queued: per daemon, unlike host-wide
+ * RcvbufErrors; it wraps at 32 bits, so deltas are 32-bit, summed into 64 */
 static void note_ovfl(int slot, unsigned int now)
 {
 	if (!C.ovfl[slot].seen) {
@@ -10067,12 +7677,8 @@ static void note_ovfl(int slot, unsigned int now)
 	C.ovfl[slot].last = now;
 }
 
-/* S36: the target set learns from CONTROL frames only - beats, joins,
- * maps, hints; at 1 Hz per peer the lock is nothing, where the data
- * plane's rate would make it something.  A member that hears an address
- * it did not know tells its master: a joiner that knows only a seed is
- * then beaten at by the master, and joins by the MASTER_ALIVE fast
- * path.  A goodbye teaches nothing. */
+/* the target set learns from CONTROL frames only (1 Hz per peer, so its lock is cheap); a member
+ * hearing an unknown address tells its master, which then beats at the joiner */
 static void send_master_alive_to(const pc_addr *to);
 
 /* tell the master about @a, at most once per @every_ms per address */
@@ -10125,26 +7731,20 @@ static void mesh_note(const pc_addr *from, int type, int trial)
 	        type != M_CLMAP && type != M_PEER_HINT)
 		return;
 	isnew = clmesh_heard(from, now, trial);
-	/* S36c: a JOINING node is not yet anyone's member, so it shares
-	 * what it knows directly: the newcomer to every address it knows,
-	 * and every address it knows to the newcomer - two nodes seeded only
-	 * with a third learn of each other, see each other's joins, and the
-	 * founding rule picks one founder among all three */
+	/* a JOINING node is no one's member, so it shares directly, newcomer to each known
+	 * address and back: two nodes seeded with a third find each other, and one founds */
 	if (isnew && C.role == PC_ROLE_JOINING)
 		mesh_share(from, now);
-	/* a JOIN request is a node looking for the master RIGHT NOW: pass
-	 * it on every time (a second apart at most), not only when the
-	 * address is new - this member may have heard it first while it
-	 * was still joining or founding itself */
+	/* a JOIN request is a node looking for the master now: passed on every time (1 s apart at
+	 * most), not only when new - this member may have heard it first while still joining */
 	if (type == M_JOIN_REQ)
 		mesh_hint(from, now, 1000);
 	else if (isnew)
 		mesh_hint(from, now, 10000);
 }
 
-/* S36, once a second: every known address the map does not name goes
- * to the master (10 s apart per address) - whatever this node heard
- * before it was a member, or from a member the master cannot reach */
+/* once a second: every known address the map does not name goes to the master (10 s apart per
+ * address) - heard before this node was a member, or from a member the master cannot reach */
 static void mesh_hint_tick(long long now)
 {
 	static __thread pc_addr kn[CLMESH_MAX_KNOWN];
@@ -10181,12 +7781,9 @@ static void handle_peer_hint(const unsigned char *pt, size_t n,
 	         a.in4.sin_port == C.self_addr.in4.sin_port))
 		return;
 	mesh_hints_recv++;
-	clmesh_heard(&a, now_ms(), 1);         /* CH-14: a hint is on trial */
-	/* a master answers a hinted address at once: if it is a joiner, its
-	 * fast path joins from this, inside its JOIN_WAIT_MS.  CH-14: only a
-	 * member's hint - any sender's made the master beacon at whatever
-	 * address the hint named.  A joiner's own hints (mesh_share) reach
-	 * the newcomer too, which then joins by its own JOIN_REQ */
+	clmesh_heard(&a, now_ms(), 1);         /* a hint is on trial */
+	/* a master answers a hinted address at once, for a joiner's fast path - but only a
+	 * member's hint, or any sender could aim the master's beacon anywhere */
 	if (C.role == PC_ROLE_MASTER && sender_admitted(from))
 		send_master_alive_to(&a);
 }
@@ -10209,7 +7806,7 @@ void pc_cluster_discovery_info(const char **mode, int *seeds,
 	*hints_recv = mesh_hints_recv;
 }
 
-/* CH-1: each sealed frame once - a copy taken before, one older than its
+/* each sealed frame once - a copy taken before, one older than its
  * stream's window, or one from a sender's older incarnation is dropped */
 static int replay_ok(const unsigned char *buf, const pc_addr *from)
 {
@@ -10217,18 +7814,19 @@ static int replay_ok(const unsigned char *buf, const pc_addr *from)
 	int rc;
 
 	clwire_id_read(buf, &id);
-	rc = clreplay_admit(&id, now_ms());
+	rc = clreplay_admit(&id, from->in4.sin_addr.s_addr, now_ms());
 	if (rc == CLREPLAY_OK || rc == CLREPLAY_FULL)
 		return 1;
 	if (pc_logrl_ok(LRL_REPLAY, from))
 		LM_INFO("cluster: dropped a frame from %s - %s\n", pc_addr_str(from),
 			rc == CLREPLAY_DUP ? "its sequence was taken before" :
 			rc == CLREPLAY_OLD ? "older than its stream's window" :
+			rc == CLREPLAY_HOST ? "its header names another host" :
 			"from an older incarnation of its sender");
 	return 0;
 }
 
-/* one sealed frame, from a datagram or (S36) the TCP frame lane: open,
+/* one sealed frame, from a datagram or the TCP frame lane: open,
  * admit, dispatch.  1 if it was handled, 0 if refused. */
 static int dispatch_dgram(unsigned char *buf, size_t r,
 		const pc_addr *from, unsigned char *pt)
@@ -10236,9 +7834,8 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 	unsigned long long ptlen = 0;
 
 	if (open_dgram(buf, (size_t)r, pt, &ptlen) != 0) {
-		/* UP1: the header is clear text before the AEAD - another
-		 * header version is a build this one cannot talk to, not a
-		 * forgery: said by name, once a minute */
+		/* the header is clear before the AEAD: another version is a build this one
+		 * cannot talk to, not a forgery - said by name, once a minute */
 		if (r >= 2 && buf[0] == PC_CL_MAGIC && buf[1] != PC_CL_VER) {
 			static long long said;
 			long long t = now_ms();
@@ -10256,7 +7853,7 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 			}
 			return 0;
 		}
-		/* the quarantine posture: count, name the source (CH-4), drop -
+		/* the quarantine posture: count, name the source, drop -
 		 * not a block by source: a spoofed one would silence a member */
 		C.st.bad_auth++;
 		if (pc_logrl_ok(LRL_BAD_AUTH, from)) {
@@ -10271,24 +7868,18 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 	}
 	if (!ptlen)
 		return 0;
-	if (!cid_admit(buf, pt[0], from))     /* S302 */
-		return 0;
-	if (!replay_ok(buf, from))            /* CH-1 */
+	if (!cid_admit(buf, pt[0], from))
 		return 0;
 	memcpy(rx_hdr_copy, buf, sizeof rx_hdr_copy);
 	rx_hdr = rx_hdr_copy;
-	/* S36.  CH-14: an ALIVE's or a map's sender is learned after its
-	 * handler, and only once it is admitted - every frame it opened was
-	 * learned, and a known address draws every control frame for ten
-	 * minutes.  A JOIN_REQ, a hint and a master's beacon are learned
-	 * first, as before: they are how joiners and seeds find each other */
+	/* an ALIVE's or a map's sender is learned after its handler, once admitted; a JOIN_REQ,
+	 * hint or master beacon first: that is how joiners and seeds find each other */
 	if (cl_unicast && pt[0] != M_ALIVE && pt[0] != M_CLMAP)
-		mesh_note(from, pt[0], 1);  /* on trial (CH-14), confirmed below */
-	if (!sender_gate(pt[0], from)) {    /* CH-12 */
+		mesh_note(from, pt[0], 1);  /* on trial, confirmed below */
+	if (!sender_gate(pt[0], from)) {
 		C.st.sender_refused++;
-		/* said, not only counted: a refusal here is a lost pull, a
-		 * forward that times out, a write refused - and the counter
-		 * alone did not say which frame, or whose (clmsg.h) */
+		/* logged, not only counted: a refusal is a lost pull, a timed-out forward or a
+		 * refused write, and the counter alone names neither frame nor sender */
 		if (pc_logrl_ok(LRL_SENDER_GATE, from))
 			LM_NOTICE("cluster: refused a type %d frame from %s - "
 				"not a sender this %s node takes it from\n", pt[0],
@@ -10297,32 +7888,39 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 		rx_hdr = NULL;
 		return 1;
 	}
+	if (!replay_ok(buf, from)) {          /* past the gate */
+		rx_hdr = NULL;
+		return 0;
+	}
 	switch (pt[0]) {
-	case M_COL_SET:   handle_col_set(pt, ptlen); break;   /* S69 */
-	case M_SWEEP_DIG:   handle_sweep_dig(pt, ptlen, from); break;  /* S260 */
+	case M_COL_SET:   handle_col_set(pt, ptlen); break;
+	case M_SWEEP_DIG:   handle_sweep_dig(pt, ptlen, from); break;
 	case M_SWEEP_DIG_R: handle_sweep_dig_r(pt, ptlen); break;
-	case M_PUBLISH:   clps_handle_publish(pt, ptlen); break;   /* PS3 */
+	case M_PUBLISH:   clps_handle_publish(pt, ptlen); break;
 	case M_PULL_REQ:  handle_pull_req(pt, ptlen, from); break;
 	case M_PULL_RSP:  handle_pull_rsp(pt, ptlen); break;
 	case M_TOMBSTONE:
-		/* 12ny AT-9: the group loops a node's own send back to it (and
-		 * single-host fleets need the loop) - its own delete, already
-		 * applied, logged and counted here */
+		/* its own delete, already applied, looped back by the group
+		 * (single-host fleets need the loop): counted only */
 		if (addr_eq(from, &C.self_addr))
 			__atomic_fetch_add(&C.st.tomb_own, 1, __ATOMIC_RELAXED);
 		else
 			(void)handle_tombstone(pt, ptlen);
 		break;
-	case M_TOMB_REQ:  handle_tomb_req(pt, ptlen, from); break;   /* S392 */
+	case M_TOMB_REQ:  handle_tomb_req(pt, ptlen, from); break;
 	case M_TOMB_RPL:  handle_tomb_rpl(pt, ptlen, from); break;
 	case M_TOMB_DONE: handle_tomb_done(pt, ptlen, from); break;
-	case M_HOLD_Q:    handle_hold_q(pt, ptlen, from); break;     /* S394 */
+	case M_HOLD_Q:    handle_hold_q(pt, ptlen, from); break;
 	case M_HOLD_A:    handle_hold_a(pt, ptlen); break;
-	case M_GAP_REQ:   handle_gap_req(pt, ptlen, from); break;   /* AT-6 */
-	case M_GAP_FLOOR: handle_gap_floor(pt, ptlen, from); break; /* S463 */
-	case M_HANDOVER: handle_handover(pt, ptlen, from); break;   /* CH-9 */
-	case M_REBUILD:   handle_rebuild(pt, ptlen, from); break;   /* AT-8 */
-	case M_UPG_SWITCH: handle_upg_switch(pt, ptlen, from); break;   /* UPS */
+	case M_GAP_REQ:   handle_gap_req(pt, ptlen, from); break;
+	case M_GAP_FLOOR: handle_gap_floor(pt, ptlen, from); break;
+	case M_HANDOVER: handle_handover(pt, ptlen, from); break;
+	case M_MEMBERS_REQ: cladmit_members_req(pt, ptlen, from); break;
+	case M_MEMBERS:  cladmit_members(pt, ptlen, from); break;
+	case M_LINK_REPORT: cladmit_link_report(pt, ptlen, from); break;
+	case M_ONLINE:   cladmit_online(pt, ptlen, from); break;
+	case M_REBUILD:   handle_rebuild(pt, ptlen, from); break;
+	case M_UPG_SWITCH: handle_upg_switch(pt, ptlen, from); break;
 	case M_UPG_ACK:   handle_upg_ack(pt, ptlen, from); break;
 	case M_FWD_OP:    handle_fwd_op(pt, ptlen, from); break;
 	case M_FWD_ACK:   handle_fwd_ack(pt, ptlen); break;
@@ -10340,15 +7938,12 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 
 		if (!clmig_ack_parse(pt, ptlen, &mreq, &mok, &mstored))
 			break;
-		/* an ack for req 0 can only come from a peer on an
-		 * older build acking a write-path push; it owns no
-		 * window slot and must not free one */
+		/* req 0 is an older peer acking a write-path push:
+		 * it owns no window slot and must not free one */
 		if (!mreq)
 			break;
-		/* S253: a push group's ack.  Its id has the top bit,
-		 * which no migration id has, so it is never a window
-		 * slot's; the short ack of an older peer says nothing
-		 * of HOW MANY were stored, and keeps them all. */
+		/* a push group's ack: its id has the top bit, never a window slot's;
+		 * an older peer's short ack does not say how many it stored: all kept */
 		if (mreq & CLPUSH_ACK_TAG) {
 			struct clpush_ack *pa = clpush_ack_take(&C.wp, mreq,
 				from);
@@ -10360,19 +7955,8 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 			}
 			break;
 		}
-		/* S85: only a matching ack frees a window slot;
-		 * the ack of a re-sent batch whose first ack
-		 * arrived after all is a duplicate and frees
-		 * nothing.  clmig_ack returns the records that
-		 * slot carried, 0 for a duplicate. */
-		/* S200: a DUPLICATE ack - a re-sent batch whose first ack
-		 * arrived after all - retires no slot, and clmig_ack says
-		 * so (clmigtest C3).  It used to credit migrated_out all
-		 * the same, so the counter read 314 or 330 for one
-		 * transfer of 331 depending on how many retransmits the
-		 * runner needed.  A late ack for a slot the deadline has
-		 * already written off as lost credits nothing either:
-		 * one event, one counter. */
+		/* only a matching ack frees a slot and credits migrated_out; a duplicate
+		 * or an ack for a slot written off as lost returns 0 */
 		if (!clmig_ack(&C.mig, mreq))
 			break;
 		/* the long ack credits RECORDS; the short one from an
@@ -10394,27 +7978,27 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 	case M_CLMAP:        handle_clmap(pt, ptlen, from); break;
 	case M_CLSYNC:       handle_clsync(pt, ptlen, from); break;
 	case M_CLSYNC_ACK:   handle_clsync_ack(pt, ptlen); break;
-	case M_PSPROBE_ACK:  clps_handle_probe_ack(pt, ptlen, from); break;   /* PS11 */
-	case M_RPPROBE_ACK:  clrp_handle_probe_ack(pt, ptlen, from); break;   /* S461 */
-	case M_PSINT_ADD:    clps_handle_int_add(pt, ptlen, from); break;     /* PS12 */
+	case M_PSPROBE_ACK:  clps_handle_probe_ack(pt, ptlen, from); break;
+	case M_RPPROBE_ACK:  clrp_handle_probe_ack(pt, ptlen, from); break;
+	case M_PSINT_ADD:    clps_handle_int_add(pt, ptlen, from); break;
 	case M_PSINT_REQ:    clps_handle_int_req(pt, ptlen, from); break;
 	case M_PSINT_FULL:   clps_handle_int_full(pt, ptlen, from); break;
-	case M_UNKCMD:       handle_unkcmd(pt, ptlen, from); break;        /* S165 */
-	case M_PEER_HINT:    handle_peer_hint(pt, ptlen, from); break;    /* S36 */
-	case M_LANE_FORCE:   handle_lane_force(from); break;              /* S36 e2 */
-	case M_LANE_PROBE:   handle_lane_probe(from); break;              /* S329 */
+	case M_UNKCMD:       handle_unkcmd(pt, ptlen, from); break;
+	case M_PEER_HINT:    handle_peer_hint(pt, ptlen, from); break;
+	case M_LANE_FORCE:   handle_lane_force(from); break;
+	case M_LANE_PROBE:   handle_lane_probe(from); break;
 	case M_LANE_PROBE_R: handle_lane_probe_r(from); break;
-	case M_MPROBE:       handle_mprobe(pt, ptlen, from); break;       /* S36 e3 */
+	case M_MPROBE:       handle_mprobe(pt, ptlen, from); break;
 	case M_MPROBE_R:     handle_mprobe_r(pt, ptlen, from); break;
-	case M_STATS_RESET:  handle_statsreset(pt, ptlen, from); break; /* S358 */
-	case M_ALERT_RELAY:  handle_alertrelay(pt, ptlen, from); break; /* S352c */
+	case M_STATS_RESET:  handle_statsreset(pt, ptlen, from); break;
+	case M_ALERT_RELAY:  handle_alertrelay(pt, ptlen, from); break;
 	default:
 		break;
 	}
 	if (cl_unicast && (pt[0] == M_ALIVE || pt[0] == M_CLMAP ||
 	        pt[0] == M_MASTER_ALIVE) && sender_admitted(from))
-		mesh_note(from, pt[0], 0);    /* CH-14: see above - confirmed */
-	rx_hdr = NULL;                 /* S302: only during a dispatch */
+		mesh_note(from, pt[0], 0);    /* see above - confirmed */
+	rx_hdr = NULL;                 /* only during a dispatch */
 	return 1;
 }
 
@@ -10428,7 +8012,7 @@ static int drain_one_fd(int fd, int slot)
 		pc_addr from;
 		struct msghdr mh;
 
-		prog(PC_PROG_DGRAM);           /* S216 */
+		prog(PC_PROG_DGRAM);
 		struct iovec iov;
 		struct cmsghdr *cm;
 		char cbuf[CMSG_SPACE(sizeof(unsigned int)) +
@@ -10449,7 +8033,7 @@ static int drain_one_fd(int fd, int slot)
 		mh.msg_control = cbuf;
 		mh.msg_controllen = sizeof cbuf;
 		r = recvmsg(fd, &mh, 0);
-		pc_iostat_udp_rx(PC_UDP_CLUSTER, 1, r > 0);   /* 0.6.0 step 1 */
+		pc_iostat_udp_rx(PC_UDP_CLUSTER, 1, r > 0);
 
 		if (r <= 0)
 			break;
@@ -10462,16 +8046,8 @@ static int drain_one_fd(int fd, int slot)
 				note_ovfl(slot, d);
 			}
 #ifdef IP_PKTINFO
-			/* The multicast socket is bound to ANY:port beside every
-			 * other daemon's on the host (REUSEADDR), so a unicast
-			 * datagram for a local address nothing is bound to - a
-			 * node just killed, its restart not up - is delivered to
-			 * one of them.  It is not this node's: a forward served
-			 * from here stored a key this node does not own and
-			 * acked it (failovertest's bounce before the CH-12 gate,
-			 * where the forwarder's own socket took its forward).
-			 * Only the group's datagrams count here; a unicast for
-			 * this node arrives on C.fd, bound to its address */
+			/* the multicast socket shares ANY:port with the host's other daemons and
+			 * gets unicasts for unbound local addresses; this node's arrive on C.fd */
 			if (slot == 1 && cm->cmsg_level == IPPROTO_IP &&
 			        cm->cmsg_type == IP_PKTINFO) {
 				struct in_pktinfo pi;
@@ -10500,7 +8076,7 @@ static int drain_one_fd(int fd, int slot)
 	return handled;
 }
 
-/* S36 step b: frames the TCP lane received - the same dispatch as a
+/* frames the TCP lane received - the same dispatch as a
  * datagram, on this thread */
 static int drain_lane(void)
 {
@@ -10512,7 +8088,7 @@ static int drain_lane(void)
 
 	while (seen++ < DRAIN_BATCH &&
 	        (r = clane_rx_take(buf, sizeof buf, &from)) > 0) {
-		rx_via_lane = 1;               /* S329 */
+		rx_via_lane = 1;
 		n += dispatch_dgram(buf, r, &from, pt);
 		rx_via_lane = 0;
 	}
@@ -10537,22 +8113,22 @@ void pc_cluster_thread(volatile int *stop)
 	pf[0].events = POLLIN;
 	pf[1].fd = C.mfd;
 	pf[1].events = POLLIN;
-	pf[2].fd = clane_rx_fd();              /* S36 step b; -1 = off */
+	pf[2].fd = clane_rx_fd();              /* -1 = off */
 	pf[2].events = POLLIN;
-	pc_qs_enter();                     /* S150 B: tables in hand between waits */
+	pc_qs_enter();                     /* tables in hand between waits */
 	while (!*stop) {
 		long long now = now_ms();
 		int prc;
 
-		prog(PC_PROG_LOOP);            /* S216 */
+		prog(PC_PROG_LOOP);
+		cladmit_link_tick(now);        /* every 500 ms while a link check runs */
 		if (now - last_hb >= 1000) {
 			static int tick;
 
 			prog(PC_PROG_TICK);
 			{
-				/* S222: the clean stop a fleet stop asked for -
-				 * the same SIGTERM a service manager sends, so it
-				 * takes exactly the same road down */
+				/* the clean stop a fleet stop asked for: the same SIGTERM
+				 * a service manager sends, so it takes the same road down */
 				long long at = __atomic_load_n(
 					&C.stop_self_at_ms, __ATOMIC_ACQUIRE);
 
@@ -10563,30 +8139,31 @@ void pc_cluster_thread(volatile int *stop)
 				}
 			}
 			membership_tick();
-			upg_msg_tick();                /* UPS: asks and answers */
-			pull_answer_tick();            /* 12nt: the owner's fetched pulls */
-			fwd_ack_tick();                /* 12nt TC-2: the master's answers */
-			fp_replay_tick();              /* S392: every beat - the asker
-			                                * waits on it, not the 10 s
-			                                * rebalance tick */
-			replicas_short_tick(now);      /* S157 */
-			if (clretain_enabled())        /* 12ny AT-5: every beat, */
+			self_state_tick();
+			upg_msg_tick();                /* asks and answers */
+			pull_answer_tick();            /* the owner's fetched pulls */
+			fwd_ack_tick();                /* the master's answers */
+			fp_replay_tick();              /* every beat: the asker waits on it */
+			replicas_short_tick(now);
+			if (clretain_enabled())        /* every beat, */
 				acks_forget_tick((unsigned int)(now / 1000));   /* not the 10-s tick */
-			acks_gap_tick(now);            /* 12ny AT-6 */
-			acks_rebuild_tick(now);        /* 12ny AT-8 */
-			ps_probe_tick(now);            /* PS11 */
-			clps_interest_tick(now);       /* PS12 */
-			unk_tick(now);                 /* S165 */
-			rz_again_tick(now);            /* S255 */
+			acks_gap_tick(now);
+			acks_rebuild_tick(now);
+			ps_probe_tick(now);
+			clps_interest_tick(now);
+			unk_tick(now);
+			rz_again_tick(now);
 			{
 				unsigned int lost = clpush_ack_expire(&C.wp, now,
-					SPREAD_ACK_WAIT_MS);   /* S253 */
+					SPREAD_ACK_WAIT_MS);
 
 				C.px.spread_ack_kept += lost;
 				C.px.spread_ack_lost += lost;
 			}
 			if (tick % ALIVE_STAMP_BEATS == 0)
-				alive_stamp_touch();       /* S223 */
+				alive_stamp_touch();
+			spread_missed_tick();      /* a peer owed writes it was skipped for */
+			spread_reclaim_tick();     /* surplus copies, once the fleet has settled */
 			if (++tick % REPL_SWEEP_BEATS == 0) {
 				prog(PC_PROG_REBAL);
 				pc_rebalance_tick();
@@ -10594,14 +8171,13 @@ void pc_cluster_thread(volatile int *stop)
 			last_hb = now;
 			prog(PC_PROG_LOOP);
 		}
-		reconcile_pump(now);           /* S393: the walk's slices */
+		reconcile_pump(now);           /* the walk's slices */
 		/* the join FSM needs sub-second deadlines */
 		if (C.role == PC_ROLE_JOINING && now >= C.join_deadline_ms)
 			membership_tick();
 		{
-			/* S105: an open push group must not wait for the 100 ms
-			 * poll; nor a request waiting on the pending table for
-			 * its timeout (PEND_SWEEP_MS) */
+			/* an open push group must not wait for the 100 ms poll, nor a
+			 * request on the pending table for its timeout (PEND_SWEEP_MS) */
 			int waiting = clpend_used(&C.pd) > 0, to;
 
 			if (waiting && now - last_sweep >= PEND_SWEEP_MS) {
@@ -10611,7 +8187,7 @@ void pc_cluster_thread(volatile int *stop)
 			to = clpush_open(&C.wp) ? REPL_FLUSH_MS : 100;
 			if (waiting && to > PEND_SWEEP_MS)
 				to = PEND_SWEEP_MS;
-			pc_qs_exit();          /* S150 B: parked across the wait */
+			pc_qs_exit();          /* parked across the wait */
 			prc = poll(pf, 3, to);
 			pc_qs_enter();
 		}
@@ -10627,7 +8203,7 @@ void pc_cluster_thread(volatile int *stop)
 		repl_flush_due(now_ms());
 	}
 	pc_qs_exit();
-	alive_stamp_touch();               /* S455: a clean stop dates its death */
+	alive_stamp_touch();               /* a clean stop dates its death */
 	if (C.role != PC_ROLE_JOINING) {
 		pc_node_state_set(PC_NST_DRAINING);
 		send_goodbye();                /* leave cleanly: peers purge now */
@@ -10636,7 +8212,7 @@ void pc_cluster_thread(volatile int *stop)
 
 /* ---- forwarded JSON path ops (proxy mode) ------------------------------- */
 
-extern const char pc_json_wrongtype_msg[];      /* verbs.c, S280 */
+extern const char pc_json_wrongtype_msg[];      /* verbs.c */
 
 static void handle_fwd_json(const unsigned char *pt, size_t n,
 		const pc_addr *from)
@@ -10689,14 +8265,13 @@ static void handle_fwd_json(const unsigned char *pt, size_t n,
 			by, (flags & 8) ? 1 : 0, (long long)ttl,
 			flags & 1, (flags & 2) ? 1 : 0, (flags & 4) ? 1 : 0,
 			&frag, &fraglen, &newval, &cnt, &emsg);
-		/* S280: 3 = the key holds a string (redis_types = strict) */
+		/* 3 = the key holds a string (redis_types = strict) */
 		st = rc == 0 ? 0 : rc == 1 ? 1 :
 			emsg == pc_json_wrongtype_msg ? 3 : 2;
 	}
 	if (fraglen > (int)MAX_FWD_VAL) {  /* fragment too big to ship */
-		/* S319: say so - this used to be silent, and a shard-mode
-		 * HGETALL of a few thousand fields failed through a forwarder
-		 * with nothing to show for it anywhere */
+		/* logged: a reply over the ack ceiling otherwise failed
+		 * through a forwarder with nothing to show for it */
 		C.st.fwd_reply_too_big++;
 		LM_WARN("cluster: a forwarded reply of %d bytes (jop %d) exceeds "
 			"the %u-byte ack ceiling - refused\n", fraglen, (int)jop,
@@ -10713,7 +8288,7 @@ static void handle_fwd_json(const unsigned char *pt, size_t n,
 		};
 		size_t an = clfwd_jack_build(ack, M_FWD_JACK, &a);
 
-		/* frag is borrowed from pc_json_rmw's thread buffer (S283) */
+		/* frag is borrowed from pc_json_rmw's thread buffer */
 		seal_send(from, ack, an);
 	}
 }
@@ -10758,9 +8333,8 @@ void pc_proxy_get_stats(struct pc_proxy_stats *out)
 	out->loc_clears = clloc_loc_clears(&C.lc);
 }
 
-/* S260 (the digest-gated sweep, below eager_repl_tick's helpers): a slot
- * bitmap, and the slots the running repair walk is confined to - NULL
- * when it is not a gated cycle */
+/* digest-gated sweep: a slot bitmap, and the slots the running repair walk is confined to
+ * (NULL when the cycle is not gated) */
 #define SG_BIT(b, i)   ((b)[(i) >> 3] & (1u << ((i) & 7)))
 #define SG_SET(b, i)   ((b)[(i) >> 3] |= (unsigned char)(1u << ((i) & 7)))
 static const unsigned char *sg_walk_filter;
@@ -10773,20 +8347,17 @@ struct mig_ctx {
 	unsigned int min_age;          /* coldest-first threshold, 0 = all */
 	int shard;                     /* reshard run: move ONLY the keys
 	                                * whose HRW owner is @to */
-	int repl;                      /* eager store: COPY records newer
-	                                * than @since to @to - no stubbing,
-	                                * the local record stays */
+	int repl;                      /* eager store: COPY records newer than @since
+	                                * to @to; the local record stays */
 	unsigned int since;
 	int incl_passive;              /* one-shot backfill: send copies too */
 	int stopped;                   /* the walk hit the budget */
 	const char *only_col;          /* restrict the run to one collection
 	                                * (per-collection marks), NULL = all */
-	long long scan_deadline_ms;    /* liveness ceiling on the walk: a
-	                                * tick must never cost heartbeats,
-	                                * victims not reached resume next
-	                                * tick (0 = uncapped) */
+	long long scan_deadline_ms;    /* walk deadline so a tick never costs heartbeats;
+	                                * unreached victims resume next tick, 0 = none */
 	unsigned scanned;              /* records seen, for the pump gate */
-	int held;                      /* S245: recovered records held back */
+	int held;                      /* recovered records held back */
 };
 
 static int mig_cb(const str *key, const str *val,
@@ -10805,77 +8376,44 @@ static int mig_cb(const str *key, const str *val,
 		beat_pump();
 		if (m->scan_deadline_ms && now_ms() >= m->scan_deadline_ms) {
 			m->stopped = 1;
-			return -1;             /* liveness ceiling: resume next
-			                        * tick rather than starve beats */
+			return -1;
 		}
 	}
 	if (m->budget <= 0) {
 		m->stopped = 1;
-		return -1;                     /* budget spent: stop the walk */
+		return -1;
 	}
 	if (mt->expires) {
-		/* Reshard and proxy placement skip a record that dies before
-		 * it is next read: moving it is pure waste.  The eager sweep
-		 * is REPAIR behind the write-path push (S73), so it keeps a
-		 * skip too - but one derived from its own period: a record
-		 * that expires within one sweep is not worth a repair
-		 * datagram, anything longer-lived is.  Delivery itself has
-		 * no threshold at all; that is pc_repl_push(). */
+		/* a record dying before its next read is not worth moving; for the repair sweep
+		 * that horizon is one sweep period (pc_repl_push has no threshold) */
 		unsigned int horizon = m->repl ? REPL_SWEEP_BEATS : 60;
 
 		if (mt->expires <= m->now + horizon) {
 			if (m->repl)
 				C.px.repl_skipped_dying++;
-			return 0;                  /* dying soon: not worth moving */
+			return 0;
 		}
 		ttl_left = mt->expires - m->now;
 	}
 	if (key->len > 4096)
 		return 0;
 	if (m->repl) {
-		/* eager: only records this node AUTHORED (a pushed or pulled
-		 * copy is PASSIVE - propagating those back would echo the
-		 * keyspace around the fleet forever), only records newer
-		 * than this peer's mark, and only what the datagram plane
-		 * carries (oversized counted) */
+		/* eager sends only what this node authored: re-sending a PASSIVE (received) copy
+		 * would echo the keyspace around the fleet forever */
 		if ((mt->rflags & PCACHE_F_PASSIVE) && !m->incl_passive)
 			return 0;
-		/* since = 0 is NO lower bound: the fresh-peer reset and a
-		 * backfill both mean "everything", and a record stamped in
-		 * the daemon's first second carries wtick 0 */
+		/* since == 0 is no lower bound at all: a record written in the daemon's first
+		 * second carries wtick 0 */
 		if (m->since && mt->wtick <= m->since)
 			return 0;
-		/* S245: A RECOVERED RECORD WAITS FOR RECONCILE.  Expiry leaves
-		 * no tombstone, so a peer holds nothing to refuse an older
-		 * copy with: measured, a node back from a stop pushed its
-		 * restored copies of keys that had since been re-set with a
-		 * short TTL and expired everywhere - they came back IMMORTAL
-		 * on every node, 376 of 500 even with reconcile running,
-		 * because the sweep reached the peers before the probe did and
-		 * the probe then found them "held".  Held here until the
-		 * fleet has ruled; the walk is reported dirty so the mark
-		 * does not pass them, and the next cycle after reconcile
-		 * sends the ones a peer confirmed. */
-		/* NOT a backfill or set-repair walk (incl_passive): those go
-		 * to a peer that is COLD or being re-placed to, and while a
-		 * live peer is cold reconcile waits (S152) - holding the walk
-		 * that warms it kept that peer cold and the hold on, for
-		 * ever.  restarttest: a whole fleet restarted at once, the
-		 * node that came back empty stayed at 0 of 400. */
+		/* a recovered record waits for reconcile: expiry leaves no tombstone, so pushing
+		 * a restored copy could resurrect a key that expired everywhere else */
+		/* not for backfill/set-repair (incl_passive): reconcile waits for a cold peer,
+		 * so holding the walk that warms it would hold both forever */
 		if (!m->incl_passive && rec_held(mt->wtick)) {
 			m->held++;
 			return 0;
 		}
-		/* S174: a value too large for a datagram is NOT skipped any
-		 * more - it falls through to the bulk batch below, which now
-		 * carries replica copies as well as placement moves.  Until
-		 * 2026-09-20 this returned, so a value over 58,000 bytes
-		 * lived on the node that took the write and on no other: the
-		 * write path keeps it (pc_repl_push has the same ceiling and
-		 * says so), and the sweep - the repair behind that push -
-		 * refused to repair it.  With the store accepting 256 KB
-		 * that would have been a silent two-in-three miss on a
-		 * three-node fleet rather than an honest refusal. */
 	}
 	if (m->shard) {
 		/* the ownership pass: shard keys move by HRW owner */
@@ -10883,12 +8421,8 @@ static int mig_cb(const str *key, const str *val,
 		        (size_t)key->len) != m->to->node)
 			return 0;
 	}
-	/* S127: the eager sweep is REPAIR behind pc_repl_push, so it must
-	 * repair toward the same nodes the push aims at.  Left unscoped it
-	 * copies every record to every peer and quietly turns spread back
-	 * into eager - which is exactly what spreadtest measured before
-	 * this existed: K=2 on four nodes held 480 copies, the same as
-	 * eager, because the push was correct and the sweep undid it. */
+	/* the sweep repairs toward the push's replica set only; unscoped, it would copy every
+	 * record to every peer and turn spread back into eager */
 	{
 		int kk = pc_cluster_replicas();
 
@@ -10897,7 +8431,7 @@ static int mig_cb(const str *key, const str *val,
 		                m->to->node, kk))
 			return 0;
 	}
-	/* S260: a gated cycle walks only the slots whose digests differed */
+	/* a gated cycle walks only the slots whose digests differed */
 	if (m->repl && sg_walk_filter &&
 	        !SG_BIT(sg_walk_filter, pc_key_slot(key->s, (size_t)key->len)))
 		return 0;
@@ -10911,11 +8445,8 @@ static int mig_cb(const str *key, const str *val,
 			return 0;
 	}
 
-	/* STUB FIRST, never reinstate: delete locally + record the receiver
-	 * in the locator BEFORE sending - a lost transfer is a miss, a fork
-	 * is impossible (the decided invariant).  A REPLICATION run copies:
-	 * the local record stays, a lost datagram just retries next tick
-	 * (the mark only advances on a clean pass) */
+	/* stub first, never reinstate: delete and locate at @to BEFORE sending - a lost
+	 * transfer is a miss, never a fork; a replication copy just retries next tick */
 	ht = pc_store_find(m->col, cn);
 	if (!ht)
 		return -1;
@@ -10932,17 +8463,12 @@ static int mig_cb(const str *key, const str *val,
 
 	n = MIG_RHDR + cn + (size_t)key->len + (size_t)val->len;
 
-	/* records above the datagram ceiling route to the BULK TCP batch
-	 * (same record format; the bulk thread streams it) - the 58KB
-	 * migration ceiling is gone */
+	/* a record above the datagram ceiling goes to the bulk TCP batch (same record format) */
 	if (val->len > MAX_FWD_VAL) {
 		if (C.bulkb_len + n > MIG_BATCH_CAP)
 			return -1;
 		{
 			unsigned char *rp = C.bulkb + C.bulkb_len;
-			/* the SAME record codec the datagram path below
-			 * uses - this was a second hand-written copy of
-			 * it, which is the drift clmig exists to stop */
 			struct clmig_rec br = {
 				.ttl_left = ttl_left,
 				.col = m->col, .collen = cn,
@@ -10960,12 +8486,8 @@ static int mig_cb(const str *key, const str *val,
 		return 0;
 	}
 
-	/* COLLECT, do not send: the pump in pc_rebalance_tick paces these
-	 * through the ack window after the scan releases its locks.
-	 * Records are GATHERED (M_MIGRATE_MANY): appended to the open group
-	 * until the datagram cap, so a 256B record costs ~1/200th of a
-	 * datagram+ack cycle instead of a whole one.  Per record:
-	 * [ttl4][cn1][klen2][vlen4][ver8][col][key][val]. */
+	/* collect, never send here: the pump paces the gathered groups through the ack window
+	 * once the scan drops its locks; record [ttl4][cn1][klen2][vlen4][ver8][col][key][val] */
 	{
 		int opened = clmig_open_for(&C.migb, n, MIG_GHDR,
 			MIG_GATHER_CAP, &msg);
@@ -10973,13 +8495,9 @@ static int mig_cb(const str *key, const str *val,
 		if (opened < 0)
 			return -1;
 		if (opened) {
-			/* a fresh group: stamp its header.  clmig knows the
-			 * shape [len2][header][records] and the sizes; the
-			 * CONTENTS are the migration protocol's, so they are
-			 * written here, beside the rest of it. */
-			/* 31 bits: PEND_TAG is what marks a parked-request
-			 * handle, and a migration group id must never look
-			 * like one */
+			/* a fresh group: the header CONTENTS belong to this protocol, not clmig */
+			/* 31 bits: a group id must never look like a parked-request
+			 * handle (PEND_TAG) */
 			req = ++C.next_req & ~PEND_TAG;
 			if (!req)
 				req = ++C.next_req & ~PEND_TAG;
@@ -11005,15 +8523,10 @@ static int mig_cb(const str *key, const str *val,
 	return 0;
 }
 
-/* coldest-first pass A: a log2-age byte histogram - selecting the age
- * threshold whose older side covers the tick budget, without copying a
- * single key */
+/* coldest-first pass A: a log2-age byte histogram picks the age threshold whose older side
+ * covers the tick budget, without copying a key */
 struct age_hist {
-	unsigned long long bytes[32];  /* age is 32-bit: floor(log2) fits
-	                                * 0..31 - a 64-bucket histogram was
-	                                * how the shift-by-32 UB (S56) and
-	                                * its 1u << 63 sibling in
-	                                * pick_min_age stayed plausible */
+	unsigned long long bytes[32];  /* age is 32-bit: floor(log2) is 0..31 */
 	unsigned int now;
 };
 
@@ -11029,17 +8542,8 @@ static int age_cb(const str *key, const str *val,
 		: h->now - mt->wtick;
 	b = 0;
 	while (b < 31 && (age >> (b + 1)))
-		b++;                           /* b = floor(log2(age)), 0..31.
-	                                    * age is 32-BIT: the old b < 63
-	                                    * bound reached age >> 32, which
-	                                    * is UB - x86 wraps the shift and
-	                                    * the 0xffffffff never-written
-	                                    * sentinel landed in bucket 63 by
-	                                    * accident; UBSan halted the
-	                                    * daemon here on its first
-	                                    * rebalance tick instead.  At 31
-	                                    * the sentinel still lands at the
-	                                    * coldest end. */
+		b++;                           /* b = floor(log2(age)); the never-written
+	                                    * 0xffffffff sentinel lands in 31, the coldest */
 	h->bytes[b] += 11u + (unsigned int)key->len +
 		(unsigned int)val->len;
 	return 0;
@@ -11063,17 +8567,9 @@ static unsigned int pick_min_age(pcache_htable_t *ht, unsigned int now,
 	return 0;                          /* everything fits: no threshold */
 }
 
-/* one migration run against @to: collect victims across the matching
- * collections (@shard = deterministic-ownership filter, else the proxy
- * coldest-first pass) and pump them through the ack-gated window plus
- * the bulk handoff.  Returns nonzero when anything was collected. */
-/* S85: re-send every in-flight batch whose ack is MIG_RETX_MS overdue,
- * up to MIG_RETX times.  The receiver stores a duplicate as "not newer"
- * and acks it again; the ack handler frees the slot on the first ack it
- * sees for the req and ignores the rest. */
-/* clmig hands back the OFFSET of each datagram due for re-send and this
- * does the sending, which is how the module needs no seal_send of its
- * own - the one dependency M10's measurement found. */
+/* a re-send is idempotent: the receiver stores a duplicate as "not newer" and acks
+ * again; the ack handler frees the slot on the first ack and ignores the rest */
+/* clmig hands back each due datagram's offset, so it needs no seal_send of its own */
 static void mig_resend_one(void *ctx, size_t off)
 {
 	const pc_addr *to = ctx;
@@ -11123,7 +8619,7 @@ static int run_migration(struct peer *to, long long budget, int mode,
 	clmig_reset(&C.mig);
 	for (i = 0; i < pc_store_count() && m.budget > 0; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;
 		pcache_htable_t *ht = pc_store_ht(i);
 
 		if (m.repl ? !pc_store_eager_enabled(ht)
@@ -11143,12 +8639,10 @@ static int run_migration(struct peer *to, long long budget, int mode,
 			pcache_ht_iter_meta(ht, mig_cb, &m);
 	}
 	moved = C.migb.len > 0 || C.bulkb_len > 0;
-	C.last_run_scanned = m.scanned;        /* S212 */
+	C.last_run_scanned = m.scanned;
 
-	/* the pump: send the collected payloads through an ack-gated window
-	 * so the receiver's UDP buffer is never overrun (victims are
-	 * already stubbed - anything undeliverable within the deadline is a
-	 * lost transfer = a miss by the invariant, counted honestly) */
+	/* the pump: an ack-gated window never overruns the receiver's UDP buffer; victims are
+	 * already stubbed, so one undelivered by the deadline is a counted miss */
 	if (C.migb.len) {
 		long long deadline = now_ms() + 5000;
 		size_t off = 0;
@@ -11163,18 +8657,14 @@ static int run_migration(struct peer *to, long long budget, int mode,
 					drain_dgrams();
 				beat_pump();   /* the ack window may poll for as
 				                * long as PEER_UP_MS - never mute */
-				mig_retransmit(&m.to->addr);   /* S85 */
+				mig_retransmit(&m.to->addr);
 			}
 			if (now_ms() >= deadline)
 				break;
 			seal_send(&m.to->addr, gp, n);
-			/* remember req -> record-count while it is in flight,
-			 * so a lost gathered datagram is charged in RECORDS -
-			 * and where its bytes are, so a late ack costs one
-			 * re-send, not a cycle (S85) */
-			/* the group's own offset, which the retransmit reads
-			 * back from: the walk has already advanced `off` past
-			 * it, but gp points just past its len2 header */
+			/* track each group: a loss is charged in records,
+			 * and a late ack costs one re-send, not a cycle */
+			/* gp sits just past the group's len2 header; `off` has already moved on */
 			clmig_track(&C.mig, clmig_group_req(gp), clmig_group_count(gp),
 				(size_t)(gp - C.migb.b) - 2, now_ms());
 			C.px.migrate_dgrams++;
@@ -11184,11 +8674,10 @@ static int run_migration(struct peer *to, long long budget, int mode,
 			if (poll(&pf, 1, 20) > 0)
 				drain_dgrams();
 			beat_pump();
-			mig_retransmit(&m.to->addr);   /* S85 */
+			mig_retransmit(&m.to->addr);
 		}
-		/* unsent groups + unacked sends are the losses, in records -
-		 * after MIG_RETX re-sends each, so a loss here is a peer that
-		 * did not answer three times in five seconds */
+		/* losses in records: unsent groups plus sends still unacked
+		 * after MIG_RETX re-sends each */
 		while (clmig_group_walk(&C.migb, &off, &gp, &n))
 			lost += clmig_group_count(gp);
 		lost += (unsigned int)clmig_lost_records(&C.mig);
@@ -11203,9 +8692,8 @@ static int run_migration(struct peer *to, long long budget, int mode,
 		clmig_buf_reset(&C.migb);
 		clmig_reset(&C.mig);
 		if (clean)
-			/* with a cursor the walk finishing is reported by
-			 * the cursor itself, so this is purely "did this
-			 * slice lose anything" */
+			/* with a cursor, the cursor reports the walk's end, so
+			 * this only says whether the slice lost anything */
 			*clean = cursor ? lost == 0 : (!m.stopped && lost == 0);
 	} else if (clean) {
 		*clean = cursor ? 1 : !m.stopped;  /* nothing to send: clean
@@ -11219,17 +8707,8 @@ static int run_migration(struct peer *to, long long budget, int mode,
 		        &m.to->addr)) {
 			C.bulkb = NULL;        /* re-alloc next tick */
 		} else if (m.repl) {
-			/* S174: a replica batch is REPAIR - the record is
-			 * still here, so a refused offer is not a loss, it
-			 * is a cycle that did not deliver.  S178: say that
-			 * about THIS PEER's cycle, through the same `clean`
-			 * every other failure uses.  It was a fleet-wide
-			 * counter compared at the cycle boundary, and since
-			 * the counter only ever climbs, one refused offer
-			 * anywhere pinned every mark on the node for ever:
-			 * the sweep then re-sent the whole keyspace to every
-			 * peer, every cycle, all of it refused as older
-			 * (measured live on 245-247, ~1,900 records/s each). */
+			/* repair: the record is still here, so a refused offer only marks
+			 * THIS peer's cycle unclean - a node-wide flag would pin every mark */
 			__atomic_fetch_add(&C.px.repl_bulk_lost, 1,
 				__ATOMIC_RELAXED);
 			if (clean)
@@ -11247,41 +8726,15 @@ static int run_migration(struct peer *to, long long budget, int mode,
 	if (m.held) {
 		C.st.repl_held_recovered += (unsigned long long)m.held;
 		if (clean)
-			*clean = 0;        /* S245: the mark must not pass them */
+			*clean = 0;        /* the mark must not pass them */
 	}
 	return moved;
 }
 
-/* eager store: push records newer than each peer's mark, per
- * collection - the background synchronizer.  The mark advances to the
- * sweep's start tick only after a CLEAN pass (full walk, no losses),
- * so a lost datagram or a budget cut simply retries next tick;
- * re-pushes are idempotent upserts.  A rejoined peer's marks are
- * zeroed with its slot: automatic full resync. */
-/* Am I the sender for @target's backfill of collection @col?  The
- * lowest-numbered live member other than @target does it, so a node
- * that came back empty is not sent the whole keyspace once per
- * surviving peer.
- *
- * S82: a peer that arrived empty within BACKFILL_SENDER_HOLDOFF_MS
- * does not count.  It is still being filled, and if its id is the
- * lowest it would take the role, send @target the little it holds,
- * walk clean and clear its own flag - while its own fill, landing a
- * moment later as passive copies, never goes on.  Observed on a
- * rolling restart eight seconds apart.  Skipping it means a node that
- * HOLDS the data self-designates; a peer that rejoined WITH data is
- * never flagged and is a sender at once.
- *
- * Each node judges from its own view, so two may send during the
- * holdoff - the target absorbs the duplicate through the version
- * compare - and none is impossible: the lowest node that is not itself
- * fresh always qualifies.  A keyspace whose fill outlasts the
- * holdoff is covered by the reported-count test above - an empty
- * candidate never qualifies, at any age.  What remains uncovered is a
- * candidate that holds SOME of the keyspace and is still filling: it
- * qualifies and sends a partial set.  That needs the joining node to
- * pull its own bootstrap and know when it is done (S83), which is
- * filed, not built. */
+/* eager store: a peer's mark advances to the sweep's start tick only after a CLEAN pass, so
+ * a loss or budget cut just retries; a rejoined peer's zeroed marks force a full resync */
+/* backfill for @target is sent by the lowest live member besides it, so an empty node gets
+ * the keyspace once; two senders in a race are absorbed by the version compare */
 static int lowest_live_sender(int target, int col)
 {
 	long long now = now_ms();
@@ -11295,18 +8748,9 @@ static int lowest_live_sender(int target, int col)
 			continue;
 		if (!clpeers_live(p, now))
 			continue;
-		if (p->nstate == PC_NST_RECOVERING)
-			continue;              /* S83: still pulling its own */
-		/* S82: a candidate that HOLDS NOTHING cannot send anything,
-		 * however long ago it restarted.  The holdoff below is a
-		 * timer and this is the state it was standing in for: a node
-		 * whose own fill outlasts the holdoff used to become
-		 * eligible while still empty, take the role as the lowest
-		 * id, hand over the little it had and clear its flag - which
-		 * is exactly the failure the holdoff exists to prevent, one
-		 * timeout later.  The count is what the peer itself reports
-		 * in its ALIVE, so this needs no new state and no wire
-		 * change; zero is unambiguous whatever the collection. */
+		if (p->nstate == PC_NST_RECOVERING || p->nstate == PC_NST_CONNECTING)
+			continue;              /* still pulling its own, or not admitted yet */
+		/* a candidate that holds nothing (its ALIVE count) can send nothing, at any age */
 		if (!p->entries || p->start_kind == PC_START_COLD)
 			continue;
 		if (p->backfill[col] &&
@@ -11319,25 +8763,88 @@ static int lowest_live_sender(int target, int col)
 	return 1;
 }
 
-/*
- * S127 Z4: has the set of slot-holding peers CHANGED?
- *
- * Under spread a departure past the grace promotes a new holder for
- * every key the departed node held, and those keys must be re-placed or
- * they sit at K-1 for ever.  Measured before this existed: kill one of
- * four nodes at K=2 and the survivors stayed at 182 of the 240 the
- * fleet owes, flat, indefinitely.
- *
- * The steady sweep could not fix it on its own for a reason worth
- * stating: it sends only records this node AUTHORED, because in an
- * EAGER fleet re-sending a received copy echoes the keyspace around the
- * fleet for ever.  Under spread that assumption is wrong - a passive
- * copy on a holder IS the record, and the newly promoted holder can
- * only get it from a holder that received it.  So a set change arms the
- * BACKFILL, which walks from zero and includes copies; mig_cb's set
- * filter then bounds what actually leaves to what that peer should
- * hold, so the wire cost is the repair and not the keyspace.
- */
+/* a live peer past its admission (not CONNECTING, not STALLED): one that can be elected */
+static int admitted_peer_live(long long now)
+{
+	int i;
+
+	for (i = 0; i < C.pt.n_peers; i++)
+		if (C.pt.peers[i].node && clpeers_usable(&C.pt.peers[i], now) &&
+		        C.pt.peers[i].nstate != PC_NST_STALLED &&
+		        !addr_eq(&C.pt.peers[i].addr, &C.master_addr))
+			return 1;
+	return 0;
+}
+
+/* a write was skipped to this peer while it was CONNECTING (the writer kept a copy): once it is
+ * usable and placed, a walk sends what it now holds.  Every beat */
+static void spread_missed_tick(void)
+{
+	long long now = now_ms();
+	int i, c;
+
+	if (!pc_cluster_replicas())
+		return;
+	for (i = 0; i < C.pt.n_peers; i++) {
+		struct peer *p = &C.pt.peers[i];
+		int id = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
+
+		if (!__atomic_load_n(&p->missed, __ATOMIC_RELAXED))
+			continue;
+		if (!clpeers_holds_slots(p, now)) {
+			__atomic_store_n(&p->missed, 0, __ATOMIC_RELAXED);
+			continue;              /* gone past its grace: the set moved without it */
+		}
+		if (!id || !clpeers_usable(p, now) || p->nstate == PC_NST_RECOVERING)
+			continue;
+		if (cl_map_usable() && !pc_clmap_placeable(pc_clmap_find(cl_map(), (uint16_t)id)))
+			continue;              /* not placed yet: a walk now would send nothing */
+		__atomic_store_n(&p->missed, 0, __ATOMIC_RELAXED);
+		for (c = 0; c < PC_MAX_COLLECTIONS; c++) {
+			p->setrepair[c] = 1;
+			p->repl_cursor[c] = 0;
+		}
+		LM_NOTICE("cluster: node %d was skipped by writes while CONNECTING - re-placing the "
+			"keys it now holds\n", id);
+	}
+}
+
+/* a node the incoming map makes placeable is owed what it now holds: a write skipped while it was
+ * CONNECTING reached no one, and reclaim must not drop the other copy before the walk sends it */
+static void spread_note_placeable(const struct pc_clmap *m)
+{
+	long long now = now_ms();
+	unsigned int i;
+	int j, c;
+
+	if (!pc_cluster_replicas() || !C.map_valid)
+		return;                        /* the first map after a start re-places nothing */
+	for (i = 0; i < m->nnodes; i++) {
+		const struct pc_clmap_node *nd = &m->node[i];
+
+		/* keys move to it from holders that were never skipped (formation's placement shifts),
+		 * so every holder walks; spread_missed_tick() covers a node skipped while still placed */
+		if (nd->node_id == (uint16_t)C.node_id || !pc_clmap_placeable(nd) ||
+		        pc_clmap_placeable(pc_clmap_find(&C.map, nd->node_id)))
+			continue;
+		for (j = 0; j < C.pt.n_peers; j++) {
+			struct peer *p = &C.pt.peers[j];
+
+			if (__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) != (int)nd->node_id ||
+			        !clpeers_live(p, now))
+				continue;
+			for (c = 0; c < PC_MAX_COLLECTIONS; c++) {
+				p->setrepair[c] = 1;
+				p->repl_cursor[c] = 0;
+			}
+			LM_NOTICE("cluster: node %u is placeable in the new map - re-placing the "
+				"keys it now holds\n", nd->node_id);
+		}
+	}
+}
+
+/* a change in the spread holder set arms a backfill (from zero, copies included): a newly
+ * promoted holder can only get a key from a holder that received it */
 static void spread_note_set_change(void)
 {
 	static unsigned long long last_fp;
@@ -11347,7 +8854,7 @@ static void spread_note_set_change(void)
 
 	if (!pc_cluster_replicas())
 		return;
-	fp = clspread_set_fp(&C.pt, now);      /* M17: who is in the set */
+	fp = clspread_set_fp(&C.pt, now);      /* who is in the set */
 	if (fp == last_fp)
 		return;
 	if (last_fp) {
@@ -11366,33 +8873,8 @@ static void spread_note_set_change(void)
 	last_fp = fp;
 }
 
-/* ---- S260: the digest-gated fast sweep --------------------------------
- * The sweep is the repair behind the fire-and-forget push: every record
- * this node authored above a peer's watermark is sent again about ten
- * seconds later, whether or not the push arrived.  Measured on a 3-node
- * spread fleet (223, 1M keys written once): the holders applied every
- * push, then refused 336k / 333k re-sent copies as older - the sweep
- * doubled their apply work after every burst.
- *
- * Now an ordinary cycle first COMPARES.  One walk digests every slot this
- * node shares with the peer - XOR of mix(key, version) over its live
- * records, the dying-soon ones skipped as the sweep skips them - and
- * notes the slots holding an authored record above the mark.  Those
- * slots' digests go to the peer, which answers with the ones that
- * differ; the sweep then walks only those, sending every authored
- * record in them regardless of the mark (which also heals a write whose
- * push and repeat were both lost).  Equal slots are not sent, and the
- * mark advances to the tick the digests were TAKEN - never the tick the
- * walk ran, or writes made in between, in equal slots, would never be
- * swept.
- *
- * Select-only, as S212 required: the digest decides what is re-sent,
- * never who is right - the version check at the receiver does that, as
- * it always has.  Backfills, set repairs and non-eager collections are
- * untouched.  A slot this node holds only a surplus copy of (spread,
- * not a holder) is never gated.  A peer that does not answer (an older
- * build ignores the type) gets the old sweep; after SG_FAILS such
- * rounds it is not asked again for SG_OFF_MS. */
+/* ---- the digest-gated sweep ------------------------------------------------
+ * re-sends only slots whose digests differ; the receiver's version check still decides */
 #define SG_PER_DGRAM   4000
 #define SG_TIMEOUT_MS  8000
 #define SG_FAILS       3
@@ -11411,11 +8893,8 @@ struct sg_col {
 	unsigned int rot;              /* the anti-entropy window's turn */
 	unsigned char diff[PC_SLOTS / 8];
 };
-/* besides the slots with something new, every cycle compares one
- * 1/SG_ROT of the slots regardless: a write whose push AND repeat were
- * both lost sits below the mark in a slot nobody writes again, and the
- * mark alone never looks there - this does, once every SG_ROT cycles
- * (~11 minutes at a 10 s sweep) */
+/* each cycle also compares 1/SG_ROT of all slots: a write whose push AND repeat were lost
+ * sits below the mark where only this rotation looks */
 #define SG_ROT 64
 struct sg_peer {
 	int node;                      /* whom this is for: a slot is reused */
@@ -11432,23 +8911,22 @@ void pc_cluster_set_sweep_digests(int on)
 	pc_sweep_digests = on ? 1 : 0;
 }
 
-static int pc_mcast_ttl = 1;           /* S291: [cluster] multicast_ttl */
-static const char *pc_cid_pin;         /* S302: [cluster] cluster_id */
+static int pc_mcast_ttl = 1;           /* [cluster] multicast_ttl */
+static const char *pc_cid_pin;         /* [cluster] cluster_id */
 
 void pc_cluster_set_cluster_id(const char *pin)
 {
 	pc_cid_pin = pin;
 }
-static int pc_max_members;             /* S299: 0 = PC_CL_MAXPEER + 1 */
+static int pc_max_members;             /* 0 = PC_CL_MAXPEER + 1 */
 
 void pc_cluster_set_max_members(int n)
 {
 	pc_max_members = n < 0 ? 0 : n > PC_CL_MAXPEER + 1 ? PC_CL_MAXPEER + 1 : n;
 }
 
-/* S299: would admitting a NEW member at @from take the fleet past its
- * ceiling?  A peer already holding an id is a member re-joining, not a
- * new one, and is never counted against it. */
+/* would a NEW member at @from pass the fleet's ceiling?  A peer already holding an id is
+ * re-joining and never counts */
 static int join_over_limit(const pc_addr *from, int *limit)
 {
 	int lim = pc_max_members ? pc_max_members : PC_CL_MAXPEER + 1;
@@ -11484,25 +8962,9 @@ struct sg_mine {
 };
 static struct sg_mine *sg_mine[PC_MAX_COLLECTIONS];
 
-/* one key and version, as both ends compute it: FNV-1a 64 over the key,
- * the version folded in, a splitmix finaliser */
-static uint64_t sg_mix(const char *k, size_t n, unsigned long long ver)
-{
-	uint64_t h = 1469598103934665603ULL;
-	size_t i;
-
-	for (i = 0; i < n; i++)
-		h = (h ^ (unsigned char)k[i]) * 1099511628211ULL;
-	h ^= ver * 0x9E3779B97F4A7C15ULL;
-	h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ULL;
-	h ^= h >> 27; h *= 0x94D049BB133111EBULL;
-	h ^= h >> 31;
-	return h;
-}
-
 struct sg_walk {
 	uint64_t *dig;
-	unsigned char *has;            /* S261: slots holding a record here */
+	unsigned char *has;            /* slots holding a record here */
 	unsigned char *cand;           /* sender: authored above the mark */
 	unsigned char *ungated;        /* sender: a slot not ours to gate */
 	int peer;                      /* sender: the peer; 0 = peer side */
@@ -11517,7 +8979,6 @@ static int sg_walk_cb(const str *key, const str *val,
 	struct sg_walk *w = arg;
 	unsigned int slot;
 
-	(void)val;
 	if ((w->scanned++ & 511) == 0)
 		beat_pump();
 	/* the sweep's own dying-soon skip, so expiry lag does not churn */
@@ -11525,9 +8986,8 @@ static int sg_walk_cb(const str *key, const str *val,
 		return 0;
 	slot = pc_key_slot(key->s, (size_t)key->len);
 	if (w->peer) {
-		/* spread: only what the peer is placed to hold, and only
-		 * where this node is a holder too - a surplus copy's slot is
-		 * never gated (it would always differ) */
+		/* spread: only slots both nodes hold; a surplus copy's slot
+		 * is never gated (it would always differ) */
 		if (w->kk && !pc_spread_in_set(slot, w->peer, w->kk))
 			return 0;
 		if (w->kk && !pc_spread_in_set(slot, 0, w->kk)) {
@@ -11538,15 +8998,15 @@ static int sg_walk_cb(const str *key, const str *val,
 		        (!w->mark || mt->wtick > w->mark))
 			SG_SET(w->cand, slot);
 	}
-	w->dig[slot] ^= sg_mix(key->s, (size_t)key->len, mt->ver);
+	w->dig[slot] ^= sg_mix(key->s, (size_t)key->len, mt->ver, val->s,
+		(size_t)val->len);
 	if (w->has)
 		SG_SET(w->has, slot);
 	return 0;
 }
 
-/* S260: send "your digests for these slots" in parts of SG_PER_DGRAM -
- * the sweep gate's question, and (S261) the reconcile's.  Returns the
- * request id and *parts, 0 when there is nothing to ask or too much. */
+/* ask @to for its digests of the @ask slots, SG_PER_DGRAM per part (sweep gate and
+ * reconcile); returns the req id and *parts, 0 when nothing or too much to ask */
 static uint32_t sg_ask(const pc_addr *to, const char *col,
 		size_t cl, const uint64_t *dig, const unsigned char *ask,
 		unsigned int want, unsigned int *parts_out)
@@ -11642,8 +9102,8 @@ static int sg_gate(struct peer *pr, int i, int c, long long now)
 			for (s = 0; s < PC_SLOTS / 8 && !g->diff[s]; s++)
 				;
 			if (s == PC_SLOTS / 8) {
-				/* every slot the same: no walk at all - the
-				 * mark moves to the tick the digests were taken */
+				/* all equal: no walk.  The mark moves to when the
+				 * digests were TAKEN - later writes are unswept */
 				pr->repl_mark[c] = g->start ? g->start - 1 : 0;
 				g->st = 0;
 				C.px.sweep_gate_clean++;
@@ -11694,12 +9154,8 @@ static int sg_gate(struct peer *pr, int i, int c, long long now)
 		         (s % SG_ROT == g->rot &&
 		          (!w.kk || (pc_spread_in_set(s, pr->node, w.kk) &&
 		                     pc_spread_in_set(s, 0, w.kk))))) {
-			/* the rotation's slots by PLACEMENT, not by what the
-			 * walk met: a slot this node holds no record in never
-			 * reached sg_walk_cb, so "ungated" never marked it, and
-			 * asking one it is not a holder of always differs -
-			 * the first spread run: 62 of 3,528 compared slots
-			 * sent as digest 0 against a holder's record */
+			/* rotation slots by PLACEMENT: an empty slot never reached sg_walk_cb, and
+			 * one this node does not hold would always differ */
 			SG_SET(cand, s);        /* compared this cycle */
 			want++;
 		}
@@ -11736,21 +9192,8 @@ static int sg_gate(struct peer *pr, int i, int c, long long now)
 	return SG_WAIT;
 }
 
-/* ---- S261: the post-restart reconcile, narrowed by the witness --------
- * A node back from an outage probes every key it replayed, 64 a second,
- * to find what the fleet deleted meanwhile: 2k keys ~35 s, 100k ~26 min,
- * 1M ~4.3 h, a resurrected key visible the whole time.  Now, once the
- * witness is known (S223 - a peer that was up throughout the outage), the
- * node first compares slot digests with it, and probes only the keys in
- * slots that differ.  Equal digests mean the witness holds exactly this
- * node's keys at the same versions in that slot, so nothing there was
- * deleted or rewritten while this node was away.  The probe, its drop
- * rule and the S152 / S223 guards are unchanged for what is probed.
- * The witness does not answer in SG_TIMEOUT_MS, or sweep_digests = no:
- * every key is probed, as before.  Not covered: a key expiring within
- * REPL_SWEEP_BEATS is outside both digests (the sweep's skip), so one
- * deleted during the outage and about to expire can survive until it
- * does. */
+/* ---- the post-restart reconcile, narrowed by the witness -----------------
+ * only keys in slots whose digests differ from the witness's are probed; equal = unchanged */
 struct rdg_col {
 	uint32_t req;
 	unsigned char parts, got;
@@ -11990,7 +9433,7 @@ static void handle_sweep_dig_r(const unsigned char *pt, size_t n)
 	if (n < 8 + (size_t)cnt * 2)
 		return;
 	if (rdg_answer(req, pt[5], pt + 8, cnt))
-		return;                        /* S261: the reconcile's round */
+		return;                        /* the reconcile's round */
 	for (i = 0; i < PC_CL_MAXPEER; i++) {
 		struct sg_peer *sp = sg_tab[i];
 
@@ -12027,7 +9470,7 @@ static void eager_repl_tick(void)
 
 	for (c = 0; c < pc_store_count(); c++) {
 		if (!pc_store_live(c))
-			continue;   /* S69: a dropped collection */
+			continue;
 		if (!pc_store_eager_enabled(pc_store_ht(c)))
 			continue;
 		for (i = 0; i < C.pt.n_peers; i++) {
@@ -12038,43 +9481,12 @@ static void eager_repl_tick(void)
 
 			if (!clpeers_live(pr, now))
 				continue;
-			/* S83: a peer pulling its own bootstrap gets no sweep at
-			 * all - not the backfill walk, not the ordinary cycle:
-			 * the pull carries everything it holds a copy of, and
-			 * writes made meanwhile go by the write-path push.  Its
-			 * flag stays armed for the fallback (below). */
-			if (pr->nstate == PC_NST_RECOVERING)
-				continue;
-			/* ONE designated sender for a backfill.  Every live
-			 * peer holds the same copies, so if they all pushed
-			 * at once the empty node would receive the keyspace
-			 * N times over.  The lowest live node id does it -
-			 * deterministic, needs no agreement, and does not
-			 * care which node is master. */
-			/* S102: the flag is only ever CLEARED by the node that
-			 * walked the backfill; on every other node it goes stale
-			 * (see BACKFILL_SENDER_HOLDOFF_MS).  The moment the lowest
-			 * live id changes - the sender died, or in the fleet's case
-			 * simply restarted - a stale holder becomes the designated
-			 * sender and pushes the WHOLE keyspace at a node that is
-			 * full, then logs "backfilled node N after its restart"
-			 * for a restart long past.  Seen live (.245, "node 846"),
-			 * and it is what failed eagertest's quiet window on
-			 * alternate tags: the same first slice from bucket 0, 148
-			 * records, every time.
-			 *
-			 * So a walk may START only while the target still says it
-			 * is cold (S81's start byte; an older build, its count).
-			 * A walk in flight runs to completion - the target turning
-			 * ESTABLISHED mid-way must not cut its sender off.  A flag
-			 * whose target is established, on a node that is not
-			 * walking, is stale by definition: dropped here, and said,
-			 * rather than left to fire when the ids reshuffle.
-			 *
-			 * NOT covered: a sender that dies after the target's cold
-			 * window has closed leaves it with a partial set and nobody
-			 * armed.  That is S83's - the joiner pulling what it is
-			 * owed - and is filed there. */
+			/* no sweep for a peer pulling its own bootstrap: the pull
+			 * carries its copies, the push its new writes */
+			if (pr->nstate == PC_NST_RECOVERING || pr->nstate == PC_NST_CONNECTING)
+				continue;          /* nor one still proving its links */
+			/* a backfill walk may START only while the target reports cold: only the
+			 * walker clears the flag, elsewhere it goes stale and is dropped here */
 			if (pr->backfill[c] && !pr->repl_bfcycle[c] &&
 			    !pr->setrepair[c] &&
 			    !(pr->start_kind == PC_START_COLD ||
@@ -12085,49 +9497,24 @@ static void eager_repl_tick(void)
 					"dropped as stale (%s)\n", pr->node,
 					pc_store_name(c));
 			}
-			/* S83: a target that is pulling its own bootstrap gets no
-			 * walk - the flag stays armed and drops as stale once it
-			 * reports established, or walks if its pull failed and it
-			 * came up ready but cold (the push is the fallback) */
-			/* S127: the designated-sender rule is an EAGER rule.
-			 * It exists because every live peer holds the same
-			 * copies there, so one sender suffices and N senders
-			 * would deliver the keyspace N times.  Under spread
-			 * each node holds K of P records and the lowest id
-			 * simply does not have most of what a cold node
-			 * needs: measured, a returning node got 18 of the ~58
-			 * records placement gives it and the fleet sat at 200
-			 * where it owed 240.  Every holder sends; duplication
-			 * is bounded by K and the version check discards it. */
+			/* no walk for a target pulling its bootstrap: the armed flag covers a pull
+			 * that fails and leaves it ready but cold */
+			/* one sender is an EAGER rule; under spread every holder sends -
+			 * duplication is bounded by K and the version check drops it */
 			bf = pr->backfill[c] && pr->nstate != PC_NST_RECOVERING &&
 				(pc_cluster_replicas() ||
 				 lowest_live_sender(pr->node, c));
-			/* S127: a set repair is a backfill-shaped walk with the
-			 * designated-sender rule REMOVED.  That rule exists
-			 * because under eager every peer holds the same copies,
-			 * so one sender suffices; under spread each holds K of
-			 * them and the lowest id simply does not have most of
-			 * what the new holder needs.  At most K-1 nodes hold any
-			 * given record, so the duplication is bounded by K and
-			 * the receiver's version check discards the repeats. */
+			/* a set repair is a backfill walk without the one-sender rule */
 			if (pr->setrepair[c] && pr->nstate != PC_NST_RECOVERING)
 				bf = 1;
-			/* S81: a backfill is a WHOLE cycle walked as the
-			 * sender.  The role moves when the lowest node dies:
-			 * gaining it part-way through an ordinary cycle
-			 * means the head of the table went by without the
-			 * copies - start over; losing it part-way means the
-			 * tail will - this cycle can no longer clear the
-			 * flag, whoever took the role walks its own. */
+			/* a backfill is a WHOLE cycle as sender: gaining the role mid-cycle
+			 * starts over, losing it leaves the flag to the new sender */
 			if (bf && pr->repl_cursor[c] && !pr->repl_bfcycle[c])
 				pr->repl_cursor[c] = 0;
 			if (!bf)
 				pr->repl_bfcycle[c] = 0;
-			/* S260: an ordinary cycle asks before it sends.  SKIP -
-			 * every comparable slot matched, the mark has moved;
-			 * WAIT - the answer is not in yet; WALK - the walk is
-			 * confined to the slots that differ; OFF - the old
-			 * sweep.  A backfill or set repair is never gated. */
+			/* an ordinary cycle asks first (SKIP matched, WAIT, WALK the diffs, OFF
+			 * the full sweep); a backfill or set repair is never gated */
 			gate = SG_OFF;
 			gc = NULL;
 			if (!bf && pc_sweep_digests) {
@@ -12140,41 +9527,25 @@ static void eager_repl_tick(void)
 				continue;
 			if (gate == SG_WALK && !gc)
 				gc = sg_col_of(pr, i, c);
-			/* one budgeted SLICE of a resumable cycle.  The
-			 * mark may only advance when a whole cycle has been
-			 * walked with nothing lost - so the cycle's start
-			 * tick is captured when the cursor is at 0, not on
-			 * every tick, or records written mid-cycle would be
-			 * skipped by the next pass. */
+			/* one slice of a resumable cycle: the start tick is taken at cursor 0
+			 * only, or records written mid-cycle would fall below the next mark */
 			if (pr->repl_cursor[c] == 0) {
 				pr->repl_cycle[c] = get_ticks();
 				pr->repl_dirty[c] = 0;
 				pr->repl_bfcycle[c] = (unsigned char)bf;
-				pr->repl_cycle_ms[c] = now_ms();      /* S212 */
+				pr->repl_cycle_ms[c] = now_ms();
 				pr->repl_scanned[c] = 0;
 				pr->repl_sent[c] = 0;
-				/* S260: a gated cycle STARTED when its digests
-				 * were taken - what was written since, in the slots
-				 * that matched, is the next cycle's */
+				/* a gated cycle started when its digests were taken */
 				if (gate == SG_WALK && gc)
 					pr->repl_cycle[c] = gc->start;
 			}
 			start = pr->repl_cycle[c];
-			/* S81: the mark says how far this node's AUTHORED
-			 * records have been pushed.  It says nothing about
-			 * copies, whose write-ticks were stamped on receipt
-			 * and sit anywhere below it.  A backfill walks from
-			 * zero.  Walking it from the mark is how a rolling
-			 * restart left a node without the fleet's records:
-			 * an ordinary cycle ran while another node held the
-			 * sender role and advanced the mark past every copy;
-			 * the role then moved here, the backfill discarded
-			 * them all on wtick <= since, walked "clean", and
-			 * logged itself complete. */
+			/* the mark covers only AUTHORED records (a copy's tick is its
+			 * receipt), so a backfill walks from zero */
 			since = bf ? 0 : pr->repl_mark[c];
-			/* S260: in a slot whose digests differed, EVERY authored
-			 * record goes - that is what heals a write whose push
-			 * and repeat were both lost */
+			/* in a slot that differed, EVERY authored record goes: that heals
+			 * a write whose push and repeat were both lost */
 			if (gate == SG_WALK && gc)
 				since = 0;
 			{
@@ -12189,12 +9560,11 @@ static void eager_repl_tick(void)
 				pr->repl_sent[c] += C.px.repl_out - out0;
 			}
 			if (gate == SG_WALK && gc && pr->repl_cursor[c] == 0)
-				gc->st = 0;            /* S260: the gated walk is done */
+				gc->st = 0;            /* the gated walk is done */
 			if (!clean)
 				pr->repl_dirty[c] = 1;
-			/* S212: a cycle is complete when the cursor is back at
-			 * 0, clean or not - the clock is about how long the
-			 * walk takes, which a lost slice does not change */
+			/* the sweep clock counts a cycle at cursor 0, clean or not:
+			 * it times the walk, which a lost slice does not change */
 			if (pr->repl_cursor[c] == 0) {
 				C.st.repl_sweep_ms = (unsigned long long)
 					(now_ms() - pr->repl_cycle_ms[c]);
@@ -12204,28 +9574,8 @@ static void eager_repl_tick(void)
 			}
 			if (pr->repl_cursor[c] == 0 && !pr->repl_dirty[c]) {
 				pr->repl_mark[c] = start ? start - 1 : 0;
-				/* a whole cycle walked cleanly AS A BACKFILL:
-				 * the copies are delivered, stop resending.
-				 *
-				 * S146: ONLY IF THIS CYCLE WAS ONE.  setrepair is
-				 * armed the moment the holder set changes, but
-				 * the walk it asks for is skipped while the
-				 * target is still RECOVERING (bf stays 0 above).
-				 * The cycle that then runs is an ORDINARY sweep
-				 * from the mark - authored records only, copies
-				 * excluded - and it completes clean in a beat on
-				 * a small table.  Clearing setrepair on that
-				 * completion marks the re-placement done when it
-				 * never ran: the returning node goes READY a
-				 * moment later with nothing armed, short of every
-				 * record only a copies-included walk carries.
-				 * Measured on 224 under concurrent=2: node 4
-				 * received 79 of the 107 a full re-placement
-				 * delivers and stayed 18 short of its share, in
-				 * about a third of runs.  The backfill clear
-				 * below already requires repl_bfcycle; this one
-				 * must too.  Left armed, the next tick after the
-				 * target is READY restarts the walk from zero. */
+				/* only a clean cycle that WAS a backfill clears the flags:
+				 * an ordinary sweep (target recovering) carried no copies */
 				if (pr->setrepair[c] && pr->repl_bfcycle[c]) {
 					pr->setrepair[c] = 0;
 					LM_NOTICE("cluster: re-placed the keys "
@@ -12244,11 +9594,8 @@ static void eager_repl_tick(void)
 	}
 }
 
-/* deterministic ownership maintenance: after a membership change each
- * node ships the keys whose HRW owner is now a peer straight to that
- * owner, budgeted per peer per tick.  The shard grace self-extends
- * while records still flow, so readers keep their broadcast fallback
- * until the fleet settles. */
+/* shard mode: ship each key whose HRW owner is now a peer to that owner, budgeted per peer;
+ * the shard grace extends while records flow, so readers keep the broadcast fallback */
 static void shard_reshard_tick(void)
 {
 	long long now = now_ms();
@@ -12256,7 +9603,7 @@ static void shard_reshard_tick(void)
 
 	for (i = 0; i < pc_store_count(); i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;
 		if (pc_store_shard_enabled(pc_store_ht(i))) {
 			have = 1;
 			break;
@@ -12272,26 +9619,11 @@ static void shard_reshard_tick(void)
 	}
 }
 
-/* ---- S127: reclaiming surplus copies -----------------------------------
- *
- * A copy on a node that placement does not make a holder is an ORPHAN:
- * the repair sweep maintains the SET, so a copy outside it is invisible
- * to repair AND to reclamation, and it is not merely wasted memory.
- * Subsequent writes go only to the set (pc_repl_push), and a local hit
- * is served without consulting anyone (op_get_miss runs on a MISS), so
- * an orphan can serve STALE data until its TTL expires.
- *
- * Surplus arises while views disagree - during convergence, or between
- * a set change and the repair that follows it.  It cannot be prevented
- * at the receiver: a node whose view has not converged would refuse
- * copies it SHOULD hold, which was measured at 212 where 240 was owed.
- * So it is a local, after-the-fact policy, and the only hard question
- * is WHEN it is safe to act.
- */
+/* ---- reclaiming surplus copies ---------------------------------------------
+ * a copy outside the holder set gets no writes yet serves local hits: stale until its TTL */
 #define SPREAD_RECLAIM_PER_TICK  64    /* keys examined-and-dropped per tick */
 
-/* M17: settled is clspread's decision, over the cluster's own reads -
- * the rule it enforces (reclaim only on the shared map) is there */
+/* settled is clspread's decision (reclaim only on the shared map) */
 static int spread_settled(int c)
 {
 	return clspread_settled(pc_cluster_replicas(), pc_shard_grace(),
@@ -12307,12 +9639,7 @@ struct reclaim_ctx {
 	struct { char key[CLSPREAD_RECLAIM_KEYMAX]; int klen; } hit[SPREAD_RECLAIM_PER_TICK];
 };
 
-/*
- * COLLECT here, DELETE after the walk returns.  Removing during an
- * iteration skips records - a lesson this project has already paid for
- * once - and a reclaim that silently skipped half the surplus would
- * look like it worked.
- */
+/* collect here, delete after the walk: removing during an iteration skips records */
 static int reclaim_cb(const str *key, const str *val,
 		const struct pcache_rec_meta *mt, void *arg)
 {
@@ -12334,16 +9661,20 @@ static int reclaim_cb(const str *key, const str *val,
 	return 0;
 }
 
+/* every beat: the settle hold counts beats (30 s, not ten sweep periods' 100 s), a pass runs each
+ * sweep period, and every beat while the last one still found surplus copies */
 static void spread_reclaim_tick(void)
 {
-	/* same local extern the migration path uses, for the same reason */
 	extern void pc_wal_del(const char *, const char *, int);
 	static unsigned int cursor[PC_MAX_COLLECTIONS];
 	static unsigned int settled_for[PC_MAX_COLLECTIONS];
+	static unsigned char busy[PC_MAX_COLLECTIONS];
+	static unsigned int beat;
 	int c, i, k = pc_cluster_replicas();
 
 	if (!k || !C.enabled)
 		return;
+	beat++;
 	for (c = 0; c < pc_store_count(); c++) {
 		pcache_htable_t *ht;
 		struct reclaim_ctx r;
@@ -12351,9 +9682,13 @@ static void spread_reclaim_tick(void)
 
 		if (!pc_store_live(c) || !pc_store_eager_enabled(pc_store_ht(c)))
 			continue;
-		/* M17: settled, and for long enough - or the sweep restarts */
-		if (!clspread_hold(&settled_for[c], &cursor[c], spread_settled(c)))
+		/* settled, and for long enough - or the sweep restarts */
+		if (!clspread_hold(&settled_for[c], &cursor[c], spread_settled(c))) {
+			busy[c] = 0;
 			continue;
+		}
+		if (!busy[c] && beat % REPL_SWEEP_BEATS)
+			continue;              /* idle: one pass a sweep period */
 		ht = pc_store_ht(c);
 		nm = pc_store_name(c);
 		r.k = k;
@@ -12361,28 +9696,17 @@ static void spread_reclaim_tick(void)
 		r.scanned = 0;
 		r.deadline_ms = now_ms() + 200;
 		pcache_ht_iter_meta_from(ht, &cursor[c], reclaim_cb, &r);
-		/*
-		 * S146: ASK BEFORE DROPPING.  reclaim_cb has established
-		 * that we are not in the map's top-K for these keys and
-		 * that the K-set is live - but live is not the same as
-		 * HOLDING, and nothing above proves a designated holder was
-		 * ever sent this record.  Measured on 224 at v0.3.7-rc8:
-		 * four nodes, one agreed map (term 2, seq 29), every guard
-		 * satisfied, and the fleet still finished 18 copies short
-		 * because the drops raced the hand-off.
-		 *
-		 * So each candidate becomes a question rather than a
-		 * delete.  The delete happens in the CLPEND_ANS_POSSESS arm
-		 * when a holder answers yes; every other outcome keeps it.
-		 */
+		busy[c] = r.n > 0;
+		/* ask before dropping: a live K-set does not prove a holder HOLDS the record;
+		 * only every holder's yes (CLPEND_ANS_POSSESS) deletes; anything else keeps it */
 		for (i = 0; i < r.n; i++) {
 			unsigned kslot;
 			int holder;
 
 			kslot = pc_key_slot(r.hit[i].key,
 				(size_t)r.hit[i].klen);
-			holder = pc_spread_pick_peer(kslot, k);
-			if (!holder) {
+			holder = spread_next_holder(kslot, k, 0);
+			if (holder <= 0) {
 				C.px.spread_possess_kept++;
 				continue;      /* nobody to ask: keep it */
 			}
@@ -12393,374 +9717,6 @@ static void spread_reclaim_tick(void)
 				C.px.spread_possess_kept++;
 		}
 	}
-}
-
-/*
- * S238: REPLAY RETAINED DELETES TO A PEER THAT MISSED THEM.
- *
- * A delete is broadcast once, at once; a peer cut off at that moment
- * never hears it, and when the partition heals its copy of the key is
- * served, swept back and pulled back (DESIGN S238: 50 of 50).  Each peer
- * carries tomb_mark: the retained tombstones it is known to have - every
- * one planted up to that second.  While it keeps talking the mark
- * follows the last time it was HEARD (less a margin: a broadcast sent
- * just after that may have been lost), so in steady state nothing is
- * sent twice.  When it has been silent the mark froze there; when it is
- * heard again, everything retained after the mark is replayed to it as
- * ordinary versioned tombstones, in windows sized so a tick sends a few
- * thousand, not the whole table.  The receiver applies each by version
- * (handle_tombstone): a copy WRITTEN after the delete survives.  A peer
- * the table cannot vouch for - away longer than tombstone_retain_s, or
- * the cap dropped entries meanwhile - gets a warning naming what may
- * come back.
- */
-static unsigned long long tomb_catchup_total;
-/* AR15: the members back after a silence the table did not cover - for
- * the alerts (cluster.peer_absent), the last one's line kept */
-static pthread_mutex_t tomb_gap_mx = PTHREAD_MUTEX_INITIALIZER;
-static unsigned long long tomb_gaps;
-static char tomb_gap_text[256];
-
-int pc_cluster_tomb_alert(struct pc_tomb_alert *out)
-{
-	struct clretain_stats rs;
-	struct timespec ts;
-
-	memset(out, 0, sizeof *out);
-	if (!clretain_enabled())
-		return 0;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	clretain_get_stats(&rs, (unsigned int)ts.tv_sec);
-	out->retain_s = rs.retain_s;
-	out->max = rs.max;
-	out->entries = rs.entries;
-	out->dropped_early = rs.dropped_early;
-	out->noted = rs.noted;
-	out->dropped_early_expiries = rs.dropped_early_expiries;   /* S443 */
-	out->noted_expiries = rs.noted_expiries;
-	pthread_mutex_lock(&tomb_gap_mx);
-	out->gaps = tomb_gaps;
-	memcpy(out->gap_text, tomb_gap_text, sizeof out->gap_text);
-	pthread_mutex_unlock(&tomb_gap_mx);
-	return 1;
-}
-
-static int catchup_by_marks;           /* 12ny AT-7: set each tick */
-
-static void tomb_catchup_cb(const char *col, size_t cn, const char *key,
-		size_t kn, uint64_t ver, int expiry, uint64_t oid, uint32_t incarn,
-		uint64_t seq, void *ctx)
-{
-	unsigned char msg[CLFWD_TOMB_MAX];
-	struct peer *p = ctx;
-	struct clfwd_key fk = {
-		.col = col, .collen = (unsigned int)cn,
-		.key = key, .klen = (unsigned int)kn };
-	/* AT-5: with its number, so the peer counts what it gets back */
-	struct clfwd_tomb_num num = { oid, incarn, seq };
-
-	/* AT-7: while the fleet confirms, a numbered delete the member's own
-	 * marks already cover is not sent again; one they do not cover goes
-	 * by time, as before.  v0.7.3-rc1 (eagerparttest, spreadparttest): it
-	 * skipped EVERY numbered one, counting on the member to ask past its
-	 * marks - but a member asks for a space it never announced only when
-	 * it did not come back empty (AT-7's guard), a fleet that started
-	 * empty is just that, and the spaces born during a partition are
-	 * exactly the ones the other side never heard of.  Each side of the
-	 * heal kept its own deletes, never got the other's, and the sweeps
-	 * brought those keys back - everywhere, once a restart had cleared
-	 * the memory of the rest. */
-	if (seq && catchup_by_marks && p->has_ident) {
-		uint64_t m = 0;
-
-		if (pc_ack_fleet_mark(fnv1a64(p->ident, sizeof p->ident), oid,
-		        incarn, &m) && m >= seq)
-			return;
-	}
-	/* S446: an expiry says so - the peer counted it as a delete; AT-5
-	 * (c): and a kept one says that too */
-	size_t n = clfwd_tomb_build_n(msg, M_TOMBSTONE, &fk, ver,
-		(expiry ? CLFWD_TOMB_F_EXPIRY : 0) |
-		(expiry == 2 ? CLFWD_TOMB_F_KEEP : 0), &num);
-
-	if (n && seal_send(&p->addr, msg, n) == 0) {
-		p->tomb_sent++;
-		tomb_catchup_total++;
-	}
-}
-
-/* 12ny AT-5: forgetting.  While the fleet confirms (AT-10's gate), each
- * numbering space this node holds is forgotten through the LOWEST mark
- * among this node and every member of the fleet: the peer table's, and
- * those gone from it whose id is still reserved (S90: purged after
- * PEER_PURGE_MS of silence, or said goodbye) for as long as the time rule
- * would keep what they missed (tombstone_retain_s) - their marks stand
- * where they left them, so what they had not confirmed stays, and a
- * restart, a freeze or a partition gets it back.  Past that the time rule
- * has dropped it anyway (AT-8).  A member that never announced the space
- * counts as 0 (clackf_min).  AT-5 (c): and an expiry goes after
- * PC_TOMB_EXPIRY_HOLD_S - each member reaps its own copy by a deadline no
- * later than the fleet's - unless its key's TTL was shortened
- * (PCACHE_F_SHORTENED): then an older copy on a member that missed the
- * write can outlive it, and it keeps the time rule (clretain's kept kind),
- * so S392's fast path still replays it */
-#define PC_TOMB_EXPIRY_HOLD_S 10
-struct fsp { uint64_t oid; uint32_t incarn; uint64_t mark, hi; };
-static struct fsp fspv[CLACK_SPACES];
-static unsigned int fspn;
-static uint64_t fmembers[PC_CL_MAXPEER + CLRES_MAX];
-
-static int fsp_cb(uint64_t oid, uint32_t incarn, uint64_t mark,
-		uint64_t applied, uint64_t hi, void *ctx)
-{
-	(void)applied; (void)ctx;
-	if (fspn < CLACK_SPACES) {
-		fspv[fspn].oid = oid;
-		fspv[fspn].incarn = incarn;
-		fspv[fspn].hi = hi;
-		fspv[fspn++].mark = mark;
-	}
-	return 0;
-}
-
-/* 12ny AT-11: what holds each space's deletes here - the member whose mark
- * is the lowest, how far behind the head it is - and who is STUCK on it
- * (clackf_stuck: still while others confirm), for /stats and the alerts,
- * which read it from their own threads (hold_mx) */
-static struct pc_ack_hold holdv[PC_ACK_HOLD_MAX];
-static int holdn;
-static pthread_mutex_t hold_mx = PTHREAD_MUTEX_INITIALIZER;
-/* this node's own mark of each space and when it last moved: its own
- * progress is "another member's" to the stuck test (clackf_stuck @also) */
-static struct { uint64_t oid; uint32_t incarn; uint64_t mark; long long ms; }
-	progv[CLACK_SPACES];
-static unsigned int progn;
-static uint64_t lmembers[PC_CL_MAXPEER];
-
-/* the node id of a member's identity hash: the peer table, then the ids
- * held for those gone (0: not known here) */
-static int member_node(uint64_t h)
-{
-	int k;
-
-	for (k = 0; k < C.pt.n_peers; k++) {
-		struct peer *p = &C.pt.peers[k];
-		int node = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
-
-		if (node && p->has_ident && fnv1a64(p->ident, sizeof p->ident) == h)
-			return node;
-	}
-	for (k = 0; k < CLRES_MAX; k++)
-		if (reserved.e[k].id && reserved.e[k].has_ident &&
-		    fnv1a64(reserved.e[k].ident, sizeof reserved.e[k].ident) == h)
-			return reserved.e[k].id;
-	return 0;
-}
-
-static long long own_progress(uint64_t oid, uint32_t incarn, uint64_t mark,
-		long long now)
-{
-	unsigned int i;
-
-	for (i = 0; i < progn; i++)
-		if (progv[i].oid == oid && progv[i].incarn == incarn) {
-			if (progv[i].mark != mark) {
-				progv[i].mark = mark;
-				progv[i].ms = now;
-			}
-			return progv[i].ms;
-		}
-	if (progn < CLACK_SPACES) {
-		progv[progn].oid = oid;
-		progv[progn].incarn = incarn;
-		progv[progn].mark = mark;
-		progv[progn++].ms = now;
-	}
-	return now;
-}
-
-/* one space, after its forgetting: who holds it below the head, and who is
- * stuck on it - into hv (PC_ACK_HOLD_MAX of them, the rest uncounted) */
-static void acks_hold_note(const struct fsp *sp, uint64_t lo, int nm, int nl,
-		long long now, struct pc_ack_hold *hv, int *hn)
-{
-	struct clackf_stuck sk[1];
-	struct pc_ack_hold *h;
-	uint64_t head = sp->hi > sp->mark ? sp->hi : sp->mark, f;
-	long long also = own_progress(sp->oid, sp->incarn, sp->mark, now);
-	int d, k;
-
-	if (nm && (f = pc_ack_fleet_max(sp->oid, sp->incarn, fmembers, nm)) > head)
-		head = f;
-	if (lo >= head || *hn >= PC_ACK_HOLD_MAX)
-		return;                        /* nothing waits, or no room */
-	h = &hv[(*hn)++];
-	memset(h, 0, sizeof *h);
-	h->oid = sp->oid;
-	h->incarn = sp->incarn;
-	h->through = lo;
-	h->head = head;
-	if (sp->mark == lo) {
-		h->node = C.node_id;           /* this node is the lowest */
-		h->self = 1;
-	} else
-		for (d = 0; d < nm; d++) {
-			uint64_t m = 0;
-
-			(void)pc_ack_fleet_mark(fmembers[d], sp->oid, sp->incarn, &m);
-			if (m == lo) {             /* 0: it never announced the space */
-				h->node = member_node(fmembers[d]);
-				break;
-			}
-		}
-	k = nl ? pc_ack_fleet_stuck(sp->oid, sp->incarn, lmembers, nl, head,
-		also, now, acks_stuck_ms, sk, 1) : 0;
-	if (k > 0) {
-		h->stuck_node = member_node(sk[0].member);
-		h->stuck_mark = sk[0].mark;
-		h->stuck_s = (unsigned int)((now - sk[0].moved) / 1000);
-	}
-}
-
-int pc_cluster_acks_holds(struct pc_ack_hold *out, int max)
-{
-	int n;
-
-	pthread_mutex_lock(&hold_mx);
-	n = holdn < max ? holdn : max;
-	memcpy(out, holdv, (size_t)n * sizeof *out);
-	pthread_mutex_unlock(&hold_mx);
-	return n;
-}
-
-static void acks_forget_tick(unsigned int now_s)
-{
-	unsigned int i;
-	int nm = 0, k;
-
-	long long now = now_ms();
-	long long keep_ms = (long long)clretain_retain_s() * 1000;
-	struct pc_ack_hold hv[PC_ACK_HOLD_MAX];
-	int hn = 0, nl = 0;
-
-	if (!pc_cluster_acks_gate(NULL, 0, NULL)) {
-		pthread_mutex_lock(&hold_mx);
-		holdn = 0;                     /* the time rule: nothing held by marks */
-		pthread_mutex_unlock(&hold_mx);
-		return;
-	}
-	for (k = 0; k < C.pt.n_peers && nm < PC_CL_MAXPEER; k++) {
-		struct peer *p = &C.pt.peers[k];
-
-		if (__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) && p->has_ident) {
-			fmembers[nm++] = fnv1a64(p->ident, sizeof p->ident);
-			if (clpeers_live(p, now))      /* AT-11: stuck is a live one's */
-				lmembers[nl++] = fmembers[nm - 1];
-		}
-	}
-	for (k = 0; k < CLRES_MAX; k++) {
-		const struct clres_ent *e = &reserved.e[k];
-		uint64_t h;
-		int d;
-
-		if (!e->id || !e->has_ident || e->why == CLRES_GONE_FORGOTTEN ||
-		    now - (e->until_ms - RESERVE_MS) >= keep_ms)
-			continue;
-		h = fnv1a64(e->ident, sizeof e->ident);
-		for (d = 0; d < nm && fmembers[d] != h; d++)
-			;
-		if (d == nm)
-			fmembers[nm++] = h;
-	}
-	fspn = 0;
-	pc_ack_each(fsp_cb, NULL);         /* collected: no lock held below */
-	for (i = 0; i < fspn; i++) {
-		uint64_t lo = fspv[i].mark;    /* this node's own confirmed */
-
-		if (nm) {
-			uint64_t f = pc_ack_fleet_min(fspv[i].oid, fspv[i].incarn,
-				fmembers, nm);
-
-			if (f < lo)
-				lo = f;
-		}
-		if (lo)
-			C.st.tomb_forgotten += clretain_forget(fspv[i].oid,
-				fspv[i].incarn, lo, now_s);
-		acks_hold_note(&fspv[i], lo, nm, nl, now, hv, &hn);   /* AT-11 */
-	}
-	clretain_expire_expiries(now_s, PC_TOMB_EXPIRY_HOLD_S);   /* AT-5 (c) */
-	pthread_mutex_lock(&hold_mx);
-	memcpy(holdv, hv, (size_t)hn * sizeof hv[0]);
-	holdn = hn;
-	pthread_mutex_unlock(&hold_mx);
-}
-
-/* ---- 12ny AT-6: gaps ----------------------------------------------------
- * A hole in an origin's numbering here - a delete datagram lost, a burst
- * past a full socket - holds this node's mark below it, so nothing past it
- * is forgotten anywhere; filling it is this node's to ask for.  A hole is
- * asked for once it has stood GAP_WAIT_MS (datagrams overtake each other),
- * then again every GAP_RETRY_MS while it stands: of the origin when it is
- * live in that incarnation, else of every live member that announces
- * marks.  Each re-sends what it holds of the range as numbered tombstones -
- * applied, logged and counted here as any delete is. */
-#define GAP_WAIT_MS   500
-#define GAP_RETRY_MS  1000
-#define GAP_SPAN_MAX  4096u                /* seqs a request asks for */
-#define GAP_SEND_MAX  4096u                /* deletes an answer re-sends */
-#define GAP_DEAD_MS   30000                /* S473: asked of the peers this long */
-struct gapst { uint64_t oid; uint32_t incarn; uint64_t from;
-	long long seen_ms, asked_ms, over_ms; int tries; };
-static struct gapst gapv[64];
-static struct pc_ack_hole holev[64];
-/* AT-7: an origin's own announced mark of its own space - what it has
- * confirmed numbering, so a member below it is missing the tail */
-struct ownmark { uint64_t oid; uint32_t incarn; uint64_t mark; };
-static struct ownmark ownv[64];
-static int ownn;
-
-static int own_cb(uint64_t member, uint32_t incarn, uint64_t oid,
-		uint32_t sincarn, uint64_t mark, void *ctx)
-{
-	(void)incarn; (void)ctx;
-	if (member == oid && ownn < 64) {      /* the origin about itself */
-		ownv[ownn].oid = oid;
-		ownv[ownn].incarn = sincarn;
-		ownv[ownn++].mark = mark;
-	}
-	return 0;
-}
-
-/* AT-7: did this process start with nothing of its own - no snapshot, no
- * record replayed - so that what it holds came from the fleet */
-static int came_back_empty(void)
-{
-	return !pc_recovered_records() && !pc_recovered_snapshot_wall();
-}
-
-/* S473: a run of an origin that is over - it restarted, or it is this node's
- * own last.  Only that run could floor a mark (S463), so only this node can now */
-static int gap_run_over(const struct pc_ack_hole *h, long long now,
-		long long *death)
-{
-	int k;
-
-	*death = LLONG_MIN;
-	if (h->oid == fnv1a64(C.self_ident, sizeof C.self_ident))
-		return h->incarn != C.self_incarn;
-	for (k = 0; k < C.pt.n_peers; k++) {
-		struct peer *p = &C.pt.peers[k];
-
-		if (__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) && p->has_ident &&
-		    clpeers_live(p, now) &&
-		    fnv1a64(p->ident, sizeof p->ident) == h->oid) {
-			if (p->boot_ms)
-				*death = p->boot_ms + WITNESS_GRACE_MS + 1;
-			return p->incarn != h->incarn;
-		}
-	}
-	return 0;
 }
 
 /* a pass over the records up to @bt, the hold on; a floor's never resyncs */
@@ -12775,17 +9731,17 @@ static void rebuild_pass(unsigned int bt, int floor, long long death,
 	C.rec_col = 0;
 	C.rec_cursor = 0;
 	C.rec_start_ms = 0;
-	clrecon_rounds_reset(&C.recon);    /* S471 */
-	rdg_drop();                        /* S261: digests asked afresh */
+	clrecon_rounds_reset(&C.recon);
+	rdg_drop();                        /* digests asked afresh */
 	rdg_phase = 0;
 	C.rec_hold = 1;
 	C.reconcile_on = 1;
 	fp_fall_back(why);
 }
 
-/* S473: nobody will resend these, so the mark goes past them, and every record
+/* nobody will resend these, so the mark goes past them, and every record
  * stored so far is re-checked: a key whose delete was in the hole is among them */
-static void gap_floor_over(const struct pc_ack_hole *h, long long death)
+void gap_floor_over(const struct pc_ack_hole *h, long long death)
 {
 	unsigned int bt = get_ticks();
 	uint64_t applied = 0, hi = 0, floor = h->to;
@@ -12816,367 +9772,6 @@ static void gap_floor_over(const struct pc_ack_hole *h, long long death)
 		"out of reach");
 }
 
-static void gap_send(const pc_addr *to, const struct pc_ack_hole *h)
-{
-	unsigned char m[M_GAP_REQ_LEN];
-	struct pc_wcur c;
-	uint64_t to_seq = h->to - h->from >= GAP_SPAN_MAX ?
-		h->from + GAP_SPAN_MAX - 1 : h->to;
-
-	pc_wcur_init(&c, m, sizeof m);
-	pc_w8(&c, M_GAP_REQ);
-	pc_w64(&c, h->oid);
-	pc_w32(&c, h->incarn);
-	pc_w64(&c, h->from);
-	pc_w64(&c, to_seq);
-	if (c.ok && seal_send(to, m, sizeof m) == 0)
-		C.st.gap_asked++;
-}
-
-static void acks_gap_tick(long long now)
-{
-	int nh, i, j, k, sent;
-
-	if (!C.enabled || self_no_acks || !pc_ack_enabled())
-		return;
-	nh = pc_ack_holes(holev, 64);
-	/* AT-7: the tails - a space whose origin announces more than this
-	 * node has seen, and one it never heard of (an origin that restarted
-	 * while this node was away): asked for from just past what is held.
-	 * The origin's mark is its own confirmed one, so it holds them */
-	ownn = 0;
-	pc_ack_fleet_each(own_cb, NULL);
-	for (j = 0; j < ownn && nh < 64; j++) {
-		uint64_t applied = 0, hi = 0;
-		int known = pc_ack_known(ownv[j].oid, ownv[j].incarn, &applied, &hi);
-
-		if (!known && came_back_empty())
-			continue;              /* its floors are its sources' (boot) */
-		if (known && hi > applied)
-			continue;              /* an inner hole first (above) */
-		if (ownv[j].mark <= applied)
-			continue;
-		holev[nh].oid = ownv[j].oid;
-		holev[nh].incarn = ownv[j].incarn;
-		holev[nh].from = applied + 1;
-		holev[nh++].to = ownv[j].mark;
-	}
-	for (i = 0; i < nh; i++) {
-		struct pc_ack_hole *h = &holev[i];
-		struct gapst *g = NULL;
-
-		for (j = 0; j < 64; j++)
-			if (gapv[j].seen_ms && gapv[j].oid == h->oid &&
-			    gapv[j].incarn == h->incarn) {
-				g = &gapv[j];
-				break;
-			}
-		if (!g || g->from != h->from) {    /* a new hole, or it moved on */
-			if (!g)
-				for (j = 0; j < 64 && !g; j++)
-					if (!gapv[j].seen_ms ||
-					    now - gapv[j].seen_ms > 60000)
-						g = &gapv[j];
-			if (!g)
-				continue;
-			g->oid = h->oid;
-			g->incarn = h->incarn;
-			g->from = h->from;
-			g->seen_ms = now;
-			g->asked_ms = 0;
-			g->over_ms = 0;
-			g->tries = 0;
-			continue;
-		}
-		{
-			long long death;
-
-			if (!gap_run_over(h, now, &death))
-				g->over_ms = 0;
-			else if (!g->over_ms)
-				g->over_ms = now;
-			else if (now - g->over_ms >= GAP_DEAD_MS) {
-				gap_floor_over(h, death);
-				continue;
-			}
-		}
-		/* AT-7: a hole that does not move waits longer each time - 1, 2,
-		 * 4 ... 32 s: what nobody holds any more is asked for rarely */
-		if (now - g->seen_ms < GAP_WAIT_MS ||
-		    now - g->asked_ms < (long long)GAP_RETRY_MS << (g->tries < 5 ? g->tries : 5))
-			continue;
-		g->asked_ms = now;
-		g->tries++;
-		if (h->from > 1 && h->to >= h->from) {
-			uint64_t applied = 0, hi = 0;
-
-			if (pc_ack_known(h->oid, h->incarn, &applied, &hi) &&
-			    h->from > hi)
-				C.st.gap_tail++;
-		}
-		/* the origin, live in that incarnation */
-		for (k = 0, sent = 0; k < C.pt.n_peers && !sent; k++) {
-			struct peer *p = &C.pt.peers[k];
-
-			if (__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) &&
-			    p->has_ident && p->incarn == h->incarn &&
-			    clpeers_live(p, now) &&
-			    fnv1a64(p->ident, sizeof p->ident) == h->oid) {
-				gap_send(&p->addr, h);
-				sent = 1;
-			}
-		}
-		if (sent)
-			continue;
-		/* gone, restarted, or this node's own old space: whoever
-		 * still holds it */
-		for (k = 0; k < C.pt.n_peers; k++) {
-			struct peer *p = &C.pt.peers[k];
-
-			if (__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) &&
-			    p->acks && clpeers_live(p, now))
-				gap_send(&p->addr, h);
-		}
-	}
-}
-
-struct gap_rpl { const struct peer *p; uint64_t oid; uint32_t incarn; };
-
-static void gap_rpl_cb(const char *col, size_t cn, const char *key,
-		size_t kn, uint64_t ver, uint64_t seq, void *ctx)
-{
-	unsigned char msg[CLFWD_TOMB_MAX];
-	struct gap_rpl *g = ctx;
-	struct clfwd_key fk = {
-		.col = col, .collen = (unsigned int)cn,
-		.key = key, .klen = (unsigned int)kn };
-	struct clfwd_tomb_num num = { g->oid, g->incarn, seq };
-	size_t n = clfwd_tomb_build_n(msg, M_TOMBSTONE, &fk, ver, 0, &num);
-
-	if (n && seal_send(&g->p->addr, msg, n) == 0)
-		C.st.gap_resent++;
-}
-
-static void rebuild_send(const pc_addr *to, int kind, long long age_ms);
-
-static void held_min_cb(const char *col, size_t cn, const char *key,
-		size_t kn, uint64_t ver, uint64_t seq, void *ctx)
-{
-	uint64_t *m = ctx;
-
-	(void)col; (void)cn; (void)key; (void)kn; (void)ver;
-	if (!*m || seq < *m)
-		*m = seq;
-}
-
-/* S463: the origin's own space - a seq it numbered and no longer holds is
- * gone for good; the floor is just below the first it holds in [lo, hi],
- * or @hi when it holds none there; 0 = nothing to floor */
-static uint64_t gap_floor_at(uint64_t oid, uint32_t incarn, uint64_t lo,
-		uint64_t hi)
-{
-	uint64_t first = 0;
-
-	(void)clretain_space_each(oid, incarn, lo, hi, GAP_SEND_MAX, held_min_cb,
-		&first);
-	if (first == lo)
-		return 0;
-	return first ? first - 1 : hi;
-}
-
-static void gap_floor_send(const pc_addr *to, uint64_t oid, uint32_t incarn,
-		uint64_t floor, int node)
-{
-	unsigned char m[M_GAP_FLOOR_LEN];
-	struct pc_wcur c;
-
-	pc_wcur_init(&c, m, sizeof m);
-	pc_w8(&c, M_GAP_FLOOR);
-	pc_w64(&c, oid);
-	pc_w32(&c, incarn);
-	pc_w64(&c, floor);
-	if (!c.ok || seal_send(to, m, sizeof m) != 0)
-		return;
-	C.st.gap_floored++;
-	if (pc_logrl_ok(LRL_GAP_FLOOR, to))
-		LM_NOTICE("cluster: node %d asked for deletes this node no longer "
-			"holds (up to %llu) - told to floor there, and asked to "
-			"rebuild\n", node, (unsigned long long)floor);
-	rebuild_send(to, M_REBUILD_ASK, M_REBUILD_FLOOR);
-}
-
-static void handle_gap_req(const unsigned char *pt, size_t n,
-		const pc_addr *from)
-{
-	struct peer *p = clpeers_by_addr(&C.pt, from);
-	struct pc_rcur c;
-	struct gap_rpl g;
-	uint64_t lo, hi;
-
-	if (!p || !__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
-	    n < M_GAP_REQ_LEN)
-		return;
-	pc_rcur_init(&c, pt, n);
-	(void)pc_ru8(&c);
-	g.p = p;
-	g.oid = pc_ru64(&c);
-	g.incarn = pc_ru32(&c);
-	lo = pc_ru64(&c);
-	hi = pc_ru64(&c);
-	if (!lo || hi < lo || hi - lo >= GAP_SPAN_MAX)
-		return;
-	if (g.oid == fnv1a64(C.self_ident, sizeof C.self_ident) &&
-	    g.incarn == C.self_incarn) {
-		uint64_t floor = gap_floor_at(g.oid, g.incarn, lo, hi);
-
-		if (floor >= lo) {             /* S463: it starts below what is held */
-			gap_floor_send(from, g.oid, g.incarn, floor, p->node);
-			if (floor >= hi)
-				return;
-			lo = floor + 1;
-		}
-	} else if (self_gap_no_copies) {
-		return;
-	}
-	C.st.gap_served++;
-	(void)clretain_space_each(g.oid, g.incarn, lo, hi, GAP_SEND_MAX,
-		gap_rpl_cb, &g);
-}
-
-/* S463: the member floors its mark where the origin's retained deletes now
- * begin - only the origin may say so of its own space */
-static void handle_gap_floor(const unsigned char *pt, size_t n,
-		const pc_addr *from)
-{
-	struct peer *p = clpeers_by_addr(&C.pt, from);
-	struct pc_rcur c;
-	uint64_t oid, floor;
-	uint32_t incarn;
-
-	if (!p || !__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
-	    n < M_GAP_FLOOR_LEN || !p->has_ident || !pc_ack_enabled() ||
-	    self_no_acks)
-		return;
-	pc_rcur_init(&c, pt, n);
-	(void)pc_ru8(&c);
-	oid = pc_ru64(&c);
-	incarn = pc_ru32(&c);
-	floor = pc_ru64(&c);
-	if (oid != fnv1a64(p->ident, sizeof p->ident) || incarn != p->incarn)
-		return;
-	if (pc_ack_floor(oid, incarn, floor) == CLACK_NEW) {
-		C.st.acks_floors++;
-		LM_NOTICE("cluster: node %d no longer holds its deletes up to %llu "
-			"- this node's mark floored there; the rebuild it asks "
-			"for re-checks what that skipped\n", p->node,
-			(unsigned long long)floor);
-	}
-}
-
-/* ---- 12ny AT-8: the backstop - a member away too long is rebuilt ---------
- * The deletes a member missed while away are kept for it while it is
- * counted (AT-5) and up to the time rule and the cap.  Past either, this
- * node no longer holds what that member lacks, and neither a replay nor a
- * gap request can give it back - so the member must be rebuilt, not
- * waited for, and it must be TOLD: a timer must never forget silently for
- * a member that has not confirmed (the ScyllaDB lesson, 12ny).  A restart
- * is told already (S392's fast path refuses: OLDER, LOST, BEHIND - and it
- * walks); a member back with its incarnation is told here. */
-struct gone_ctx { uint64_t member; int owed; };
-
-static int gone_cb(uint64_t oid, uint32_t incarn, uint64_t gone_hi, void *ctx)
-{
-	struct gone_ctx *g = ctx;
-	uint64_t m = 0;
-
-	if (!gone_hi)
-		return 0;
-	if (!pc_ack_fleet_mark(g->member, oid, incarn, &m) || m < gone_hi) {
-		g->owed = 1;
-		return 1;
-	}
-	return 0;
-}
-
-static void rebuild_send(const pc_addr *to, int kind, long long age_ms)
-{
-	unsigned char m[M_REBUILD_LEN];
-	struct pc_wcur c;
-
-	pc_wcur_init(&c, m, sizeof m);
-	pc_w8(&c, M_REBUILD);
-	pc_w8(&c, (unsigned char)kind);
-	pc_w32(&c, age_ms > 0xffffffffLL ? 0xffffffffu : (uint32_t)age_ms);
-	if (c.ok && seal_send(to, m, sizeof m) == 0 && kind == M_REBUILD_ASK)
-		C.st.rebuild_sent++;
-}
-
-/* the member's first keepalive after @now - @was ms of silence.  Its marks
- * are the ones it announced before (this keepalive's are reported after),
- * which is what it holds of this node's spaces: nothing of them reached
- * it meanwhile.  Owed: a space this node no longer holds past its mark, or
- * an unnumbered entry noted since it went silent that is gone.  Only what
- * this node lost: a node that noted nothing meanwhile asks nothing, however
- * long the absence (the other side of a partition sees it too) */
-static void acks_back_check(struct peer *p, uint64_t member,
-		long long was, long long now)
-{
-	long long away_s = (now - was) / 1000;
-	struct gone_ctx g = { member, 0 };
-
-	clretain_gone_each(gone_cb, &g);
-	if (!g.owed && !clretain_lost_since((unsigned int)(was / 1000)))
-		return;                        /* everything it missed is held */
-	p->rb_state = 1;
-	p->rb_from_ms = was;
-	LM_WARN("cluster: node %d is back after %lld s - this node no longer "
-		"holds every delete made meanwhile (%s); asking it to rebuild: "
-		"reconcile what it stored before then with the fleet\n",
-		p->node, away_s, g.owed ? "some past its marks were forgotten or "
-		"dropped" : "some noted since were dropped by the time rule or "
-		"the cap");
-	/* AT-11: and to the alerts, with what happens now - not S427's
-	 * "re-issue the deletes" */
-	pthread_mutex_lock(&tomb_gap_mx);
-	snprintf(tomb_gap_text, sizeof tomb_gap_text, "node %d back after "
-		"%lld s - deletes made meanwhile are no longer all held here, "
-		"so it was asked to rebuild: it reconciles what it stored "
-		"before the absence with the fleet", p->node, away_s);
-	tomb_gaps++;
-	pthread_mutex_unlock(&tomb_gap_mx);
-	/* now, not at the next beat: from this keepalive on, this node takes
-	 * its sweeps and its pull answers, and until it holds what it stored
-	 * before, those can carry a key whose delete nobody kept */
-	rebuild_send(&p->addr, M_REBUILD_ASK, now - was);
-	p->rb_sent_ms = now;
-	p->rb_tries = 1;
-}
-
-static void acks_rebuild_tick(long long now)
-{
-	int i;
-
-	for (i = 0; i < C.pt.n_peers; i++) {
-		struct peer *p = &C.pt.peers[i];
-
-		if (p->rb_state != 1 || !__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
-		    !clpeers_live(p, now) || now - p->rb_sent_ms < 2000)
-			continue;
-		if (p->rb_tries >= 5) {
-			p->rb_state = 0;
-			LM_WARN("cluster: node %d did not take the rebuild it was "
-				"asked for 5 times - it may keep deletes it missed; "
-				"restart it to make it reconcile\n", p->node);
-			continue;
-		}
-		/* the age as of this send: the asked node takes its boundary
-		 * from its own clock, now minus this */
-		rebuild_send(&p->addr, M_REBUILD_ASK, now - p->rb_from_ms);
-		p->rb_sent_ms = now;
-		p->rb_tries++;
-	}
-}
-
 static void handle_rebuild(const unsigned char *pt, size_t n,
 		const pc_addr *from)
 {
@@ -13202,12 +9797,11 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 	if (kind != M_REBUILD_ASK || !C.cfg_eager)
 		return;
 	floor = age_ms == M_REBUILD_FLOOR;
-	/* the records in question are the ones stored before the absence:
-	 * held (S245) and walked (B4) until the fleet rules on each.  Whole
-	 * ticks, rounded up: a record stored in the second the absence
-	 * began is in question, as one stored a second before is */
+	/* in question: every record stored before the absence, held and walked until the fleet
+	 * rules; whole ticks rounded up, so the absence's first second counts */
 	nowt = get_ticks();
-	bt = nowt > age_ms / 1000 ? nowt - age_ms / 1000 : 0;
+	/* a floor's is every record stored so far: its age was no absence, and as one it walked none */
+	bt = floor ? nowt : nowt > age_ms / 1000 ? nowt - age_ms / 1000 : 0;
 	if ((C.reconcile_on && C.rec_tick >= bt) || (C.rb_cover && C.rb_cover >= bt)) {
 		C.st.rebuild_covered++;
 		rebuild_send(from, M_REBUILD_TAKEN, 0);
@@ -13216,13 +9810,12 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 	C.rb_cover = bt;
 	C.st.rebuilds++;
 	if (C.reconcile_on) {
-		/* a pass under way with an earlier boundary - a restart's, or
-		 * another asker's: the boundary moves up and the walk starts
-		 * over, so every record stored before it is walked */
+		/* a pass under way with an earlier boundary: the boundary moves up and the walk
+		 * starts over, so every record stored before it is walked */
 		C.rec_tick = bt;
 		C.rec_col = 0;
 		C.rec_cursor = 0;
-		clrecon_rounds_reset(&C.recon);   /* S471 */
+		clrecon_rounds_reset(&C.recon);
 		rebuild_send(from, M_REBUILD_TAKEN, 0);
 		if (floor)
 			LM_WARN("cluster: node %d no longer holds deletes this "
@@ -13234,7 +9827,7 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 				"stored before then\n", p->node, age_ms / 1000);
 		return;
 	}
-	/* S455: a split's rebuild - the fleet was up through it.  A floor is no
+	/* a split's rebuild - the fleet was up through it.  A floor is no
 	 * absence: the origin made those deletes since its boot, so it witnesses */
 	rebuild_pass(bt, floor, !floor ? now_ms() - (long long)age_ms :
 		p->boot_ms ? p->boot_ms + WITNESS_GRACE_MS + 1 : LLONG_MIN,
@@ -13252,131 +9845,10 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 			"fleet\n", p->node, age_ms / 1000);
 }
 
-static void tomb_catchup_tick(void)
-{
-	long long now = now_ms();
-	unsigned int now_s = (unsigned int)(now / 1000);
-	struct clretain_stats rs;
-	int i;
-
-	if (!clretain_enabled())
-		return;
-	clretain_expire(now_s);
-	if (self_gap_no_copies)
-		return;                        /* S473: no copies by this road either */
-	catchup_by_marks = pc_cluster_acks_gate(NULL, 0, NULL);    /* AT-7 */
-	clretain_get_stats(&rs, now_s);
-	for (i = 0; i < C.pt.n_peers; i++) {
-		struct peer *p = &C.pt.peers[i];
-		unsigned int horizon, upto, sent, win;
-
-		if (!__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
-		    !clpeers_live(p, now))
-			continue;              /* silent: the gap is noted on return */
-		horizon = now_s > rs.retain_s ? now_s - rs.retain_s : 0;
-		if (!p->tomb_owed) {
-			if (p->tomb_gap_from) {
-				/* it went quiet at gap_from: what was deleted
-				 * since may never have reached it */
-				unsigned int away = now_s - p->tomb_gap_from;
-
-				/* S427 (PROD 0.6.6, 2026-10-20): the table vouches for
-				 * the gap when it holds every delete made since the
-				 * peer went quiet - clretain_complete_since(), the
-				 * fast reconcile's test (S392): its horizon, or the
-				 * newest delete the cap or the memory lost.  Before,
-				 * ANY early drop while it was away raised this: with
-				 * the cap biting, the OLDEST deletes go - hours older
-				 * than a 34 s restart - and every restart said "past
-				 * tombstone_retain_s 900 s", which it was not */
-				unsigned int whole = clretain_complete_since(now_s);
-
-				/* 12ny AT-11: a member that confirms, in an eager
-				 * fleet, is AT-8's: it is asked to rebuild when
-				 * something it may lack is gone (acks_back_check says
-				 * so, and raises this) - "re-issue the deletes" is not
-				 * the outcome there */
-				if (whole > p->tomb_gap_from &&
-				    !(p->acks && C.cfg_eager && pc_ack_enabled())) {
-					int past = away > rs.retain_s;
-					char why[160];
-
-					if (past)
-						snprintf(why, sizeof why, "past "
-							"tombstone_retain_s %u s", rs.retain_s);
-					else
-						snprintf(why, sizeof why, "and the cap "
-							"(tombstone_retain_max %u) dropped "
-							"deletes made while it was away", rs.max);
-					LM_WARN("cluster: node %d is back after %u s, %s: "
-						"a delete made while it was away may come "
-						"back; re-issue deletes that matter\n",
-						p->node, away, why);
-					/* AR15: and to the alerts */
-					pthread_mutex_lock(&tomb_gap_mx);
-					snprintf(tomb_gap_text, sizeof tomb_gap_text,
-						"node %d back after %u s, %s - deletes made "
-						"meanwhile may come back; re-issue the ones "
-						"that matter", p->node, away, why);
-					tomb_gaps++;
-					pthread_mutex_unlock(&tomb_gap_mx);
-				}
-				LM_NOTICE("cluster: node %d is back after %u s of "
-					"silence - replaying the deletes it may have "
-					"missed (%llu retained)\n", p->node, away,
-					rs.entries);
-				p->tomb_mark = p->tomb_gap_from;
-				p->tomb_gap_from = 0;
-			} else if (!p->tomb_mark) {
-				/* never caught up before: everything retained */
-				p->tomb_mark = horizon;
-			} else {
-				/* heard all along: the broadcasts reached it */
-				p->tomb_mark = now_s;
-				p->tomb_drop_mark = clretain_dropped_early();
-				continue;
-			}
-			p->tomb_owed = 1;
-			p->tomb_sent = 0;
-			p->tomb_win = 60;
-		}
-		if (p->tomb_mark < horizon)
-			p->tomb_mark = horizon;    /* nothing older is held */
-		win = p->tomb_win ? p->tomb_win : 60;
-		upto = p->tomb_mark + win < now_s ? p->tomb_mark + win : now_s;
-		sent = clretain_each(p->tomb_mark, upto, tomb_catchup_cb, p);
-		p->tomb_mark = upto;
-		/* a few thousand a tick: halve the window past 4,000, double it
-		 * under 1,000 */
-		if (sent > 4000 && win > 1)
-			p->tomb_win = win / 2;
-		else if (sent < 1000 && win < 3600)
-			p->tomb_win = win * 2;
-		if (upto >= now_s) {
-			p->tomb_owed = 0;
-			p->tomb_drop_mark = clretain_dropped_early();
-			if (p->tomb_sent)
-				LM_NOTICE("cluster: node %d caught up - %llu delete(s) "
-					"replayed\n", p->node, p->tomb_sent);
-		}
-	}
-}
-
-/* ---- S392: the reconcile's fast path, the witness's half ----------------
- * A peer back from a restart asks for every delete planted here since its
- * snapshot began - as an AGE, since its wall clock is not this node's
- * monotonic one.  The window opens TOMBFP_MARGIN_S earlier still: both
- * ends count whole seconds, and a delete made here is planted here before
- * it reaches the asker.  This node vouches when its table is whole over
- * the window: begun after its own start and the witness grace (the rule a
- * witness meets), inside retain_s, and nothing lost to the cap since.  It
- * then replays the window numbered, at the catch-up's pace, checks again
- * at the end that nothing inside it expired or was evicted meanwhile, and
- * says DONE with the count.  A number is spent whether its datagram left
- * or not, so a send that failed here reads as a short replay there.
- */
+/* ---- the reconcile's fast path, the witness's half ----------------------
+ * replay the deletes since the asker's snapshot only if this node retained that window whole */
 #define TOMBFP_MARGIN_S 10
-#define FP_MARKS_WAIT_MS 3000          /* AT-5: under the asker's FP_QUIET_MS */
+#define FP_MARKS_WAIT_MS 3000          /* under the asker's FP_QUIET_MS */
 
 static void fp_wire_done(const struct peer *p, uint32_t req, int status,
 		unsigned int n)
@@ -13390,13 +9862,8 @@ static void fp_wire_done(const struct peer *p, uint32_t req, int status,
 	(void)seal_send(&p->addr, m, sizeof m);
 }
 
-/* 12ny AT-5: what this node forgot by the members' marks after @from_s was
- * confirmed by the asker's previous incarnation too, so the asker holds it -
- * unless its state is older than what it confirmed (a restore from a
- * backup).  Its current marks say which: every space forgotten here after
- * the window began must be reached by them.  -1 while a space's mark from
- * it is not in yet (its keepalives carry them a slice a beat: the asker
- * asks again), else TOMBFP_OK or TOMBFP_BEHIND */
+/* a delete forgotten here after @from_s must be reached by the asker's current marks, or its
+ * state predates what it confirmed (a backup restore); -1 = a mark not in yet */
 struct fpm { uint64_t member; unsigned int from_s; int st; };
 
 static int fp_marks_cb(uint64_t oid, uint32_t incarn, uint64_t through,
@@ -13453,10 +9920,10 @@ static void fp_rpl_cb(const char *col, size_t cn, const char *key,
 	struct clfwd_key fk = {
 		.col = col, .collen = (unsigned int)cn,
 		.key = key, .klen = (unsigned int)kn };
-	struct clfwd_tomb_num num = { oid, incarn, seq };      /* AT-5 */
+	struct clfwd_tomb_num num = { oid, incarn, seq };
 	size_t n = clfwd_tomb_build_n(msg + 9, M_TOMBSTONE, &fk, ver,
-		(expiry ? CLFWD_TOMB_F_EXPIRY : 0) |       /* S446 */
-		(expiry == 2 ? CLFWD_TOMB_F_KEEP : 0), &num);   /* AT-5 (c) */
+		(expiry ? CLFWD_TOMB_F_EXPIRY : 0) |
+		(expiry == 2 ? CLFWD_TOMB_F_KEEP : 0), &num);
 
 	if (n) {
 		msg[0] = M_TOMB_RPL;
@@ -13476,7 +9943,7 @@ static const char *fp_status_why(int st)
 		"it is older than the retained deletes reach";
 }
 
-/* ---- UPS: a member asks this node to install a build; the asking side - */
+/* ---- a member asks this node to install a build; the asking side ---------- */
 _Static_assert(UPGSW_ACCEPTED == 0 && UPGSW_NOT_STAGED == 1 &&
 	UPGSW_UNVERIFIED == 2 && UPGSW_NO_HELPER == 3 && UPGSW_BUSY == 4 &&
 	UPGSW_OTHER == 5, "upgrade.c's copies of UPGSW_*");
@@ -13552,7 +10019,7 @@ static void handle_tomb_req(const unsigned char *pt, size_t n,
 		now_s - age - TOMBFP_MARGIN_S : 0;
 	st = fp_vouch(from_s, now_s);
 	if (st == TOMBFP_OK && (st = fp_vouch_marks(p, from_s)) < 0) {
-		/* AT-5: its marks are not in yet - its keepalives carry them
+		/* its marks are not in yet - its keepalives carry them
 		 * a slice a beat; held, and decided by the replay's tick */
 		p->fp_req = req;
 		p->fp_from = from_s;
@@ -13596,7 +10063,7 @@ static void fp_replay_tick(void)
 			p->fp_on = 0;              /* gone: it asks again */
 			continue;
 		}
-		if (p->fp_on == 2) {               /* AT-5: held for its marks */
+		if (p->fp_on == 2) {               /* held for its marks */
 			st = fp_vouch_marks(p, p->fp_from);
 			if (st < 0 && now < p->fp_hold_ms)
 				continue;
@@ -13632,8 +10099,8 @@ static void fp_replay_tick(void)
 			p->fp_win = win * 2;
 		if (upto < now_s)
 			continue;
-		/* the window is out: was it whole to the end?  AT-5: and does
-		 * the asker still reach what was forgotten meanwhile */
+		/* the window is out: was it whole to the end, and does
+		 * the asker still reach what was forgotten meanwhile? */
 		st = fp_vouch(p->fp_from, now_s);
 		if (st == TOMBFP_OK && (st = fp_vouch_marks(p, p->fp_from)) < 0)
 			st = TOMBFP_BEHIND;
@@ -13654,15 +10121,8 @@ static void fp_replay_tick(void)
 	}
 }
 
-unsigned long long pc_cluster_tomb_catchup_sent(void)
-{
-	return tomb_catchup_total;
-}
-
-/* S296: the rebalancer's last verdict - see struct pc_rebalance.  Every
- * field is a plain word written by the peer thread alone and read with
- * relaxed atomics; a reader may see two fields from adjacent ticks,
- * which describes the fleet no less truly. */
+/* the rebalancer's last verdict: written by the peer thread alone, read relaxed - a reader
+ * may mix fields from adjacent ticks, which is still true of the fleet */
 enum { RB_NONE = 0, RB_SMALL, RB_BAND, RB_NOPEER, RB_SHED };
 static struct {
 	int code, node, settled;
@@ -13741,13 +10201,9 @@ void pc_rebalance_tick(void)
 
 	if (!C.enabled)
 		return;
-	tomb_catchup_tick();               /* S238: deletes a peer missed */
+	tomb_catchup_tick();               /* deletes a peer missed */
 	shard_reshard_tick();              /* ownership first: deterministic
 	                                    * moves are not load leveling */
-	spread_reclaim_tick();             /* S127: and drop surplus copies,
-	                                    * but only once the fleet has
-	                                    * settled and the repair that
-	                                    * follows a set change is done */
 	eager_repl_tick();                 /* then the eager synchronizer */
 	for (i = 0; i < C.pt.n_peers; i++) {
 		unsigned int u;
@@ -13757,9 +10213,8 @@ void pc_rebalance_tick(void)
 		u = live_per_mille(C.pt.peers[i].live_kb, C.pt.peers[i].total_mb);
 		sum += u;
 		n++;
-		/* equal utilization ties break toward more ABSOLUTE free -
-		 * else a tiny empty node wins over a huge empty one and the
-		 * data double-hops through it (measured: B->A->C cascade) */
+		/* ties go to more ABSOLUTE free space, or data double-hops
+		 * through a tiny empty node */
 		if (u < best_util || (u == best_util && best &&
 		        C.pt.peers[i].free_mb > best->free_mb)) {
 			best_util = u;
@@ -13767,24 +10222,18 @@ void pc_rebalance_tick(void)
 		}
 	}
 	if (n < 2 || !best) {
-		rb_set(RB_SMALL, self_per_mille, self_per_mille, 0, 0);  /* S296 */
+		rb_set(RB_SMALL, self_per_mille, self_per_mille, 0, 0);
 		return;
 	}
 	mean = sum / (unsigned int)n;
-	/* the leveling metric is UTILIZATION (used/total), not absolute
-	 * free bytes (REVISED on the user's call - the absolute metric
-	 * drained small nodes to zero next to a big one): equal arenas
-	 * level to equal key counts; mixed arenas to capacity-PROPORTIONAL
-	 * shares.  Shed only when meaningfully fuller than the fleet mean,
-	 * toward the least-utilized peer, and only by the EXCESS - the
-	 * budget then caps churn, and overshoot oscillation is impossible
-	 * by construction. */
+	/* level by UTILIZATION, not free bytes: shed only above mean + band, to the least
+	 * utilized peer, and only the EXCESS, so it cannot overshoot and oscillate */
 	if (self_per_mille <= mean + 50) {     /* band: 50 per-mille = 5% */
-		rb_set(RB_BAND, self_per_mille, mean, 0, 0);            /* S296 */
+		rb_set(RB_BAND, self_per_mille, mean, 0, 0);
 		return;
 	}
 	if (best_util >= self_per_mille) {
-		rb_set(RB_NOPEER, self_per_mille, mean, 0, 0);          /* S296 */
+		rb_set(RB_NOPEER, self_per_mille, mean, 0, 0);
 		return;
 	}
 	{
@@ -13795,13 +10244,12 @@ void pc_rebalance_tick(void)
 		if ((long long)excess << 20 < budget)
 			budget = (long long)excess << 20;
 		if (budget <= 0) {
-			rb_set(RB_BAND, self_per_mille, mean, 0, 0);    /* S296 */
+			rb_set(RB_BAND, self_per_mille, mean, 0, 0);
 			return;
 		}
 		rb_set(RB_SHED, self_per_mille, mean, best->node, budget >> 10);
 		run_migration(best, budget, 0, 0, NULL, NULL, NULL, 0);
-		/* S296: what this tick actually moved, by the records the
-		 * migration counted out */
+		/* what this tick moved, by the records the migration counted out */
 		if (C.px.migrated_out > before) {
 			__atomic_fetch_add(&rb.moved, C.px.migrated_out - before,
 				__ATOMIC_RELAXED);
@@ -13813,24 +10261,10 @@ void pc_rebalance_tick(void)
 }
 
 /* ---- the bulk TCP plane (records above the datagram ceiling) ------------
- * Cluster-principal Noise sessions on advertise:port/TCP.  The peer
- * thread's tick stubs oversized victims into a batch; this thread owns
- * every socket - connects, handshakes, streams, and accepts inbound
- * transfers - so membership never stalls on TCP timeouts.  Stream:
- * [count u32] then M_MIGRATE_MANY-format records; the ack is one
- * [stored u32] record. */
+ * the bulk thread owns every TCP socket, so membership never stalls on TCP timeouts */
 
-/* ---- S83: the bootstrap pull over the bulk plane ------------------------
- * Joiner: [count u32 = BOOT_MAGIC][kind u8][node u16][0 u8], then reads
- * M_MIGRATE_MANY-format records until a header of all zeros, applies
- * each PASSIVE (a copy never re-propagates) and off the WAL (the author
- * persists it), and answers [stored u32].  Peer: walks every eager
- * collection, streaming as the buffer fills.  The stream is written
- * from inside the walk callback; in the bucket phase no lock is held,
- * in the overflow leg the overflow lock is - a flush there stalls
- * writers that need it for as long as the socket takes the buffer,
- * microseconds against a receiver that applies at memory speed, and
- * bounded by the socket's 5 s send timeout. */
+/* ---- the bootstrap pull over the bulk plane --------------------------------
+ * the walk callback writes the stream, so a flush in the overflow leg holds its lock (5 s cap) */
 struct boot_ctx {
 	int fd;
 	struct pc_cipherstate *cs;
@@ -13838,7 +10272,7 @@ struct boot_ctx {
 	size_t len, cap;
 	const char *col;
 	unsigned int cn, now, streamed;
-	unsigned int skipped;          /* S156: outside the joiner's share */
+	unsigned int skipped;          /* outside the joiner's share */
 	int node;                      /* the joiner */
 	int k;                         /* copy factor; 0 = not spread */
 	int err;
@@ -13871,23 +10305,8 @@ static int boot_cb(const str *key, const str *val,
 	}
 	if (key->len > 4096)
 		return 0;
-	/*
-	 * S156: UNDER SPREAD THE JOINER IS HANDED ITS SHARE, NOT THE STORE.
-	 *
-	 * This walk streamed every record of every eager collection.  That
-	 * is right for eager - the joiner owes everything - and wrong for
-	 * spread, where it left a node that came back empty holding the
-	 * whole keyspace: measured on three nodes at K=2 with 3,000 keys,
-	 * the returning node reached 3,000 of 3,000 within 18 s and the
-	 * fleet 7,001 where K x N is 6,000, and the reclaim pass then
-	 * trimmed the surplus at 64 keys a sweep, minutes on a bench
-	 * keyspace and hours on a production one.  The predicate is the
-	 * write path's own (map first, HRW over live peers behind it), so
-	 * the boot pull places exactly where a write would.  A joiner the
-	 * map does not list yet reads as "not in the set" and gets nothing
-	 * from here - set-repair, armed on every holder by a cold start
-	 * (S147), delivers its share by the scoped walk.
-	 */
+	/* under spread the joiner gets only its share, placed as a write would; one the map
+	 * does not list yet gets nothing here - set repair delivers it */
 	if (bc->k && !pc_spread_in_set(pc_key_slot(key->s, (size_t)key->len),
 	        bc->node, bc->k)) {
 		bc->skipped++;
@@ -13930,11 +10349,8 @@ static void bulk_serve_boot(int cfd, struct pc_cipherstate *cs_s,
 	if (clbulk_recv_exact(cfd, cs_r, stash, slen, scap, req,
 	        CLBULK_BOOTREQ_LEN) != 0)
 		return;
-	/* parse BEFORE the kind is tested.  This read req[0] directly once,
-	 * and moving the check onto a parsed field without moving the parse
-	 * up left it reading an uninitialised int - the sender then served
-	 * nothing and every bootstrap pull came back empty.  -Wall did not
-	 * catch it: &bkind is taken below, which defeats the analysis. */
+	/* parse BEFORE testing the kind: -Wall cannot flag an uninitialised
+	 * bkind, since its address is taken */
 	if (!clbulk_bootreq_parse(req, CLBULK_BOOTREQ_LEN, &bkind, &node))
 		return;
 	if (bkind != BOOT_KIND_PULL)
@@ -13948,10 +10364,10 @@ static void bulk_serve_boot(int cfd, struct pc_cipherstate *cs_s,
 		return;
 	bc.now = get_ticks();
 	bc.node = node;
-	bc.k = pc_cluster_replicas();      /* S156: scope the walk under spread */
+	bc.k = pc_cluster_replicas();      /* scope the walk under spread */
 	for (c = 0; c < pc_store_count() && !bc.err; c++) {
 		if (!pc_store_live(c))
-			continue;   /* S69: a dropped collection */
+			continue;
 		pcache_htable_t *ht = pc_store_ht(c);
 
 		if (!pc_store_eager_enabled(ht))
@@ -13980,9 +10396,8 @@ out:
 	free(bc.buf);
 }
 
-/* the joiner's side, one candidate.  0 = the stream ended cleanly;
- * -2 = nothing came back before the first record (an older build closed
- * on the magic count, or a refusal); -1 = the stream broke. */
+/* one candidate: 0 = clean end; -2 = nothing before the first record (an older build or a
+ * refusal); -1 = the stream broke */
 static int bulk_pull_from(const pc_addr *peer,
 		unsigned int *streamed, unsigned int *stored, unsigned int *older)
 {
@@ -14032,7 +10447,7 @@ static int bulk_pull_from(const pc_addr *peer,
 	for (;;) {
 		unsigned int ttl_left, cn, kn, vl, exp;
 		unsigned long long ver;
-		unsigned char rtype;           /* S280: the record's type */
+		unsigned char rtype;
 		pcache_htable_t *ht;
 		char colz[256];
 		str k, v;
@@ -14070,12 +10485,12 @@ static int bulk_pull_from(const pc_addr *peer,
 		k.len = (int)kn;
 		v.s = (char *)rec + cn + kn;
 		v.len = (int)vl;
-		exp = pc_upstream_copy_exp(colz, cn, ttl_left);   /* S449 */
+		exp = pc_upstream_copy_exp(colz, cn, ttl_left);
 		pc_lamport_observe(ver);
 		{
 			unsigned long long tv;
 
-			/* S209: superseded by a newer tombstone - resolved, not
+			/* superseded by a newer tombstone - resolved, not
 			 * stored (the batch must not be retried for it) */
 			if (pc_neg_ver(colz, cn, k.s, kn, &tv) && tv && ver <= tv) {
 				(*older)++;
@@ -14084,11 +10499,11 @@ static int bulk_pull_from(const pc_addr *peer,
 				continue;
 			}
 		}
-		if (dropfloor_refuses(colz, cn, k.s, kn, ver)) {   /* S278 */
+		if (dropfloor_refuses(colz, cn, k.s, kn, ver)) {
 			(*older)++;
 			continue;
 		}
-		brc = pcache_ht_store_ver(ht, &k, &v, exp,
+		brc = pcache_ht_store_peer(ht, &k, &v, exp,      /* a replica: ties broken */
 			(unsigned char)(PCACHE_F_PASSIVE | rtype), ver);
 		if (brc == PCACHE_E_OLDER) {
 			(*older)++;
@@ -14099,13 +10514,13 @@ static int bulk_pull_from(const pc_addr *peer,
 			unsigned long long tv;
 
 			if (pc_neg_ver(colz, cn, k.s, kn, &tv) &&
-			        clorder_take_back(ht, &k, ver, tv)) {      /* S461 */
+			        clorder_take_back(ht, &k, ver, tv)) {
 				__atomic_fetch_add(&C.px.recv_tombstoned, 1,
 					__ATOMIC_RELAXED);
 				continue;
 			}
 			pc_loc_clear(colz, cn, k.s, kn);
-			pc_upstream_note_copy(colz, cn, k.s, kn, exp, ver);   /* S418 */
+			pc_upstream_note_copy(colz, cn, k.s, kn, exp, ver);
 			(*stored)++;
 		}
 	}
@@ -14149,17 +10564,13 @@ static void bulk_pull(void)
 			"or unreachable" : "the stream broke",
 			k + 1 < n ? " - trying the next candidate" : "");
 	}
-	/* every candidate of this round failed: hand the decision back to
-	 * the tick, which re-picks with the peers known by now, or gives
-	 * up after three rounds */
+	/* every candidate failed: the tick re-picks from the peers known by then, or gives up
+	 * after three rounds */
 	clboot_pull_failed(&C.bt, clbulk_lock(&C.bk));
 }
 
-/* S178: the bulk thread has only the destination address, so the peer
- * is found by it.  Setting repl_dirty from this thread races the
- * cluster thread's own writes to it, which is harmless in both
- * directions: the flag only ever costs an extra walk, and a walk is
- * what a failed replica batch asks for. */
+/* runs on the bulk thread: setting repl_dirty races the cluster thread's writes, harmlessly -
+ * the flag only ever costs an extra walk */
 static void repl_bulk_peer_failed(const pc_addr *to)
 {
 	int i, c;
@@ -14195,7 +10606,7 @@ static void bulk_tx(volatile int *stop)
 	if (!clbulk_take(&C.bk, &batch, &blen, &recs, &kind, &to))
 		return;
 
-	pc_addr_set_port(&to, pc_addr_port(&C.mcast_dst));    /* the cluster port, TCP */
+	pc_addr_set_port(&to, pc_addr_port(&C.mcast_dst));
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0)
 		goto out;
@@ -14207,9 +10618,8 @@ static void bulk_tx(volatile int *stop)
 
 	pc_hs_init_initiator(&hs, prologue, 1);
 	{
-		/* S174: [client version][batch kind].  An older receiver
-		 * checks the first byte and ignores the rest, so it reads a
-		 * replica batch as the placement move it used to be. */
+		/* [client version][batch kind]: an older receiver reads byte 0 only,
+		 * taking a replica batch for a placement move */
 		unsigned char pay[2] = { ver, (unsigned char)kind };
 
 		if (pc_hs_write_msg1(&hs, C.psk, pay, sizeof pay,
@@ -14238,7 +10648,7 @@ out:
 	if (fd >= 0)
 		close(fd);
 	if (kind == CLBULK_KIND_STAGE) {
-		/* UP6n: the answer is the receiver's status, 0 = staged */
+		/* the answer is the receiver's status, 0 = staged */
 		pc_upg_relay_note(to.in4.sin_addr.s_addr, ok ? stored : PC_UPG_RELAY_LOST);
 		free(batch);
 		clbulk_done(&C.bk);
@@ -14249,13 +10659,8 @@ out:
 		unsigned int miss = recs - (ok ? stored : 0);
 
 		if (kind == CLBULK_KIND_REPLICA) {
-			/* S174: the copies are still here; what is lost is
-			 * this cycle's claim to have repaired the peer, so
-			 * the mark must not advance past them.  S178: mark
-			 * THAT PEER's cycles dirty, by the address the batch
-			 * was addressed to - this runs on the bulk thread,
-			 * and a byte flag the cluster thread reads is the
-			 * same shape the rest of the sweep state has. */
+			/* the copies are still here: only this peer's cycle is unproven,
+			 * so its mark must not advance past them */
 			__atomic_fetch_add(&C.px.repl_bulk_lost, 1,
 				__ATOMIC_RELAXED);
 			repl_bulk_peer_failed(&to);
@@ -14273,14 +10678,8 @@ out:
 	clbulk_done(&C.bk);
 }
 
-/* ---- UP6n: a staged build over the bulk lane -----------------------------
- * After the count word (CLBULK_STAGE_MAGIC):
- *     [size u64][sha256 32][signed 1][signature 64][vlen 1][version]
- *     then size bytes of the build
- * and the receiver answers [status u32]: PC_UPG_RELAY_* (0 = staged).  It
- * stages the build through the same begin / chunk / end as an operator's
- * upload, so it verifies it against ITS OWN keys - a member is not trusted
- * to have checked for it - and it never relays it further. */
+/* ---- a staged build over bulk: [size8][sha256 32][signed1][sig64][vlen1][version][build],
+ * answered [status u32]; verified against the receiver's OWN keys and never relayed further */
 #define STAGE_HDR (8 + 32 + 1 + PC_UPG_SIG_LEN + 1)
 
 static void bulk_rx_stage(int cfd, struct pc_cipherstate *cs_s,
@@ -14414,7 +10813,7 @@ int pc_cluster_stage_relay(const void *data, size_t len,
 	return offered;
 }
 
-/* CH-11: from this node's own host, as the receiver's gate below expects -
+/* from this node's own host, as the receiver's gate below expects -
  * unbound, a multi-homed host or a loopback-alias fleet connects from another */
 static void bulk_bind_self(int fd)
 {
@@ -14424,7 +10823,7 @@ static void bulk_bind_self(int fd)
 	if (bind(fd, &me.sa, pc_addr_len(&me)) != 0) { /* unbound: the route's */ }
 }
 
-/* CH-11: the bulk plane is served one connection at a time, so only a host
+/* the bulk plane is served one connection at a time, so only a host
  * the peer table knows (a joiner's slot too, before its id) is read from */
 static int bulk_host_known(const pc_addr *a)
 {
@@ -14450,7 +10849,7 @@ static void bulk_rx(int cfd)
 	unsigned int nrec, i, resolved = 0;
 	int replica = 0, stage = 0;
 
-	/* CH-11: the opening message within a second - a silent connection
+	/* the opening message within a second - a silent connection
 	 * holds the bulk thread, and everything queued behind it, that long */
 	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv1, sizeof tv1);
 	setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -14470,7 +10869,7 @@ static void bulk_rx(int cfd)
 
 		if (pc_hs_read_msg1(&hs, C.psk, frame + 3, flen - 1, pay,
 		        &pl2) != 0) {
-			if (!have_psk_accept)              /* CH-7: the other secret */
+			if (!have_psk_accept)              /* the other secret */
 				goto out;
 			pc_hs_init_responder(&hs, frame + 2, 1);
 			if (pc_hs_read_msg1(&hs, psk_accept, frame + 3, flen - 1,
@@ -14479,12 +10878,12 @@ static void bulk_rx(int cfd)
 		}
 		if (pl2 < 1 || pay[0] != PC_CLIENT_VER)
 			goto out;
-		/* S174: the batch kind is an ADDITIVE second byte - a peer
+		/* the batch kind is an ADDITIVE second byte - a peer
 		 * on an older build sends one and means a placement move */
 		if (pl2 >= 2 && pay[1] == CLBULK_KIND_REPLICA)
 			replica = 1;
 		if (pl2 >= 2 && pay[1] == CLBULK_KIND_STAGE)
-			stage = 1;                 /* UP6n */
+			stage = 1;
 	}
 	if (pc_hs_write_msg2(&hs, NULL, 0, m2 + CLBULK_HS2_AT, &mlen,
 	        &cs_s, &cs_r) != 0)
@@ -14501,11 +10900,11 @@ static void bulk_rx(int cfd)
 	        != 0)
 		goto out;
 	nrec = g32(cnt4);
-	if (nrec == BOOT_MAGIC) {              /* S83: a pull, not a batch */
+	if (nrec == BOOT_MAGIC) {              /* a pull, not a batch */
 		bulk_serve_boot(cfd, &cs_s, &cs_r, stash, &slen, sizeof stash);
 		goto out;
 	}
-	if (stage || nrec == CLBULK_STAGE_MAGIC) {     /* UP6n: both, or neither */
+	if (stage || nrec == CLBULK_STAGE_MAGIC) {     /* both, or neither */
 		if (stage && nrec == CLBULK_STAGE_MAGIC)
 			bulk_rx_stage(cfd, &cs_s, &cs_r, stash, &slen, sizeof stash);
 		goto out;
@@ -14518,7 +10917,7 @@ static void bulk_rx(int cfd)
 	for (i = 0; i < nrec; i++) {
 		unsigned int ttl_left, cn, kn, vl, exp;
 		unsigned long long ver;
-		unsigned char rtype;           /* S280: the record's type */
+		unsigned char rtype;
 		pcache_htable_t *ht;
 		char colz[256];
 		str k, v;
@@ -14552,51 +10951,42 @@ static void bulk_rx(int cfd)
 		k.len = (int)kn;
 		v.s = (char *)rec + cn + kn;
 		v.len = (int)vl;
-		exp = pc_upstream_copy_exp(colz, cn, ttl_left);   /* S449 */
+		exp = pc_upstream_copy_exp(colz, cn, ttl_left);
 		pc_lamport_observe(ver);
-		/* S174: a replica batch lands exactly as the same record
-		 * would through a datagram (handle_migrate_many, passive):
-		 * PASSIVE so this node never re-propagates it, and OFF the
-		 * WAL because the author persists it and a restarted replica
-		 * resyncs.  A placement move is unchanged - it makes this
-		 * node the owner. */
+		/* a replica lands PASSIVE (never re-sent) and off the WAL (its author persists
+		 * it); a placement move makes this node the owner */
 		{
 			unsigned long long tv;
 
-			/* S209: superseded by a newer tombstone for the key */
+			/* superseded by a newer tombstone for the key */
 			if (pc_neg_ver(colz, cn, k.s, kn, &tv) && tv && ver <= tv) {
 				__atomic_fetch_add(&C.px.recv_tombstoned, 1,
 					__ATOMIC_RELAXED);
 				continue;
 			}
 		}
-		if (dropfloor_refuses(colz, cn, k.s, kn, ver))     /* S278 */
+		if (dropfloor_refuses(colz, cn, k.s, kn, ver))
 			continue;
-		brc = pcache_ht_store_ver(ht, &k, &v, exp,
+		brc = (replica ? pcache_ht_store_peer : pcache_ht_store_ver)(ht, &k, &v, exp,
 			(unsigned char)((replica ? PCACHE_F_PASSIVE : 0) | rtype), ver);
 		if (brc == -2)
 			nomem_drop(ht, colz, cn, &k, ver);
 		if (brc == PCACHE_E_OLDER) {
 			__atomic_fetch_add(&C.px.recv_older, 1,
 				__ATOMIC_RELAXED);
-			/* S179: refused as older means this node HAS the
-			 * record, at this version or a newer one - the
-			 * transfer did its job.  The count below is what the
-			 * sender measures delivery by, so counting only
-			 * stores told it every already-converged batch had
-			 * failed, and it re-sent them for ever. */
+			/* refused as older = held here at this version or newer: delivered */
 			resolved++;
 		}
 		if (brc == 0) {
 			unsigned long long tv;
 
 			if (pc_neg_ver(colz, cn, k.s, kn, &tv) &&
-			        clorder_take_back(ht, &k, ver, tv)) {      /* S461 */
+			        clorder_take_back(ht, &k, ver, tv)) {
 				__atomic_fetch_add(&C.px.recv_tombstoned, 1,
 					__ATOMIC_RELAXED);
 				continue;
 			}
-			pc_upstream_note_copy(colz, cn, k.s, kn, exp, ver);   /* S418 */
+			pc_upstream_note_copy(colz, cn, k.s, kn, exp, ver);
 			if (replica) {
 				pc_ev_applied(ht, &k);
 			} else {
@@ -14613,9 +11003,7 @@ static void bulk_rx(int cfd)
 			resolved++;
 		}
 	}
-	/* S179: RESOLVED, not stored.  bulk_in and migrated_in still count
-	 * what was new; what goes back on the wire is what the peer now
-	 * holds, which is the only thing the sender can act on. */
+	/* answer RESOLVED, not stored: what this node now holds is all the sender can act on */
 	p32(cnt4, resolved);
 	clbulk_send(cfd, &cs_s, cnt4, 4);
 out:
@@ -14631,21 +11019,20 @@ void pc_bulk_thread(volatile int *stop)
 		return;
 	pf.fd = C.blfd;
 	pf.events = POLLIN;
-	pc_qs_enter();                     /* S150 B: a pull or a boot walk holds a table */
+	pc_qs_enter();                     /* a pull or a boot walk holds a table */
 	while (!*stop) {
 		int have_tx, have_boot, prc;
 
-		/* both under ONE acquisition, as before: splitting them is the
-		 * defect M4 fixed in boot_tick */
+		/* both read under ONE acquisition, as boot_tick does - never split them */
 		pthread_mutex_lock(clbulk_lock(&C.bk));
-		have_tx = C.bk.n > 0;              /* S178: a queue, not one */
+		have_tx = C.bk.n > 0;              /* a queue, not one */
 		have_boot = C.bt.pending;
 		pthread_mutex_unlock(clbulk_lock(&C.bk));
 		if (have_boot)
-			bulk_pull();               /* S83 */
+			bulk_pull();
 		if (have_tx)
 			bulk_tx(stop);
-		pc_qs_exit();                  /* S150 B: parked across the wait */
+		pc_qs_exit();
 		prc = poll(&pf, 1, 200);
 		pc_qs_enter();
 		if (prc > 0) {
@@ -14653,7 +11040,7 @@ void pc_bulk_thread(volatile int *stop)
 			socklen_t al = sizeof a;
 			int cfd = accept(C.blfd, &a.sa, &al);
 
-			if (cfd >= 0 && !bulk_host_known(&a)) {    /* CH-11 */
+			if (cfd >= 0 && !bulk_host_known(&a)) {
 				if (pc_logrl_ok(LRL_BULK_HOST, &a)) {
 					char ab[PC_ADDR_STRLEN];
 
@@ -14670,15 +11057,12 @@ void pc_bulk_thread(volatile int *stop)
 }
 
 /* ---- the cluster plane's internal API (clstate.h) -----------------------
- * These are the ONLY way an extracted translation unit reaches the
- * state: handles, readers, and a function per counter so that no
- * mutable pointer into C escapes.  Each counter reproduces the ordering
- * its call site used - three atomic, five plain - because rule 6 moves
- * code without rewording it. */
+ * the only way other units reach C; no mutable pointer escapes, counters keep their ordering */
 
 struct clpeers *cl_peers(void) { return &C.pt; }
 struct clpend  *cl_pend(void)  { return &C.pd; }
 struct clpush  *cl_push(void)  { return &C.wp; }
+struct clapply *cl_ap(void)    { return &C.ap; }
 
 int cl_enabled(void)    { return C.enabled; }
 int cl_node_id(void)    { return C.node_id; }
@@ -14689,9 +11073,8 @@ int cl_map_usable(void) { return C.map_usable; }
 const struct pc_clmap *cl_map(void) { return &C.map; }
 pc_addr cl_self_addr(void) { return C.self_addr; }
 
-/* S467: per thread, folded on its first hit and then 1,024 at a time - a
- * plain ++ on C from every worker was a contended line a command (0.8% of
- * a SET), and lost counts besides */
+/* per thread, folded on its first hit and then 1,024 at a time: a shared ++ from every
+ * worker is a contended line, and loses counts */
 void cl_place_map_hit(void)
 {
 	static __thread unsigned int n;
@@ -14728,7 +11111,7 @@ void cl_px_migrate_skipped_big(void) { C.px.migrate_skipped_big++; }
 void cl_px_placed_local(void)        { C.px.placed_local++; }
 void cl_px_placed_remote(void)       { C.px.placed_remote++; }
 
-/* M9b: the primitives clwork.c's entry points call instead of statics */
+/* the primitives clwork.c's entry points call instead of statics */
 uint32_t cl_pend_alloc(int kind, int expect, int extra_ms,
 		struct pending **out)
 {
@@ -14761,11 +11144,69 @@ void cl_px_spread_ack(unsigned int parked, unsigned int kept)
 		__atomic_fetch_add(&C.px.spread_ack_kept, kept, __ATOMIC_RELAXED);
 }
 
-/* clwork needs the clock and the free-space read; both stay defined
- * here (now_ms has 82 call sites in this file) and are reached through
- * a wrapper rather than renamed at every site. */
+/* clwork reaches these statics through wrappers rather than a rename at every site */
 long long cl_now_ms(void) { return now_ms(); }
 unsigned int cl_self_free_mb(void) { return self_free_mb(); }
+unsigned int cl_self_total_mb(void) { return self_total_mb(); }
+unsigned int cl_self_live_kb(void) { return self_live_kb(); }
+int cl_max_datagram(void) { return cl_max_dgram; }
+
+/* clrecv.c's writes, each as its call site had it - migrated_in
+ * both ways (handle_migrate's plain ++, apply_rec's atomic) */
+void cl_shard_note_change(void) { shard_note_change(); }
+void cl_px_migrated_in(void)
+{
+	__atomic_fetch_add(&C.px.migrated_in, 1, __ATOMIC_RELAXED);
+}
+void cl_px_migrated_in_plain(void)   { C.px.migrated_in++; }
+void cl_px_recv_nomem(void)
+{
+	__atomic_fetch_add(&C.px.recv_nomem, 1, __ATOMIC_RELAXED);
+}
+void cl_px_recv_older(void)
+{
+	__atomic_fetch_add(&C.px.recv_older, 1, __ATOMIC_RELAXED);
+}
+void cl_px_recv_tombstoned(void)
+{
+	__atomic_fetch_add(&C.px.recv_tombstoned, 1, __ATOMIC_RELAXED);
+}
+void cl_px_recv_below_dropped(void)
+{
+	__atomic_fetch_add(&C.px.recv_below_dropped, 1, __ATOMIC_RELAXED);
+}
+void cl_px_recv_stale_dropped(void)
+{
+	__atomic_fetch_add(&C.px.recv_stale_dropped, 1, __ATOMIC_RELAXED);
+}
+
+/* what cltomb.c reads and writes: the identity, the test hooks, two policy constants, the
+ * resync flag and its counters (each a plain ++ as it was) */
+const unsigned char *cl_self_ident(void) { return C.self_ident; }
+const struct clres *cl_reserved(void) { return &reserved; }
+long long cl_reserve_ms(void)        { return RESERVE_MS; }
+long long cl_witness_grace_ms(void)  { return WITNESS_GRACE_MS; }
+int cl_self_no_acks(void)            { return self_no_acks; }
+int cl_self_gap_no_copies(void)      { return self_gap_no_copies; }
+int cl_self_no_autoscale(void)       { return self_no_autoscale; }
+int cl_self_as_deaf(void)            { return self_as_deaf; }
+long long cl_acks_stuck_ms(void)     { return acks_stuck_ms; }
+int cl_resync_floor(void)            { return C.resync_floor; }
+void cl_resync_floor_clear(void)     { C.resync_floor = 0; }
+void cl_st_acks_floors(void)         { C.st.acks_floors++; }
+unsigned long long cl_st_acks_floors_read(void) { return C.st.acks_floors; }
+void cl_st_tomb_forgotten(unsigned long long n) { C.st.tomb_forgotten += n; }
+void cl_st_gap_asked(void)           { C.st.gap_asked++; }
+void cl_st_gap_tail(void)            { C.st.gap_tail++; }
+void cl_st_gap_resent(void)          { C.st.gap_resent++; }
+void cl_st_gap_floored(void)         { C.st.gap_floored++; }
+void cl_st_gap_served(void)          { C.st.gap_served++; }
+void cl_st_rebuild_sent(void)        { C.st.rebuild_sent++; }
+pc_addr cl_master_addr(void)         { return C.master_addr; }
+int cl_unicast_on(void)              { return cl_unicast; }
+void cl_st_members_asked(void)       { C.st.members_asked++; }
+void cl_st_members_sent(void)        { C.st.members_sent++; }
+void cl_st_admission_stuck(unsigned long long n) { C.st.admission_stuck = n; }
 
 /* ---- init / stats ------------------------------------------------------- */
 
@@ -14777,7 +11218,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	/* the WAL takes this node out of service if it starts discarding
 	 * acknowledged writes - see pc_node_wal_shed() */
 	pc_wal_on_shed(pc_node_wal_shed);
-	pc_wal_on_heal(pc_node_wal_heal);                /* S229 */
+	pc_wal_on_heal(pc_node_wal_heal);
 
 	pc_addr sa;
 	struct in_addr self_ip;
@@ -14785,13 +11226,10 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	int one = 1;
 
 	memset(&C.st, 0, sizeof C.st);
-	/* PS12: patterns the peers hold; fixed buckets, read without a lock */
+	/* patterns the peers hold; fixed buckets, read without a lock */
 	clps_init();
-	/* Size the parked-request table ONCE.  Clamped, not rejected: the
-	 * ceiling is structural (the slot index rides in the request id)
-	 * and a config that asks for more should still start, saying so.
-	 * Allocated once and never resized - clpend_find() hands out raw
-	 * pointers into this. */
+	/* the parked-request table: sized ONCE, clamped not refused (the slot index rides in
+	 * the request id), never resized - clpend_find() hands out raw pointers into it */
 	clpush_init(&C.wp, PC_CL_MAXPEER, MIG_GHDR, MIG_GATHER_CAP,
 		REPL_GROUP_FLUSH_BYTES, REPL_FLUSH_MS);
 	if (!clpend_init(&C.pd, max_pending)) {
@@ -14802,13 +11240,8 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	if (max_pending > 0 && C.pd.cap != max_pending)
 		LM_WARN("cluster: max_pending %d clamped to %d - the slot index "
 			"rides in the request id\n", max_pending, C.pd.cap);
-	/* S80: the state directory must exist and be writable before
-	 * anything is persisted into it.  A missing directory whose parent
-	 * exists is created (0700: it will hold the node's name); anything
-	 * else refuses startup, because a node that silently ran ephemeral
-	 * would present as new after every restart while the admin
-	 * believed otherwise.  tmpfs is accepted and said loudly: it
-	 * survives a daemon restart, not a host restart. */
+	/* an unusable state_dir refuses startup: a node silently running ephemeral would present
+	 * as new after every restart.  Created 0700 (it holds the node's name) */
 	C.state_dir[0] = 0;
 	C.state_tmpfs = 0;
 	if (state_dir && *state_dir) {
@@ -14845,7 +11278,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	}
 	if (identity_init(state_dir, legacy_dir) != 0)
 		return -1;
-	/* 12nu: the newest epoch this build speaks (the suites raise it to
+	/* the newest epoch this build speaks (the suites raise it to
 	 * prove a commit), then the committed epoch a clean stop left */
 	{
 		const char *e = getenv("PERFCACHED_TEST_EPOCH_MAX");
@@ -14903,17 +11336,13 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 			"answer hold-checks (a test flag): the fleet's reconcile "
 			"asks with pulls while it is a member\n");
 	}
-	/* The mastership term lives beside the identity and in the same
-	 * durability class, because it has to outlive any map somebody
-	 * could still believe.  A node that cannot read a term it wrote
-	 * refuses to start: silently forgetting one is how a term gets
-	 * reissued with different content behind it. */
-	/* S80: the term already persisted in the WAL directory is carried
-	 * across once when state_dir is introduced beside it - a reset
-	 * term is an election hazard, not a cosmetic one */
+	/* the term must outlive any map somebody could still believe: an unreadable term refuses
+	 * startup, since forgetting one reissues it with different content */
+	/* a term persisted in the legacy (WAL) directory moves over once: a reset term is an
+	 * election hazard */
 	if (legacy_dir && state_dir && *state_dir)
 		carry_file(legacy_dir, state_dir, PC_TERM_FILE);
-	/* S302: the cluster id, before anything is sealed */
+	/* the cluster id, before anything is sealed */
 	if (pc_cid_init(state_dir, pc_cid_pin) != 0)
 		return -1;
 	if (pc_term_init(state_dir) != 0) {
@@ -14924,13 +11353,11 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 			state_dir ? state_dir : "(none)");
 		return -1;
 	}
-	/* B4: armed when this node came back holding data.  A node that
-	 * restored nothing has nothing to reconcile, and a fleet that is
-	 * not eager cannot answer the question at all. */
+	/* the reconcile arms only when this node came back holding data */
 	pc_clhist_init(&C.hist);
 	pc_clsync_init(&C.sync, pc_term_current(), 0);
 	C.reconcile_on = pc_recovered_records() > 0;
-	C.rec_rebuild = 0;                 /* S455: a restart's pass */
+	C.rec_rebuild = 0;                 /* a restart's pass */
 	C.rec_floored = 0;
 	C.rec_tick = get_ticks();
 	C.rec_hold = C.reconcile_on;
@@ -14954,7 +11381,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	C.mcast_dst.in4.sin_port = htons((uint16_t)mcast_port);
 	C.mfd = -1;
 	if (cl_unicast) {
-		/* S36: seeds resolved before anything is sent */
+		/* seeds resolved before anything is sent */
 		if (clmesh_start(cl_seeds, mcast_port) != 0)
 			return -1;
 	} else if (!mcast_addr ||
@@ -14977,7 +11404,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 		socklen_t sl = sizeof probe_sa;
 		int pfd;
 
-		/* S36: unicast has no group to route toward - a seed */
+		/* unicast has no group to route toward - a seed */
 		if (cl_unicast && clmesh_targets(&toward, 1, NULL, 0) != 1) {
 			LM_ERR("cluster: discovery = unicast and no seed resolved "
 				"- cannot auto-detect the advertise address; set "
@@ -15005,27 +11432,12 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	C.fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (C.fd < 0)
 		return -1;
-	clsend_init(C.fd, C.psk, NULL);        /* M14: the socket and key, once */
+	clsend_init(C.fd, C.psk, NULL);        /* the socket and key, once */
 	if (have_psk_accept)
-		clsend_set_accept(psk_accept);     /* CH-7 */
+		clsend_set_accept(psk_accept);
 	{
-		/* Pulls, migrations AND forwards burst together: a pipelined
-		 * client write burst puts one datagram per key on the wire at
-		 * once, each up to MAX_FWD_VAL.  A forward that the kernel
-		 * drops is a REFUSED CLIENT WRITE - forwards carry no retry
-		 * (unlike migrations, which have the ack window), so the
-		 * receive buffer is the whole guarantee.
-		 *
-		 * MEASURED (2026-08-27, the proxytest 'placement writes'
-		 * flake): 120 pipelined 40KB writes = 4.8MB arriving at once.
-		 * With net.core.rmem_max at its 208KB default the kernel
-		 * SILENTLY clamped this request and dropped 4-6 datagrams a
-		 * run - UDP RcvbufErrors matched the refused writes exactly,
-		 * one for one.  So: ask with SO_RCVBUFFORCE first (it bypasses
-		 * rmem_max wherever we hold CAP_NET_ADMIN), fall back to a
-		 * plain request, then READ THE BUFFER BACK and say plainly
-		 * when the kernel gave us less than we asked for.  Silent
-		 * under-delivery is how this cost a day. */
+		/* a dropped forward is a refused client write (forwards never retry): force the
+		 * buffer past rmem_max where allowed, read it back, and warn if it was clamped */
 		int rb = PC_CLUSTER_RCVBUF, got = 0;
 		socklen_t gl = sizeof got;
 
@@ -15034,9 +11446,8 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 		        sizeof rb) != 0)
 #endif
 			setsockopt(C.fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
-		/* S125: ask the kernel to report what this socket drops.  Per
-		 * socket, so a second daemon on the same host cannot pollute
-		 * it the way the host-wide UDP RcvbufErrors would. */
+		/* per-socket drop counts: host-wide RcvbufErrors
+		 * would mix in any other daemon on the host */
 		{
 			int on = 1;
 
@@ -15056,15 +11467,8 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 					got / 1024, rb / 1024, rb);
 		}
 	}
-	/* the mcast rx socket wildcard-binds the SAME port: every socket
-	 * sharing it needs REUSEADDR, this one included.  REUSEADDR is
-	 * the whole requirement here - SO_REUSEPORT was set alongside it
-	 * until 2026-08-31 and did nothing, verified by binding this exact
-	 * pair for two daemons on one host without it and confirming both
-	 * still receive the group.  It is deliberately NOT set: on the TCP
-	 * listeners the same option is what lets a stray daemon join a
-	 * live port unnoticed, so it is worth having nowhere it is not
-	 * earning its place. */
+	/* the mcast rx socket shares this port, so both need REUSEADDR; SO_REUSEPORT is
+	 * deliberately unset - it lets a stray daemon join a live port unnoticed */
 	setsockopt(C.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 	memset(&sa, 0, sizeof sa);
 	sa.in4.sin_family = AF_INET;
@@ -15076,10 +11480,10 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 		return -1;
 	}
 	C.self_addr = sa;
-	clrpt_set_source(&C.self_addr);    /* S469: the receiver gates on our host */
-	clwire_set_self(sa.in4.sin_addr.s_addr, (uint16_t)mcast_port);   /* CH-1 */
+	clrpt_set_source(&C.self_addr);    /* the receiver gates on our host */
+	clwire_set_self(sa.in4.sin_addr.s_addr, (uint16_t)mcast_port);
 	fcntl(C.fd, F_SETFL, O_NONBLOCK);
-	/* S36 step b: unicast mode carries frames over max_datagram on the
+	/* unicast mode carries frames over max_datagram on the
 	 * TCP frame lane - nothing fragments */
 	if (cl_unicast && cl_max_dgram > 0) {
 		if (clane_start(&C.self_addr, cl_lane_port - mcast_port) != 0)
@@ -15093,7 +11497,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	if (!cl_unicast) {
 		unsigned char ttl = (unsigned char)pc_mcast_ttl, loop = 1;
 
-		/* S291: 1 by default - no router forwards it; more lets a
+		/* 1 by default - no router forwards it; more lets a
 		 * multicast router carry the cluster plane across segments */
 		setsockopt(C.fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
 			sizeof ttl);
@@ -15110,18 +11514,15 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 			sizeof mreq);
 	}
 
-	/* the multicast rx socket: ANY:port + membership.  REUSEADDR is
-	 * what lets several daemons share one host - the test rigs, and
-	 * blue/green restarts - and it is sufficient on its own; see the
-	 * note on C.fd above.  S36: none in unicast mode - every control
-	 * frame arrives on C.fd. */
+	/* the multicast rx socket, ANY:port + membership; none in unicast mode, where every
+	 * control frame arrives on C.fd */
 	if (cl_unicast)
 		goto group_done;
 	C.mfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (C.mfd < 0)
 		return -1;
 	setsockopt(C.mfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-	setsockopt(C.mfd, SOL_SOCKET, SO_RXQ_OVFL, &one, sizeof one);   /* S125 */
+	setsockopt(C.mfd, SOL_SOCKET, SO_RXQ_OVFL, &one, sizeof one);
 #ifdef IP_PKTINFO
 	/* each datagram's destination, so drain_one_fd takes only the
 	 * group's here - see there */
@@ -15129,7 +11530,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 #endif
 #ifdef IP_MULTICAST_ALL
 	{
-		int zero = 0;          /* CH-5: the group it joined, not every one on the port */
+		int zero = 0;          /* the group it joined, not every one on the port */
 
 		setsockopt(C.mfd, IPPROTO_IP, IP_MULTICAST_ALL, &zero, sizeof zero);
 	}
@@ -15183,11 +11584,12 @@ group_done:
 	C.role = PC_ROLE_JOINING;
 	randombytes_buf(&C.join_tok, 8);
 	C.join_deadline_ms = now_ms() + JOIN_WAIT_MS;
+	clfound_window_open(now_ms());
 	C.join_held = 0;
 	C.join_last_ms = 0;
 	C.st.enabled = 1;
 	C.enabled = 1;
-	/* S217: the apply rings.  1 = today's receiver, inline and alone. */
+	/* the apply rings; 1 = apply inline on the receiver */
 	if (C.apply_threads_cfg >= 2) {
 		int n = clapply_init(&C.ap, C.apply_threads_cfg, apply_rec,
 			ack_group, NULL);
@@ -15200,7 +11602,7 @@ group_done:
 		else
 			LM_NOTICE("cluster: replica apply sharded over %d "
 				"threads by key hash\n", n);
-		/* S461: its apply threads keep the pushes, so peers keep the cluster socket */
+		/* its apply threads keep the pushes, so peers keep the cluster socket */
 		clrp_take(n < 1);
 	}
 	LM_NOTICE("cluster: automatic membership - %s %s:%d, "
@@ -15240,9 +11642,8 @@ int pc_cluster_fleet_stop(long long timeout_ms, int *gone, int *ngone,
 	*ngone = *nstill = *nlost = 0;
 	if (!C.enabled)
 		return -1;
-	/* who we are asking - fixed now, so a node that joins while the
-	 * fleet is stopping is not waited for, and one that leaves on its
-	 * own is still accounted for */
+	/* the targets are fixed now: a node joining mid-stop is not waited for, and one that
+	 * leaves on its own is still accounted for */
 	for (i = 0; i < pt->n_peers && nt < PC_CL_MAXPEER; i++) {
 		int node = __atomic_load_n(&pt->peers[i].node, __ATOMIC_ACQUIRE);
 
@@ -15292,9 +11693,7 @@ int pc_cluster_fleet_stop(long long timeout_ms, int *gone, int *ngone,
 		LM_WARN("cluster: FLEET STOP - %d peer(s) did not go within "
 			"%lld ms; they are still up and still serving\n",
 			*nstill, timeout_ms);
-	/* S233: gone from the live set is not stopped.  RV-5's fault run
-	 * reported a peer "stopped" that had promoted itself and gone on
-	 * serving - it left our live set, it never said goodbye. */
+	/* gone from the live set is not stopped: only a goodbye says it stopped */
 	if (*nlost)
 		LM_WARN("cluster: FLEET STOP - %d peer(s) left without a "
 			"goodbye; nothing says they stopped\n", *nlost);
@@ -15305,12 +11704,12 @@ int pc_cluster_fleet_stop(long long timeout_ms, int *gone, int *ngone,
 void pc_cluster_get_stats(struct pc_cl_stats *out)
 {
 
-	rx_sample();                   /* S125: sampled by the reader */
+	rx_sample();                   /* sampled by the reader */
 	*out = C.st;
-	out->stalled = pc_node_stalled();   /* S216 */
+	out->stalled = pc_node_stalled();
 	out->reconcile_pending = (unsigned long long)
-		clpend_used_kind(&C.pd, PC_DONE_RECONCILE);            /* S212 */
-	out->apply_threads = C.ap.n;                                    /* S217 */
+		clpend_used_kind(&C.pd, PC_DONE_RECONCILE);
+	out->apply_threads = C.ap.n;
 	out->apply_dispatched = C.ap.dispatched;
 	out->apply_blocks = 0;
 	out->apply_backlog = 0;
@@ -15335,10 +11734,8 @@ void pc_cluster_get_stats(struct pc_cl_stats *out)
 		}
 	}
 	out->stalled_for_ms = out->stalled ? now_ms() - C.stall_since_ms : 0;
-	/* the two receive TOTALS and the two queue gauges are read live
-	 * rather than copied from the sample, so they can never disagree
-	 * with migrated_in in the same reply.  Only the three per-second
-	 * figures need the previous sample to exist. */
+	/* totals and queue gauges are read live, so they never disagree with migrated_in in one
+	 * reply; only the per-second figures come from the sample */
 	out->rx_applied = __atomic_load_n(&C.px.migrated_in, __ATOMIC_RELAXED);
 	out->rx_drops = __atomic_load_n(&C.rxq_drops, __ATOMIC_RELAXED);
 	out->rx_queue = rx_queue_bytes(C.fd) + rx_queue_bytes(C.mfd);
@@ -15349,13 +11746,13 @@ void pc_cluster_get_stats(struct pc_cl_stats *out)
 	out->pend_peak_win = clpend_peak_win(&C.pd);
 	out->pend_exhausted = clpend_exhausted(&C.pd);
 	out->neg_hits = clloc_neg_hits(&C.lc);
-	out->neg_displaced = clloc_neg_displaced(&C.lc);       /* RV-15 */
+	out->neg_displaced = clloc_neg_displaced(&C.lc);
 	out->tomb_displaced = clloc_tomb_displaced(&C.lc);
 	out->node_id = pc_my_node_id();
 	out->peers_up = 0;
-	out->reserved_ids = clres_count(&reserved, now_ms());   /* S90 */
+	out->reserved_ids = clres_count(&reserved, now_ms());
 	out->peers_up = clpeers_count_live(&C.pt, now_ms());
-	out->replicas_short = clspread_short_now(&replicas_short);   /* S157 */
+	out->replicas_short = clspread_short_now(&replicas_short);
 }
 
 int pc_cluster_peers(struct pc_cl_peer_info *out, int max)

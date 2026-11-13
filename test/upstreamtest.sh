@@ -1,44 +1,6 @@
 #!/bin/sh
-# upstreamtest.sh - S331: read-through from a RESP upstream (DESIGN 12ix).
-#
-# One node whose collection 0 names an upstream: test/fakeupstream.py, a
-# scripted RESP server standing in for Redis (none on the runners - and it
-# FAILS the suite if perfcached ever sends it a write).  Over the RESP door:
-#   1  a string, a hash and a JSON document come through on a local miss,
-#      with the upstream's TTL; a list answers WRONGTYPE, as Redis would
-#   2  only the allow-list falls through; an absent key is remembered
-#      (one fetch for two misses inside upstream_negative_ms)
-#   3  single-flight: ten clients missing one slow key cause ONE fetch,
-#      and every one of them gets the value
-#   4  a pipeline whose first command waits on a fetch answers IN ORDER
-#   5  a plain SET is local and does not wait; a background ownership
-#      check asks the upstream once, and the local value wins
-#   6  an upstream that is down answers an error (upstream_on_error=error),
-#      and the node comes back when it does
-#   7  nothing was ever written upstream; the stats carry the upstream block
-#   8  (phase B) a mutation PROMOTES the fetched value first: INCR of an
-#      upstream counter, HSET into an upstream hash
-#   9  a key this node wrote or deleted never reads through again: DEL of
-#      a key only the upstream had, SET-then-DEL, an owned key expiring
-#  10  the no-fall entries and promoted records survive a clean restart
-#  11  (phase C) the native doors: CMD get/add/del/hcmd and the binary
-#      GET/ADD verbs read through and promote the same way; two binary
-#      frames in flight, the first waiting on a fetch, each answered
-#      under its own id
-#  12  (phase D) tracking: an invalidation from the upstream drops the
-#      fetched copy (the next read fetches the new value); losing the
-#      tracking connection drops every fetched copy; tracking comes back
-#  13  the drain sweep (updrain, privileged): every allowed key the upstream
-#      holds is taken over unless the fleet has it - then the upstream is
-#      switched off and the keys still answer, with their TTLs; the
-#      fleet's own versions (written, deleted, promoted) are kept
-#  14  one server: a connection that reached another server than the
-#      tracking connection (a round-robin proxy) is not tracked - its
-#      copy lives upstream_negative_ms, and a change the upstream never
-#      announces is read after it; an upstream that will not say which
-#      server it is (INFO refused) gets no tracking at all
-# FAIL-FIRST: a build without S331 refuses `upstream` in the config.
-# Usage: test/upstreamtest.sh [./perfcached]
+# upstreamtest.sh - read-through from a RESP upstream (test/fakeupstream.py, failing on any write): fetch,
+# promote, tracking, drain, read-only mirrors, every door.  Usage: test/upstreamtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=$(readlink -f "${1:-./perfcached}")
@@ -143,8 +105,8 @@ print(u[sys.argv[1]])' "$1" 2>/dev/null; }
 k=0; while [ "$(stat tracking)" != True ] && [ $k -lt 40 ]; do sleep 0.1; k=$((k+1)); done
 [ "$(stat tracking)" = True ] && ok "tracking is on (the invalidation connection is up)" \
 	|| bad "tracking never came on: $(stat tracking); $(grep -m1 -i tracking "$D/n.log" | cut -c1-120)"
-# 0.5.6.1: the companion is sized as its parent - buckets AND autoscale
-# (an empty 0.nofall under the default auto shrank to 2^12 after a minute)
+# the companion is sized as its parent, buckets and autoscale: an empty 0.nofall under auto
+# shrank to 2^12
 NF=$(python3 -c 'import json,sys,urllib.request
 r=json.loads(urllib.request.urlopen("http://127.0.0.1:'$HTTP'/stats",timeout=5).read())
 c=[c for c in r["collections"] if c["name"]=="0.nofall"]
@@ -152,8 +114,8 @@ print(("%s %s" % (c[0].get("autoscale"), c[0].get("autoscale_floor_log2"))) if c
 [ "$NF" = "floor 10" ] && ok "the companion 0.nofall inherits its parent's autoscale: floor at 2^10" \
 	|| bad "0.nofall autoscale: $NF (want: floor 10, as collection 0)"
 
-# rc <cmd> [<cmd> ...]: one connection, the commands PIPELINED in one
-# write, one line per reply (RESP2 decoded, printed as Python literals)
+# rc <cmd> [<cmd> ...]: one connection, the commands pipelined in one write, one line per reply
+# (RESP2 decoded, printed as Python literals)
 cat > "$D/rc.py" <<'P'
 import socket, sys
 def enc(cmd):
@@ -410,9 +372,8 @@ ST="$(dstat state) read=$(dstat read) taken=$(dstat taken_over) fleet_had=$(dsta
 [ "$(dstat state)" = done ] && [ "$(dstat taken_over)" -ge 4 ] && [ "$(dstat fleet_had)" -ge 3 ] \
 	&& [ "$(dstat wrongtype)" -ge 2 ] && [ "$(dstat errors)" = 0 ] && ok "the sweep is done ($ST)" \
 	|| bad "the sweep: $ST"
-# 0.5.6.1: the sweep's reads go into the collection, not the shadow - its
-# connection must not arm tracking, or the upstream remembers every key of
-# the family for it and pushes an invalidation for each later write
+# the sweep's reads go into the collection: its connection must not arm tracking, or the upstream
+# pushes an invalidation for every later write of the family
 TRK1=$(grep -c "^TRACKING " "$D/up/counts"); SC1=$(grep -c "^SCAN " "$D/up/counts")
 [ "$SC1" -gt "$SC0" ] && [ "$TRK1" = "$TRK0" ] \
 	&& ok "the sweep's connection read with SCAN and never asked for tracking ($((SC1 - SC0)) SCANs, 0 TRACKING)" \
@@ -446,10 +407,8 @@ restart_node() {
 	PID=$!
 	i=0; while [ $i -lt 100 ]; do [ "$(grep -c "perfcached ready" "$D/n.log")" -gt "$n0" ] && break; sleep 0.1; i=$((i+1)); done
 }
-# a round-robin proxy in front of several servers: the fake tells every
-# connection it reached a different one.  The tracking connection's id
-# means nothing (or somebody else) on the others, so a fetch connection
-# there must stay untracked - this change is never announced
+# a round-robin proxy: the fake says every connection reached a different server, so a fetch
+# connection there stays untracked - this change is never announced
 echo '{"password": "up-pass-1", "resp3": true, "run_id_per_conn": true}' > "$D/up/ctl.json"
 restart_node
 k=0; while [ "$(stat tracking)" != True ] && [ $k -lt 40 ]; do sleep 0.1; k=$((k+1)); done
@@ -479,9 +438,8 @@ X=$(rc 'GET tok:rr3')
 echo '{"password": "up-pass-1", "resp3": true}' > "$D/up/ctl.json"
 
 echo "--- 15: a mapped RESP db index reads through"
-# S338: the RESP gate was handed what SELECT named, not the collection it
-# maps to - under resp_collections (7:0, PROD's 1:trial) it found no
-# upstream for "7" and the read answered nil, never fetching
+# the RESP gate looks up the collection SELECT maps to under resp_collections, not the number
+# SELECT named
 python3 -c 'import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["tok:map1"]={"type":"string","value":"mapv"}
 json.dump(d, open(p+".t","w")); import os; os.replace(p+".t", p)' "$D/up/data.json"
@@ -492,12 +450,8 @@ X=$(rc 'SELECT 7' 'GET tok:map1' | tr '\n' ' ')
 	|| bad "SELECT 7 then GET tok:map1: $X (fetched $F0 -> $(cnt TYPE tok:map1))"
 
 echo "--- 16: what the collection counts"
-# S340: a read answered from a fetched copy is a HIT of the collection; only
-# an absent answer is a miss; the read-through's own looks (the gate's
-# probes, the no-fall checks) count nowhere.  0.5.6.1 counted every
-# read-through read a miss - twice, with the gate's probe - and the
-# companion a miss per lookup: PROD's prod-redis read 0 hits while the SBC
-# blocked devices from the keys it fetched.
+# a read answered from a fetched copy is a hit, only an absent answer a miss; the read-through's
+# own looks (gate probes, no-fall checks) count nowhere
 colc() { python3 -c 'import json,sys,urllib.request
 r=json.loads(urllib.request.urlopen("http://127.0.0.1:'$HTTP'/stats",timeout=5).read())
 c={x["name"]:x for x in r["collections"]}
@@ -514,10 +468,8 @@ set -- $(colc); H1=${1:-0} M1=${2:-0} N1=${3:-0}
 	|| bad "counted: reads $X -> hits +$((H1 - H0)), misses +$((M1 - M0)) (want +2, +2)"
 [ $((N1 - N0)) = 0 ] && ok "the companion 0.nofall counted none of those lookups" \
 	|| bad "0.nofall counted $((N1 - N0)) hits+misses for 4 reads of its parent"
-# the same through the BINARY door - what cachedb_perfd sends.  A read that
-# waits for a fetch is parked as a frame and dispatched again when the
-# fetch completes; PROD (0.5.6.1 ba2244c4) counted those reads neither hit
-# nor miss: 30 s fleet-wide, 1,535 fetch-completed reads, 0 counted
+# the same through the binary door: a read parked on a fetch is counted when it is dispatched
+# again
 python3 -c 'import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d["tok:cnt2"]={"type":"string","value":"c2"}
 json.dump(d, open(p+".t","w")); import os; os.replace(p+".t", p)' "$D/up/data.json"
@@ -548,11 +500,8 @@ set -- $(colc); H1=${1:-0} M1=${2:-0} N1=${3:-0}
 	|| bad "binary door counted: reads $X -> hits +$((H1 - H0)), misses +$((M1 - M0)), companion +$((N1 - N0)) (want +2, +2, +0)"
 
 echo "--- 17: upstream_writes = refuse (S348)"
-# A collection that mirrors its upstream and that clients can only READ:
-# every write form on every door refused with one message, the upstream's
-# value still read through after them; updrain refused (a takeover IS a
-# write); no <name>.nofall companion; the refusals counted.  -C refuses the
-# setting without upstream.  Its own node, so cases 1-16 are untouched.
+# a read-only mirror: every write form on every door refused with one message, upstream values
+# still read through, updrain refused, no .nofall companion.  Its own node, so cases 1-16 stand.
 printf '[daemon]\nworkers = 1\n[memory]\narena_mb = 32\n[secrets]\nclient = x\n[listen]\ntcp = 127.0.0.1:17999\nplaintext = loopback\n[collection plain]\nbuckets_log2 = 8\nupstream_writes = refuse\n' > "$D/noup.conf"
 chmod 600 "$D/noup.conf"
 OUT=$("$BIN" -C -f "$D/noup.conf" 2>&1); rcv=$?
@@ -648,13 +597,8 @@ fi
 kill -9 $PID2 2>/dev/null
 
 echo "--- 18: EXISTS, TTL and TYPE read no value (ST2)"
-# A probe on a miss asks TYPE + PTTL (+ the pipelined GET, which carries a
-# string's value for free) and keeps a PRESENT marker for a hash or a
-# document - no HGETALL / JSON.GET, no value moved.  The marker answers the
-# next probes with the upstream's TTL and type; a value read still fetches
-# the value; an invalidation drops the marker; a read that joins a probe's
-# fetch gets the value.  Fail-first: 0.5.6.6 fetches the document
-# (JSON.GET 1 after an EXISTS) and has no fill_present / present_hits.
+# a probe on a miss asks TYPE + PTTL (+ GET) and keeps a PRESENT marker for a hash or document,
+# moving no value; a value read still fetches, an invalidation drops the marker
 python3 -c 'import json,sys
 p=sys.argv[1]; d=json.load(open(p))
 d["tok:pj"]={"type":"json","value":{"a":1},"ttl_ms":50000}
@@ -768,8 +712,7 @@ P
 	|| bad "native probes: $R; TYPE $(cnt TYPE tok:pn), JSON.GET $(cnt JSON.GET tok:pn) (want '1 -1 True -1', 1, 0)"
 [ "$(stat untracked_fills)" = "$UT0" ] && ok "every probe of case 18 was tracked (untracked stayed $UT0)" \
 	|| bad "untracked fetches during case 18: $UT0 -> $(stat untracked_fills) - the TTLs above were capped"
-# CMD exists of a key held as a FETCHED COPY (not a marker): true, as
-# EXISTS on the other doors - 0.5.6.6 answered false
+# CMD exists of a key held as a fetched copy (not a marker) is true, as EXISTS on the other doors
 R=$(rc 'GET tok:ps')
 R2=$(python3 - $TCP <<'P'
 import socket, sys, pcnative

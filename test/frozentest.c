@@ -1,5 +1,5 @@
-/* frozentest.c - S476: a member that takes the connection and says nothing must not hold a caller.
- * Usage: frozentest host1 host3 port secret secret3 pid3; node 3 frozen by SIGSTOP, its kernel still accepting. */
+/* frozentest.c - a member that takes the connection and then says nothing must not hold a caller.
+ * Usage: frozentest host1 host3 port secret secret3 pid3 (node 3 frozen by SIGSTOP) */
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +10,7 @@
 
 #define NH 6
 #define SETTLE_S 8.0
-#define HOLD_MS 1500.0         /* idle_ping's 500 ms, and room for a loaded runner; the dial's old cost was 5,000 ms */
+#define HOLD_MS 1500.0         /* idle_ping's 500 ms, and room for a loaded runner */
 static int pass, fail;
 static pid_t frozen;
 #define OK(c, ...) do { if (c) { pass++; printf("  ok   "); } else { fail++; printf("  FAIL "); } \

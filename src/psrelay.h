@@ -1,35 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * psrelay.h - sequence accounting for the pub/sub fleet relay (PS3),
- * rebuilt after the PS7 bench.  Header-only and pure, so the unit test
- * drives exactly what the receiver runs.
- *
- * WHY IT WAS REBUILT.  The relay stamped every M_PUBLISH with one global
- * counter, taken by whichever worker handled the publish, and the
- * receiver counted a gap whenever a number arrived more than one above the
- * last.  Two workers publishing at once take N and N+1 and may send N+1
- * first, so the receiver counted N lost - and never took it back when N
- * arrived.  On the two-host bench every relayed message arrived and every
- * delivery was made, yet relay_lost read 411 at 2k/s and 142,710 at 100k/s
- * where 77,914 were truly missing.  It was also blind after a restart: the
- * counter began again at 1, below the old high-water mark, and real gaps
- * went uncounted until it caught up.
- *
- * THE SEQUENCE (the same 8 bytes on the wire):
- *     [ epoch 16 ][ lane 8 ][ counter 40 ]
- * epoch   drawn at random when the process starts: a new epoch is a restart
- * lane    one per sending thread, so a lane's datagrams leave in order
- * counter per lane, from 1 (2^40 messages a lane a process lifetime)
- *
- * THE RECEIVER keeps, per sender node and lane, the highest counter seen and
- * a 64-bit window of which of the 64 counters below it arrived.  A late
- * datagram inside the window fills its bit: no loss.  A counter is lost only
- * when it falls out of the window unseen, so a loss is reported up to 64
- * messages later on that lane - and a lane that falls silent never reports
- * its last gap.  A bit already set is a duplicate and is dropped, which is
- * what at-most-once promises; beyond the window a late datagram is delivered
- * (it was already counted lost), so the promise holds within 64 messages.
- */
+/* psrelay.h - sequence accounting for the pub/sub fleet relay, header-only and pure.  A sequence is
+ * [epoch 16, random per process start][lane 8, per sending thread][counter 40, per lane, from 1] */
 #ifndef PC_PSRELAY_H
 #define PC_PSRELAY_H
 
@@ -59,8 +30,8 @@ static inline uint64_t psr_counter(uint64_t seq) { return seq & PSR_COUNTER_MASK
 #define PSR_DUPLICATE 0
 #define PSR_DELIVER   1
 
-/* account one arrival.  PSR_DELIVER or PSR_DUPLICATE; *lost grows by the
- * counters this arrival pushed out of the window unseen. */
+/* account one arrival: PSR_DELIVER or PSR_DUPLICATE; *lost grows by the counters pushed out of
+ * the 64-wide window unseen, so a loss shows up to 64 later and an arrival past it is delivered */
 static inline int psr_accept(struct psr_lane *l, uint64_t seq, uint64_t *lost)
 {
 	uint16_t epoch = psr_epoch(seq);
@@ -105,27 +76,12 @@ static inline int psr_accept(struct psr_lane *l, uint64_t seq, uint64_t *lost)
 	return PSR_DELIVER;
 }
 
-/* ---- which path a relay to one peer takes (PS11) --------------------------
- * A node may receive relays on a dedicated port, read by several threads,
- * instead of the one cluster socket that also carries membership, pulls and
- * replication.  A sender uses that port only once the peer has ANSWERED a
- * probe on it, and only while the answers stay fresh: a firewall that drops
- * the port, or a peer that stopped listening, must never turn into relays
- * sent into a hole.  Until then, and after the answers stop, relays go to
- * the cluster socket as they always did.
- *
- * Written by the cluster thread (port, probe, answer); read by the sending
- * workers (psr_path_direct), which is why port and ok_ms are stored and
- * loaded atomically - one relay taking the old path during a change is
- * harmless. */
+/* ---- which path a relay to one peer takes: its relay port only while the peer ANSWERS probes on
+ * it, else the cluster socket.  Written by the cluster thread, read atomically by the workers */
 #define PSR_PROBE_MS        1000        /* while not direct: probe this often */
 #define PSR_REPROBE_MS      1000        /* while direct: re-confirm this often */
-/* no answer for this long: fall back.  Three unanswered probes, not two:
- * the cluster thread's ticks run a little over a second apart and a tick
- * probes before it decides, so 3 s would expire in the tick that sends the
- * third probe.  At 10 s / 30 s a firewall took 30 s of relays on the rig
- * (59,602 at 2,000/s); this bounds that to ~3.5 s for one small datagram a
- * second per peer. */
+/* no answer for this long: fall back.  Three unanswered probes, not two: ticks run a little over a
+ * second apart and probe before deciding, so 3 s would expire in the tick sending the third */
 #define PSR_DIRECT_TTL_MS   3500
 struct psr_path {
 	uint64_t nonce;                    /* the outstanding probe's */
@@ -148,7 +104,7 @@ static inline void psr_path_port(struct psr_path *p, uint16_t port)
 
 static inline int psr_path_direct(const struct psr_path *p, long long now)
 {
-	/* OM2-14: the port, its proof, the port again - psr_path_port clears the
+	/* the port, its proof, the port again - psr_path_port clears the
 	 * proof before it sets a new port, so an old proof never pairs with it */
 	uint16_t port = __atomic_load_n(&p->port, __ATOMIC_ACQUIRE);
 	long long ok = __atomic_load_n(&p->ok_ms, __ATOMIC_ACQUIRE);

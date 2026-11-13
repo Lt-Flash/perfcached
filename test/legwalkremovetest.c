@@ -1,18 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * legwalkremovetest.c - S198: a walk whose callback REMOVES the record it
- * is handed must still hand over every record.
- *
- * That is what a proxy migration is: mig_cb stubs (removes) each victim
- * before it is sent, from inside pcache_ht_iter_meta().  proxytest on
- * rc16 moved 236 of 400 small records off a 16-bucket table (96 in the
- * buckets, 304 in the overflow leg) and never the rest, on every runner,
- * every time.  A non-mutating walk of the same table sees all 400
- * (KEYS), so the loss is in walking while removing.
- *
- * Same table shape as legmetatest: 16 buckets x 6 slots, 400 records.
- */
+/* legwalkremovetest.c - a walk whose callback removes the record it is handed (a proxy migration's
+ * stub) still hands over every record; 16 buckets x 6 slots, 400 records, most in the leg. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"
@@ -67,8 +56,8 @@ static int remove_cb(const str *key, const str *val,
 	return 0;
 }
 
-/* S477: what another thread's delete does to a lock-free walk: it removes a record
- * already handed over, and the bucket's last record moves into that slot, behind the walk */
+/* another thread's delete under a lock-free walk: it removes a record already handed over,
+ * and the bucket's last record moves into that slot, behind the walk */
 static char prev[24];
 static int behind_cb(const str *key, const str *val,
 		const struct pcache_rec_meta *mt, void *ctx)
@@ -157,7 +146,7 @@ int main(void)
 		"the table is empty afterwards (%d left, chained %u)", left,
 		pcache_ht_overflow(ht));
 
-	/* S477: 48 records in 16 buckets, most of them unchained, the walk lock-free */
+	/* 48 records in 16 buckets, most of them unchained, the walk lock-free */
 	ht = pcache_htable_new(4);
 	if (!ht) {
 		printf("create failed\n");

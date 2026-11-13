@@ -1,12 +1,6 @@
 #!/bin/bash
-# drive.sh <rounds> <Ns> <configs> - the overflow bench (DESIGN S458, 12oc OC-0), run ON the bench host.
-# A 3-node eager fleet in podman (bridge pcnet), one collection "th" per cycle, a fresh fleet per cycle;
-# n1 is driven (8 workers), n2/n3 are peers, pcbench shares n1's netns (plaintext = loopback).
-# Each cycle twice: MODE=eager (a production fleet) and MODE=local (nothing replicates: a miss stays local).
-# configs: name:buckets_log2:autoscale, e.g. fix9:9:off auto:9:auto big:22:off
-# Arms: fill (serial inserts), hit d1/d16, miss d1/d16, mix95 d16, new16 (SETs over fresh keys, last).
-# CPU sets by env (defaults: a 2-socket 40-thread host, n1 on node 1, clients on node 0); IMG from mkimage.sh.
-# PERF=1: futex counts (perf trace -s) and a profile per arm - those numbers are not for the tables.
+# drive.sh <rounds> <Ns> <configs> - the overflow bench on a 3-node eager podman fleet, MODE=eager and
+# MODE=local per cycle; configs name:buckets_log2:autoscale.  CPU sets by env; PERF=1 numbers are not for tables.
 set -u
 ROUNDS=$1 NS=$2 CONFIGS=$3
 IMG=${IMG:?IMG=<image from mkimage.sh>}

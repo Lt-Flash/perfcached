@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * walprobe.c — WAL storage probe + policy recommendation (task S12).
- * See walprobe.h.
- */
+/* walprobe.c - WAL storage probe + policy recommendation.  See walprobe.h. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,10 +150,8 @@ void pc_wal_policy_from(const struct pc_wal_probe *pr,
 		return;
 	}
 
-	/* Ring depth for fsync = always, from the ONE number that governs
-	 * it: how long a drain cycle is blocked in fdatasync.  Scaled off
-	 * an NVMe-class baseline (300us), where the shipped 1 MB default
-	 * is already right, and clamped to the config's own range. */
+	/* ring depth for fsync = always follows the p99 fdatasync stall, scaled off an NVMe-class
+	 * 300us where the 1 MB default is right, clamped to the config's range */
 	{
 		long long mult = (pr->fsync_p99_us + 299) / 300;
 

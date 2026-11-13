@@ -1,0 +1,19 @@
+name: Question
+description: How to do something, or whether perfcached fits a use
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions are welcome here or in Discussions (Q&A), where answers stay findable for others.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `perfcached -V`, if you run it already.

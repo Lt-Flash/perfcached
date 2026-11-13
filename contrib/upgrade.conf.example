@@ -1,4 +1,4 @@
-# /etc/perfcached/upgrade.conf - the root helper's settings (UP5).  Read as
+# /etc/perfcached/upgrade.conf - the root helper's settings.  Read as
 # key = value lines, never sourced.  Every key is optional; the defaults:
 #unit = perfcached
 #link = /opt/perfcached

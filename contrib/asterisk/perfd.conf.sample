@@ -9,7 +9,8 @@
 ;
 ; What the server side needs:
 ;   binary - the secret below listed in [secrets] client on every perfcached
-;            node (the native door is encrypted off loopback)
+;            node (the native door authenticates off loopback, and encrypts
+;            where the node's listener has encrypt = yes)
 ;   resp   - perfcached: [listen] resp = <ip:port>, resp_allow covering the
 ;            Asterisk hosts, [secrets] resp = <password>
 ;            Redis: a standalone server, or a master behind a VIP whose
@@ -18,7 +19,7 @@
 ;
 
 [general]
-; binary: perfcached's native door through libperfd - encrypted, and
+; binary: perfcached's native door through libperfd - authenticated, and
 ;         fleet-aware: it learns the members, fails over, and can route
 ;         each key to its owner
 ; resp:   RESP2, to perfcached's RESP door or a standalone Redis

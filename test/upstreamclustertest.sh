@@ -1,19 +1,6 @@
 #!/bin/sh
-# upstreamclustertest.sh - S331 read-through in an EAGER fleet (DESIGN 12ix).
-#
-# Three nodes, one upstream (test/fakeupstream.py - it fails the suite on
-# any write).  A fetched copy is NODE-LOCAL (each node's shadow); what
-# changes a key is a real write, and replicates:
-#   1  the fleet forms with the companion collection on every node
-#   2  each node fetches a key for itself - one fetch per node
-#   3  a mutation on one node (INCR of an upstream counter) PROMOTES it:
-#      the others read the replicated record and never fetch it
-#   4  a key another node holds a fetched copy of, deleted elsewhere,
-#      reads as gone there too - the no-fall entry replicated, and the
-#      shadow's gate refuses the stale copy
-#   5  a plain SET on one node and a DEL on another: gone everywhere
-#   6  nothing was written upstream
-# Usage: test/upstreamclustertest.sh [./perfcached]
+# upstreamclustertest.sh - read-through in an EAGER fleet: a fetched copy is node-local, a mutation
+# promotes and replicates it, a delete anywhere hides stale copies, and nothing is written upstream.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=$(readlink -f "${1:-./perfcached}")
@@ -133,9 +120,8 @@ A=$(rc 1 'GET tok:a')$(rc 2 'GET tok:a')
 	|| bad "tok:a: $A, fetched $(cnt tok:a) time(s)"
 
 echo "--- 3: a mutation promotes, and the record replicates"
-# read on the others only once the promotion has REPLICATED: inside the
-# eager window a read there falls through and may answer the upstream's
-# older value (DESIGN 12ix, "replication window") - that is not under test
+# read on the others only once the promotion has REPLICATED: inside the eager window a read there may
+# answer the upstream's older value, which is not under test
 nfe() { python3 -c 'import json,sys,urllib.request
 r=json.loads(urllib.request.urlopen("http://127.0.0.1:1879%s/stats" % sys.argv[1],timeout=3).read())
 print([c for c in r["collections"] if c["name"]=="0.nofall"][0]["entries"])' "$1" 2>/dev/null || echo 0; }

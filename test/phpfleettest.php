@@ -161,7 +161,18 @@ if ($arm === 'seeds') {
             ok(false, 'the list ' . implode(',', $list) . ' with node 2 frozen: ' . substr($e->getMessage(), 0, 100));
         }
     }
-    exec('kill -CONT ' . (int)$argv[4]);
+    // S497: both seeds frozen - the second pass shares connect_timeout_ms (2 s) between them, it
+    // does not give each its own: about 1 s + 2 s, not 1 s + 4 s
+    exec('kill -STOP ' . (int)$argv[5]);
+    $t0 = microtime(true);
+    try {
+        new Perfcached([$n2, $n3], 19591, $single);
+        ok(false, 'both seeds frozen: the dial failed');
+    } catch (PerfcachedTransportException $e) {
+        $ms = (int)((microtime(true) - $t0) * 1000);
+        ok($ms >= 2500 && $ms < 4000, "both seeds frozen: the dial gives up in $ms ms - 2 x 500 ms, then 2 s shared, not 2 s each");
+    }
+    exec('kill -CONT ' . (int)$argv[4] . ' ' . (int)$argv[5]);
     exec('kill -9 ' . (int)$argv[4] . ' ' . (int)$argv[5]);
     usleep(300000);
     $f0 = Perfcached::pool()['seeds_failed'];

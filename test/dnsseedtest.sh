@@ -1,20 +1,6 @@
 #!/bin/sh
-# dnsseedtest.sh - S36 step a: seeds are DNS NAMES, re-resolved while
-# the node runs - a cloud instance comes back at a new address.
-#
-# A network namespace of its own, whose /etc/hosts `ip netns exec`
-# swaps in (/etc/netns/<ns>/hosts), so a name can be pointed at one
-# node and then moved to another without touching the host:
-#   1  nodes 1 and 2 form a fleet through `seeds = seed-a`, seed-a ->
-#      node 1 (node 1 has no seeds)
-#   2  node 1 dies; seed-a moves to node 3's address; node 3 starts blank
-#      with NO seeds.  Node 2 - which only ever knew seed-a by name -
-#      re-resolves it, beats at node 3, and node 3 (a founder seconds
-#      old) yields to node 2's established cluster: one fleet, node 2's
-#      id, inside the 30 s provisional window
-# Needs root and ip netns; SKIPs loudly without them - a skip is not a
-# pass.
-# Usage: test/dnsseedtest.sh [./perfcached]
+# dnsseedtest.sh - seeds are DNS NAMES re-resolved while the node runs: a name moved (in a netns hosts
+# file) to a blank node draws it into the established fleet.  Needs root and ip netns, else SKIPs loudly.
 set -u
 BIN=$(readlink -f "${1:-./perfcached}")
 if [ "$(id -u)" != 0 ] || ! command -v ip >/dev/null 2>&1; then
@@ -40,14 +26,8 @@ ip -n $NS link set lo up
 mkdir -p "/etc/netns/$NS"
 hosts() { printf '127.0.0.1 localhost\n%s seed-a\n' "$1" > "/etc/netns/$NS/hosts"; }
 hosts 127.0.33.1
-# The whole test rides on the namespace's hosts file being the one the
-# resolver reads.  A caching resolver (nscd) answers from OUTSIDE the
-# namespace and never sees it: the shadow is in place, `files` is first
-# in nsswitch, and the name still does not resolve - seen on the GitLab
-# runner (Debian 13, nscd active) on the first run of this suite, while
-# the same test passed on a VM without nscd.  Read it off the live
-# namespace rather than guessing: when the name does not resolve in
-# there, there is nothing this suite can test here.
+# the name must resolve inside the namespace: a caching resolver (nscd) answers from outside it, and
+# then there is nothing this suite can test here
 if ! ip netns exec $NS getent hosts seed-a 2>/dev/null | grep -q '^127\.0\.33\.1 '; then
 	echo "dnsseedtest: SKIP - the namespace's hosts file is not consulted (a caching resolver such as nscd answers from outside it) - nothing was tested"
 	exit 0

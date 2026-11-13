@@ -1,23 +1,6 @@
 #!/bin/sh
-# httpsweeptest.sh - S356: the metrics-door sweep must not free a
-# connection that still has an event in the batch being dispatched.
-# worker_main() sweeps aged HTTP connections (http_timeout) AFTER
-# epoll_wait() has returned a batch and BEFORE it dispatches it; a
-# connection whose request (or FIN) arrives in the very turn it reaches
-# its timeout was destroyed by the sweep and then handed to
-# pc_conn_event() from the batch - a use-after-free that crashed 247
-# twice in production (conn_destroy, proto.c, write to 0x420).
-#   - one worker, http_timeout 1: ticks are whole seconds, so a client
-#     that sends 0.15-0.95 s after connecting crosses a tick boundary in
-#     most turns, and its own event is what wakes the worker
-#   - a finished HTTP request first, as the positive control
-#   - ~8 s of such clients (a request, or a bare close); some must be
-#     swept with their request already sent - the window was exercised
-#   - the daemon must still be running and answering afterwards, with no
-#     sanitizer report or segfault in its log
-# Fail-first: the build before the fix dies (ASan: heap-use-after-free;
-# plain: SIGSEGV in conn_destroy).
-# Usage: test/httpsweeptest.sh [./perfcached]
+# httpsweeptest.sh - the metrics-door sweep (after epoll_wait, before dispatch) must not free a
+# connection that still has an event in the batch: clients timed across tick boundaries, no crash.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pchttpsweep.XXXXXX); P1=
@@ -124,6 +107,7 @@ except OSError as e:
     ok1 = False
 check(ok1, "the http door still answers after the race")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; I\ *) echo "  ..   ${l#I }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

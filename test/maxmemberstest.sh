@@ -1,18 +1,6 @@
 #!/bin/sh
-# maxmemberstest.sh - S299: a fleet at its member limit refuses a new
-# member OUT LOUD, and the refused node stops instead of founding a
-# second cluster.
-#
-# Before S299 a full peer table made the master log a warning and answer
-# the joiner NOTHING; a joiner reads silence as "no master" and founds its
-# own cluster.  Here the limit is reached with [cluster] max_members = 2,
-# which takes the same refusal path as the build's 256-peer bound.
-#
-#   1  two nodes form a fleet
-#   2  a third is REFUSED: the master says so, the joiner says why and
-#      exits non-zero, and it never claims mastership
-#   3  the fleet is still two, and still serving
-# Usage: test/maxmemberstest.sh [./perfcached]
+# maxmemberstest.sh - a fleet at its member limit (max_members = 2) refuses a new member OUT LOUD,
+# and the refused node stops instead of founding a second cluster.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcmm.XXXXXX)
@@ -76,10 +64,8 @@ if kill -0 $P3 2>/dev/null; then
 	bad "the refused node is still running after 20 s"
 	kill -9 $P3; P3=
 else
-	# it stops through the ordinary shutdown path, as the duplicate-
-	# identity refusal does, so it exits 0 - which is what keeps
-	# systemd's Restart=on-failure from re-running it into the same
-	# refusal every second
+	# it stops through the ordinary shutdown path and exits 0, so systemd's Restart=on-failure
+	# does not re-run it into the same refusal every second
 	wait $P3; rc=$?; P3=
 	ok "the refused node stopped by itself (rc $rc)"
 fi

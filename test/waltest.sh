@@ -1,13 +1,6 @@
 #!/bin/sh
-# waltest.sh — S13 verification over a live daemon:
-#  - every mutation class lands as a record (upsert/del/touch, add as the
-#    ABSOLUTE resulting value), seq ascending, CRC-valid, wall-clock TTL;
-#  - segments are zero-write provisioned (full-size, non-sparse);
-#  - recycling wraps generations and stale-gen records are fenced;
-#  - a torn/corrupted record stops the scan (red proof of the CRC);
-#  - a tiny ring under a burst DROPS + counts, the daemon never blocks;
-#  - stats carry the wal block; clean shutdown syncs the tail.
-# Usage: test/waltest.sh [./perfcached]
+# waltest.sh - the WAL over a live daemon: every mutation lands as a CRC-valid record, segments are
+# provisioned, recycling fences stale generations, a torn record stops the scan, a full ring waits.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -125,12 +118,7 @@ R=$("$BIN" -W "$D/wal")
 echo "$R" | grep -q "stop=torn" && ok || bad "corruption undetected: $R"
 
 # ---- round 2: recycling + gen fencing ---------------------------------
-# The ring is provisioned ABOVE the whole ~2.8MB pump: this round
-# proves recycling + gen fencing and asserts dropped==0, so overflow
-# must be structurally impossible - a WAL thread that loses the CPU
-# for ~250ms to a noisy neighbour (GitHub's 2-vCPU runners routinely
-# do this) overflowed the old 1MB ring.  Deliberate ring-full drops
-# are round 3's subject, on a ring sized to guarantee them.
+# the ring is provisioned above the whole ~2.8MB pump, so a descheduled WAL thread cannot overflow it
 rm -rf "$D/wal"; mkconf 4096 1 2; start
 python3 - <<'EOF'
 import json, pcnative, socket
@@ -145,9 +133,8 @@ def call(m, **p):
 # ~3MB of records through 2x1MB segments -> recycling must happen
 for i in range(700):
     call("set", col="th", key="k%03d" % (i % 100), value="x" * 4000)
-# drain barrier before reading the ledger: on a starved host most of
-# the pump can still sit in the rings here - recycles would honestly
-# read 0 and appended+dropped would cover only part of last_seq
+# drain barrier before reading the ledger: on a starved host the pump can still sit
+# in the rings, and recycles and appended+dropped would read short
 call("sync")
 st = call("stats")["result"]["wal"]
 assert st["recycles"] >= 1, st
@@ -162,14 +149,14 @@ N=$(echo "$R" | grep -c '^seq=')
 [ "$N" -gt 50 ] && ok || bad "window too small after recycle ($N)"
 
 # ---- round 3: tiny ring under a pipelined burst -> it waits, drops nothing
-# (S466: a full ring holds the writer under every fsync policy; it dropped before) --
+# a full ring holds the writer under every fsync policy
 rm -rf "$D/wal"; mkconf 4 1 4; start
 python3 - <<'EOF'
 import json, pcnative, socket
 s = socket.create_connection(("127.0.0.1", 16485), timeout=5)
 f = pcnative.wrap(s)
 # one pipelined burst: 2000 sets in a single write laps the 4KB ring
-# no matter how the pump timing falls (500 once passed with 0 drops)
+# no matter how the pump timing falls
 reqs = b"".join(
     (json.dumps({"jsonrpc":"2.0","id":i,"method":"set","params":
         {"col":"th","key":"b%03d"%i,"value":"y"*900}})+"\n").encode()
@@ -186,8 +173,8 @@ def call(m, **p):
     return json.loads(f.readline())
 call("sync")                    # drain barrier, as round 2: appended is the pump's count
 st = call("stats")["result"]["wal"]
-# held at the connection (writer_pauses) or in the ring (ring_waits), as
-# waldroptest 6 - GitHub's runner paused 145 times and never ring-waited
+# held at the connection (writer_pauses) or in the ring (ring_waits), as in
+# waldroptest 6 - either way nothing is dropped
 assert st["dropped"] == 0 and st["appended"] == 2000, st
 assert st.get("ring_waits", 0) + st.get("writer_pauses", 0) > 0, st
 assert call("ping")["result"]["pong"] is True

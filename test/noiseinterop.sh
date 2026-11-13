@@ -1,10 +1,6 @@
 #!/bin/sh
-# noiseinterop.sh — S25' interop proof: an independent Python NNpsk0
-# initiator (test/noise_interop.py) handshakes with the live daemon over
-# an encryption-required listener, then exchanges real requests.  Also
-# proves wrong-PSK and tampered-handshake connections are rejected, and
-# that a plaintext client on the encrypted port gets nothing.
-# Usage: test/noiseinterop.sh [./perfcached] [./noisetest]
+# noiseinterop.sh - an independent NNpsk0 initiator (test/noise_interop.py) talks to the daemon; a wrong PSK,
+# a tampered handshake and a plaintext client get nothing.  Usage: test/noiseinterop.sh [./perfcached] [./noisetest]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -49,9 +45,8 @@ run() { # run <mode> <label>
 	python3 "$HERE/noise_interop.py" 127.0.0.1 16481 0 "$PSK" "$1"
 	rc=$?
 	if [ $rc = 77 ]; then
-		# the host's python cryptography cannot drive the handshake -
-		# nothing here is testable, and a FAIL would say the daemon
-		# refused a valid client when no client was ever built
+		# the host's cryptography cannot drive the handshake: nothing is testable, and a FAIL would blame
+		# the daemon for a client never built
 		echo "  ..   SKIP: this host's python cryptography is too old to "\
 			"drive the interop initiator"
 		echo "noiseinterop: SKIPPED"
@@ -67,11 +62,8 @@ run ok       "handshake + requests"
 run wrongpsk "wrong-PSK rejection"
 run tamper   "tampered-handshake rejection"
 
-# a plaintext client on the encrypted port must get nothing back.  The
-# probe is a native CMD frame (test/pcnative.py).  The door reads its
-# first two bytes (0x9E 0x01) as a handshake length of 414, so the frame
-# carries enough to fill that bogus handshake - the daemon then refuses
-# it and closes, where a shorter frame would leave it waiting for more.
+# a plaintext client on the encrypted port gets nothing.  The door reads a CMD frame's first two
+# bytes (0x9E 0x01) as a 414-byte handshake length, so the frame fills it and is refused.
 if python3 - <<'EOF'
 import pcnative, socket, sys
 s = socket.create_connection(("127.0.0.1", 16481), timeout=3)

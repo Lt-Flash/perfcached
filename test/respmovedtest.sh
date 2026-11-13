@@ -1,27 +1,6 @@
 #!/bin/sh
-# respmovedtest.sh - RV-10: `resp_redirect = moved` answers a key this node
-# does not own with a genuine -MOVED, and `forward` (the default) still
-# answers it.
-#
-# A stock cluster-aware Redis client routes by CLUSTER SLOTS and refreshes
-# that table on -MOVED and on nothing else.  The daemon forwards instead
-# (S44) - right for a plain client, and the reason a cluster-aware one
-# stays stale for ever after a rebalance: it is never told.  The policy is
-# per daemon because the daemon cannot tell the two kinds of client apart.
-#
-# The same client, both policies, a three-node SHARD fleet each:
-#  moved   - 30 one-key writes through node A: a key A does not own gets
-#            -MOVED <slot> <ip>:<port>; the slot is the one a Redis client
-#            computes itself (CRC16/XMODEM mod 16384, checked here); the
-#            write repeated at that address succeeds WITHOUT another
-#            redirect (so the address really is the owner) and reads back;
-#            the fleet forwarded NOTHING; commands without a key (DBSIZE,
-#            KEYS) are never redirected;
-#  forward - the same 30 writes through node A all answer +OK, none is
-#            redirected, and the fleet's forward counter moved.
-# A daemon without the policy refuses the config key, so the moved fleet
-# does not start.
-# Usage: test/respmovedtest.sh [./perfcached]
+# respmovedtest.sh - `resp_redirect = moved` answers a key this node does not own with a genuine
+# -MOVED to its owner; `forward` (the default) still serves it.  Usage: test/respmovedtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -35,10 +14,8 @@ bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 
 DRV="$D/drv.py"
 cat > "$DRV" <<'EOF'
-# run <host> <port> <n> <prefix>: n one-key SETs through host:port, following
-#   -MOVED once.  Prints: ok=<n> moved=<n> badslot=<n> loops=<n> readback=<n>
-# plain <host> <port> <cmd...>: one command, prints the reply's first line
-# fwd <host:port>...: sum of cluster.fwd_sent over the nodes (native door)
+# drv.py run <host> <port> <n> <prefix> (SETs following -MOVED once) | plain <host> <port>
+# <cmd...> (one reply line) | fwd <host:port>... (cluster.fwd_sent summed)
 import json, pcnative, socket, sys
 
 def crc16(b):                                  # CRC16/XMODEM, as Redis Cluster

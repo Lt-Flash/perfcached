@@ -1,20 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * uprespc.c - the upstream's RESP reply parser: one RESP2 or RESP3 reply
- * from a buffer.  No connection, no thread state but the per-thread size
- * ceiling, no logging - upstream.c reads the bytes from its connections and
- * acts on what this parses.  Moved from upstream.c unchanged (the 0.7.2
- * split, wave 1 - doc/MODULARITY.md); test/uprespctest.c.
- */
+/* uprespc.c - the upstream's parser of one RESP2 or RESP3 reply from a buffer: no connection, no
+ * logging, no thread state but the per-thread size ceiling.  test/uprespctest.c. */
 #include <stdlib.h>
 #include <string.h>
 
 #include "uprespc.h"
 
-/* S385: the largest bulk - and, in read_reply, the largest reply - this
- * thread reads: the fetch threads' record ceiling, the writer's and the
- * pass reader's upstream_pass_max_kb */
+/* the largest bulk (in read_reply, the largest reply) this thread reads: the fetch threads'
+ * record ceiling, the writer's and the pass reader's upstream_pass_max_kb */
 __thread size_t rv_max = UP_RBUF_MAX;
 
 void rv_free(struct rv *v)
@@ -30,9 +24,8 @@ void rv_free(struct rv *v)
 	v->nel = 0;
 }
 
-/* parse one reply at buf[*pos..len): 1 complete (*pos advanced), 0 need
- * more bytes, -1 malformed.  Strings point into buf (valid until the
- * next read compacts it). */
+/* parse one reply at buf[*pos..len): 1 complete (*pos advanced), 0 need more bytes, -1
+ * malformed.  Strings point into buf, valid until the next read compacts it. */
 int rv_parse(char *buf, size_t len, size_t *pos, struct rv *v, int depth)
 {
 	size_t p = *pos, e;
@@ -78,10 +71,8 @@ int rv_parse(char *buf, size_t len, size_t *pos, struct rv *v, int depth)
 			return 1;
 		}
 		if ((size_t)n > rv_max)
-			return -3;             /* too large to hold: the caller
-			                        * marks the key and drops the
-			                        * connection (the stream is mid
-			                        * value) */
+			return -3;             /* too large to hold: the caller marks the key and
+			                        * drops the connection (the stream is mid value) */
 		if (len - (e + 1) < (size_t)n + 2)
 			return 0;
 		v->s = buf + e + 1;

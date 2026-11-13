@@ -1,7 +1,5 @@
-/* S151: client-only totals and reach are a RANGE of pstats slots, and the
- * range is the whole story.  process_no is the thread's slot; setting it
- * here plays each thread in turn on one thread, which is exactly what
- * HT_ST sees.  Epochs are driven through compat_ticks_offset. */
+/* origintest.c - client-only totals and reach are a range of pstats slots: setting process_no plays
+ * each thread in turn on one thread, as HT_ST sees it; epochs move via compat_ticks_offset. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"
@@ -57,9 +55,8 @@ int main(void)
 	process_no = 0;
 	compat_ticks_offset += 2 * PCACHE_REACH_EPOCH_S;
 
-	/* client worker 1: 10 hits, 5 misses.  worker 2: 4 hits on keys
-	 * worker 1 already touched.  slot 0 (recovery): 7 hits.  slot 6
-	 * (the peer rx thread when workers = 2): 3 hits on NEW keys, 2 misses */
+	/* client worker 1: 10 hits, 5 misses; worker 2: 4 hits on worker 1's keys; slot 0
+	 * (recovery): 7 hits; slot 6 (peer rx, 2 workers): 3 hits on new keys, 2 misses */
 	for (i = 0; i < 10; i++) { snprintf(kb, sizeof kb, "k%u", i);   get(ht, 1, kb); }
 	for (i = 0; i < 5;  i++) { snprintf(kb, sizeof kb, "nope%u", i); get(ht, 1, kb); }
 	for (i = 0; i < 4;  i++) { snprintf(kb, sizeof kb, "k%u", i);   get(ht, 2, kb); }
@@ -95,8 +92,7 @@ int main(void)
 		"after reset: all=%lu client=%lu (want 3/2)", all.hits, cli.hits);
 	CHK(all.entries == 50, "entries survived the reset: %lu", all.entries);
 
-	/* FAIL-FIRST: with no range registered, client == all.  This is what
-	 * a library user sees, and it is what the daemon saw before S151. */
+	/* FAIL-FIRST: with no range registered, client == all - what a library user sees */
 	pcache_ht_default_client_slots(0, 0);
 	plain = pcache_htable_new(8);
 	process_no = 1; k.s = "x"; k.len = 1; pcache_ht_store(plain, &k, &v, 0); process_no = 0;
@@ -105,9 +101,8 @@ int main(void)
 	CHK(all.hits == 2 && cli.hits == 2,
 		"unregistered range: client==all (%lu==%lu) - the range IS the fix", cli.hits, all.hits);
 
-	/* S153: a miss on a record still present but past its TTL reports
-	 * the past expiry through exp_out; a never-present key reports 0.
-	 * The door uses this to say cause=expired vs cause=absent. */
+	/* a miss on a record present but past its TTL reports its expiry via exp_out
+	 * (cause=expired); a never-present key reports 0 (cause=absent) */
 	{
 		char buf[64]; unsigned int vlen = 0, needed = 0, exp = 7;
 		int rc;
@@ -127,18 +122,16 @@ int main(void)
 		process_no = 0;
 	}
 
-	/* S154: the stat array is sized to the registered thread count.  The
-	 * charge against the arena ceiling falls with it, and a slot beyond
-	 * the size is ignored rather than faulting. */
+	/* the stat array is sized to the registered thread count: the arena charge falls with it,
+	 * and a slot beyond the size is ignored rather than faulting */
 	{
 		unsigned long big = pcache_htable_index_bytes(12), small;
 		pcache_htable_t *t;
 
 		pcache_ht_default_stat_slots(24);
 		small = pcache_htable_index_bytes(12);
-		/* S155 made the region header-less, and 1,024 lines of 256 B is
-		 * then EXACTLY one slot - so the charge no longer shows the
-		 * difference at region granularity; the array itself must. */
+		/* 1,024 lines of 256 B is exactly one header-less region slot, so the charge
+		 * cannot show the difference at region granularity; the array itself must */
 		CHK(small <= big,
 			"24 stat slots: index charge %lu -> %lu (%lu KB less)", big, small, (big - small) / 1024);
 		pcache_ht_default_client_slots(1, 3);
@@ -153,9 +146,8 @@ int main(void)
 		pcache_ht_default_stat_slots(0);            /* back to the default for anything after */
 	}
 
-	/* S150: growth at a percentage of slot capacity.  16 buckets x 6 slots
-	 * = 96; 75% is 72.  70 entries must not split at 75 and must at 67
-	 * (the old hardcode, 64); 75 entries must split at 75. */
+	/* growth at a percentage of slot capacity: 16 buckets x 6 slots = 96, 75% is 72; 70 entries
+	 * must not split at 75 but must at 67, and 75 entries must split at 75 */
 	{
 		pcache_htable_t *g = pcache_htable_new(4);
 		unsigned int nb0, d;

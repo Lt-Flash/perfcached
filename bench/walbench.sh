@@ -1,26 +1,6 @@
 #!/bin/sh
-# walbench.sh — what durability costs, and what it buys back when a node dies.
-#
-# Two questions, and the second is the one nothing had answered.
-#
-# PART 1, COST.  Writes are the only operations a WAL touches, so every
-# arm is 100% SET, run twice: once one-request-at-a-time (what an
-# application feels) and once pipelined (the daemon's ceiling, where the
-# fsync policy has nowhere to hide).  Arms are memory-only, then
-# fsync = no | everysec | always, then everysec with RDB snapshots on -
-# so the snapshot walker's cost is separated from the WAL's rather than
-# blended into it.
-#
-# PART 2, FAILOVER.  The mode matrix measures what SURVIVORS hold after a
-# node dies.  It says nothing about what the dead node brings BACK, which
-# is the whole point of having a WAL - and DESIGN 6.5 claims durability
-# "matters more for proxy collections" precisely because peers cannot
-# rehydrate those keys.  That claim has never been tested.  So per mode:
-# fill through node 1, kill -9 node 1, RESTART it, and read the original
-# keyspace back THROUGH NODE 1 with the fill skipped.  With no WAL the
-# answer should be nothing; with one it should be its own share.
-#
-# usage: bench/walbench.sh [./perfcached] [./pcbench] [./mmclient] [./perfcli]
+# walbench.sh - what durability costs per fsync policy, and what a WAL brings back to a node
+# restarted after kill -9.  usage: bench/walbench.sh [./perfcached] [./pcbench] [./mmclient] [./perfcli]
 set -u
 
 BIN=${1:-./perfcached}
@@ -52,18 +32,14 @@ for pf in 17901 17902 17903; do
 	fi
 done
 
-# NOTE: the trap must NOT rm -rf "$D" - results.tsv lives there, and a
-# harness that deletes its own output on the way out is a long walk for
-# nothing.  Only the daemons go.
+# the trap must not rm -rf "$D": results.tsv lives there
 trap 'for v in "$P1" "$P2" "$P3"; do [ -n "$v" ] && kill -9 $v 2>/dev/null; \
      done' EXIT TERM INT
 
 addr() { echo "127.0.45.$1"; }
 port() { echo "$((17900 + $1))"; }
-# part 2's fleet is encrypted, part 1's single node is plaintext (pcbench
-# speaks plaintext only, and `plaintext = loopback` is EXCLUSIVE - an
-# authenticated perfcli would be refused there, so the two need different
-# stats callers rather than one with -a bolted on)
+# part 2's fleet is encrypted, part 1's node plaintext (pcbench speaks only plaintext, and
+# 'plaintext = loopback' refuses an authenticating perfcli), hence two stats callers
 statj() { "$CLI" -h "$(addr $1)" -p "$(port $1)" -a "$SECRET" \
 	-j '{"method":"stats"}' 2>/dev/null; }
 statp() { "$CLI" -h "$(addr $1)" -p "$(port $1)" \
@@ -76,10 +52,7 @@ try:
     print($1)
 except Exception:
     print('')" 2>/dev/null; }
-# One retry: a momentarily unanswered stats call returns empty, and an
-# empty read that gets treated as 0 is indistinguishable from a node that
-# genuinely holds nothing - which is the exact number this harness is
-# trying to measure.
+# one retry: an empty stats reply read as 0 looks exactly like a node holding nothing
 entries() {
 	e=$(statj "$1" | jget 'd["collections"][0]["entries"]')
 	if [ -z "$e" ]; then
@@ -128,11 +101,8 @@ start1() {
 }
 stop1() { [ -n "$P1" ] && kill -9 $P1 2>/dev/null; P1=; wait 2>/dev/null; }
 
-# the two measured drives, factored out so the warm-up is provably the
-# SAME work as the measurement rather than an approximation of it.
-# -P bin: the data verbs on their fixed-layout frames (src/proto.h),
-# the path libperfd's typed verbs ride - the WAL's cost on top of the
-# bare wire, with no per-request encoding in the number
+# the measured drives, shared with the warm-up so it is the same work.  -P bin: fixed-layout
+# data frames, so no per-request encoding is in the WAL's number
 drive_rtt() { # drive_rtt [seconds]
 	"$PB" -h "$(addr 1)" -p "$(port 1)" -P bin -C c -N -n "$KEYS" \
 		-v "$VAL" -M 0 -d 1 -c 4 -T "${1:-5}" -q 2>&1 | tail -1 \
@@ -144,24 +114,8 @@ drive_pipe() { # drive_pipe [seconds]
 		| sed -n 's/.*: \([0-9]*\) ops\/s.*/\1/p'
 }
 
-# ---- part 1 measurement: INTERLEAVED, median of N rounds -----------------
-#
-# Sequential single-pass measurement did not work and the reason is
-# recorded: six consecutive pipelined drives against ONE unchanged arm
-# spanned 945,640 to 1,572,177 - a range wide enough to contain nearly
-# every "difference" the ranked table was reporting between arms.  Two
-# full runs then disagreed about the ranking completely (memory-only went
-# 5th to 2nd, wal-rdb 1st to 5th).
-#
-# Repeating the arms SEQUENTIALLY would not fix that: a slow patch of the
-# box would still land entirely on whichever arm happened to be running.
-# So the rounds are INTERLEAVED - every round drives every arm once, in
-# the same order - and each arm reports the median of its rounds with the
-# observed low and high beside it.  Drift is then shared by all arms
-# instead of being attributed to one.
-#
-# Recovery is measured ONCE per arm, not per round: it is a WAL replay of
-# a known keyspace, it is slow, and it is not what the noise was in.
+# ---- part 1 measurement: rounds interleaved (every round drives every arm), median of
+# $ROUNDS with low and high, so drift is shared by all arms.  Recovery is measured once per arm.
 
 ROUNDS=${ROUNDS:-7}
 
@@ -178,14 +132,13 @@ wal_block() { # wal_block <label> -> the [wal] section for that arm
 }
 ARMS="memory wal-no wal-everysec wal-always wal-rdb"
 
-# one round for one arm: fresh daemon, discarded warm-up, then the two
-# measured drives.  Echoes "<rtt> <pipe>".
+# one round for one arm: fresh daemon, discarded warm-up, then the two measured drives.
+# Echoes "<rtt> <pipe>".
 round_arm() { # round_arm <label>
 	rm -rf "$D/wal"; mkdir -p "$D/wal"
 	mk1 "$(wal_block "$1")"
 	start1 || { echo "WALBENCH: $1 did not start" >&2; echo "0 0"; return 0; }
-	# short warm-up: the box is already warm after round 1, this is here
-	# for the fresh arena and the new connections
+	# short warm-up for the fresh arena and connections
 	drive_rtt 2 >/dev/null 2>&1
 	drive_pipe 2 >/dev/null 2>&1
 	R=$(drive_rtt); P=$(drive_pipe)
@@ -276,9 +229,8 @@ if part 1; then
 	echo "  RESOLUTION: the widest arm's own spread is ${WIDEST}% - any" \
 		"difference between arms smaller than that is not a result" >&2
 
-	# SANITY: memory-only does strictly less work than every WAL arm, so
-	# it cannot be slower.  If it still is with medians in hand, the rig
-	# is not measuring the daemon.  Shout; part 2 is unaffected.
+	# memory-only does less work than every WAL arm: slower with medians in hand means the rig is
+	# not measuring the daemon
 	MEMP=$(awk -F'\t' '$1=="cost" && $2=="memory" {print $6}' "$D/results.tsv")
 	BESTW=$(awk -F'\t' '$1=="cost" && $2!="memory" && $2!~/^#/ && $6+0>m {m=$6+0}
 		END {print m+0}' "$D/results.tsv")
@@ -360,22 +312,8 @@ modearm() { # modearm <label> <mode-block> <wal 0|1>
 		>/dev/null 2>>"$D/$LABEL.err"
 	HELD=$(entries 1); HELD=${HELD:-0}
 
-	# LET THE FLEET SETTLE FIRST.  eager replicates in the background, so
-	# killing the moment the fill returns would measure it mid-push and
-	# make eager look exactly like store - the very distinction this arm
-	# exists to draw.  Wait for the peer census to stop moving.
-	# eager's sweep pauses BETWEEN batches, so "unchanged for a moment"
-	# is not "finished": the first version of this stopped at 18894 of
-	# 20000 and the 1106 it had not yet pushed came back as data loss
-	# that eager had not actually suffered.  Stop early only on FULL
-	# convergence; otherwise demand a long quiet period.
-	# The eager sweep runs on a ~10s TICK, so a few seconds of "no
-	# change" only means we are between ticks.  Measured twice at
-	# exactly 18894/20000 with a 4.8s quiet window - the same number
-	# twice is a deterministic gap, not slow convergence, and here the
-	# gap was the harness's patience rather than the daemon's sweep.
-	# So: poll for FULL convergence for up to 60s, and only then fall
-	# back to a quiet window long enough to span a tick.
+	# let the fleet settle: killed mid-push, eager looks like store.  Its sweep runs on a ~10 s tick,
+	# so poll for full convergence up to 60 s, then accept a quiet window longer than a tick.
 	PL=""; PS=0; k=0
 	while [ $k -lt 300 ]; do
 		A=$(entries 2); B=$(entries 3)
@@ -385,7 +323,7 @@ modearm() { # modearm <label> <mode-block> <wal 0|1>
 		fi
 		if [ "$PN" = "$PL" ]; then
 			PS=$((PS + 1))
-			# 40 x 0.4s = 16s, comfortably more than one sweep tick
+			# 40 x 0.4 s = 16 s, more than one sweep tick
 			[ $PS -ge 40 ] && break
 		else
 			PS=0
@@ -396,11 +334,8 @@ modearm() { # modearm <label> <mode-block> <wal 0|1>
 	echo "  $LABEL: peers settled at $PL before the kill" >&2
 
 	kill -9 $P1 2>/dev/null; P1=; sleep 6
-	# Restart the SAME node with the SAME wal dir, into a FRESH log.
-	# Appending to the old one meant the ready marker from the FIRST
-	# start was already there, so the wait returned immediately and
-	# every number after it described a node that had not come up -
-	# which is how all five arms reported "recovered 0" in ~750ms.
+	# restart the same node with the same wal dir into a fresh log: the old one already holds a ready
+	# marker, and the wait would return at once
 	T0=$(now_ms)
 	"$BIN" -f "$D/n1.conf" > "$D/n1.restart.log" 2>&1 &
 	P1=$!
@@ -418,12 +353,8 @@ modearm() { # modearm <label> <mode-block> <wal 0|1>
 		stopfleet
 		return 0
 	fi
-	# WAIT FOR IT TO REJOIN, not just to listen.  A restarted node needs
-	# its peers before it can pull or gather, and "perfcached ready"
-	# comes first - so reading straight away measures the membership
-	# race.  It showed up worst in the since-removed ec mode, where an
-	# un-joined node could not gather k chunks and reported 3329 of
-	# 20000 "missing" that a survivor read perfectly well.
+	# wait for it to rejoin, not just to listen: reading before it has its peers measures the
+	# membership race
 	k=0
 	while [ $k -lt 300 ]; do
 		M=$("$CLI" -h "$(addr 1)" -p "$(port 1)" -a "$SECRET" \
@@ -446,11 +377,8 @@ modearm() { # modearm <label> <mode-block> <wal 0|1>
 	done
 	RMS=$(( $(now_ms) - T0 ))
 	BACK=${LAST:-0}
-	# and what the ORIGINAL keyspace looks like read back through the
-	# node that died - fill skipped, so this is recovery not rewriting.
-	# mmclient's args: getpct 100, route 0, then the 9th slot (once the
-	# wire 0|1, accepted and ignored since S317 - the daemon has one
-	# wire) kept only so nofill stays the 10th: 1
+	# the original keyspace read back through the node that died, fill skipped.  mmclient args:
+	# getpct 100, route 0, an ignored 9th slot, nofill 1.
 	SURV=$("$MM" "$(addr 1)" "$(port 1)" "$SECRET" c "$KEYS" "$VAL" 100 0 0 1 \
 		2>>"$D/$LABEL.err")
 	MISS=$(field "$SURV" missed); MISS=${MISS:-?}
@@ -468,11 +396,8 @@ part 2 && modearm store-nowal "mode = store
 collections = c"      0
 part 2 && modearm store-wal "mode = store
 collections = c"      1
-# eager is the counterpart to store: it pushes every key to every node,
-# so the peers already hold what the dead node held.  If the fleet can
-# cover for a node that came back empty, the log is not load-bearing
-# there - and that is a different question from whether the node can
-# cover for itself.
+# eager pushes every key to every node, so peers can cover for a node that came back empty: a
+# different question from whether the node covers for itself
 part 2 && modearm eager-nowal "mode = eager
 collections = c"      0
 part 2 && modearm eager-wal "mode = eager

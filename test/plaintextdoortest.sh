@@ -1,28 +1,6 @@
 #!/bin/sh
-# plaintextdoortest.sh - RV-2: no door off loopback reaches the
-# transport's no-key copy-through.
-#
-# The transport copies a record through unencrypted when a cipher state
-# has no key - that is Noise, and it is what `plaintext = loopback`
-# rides on.  It is POLICY, not a hole: a native listener is plaintext-
-# eligible only when the operator said `plaintext = loopback` AND the
-# listener is on a loopback address (daemon.c listener_plaintext_ok);
-# everything else starts a connection encrypted, so the first bytes must
-# be a handshake.  Nothing tested that the policy holds at the door.
-#
-# One daemon, `plaintext = loopback`, a native listener on 127.0.0.1 and
-# another on the host's own LAN address:
-#  - a plaintext command on the loopback door is served (the control:
-#    the policy is on, and the client here can be answered);
-#  - the SAME plaintext write on the LAN door gets no result, and the
-#    key it tried to write does not exist afterwards - read back through
-#    the loopback door, so "not served" is a fact about the store, not
-#    about what this client saw;
-#  - an ENCRYPTED client on that LAN door is served (the door is alive;
-#    what it refuses is plaintext).
-# A second daemon with the default `plaintext = never`: the loopback
-# door refuses plaintext too, and serves the encrypted client.
-# Usage: test/plaintextdoortest.sh [./perfcached] [./perfcli]
+# plaintextdoortest.sh - no door off loopback reaches the transport's no-key copy-through: under
+# `plaintext = loopback` only the loopback door serves plaintext, under `never` none does.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -45,9 +23,8 @@ LANIP=$(ip -4 -o addr show scope global 2>/dev/null \
 
 PLAIN="$D/plain.py"
 cat > "$PLAIN" <<'EOF'
-# one plaintext CMD frame to host:port (the request is given as a JSON-RPC
-# object: id/method/params - pcnative frames it); prints the result tree
-# as JSON, an error frame's message, or why there is no reply
+# one plaintext CMD frame (a JSON-RPC object, framed by pcnative) to host:port; prints
+# the result tree as JSON, an error frame's message, or why there is no reply
 import json, socket, struct, sys
 import pcnative
 try:

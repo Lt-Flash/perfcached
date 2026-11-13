@@ -1,8 +1,6 @@
 #!/bin/sh
-# replicastest.sh - S157: a spread fleet whose live members fall below
-# `replicas` says so - one WARNING in, one NOTICE out, replicas_short on
-# /stats - and a fleet that can still honour K says nothing.
-# Usage: test/replicastest.sh [./perfcached]
+# replicastest.sh - a spread fleet whose live members fall below `replicas` says so (one WARNING in,
+# one NOTICE out, replicas_short on /stats), and a fleet that can still honour K says nothing.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcreplicas.XXXXXX); P1= P2= P3=

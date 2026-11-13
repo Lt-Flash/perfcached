@@ -1,20 +1,5 @@
-/*
- * routebench.c — what does the forward hop actually cost?
- *
- * shard looks slow in the mode matrix because the load generator
- * there is dialect-level: it talks to ONE node, so on a shard
- * collection roughly (members-1)/members of every write has to be
- * forwarded to its owner and waited for.  The hashing is free; the
- * round trip is not.
- *
- * This measures the same work through libperfd with per-key routing
- * (task S35) off and then on, against the same fleet, so the forward
- * cost is isolated from everything else.  The daemons' own fwd_sent
- * counters are the cross-check - a routed client should drive them to
- * (near) zero.
- *
- * usage: routebench <host> <port> <secret> <keys> <0|1 route>
- */
+/* routebench - the forward hop's cost: the same work through libperfd with per-key
+ * routing off, then on.  usage: routebench <host> <port> <secret> <keys> <0|1 route> */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

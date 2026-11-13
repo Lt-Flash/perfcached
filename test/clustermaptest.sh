@@ -1,29 +1,6 @@
 #!/bin/sh
-# clustermaptest.sh — the CLUSTER topology surface on the RESP door (S44).
-#
-# Placement runs rendezvous over the Redis SLOT, which is what makes this
-# surface derivable at all.  Four things must hold or a stock Redis
-# client routes wrongly and silently:
-#
-#  - CLUSTER KEYSLOT agrees with Redis's own CRC16, hash tags included.
-#    The test recomputes it here rather than trusting src/pc_slot.h, so
-#    a matching pair of bugs on both sides cannot pass.
-#  - CLUSTER SLOTS covers all 16384 slots EXACTLY once: a gap is a key
-#    no client can place, an overlap is two clients disagreeing.
-#  - CLUSTER SHARDS describes the SAME assignment.  Clients pick one
-#    reply or the other by version, so a divergence sends half the
-#    ecosystem to the wrong node.
-#  - a node with no cluster still answers KEYSLOT (it is pure maths) and
-#    refuses SLOTS rather than inventing a one-node map.
-#
-# Run at 2, 3 AND 4 nodes.  The count is not incidental: rendezvous
-# scatters ownership, so the SLOTS reply grows with the fleet, and at 4
-# nodes it passes 1MB.  This test was written at 3 - the last size that
-# fit in the old fixed reply buffer - and so it passed while CLUSTER
-# SLOTS was already broken for every real fleet.  Do not reduce the
-# counts.
-#
-# Usage: test/clustermaptest.sh [./perfcached]
+# clustermaptest.sh - CLUSTER KEYSLOT/SLOTS/SHARDS on the RESP door at 2, 3 and 4 nodes: Redis's CRC16,
+# every slot exactly once, one assignment in both replies.  Usage: test/clustermaptest.sh [./perfcached]
 set -u
 
 BIN=${1:-./perfcached}
@@ -151,9 +128,8 @@ if what == "keyslot":
     print("MISMATCHES %d" % bad)
 
 elif what == "cover":
-    # SLOTS first, and report it fully before touching SHARDS: a
-    # malformed SHARDS reply must not take the SLOTS verdict down with
-    # it, or every fault reads as "the fleet never formed".
+    # SLOTS first, reported in full before SHARDS: a malformed SHARDS reply must not
+    # take the SLOTS verdict down with it
     sl, _ = parse(call(host, port, [b"CLUSTER", b"SLOTS"]))
     cov = [0] * 16384
     own = {}
@@ -224,12 +200,7 @@ slotstat() { # slotstat <n> <field> - stats.resp.<field> over the native door
 		| python3 -c 'import json,sys; print(json.load(sys.stdin)["resp"]["'"$2"'"])'
 }
 fleet() { # fleet <count> - bring up N nodes and assert the whole surface
-	#
-	# Loop counters here are prefixed f_.  sh has no locals, and
-	# start() spends `i` on its own wait loop: sharing the name meant
-	# the first start() returned with i already past the node count,
-	# so only node 1 was ever launched and every size reported "1
-	# node".  The symptom looked exactly like a membership failure.
+	# loop counters are prefixed f_: sh has no locals and start() spends `i` on its own wait loop
 	N=$1
 	f_n=1
 	while [ $f_n -le "$N" ]; do node $f_n; f_n=$((f_n+1)); done
@@ -283,11 +254,7 @@ fleet() { # fleet <count> - bring up N nodes and assert the whole surface
 	[ "$c1" = "$c2" ] && ok "peers publish the same slot map" \
 		|| bad "node 1 and node 2 publish different maps: [$c1] vs [$c2]"
 
-	# The advertised endpoints must be the RESP DOORS - the ports this
-	# very test is dialling - never the native ones.  Shipped broken:
-	# every reply carried client_port, whose door speaks only Noise
-	# off-box, so a routing Redis client was told to dial a door that
-	# cannot say hello.  Would have been caught here.
+	# the advertised endpoints must be the RESP doors this test dials, never the native ones
 	ports=$(echo "$cv" | grep '^PORTS ' | cut -d' ' -f2)
 	want=""
 	f_p=1
@@ -306,7 +273,7 @@ fleet() { # fleet <count> - bring up N nodes and assert the whole surface
 		bad "CLUSTER NODES: covered ${ncov:-?}, disagrees on ${ndis:-?} - $nc"
 	fi
 
-	# ---- S74: the advertisement agrees with the map --------------------
+	# ---- the advertisement agrees with the map ---------------------------------
 	inf=$(python3 "$PY" 127.0.0.71 17461 info server)
 	echo "$inf" | grep -q "redis_mode:cluster" && ok "INFO server says redis_mode:cluster" \
 		|| bad "S74: INFO server: $(echo "$inf" | grep redis_mode)"
@@ -315,7 +282,7 @@ fleet() { # fleet <count> - bring up N nodes and assert the whole surface
 		|| bad "S74: INFO cluster: $(echo "$inf" | head -2 | tr '\n' ' ')"
 	python3 "$PY" 127.0.0.71 17461 info | grep -q "^# Cluster" && ok "bare INFO carries the Cluster section" \
 		|| bad "S74: bare INFO has no Cluster section"
-	# ---- S75: built once per membership, served from the cache after ----
+	# ---- built once per membership, served from the cache after ----------------
 	b0=$(slotstat 1 slots_builds); h0=$(slotstat 1 slots_hits)
 	python3 "$PY" 127.0.0.71 17461 cover >/dev/null 2>&1
 	python3 "$PY" 127.0.0.71 17461 cover >/dev/null 2>&1
@@ -346,8 +313,8 @@ fleet() { # fleet <count> - bring up N nodes and assert the whole surface
 	return 0
 }
 
-# 4 is the size that used to fail: its reply passes 1MB, which the old
-# fixed reply buffer refused.  2 is the smallest real cluster.
+# 4 nodes is the size whose SLOTS reply passes 1 MB; 2 is the smallest real cluster.  Do not reduce
+# the counts.
 fleet 2
 fleet 3
 fleet 4
@@ -390,7 +357,7 @@ echo "$so" | grep -q "KEYSLOT 12182" \
 echo "$so" | grep -qi "SLOTS 'ERR.*cluster support disabled" \
 	&& ok "SLOTS refuses without a cluster rather than inventing a map" \
 	|| bad "clusterless SLOTS: $(echo "$so" | grep '^SLOTS')"
-# S74: and the same node calls itself standalone, in both places
+# and the same node calls itself standalone, in both places
 python3 "$PY" 127.0.0.79 17469 info server | grep -q "redis_mode:standalone" \
 	&& ok "a clusterless node says redis_mode:standalone" || bad "S74: clusterless INFO server"
 python3 "$PY" 127.0.0.79 17469 info cluster | grep -q "cluster_enabled:0" \

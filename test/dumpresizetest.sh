@@ -1,35 +1,6 @@
 #!/bin/sh
-# dumpresizetest.sh - a `dump` walk across a table resize.
-#
-# THE BUG.  `dump` pages a collection by BUCKET cursor and resolved the
-# collection's current table on every call.  A resize publishes a new
-# table of another shape, so a cursor handed out by the old one indexes
-# the new one wrongly: after a GROW, records of buckets already walked
-# reappear past the cursor (duplicates); after a SHRINK, buckets not yet
-# walked fold in behind it (records MISSED, silently).  perfdump is the
-# backup tool.  Found by CI: rc32's check-asan loadtest dumped an eager
-# member still growing from its push and got 114 records twice.
-#
-# THE FIX.  Every reply names the table it walked (`table`, with its
-# `buckets`); a caller that hands `table` back is refused ("table resized
-# during the dump") the moment the collection has been republished, and
-# restarts that collection.  perfdump pins each collection's walkers to one
-# table, plans their bucket ranges over THAT table, and dumps a resized
-# collection again from scratch.  A caller that sends no `table` is served
-# as before, so the hazard stays demonstrable (arms 1 and 2).
-#
-# One node, 3000 records, a collection of 1024 buckets, resizes forced
-# with the privileged `resize` verb between two chunks:
-#   1. GROW, no token: the walk repeats records (the hazard, shown);
-#   2. SHRINK, no token: the walk misses records (the hazard, shown);
-#   3. GROW, token: the chunk after the swap is refused, and a restart
-#      yields all 3000 exactly once;
-#   4. SHRINK, token: the same;
-#   5. perfdump with a resize forced mid-run: it says it restarted the
-#      collection, and its files hold all 3000 keys exactly once.
-# FAIL-FIRST: 3, 4 and 5 fail on a build without the fix (no `table` in
-# the reply, no refusal; perfdump writes the duplicates).
-# usage: test/dumpresizetest.sh [./perfcached] [./perfcli] [./perfdump]
+# dumpresizetest.sh - a dump across a table resize: a caller handing back `table` is refused and restarts, so
+# perfdump writes every record exactly once.  usage: test/dumpresizetest.sh [./perfcached] [./perfcli] [./perfdump]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -185,10 +156,8 @@ echo "    $R"
 	|| bad "shrink with the token: $R"
 
 echo "--- 5. perfdump with a resize forced mid-run"
-# paced (~6 s: 1500 records per connection at 250/s) and small-chunked so
-# the resize's SWAP - two maintenance ticks after it starts - lands inside
-# the run; at 600/s the run ended first and nothing was tested.
-# Uncompressed, so the files can be read back here.
+# paced (~6 s) and small-chunked so the resize's swap, two maintenance ticks in, lands inside the
+# run; uncompressed, so the files can be read back here
 "$DUMP" --from 127.0.0.1:$PORT --out "$D/dump" --threads 2 --count 8 \
 	--rate 250 --zstd 0 > "$D/pd.out" 2>&1 &
 DP=$!

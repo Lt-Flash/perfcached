@@ -1,28 +1,5 @@
-/*
- * perfdump - S112: a parallel dumper over the client door.
- *
- * One node's collections are walked with the `dump` verb by N
- * connections, each owning a range of buckets (`end`), the last one the
- * tail; the records go to a directory of chunk files with a manifest.
- * Shaped like mydumper: one file per collection per chunk, a manifest
- * naming every file with its record and byte counts and a checksum, a
- * chunk complete only once its trailer and its manifest entry are
- * written, so a restart re-dumps what is not complete.
- *
- * File format (perfdump-format v1, doc/perfdump-format.md):
- *   "PCD1" magic, then records: u32 klen, u32 vlen, u64 expiry (absolute
- *   unix ms, 0 = never), u64 version, u8 flags, key bytes, value bytes;
- *   trailer: u32 0xFFFFFFFF, u64 record count.  Little-endian throughout.
- *   Compressed chunks are the same bytes through zstd (the binary).
- *
- * Built on libperfd: learns nothing it does not need, holds one plain
- * handle per connection (no spares).  The walk rides the tree-level
- * entry (perfd_command_tree): a dump chunk's keys and values are bulks
- * read byte-exact off the reply tree - never through the JSON edge,
- * whose rendering is lossy for bytes that are not UTF-8 (S317).  Only
- * the one `stats` call at startup reads rendered JSON, for names and
- * integers.
- */
+/* perfdump - a parallel dumper over the client door: N connections walk a node's collections
+ * with the `dump` verb into chunk files and a manifest (format: doc/perfdump-format.md). */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -41,10 +18,18 @@
 #include "../src/json.h"
 #include "../src/ptree.h"
 #include "../src/pcaddr.h"
+#include "../src/core/pcache_arena.h"
 
-#define VERSION "0.1"
+#define VERSION "0.2"
 #define MAXTOK   (1 << 17)
-#define RECMAX   (1 << 20)          /* PCACHE_CELL_MAX-sized key/value scratch */
+#define RECMAX   PCACHE_CELL_MAX    /* the store's largest record: key + value never exceed it */
+
+/* perfdump-format 2: the chunk magic, and the type byte as an index here - the daemon's
+ * dump `t` (absent = a string); perfload reads it with the same table */
+#define PCD_FORMAT 2
+#define PCD_MAGIC  "PCD2"
+static const char *const pcd_types[] = { NULL, "json", "rl", "hash", "lock" };
+#define PCD_NTYPES ((int)(sizeof pcd_types / sizeof pcd_types[0]))
 
 struct opts {
 	const char *host, *out, *cols, *secret;
@@ -98,9 +83,8 @@ struct shared {
 	/* per collection */
 	char cols[64][64];
 	unsigned int nb[64];
-	/* the table each collection's walkers are pinned to: the daemon
-	 * refuses a chunk the moment the collection has been republished
-	 * (a resize swap), and the collection is dumped again */
+	/* the table each collection's walkers are pinned to: the daemon refuses a chunk once
+	 * a resize swap republished the collection, and it is dumped again */
 	unsigned long long tbl[64];
 	int ncols;
 	char fleet[128];
@@ -176,7 +160,9 @@ static int manifest_write(struct shared *sh)
 	memset(&w, 0, sizeof w);           /* init_heap wants an empty writer */
 	if (pc_jw_init_heap(&w, 1 << 16) != 0)
 		return -1;
-	pc_jw_lit(&w, "{\"format\":\"perfdump-format\",\"format_version\":1,\"tool\":\"perfdump " VERSION "\"");
+	pc_jw_lit(&w, "{\"format\":\"perfdump-format\",\"format_version\":");
+	pc_jw_i64(&w, PCD_FORMAT);
+	pc_jw_lit(&w, ",\"tool\":\"perfdump " VERSION "\"");
 	pc_jw_lit(&w, ",\"source\":");
 	pc_jw_str(&w, sh->fleet, strlen(sh->fleet));
 	pc_jw_lit(&w, ",\"started\":");
@@ -282,18 +268,28 @@ static int chunk_open(struct shared *sh, struct job *j, struct chunk *c)
 		return -1;
 	c->records = c->bytes = 0;
 	c->crc = 0;
-	if (fwrite("PCD1", 1, 4, c->f) != 4)
+	if (fwrite(PCD_MAGIC, 1, 4, c->f) != 4)
 		return -1;
 	c->bytes = 4;
-	c->crc = crc32_upd(c->crc, "PCD1", 4);
+	c->crc = crc32_upd(c->crc, PCD_MAGIC, 4);
 	return 0;
 }
 
-/* the record's flags byte: bit 0 = a JSON document (S280) */
-#define PCD_F_JSON 0x01
+/* the type byte of a dumped record's `t`: 0 = none (a string), -1 = one this tool cannot carry */
+static int pcd_type_of(const struct pc_tv *v, int tt)
+{
+	int i;
+
+	if (tt < 0)
+		return 0;
+	for (i = 1; i < PCD_NTYPES; i++)
+		if (pc_tv_streq(v, tt, pcd_types[i]))
+			return i;
+	return -1;
+}
 
 static int chunk_put(struct chunk *c, const char *k, size_t kl, const char *v, size_t vl,
-		unsigned long long exp_ms, unsigned long long ver, unsigned char flags)
+		unsigned long long exp_ms, unsigned long long ver, unsigned char type)
 {
 	unsigned char h[25];
 
@@ -301,7 +297,7 @@ static int chunk_put(struct chunk *c, const char *k, size_t kl, const char *v, s
 	put32(h + 4, (uint32_t)vl);
 	put64(h + 8, exp_ms);
 	put64(h + 16, ver);
-	h[24] = flags;
+	h[24] = type;
 	if (fwrite(h, 1, 25, c->f) != 25 || fwrite(k, 1, kl, c->f) != kl ||
 	    (vl && fwrite(v, 1, vl, c->f) != vl))
 		return -1;
@@ -423,9 +419,8 @@ static void *walker(void *arg)
 				count /= 2;    /* a chunk that did not fit: smaller buckets */
 				continue;
 			}
-			/* the collection was resized since it was planned: every
-			 * range and cursor of it now names another table's
-			 * buckets.  Not a failure - main dumps it again. */
+			/* resized since it was planned: every range and cursor now names another
+			 * table's buckets - not a failure, main dumps it again */
 			if (e && strstr(e, "table resized")) {
 				j->resized = 1;
 				break;
@@ -453,10 +448,10 @@ static void *walker(void *arg)
 			break;
 		}
 		more = pc_tv_get_bool(&v, 0, "more");
-		/* every record of the array: {k, v, ttl, ver, t?} - the key and
-		 * the value are bulks, written to the chunk byte for byte */
+		/* every record: {k, v, ttl, ver, t?} - key and value are bulks off the reply tree, never
+		 * the JSON edge (lossy for non-UTF-8), written byte for byte */
 		for (i = 0; i < v.n[tr].len; i++) {
-			int rec = pc_tv_at(&v, tr, i), tk, tvv, tt;
+			int rec = pc_tv_at(&v, tr, i), tk, tvv, tt, type;
 			long long ttl, ver;
 			unsigned long long exp_ms;
 
@@ -472,11 +467,20 @@ static void *walker(void *arg)
 			if (v.n[tk].len > RECMAX || v.n[tvv].len > RECMAX)
 				continue;
 			tt = pc_tv_get(&v, rec, "t");
+			type = pcd_type_of(&v, tt);
+			if (type < 0) {
+				int bl = v.n[tt].type == 'b';
+
+				fprintf(stderr, "perfdump: connection %d: a record of type '%.*s', which "
+					"perfdump " VERSION " cannot carry - use the perfdump of the daemon's release\n",
+					j->idx, bl ? (int)v.n[tt].len : 1, bl ? (const char *)v.n[tt].p : "?");
+				j->failed = 1;
+				break;
+			}
 			exp_ms = ttl < 0 ? 0 : now_ms() + (unsigned long long)ttl * 1000ULL;
 			if (chunk_put(&ch, (const char *)v.n[tk].p, v.n[tk].len,
 			        (const char *)v.n[tvv].p, v.n[tvv].len, exp_ms,
-			        (unsigned long long)ver,
-			        pc_tv_streq(&v, tt, "json") ? PCD_F_JSON : 0) != 0) {
+			        (unsigned long long)ver, (unsigned char)type) != 0) {
 				fprintf(stderr, "perfdump: write failed on %s: %s\n", ch.path, strerror(errno));
 				j->failed = 1;
 				break;
@@ -551,6 +555,16 @@ static int inspect(const char *dir)
 		fprintf(stderr, "perfdump: manifest unparsable\n");
 		return 1;
 	}
+	i = pc_json_get(buf, toks, ntok, 0, "format_version");
+	if (i < 0 || toks[i].type != PC_J_PRIM || atoi(buf + toks[i].start) != PCD_FORMAT) {
+		fprintf(stderr, "perfdump: %s is perfdump format %.*s; perfdump " VERSION " reads format %d "
+			"only (format 1 dropped the hash, rate-limit and lock types): dump the source again\n",
+			dir, i >= 0 ? toks[i].end - toks[i].start : 1, i >= 0 ? buf + toks[i].start : "?",
+			PCD_FORMAT);
+		free(buf);
+		free(toks);
+		return 1;
+	}
 	i = pc_json_get(buf, toks, ntok, 0, "source");
 	printf("source: %.*s\n", i >= 0 ? toks[i].end - toks[i].start : 1, i >= 0 ? buf + toks[i].start : "?");
 	tf = pc_json_get(buf, toks, ntok, 0, "files");
@@ -590,8 +604,8 @@ static int inspect(const char *dir)
 			continue;
 		}
 		pf = sp.f;
-		rec = malloc(RECMAX * 2 + 32);
-		if (fread(h, 1, 4, pf) == 4 && memcmp(h, "PCD1", 4) == 0) {
+		rec = malloc(RECMAX);
+		if (fread(h, 1, 4, pf) == 4 && memcmp(h, PCD_MAGIC, 4) == 0) {
 			crc = crc32_upd(crc, h, 4);
 			for (;;) {
 				uint32_t kl, vl;
@@ -612,8 +626,8 @@ static int inspect(const char *dir)
 				if (fread(h + 4, 1, 21, pf) != 21)
 					break;
 				vl = get32(h + 4);
-				if (kl + vl > RECMAX * 2)
-					break;
+				if (kl > RECMAX || vl > RECMAX - kl || h[24] >= PCD_NTYPES)
+					break;    /* perfload refuses it too */
 				got_n = fread(rec, 1, kl + vl, pf);
 				if (got_n != kl + vl)
 					break;
@@ -642,7 +656,7 @@ static int inspect(const char *dir)
 static void usage(FILE *f)
 {
 	fputs("usage: perfdump --from HOST:PORT --out DIR [-a SECRET] [--collections a,b] [--threads N]\n"
-	      "                [--count BUCKETS] [--chunk-mb MB] [--zstd LEVEL] [--rate RECORDS/S] [-v]\n"
+	      "                [--count BUCKETS] [--chunk-mb MB] [--zstd LEVEL] [--rate RECORDS/S]\n"
 	      "       perfdump --inspect DIR\n"
 	      "  --from        one node's client door (eager: any READY node holds everything)\n"
 	      "  --out         directory for the chunk files and manifest.json (created)\n"
@@ -653,7 +667,8 @@ static void usage(FILE *f)
 	      "  --chunk-mb    chunk file size before compression (default 64)\n"
 	      "  --zstd        0 = raw .pcd files; N = zstd -N through the zstd binary (default 3)\n"
 	      "  --rate        records per second per connection, 0 = unpaced\n"
-	      "  --inspect     print a dump's manifest summary and verify every file's checksum\n", f);
+	      "  --inspect     print a dump's manifest summary and verify every file's checksum\n"
+	      "  -V            version\n", f);
 }
 
 /* ---- a collection resized under the dump (see the walker) ------------ */
@@ -672,10 +687,8 @@ static perfd_t *dconnect(struct opts *o)
 	return perfd_connect(o->host, o->port, &po);
 }
 
-/* the table a collection's walkers will be pinned to, and ITS bucket
- * count: one bucket's dump, whose records are not kept.  The bucket
- * count in `stats` is not the same read - a swap between the two would
- * plan ranges for one table and pin them to another. */
+/* the table a collection's walkers will be pinned to and ITS bucket count, from one bucket's
+ * dump: `stats` is another read, and a swap between the two would mix two tables */
 static int probe_table(struct shared *sh, int c)
 {
 	struct pc_tv v;
@@ -816,7 +829,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	if (pc_hostport_split(o.host, hostbuf, sizeof hostbuf, &o.port) != 0) {
-		/* IP6-1: HOST:PORT or [V6]:PORT, the port a whole number */
+		/* HOST:PORT or [V6]:PORT, the port a whole number */
 		fprintf(stderr, "perfdump: --from needs HOST:PORT (or [IPV6]:PORT)\n");
 		return 2;
 	}

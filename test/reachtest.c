@@ -1,5 +1,5 @@
-/* S148 coverage sketch: does it actually count DISTINCT served keys?
- * Epochs are driven through compat_ticks_offset so nothing sleeps. */
+/* reachtest.c - the coverage sketch counts DISTINCT served keys; epochs are driven through
+ * compat_ticks_offset so nothing sleeps. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

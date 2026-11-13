@@ -1,20 +1,6 @@
 #!/bin/sh
-# hsparktest.sh - ST5: a worker turn runs at most PC_HS_PER_TURN Noise
-# handshakes and parks the rest, oldest first, off the epoll ready list - so
-# an established client's request never waits behind a connect storm's
-# backlog (1 worker, ~6,000 encrypted connects/s: a RESP probe's p99 89-107
-# ms before, 33-37 ms with parking and the accept cap; DESIGN 12kw).
-# Latency is the measurement's job (hold50k/st5bench.sh); this suite proves
-# the mechanism and that it loses nothing: ONE worker, 400 encrypted clients
-# connect and send their first handshake message in one burst, every one
-# completes the handshake and a ping over the channel, and /stats says
-# handshakes were parked (clients.handshakes.deferred > 0, per_turn 8).
-# The initiator is test/noise_interop.py's (an independent Noise
-# implementation); where the host's python cryptography is too old to drive
-# it, the suite SKIPS loudly, as noiseinterop does.
-# Fail-first: 0.5.6.6 has no clients.handshakes; a build whose cap never
-# binds parks nothing (deferred 0).
-# Usage: test/hsparktest.sh [./perfcached] [./noisetest]
+# hsparktest.sh - a worker turn runs at most PC_HS_PER_TURN Noise handshakes and parks the rest, oldest
+# first: 400 encrypted clients on one worker all complete, and /stats counts the parked ones.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

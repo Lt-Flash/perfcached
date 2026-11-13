@@ -1,10 +1,6 @@
 #!/bin/sh
-# hinttest.sh - S295: proxy holder hints (test/hinttest.c holds the legs).
-# A three-node proxy fleet, each node on its own loopback address so a
-# client's standbys reach the address a member advertises.
-# Fail-first: a daemon before S295 sends no hint - every read keeps going
-# to node 1 and pays the pull (hint hits 0).
-# Usage: test/hinttest.sh [./perfcached] [./hinttest]
+# hinttest.sh - proxy holder hints (test/hinttest.c holds the legs): a three-node fleet, each
+# node on its own loopback address so a client's standbys reach the address a member advertises.
 set -u
 BIN=${1:-./perfcached}
 DRV=${2:-./hinttest}

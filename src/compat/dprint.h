@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* Shim for OpenSIPS dprint.h — the seven LM_* macros the vendored core
- * uses, on OpenSIPS level numbering (lower = more severe), gated by
- * compat_log_level and written to stderr.  Keep log strings ASCII. */
+/* the seven LM_* macros the vendored core uses, its level numbering (lower = more
+ * severe), gated by compat_log_level and written to stderr; log strings are ASCII */
 #ifndef PC_COMPAT_DPRINT_H
 #define PC_COMPAT_DPRINT_H
 

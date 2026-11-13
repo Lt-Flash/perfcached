@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* hostlink.h - S465: the node's network link, read beside hostmon's figures
+/* hostlink.h - the node's network link, read beside hostmon's figures
  * (bytes a second against its speed, drops), for alerts.c's host.link */
 #ifndef PC_HOSTLINK_H
 #define PC_HOSTLINK_H
@@ -25,12 +25,17 @@ struct hostlink {
 	int rx_pct, tx_pct;                /* ...of the speed; -1 = no speed */
 	int rx_peak_pct, tx_peak_pct;      /* the busiest second of the last 10 */
 	long long drops_ps, udperr_ps;     /* a second, over the minute */
+	unsigned long long retrans[HM_N];  /* TCP RetransSegs */
+	long long retrans_ps;
+	int rx_queues;                     /* the NIC's, -1 = not a NIC */
+	int irqs, irq_cpus;                /* its interrupts and the CPUs they land on */
 };
 extern struct hostlink HL;
 
 struct hl_obs {
 	int ok, moved, speed;
-	unsigned long long rx, tx, drops, udperr;
+	int rx_queues, irqs, irq_cpus;     /* read when moved */
+	unsigned long long rx, tx, drops, udperr, retrans;
 	char phys[64], path[192];
 	long long now;
 };

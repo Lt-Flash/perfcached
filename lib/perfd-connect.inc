@@ -3,14 +3,8 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-connect.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds connect and free: the Noise handshake, socket setup and the handle
- * lifecycle.
- */
+/* perfd-connect.inc - connect and free, #included by perfd.c (one translation unit, never
+ * compiled alone): the Noise handshake, socket setup and the handle lifecycle. */
 /* ---- notifications ------------------------------------------------------ */
 
 void perfd_set_notify(perfd_t *p, perfd_notify_cb cb, void *ctx)
@@ -23,7 +17,7 @@ void perfd_set_notify(perfd_t *p, perfd_notify_cb cb, void *ctx)
 
 static int psk_for(const char *secret, uint8_t out[PC_NOISE_KEYLEN]);
 
-/* S468: the switch record, after a msg2 that granted plaintext: proof this
+/* the switch record, after a msg2 that granted plaintext: proof this
  * end holds the session keys; the channel is plaintext from here */
 static int plain_switch_rec(perfd_t *p, uint8_t rec[2 + PC_HS_SWITCH_LEN + PC_NOISE_TAGLEN])
 {
@@ -41,17 +35,16 @@ static int plain_switch_rec(perfd_t *p, uint8_t rec[2 + PC_HS_SWITCH_LEN + PC_NO
 static int noise_handshake(perfd_t *p, const char *secret)
 {
 	uint8_t psk[PC_NOISE_KEYLEN], prologue[1] = { PC_PRIN_CLIENT };
-	uint8_t ver[2] = { PC_CLIENT_VER, PC_HS_PLAIN };          /* S468 */
+	uint8_t ver[2] = { PC_CLIENT_VER, PC_HS_PLAIN };
 	struct pc_handshake hs;
-	uint8_t msg[3 + PERFD_HS_MAX], m2[PERFD_HS_MAX], hdr[2];     /* S369 */
+	uint8_t msg[3 + PERFD_HS_MAX], m2[PERFD_HS_MAX], hdr[2];
 	uint8_t pay[PERFD_HS_MAX], rec[2 + PC_HS_SWITCH_LEN + PC_NOISE_TAGLEN];
 	int rl;
 	size_t mlen = 0, plen = 0, cl;
 	int rc = -1;
 
-	/* S354: from the process-wide cache, as the async connect does -
-	 * deriving here (Argon2id: ~100 ms of CPU and a 64 MiB populated
-	 * mapping) made every blocking connect, standby and reconnect pay it */
+	/* from the process-wide cache: deriving (Argon2id, ~100 ms of CPU and a
+	 * 64 MiB mapping) on every connect, standby and reconnect is too dear */
 	if (psk_for(secret, psk) != 0)
 		return -1;
 	pc_hs_init_initiator(&hs, prologue, 1);
@@ -80,10 +73,8 @@ out:
 	return rc;
 }
 
-/* S104: keep a link honest while it is idle.  The kernel probes after
- * @idle_s of silence, every ten seconds, three times, so a peer that
- * vanished without a FIN fails the next send at once instead of after
- * the io timeout, and a middlebox that ages idle flows sees traffic. */
+/* the kernel probes after @idle_s of silence, every ten seconds, three times: a
+ * peer gone without a FIN fails the next send, and a middlebox sees traffic */
 static void sock_keepalive(int fd, int idle_s)
 {
 	int one = 1, intvl = idle_s < 10 ? (idle_s > 0 ? idle_s : 1) : 10,
@@ -99,14 +90,8 @@ static void sock_keepalive(int fd, int idle_s)
 #endif
 }
 
-/* S441: a connect bounded by @timeout_ms - non-blocking, poll, SO_ERROR,
- * and the descriptor blocking again after, as every caller expects.  A
- * member whose host drops the SYN (gone dark, cut off, a firewall) held a
- * blocking connect for the kernel's SYN retries, ~127 s: perfcli's first
- * stats on a node beside a partitioned master took 134 s (225's container
- * fleet, 2026-10-24) - the handle dials its standbys on connect (S34) -
- * and every bound the library asked for (200 ms, 1 s, connect_timeout_ms
- * itself) was ignored here.  0 or an fcntl failure: as before. */
+/* a connect bounded by @timeout_ms (a dropped SYN otherwise holds ~127 s of kernel retries);
+ * blocking again after, as callers expect.  0 or an fcntl failure: a plain connect. */
 static int connect_bounded(int fd, const struct sockaddr *sa, socklen_t sl,
 		int timeout_ms)
 {
@@ -177,11 +162,11 @@ static int sock_connect(const char *host, int port, const char *unixp,
 		char ps[16];
 		int one = 1;
 
-		/* S441: 0 = the documented 5000 (perfd.h) */
+		/* 0 = the documented 5000 (perfd.h) */
 		if (timeout_ms <= 0)
 			timeout_ms = DEF_TIMEOUT_MS;
 		memset(&hints, 0, sizeof hints);
-		hints.ai_family = pc_resolve_family();   /* 12np: no AAAA without IPv6 */
+		hints.ai_family = pc_resolve_family();   /* no AAAA without IPv6 */
 		hints.ai_socktype = SOCK_STREAM;
 		snprintf(ps, sizeof ps, "%d", port);
 		if (getaddrinfo(host, ps, &hints, &res) != 0)
@@ -204,16 +189,13 @@ static int sock_connect(const char *host, int port, const char *unixp,
 	}
 }
 
-/* S34: a freshly connected handle learns the fleet, opens its standbys
- * and settles onto the member its policy prefers.  All of it is best
- * effort: a standalone daemon answers no members, an unreachable peer
- * is simply skipped, and the handle works exactly as before either
- * way. */
+/* learn the fleet, open the standbys, settle on the member the policy prefers;
+ * best effort - no members or an unreachable peer leave the handle working */
 static perfd_t *conn_ready(perfd_t *p, long long dial_ms)
 {
 	long long wait_ms = dial_ms * 10;
 
-	/* S476: a policy can only move to a standby that is up, so the healthy ones are
+	/* a policy can only move to a standby that is up, so the healthy ones are
 	 * waited for, a few times what this dial took, and the rest come up behind it */
 	if (wait_ms < DIAL_SETTLE_MIN_MS)
 		wait_ms = DIAL_SETTLE_MIN_MS;
@@ -224,7 +206,7 @@ static perfd_t *conn_ready(perfd_t *p, long long dial_ms)
 	if (p->is_child || !p->want_spares)
 		return p;
 	/* an independent random start per client is what makes
-	 * round-robin spread without any coordination (par 5.6) */
+	 * round-robin spread without any coordination */
 	p->rr = (unsigned int)(now_ms_lib() ^ (long long)(uintptr_t)p ^
 		((long long)getpid() << 7));
 	if (learn_members(p) > 0) {
@@ -237,9 +219,8 @@ static perfd_t *conn_ready(perfd_t *p, long long dial_ms)
 	return p;
 }
 
-/* allocate a handle and copy the options into it.  Shared by the
- * blocking and the event-loop connect (S32) so the two cannot drift on
- * what an option means. */
+/* shared by the blocking and the event-loop connect so the two cannot
+ * drift on what an option means */
 static perfd_t *pd_alloc(const perfd_opts *opts)
 {
 	static const perfd_opts defaults = { 0 };
@@ -261,31 +242,32 @@ static perfd_t *pd_alloc(const perfd_opts *opts)
 	}
 	p->io_ms = o->io_timeout_ms > 0 ? o->io_timeout_ms : DEF_TIMEOUT_MS;
 	p->eager_push = o->eager_push != 0;
-	p->want_enc = o->encrypt > 0;                              /* S468 */
-	p->conn_name = o->name && *o->name ? strdup(o->name) : NULL;  /* 0.7.0 */
+	p->want_enc = o->encrypt > 0;
+	p->conn_name = o->name && *o->name ? strdup(o->name) : NULL;
 	p->name_due = p->conn_name != NULL;
 	p->fd = -1;
-	/* S34: remember how to open standbys (secrets COPIED - the
+	/* remember how to open standbys (secrets COPIED - the
 	 * caller's array need not outlive the handle) */
-	p->policy = o->policy;
-	/* S104: the default is every member (0 and -1 alike); only
+	p->pin = o->pin != 0;
+	p->policy = p->pin ? PERFD_POLICY_FAILOVER : o->policy;
+	/* the default is every member (0 and -1 alike); only
 	 * PERFD_SPARES_NONE asks for the bare handle */
 	p->spread_left = -1;
 	p->want_spares = o->spares == PERFD_SPARES_NONE ? 0 :
 		o->spares == 0 ? -1 : o->spares;
-	/* S104: 0 = the default, -1 = off, else as given */
+	/* 0 = the default, -1 = off, else as given */
 	p->keepalive_s = o->keepalive_s > 0 ? o->keepalive_s :
 		o->keepalive_s < 0 ? 0 : DEF_KEEPALIVE_S;
 	p->idle_ping_ms = o->idle_ping_ms > 0 ? o->idle_ping_ms :
 		o->idle_ping_ms < 0 ? 0 : DEF_IDLE_PING_MS;
-	p->route_want = o->route_keys;
-	/* S295: the holder table, once; without it the option is off */
-	if (o->route_hints) {
+	p->route_want = p->pin ? 0 : o->route_keys;
+	/* the holder table, once; without it the option is off */
+	if (o->route_hints && !p->pin) {
 		p->hints = calloc(HINT_SLOTS, sizeof *p->hints);
 		p->route_hints = p->want_hh = p->hints != NULL;
 	}
 	p->ignore_push = o->ignore_member_push != 0;
-	p->worker_bal = o->worker_balance >= 0;                    /* S460 */
+	p->worker_bal = o->worker_balance >= 0;
 	p->refresh_ms = o->refresh_ms > 0 ? o->refresh_ms : 30000;
 	p->o_connect_ms = o->connect_timeout_ms;
 	p->o_io_ms = o->io_timeout_ms;
@@ -320,7 +302,7 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 		struct timeval tv = { io_ms / 1000, (io_ms % 1000) * 1000L };
 		struct timeval hs;
 
-		/* S476: the handshake is part of connecting: a frozen node's kernel takes the TCP */
+		/* the handshake is part of connecting: a frozen node's kernel takes the TCP */
 		if (hs_ms > io_ms)
 			hs_ms = io_ms;
 		hs.tv_sec = hs_ms / 1000;
@@ -335,7 +317,7 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 		}
 		setsockopt(p->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 		setsockopt(p->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-		sock_keepalive(p->fd, p->keepalive_s);                  /* S104 */
+		sock_keepalive(p->fd, p->keepalive_s);
 		if (!nsec)
 			return p;              /* plaintext */
 		setsockopt(p->fd, SOL_SOCKET, SO_RCVTIMEO, &hs, sizeof hs);
@@ -361,7 +343,7 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 	return NULL;
 }
 
-/* S460: where this connection landed - its worker's live native connections,
+/* where this connection landed - its worker's live native connections,
  * the least any worker holds, and how many workers; -1 from a daemon without conninfo */
 static int conn_where(perfd_t *p, int *mine, int *least, int *workers)
 {
@@ -390,7 +372,7 @@ static int conn_where(perfd_t *p, int *mine, int *least, int *workers)
 	return rc;
 }
 
-/* S460: the kernel hashes a connection to a worker; while this one's worker holds
+/* the kernel hashes a connection to a worker; while this one's worker holds
  * more than one beyond the least-loaded, try fresh connections and keep a good one */
 static perfd_t *balance_worker(perfd_t *p, const char *host, int port,
 		const char *unixp, const perfd_opts *o)
@@ -427,7 +409,7 @@ static perfd_t *do_connect(const char *host, int port, const char *unixp,
 	return conn_ready(p, now_ms_lib() - t0);
 }
 
-/* S370: the caller's options as this library's layout - only the bytes the
+/* the caller's options as this library's layout - only the bytes the
  * caller's struct has (opts->size; 0 = this header's), the rest 0 */
 static const perfd_opts *opts_norm(const perfd_opts *opts, perfd_opts *oc)
 {
@@ -440,6 +422,9 @@ static const perfd_opts *opts_norm(const perfd_opts *opts, perfd_opts *oc)
 	if (n == 0 || n > sizeof *oc)
 		n = sizeof *oc;
 	memcpy(oc, opts, n);
+	/* a caller built before encrypt existed stays encrypted, as its own library did */
+	if (n <= offsetof(perfd_opts, encrypt))
+		oc->encrypt = 1;
 	oc->size = sizeof *oc;
 	return oc;
 }
@@ -458,12 +443,20 @@ perfd_t *perfd_connect_unix(const char *path, const perfd_opts *opts)
 	return do_connect(NULL, 0, path, opts_norm(opts, &oc));
 }
 
-void perfd_opts_init(perfd_opts *o)
+void perfd_opts_init_sz(perfd_opts *o, size_t size)
 {
-	if (!o)
+	if (!o || size < sizeof o->size)
 		return;
-	memset(o, 0, sizeof *o);
-	o->size = sizeof *o;
+	if (size > sizeof *o)
+		size = sizeof *o;
+	memset(o, 0, size);
+	o->size = size;
+}
+
+/* the struct as libperfd.so.0 first froze it, through route_hints */
+void (perfd_opts_init)(perfd_opts *o)
+{
+	perfd_opts_init_sz(o, offsetof(perfd_opts, name));
 }
 
 void perfd_free_value(void *buf)
@@ -474,22 +467,22 @@ void perfd_free_value(void *buf)
 void perfd_free(perfd_t *p)
 {
 	if (p) {
-		free(p->enable_sec);           /* 0.6.6 */
-		free(p->conn_name);            /* 0.7.0 */
+		free(p->enable_sec);
+		free(p->conn_name);
 	}
 	struct early *e;
 	int i;
 
 	if (!p)
 		return;
-	for (i = 0; i < p->nspare; i++)      /* S34: standbys go too */
+	for (i = 0; i < p->nspare; i++)      /* standbys go too */
 		perfd_free(p->spare[i]);
 	p->nspare = 0;
 	for (i = 0; i < p->ndial; i++)
 		perfd_free(p->dial[i].c);
 	p->ndial = 0;
 	for (i = 0; i < p->nsec; i++) {
-		/* S59: the lib re-derives the PSK per handshake, so the
+		/* the lib re-derives the PSK per handshake, so the
 		 * raw copies must live until close - which is now */
 		if (p->sec[i])
 			sodium_memzero(p->sec[i], strlen(p->sec[i]));
@@ -508,52 +501,26 @@ void perfd_free(perfd_t *p)
 		free(e);
 	}
 	free(p->rbuf);
-	free(p->xbuf);                     /* S369 */
-	free(p->rsc);                      /* S284 */
+	free(p->xbuf);
+	free(p->rsc);
 	free(p->wsc);
 	free(p->tvn);
-	free(p->hints);                    /* S295 */
+	free(p->hints);
 	free(p->q);
 	free(p->ids);
 	free(p->w);
-	free(p->wst);                      /* S468 */
+	free(p->wst);
 	free(p->cin);
 	free(p->calls);
 	free(p->nj);
 	free(p);
 }
 
-/* ======================================================================
- * S32 — the event-loop surface
- *
- * Everything above this line blocks by design and is unchanged.  What
- * follows is the same protocol driven by someone else's event loop: the
- * consumer owns the loop, watches perfd_fd() for perfd_events(), and
- * hands control back in through the two readiness entry points.  The
- * library starts no thread and never calls back from one.
- *
- * The wire is shared, not reimplemented: requests are built by the same
- * enqueue_cmd() / enqueue_bin(), replies are extracted by the same
- * take_msg().  The only
- * genuinely new machinery is (a) an output buffer, because a
- * non-blocking write may take a prefix, (b) incremental Noise record
- * framing, because a record can arrive in pieces, and (c) an id ->
- * callback table replacing the in-order FIFO.
- * ====================================================================== */
+/* ==== the event-loop surface: the consumer's loop watches perfd_fd() for perfd_events();
+ * the library starts no thread and never calls back from one ==== */
 
-/* Argon2id at INTERACTIVE limits costs ~100 ms of CPU.  Paying that per
- * connect is merely slow for a blocking client, but for an event loop it
- * is a stall - and RECONNECT happens inside the loop, which is exactly
- * when a consumer can least afford it.  So derived PSKs are cached for
- * the life of the process, keyed by the secret.  The secret itself is
- * already held for the life of a handle (spares and failover need it),
- * so this keeps nothing that was not kept before. */
-/* S355: single-flight.  The first caller for a secret derives while the
- * others for the SAME secret wait on g_psk_cond - before, every thread that
- * connected while the first derive ran did its own (a 100-thread client
- * mapped 100 x 64 MiB at once and was OOM-killed).  Different secrets do not
- * wait for one another.  An entry is PSK_DERIVING while its first caller
- * runs Argon2id outside the lock, PSK_READY once the key is in it. */
+/* PSKs cached per process by secret: Argon2id (~100 ms) per reconnect stalls an event loop.
+ * Single-flight: the first caller derives outside the lock, the same secret's others wait. */
 #define PSK_FREE     0
 #define PSK_READY    1
 #define PSK_DERIVING 2
@@ -566,12 +533,8 @@ static struct psk_ent {
 	int used;                              /* PSK_* */
 } g_psk[8];
 
-/* S355: a fork while another thread derives would leave the child an entry
- * marked PSK_DERIVING that nothing will ever finish - its connects would
- * wait for good.  Hold the lock across fork(); in the child, start the lock
- * and the condition afresh and free what was being derived (the child
- * derives it itself when it needs it).  READY keys are inherited, which is
- * the point of perfd_psk_prepare(). */
+/* a child forked mid-derive would wait for good on a PSK_DERIVING entry: the lock is held
+ * across fork() and the child frees those; READY keys are inherited (perfd_psk_prepare) */
 static void psk_atfork_prepare(void)
 {
 	pthread_mutex_lock(&g_psk_lock);

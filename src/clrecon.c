@@ -1,19 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clrecon.c - the B4 reconcile's pacing (clrecon.h): the probe budget a
- * second and its backoff (S393), the slices it is spent in and the debt a
- * slice that overshot leaves, the walk's rate and what it leaves (S395),
- * and the no-witness clock (ST8).  Moved from cluster.c with its state;
- * what it read of the cluster's - the pending table's room, the counters
- * - is passed in (the 0.7.2 split, wave 1 - doc/MODULARITY.md).  And the
- * returning node's half of the S392 fast path: the ask, the wait, the
- * numbering of the witness's replay and its count; the frames, the sends,
- * the logs and the stats stay cluster.c's.  And S223's witness: when this
- * node stopped being current, which live peers were up throughout, and
- * (S274) what a restart of this node now would find - the grace is
- * cluster.c's, passed in.  test/clrecontest.c.  Peer thread only.
- */
+/* clrecon.c - the reconcile's pacing (probe budget, slices, debt, walk rate, no-witness
+ * clock), the returning node's half of the fast path, and the witness.  Peer thread only. */
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,7 +143,7 @@ void clrecon_nowit_end(struct clrecon *r)
 	r->nowit_warned = 0;
 }
 
-/* ---- S392: the fast path, the returning node's half ------------------- */
+/* ---- the fast path, the returning node's half ------------------------- */
 
 void clrecon_fp_drop_seen(struct clrecon_fp *f)
 {
@@ -242,7 +230,7 @@ void clrecon_fp_count(struct clrecon_fp *f, long long n)
 		f->state = FPS_DONE;
 }
 
-/* ---- S223: the witness ------------------------------------------------- */
+/* ---- the witness ------------------------------------------------------- */
 
 long long clrecon_death_mono(long long last, long long stamp, long long wall_now,
 		long long mono_now)
@@ -322,10 +310,8 @@ void clrecon_restart(const struct clpeers *pt, long long now, long long ready_ms
 		        !clpeers_live(p, now))
 			continue;
 		o->live++;
-		/* ST8, narrowed in 0.5.7.1: only a peer whose LAST live
-		 * witness is this node (or that does not say) - one with
-		 * another witness loses nothing, one with none already waits
-		 * for its own restart */
+		/* only a peer whose LAST live witness is this node (or unknown): one
+		 * with another loses nothing, one with none waits for its own restart */
 		if (p->reconciling && o->waits_n < 8 &&
 		    (p->sole_witness < 0 || p->sole_witness == self))
 			o->waits_for[o->waits_n++] = p->node;

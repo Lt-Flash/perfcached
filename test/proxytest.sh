@@ -1,24 +1,6 @@
 #!/bin/sh
-# proxytest.sh — M5 verification: proxy mode, the capacity plane.
-#  - placement: an ingress node meaningfully fuller than its peers sends
-#    new keys AWAY (power-of-two on free-MB + the self band); sum of
-#    local entries across the fleet == keys written, ingress holds ~none;
-#  - sticky forwarding: updates and counters route to the single holder
-#    (counters come out EXACT - the conflict-model proof);
-#  - reads: a non-holder serves from the cluster WITHOUT storing, and
-#    the locator turns the second read into a unicast (loc_hits);
-#  - delete via non-holder forwards; the key dies fleet-wide;
-#  - birth race: 30 same-new-key racing writes through two nodes end
-#    with EXACTLY ONE holder each (the keys verb is local-only - the
-#    per-node holder census is exact);
-#  - the rebalancer: a late-joining empty node RECEIVES migrated keys
-#    within two 10s ticks, totals conserved, values intact - leveling
-#    is PROPORTIONAL (utilization), so the donor keeps its fair share
-#    (sm registers first so the small records migrate in tick one);
-#  - sm runs on 16 buckets so ~3/4 of its 400 records live in OVERFLOW:
-#    the donor scan MUST survive the overflow leg (the ovf_lock
-#    self-deadlock regression - the peer thread froze mid-tick).
-# Usage: test/proxytest.sh [./perfcached]
+# proxytest.sh - proxy mode, the capacity plane: placement away from a full ingress, sticky
+# forwarding with exact counters, reads and deletes via non-holders, birth races, the rebalancer.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -104,7 +86,18 @@ node 2 17012 64
 node 3 17013 256
 start 1 1
 start 2 2
-sleep 3.5   # join window + election + first keepalives
+# a joiner is CONNECTING until its links answer: wait for every node ready and seeing the others
+st() { call $1 '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+formed() { # formed <port>...: up to 30 s
+	i=0
+	while [ $i -lt 300 ]; do
+		f=0; for p in "$@"; do [ "$(st $p)" = "ready $(($# - 1))" ] || f=1; done
+		[ $f = 0 ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
+formed 17011 17012
 
 # ---- a value ABOVE the datagram ceiling, written FIRST and aged a
 # second: coldest-first must pick it in the joiner tick -> bulk TCP ------
@@ -112,10 +105,8 @@ python3 - <<'EOF'
 import json, pcnative, socket
 s = socket.create_connection(("127.0.0.1", 17012), timeout=6)
 f = pcnative.wrap(s)
-# oversized proxy births need fleet-confirmed absence first (the
-# get-miss->set pattern): a blind oversized SET through a non-holder
-# is refused, because the forward plane cannot carry it and a local
-# store could fork a remote holder
+# an oversized birth through a non-holder needs fleet-confirmed absence first (get miss,
+# then set): the forward plane cannot carry it and a local store could fork a holder
 f.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"get","params":
     {"col":"px","key":"bigkey"}}).encode()+b"\n")
 f.flush()
@@ -145,12 +136,8 @@ for _ in range(120):
 assert okc == 120, okc
 EOF
 [ $? -eq 0 ] && ok || bad "placement writes"
-# The burst above is the REGRESSION for the receive-buffer flake: a
-# forward the kernel drops is a refused write (forwards carry no
-# retry), and at the 208KB rmem_max default this leg lost 4-6 of the
-# 120 - UDP RcvbufErrors matched the refusals one for one.  That check
-# is probabilistic, so pin the cause deterministically too: the daemon
-# either GOT the buffer it asked for, or said out loud that it did not.
+# a forward the kernel drops is a refused write (forwards carry no retry), so the daemon
+# either got the receive buffer it asked for or said out loud that it did not
 RB=$(cstat 17011 rcvbuf)
 [ "${RB:-0}" -gt 0 ] 2>/dev/null && ok || bad "rcvbuf not reported: $RB"
 if [ "${RB:-0}" -ge 8388608 ]; then
@@ -207,11 +194,7 @@ V=$(call 17011 '{"method":"add","params":{"col":"px","key":"ctr","by":0}}' \
 [ "$V" = 10 ] && ok || bad "counter not serialized (got $V, want 10)"
 
 # ---- delete via non-holder ---------------------------------------------
-# unprimed (no locator): the delete asks the fleet where the key is and
-# forwards to the holder, which deletes it and says so (S249).  It used to
-# broadcast a tombstone under this node's clock and answer false - which
-# worked here only because this node had seen the write's version; a node
-# that never had, deleted nothing (resizefleettest)
+# unprimed (no locator): the delete asks the fleet where the key is and forwards to the holder
 R=$(call 17011 '{"method":"del","params":{"col":"px","key":"pk007"}}')
 echo "$R" | grep -q '"deleted": true' && ok || bad "unprimed del reply: $R"
 sleep 0.4
@@ -279,18 +262,13 @@ print("birth race: 30/30 keys have exactly one holder")
 EOF
 [ $? -eq 0 ] && ok || bad "birth race left duals"
 
-# ---- the late joiner: C starts empty, JOINS AUTOMATICALLY, migration
-# fills it (no config anywhere names it - the automatic-membership demo)
+# ---- the late joiner: C starts empty, joins automatically (no config names it), migration fills it
 start 3 3
-sleep 3.5
+formed 17011 17012 17013
 B0=$(entries 17012); C0=$(entries 17013)
 echo "before rebalance: B=$B0 C=$C0"
-# Condition-wait, not a fixed sleep: natively the first 10s tick moves
-# the records and the loop exits in 1-2 ticks, faster than the old
-# `sleep 22`; under sanitizer slowdown the SAME semantics simply take
-# longer, and a fixed window read healthy-but-slow as broken.  The
-# ceiling is the failure detector.  Totals gate the exit too: mid-tick
-# a stubbed record is at neither node, so sample only a quiet moment.
+# condition-wait, not a fixed sleep (sanitizer builds are slower); totals gate the exit too:
+# mid-tick a stubbed record is at neither node, so sample only a quiet moment
 i=0; A1=0; B1=0; C1=0; TOT=0
 while [ $i -lt 45 ]; do
 	A1=$(entries 17011); B1=$(entries 17012); C1=$(entries 17013)
@@ -318,8 +296,7 @@ echo "bulk: donor bulk_out=$BO joiner bulk_in=$BI"
 [ $((BO + BI)) -ge 1 ] && ok || bad "bulk channel unused (out=$BO in=$BI)"
 
 # ---- M_MIGRATE_MANY: the 400 small records moved GATHERED ---------------
-# sm registers first so these move in tick one natively; the same
-# condition-wait discipline as above covers a slowed world.
+# sm registers first so these move in tick one
 i=0; SA=0; SB=0; SC=0
 while [ $i -lt 30 ]; do
 	SA=$(entc 17011 sm); SB=$(entc 17012 sm); SC=$(entc 17013 sm)
@@ -334,15 +311,12 @@ echo "small records: A=$SA B=$SB C=$SC; donor migrated_out=$MO in $MD datagram(s
 [ $((SA + SB + SC)) -eq 400 ] && ok || bad "small records not conserved ($((SA+SB+SC)) != 400)"
 [ "$SC" -ge 300 ] && ok || bad "small records not migrated (C=$SC)"
 [ "$ML" = 0 ] && ok || bad "migration lost records ($ML)"
-# the gather proof is a RATIO: gathered small records amortize to
-# many records per datagram, ungathered runs at ~1/each.  (The old
-# fixed margin MD <= MO-350 assumed ~465 records migrate; a
-# condition-wait sampling at 427 failed it by ONE datagram - the
-# margin tested the sample point, not the gathering.)
+# the gather proof is a RATIO: gathered small records amortize to many records per
+# datagram, ungathered runs at ~1/each
 [ "$MD" -gt 0 ] && [ $((MO / MD)) -ge 3 ] && ok \
 	|| bad "no gathering: $MO records took $MD datagrams"
 
-# ---- S296: the rebalancer says what it did, and then that it is done ----
+# ---- the rebalancer says what it did, and then that it is done ----
 rb() { call $1 '{"method":"stats"}' | python3 -c "import json,sys; r=json.load(sys.stdin)['cluster']['rebalance']; print(r['$2'])"; }
 RBM=$(rb 17012 moved_records); RBT=$(rb 17012 ticks_shed); RBL=$(rb 17012 last_move)
 echo "S296: donor rebalance moved_records=$RBM ticks_shed=$RBT last_move=$RBL"
@@ -364,13 +338,7 @@ R=$(call 17011 '{"method":"get","params":{"col":"sm","key":"sk123"}}')
 echo "$R" | grep -q '"found": true' && ok || bad "small migrated key lost: $R"
 
 # ---- probe-before-place: a fresh-locator ingress must not fork ----------
-# Regression for the measured locator-eviction duplication: a RE-WRITE
-# through a node that no longer knew the holder re-entered placement,
-# which kept the key local ~1/3 of the time - a duplicate holder (the
-# container matrix measured ~220.7k entries for 200k keys).  A restart
-# is the deterministic eviction: node B comes back with an empty
-# locator AND empty negative cache, so every re-write must
-# probe-then-forward, never fork.
+# a restart empties node B's locator and negative cache: every re-write must probe-then-forward
 S0=$(( $(entries 17011) + $(entries 17012) + $(entries 17013) ))
 E2_0=$(entries 17012)
 PKCOUNT=0
@@ -381,12 +349,9 @@ done
 K2=$(call 17012 '{"method":"keys","params":{"col":"px","match":"pk*","limit":1000}}' | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["keys"]))')
 kill -9 $P2 2>/dev/null; wait $P2 2>/dev/null || true
 start 2 2
-i=0
-while [ $i -lt 60 ]; do
-	UP=$(cstat 17012 peers_up 2>/dev/null || echo 0)
-	[ "$UP" = 2 ] && break
-	sleep 0.2; i=$((i+1))
-done
+# it sees its peers at once, but refuses the re-writes until it is ready again
+formed 17011 17012 17013
+UP=$(cstat 17012 peers_up 2>/dev/null || echo 0)
 [ "$UP" = 2 ] && ok || bad "restarted node did not rejoin"
 PS0=$(cstat 17012 pull_sent)
 for i in $(seq 0 119); do
@@ -395,10 +360,8 @@ done | python3 "$CLI" 17012 > "$D/rewr.out"
 RW_OK=$(grep -c '"stored": true' "$D/rewr.out" || true)
 S1=$(( $(entries 17011) + $(entries 17012) + $(entries 17013) ))
 PS1=$(cstat 17012 pull_sent)
-# the kill wiped node2's in-memory shard (proxy node loss loses its
-# keys, by design).  Expected: survivors' entries plus a re-create for
-# every key that DIED with node2 (K2) or was deleted earlier
-# (120 - PKCOUNT).  Any fork lands ABOVE this exact number.
+# the kill wiped node2's in-memory shard (by design); any fork lands ABOVE survivors' entries
+# plus a re-create for every key that died with node2 or was deleted earlier
 WANT=$((S0 - E2_0 + K2 + 120 - PKCOUNT))
 echo "probe-before-place: sum $S0 -> $S1 (want $WANT; node2 held $E2_0 incl $K2 pk; $PKCOUNT of 120 existed); acked=$RW_OK; probes=$((PS1 - PS0))"
 [ "$S1" -eq "$WANT" ] && ok || bad "re-writes through a fresh locator FORKED ($S0 -> $S1, want $WANT)"
@@ -420,17 +383,12 @@ echo "$R" | grep -q '"stored": true' && ok || bad "neg-gated create refused: $R"
 PS4=$(cstat 17012 pull_sent)
 [ "$PS4" -eq "$PS3" ] && ok || bad "neg-gated set still probed ($PS3 -> $PS4)"
 
-# everyone alive
 for p in 17011 17012 17013; do
 	call $p '{"method":"ping"}' | grep -q pong && ok || bad "node on $p died"
 done
 
-# ---- oversized proxy writes: refuse, never fork (S54 open defect) ------
-# The forward plane carries at most PC_MAX_FWD_VAL bytes.  An oversized
-# SET through a NON-holder must be refused (a local store could fork the
-# remote holder); with a locator naming the holder OR with the holder
-# unknown, the answer is "value too large".  Only a fleet-confirmed-
-# absent key (GET miss stamps the negative cache) may be BORN locally.
+# ---- oversized proxy writes: refuse, never fork ------
+# a SET over PC_MAX_FWD_VAL through a non-holder is refused unless the key is fleet-confirmed absent
 OVR=$(python3 - <<'EOF'
 import json, pcnative, socket
 def rpc(f, i, method, params):

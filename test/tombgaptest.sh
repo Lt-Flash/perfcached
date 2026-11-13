@@ -1,22 +1,6 @@
 #!/bin/sh
-# tombgaptest.sh - S427 (0.7.1; PROD 2026-10-20): cluster.peer_absent says a
-# member's absence was NOT covered by the retained deletes only when it was
-# not.  0.6.6 raised it on ANY early drop by the cap while the member was
-# away - with the cap biting the OLDEST deletes go, ones made long before the
-# absence - and every 34-s restart on PROD said "back after 34 s, past
-# tombstone_retain_s 900 s", which it was not.
-#
-# Three eager nodes, tombstone_retain_s 120, tombstone_retain_max 1000 (its
-# minimum), and a steady 50 deletes a second through node 1: the cap bites all the time, and
-# the table covers the last ~20 s (1000 / 50).  Node 3 is FROZEN (SIGSTOP) -
-# silent to its peers, then back (SIGCONT), no restart:
-#   A. frozen 8 s - a gap (~18 s) inside the coverage C (measured: the oldest
-#      delete held): node 1 notes the silence and raises NO peer_absent
-#   B. frozen C + 5 s - a gap past C: cluster.peer_absent, naming the cap
-#      ("tombstone_retain_max 1000 dropped deletes made while it was away"),
-#      not the 120-s window it was well inside
-# Fail-first: before S427, A raises "past tombstone_retain_s 120 s".
-# Usage: test/tombgaptest.sh [./perfcached]
+# tombgaptest.sh - cluster.peer_absent says a frozen member's absence was not covered by the retained
+# deletes only when it was not, and then names the cap.  Usage: test/tombgaptest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -53,7 +37,7 @@ advertise = 127.0.51.$i
 mode = eager
 tombstone_retain_s = 120
 tombstone_retain_max = 1000
-# 12ny AT-5: this suite tests the time rule's cap - no forgetting by marks
+# this suite tests the time rule's cap - no forgetting by marks
 tombstone_acks = no
 collections = c
 [wal]
@@ -113,10 +97,8 @@ silent() { # silent <seconds>: node 3 frozen, then back; waits until node 1 note
 	sleep 3                           # the alert tick
 }
 gap() { grep "is back after" "$D/n1.log" | tail -1 | sed -n 's/.*is back after \([0-9]*\) s.*/\1/p'; }
-# the gap node 1 measures runs from the silence to the return - ~10 s more
-# than the freeze (detection, the purge at 6 s, readmission), and a freeze
-# shorter than the detection is no gap at all: A freezes 8 s (a gap of ~18),
-# B past the coverage C; the verdicts are on the gap node 1 logged
+# node 1's gap runs from the silence to the return, ~10 s more than the freeze (detection, purge,
+# readmission): A freezes 8 s, B past the coverage C; the verdicts are on the logged gap
 c0=$(pa)
 silent 8
 g=$(gap); c1=$(pa)

@@ -1,0 +1,58 @@
+name: Bug report
+description: perfcached, libperfd or one of the tools does something wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting.  A security problem goes privately, not here: see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `perfcached -V` (and `perfcli -V` if a client is involved).
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Edition and install
+      options:
+        - perfcached package (clustered)
+        - perfcached-standalone package
+        - Alpine apk
+        - release tarball
+        - built from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: Debian 13, amd64
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+  - type: textarea
+    id: cluster
+    attributes:
+      label: Cluster
+      description: If clustered - the mode of the collections involved, the number of nodes, discovery (multicast or unicast).
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: perfcached.conf with every secret, password and token removed.
+      render: ini
+  - type: textarea
+    id: log
+    attributes:
+      label: Log around the event
+      render: text

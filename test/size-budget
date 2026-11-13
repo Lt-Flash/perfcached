@@ -1,0 +1,4 @@
+# OM2-2: <file> <most lines it may have> - lowered by each extraction
+src/cluster.c 13637
+src/upstream.c 8159
+src/verbs.c 8114

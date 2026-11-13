@@ -1,26 +1,6 @@
 #!/bin/sh
-# tombrestoretest.sh - 12ny AT-12 (f): a member restored from an older
-# snapshot does not get back the keys deleted since.
-#
-# The fleet forgets a delete once every member has confirmed it (AT-5).  A
-# member then restored from a backup older than those deletes holds the
-# keys again, and nobody holds the deletes to replay to it.  Its marks say
-# so - the restored `acks` file is as old as the snapshot - and S392's fast
-# path refuses it (TOMBFP_BEHIND), so it walks (B4): every record it brought
-# back is asked about, and the fleet holds none of the deleted keys.  Three
-# eager nodes; node 3 takes snapshots (a clean stop writes one):
-#   1. 300 keys; node 3 stopped cleanly and its state (snapshot, acks, WAL)
-#      copied aside - the backup; node 3 back
-#   2. 200 of the keys deleted through node 1, confirmed by all three and
-#      forgotten by node 1
-#   3. node 3 stopped and restored from the backup: its fast path was
-#      refused because deletes were forgotten past its marks
-#   4. it walked: node 3 holds none of the 200 and all 100 kept, and nodes 1
-#      and 2 hold none of the 200 either
-# FAIL-FIRST: without the marks' check (AT-5's TOMBFP_BEHIND), the witness's
-# table held none of the 200 - forgotten - and its fast path answered OK:
-# node 3 kept them.
-# Usage: test/tombrestoretest.sh [./perfcached]
+# tombrestoretest.sh - a member restored from a snapshot older than forgotten deletes has its fast
+# path refused and walks, so no deleted key comes back.  Usage: test/tombrestoretest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -109,12 +89,8 @@ for i in 1 2 3; do start $i; done
 T0=$(date +%s)
 gate
 
-# 1. 300 keys; node 3's backup.  Taken more than 30 s after the starts: the
-# restored node dates its absence from the backup's files, and its walk can
-# drop only on a WITNESS - a peer up 30 s (WITNESS_GRACE_MS, three sweeps)
-# before that.  v0.7.3-rc8 (both CIs) took it ~3 s in: no witness, no fast
-# path ('none'), every drop deferred - and the 200 deleted keys came back on
-# all three nodes (S455)
+# 1. 300 keys; node 3's backup, taken over 30 s after the starts: the restored node's walk drops
+# only on a witness, a peer up WITNESS_GRACE_MS before the backup's files
 w=$((32 - $(date +%s) + T0)); [ $w -gt 0 ] && sleep $w
 ops set 0 300; sleep 2
 stopn 3
@@ -138,11 +114,8 @@ rm -rf "$D/s3" "$D/w3"; cp -a "$D/s3.bak" "$D/s3"; cp -a "$D/w3.bak" "$D/w3"
 start 3
 k=0; while [ $k -lt 150 ] && [ -z "$(st 3 'c.get("reconcile_fast_why") or ""')" ] && [ "$(st 3 'c.get("reconcile_open")')" != False ]; do sleep 0.2; k=$((k+1)); done
 WHY=$(st 3 'c.get("reconcile_fast_why")')
-# either refusal is the property: the witness's marks are behind the
-# restored node's (AT-5's TOMBFP_BEHIND, "forgot"), or - checked first -
-# its retained deletes no longer reach back to the restored snapshot,
-# because forgetting moved their start (v0.7.3-rc9 GitLab: the latter,
-# and step 4 - the walk - held)
+# either refusal is the property: the witness's marks are behind the restored node's ("forgot"),
+# or its retained deletes no longer reach back to the restored snapshot
 case "$WHY" in *forgot*|*"do not reach back"*) ok "3. node 3 restored from the older backup: its fast path was refused - $WHY" ;;
 	*) bad "3. node 3's fast path after the restore: '${WHY:-none}' (want it refused because deletes were forgotten past its marks); fast $(st 3 'c.get("reconcile_fast")'); $(grep -m2 -h 'fast path\|forgot' "$D/n3.log" "$D/n1.log" "$D/n2.log" | tr '\n' ' ' | cut -c1-300)" ;; esac
 

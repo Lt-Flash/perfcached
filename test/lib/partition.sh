@@ -1,38 +1,6 @@
 #!/bin/sh
-# partition.sh — cut and heal the peer plane between named cluster
-# nodes, so a partition is a TEST INPUT rather than an accident (S42a).
-#
-# HOW, and why this way.  The rules go inside each container's own
-# network namespace, applied with the HOST's iptables via nsenter, so:
-#
-#  - nothing is added to the host's own tables, and a leaked rule
-#    cannot affect anything but the container it was meant for;
-#  - it does not depend on br_netfilter (bridge traffic only traverses
-#    the host FORWARD chain when net.bridge.bridge-nf-call-iptables is
-#    on, which is not guaranteed and is a host-wide setting to boot);
-#  - the container image needs no iptables of its own.
-#
-# A cut is applied at BOTH ends.  One-directional loss is a different
-# and far nastier fault than a partition, and conflating them would
-# make a failure impossible to interpret - so it is asked for BY NAME:
-# part_mute <from> <to> drops, at <to>, everything sourced from <from>,
-# and nothing else.  <from> keeps hearing <to>'s heartbeats, so it goes
-# on believing <to> is alive while every byte it sends is swallowed -
-# the one fault that makes a node hand keys to a peer that will never
-# receive them (test/reshardtest.sh).
-#
-# The cluster plane is multicast discovery plus unicast; dropping by
-# SOURCE address covers both, because a multicast datagram still
-# carries the sender's unicast source.
-#
-# Usage:
-#   . test/lib/partition.sh
-#   part_init nerdctl          # runtime to talk to
-#   part_cut  pcnode1 pcnode2
-#   part_heal pcnode1 pcnode2
-#   part_mute pcnode1 pcnode3   # one direction: node3 stops hearing node1
-#   part_unmute pcnode1 pcnode3
-#   part_heal_all             # ALWAYS from an EXIT trap (cuts AND mutes)
+# partition.sh - cut, mute and heal the peer plane between named containers: iptables rules inside
+# each container's netns via nsenter, dropped by source address at both ends (multicast included).
 set -u
 
 PART_RT=""
@@ -54,8 +22,8 @@ part_pid() { # part_pid <container> -> host pid
 }
 
 part_ip() { # part_ip <container> -> its address on the bridge
-	# `ip -o addr` inside the netns, not the runtime's metadata: the
-	# metadata is what was ASKED for, this is what the interface has.
+	# `ip -o addr` inside the netns: the runtime's metadata is what was asked for, this is what the
+	# interface has
 	pi_pid=$(part_pid "$1") || return 1
 	[ -n "$pi_pid" ] && [ "$pi_pid" != 0 ] || return 1
 	nsenter -t "$pi_pid" -n ip -o -4 addr show eth0 2>/dev/null |
@@ -84,17 +52,14 @@ part_heal() { # part_heal <a> <b>
 	ph_a=$1; ph_b=$2
 	ph_ai=$(part_ip "$ph_a") || return 0
 	ph_bi=$(part_ip "$ph_b") || return 0
-	# delete BY SPEC, never by index - an index shifts under you and
-	# the wrong rule goes (feedback-no-iptables-rule-by-index)
+	# delete by spec, never by index: an index shifts and the wrong rule goes
 	part_drop "$ph_a" "$ph_bi" -D 2>/dev/null
 	part_drop "$ph_b" "$ph_ai" -D 2>/dev/null
 	echo "  partition: $ph_a <---> $ph_b healed"
 }
 
-# ---- one-directional loss, by name --------------------------------------
-# @to stops receiving from @from; @from is untouched and keeps hearing
-# @to.  This is NOT a partition: the two ends disagree about who is
-# alive, which is precisely the state a hand-over has to survive.
+# ---- one-directional loss, by name: @to stops hearing @from, which keeps hearing @to - not a
+# partition, the two ends disagree about who is alive
 part_mute() { # part_mute <from> <to>
 	pm_f=$1; pm_t=$2
 	pm_fi=$(part_ip "$pm_f") || return 1
@@ -112,9 +77,8 @@ part_unmute() { # part_unmute <from> <to>
 	echo "  partition: $pu_f -----> $pu_t unmuted"
 }
 
-# Heal everything this script cut OR muted.  Call it from an EXIT trap:
-# a DROP rule left behind outlives the test and silently poisons every
-# later run against the same fleet.
+# heal everything cut or muted; call it from an EXIT trap: a DROP rule left behind poisons every
+# later run against the same fleet
 part_heal_all() {
 	for pha_p in $PART_MUTES; do
 		part_unmute "${pha_p%%:*}" "${pha_p##*:}"
@@ -126,8 +90,7 @@ part_heal_all() {
 	PART_CUTS=""
 }
 
-# how many rules this container is currently dropping on - the proof
-# that a cut is really in place, and that a heal really removed it
+# rules this container is dropping on: proof a cut is in place, and that a heal removed it
 part_rules() { # part_rules <container>
 	pr_pid=$(part_pid "$1") || { echo 0; return; }
 	nsenter -t "$pr_pid" -n iptables -S INPUT 2>/dev/null |

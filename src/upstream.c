@@ -1,27 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * upstream.c - read-through from a RESP upstream (task S331, DESIGN 12ix).
- *
- * One-way unless asked: the fetch connections send READ commands only -
- * TYPE, PTTL, GET, HGETALL, JSON.GET, plus the handshake (HELLO/AUTH/
- * SELECT) - and the suites enforce that with an upstream that fails the
- * run on any write.  S385 (upstream_writes = through) adds ONE writer per
- * collection, its own thread and connection to the upstream's master,
- * below "write-through"; nothing else here writes upstream.
- * No Redis code: RESP is a published protocol, the reader is written
- * from it.
- *
- * Shape.  Each upstream collection has a shadow table (node-local) and
- * `upstream_conns` threads, each owning one connection.  A worker whose
- * gate finds a key it must fetch registers a REQUEST (one per command,
- * counting its keys) and joins the key's single-flight entry - one fetch
- * per key however many commands wait for it.  A connection thread takes
- * the key off the queue, fetches it, stores the value (or a marker) in
- * the shadow and counts the request down; the last key posts the
- * completion to the request's worker, whose drain hands it to proto -
- * which lets the held connection run the command again.
- */
+/* upstream.c - read-through from a RESP upstream: a shadow table per collection, filled by
+ * single-flight fetches on read-only connections (plus one optional writer per collection) */
+/* no Redis code: the RESP reader is written from the published protocol */
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -44,7 +25,7 @@
 #include <unistd.h>
 
 #include "pcaddr.h"
-#include "uprespc.h"                 /* the reply parser (wave 1) */
+#include "uprespc.h"
 #include "compat/compat.h"
 #include "compat/dprint.h"
 #include "compat/mem/mem.h"
@@ -52,7 +33,7 @@
 #include "compat/timer.h"
 #include "core/pcache_htable.h"
 #include "cluster.h"
-#include "pc_slot.h"                   /* 12nt: pc_key_slot for spread's K-set */
+#include "pc_slot.h"
 #include "config.h"
 #include "daemon.h"
 #include "hashrec.h"
@@ -61,9 +42,9 @@
 #include "proto.h"
 #include "store.h"
 #include "upstream.h"
-#include "winctr_tw.h"     /* S351 */
+#include "winctr_tw.h"
 #include "verbs.h"
-#include "upstreamint.h"            /* the types and macros (wave 1) */
+#include "upstreamint.h"
 
 static void rb_free(struct up_rb *rb, int n);
 static struct up_wq *wq;
@@ -74,7 +55,7 @@ const char *const updr_name[] = { "idle", "running", "done",
 	"stopped", "failed" };
 struct up_col up_cols[UP_MAX_COLS];
 static int ncols;
-static char up_state_dir[1024];       /* S421: for the re-warm names file */
+static char up_state_dir[1024];       /* for the re-warm names file */
 static unsigned int next_id = 1;
 
 int pc_upstream_any(void)
@@ -83,9 +64,8 @@ int pc_upstream_any(void)
 }
 
 
-/* S384: another perfcached's read-through fetcher read @col here, and
- * @col reads through itself - answered from what this node holds, never
- * fetched onward (a daisy-chain cut at one hop); counted for the alert */
+/* another node's read-through fetcher read @col, which reads through itself: answered
+ * from what this node holds, never fetched onward (one hop); counted for the alert */
 void pc_upstream_chain_note(const char *col, size_t collen)
 {
 	struct up_col *uc = col_of(col, collen);
@@ -97,6 +77,47 @@ void pc_upstream_chain_note(const char *col, size_t collen)
 int pc_upstream_count(void)
 {
 	return ncols;
+}
+
+/* a reload re-reads every rediss:// collection's files: staged here, then applied or dropped
+ * (pc_upstream_tls_commit), so one that does not load changes none */
+int pc_upstream_tls_stage(char *err, size_t el)
+{
+	int i, n = 0;
+
+	for (i = 0; i < ncols; i++) {
+		struct up_col *uc = &up_cols[i];
+		char te[300];
+
+		if (!uc->tls)
+			continue;
+		uc->tls_next = uptls_new(uc->tls_ca, uc->tls_cert, uc->tls_key, uc->tls_verify,
+			te, sizeof te);
+		if (!uc->tls_next) {
+			snprintf(err, el, "collection '%s': %s", uc->name, te);
+			pc_upstream_tls_commit(0);
+			return -1;
+		}
+		n++;
+	}
+	return n;
+}
+
+void pc_upstream_tls_commit(int apply)
+{
+	int i;
+
+	for (i = 0; i < ncols; i++) {
+		struct up_col *uc = &up_cols[i];
+
+		if (!uc->tls_next)
+			continue;
+		if (apply)
+			uptls_swap(uc->tls, uc->tls_next);
+		else
+			uptls_free(uc->tls_next);
+		uc->tls_next = NULL;
+	}
 }
 
 
@@ -113,29 +134,33 @@ int pc_upstream_health(int i, struct pc_up_health *h)
 	h->host = uc->srv[0].host;
 	h->port = uc->srv[0].port;
 	h->tracking_wanted = uc->tracking;
-	h->nsrv = uc->nsrv;
+	h->nsrv = srv_n(uc);
 	h->role_replica = uc->role_req == PC_UP_ROLE_REPLICA;
-	h->chained = ST_GET(uc->chained);                  /* S384 */
-	h->through = uc->through;                          /* S385 */
+	h->chained = ST_GET(uc->chained);
+	h->through = uc->through;
 	h->w_state = __atomic_load_n(&uc->w_state, __ATOMIC_RELAXED);
 	h->w_target = __atomic_load_n(&uc->w_master, __ATOMIC_RELAXED);
 	h->w_json = __atomic_load_n(&uc->w_json, __ATOMIC_RELAXED);
 	h->w_forwarded = UPV(uc, wt_fwd);
 	h->w_passed = UPV(uc, pass_w);
-	h->w_qfull = UPV(uc, wt_qfull);                    /* AR2 */
+	h->w_qfull = UPV(uc, wt_qfull);
 	h->w_qexpired = UPV(uc, wt_qexpired);
-	h->w_bcast = bcast_state(uc);                      /* AR1 */
-	pthread_mutex_lock(&uc->mx);                       /* S382 part 2 */
+	h->w_bcast = bcast_state(uc);
+	pthread_mutex_lock(&uc->mx);
 	h->failover = uc->mode == PC_UP_MODE_FAILOVER;
 	h->primary = uc->primary;
 	h->active = uc->active;
 	pthread_mutex_unlock(&uc->mx);
-	for (j = 0; j < uc->nsrv; j++) {
+	for (j = 0; j < srv_n(uc); j++) {
 		const struct up_srv *s = &uc->srv[j];
 		struct pc_up_srv_health *sh = &h->srv[j];
 
-		sh->host = s->host;
+		pthread_mutex_lock((pthread_mutex_t *)&s->run_mx);
+		memcpy(sh->hbuf, s->host, sizeof sh->hbuf);
 		sh->port = s->port;
+		pthread_mutex_unlock((pthread_mutex_t *)&s->run_mx);
+		sh->hbuf[sizeof sh->hbuf - 1] = 0;
+		sh->host = sh->hbuf;
 		sh->conns_up = __atomic_load_n(&s->conns_up, __ATOMIC_RELAXED);
 		sh->tracking_on = __atomic_load_n(&s->inv_id, __ATOMIC_ACQUIRE) > 0;
 		sh->state = srv_state(s);
@@ -143,9 +168,11 @@ int pc_upstream_health(int i, struct pc_up_health *h)
 		sh->link_down = __atomic_load_n(&s->link_down, __ATOMIC_RELAXED);
 		sh->lag_ms = __atomic_load_n(&s->lag_ms, __ATOMIC_RELAXED);
 		sh->perfcached = __atomic_load_n(&s->is_pc, __ATOMIC_RELAXED) &&
-			!uc->allow_pc;                         /* S384: refused */
+			!uc->allow_pc;                         /* refused */
 		sh->chain_hop = __atomic_load_n(&s->is_pc, __ATOMIC_RELAXED) &&
-			uc->allow_pc;                          /* S384: allowed */
+			uc->allow_pc;                          /* allowed */
+		sh->quiet = __atomic_load_n(&s->is_sentinel, __ATOMIC_RELAXED) ||
+			__atomic_load_n(&s->gone, __ATOMIC_RELAXED);
 		h->conns_up += sh->conns_up;
 		if (sh->state == PC_UPS_SERVE)
 			h->serving++;
@@ -155,8 +182,8 @@ int pc_upstream_health(int i, struct pc_up_health *h)
 	if (h->serving)
 		h->fallback = NULL;            /* a replica serves: no fallback */
 	h->tracking_on = 1;
-	for (j = 0; j < uc->nsrv; j++)
-		if (!h->srv[j].tracking_on && (uc->nsrv == 1 ||
+	for (j = 0; j < srv_n(uc); j++)
+		if (!h->srv[j].tracking_on && (srv_n(uc) == 1 ||
 		    h->srv[j].state != PC_UPS_OFF))
 			h->tracking_on = 0;
 	return 0;
@@ -172,13 +199,13 @@ struct up_col *col_of(const char *col, size_t collen)
 	return NULL;
 }
 
-/* AR1: 1 every upstream whose tracking connection is up follows every
- * change (broadcast), -1 one refused it, 0 none up or not asked */
+/* 1 every upstream whose tracking connection is up follows every change (broadcast),
+ * -1 one refused it, 0 none up or not asked */
 int bcast_state(const struct up_col *uc)
 {
 	int i, up = 0, on = 0;
 
-	for (i = 0; i < uc->nsrv; i++) {
+	for (i = 0; i < srv_n(uc); i++) {
 		int b = __atomic_load_n(&uc->srv[i].bcast, __ATOMIC_RELAXED);
 
 		if (b < 0)
@@ -211,6 +238,70 @@ void pc_upstream_worker_register(int worker, int efd)
 		wq[worker].efd = efd;
 }
 
+/* a fetched copy the arena had no room for: its bytes in one block every waiter's relay
+ * shares, freed with the last; never stored */
+struct up_rdata {
+	int refs;
+	char b[];
+};
+struct up_relay {
+	struct pcache_relay r;             /* first: the store walks these */
+	struct up_rdata *d;
+};
+
+static struct pcache_relay *relay_new(const str *k, const str *v,
+		unsigned int exp, unsigned char fl, unsigned long long ver)
+{
+	struct up_relay *u = malloc(sizeof *u);
+	struct up_rdata *d = malloc(sizeof *d + (size_t)k->len + (size_t)v->len + 1);
+
+	if (!u || !d) {
+		free(u);
+		free(d);
+		return NULL;
+	}
+	d->refs = 1;
+	memcpy(d->b, k->s, (size_t)k->len);
+	if (v->len)
+		memcpy(d->b + k->len, v->s, (size_t)v->len);
+	u->d = d;
+	u->r.next = NULL;
+	u->r.key.s = d->b;
+	u->r.key.len = k->len;
+	u->r.val.s = d->b + k->len;
+	u->r.val.len = v->len;
+	u->r.exp = exp;
+	u->r.fl = fl;
+	u->r.ver = ver;
+	return &u->r;
+}
+
+/* another waiter's relay of the same bytes */
+static struct pcache_relay *relay_share(const struct pcache_relay *r)
+{
+	const struct up_relay *o = (const struct up_relay *)r;
+	struct up_relay *u = malloc(sizeof *u);
+
+	if (!u)
+		return NULL;
+	*u = *o;
+	u->r.next = NULL;
+	__atomic_add_fetch(&u->d->refs, 1, __ATOMIC_RELAXED);
+	return &u->r;
+}
+
+static void relay_free(struct pcache_relay *r)
+{
+	while (r) {
+		struct up_relay *u = (struct up_relay *)r;
+
+		r = r->next;
+		if (__atomic_sub_fetch(&u->d->refs, 1, __ATOMIC_ACQ_REL) == 0)
+			free(u->d);
+		free(u);
+	}
+}
+
 static void post_done(int worker, const struct up_done *d)
 {
 	struct up_wq *w;
@@ -220,6 +311,7 @@ static void post_done(int worker, const struct up_done *d)
 		free(d->key);
 		free(d->val);
 		rb_free(d->rb, d->nrb);
+		relay_free(d->relay);
 		return;
 	}
 	w = &wq[worker];
@@ -229,15 +321,15 @@ static void post_done(int worker, const struct up_done *d)
 		struct up_done *nq = realloc(w->q, (size_t)nc * sizeof *nq);
 
 		if (!nq) {
-			/* the request can never complete: its connection
-			 * stays held until it closes - logged, and counted
-			 * by the caller as an error */
+			/* the request can never complete: its connection stays held until it closes
+			 * (logged; the caller counts an error) */
 			pthread_mutex_unlock(&w->mx);
 			LM_ERR("upstream: no memory to post a completion - a "
 				"client connection stays held\n");
 			free(d->key);
 			free(d->val);
 			rb_free(d->rb, d->nrb);
+			relay_free(d->relay);
 			return;
 		}
 		w->q = nq;
@@ -251,7 +343,8 @@ static void post_done(int worker, const struct up_done *d)
 			strerror(errno));
 }
 
-static void post(int worker, unsigned int id, int status)
+static void post(int worker, unsigned int id, int status,
+		struct pcache_relay *rl)
 {
 	struct up_done d;
 
@@ -259,6 +352,7 @@ static void post(int worker, unsigned int id, int status)
 	d.id = id;
 	d.status = status;
 	d.kind = UPD_REQ;
+	d.relay = rl;
 	post_done(worker, &d);
 }
 
@@ -272,23 +366,12 @@ static void wt_job_free(struct up_wjob *j);
 static void wt_queue(struct up_col *uc, struct up_wjob *j);
 static void wt_err_add(struct up_col *uc, const char *kind, const char *cmd,
 		size_t cl, const char *key, size_t kl, const char *msg, size_t ml);
-static void wt_count_owned(struct up_col *uc);                     /* AR4 */
+static void wt_count_owned(struct up_col *uc);
 static void wt_refused_note(struct up_col *uc, const char *what, size_t wl,
 		const char *msg);
-/* ---- AR1: Redis changed a key a write-through collection holds ------------
- * The broadcast tracking (CLIENT TRACKING ON BCAST, the collection's
- * prefixes) tells every node of every change Redis makes - by a client of
- * Redis, or replicated from this fleet's own write.  The node's record of
- * the key and its no-fall entry go, HERE only (every node hears it); the
- * next read fetches what Redis holds from a serving replica.  The tracking
- * thread posts the key; a worker drops it. */
-/* the worker that applies them: the first registered.  Workers are slots
- * 1..n - there is no worker 0, and what was posted there waited for a wake
- * that never came (0.6.3's first CI: no invalidation was ever applied).
- * -1 before any worker has registered */
-/* 12nt (0.7.1): is @key's through copy another node's to fetch and hold -
- * the owner's in shard, the K holders' in spread when this node is not one
- * of them?  0 in eager, store, proxy and outside a cluster: here. */
+/* ---- write-through invalidation: a worker drops each key broadcast tracking reports ---- */
+/* is @key's through copy another node's to fetch and hold (the owner in shard, the K holders
+ * in spread when this node is not one)?  0 in eager, store, proxy and outside a cluster */
 static int through_elsewhere(pcache_htable_t *ht, const char *col,
 		size_t collen, const char *key, size_t kl)
 {
@@ -304,6 +387,8 @@ static int through_elsewhere(pcache_htable_t *ht, const char *col,
 	return 0;
 }
 
+/* the worker that applies them: the first registered (workers are slots 1..n, there is no
+ * worker 0); -1 before any has registered */
 static int inv_worker(void)
 {
 	int i;
@@ -332,18 +417,16 @@ static void inv_post(struct up_col *uc, const char *k, size_t kl)
 	post_done(w, &d);
 }
 
-/* a gap in the tracking (a connection lost or new, a FLUSHALL): any change
- * may have been missed, so every record written through goes - not the
- * keys the fleet owned under allow ("1"), which Redis may not have */
+/* a gap in the tracking (a connection lost or new, a FLUSHALL) may have missed any change:
+ * every record written through goes, not the fleet's own keys under allow ("1") */
 static void inv_post_all(struct up_col *uc)
 {
 	struct up_done d;
 	int w = inv_worker();
 
 	if (w < 0) {
-		/* at start, before the workers: the records recovered from the
-		 * WAL may have missed a change while the node was down - the
-		 * first drain on any worker drops them */
+		/* at start, before the workers: records recovered from the WAL may have missed a change
+		 * while the node was down - the first drain on any worker drops them */
 		__atomic_store_n(&uc->inv_all_pending, 1, __ATOMIC_RELEASE);
 		return;
 	}
@@ -353,8 +436,8 @@ static void inv_post_all(struct up_col *uc)
 	post_done(w, &d);
 }
 
-/* S404: the no-fall entry's value - '1', 't' or 'g' - or 0 when there is
- * none.  Uncounted, as the gate's every look at the companion is (S340) */
+/* the no-fall entry's value ('1', 't' or 'g'), 0 when none; uncounted, like every gate
+ * look at the companion */
 static int nofall_mark(struct up_col *uc, const str *k)
 {
 	pcache_htable_t *nf = pc_store_find(uc->nf, uc->nflen);
@@ -365,14 +448,8 @@ static int nofall_mark(struct up_col *uc, const str *k)
 	return m;
 }
 
-/* S404: a written-through key's mark with no record beside it.  A write
- * reaches the other members as two replicated writes - the record, then
- * its mark - and Redis's broadcast invalidation of that same write reaches
- * every member on its own.  Landing between the two, the invalidation
- * dropped the record and the mark arrived after it: alone, it told the
- * gate the fleet holds the key, and reads here answered nil for a key
- * Redis holds (staging, 2026-10-14).  Such a mark is dropped (here only)
- * and the key falls through.  1 it was one (and is gone), 0 not */
+/* a 't' mark without its record (an invalidation landed between the replicated record and
+ * its mark) would answer nil: dropped here, the key falls through; 1 it was one, 0 not */
 static int nofall_bare_t(struct up_col *uc, const str *k)
 {
 	pcache_htable_t *nf = pc_store_find(uc->nf, uc->nflen);
@@ -386,10 +463,10 @@ static int nofall_bare_t(struct up_col *uc, const str *k)
 
 static int join_key(struct up_col *uc, const char *k, size_t kl,
 		struct up_req *r, int own, int own_worker, int full);
-static void rewarm_save(struct up_col *uc, const char *state_dir);   /* S421 */
+static void rewarm_save(struct up_col *uc, const char *state_dir);
 static void rewarm_load(struct up_col *uc, const char *state_dir);
 
-/* S422: FNV-1a over the key */
+/* FNV-1a over the key */
 static uint64_t echo_hash(const char *k, size_t kl)
 {
 	uint64_t h = 1469598103934665603ULL;
@@ -400,9 +477,8 @@ static uint64_t echo_hash(const char *k, size_t kl)
 	return h ? h : 1;
 }
 
-/* S435: a removal of copies or records, bracketed for a read the gate let
- * through while it ran (pc_upstream_resp_lost): begun before the first
- * entry goes, done after the last */
+/* a removal of copies or records, bracketed for a read the gate let through while it ran
+ * (pc_upstream_resp_lost): begun before the first entry goes, done after the last */
 static void rm_begin(struct up_col *uc)
 {
 	__atomic_add_fetch(&uc->rm_begin, 1, __ATOMIC_SEQ_CST);
@@ -413,7 +489,7 @@ static void rm_end(struct up_col *uc)
 	__atomic_add_fetch(&uc->rm_end, 1, __ATOMIC_RELEASE);
 }
 
-/* S422: this node applied a write-through of @k now (wt_apply) */
+/* this node applied a write-through of @k now (wt_apply) */
 static void echo_note(struct up_col *uc, const char *k, size_t kl)
 {
 	uint64_t h;
@@ -425,8 +501,8 @@ static void echo_note(struct up_col *uc, const char *k, size_t kl)
 	uc->echo[h % UP_ECHO_N].t0 = now_ms();
 }
 
-/* S422: is an invalidation of @k arriving now the echo of this node's own
- * write (inside upstream_echo_ms of its apply)? */
+/* is an invalidation of @k arriving now the echo of this node's own write
+ * (inside upstream_echo_ms of its apply)? */
 static int echo_hit(struct up_col *uc, const char *k, size_t kl)
 {
 	uint64_t h;
@@ -439,8 +515,8 @@ static int echo_hit(struct up_col *uc, const char *k, size_t kl)
 	return e->h == h && now_ms() - e->t0 <= uc->echo_ms;
 }
 
-/* S422: the echo left no copy of @k anywhere here - fetch it again now, so
- * the next read hits (the fetched copy is Redis's current state) */
+/* the echo left no copy of @k here: fetch it again now so the next read hits
+ * (the fetched copy is Redis's current state) */
 static void echo_refetch(struct up_col *uc, pcache_htable_t *ht, const str *k)
 {
 	unsigned char fl = 0, mark = 0;
@@ -452,6 +528,24 @@ static void echo_refetch(struct up_col *uc, pcache_htable_t *ht, const str *k)
 	if (join_key(uc, k->s, (size_t)k->len, NULL, 0, -1, 1) == 0)
 		ST_ADD(uc->wt_echo, 1);
 	pthread_mutex_unlock(&uc->mx);
+}
+
+/* tests only: PERFCACHED_TEST_INV_GAP_US=<us> holds an invalidation between dropping a
+ * record and its mark - the window a read's lost check lands in */
+static void inv_test_gap(void)
+{
+	static int us = -1;
+
+	if (us < 0) {
+		const char *e = getenv("PERFCACHED_TEST_INV_GAP_US");
+
+		us = e && atoi(e) > 0 ? atoi(e) : 0;
+		if (us)
+			LM_WARN("upstream: PERFCACHED_TEST_INV_GAP_US=%d - an invalidation "
+				"waits %d us between a record and its mark (a test setting)\n", us, us);
+	}
+	if (us)
+		usleep((useconds_t)us);
 }
 
 static void inv_apply(struct up_col *uc, const char *key, size_t klen)
@@ -467,18 +561,13 @@ static void inv_apply(struct up_col *uc, const char *key, size_t klen)
 		return;
 	k.s = (char *)key;
 	k.len = (int)klen;
-	/* S404: the record goes, and its mark with it - but a "t" mark found
-	 * WITHOUT its record stays: the record may still be on its way from
-	 * the member that made the write, and it must land marked, not as the
-	 * fleet's own.  A read that later finds such a mark alone drops it
-	 * and falls through (nofall_bare_t).  "1" and "g" marks go either
-	 * way.  (Dropping both together keeps the usual path as it was: every
-	 * write-through write comes back as an invalidation, and the read
-	 * after it must not pay for a mark left behind on purpose.) */
-	rm_begin(uc);                      /* S435: a read on another worker */
+	/* the record goes with its mark, but a 't' mark found WITHOUT its record stays: the record
+	 * may still be on its way and must land marked (a read drops a lone mark: nofall_bare_t) */
+	rm_begin(uc);
 	if (pcache_ht_probe_main(ht, &k, NULL) == 0) {
 		pc_verb_forget_local(ht, &k);
 		had = 1;
+		inv_test_gap();
 	}
 	if (nf && pcache_ht_probe_main(nf, &k, NULL) == 0 &&
 	    (had || nofall_mark(uc, &k) != 't')) {
@@ -488,19 +577,16 @@ static void inv_apply(struct up_col *uc, const char *key, size_t klen)
 	rm_end(uc);
 	if (had)
 		ST_ADD(uc->wt_inval, 1);
-	/* S422: the echo of this node's own write (or a change racing it)
-	 * inside the window - the key is read again rather than left empty;
-	 * every tracked upstream echoes once, so a later echo that dropped
-	 * the refetched copy refetches too (one fetch per tracked upstream
-	 * at most, inside the window) */
+	/* the echo of this node's own write (or a change racing it) inside the window: the key is
+	 * read again rather than left empty (at most one fetch per tracked upstream) */
 	if (echo_hit(uc, key, klen))
 		echo_refetch(uc, ht, &k);
 }
 
 struct inv_keys {
 	str *k;
-	char *mk;                          /* S421: the mark, 't' or 'g' */
-	unsigned int *wt;                  /* S421: the record's last write tick */
+	char *mk;                          /* the mark, 't' or 'g' */
+	unsigned int *wt;                  /* the record's last write tick */
 	int n, cap;
 };
 
@@ -539,8 +625,7 @@ static int inv_collect(const str *key, const str *val,
 	return 0;
 }
 
-/* S421: newest-written first - the keys a client is likeliest to ask for
- * next come back first */
+/* newest-written first: the keys a client is likeliest to ask for next come back first */
 static int rw_cmp_desc(const void *a, const void *b)
 {
 	unsigned int x = *(const unsigned int *)a, y = *(const unsigned int *)b;
@@ -548,8 +633,7 @@ static int rw_cmp_desc(const void *a, const void *b)
 	return x < y ? 1 : x > y ? -1 : 0;
 }
 
-/* S421: the names of the records a gap dropped go on the re-warm list
- * (the 't' ones: a 'g' is a key the upstream did not have), bounded by
+/* the names of the 't' records a gap dropped go on the re-warm list, bounded by
  * upstream_rewarm_max; the pacer (rewarm_tick) fetches them again */
 static void rewarm_queue(struct up_col *uc, struct inv_keys *ik)
 {
@@ -620,7 +704,7 @@ static void inv_apply_all(struct up_col *uc)
 	if (!nf)
 		return;
 	pcache_ht_iter_meta(nf, inv_collect, &ik);   /* collected, then dropped */
-	rm_begin(uc);                                      /* S435 */
+	rm_begin(uc);
 	for (i = 0; i < ik.n; i++) {
 		pc_verb_forget_local(nf, &ik.k[i]);
 		if (ht)
@@ -633,7 +717,7 @@ static void inv_apply_all(struct up_col *uc)
 			"written through are dropped here and fetched again from "
 			"the upstream when read\n", uc->name, ik.n);
 	if (ik.n && uc->rewarm_max > 0)
-		rewarm_queue(uc, &ik);         /* S421: or in the background */
+		rewarm_queue(uc, &ik);         /* or re-fetched in the background */
 	for (i = 0; i < ik.n; i++)
 		free(ik.k[i].s);
 	free(ik.k);
@@ -641,10 +725,8 @@ static void inv_apply_all(struct up_col *uc)
 	free(ik.wt);
 }
 
-/* S431: one name onto the re-warm list, under mx - a copy that a
- * tracking change flushed, or that was fetched while its server's tracking
- * was not up (it would live at most upstream_negative_ms).  1 queued, 0 not
- * (over upstream_rewarm_max: when read) */
+/* one name onto the re-warm list, under mx: a copy a tracking change flushed, or fetched while
+ * its server's tracking was not up; 1 queued, 0 not (over upstream_rewarm_max) */
 static int rewarm_add_locked(struct up_col *uc, const char *k, size_t kl)
 {
 	char *c;
@@ -679,13 +761,10 @@ static int rewarm_add_locked(struct up_col *uc, const char *k, size_t kl)
 	return 1;
 }
 
-static struct up_srv *pick_rw(struct up_col *uc);       /* S431 */
+static struct up_srv *pick_rw(struct up_col *uc, uint32_t allow);
 
-/* S421: the pacer - once a loop of an invalidation thread (at most once a
- * second when quiet): up to drain_rate names a second, never more than
- * 512 fetches queued at the upstreams, each name first checked against the
- * shadow (a client read may have fetched it already: skipped).  Under mx,
- * as join_key wants. */
+/* the pacer, once a loop of an invalidation thread: up to drain_rate names a second, at most
+ * RW_QUEUE_CAP fetches queued; a name a client read fetched already is skipped */
 #define RW_QUEUE_CAP 512
 static void rewarm_tick(struct up_col *uc)
 {
@@ -693,9 +772,8 @@ static void rewarm_tick(struct up_col *uc)
 	long long now, budget;
 	int queued = 0, i, started = 0, skipped = 0;
 
-	/* a gap seen before any worker registered (the start: the WAL's
-	 * records may have missed a change) waited for the first request's
-	 * drain - the re-warm needs it applied now, traffic or not */
+	/* a gap seen before any worker registered waited for the first request's drain;
+	 * the re-warm needs it applied now, traffic or not */
 	if (__atomic_load_n(&uc->inv_all_pending, __ATOMIC_ACQUIRE) &&
 	    inv_worker() >= 0 &&
 	    __atomic_exchange_n(&uc->inv_all_pending, 0, __ATOMIC_ACQ_REL))
@@ -710,13 +788,9 @@ static void rewarm_tick(struct up_col *uc)
 		pthread_mutex_unlock(&uc->mx);
 		return;
 	}
-	/* S431: not before a server's tracking is up.  This runs on each
-	 * server's invalidation thread, so at a start the first server up
-	 * began the run while another was still connecting: a name fetched
-	 * there was untracked (gone after upstream_negative_ms), or flushed
-	 * with that server's shadow when its tracking came up - counted done,
-	 * and the copy lost (upwritethroughtest 20 (a), 1 run in 4-5) */
-	if (!pick_rw(uc)) {
+	/* not before a server's tracking is up: at a start, a name fetched on a server still connecting
+	 * was untracked, or flushed when its tracking came up, and lost */
+	if (!pick_rw(uc, ~0u)) {
 		pthread_mutex_unlock(&uc->mx);
 		return;
 	}
@@ -729,11 +803,11 @@ static void rewarm_tick(struct up_col *uc)
 		return;
 	}
 	uc->rw_last_ms = now;
-	for (i = 0; i < uc->nsrv; i++)
+	for (i = 0; i < srv_n(uc); i++)
 		queued += uc->srv[i].queued;
 	if (budget > RW_QUEUE_CAP - queued)
 		budget = RW_QUEUE_CAP - queued;
-	uc->rw_dispatch = 1;               /* S431: join_key routes to pick_rw */
+	uc->rw_dispatch = 1;               /* join_key routes to pick_rw */
 	while (budget > 0 && uc->rw_head < uc->rw_n) {
 		str *k = &uc->rw[uc->rw_head++];
 		unsigned char fl = 0, mark = 0;
@@ -763,9 +837,21 @@ static void rewarm_tick(struct up_col *uc)
 	pthread_mutex_unlock(&uc->mx);
 }
 
-/* S385: the result being re-run on this worker (pc_upstream_drain sets it
- * for the one completion it hands to proto; the gate takes it once) */
+/* the result being re-run on this worker (pc_upstream_drain sets it for the one completion it
+ * hands to proto; the gate takes it once) */
 static __thread struct up_done *wt_cur;
+/* the copies that found no room, for the request being re-run (the gate takes them once,
+ * as rl_live, until the next gate or the drain) */
+static __thread struct pcache_relay *rl_cur;
+static __thread struct pcache_relay *rl_live;
+
+static void relay_drop(void)
+{
+	if (rl_live) {
+		rl_live = NULL;
+		pcache_ht_set_relay(NULL, NULL);
+	}
+}
 
 void pc_upstream_drain(int worker)
 {
@@ -775,7 +861,7 @@ void pc_upstream_drain(int worker)
 
 	if (worker < 0 || worker >= wq_n)
 		return;
-	/* AR1: a tracking gap no worker could take when it was seen */
+	/* a tracking gap no worker could take when it was seen */
 	for (i = 0; i < ncols; i++)
 		if (__atomic_load_n(&up_cols[i].inv_all_pending, __ATOMIC_ACQUIRE) &&
 		    __atomic_exchange_n(&up_cols[i].inv_all_pending, 0,
@@ -784,9 +870,8 @@ void pc_upstream_drain(int worker)
 	w = &wq[worker];
 	for (;;) {
 		pthread_mutex_lock(&w->mx);
-		/* the wake fd fires for the cluster and pub/sub too: most
-		 * drains find nothing - and a queue never posted to has no
-		 * buffer (memcpy from NULL, even of nothing, is undefined) */
+		/* the wake fd fires for the cluster and pub/sub too: most drains find nothing,
+		 * and a queue never posted to has no buffer (memcpy from NULL is undefined) */
 		if (!w->n) {
 			pthread_mutex_unlock(&w->mx);
 			return;
@@ -828,15 +913,13 @@ void pc_upstream_drain(int worker)
 				continue;
 			}
 			if (buf[i].kind == UPD_WT) {
-				/* S385: the fleet takes Redis's state of the keys
-				 * first, then the parked command answers - with
-				 * Redis's reply, handed over in wt_cur */
+				/* the fleet takes Redis's state of the keys first, then the parked
+				 * command answers with Redis's reply, handed over in wt_cur */
 				if (buf[i].col >= 0 && buf[i].col < ncols)
 					wt_apply(&up_cols[buf[i].col], &buf[i]);
 				if (buf[i].fwd) {
-					/* 12nt: a peer's forwarded op - the owner
-					 * holds what Redis holds now; the asker
-					 * gets the ack on the cluster thread */
+					/* a peer's forwarded op: the owner holds what Redis holds
+					 * now; the asker gets the ack on the cluster thread */
 					fa_push(buf[i].fwd, &buf[i]);
 				} else {
 					wt_cur = &buf[i];
@@ -847,7 +930,11 @@ void pc_upstream_drain(int worker)
 				free(buf[i].val);
 				continue;
 			}
+			rl_cur = buf[i].relay;
 			pc_proto_upstream_complete(buf[i].id, buf[i].status);
+			rl_cur = NULL;
+			relay_drop();
+			relay_free(buf[i].relay);
 		}
 	}
 }
@@ -948,11 +1035,7 @@ static int jset_class(char *const *argv, const size_t *argl, int nargs)
 	return UPC_PLAIN;
 }
 
-/* join @k's single-flight entry (or start one and queue it); called with
- * uc->mx held.  @r the request waiting on it (NULL: none - a background
- * ownership check); @own: the fetch also decides whether this fleet now
- * owns the key (own_apply, on worker @own_worker). */
-/* ---- S382: the upstreams' shadow chain, and which upstream fetches --- */
+/* ---- the upstreams' shadow chain, and which upstream fetches --- */
 
 /* the first copy or marker of @k in any upstream's table: 0 found */
 static int sh_peek(struct up_col *uc, const str *k, unsigned char *fl,
@@ -960,7 +1043,7 @@ static int sh_peek(struct up_col *uc, const str *k, unsigned char *fl,
 {
 	int j;
 
-	for (j = 0; j < uc->nsrv; j++)
+	for (j = 0; j < srv_n(uc); j++)
 		if (pcache_ht_peek(uc->srv[j].shadow, k, fl, mark, exp) == 0)
 			return 0;
 	return -2;
@@ -972,17 +1055,13 @@ static void sh_remove(struct up_col *uc, const str *k)
 	int j;
 
 	rm_begin(uc);
-	for (j = 0; j < uc->nsrv; j++)
+	for (j = 0; j < srv_n(uc); j++)
 		pcache_ht_remove(uc->srv[j].shadow, k);
 	rm_end(uc);
 }
 
-/* what an upstream may do now - PC_UPS_*.  SERVE: it takes fetches.
- * UNKNOWN: not connected yet, so not known - it may, its first connect
- * checks.  FALLBACK: a master that upstream_master_fallback lets serve
- * while no replica does.  OFF: it cannot reach it, or it is a master (or
- * says nothing) where a replica is asked for, or its master link is down,
- * or it lags more than upstream_max_lag_ms */
+/* what an upstream may do now (PC_UPS_*): SERVE takes fetches, UNKNOWN is not connected yet,
+ * FALLBACK a master serving while no replica does, OFF unreachable/wrong role/link down/lagging */
 int srv_state(const struct up_srv *s)
 {
 	const struct up_col *uc = s->uc;
@@ -991,10 +1070,12 @@ int srv_state(const struct up_srv *s)
 
 	if (__atomic_load_n(&s->failing, __ATOMIC_RELAXED))
 		return PC_UPS_OFF;
-	/* S384: a ring of read-throughs (perfcached <-> perfcached, a fleet
-	 * reading its own VIP) is a fetch storm - refused unless allowed,
-	 * and then one hop at most (the fetcher's name, pc_conn_rt_fetcher) */
+	/* a ring of read-throughs (perfcached <-> perfcached, a fleet reading its own VIP) is a fetch
+	 * storm: refused unless allowed, and then one hop at most */
 	if (__atomic_load_n(&s->is_pc, __ATOMIC_RELAXED) && !uc->allow_pc)
+		return PC_UPS_OFF;
+	if (__atomic_load_n(&s->is_sentinel, __ATOMIC_RELAXED) ||
+	    __atomic_load_n(&s->gone, __ATOMIC_RELAXED))
 		return PC_UPS_OFF;
 	if (uc->role_req == PC_UP_ROLE_REPLICA) {
 		if (role == UPR_UNKNOWN && !__atomic_load_n(&s->checked_ms,
@@ -1034,7 +1115,11 @@ const char *srv_why(const struct up_srv *s)
 	if (__atomic_load_n(&s->failing, __ATOMIC_RELAXED))
 		return "unreachable";
 	if (__atomic_load_n(&s->is_pc, __ATOMIC_RELAXED) && !s->uc->allow_pc)
-		return "a perfcached: daisy-chaining off";       /* S384 */
+		return "a perfcached: daisy-chaining off";
+	if (__atomic_load_n(&s->gone, __ATOMIC_RELAXED))
+		return "gone from the topology";
+	if (__atomic_load_n(&s->is_sentinel, __ATOMIC_RELAXED))
+		return "a sentinel: the topology comes from it";
 	if (ro == UPR_MASTER)
 		return "a master";
 	if (ro != UPR_REPLICA)
@@ -1044,9 +1129,8 @@ const char *srv_why(const struct up_srv *s)
 	return "lagging";
 }
 
-/* under uc->mx: S382 part 2's order - the primary, then the list - and,
- * by tier, the first that serves, else one not reached yet, else a master
- * the fallback allows; @not left out (a retry); -1 none */
+/* under uc->mx: in failover order (the primary, then the list), by tier the first that serves,
+ * else one not reached yet, else a master the fallback allows; @not left out; -1 none */
 static int fo_first(struct up_col *uc, const struct up_srv *not)
 {
 	static const int tier[3] = { PC_UPS_SERVE, PC_UPS_UNKNOWN,
@@ -1054,7 +1138,7 @@ static int fo_first(struct up_col *uc, const struct up_srv *not)
 	int t, j;
 
 	for (t = 0; t < 3; t++)
-		for (j = -1; j < uc->nsrv; j++) {
+		for (j = -1; j < srv_n(uc); j++) {
 			int i = j < 0 ? uc->primary : j;
 
 			if (j >= 0 && i == uc->primary)
@@ -1086,13 +1170,8 @@ static void fo_switch(struct up_col *uc, int to)
 			uc->srv[from].addr, srv_why(&uc->srv[from]));
 }
 
-/* under uc->mx: failover's decision, on every pick and once a second.
- * The active one stays while it serves (or is not reached yet - at the
- * start the primary gets its first connect, not a switch away); when it
- * stops, or is the master while a replica serves again, the first in the
- * order takes over.  With upstream_preempt a primary that has served for
- * upstream_preempt_hold_s takes over again - not sooner, so a primary that
- * flaps does not drag the fetches back and forth */
+/* under uc->mx, on every pick and once a second: the active one stays while it serves (or is
+ * not reached yet); a preempting primary takes over only after serving for the hold time */
 static void fo_eval(struct up_col *uc)
 {
 	const struct up_srv *p = &uc->srv[uc->primary];
@@ -1125,17 +1204,32 @@ static void fo_eval(struct up_col *uc)
 		fo_switch(uc, best);
 }
 
-/* under uc->mx: the upstream a fetch goes to - of those that serve, the
- * one with the fewest fetches queued or running (a slow one gets fewer,
- * unlike round-robin); else one not known yet; else a master the fallback
- * allows; else NULL.  @not: one to leave out (a retry), or NULL */
+/* under uc->mx: the upstream a fetch goes to - of those that serve, the one with the fewest
+ * fetches queued or running; else one not known yet; else an allowed master; @not left out */
+static struct up_srv *pick_in(struct up_col *uc, const struct up_srv *not,
+		uint32_t allow);
+
 static struct up_srv *pick(struct up_col *uc, const struct up_srv *not)
+{
+	return pick_in(uc, not, ~0u);
+}
+
+/* in a Redis Cluster, among the servers of the key's shard */
+static struct up_srv *pick_key(struct up_col *uc, const char *k, size_t kl,
+		const struct up_srv *not)
+{
+	return pick_in(uc, not, uc->cluster ? cl_key_nodes(uc, k, kl, NULL) : ~0u);
+}
+
+/* @allow: the servers it may be (a bit per index) */
+static struct up_srv *pick_in(struct up_col *uc, const struct up_srv *not,
+		uint32_t allow)
 {
 	static const int order[3] = { PC_UPS_SERVE, PC_UPS_UNKNOWN,
 		PC_UPS_FALLBACK };
 	int o, j;
 
-	if (uc->mode == PC_UP_MODE_FAILOVER) {         /* S382 part 2 */
+	if (uc->mode == PC_UP_MODE_FAILOVER && !uc->cluster) {
 		int i;
 
 		fo_eval(uc);
@@ -1148,43 +1242,38 @@ static struct up_srv *pick(struct up_col *uc, const struct up_srv *not)
 	for (o = 0; o < 3; o++) {
 		struct up_srv *best = NULL;
 
-		for (j = 0; j < uc->nsrv; j++) {
-			struct up_srv *s = &uc->srv[(uc->rr + j) % uc->nsrv];
+		for (j = 0; j < srv_n(uc); j++) {
+			struct up_srv *s = &uc->srv[(uc->rr + j) % srv_n(uc)];
 
-			if (s == not || srv_state(s) != order[o])
+			if (s == not || !(allow & (1u << s->idx)) || srv_state(s) != order[o])
 				continue;
 			if (!best || s->queued + s->busy < best->queued + best->busy)
 				best = s;
 		}
 		if (best) {
-			uc->rr = (best->idx + 1) % uc->nsrv;
+			uc->rr = (best->idx + 1) % srv_n(uc);
 			return best;
 		}
 	}
 	return NULL;
 }
 
-/* S431: is @s's tracking up (or is tracking off for the collection) - a
- * copy fetched there now is tracked */
+/* is @s's tracking up (or tracking off for the collection): a copy fetched there now is tracked */
 static int srv_tracked(const struct up_srv *s)
 {
-	/* inv_ready, not inv_id: the id is published before tracking_moved()
-	 * flushes the server's shadow, and the re-warm runs on EVERY server's
-	 * invalidation thread - a copy routed here by another thread in that
-	 * instant was stored and flushed, and never queued again (rc9's ASan
-	 * core1 on GitHub, upwritethroughtest 20 (d): one copy) */
+	/* inv_ready, not inv_id: the id is published before tracking_moved() flushes the
+	 * shadow, so a copy routed here in that instant would be flushed and never queued again */
 	return !s->uc->tracking || __atomic_load_n(&s->inv_ready, __ATOMIC_ACQUIRE);
 }
 
-/* S431: the re-warm's pick - pick()'s order among the servers whose
- * tracking is up; NULL while none is (the run waits) */
-static struct up_srv *pick_rw(struct up_col *uc)
+/* the re-warm's pick: pick()'s order among the servers whose tracking is up; NULL while none is */
+static struct up_srv *pick_rw(struct up_col *uc, uint32_t allow)
 {
 	static const int order[3] = { PC_UPS_SERVE, PC_UPS_UNKNOWN,
 		PC_UPS_FALLBACK };
 	int o, j;
 
-	if (uc->mode == PC_UP_MODE_FAILOVER) {
+	if (uc->mode == PC_UP_MODE_FAILOVER && !uc->cluster) {
 		struct up_srv *s = pick(uc, NULL);
 
 		return s && srv_tracked(s) ? s : NULL;
@@ -1192,16 +1281,17 @@ static struct up_srv *pick_rw(struct up_col *uc)
 	for (o = 0; o < 3; o++) {
 		struct up_srv *best = NULL;
 
-		for (j = 0; j < uc->nsrv; j++) {
-			struct up_srv *s = &uc->srv[(uc->rr + j) % uc->nsrv];
+		for (j = 0; j < srv_n(uc); j++) {
+			struct up_srv *s = &uc->srv[(uc->rr + j) % srv_n(uc)];
 
-			if (srv_state(s) != order[o] || !srv_tracked(s))
+			if (!(allow & (1u << s->idx)) || srv_state(s) != order[o] ||
+			    !srv_tracked(s))
 				continue;
 			if (!best || s->queued + s->busy < best->queued + best->busy)
 				best = s;
 		}
 		if (best) {
-			uc->rr = (best->idx + 1) % uc->nsrv;
+			uc->rr = (best->idx + 1) % srv_n(uc);
 			return best;
 		}
 	}
@@ -1221,23 +1311,31 @@ static void enqueue(struct up_srv *s, struct up_key *e)
 	pthread_cond_signal(&s->cv);
 }
 
-/* S423 (AR13, 2026-10-20): the master among the listed upstreams, when its
- * ROLE says so and it is reachable; NULL else.  Under uc->mx */
-static struct up_srv *master_srv(struct up_col *uc)
+/* the master among the listed upstreams, when its ROLE says so and it is reachable;
+ * NULL else.  Under uc->mx */
+static struct up_srv *master_srv(struct up_col *uc, const char *k, size_t kl)
 {
-	int j;
+	int j, m = -1;
 
-	for (j = 0; j < uc->nsrv; j++) {
+	if (uc->cluster)                   /* the master of the key's shard */
+		cl_key_nodes(uc, k, kl, &m);
+	for (j = 0; j < srv_n(uc); j++) {
 		struct up_srv *s = &uc->srv[j];
+
+		if (uc->cluster && j != m)
+			continue;
 
 		if (__atomic_load_n(&s->role, __ATOMIC_RELAXED) == UPR_MASTER &&
 		    !__atomic_load_n(&s->failing, __ATOMIC_RELAXED) &&
+		    !__atomic_load_n(&s->gone, __ATOMIC_RELAXED) &&
 		    !(__atomic_load_n(&s->is_pc, __ATOMIC_RELAXED) && !uc->allow_pc))
 			return s;
 	}
 	return NULL;
 }
 
+/* join @k's single-flight entry (or start one and queue it), uc->mx held; @r the waiting
+ * request (NULL: none); @own: the fetch also decides ownership (own_apply on @own_worker) */
 static int join_key(struct up_col *uc, const char *k, size_t kl,
 		struct up_req *r, int own, int own_worker, int full)
 {
@@ -1267,25 +1365,22 @@ static int join_key(struct up_col *uc, const char *k, size_t kl,
 		e->tried = 0;
 		e->inv = 0;
 		e->rounds = 0;
-		e->rw = uc->rw_dispatch;           /* S431 */
+		e->unkept = NULL;
+		e->rw = uc->rw_dispatch;
 		e->next = uc->inflight;
 		uc->inflight = e;
 		{
-			/* S382: none serving - the first takes it, and fails it
-			 * fast as a single dead upstream does.  S423: inside the
-			 * echo window of this node's own write the key goes to the
-			 * master, which has the write by definition - a replica may
-			 * not yet (its lag), and its answer would be the older
-			 * value or none: a client read nil for the key it had just
-			 * set (AR13 on 245-247, ~4% of writes).  The echo refetch
-			 * and a read that misses in the window both come here */
+			/* none serving: the first takes it, and fails it fast.  In the echo window
+			 * of this node's own write the key goes to the master, which has the write */
 			struct up_srv *s = NULL;
+			uint32_t allow = uc->cluster ? cl_key_nodes(uc, k, kl, NULL) : ~0u;
 
+			e->ask = e->redirs = 0;
 			if (echo_hit(uc, k, kl) &&
-			    (s = master_srv(uc)) != NULL)
+			    (s = master_srv(uc, k, kl)) != NULL)
 				ST_ADD(uc->wt_echo_master, 1);
-			else if (!uc->rw_dispatch || !(s = pick_rw(uc)))
-				s = pick(uc, NULL);
+			else if (!uc->rw_dispatch || !(s = pick_rw(uc, allow)))
+				s = pick_in(uc, NULL, allow);
 			enqueue(s ? s : &uc->srv[0], e);
 		}
 	}
@@ -1306,9 +1401,8 @@ static int join_key(struct up_col *uc, const char *k, size_t kl,
 
 /* ---- ownership: the companion's no-fall entries ------------------------ */
 
-/* has this fleet written or deleted @k (a no-fall entry)?  Read on a
- * worker, in its turn - the companion's table is resolved by name each
- * time, so a resize of it is never a stale pointer */
+/* has this fleet written or deleted @k (a no-fall entry)?  On a worker; the companion is resolved
+ * by name each time, so a resize of it is never a stale pointer */
 static int nofall_has(struct up_col *uc, const str *k)
 {
 	pcache_htable_t *nf = pc_store_find(uc->nf, uc->nflen);
@@ -1323,9 +1417,8 @@ static int shadow_ok(void *ctx, const str *k)
 	return !nofall_has(ctx, k);
 }
 
-/* record that this fleet owns @k from here on, until the upstream's copy
- * would expire (@exp absolute ticks, 0 = it has none); the shadow's copy
- * of it goes.  A worker only: it is a write, logged and replicated. */
+/* this fleet owns @k from here on, until the upstream's copy would expire (@exp absolute ticks,
+ * 0 none); the shadow's copy goes.  A worker only: it is a logged, replicated write */
 static int nofall_put_m(struct up_col *uc, const str *k, unsigned int exp,
 		const char *m)
 {
@@ -1340,21 +1433,15 @@ static int nofall_put_m(struct up_col *uc, const str *k, unsigned int exp,
 	return 0;
 }
 
-/* the entry's value says who left it (AR1): "1" the fleet took the key
- * over (a client write under allow, a promote) - Redis may not have it;
- * "t" a write-through read-back found a value, "g" found it gone - Redis
- * holds that state, so a broadcast invalidation or a tracking gap may
- * drop it */
+/* who left the entry: "1" the fleet took the key over (Redis may not have it); "t"/"g" a write-through
+ * read-back found a value / found it gone, so an invalidation or a gap may drop it */
 static int nofall_put(struct up_col *uc, const str *k, unsigned int exp)
 {
 	return nofall_put_m(uc, k, exp, "1");
 }
 
-/* PROMOTE: the shadow's copy of @k becomes a record of the collection - a
- * real write, logged and replicated - before a command changes it, and
- * the key is the fleet's from here (a no-fall entry as long as the
- * upstream's copy lives).  0 done, -1 not (the copy went meanwhile, or
- * no memory). */
+/* PROMOTE: the shadow's copy of @k becomes a logged, replicated record before a command changes it,
+ * and the key is the fleet's from here; 0 done, -1 not (the copy went, or no memory) */
 static int promote(struct up_col *uc, pcache_htable_t *ht, const str *k)
 {
 	str v;
@@ -1364,11 +1451,11 @@ static int promote(struct up_col *uc, pcache_htable_t *ht, const str *k)
 
 	v.s = NULL;
 	v.len = 0;
-	for (j = 0; j < uc->nsrv; j++)                 /* S382: the chain */
+	for (j = 0; j < srv_n(uc); j++)                 /* the chain */
 		if (pcache_ht_fetch_full(uc->srv[j].shadow, k, &v, &exp, &fl,
 		        NULL) == 0)
 			break;
-	if (j == uc->nsrv)
+	if (j == srv_n(uc))
 		return -1;
 	if (fl & PCACHE_F_UPMARK) {
 		pkg_free(v.s);
@@ -1380,6 +1467,33 @@ static int promote(struct up_col *uc, pcache_htable_t *ht, const str *k)
 		return -1;
 	ST_ADD(uc->promoted, 1);
 	nofall_put(uc, k, exp);
+	return 0;
+}
+
+/* this re-run's relay of @k, NULL none */
+static const struct pcache_relay *relay_of(const str *k)
+{
+	const struct pcache_relay *r;
+
+	for (r = rl_live; r; r = r->next)
+		if (r->key.len == k->len && !memcmp(r->key.s, k->s, (size_t)k->len))
+			return r;
+	return NULL;
+}
+
+/* promote() from the copy that found no room (the relay): 0 taken over, 1 none relayed for @k,
+ * -1 not stored either */
+static int relay_promote(struct up_col *uc, pcache_htable_t *ht, const str *k)
+{
+	const struct pcache_relay *r = relay_of(k);
+
+	if (!r)
+		return 1;
+	if ((r->fl & PCACHE_F_UPMARK) || pc_verb_store_local(ht, k, r->val.s,
+	        (size_t)r->val.len, r->exp, r->fl) != 0)
+		return -1;
+	ST_ADD(uc->promoted, 1);
+	nofall_put(uc, k, r->exp);
 	return 0;
 }
 
@@ -1401,9 +1515,8 @@ static void own_apply(struct up_col *uc, const char *kp, size_t kl)
 	nofall_put(uc, &k, (fl & PCACHE_F_UPMARK) ? 0 : exp);
 }
 
-/* the drain sweep read a key (a worker): the fleet takes it over - a real
- * write and a no-fall entry, as a promotion makes - unless the fleet
- * already holds it, wrote it, or deleted it.  The fleet's version wins. */
+/* the drain sweep read a key (a worker): the fleet takes it over, as a promotion does, unless it
+ * already holds, wrote or deleted it - the fleet's version wins */
 static void pull_apply(struct up_col *uc, const struct up_done *d)
 {
 	pcache_htable_t *ht = pc_store_find(uc->name, uc->nlen);
@@ -1418,7 +1531,7 @@ static void pull_apply(struct up_col *uc, const struct up_done *d)
 		return;
 	}
 	if (pcache_ht_probe_main(ht, &k, NULL) == 0 ||
-	    (nofall_has(uc, &k) && !nofall_bare_t(uc, &k))) {      /* S404 */
+	    (nofall_has(uc, &k) && !nofall_bare_t(uc, &k))) {
 		ST_ADD(uc->dr_owned, 1);
 		return;
 	}
@@ -1430,9 +1543,8 @@ static void pull_apply(struct up_col *uc, const struct up_done *d)
 	ST_ADD(uc->dr_pulled, 1);
 }
 
-/* deletes and expiries: on a LOCAL key whose ownership was never decided,
- * the upstream is asked first - otherwise the key would read through to
- * the upstream's copy the moment it is gone here */
+/* deletes and expiries: a LOCAL key whose ownership was never decided asks the upstream first,
+ * else it would read through to the upstream's copy the moment it is gone here */
 static int deletes_key(const char *c, size_t cl)
 {
 	return name_is(c, cl, "DEL") || name_is(c, cl, "UNLINK") ||
@@ -1449,9 +1561,8 @@ static void wrongtype(struct pc_jw *out)
 	pc_jw_lit(out, "\r\n");
 }
 
-/* the class of a command named @c (RESP, or an H command inside a binary
- * hcmd) with its arguments; *@del: it deletes or re-arms the key; *@all:
- * every argument from 1 is a key.  UPC_NONE: never falls through. */
+/* the class of command @c (RESP, or an H command inside a binary hcmd); *@del: it deletes or
+ * re-arms the key; *@all: every argument from 1 is a key.  UPC_NONE: never falls through */
 int pc_upstream_cmd_class(const char *c, size_t cl, char *const *argv,
 		const size_t *argl, int nargs, int *del, int *all)
 {
@@ -1472,7 +1583,7 @@ int pc_upstream_cmd_class(const char *c, size_t cl, char *const *argv,
 	return cls;
 }
 
-/* the read-through gate (S331); S385's write-through gate is wt_gate */
+/* the read-through gate; the write-through gate is wt_gate */
 static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 		int cls, int del, const char *const *keys, const size_t *kl,
 		int nkeys, int verdict, struct pc_upg *g)
@@ -1480,11 +1591,8 @@ static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 	struct up_col *uc;
 	struct up_req *r;
 	int i, nj = 0, nbg = 0, need = 0;
-	/* pass 1 decides (and does the local writes - promotion, no-fall -
-	 * with no lock held); pass 2 joins what must be fetched under ONE
-	 * hold of the lock.  The door parks the request after this returns:
-	 * a completion is drained on this same worker, which is busy until
-	 * the door is done, so it cannot arrive first. */
+	/* pass 1 decides (and does the local writes, no lock held); pass 2 joins the fetches
+	 * under one hold of the lock.  The completion drains on this busy worker: never first */
 	int *jk = NULL, *jown = NULL, *bg = NULL;
 
 	memset(g, 0, sizeof *g);
@@ -1493,10 +1601,8 @@ static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 	uc = col_of(col, collen);
 	if (!uc)
 		return PC_UPG_PROCEED;
-	/* S348: a collection that only mirrors its upstream refuses every
-	 * write here, before the gate's own local writes (promotion, no-fall)
-	 * - a write that landed would make the key this fleet's and Redis'
-	 * later changes to it would never reach the readers */
+	/* a collection that only mirrors its upstream refuses every write, before the gate's own local
+	 * writes: a landed write would make the key the fleet's and hide Redis's later changes */
 	if (uc->refuse && (cls == UPC_MUTATE || cls == UPC_PLAIN || del)) {
 		ST_ADD(uc->writes_refused, 1);
 		g->err = uc->refuse_msg;
@@ -1512,19 +1618,14 @@ static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 		k.len = (int)kl[i];
 		if (!allowed(uc, keys[i], kl[i]))
 			continue;
-		/* 12nt (0.7.1): in shard mode a key this node does not own is the
-		 * owner's to fetch, in spread one this node does not hold is its
-		 * K holders' - the read pulls it from there (op_get_miss) and the
-		 * holder's pull handler runs the fetch.  Nothing here. */
+		/* in shard mode a key this node does not own, in spread one it does not hold, is
+		 * fetched by the owner or K holders: the read pulls it from there (op_get_miss) */
 		if ((cls == UPC_READ || cls == UPC_PROBE) &&
 		    through_elsewhere(ht, col, collen, keys[i], kl[i]))
 			continue;
 		if (pcache_ht_probe_main(ht, &k, NULL) == 0) {
-			/* a local key: it answers.  Only a delete or an expiry
-			 * of one whose ownership was never decided asks the
-			 * upstream first (and records a no-fall entry if the
-			 * upstream has it) - else the upstream's copy would
-			 * read through the moment it is gone here */
+			/* a local key answers; a delete or expiry of one never decided asks the
+			 * upstream first (deletes_key) */
 			if (!del || nofall_has(uc, &k))
 				continue;
 			sh = pcache_ht_shadow_peek(ht, &k, &fl, &mark, &exp);
@@ -1550,7 +1651,7 @@ static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 			own = 1;
 			goto fetch;
 		}
-		if (nofall_has(uc, &k) && !nofall_bare_t(uc, &k)) {   /* S404 */
+		if (nofall_has(uc, &k) && !nofall_bare_t(uc, &k)) {
 			ST_ADD(uc->nofall_hits, 1);
 			continue;                  /* the fleet's: no fall-through */
 		}
@@ -1579,19 +1680,14 @@ static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 				continue;
 			}
 			if (cls == UPC_PLAIN) {
-				/* overwriting a key the upstream holds as
-				 * something this collection cannot - owned from
-				 * here, for as long as that copy may live */
+				/* overwriting a key the upstream holds as something this
+				 * collection cannot: owned for as long as that copy may live */
 				nofall_put(uc, &k, 0);
 				continue;
 			}
 			if (mark == PCACHE_UPMARK_PRESENT) {
-				/* ST2: the upstream has it, its value unread.
-				 * A probe is answered by the marker; a read or
-				 * a change needs the value - fetched, also on a
-				 * re-run (a GET that joined a probe's fetch too
-				 * late is queued again by finish(); this covers
-				 * the marker coming back between the two) */
+				/* the upstream has it, its value unread: a probe is answered by
+				 * the marker; a read or a change fetches the value, on a re-run too */
 				if (cls == UPC_PROBE) {
 					ST_ADD(uc->present_hits, 1);
 					continue;
@@ -1618,22 +1714,28 @@ static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 		}
 		/* nothing known about it */
 		if (cls == UPC_PLAIN) {
-			/* a plain write does not wait: the ownership check runs
-			 * in the background, and records a no-fall entry if
-			 * the upstream has the key */
+			/* a plain write does not wait: the ownership check runs in the background
+			 * and records a no-fall entry if the upstream has the key */
 			if (!bg && !(bg = malloc((size_t)nkeys * sizeof *bg)))
 				continue;
 			bg[nbg++] = i;
 			continue;
 		}
 		if (verdict != PC_UPV_NONE) {
-			/* the run after a completion: a key still unknown is
-			 * not fetched again.  A mutation never runs on a guess */
+			/* the run after a completion: a key still unknown is not fetched again;
+			 * a mutation never runs on a guess */
 			if (verdict == PC_UPV_ERROR &&
 			    (uc->on_error == PC_UP_ON_ERROR_ERROR ||
 			     cls == UPC_MUTATE)) {
 				g->err = "upstream: the read-through fetch failed "
 					"(upstream unreachable or timed out)";
+				goto answered;
+			}
+			/* fetched with no room for the copy: a read is answered from the relay,
+			 * a change takes it over first */
+			if (cls == UPC_MUTATE && relay_promote(uc, ht, &k) < 0) {
+				g->err = "upstream: no room in the arena for the "
+					"fetched value - not changed";
 				goto answered;
 			}
 			continue;
@@ -1702,7 +1804,7 @@ answered:
 	return PC_UPG_ANSWERED;
 }
 
-/* S385: what the read-back of a RESP write asks first */
+/* what the read-back of a RESP write asks first */
 static int resp_guess(const char *c, size_t cl)
 {
 	if (cl >= 5 && !strncasecmp(c, "JSON.", 5))
@@ -1730,29 +1832,14 @@ static void resp_answer(struct pc_jw *out, const struct pc_upg *g)
 	}
 }
 
-/* S435: the read this worker's gate last let through - its collection and
- * the removals done before it looked (on the run after a fetch: when the
- * gate parked it).  pc_upstream_resp_lost takes it once */
+/* the read this worker's gate last let through: its collection and the removals done before it
+ * looked.  pc_upstream_resp_lost takes it once */
 static __thread struct up_col *lost_uc;
+static __thread struct up_col *spent_uc;   /* the collection a lost read was last found in */
 static __thread unsigned long long lost_end0;
 
-/* S435: did a read the gate let through lose a key before its handler
- * read it?  The gate looks (a record, a copy) and the handler reads after
- * it, with no lock between: an invalidation (any tracked server's echo of
- * a write takes the key's copies from every server's shadow), an echo's
- * record drop on another worker, or a flush can take the key in between,
- * and the handler answered nil for a key Redis holds - upechomastertest A
- * and B, 1 key in 40 on some runs, each just after a replica's echo.  The
- * run after a fetch is the other door: its key is not fetched again by
- * rule, and a change that took the fresh copy before the run left it
- * unknown.  1: a key the command reads is now unknown here (no record, no
- * no-fall entry, no copy or marker) and a removal overlapped the read (or
- * on the run after a fetch, since the command parked) - the caller drops
- * the reply and gates the command again.  A key left unknown by the fetch
- * itself (absent under upstream_negative_ms = 0, a fill that found no
- * room) with nothing removed meanwhile is its answer, not a loss.  Pure
- * reads only (GET, MGET, the probes, the hash reads, JSON.GET); one atomic
- * load when no removal overlapped. */
+/* did a read the gate let through lose a key before its handler read it (no lock between: an
+ * invalidation or a flush can land there)?  1: a read key is now unknown and a removal overlapped */
 int pc_upstream_resp_lost(pcache_htable_t *ht, const char *col, size_t collen,
 		char *const *argv, const size_t *argl, int nargs)
 {
@@ -1762,7 +1849,7 @@ int pc_upstream_resp_lost(pcache_htable_t *ht, const char *col, size_t collen,
 
 	lost_uc = NULL;
 	if (off < 0) {
-		/* tests only: the defect shown (upechomastertest F) */
+		/* tests only: the lost-read check off, to show the defect */
 		off = getenv("PERFCACHED_TEST_LOST_OFF") != NULL;
 		if (off)
 			LM_WARN("upstream: PERFCACHED_TEST_LOST_OFF - a read that "
@@ -1780,6 +1867,7 @@ int pc_upstream_resp_lost(pcache_htable_t *ht, const char *col, size_t collen,
 	for (i = 1; i <= n; i++) {
 		unsigned char fl = 0, mark = 0;
 		unsigned int exp = 0;
+		int m;
 		str k;
 
 		/* the gate's own skips: outside the prefixes, another node's */
@@ -1788,18 +1876,29 @@ int pc_upstream_resp_lost(pcache_htable_t *ht, const char *col, size_t collen,
 			continue;
 		k.s = argv[i];
 		k.len = (int)argl[i];
-		if (pcache_ht_probe_main(ht, &k, NULL) == 0 || nofall_has(uc, &k) ||
-		    pcache_ht_shadow_peek(ht, &k, &fl, &mark, &exp) == 0)
+		/* a "t" mark alone is a record an echo is dropping, not the key */
+		m = nofall_mark(uc, &k);
+		if (pcache_ht_probe_main(ht, &k, NULL) == 0 || (m && m != 't') ||
+		    pcache_ht_shadow_peek(ht, &k, &fl, &mark, &exp) == 0 ||
+		    relay_of(&k))                  /* answered from the relay */
 			continue;                  /* known here: the answer stands */
 		ST_ADD(uc->read_lost, 1);
+		spent_uc = uc;
 		return 1;
 	}
 	return 0;
 }
 
-/* S435, tests only: PERFCACHED_TEST_GATE_DELAY_US=<us> holds a read the
- * gate let through that long before its handler runs - the window a
- * removal must land in, made wide (upechomastertest F) */
+/* the lost read just found is not gated again: its retries are spent */
+void pc_upstream_lost_spent(void)
+{
+	if (spent_uc)
+		ST_ADD(spent_uc->read_lost_spent, 1);
+	spent_uc = NULL;
+}
+
+/* tests only: PERFCACHED_TEST_GATE_DELAY_US=<us> holds a read the gate let through that long
+ * before its handler runs, widening the window a removal must land in */
 void pc_upstream_test_pause(void)
 {
 	static int us = -1;
@@ -1833,20 +1932,20 @@ int pc_upstream_resp_gate(pcache_htable_t *ht, const char *col, size_t collen,
 	char ttl[24];
 	unsigned long long end0 = 0;
 
-	lost_uc = NULL;                    /* S435 */
+	lost_uc = NULL;
+	relay_drop();                      /* a pipelined command after the re-run */
 	if (!ncols || nargs < 2)
 		return PC_UPG_PROCEED;
 	verdict = pc_conn_upstream_verdict(conn);
 	cls = pc_upstream_cmd_class(argv[0], argl[0], argv, argl, nargs, &del,
 		&all);
 	uc = col_of(col, collen);
-	/* S435: the removals done before the gate looks - read first */
+	/* the removals done before the gate looks: read first */
 	if (uc && (cls == UPC_READ || cls == UPC_PROBE) && !del)
 		end0 = __atomic_load_n(&uc->rm_end, __ATOMIC_ACQUIRE);
 	if (uc && uc->through) {
-		/* S385: writes go to the master.  A write this gate does not
-		 * class (perfcached's own: its lock scripts, its rate limiter)
-		 * has no meaning there and would change the fleet only */
+		/* writes go to the master; a write this gate does not class (perfcached's own:
+		 * lock scripts, rate limiter) means nothing there and would change only the fleet */
 		if (cls == UPC_NONE && verdict != PC_UPV_WT) {
 			if (name_is(argv[0], argl[0], "EVAL") ||
 			    name_is(argv[0], argl[0], "EVALSHA") ||
@@ -1937,16 +2036,13 @@ int pc_upstream_resp_gate(pcache_htable_t *ht, const char *col, size_t collen,
 	if (rc == PC_UPG_HELD) {
 		pc_conn_upstream_hold(conn, g.req);
 		if (uc && (cls == UPC_READ || cls == UPC_PROBE) && !del)
-			pc_conn_upstream_set_mark(conn, end0);    /* S435 */
+			pc_conn_upstream_set_mark(conn, end0);
 	} else if (rc == PC_UPG_ANSWERED)
 		resp_answer(out, &g);
 	else if (uc && (cls == UPC_READ || cls == UPC_PROBE) && !del &&
 	         verdict != PC_UPV_ERROR) {
-		/* S435: for pc_upstream_resp_lost - on the run after a fetch,
-		 * what was removed since the command parked (the change that
-		 * took the fresh copy came before this run looked).  Not after
-		 * a failed fetch: on_error answered, and a re-gate would ask
-		 * the failing upstream twice more */
+		/* for pc_upstream_resp_lost: on the run after a fetch, what went since it parked.
+		 * Not after a failed fetch: on_error answered, and a re-gate would ask twice more */
 		lost_uc = uc;
 		lost_end0 = verdict == PC_UPV_OK ?
 			pc_conn_upstream_mark(conn) : end0;
@@ -1966,19 +2062,18 @@ static int rm_cb(const str *key, const str *val,
 	return 0;
 }
 
-/* everything an upstream's shadow holds goes: an invalidation from it may
- * have been missed (its tracking connection was lost) - the next read
- * fetches afresh.  S382: that upstream's copies, no other's */
+/* everything an upstream's shadow holds goes (that upstream's copies, no other's): an invalidation
+ * from it may have been missed - the next read fetches afresh */
 void flush_shadow(struct up_srv *s)
 {
-	rm_begin(s->uc);                                   /* S435 */
+	rm_begin(s->uc);
 	pcache_ht_iter_meta(s->shadow, rm_cb, s->shadow);
 	rm_end(s->uc);
 	ST_ADD(s->uc->flushes, 1);
 	ST_ADD(s->flushes, 1);
 }
 
-/* S431: the names of a shadow's value copies (its marks left out) */
+/* the names of a shadow's value copies (its marks left out) */
 struct name_list {
 	str *k;
 	int n, cap;
@@ -2010,12 +2105,8 @@ static int name_collect(const str *key, const str *val,
 	return 0;
 }
 
-/* an upstream's invalidation connection changed (lost, or newly up): its
- * fetch connections must re-arm toward the new one, and what was fetched
- * under the old one may have missed an invalidation.  S431: on a through
- * collection the copies the flush drops are fetched again in the
- * background, as a restart's are (S421) - before, a lost tracking
- * connection left them to the next read */
+/* an upstream's invalidation connection changed: its fetch connections re-arm, and what was fetched
+ * may have missed an invalidation; on a through collection the flushed copies are re-warmed */
 static void tracking_moved(struct up_srv *s)
 {
 	struct up_col *uc = s->uc;
@@ -2023,7 +2114,7 @@ static void tracking_moved(struct up_srv *s)
 	int i, q = 0;
 
 	__atomic_add_fetch(&s->inv_gen, 1, __ATOMIC_ACQ_REL);
-	if (uc->through && uc->rewarm_max > 0)    /* S421's scope */
+	if (uc->through && uc->rewarm_max > 0)
 		pcache_ht_iter_meta(s->shadow, name_collect, &nl);
 	flush_shadow(s);
 	if (nl.n) {
@@ -2039,17 +2130,11 @@ static void tracking_moved(struct up_srv *s)
 		free(nl.k[i].s);
 	free(nl.k);
 	if (uc->through)
-		inv_post_all(uc);              /* AR1: so may the records written */
+		inv_post_all(uc);              /* the records written through may have missed one too */
 }
 
-/* S424 (AR13, 2026-10-20): an invalidation of @k (all keys: @k NULL)
- * while a fetch of it is in flight.  The fetch may have read the value
- * BEFORE the change, and its reply - on the fetch connection - may land
- * after this push (on the invalidation connection) was handled: the copy
- * it stores would be older than Redis's, and nothing invalidates it again
- * (245, 14:07:40: the previous value served 500 ms and more after a
- * write).  The entry is marked; when its fetch completes, the copy goes
- * and the key is fetched again (conn_main) */
+/* an invalidation of @k (all keys: @k NULL) while a fetch of it is in flight: the fetch may have read
+ * the older value and land after this push, so the entry is marked and its copy refetched (conn_main) */
 static void inflight_inv(struct up_col *uc, const char *k, size_t kl)
 {
 	struct up_key *e;
@@ -2064,10 +2149,8 @@ static void inflight_inv(struct up_col *uc, const char *k, size_t kl)
 	pthread_mutex_unlock(&uc->mx);
 }
 
-/* push messages (RESP3 '>') between replies.  ["invalidate", [keys]] drops
- * those keys from the shadow; ["invalidate", null] (a FLUSHALL upstream)
- * drops everything; "tracking-redir-broken" on a fetch connection means
- * its invalidations have nowhere to go - it re-arms */
+/* push messages (RESP3 '>') between replies: "invalidate" drops the keys (null: everything, a
+ * FLUSHALL); "tracking-redir-broken" on a fetch connection makes it re-arm */
 void on_push(struct uconn *c, struct rv *v)
 {
 	struct up_col *uc = c->uc;
@@ -2082,9 +2165,9 @@ void on_push(struct uconn *c, struct rv *v)
 
 		if (!ks || ks->t == '_') {
 			flush_shadow(c->s);        /* a FLUSHALL: each says it */
-			inflight_inv(uc, NULL, 0);                  /* S424 */
+			inflight_inv(uc, NULL, 0);
 			if (uc->through)
-				inv_post_all(uc);      /* AR1 */
+				inv_post_all(uc);
 			return;
 		}
 		for (i = 0; i < ks->nel; i++) {
@@ -2094,12 +2177,12 @@ void on_push(struct uconn *c, struct rv *v)
 				continue;
 			k.s = ks->el[i].s;
 			k.len = (int)ks->el[i].len;
-			/* S382: changed upstream - a copy from any of them is
-			 * stale; each tracking connection says so for its own */
+			/* changed upstream: a copy from any of them is stale; each tracking
+			 * connection says so for its own */
 			sh_remove(uc, &k);
-			inflight_inv(uc, k.s, (size_t)k.len);       /* S424 */
+			inflight_inv(uc, k.s, (size_t)k.len);
 			if (uc->through)
-				inv_post(uc, k.s, (size_t)k.len);   /* AR1 */
+				inv_post(uc, k.s, (size_t)k.len);
 			ST_ADD(uc->invalidations, 1);
 			ST_ADD(c->s->invalidations, 1);
 		}
@@ -2109,10 +2192,6 @@ void on_push(struct uconn *c, struct rv *v)
 		c->gen = (unsigned int)-1;     /* re-arm before the next fetch */
 }
 
-/* read ONE reply (pushes handled in between).  0 ok, -1 error, -2 timeout,
- * -3 a value too large to hold (the connection must be dropped).  S385:
- * @sp/@ep, when given, the reply's bytes in c->buf [*sp, *ep) - valid until
- * the next read - for a relay that copies them as they came */
 /* ---- one fetch --------------------------------------------------------- */
 
 /* a DURATION (ms) as an expiry tick - the negative cache, a cover window:
@@ -2128,15 +2207,8 @@ static unsigned int ttl_ticks(long long ms)
 	return get_ticks() + (unsigned int)s;
 }
 
-/* S449: an upstream KEY's time left (PTTL, ms) as its copy's expiry tick -
- * the last tick boundary at or before the key's deadline, so the copy never
- * outlives the key and keeps all but the deadline's fraction of a tick.
- * ttl_ticks rounded the seconds up, on a tick up to a second old: a copy -
- * an EXISTS's present mark among them - answered for up to a second after
- * Redis had expired the key (staging 2026-10-25, a registration's
- * device_info: EXISTS 1 from the copy, then JSON.SET $.status refused, "new
- * objects must be created at the root").  A deadline inside the current
- * tick: that tick, which reads expired - nothing held for that fraction */
+/* an upstream KEY's time left (PTTL, ms) as its copy's expiry tick: the last tick boundary at or
+ * before the key's deadline, so the copy never outlives the key (ttl_ticks would round up) */
 static unsigned int pttl_ticks(long long ms)
 {
 	unsigned int e = compat_ticks_deadline(ms);
@@ -2158,22 +2230,38 @@ static void put_mark(struct up_srv *s, const str *k, char mark)
 		ttl_ticks(uc->neg_ms > 0 ? uc->neg_ms : 1000), PCACHE_F_UPMARK);
 }
 
-/* a copy no invalidation can reach (tracking configured, but this fetch
- * was not tracked, or the tracking moved while it ran) lives no longer
- * than upstream_negative_ms: stale for at most that */
+/* a copy no invalidation can reach (this fetch untracked, or the tracking moved while it ran)
+ * lives no longer than upstream_negative_ms: stale for at most that */
 static __thread int fill_capped;
+static __thread int fill_gen_set;      /* fill_gen is this fetch's generation */
+static __thread unsigned int fill_gen;
 
-/* ST2: the upstream has @k (TYPE said @tfl's type), its value not read.
- * It lives as a copy would: the upstream's expiry, an invalidation drops
- * it, and an untracked fetch caps it at upstream_negative_ms. */
-static void put_present(struct up_srv *s, const str *k, unsigned char tfl,
-		unsigned int exp)
+/* capped: untracked, or the server's tracking moved (or it left the topology) while out */
+static int fill_cap_now(struct up_srv *s)
+{
+	return fill_capped || (fill_gen_set && s->uc->tracking &&
+		fill_gen != __atomic_load_n(&s->inv_gen, __ATOMIC_ACQUIRE));
+}
+
+/* the fill found no room: the copy goes to the commands waiting for it instead (one per fetch:
+ * a refetch replaces it) */
+static void keep_unkept(struct up_key *e, const str *k, const str *v,
+		unsigned int exp, unsigned char fl)
+{
+	relay_free(e->unkept);
+	e->unkept = relay_new(k, v, exp, fl, pc_lamport_tick());
+}
+
+/* the upstream has @k (TYPE said @tfl's type), its value not read; it lives as a copy would
+ * (the upstream's expiry, invalidations, the untracked cap) */
+static void put_present(struct up_srv *s, struct up_key *e, const str *k,
+		unsigned char tfl, unsigned int exp)
 {
 	struct up_col *uc = s->uc;
 	char b[2] = { PCACHE_UPMARK_PRESENT, (char)tfl };
 	str v;
 
-	if (fill_capped) {
+	if (fill_cap_now(s)) {
 		unsigned int cap = ttl_ticks(uc->neg_ms > 0 ? uc->neg_ms : 1000);
 
 		if (!exp || exp > cap)
@@ -2184,23 +2272,25 @@ static void put_present(struct up_srv *s, const str *k, unsigned char tfl,
 	v.len = 2;
 	if (pcache_ht_store_ex(s->shadow, k, &v, exp, PCACHE_F_UPMARK) == 0)
 		ST_ADD(uc->fill_present, 1);
-	else
+	else {
 		ST_ADD(uc->fill_failed, 1);
+		keep_unkept(e, k, &v, exp, PCACHE_F_UPMARK);
+	}
 }
 
 #define UPF_FINAL   1                  /* what any waiter needs is stored */
-#define UPF_PRESENT 2                  /* only a PRESENT marker (ST2) */
+#define UPF_PRESENT 2                  /* only a PRESENT marker */
 
-/* a fetched value into the shadow.  The store refuses a value over the
- * cell ceiling (a marker, so it is not fetched again) and an arena with no
- * room (nothing stored: counted, and the command runs as a miss). */
-static void store_fill(struct up_srv *s, const str *k, const str *v,
-		unsigned int exp, unsigned char fl, unsigned long long *ok_ctr)
+/* a fetched value into the shadow: over the cell ceiling it becomes a marker (not fetched again);
+ * an arena with no room stores nothing and the value is relayed to the waiters */
+static void store_fill(struct up_srv *s, struct up_key *e, const str *k,
+		const str *v, unsigned int exp, unsigned char fl,
+		unsigned long long *ok_ctr)
 {
 	struct up_col *uc = s->uc;
 	int rc;
 
-	if (fill_capped) {
+	if (fill_cap_now(s)) {
 		unsigned int cap = ttl_ticks(uc->neg_ms > 0 ? uc->neg_ms : 1000);
 
 		if (!exp || exp > cap)
@@ -2211,9 +2301,10 @@ static void store_fill(struct up_srv *s, const str *k, const str *v,
 
 	if (rc == 0)
 		ST_ADD(*ok_ctr, 1);
-	else if (rc == -2)
+	else if (rc == -2) {
 		ST_ADD(uc->fill_failed, 1);
-	else {
+		keep_unkept(e, k, v, exp, fl);
+	} else {
 		put_mark(s, k, PCACHE_UPMARK_TOOBIG);
 		ST_ADD(uc->toobig, 1);
 	}
@@ -2273,8 +2364,61 @@ static long hash_record(const struct rv *v, unsigned char **out)
 	return (long)n;
 }
 
-/* fetch @k into the shadow.  0 ok (a value or a marker stored), -1 the
- * connection failed, -2 timed out */
+/* an -ASK sent the key here: each of its commands goes after ASKING, whose +OK is read past */
+static int send_ask(struct uconn *c, long long dl, int ask, int argc,
+		const char *const *av, const size_t *al)
+{
+	static const char *const as[1] = { "ASKING" };
+	static const size_t asl[1] = { 6 };
+
+	if (ask && send_cmd(c, dl, 1, as, asl) != 0)
+		return -1;
+	return send_cmd(c, dl, argc, av, al);
+}
+
+static int read_ask(struct uconn *c, struct rv *v, long long dl, int ask)
+{
+	int rc;
+
+	if (ask) {
+		if ((rc = read_reply(c, v, dl)) != 0)
+			return rc;
+		rv_free(v);
+		memset(v, 0, sizeof *v);
+	}
+	return read_reply(c, v, dl);
+}
+
+/* a Redis Cluster's answer for a key not here: 1 -MOVED or -ASK (the target in @e; an empty host
+ * is @cur's), 2 -TRYAGAIN, -CLUSTERDOWN or an unparsable redirect, 0 neither */
+static int cluster_err(const struct rv *v, struct up_key *e, const char *cur)
+{
+	char t[160], *sp, *col;
+	int ask;
+
+	if (v->t != '-' || !v->s)
+		return 0;
+	snprintf(t, sizeof t, "%.*s", (int)(v->len < sizeof t - 1 ? v->len : sizeof t - 1),
+		v->s);
+	if (!strncmp(t, "TRYAGAIN", 8) || !strncmp(t, "CLUSTERDOWN", 11))
+		return 2;
+	ask = !strncmp(t, "ASK ", 4);
+	if (!ask && strncmp(t, "MOVED ", 6))
+		return 0;
+	sp = strchr(t + (ask ? 4 : 6), ' ');
+	col = sp ? strrchr(sp + 1, ':') : NULL;
+	if (!col || (size_t)(col - sp - 1) >= sizeof e->rhost || atoi(col + 1) <= 0 ||
+	    atoi(col + 1) > 65535 || (col == sp + 1 && strlen(cur) >= sizeof e->rhost))
+		return 2;
+	*col = 0;
+	snprintf(e->rhost, sizeof e->rhost, "%.63s", col == sp + 1 ? cur : sp + 1);
+	e->rport = atoi(col + 1);
+	e->ask = ask;
+	return 1;
+}
+
+/* fetch @k into the shadow: 0 ok (a value or a marker stored), -1 the connection failed,
+ * -2 timed out, -5 redirected (the target in @e), -6 the cluster cannot answer now */
 static int fetch(struct uconn *c, struct up_key *e)
 {
 	const char *kp = e->key;
@@ -2284,7 +2428,7 @@ static int fetch(struct uconn *c, struct up_key *e)
 	long long t0 = now_ms(), dl = t0 + uc->timeout_ms;
 	struct rv ty, tt, gv;
 	str k, v;
-	int rc;
+	int rc, ce, ask = e->ask;              /* kept for a refetch here; a retry elsewhere clears it */
 	unsigned int exp;
 	char tname[32];
 	size_t tn;
@@ -2292,6 +2436,8 @@ static int fetch(struct uconn *c, struct up_key *e)
 	k.s = (char *)kp;
 	k.len = (int)kl;
 	e->fetched = UPF_FINAL;
+	relay_free(e->unkept);             /* an earlier round's */
+	e->unkept = NULL;
 	/* tracking moved since this connection armed it: re-arm (a quiet
 	 * close - the gap was already flushed) */
 	if (c->fd >= 0 && uc->tracking && c->gen !=
@@ -2299,12 +2445,16 @@ static int fetch(struct uconn *c, struct up_key *e)
 		c->tracked = 0;
 		uc_close(c);
 	}
+	if (c->fd >= 0 && c->incarn != __atomic_load_n(&s->incarn, __ATOMIC_ACQUIRE))
+		uc_close(c);                   /* dialled another address */
 	if (c->fd < 0 && uc_connect(c, dl) != 0)
 		return -1;
 	{
 		unsigned int g0 = __atomic_load_n(&s->inv_gen, __ATOMIC_ACQUIRE);
 
 		fill_capped = uc->tracking && (!c->tracked || g0 != c->gen);
+		fill_gen = g0;
+		fill_gen_set = 1;
 	}
 	{
 		/* one round trip for the common case: TYPE, PTTL and GET
@@ -2313,25 +2463,42 @@ static int fetch(struct uconn *c, struct up_key *e)
 			*a3[2] = { "GET", kp };
 		size_t l1[2] = { 4, kl }, l2[2] = { 4, kl }, l3[2] = { 3, kl };
 
-		if (send_cmd(c, dl, 2, a1, l1) != 0 ||
-		    send_cmd(c, dl, 2, a2, l2) != 0 ||
-		    send_cmd(c, dl, 2, a3, l3) != 0)
+		if (send_ask(c, dl, ask, 2, a1, l1) != 0 ||
+		    send_ask(c, dl, ask, 2, a2, l2) != 0 ||
+		    send_ask(c, dl, ask, 2, a3, l3) != 0)
 			goto io;
 	}
 	memset(&ty, 0, sizeof ty);
 	memset(&tt, 0, sizeof tt);
 	memset(&gv, 0, sizeof gv);
-	if ((rc = read_reply(c, &ty, dl)) != 0)
+	if ((rc = read_ask(c, &ty, dl, ask)) != 0)
 		goto io_rc;
+	/* not here, or not now.  A redirect is followed in a cluster only: a perfcached door with
+	 * resp_redirect = moved names a node that is no upstream of this one */
+	if ((ce = cluster_err(&ty, e, s->host)) == 1 &&
+	    !__atomic_load_n(&uc->cluster, __ATOMIC_ACQUIRE)) {
+		ce = 2;
+		e->ask = ask;
+	}
+	if (ce) {
+		rv_free(&ty);
+		if ((rc = read_ask(c, &tt, dl, ask)) != 0)
+			goto io_rc;
+		rv_free(&tt);
+		if ((rc = read_ask(c, &gv, dl, ask)) != 0)
+			goto io_rc;
+		rv_free(&gv);
+		return ce == 1 ? -5 : -6;
+	}
 	/* the TYPE text NOW: a reply's strings point into the read buffer,
 	 * which the next read may reset or move */
 	tn = ty.t == '+' && ty.len < sizeof tname ? ty.len : 0;
 	memcpy(tname, ty.s ? ty.s : "", tn);
 	tname[tn] = 0;
 	rv_free(&ty);
-	if ((rc = read_reply(c, &tt, dl)) != 0)
+	if ((rc = read_ask(c, &tt, dl, ask)) != 0)
 		goto io_rc;
-	if ((rc = read_reply(c, &gv, dl)) != 0)
+	if ((rc = read_ask(c, &gv, dl, ask)) != 0)
 		goto io_rc;
 
 	if (tt.t == ':' && tt.n == -2) {
@@ -2340,7 +2507,7 @@ static int fetch(struct uconn *c, struct up_key *e)
 		rv_free(&gv);
 		goto done;
 	}
-	exp = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;   /* S449 */
+	exp = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;
 
 	if (!strcmp(tname, "none")) {
 		put_mark(s, &k, PCACHE_UPMARK_ABSENT);
@@ -2358,17 +2525,16 @@ static int fetch(struct uconn *c, struct up_key *e)
 		}
 		v.s = gv.s;
 		v.len = (int)gv.len;
-		store_fill(s, &k, &v, exp, 0, &uc->fill_string);
+		store_fill(s, e, &k, &v, exp, 0, &uc->fill_string);
 		rv_free(&gv);
 		goto done;
 	}
 	rv_free(&gv);
-	/* ST2: a hash or a document nobody waiting needs the value of (an
-	 * EXISTS, a TTL, a TYPE, an ownership check): what TYPE and PTTL said
-	 * is the answer - no second round trip, no value moved or stored */
+	/* a hash or a document nobody waiting needs the value of (EXISTS, TTL, TYPE, an ownership
+	 * check): TYPE and PTTL are the answer - no second round trip, no value stored */
 	if ((!strcmp(tname, "hash") || !strcmp(tname, "ReJSON-RL")) &&
 	    !__atomic_load_n(&e->full, __ATOMIC_ACQUIRE)) {
-		put_present(s, &k, !strcmp(tname, "hash") ? PCACHE_F_HASH
+		put_present(s, e, &k, !strcmp(tname, "hash") ? PCACHE_F_HASH
 			: PCACHE_F_JSON, exp);
 		e->fetched = UPF_PRESENT;
 		goto done;
@@ -2379,9 +2545,9 @@ static int fetch(struct uconn *c, struct up_key *e)
 		unsigned char *rec = NULL;
 		long n;
 
-		if (send_cmd(c, dl, 2, a, l) != 0)
+		if (send_ask(c, dl, ask, 2, a, l) != 0)
 			goto io;
-		if ((rc = read_reply(c, &gv, dl)) != 0)
+		if ((rc = read_ask(c, &gv, dl, ask)) != 0)
 			goto io_rc;
 		if (gv.t != '%' && gv.t != '*') {
 			rv_free(&gv);
@@ -2404,7 +2570,7 @@ static int fetch(struct uconn *c, struct up_key *e)
 		}
 		v.s = (char *)rec;
 		v.len = (int)n;
-		store_fill(s, &k, &v, exp, PCACHE_F_HASH, &uc->fill_hash);
+		store_fill(s, e, &k, &v, exp, PCACHE_F_HASH, &uc->fill_hash);
 		free(rec);
 		goto done;
 	}
@@ -2412,9 +2578,9 @@ static int fetch(struct uconn *c, struct up_key *e)
 		const char *a[2] = { "JSON.GET", kp };
 		size_t l[2] = { 8, kl };
 
-		if (send_cmd(c, dl, 2, a, l) != 0)
+		if (send_ask(c, dl, ask, 2, a, l) != 0)
 			goto io;
-		if ((rc = read_reply(c, &gv, dl)) != 0)
+		if ((rc = read_ask(c, &gv, dl, ask)) != 0)
 			goto io_rc;
 		if (gv.t != '$') {
 			rv_free(&gv);
@@ -2424,7 +2590,7 @@ static int fetch(struct uconn *c, struct up_key *e)
 		}
 		v.s = gv.s;
 		v.len = (int)gv.len;
-		store_fill(s, &k, &v, exp, PCACHE_F_JSON, &uc->fill_json);
+		store_fill(s, e, &k, &v, exp, PCACHE_F_JSON, &uc->fill_json);
 		rv_free(&gv);
 		goto done;
 	}
@@ -2453,13 +2619,8 @@ io_rc:
 
 /* ---- the connection threads ------------------------------------------- */
 
-/* ---- 12nt (0.7.1): a pull answered after the fetch -------------------------
- * In shard mode a through key is fetched by its OWNER: a peer that missed
- * it pulls from the owner (op_get_miss), and the owner, holding nothing,
- * fetches from Redis instead of answering absent.  The fetch completes on
- * the upstream worker, which stores the copy in the shadow as for a client
- * read; the asker is queued here and the cluster thread (the only sender
- * on the cluster socket) reads the copy and sends the M_PULL_RSP. */
+/* ---- a pull answered after the fetch: in shard mode the owner fetches a through key a peer
+ * pulled (op_get_miss); the cluster thread, the only sender on its socket, sends the M_PULL_RSP */
 static struct {
 	pthread_mutex_t mx;
 	struct up_pull **q;
@@ -2475,6 +2636,7 @@ static void pa_push(struct up_pull *p)
 
 		if (!nq) {
 			pthread_mutex_unlock(&PA.mx);
+			relay_free(p->relay);
 			free(p);                   /* the asker's slot times out */
 			return;
 		}
@@ -2492,12 +2654,11 @@ int pc_upstream_pull_fetch(const char *col, size_t collen, const char *key,
 	struct up_req *r;
 	struct up_pull *p;
 
-	if (!uc || !uc->through || klen > INT_MAX || !allowed(uc, key, klen))
+	if (!uc || klen > INT_MAX || !allowed(uc, key, klen))
 		return 0;
 	{
-		/* the owner's negative marker answers a pull as it answers a
-		 * client's read (gate_rt): a key every upstream said is absent
-		 * is not fetched again within upstream_negative_ms */
+		/* the owner's negative marker answers a pull as it answers a client's read: a key
+		 * every upstream said is absent is not fetched again within upstream_negative_ms */
 		pcache_htable_t *ht = pc_store_find(uc->name, uc->nlen);
 		unsigned char fl = 0, mark = 0;
 		unsigned int exp = 0;
@@ -2522,6 +2683,7 @@ int pc_upstream_pull_fetch(const char *col, size_t collen, const char *key,
 	p->port = port;
 	p->req = req;
 	p->col = uc->idx;
+	p->relay = NULL;
 	p->klen = klen;
 	memcpy(p->key, key, klen);
 	r->worker = -1;
@@ -2544,9 +2706,17 @@ int pc_upstream_pull_answer_take(uint32_t *addr, uint16_t *port, uint32_t *req,
 		char *col, size_t ccap, size_t *collen, char *key, size_t kcap,
 		size_t *klen)
 {
+	/* a copy that found no room, answered to the pull_serve after this (the cluster thread's reads)
+	 * until the next take */
+	static __thread struct pcache_relay *pa_live;
 	struct up_pull *p;
 	struct up_col *uc;
 
+	if (pa_live) {
+		pcache_ht_set_relay(NULL, NULL);
+		relay_free(pa_live);
+		pa_live = NULL;
+	}
 	pthread_mutex_lock(&PA.mx);
 	if (!PA.n) {
 		pthread_mutex_unlock(&PA.mx);
@@ -2558,9 +2728,14 @@ int pc_upstream_pull_answer_take(uint32_t *addr, uint16_t *port, uint32_t *req,
 	pthread_mutex_unlock(&PA.mx);
 	uc = p->col >= 0 && p->col < ncols ? &up_cols[p->col] : NULL;
 	if (!uc || uc->nlen >= ccap || p->klen >= kcap) {
+		relay_free(p->relay);
 		free(p);
 		return pc_upstream_pull_answer_take(addr, port, req, col, ccap,
 			collen, key, kcap, klen);
+	}
+	if (p->relay) {
+		pa_live = p->relay;
+		pcache_ht_set_relay(pc_store_find(uc->name, uc->nlen), pa_live);
 	}
 	*addr = p->addr;
 	*port = p->port;
@@ -2574,16 +2749,8 @@ int pc_upstream_pull_answer_take(uint32_t *addr, uint16_t *port, uint32_t *req,
 	return 1;
 }
 
-/* ---- 12nt TC-2 (0.7.1): a forwarded write run through at the owner ------
- * In shard mode a write-through on a non-owner is forwarded as every write
- * is (pc_upstream_gate_fw PROCEEDs; pc_op_* -> pc_fwd_begin -> the owner's
- * handle_fwd_op).  The owner composes the Redis command the op means and
- * queues it for the collection's writer like a client's write - the master
- * first, the keys read back, wt_apply stores what Redis holds HERE, at the
- * owner - and the completion acks the asker instead of re-running a frame.
- * Redis's reply text does not fit the binary ack: ok is "applied", newval
- * the number the op's ack carries; a refusal at the master is ok 0 (the
- * asker says "holder rejected") and its text stays in last_errors here. */
+/* ---- a forwarded write run through at the owner: the Redis command the op means goes to the writer,
+ * wt_apply stores what Redis holds here, the asker gets ok/newval (a master refusal is ok 0) ---- */
 static struct {
 	pthread_mutex_t mx;
 	struct up_fwd_ack {
@@ -2633,7 +2800,7 @@ static void fa_push(struct up_fwd *f, const struct up_done *d)
 
 	if (iserr) {
 		if (d->val && strstr(d->val, "WRONGTYPE"))
-			nv = PC_FWD_E_TYPE;        /* S280/S297: the type error, typed */
+			nv = PC_FWD_E_TYPE;        /* the type error, typed */
 	} else {
 		switch (f->op) {
 		case 0:                        /* SET: +OK */
@@ -2673,7 +2840,7 @@ int pc_upstream_fwd_through(const char *col, size_t collen, int op,
 	int ac = 0, n2 = 0, guess = UPWG_STRING;
 
 	if (!uc || !uc->through || op < 0 || op > 5 || !allowed(uc, key, klen))
-		return 0;                      /* not a through key here: as before */
+		return 0;                      /* not a through key here: the usual forward */
 	/* the Redis command the op means (handle_fwd_op's contract: ttl_rel in
 	 * seconds, PCACHE_EXP_PRESERVE keeps the key's, 0 none) */
 	switch (op) {
@@ -2800,7 +2967,7 @@ int pc_upstream_pull_extra_ms(const char *col, size_t collen)
 {
 	struct up_col *uc = ncols ? col_of(col, collen) : NULL;
 
-	return uc && uc->through ? uc->timeout_ms + 100 : 0;
+	return uc ? uc->timeout_ms + 100 : 0;              /* read-only too */
 }
 
 /* finish @e: count every waiting request down, post the ones done */
@@ -2835,27 +3002,32 @@ static void finish(struct up_col *uc, struct up_key *e, int status)
 		wn = w->next;
 		if (status != PC_UPV_OK)
 			r->status = status;
+		else if (e->unkept) {
+			/* each waiter its own, freed with its completion */
+			struct pcache_relay *c = relay_share(e->unkept);
+
+			if (c) {
+				c->next = r->relay;
+				r->relay = c;
+			}
+		}
 		if (--r->left == 0) {
-			if (r->pull)
-				pa_push(r->pull);  /* 12nt: the cluster thread answers */
-			else
-				post(r->worker, r->id, r->status);
+			if (r->pull) {
+				r->pull->relay = r->relay;
+				pa_push(r->pull);  /* the cluster thread answers */
+			} else
+				post(r->worker, r->id, r->status, r->relay);
 			free(r);
 		}
 		free(w);
 	}
 	pthread_mutex_unlock(&uc->mx);
+	relay_free(e->unkept);
 	free(e);
 }
 
-/* the invalidation connection: RESP3, its id published for the fetch
- * connections to redirect to, then nothing but pushes */
-/* AR1: upstream_prefixes as BCAST PREFIXes: "abc*" is PREFIX abc, an exact
- * key is a PREFIX of itself (a superset - inv_apply filters on the
- * patterns), and "*" or a wildcard anywhere else means every key (no
- * PREFIX at all; the cost is an invalidation for every change Redis makes
- * in the database).  Returns how many it set in @pv/@pl, or 0 for every
- * key. */
+/* upstream_prefixes as BCAST PREFIXes: "abc*" is PREFIX abc, an exact key its own (inv_apply
+ * filters); "*" or any other glob means every key.  Returns how many set in @pv/@pl, 0 every key */
 static int bcast_prefixes(const struct up_col *uc, const char **pv, size_t *pl,
 		int max)
 {
@@ -2881,8 +3053,8 @@ static int bcast_prefixes(const struct up_col *uc, const char **pv, size_t *pl,
 	return i < uc->npat ? 0 : n;
 }
 
-/* AR1: this connection hears every change Redis makes under the
- * collection's prefixes - not only the keys fetched through it */
+/* this connection hears every change Redis makes under the collection's prefixes, not only
+ * the keys fetched through it */
 static void bcast_on(struct up_srv *s, struct uconn *c, long long dl)
 {
 	struct up_col *uc = s->uc;
@@ -2922,7 +3094,22 @@ static void bcast_on(struct up_srv *s, struct uconn *c, long long dl)
 			"every key (upstream_prefixes is not a list of prefixes)");
 }
 
-static void *inv_main(void *arg)
+/* the tracking connection is down: no redirect to it, its server's copies dropped */
+static void inv_down(struct up_srv *s, struct uconn *c)
+{
+	__atomic_store_n(&s->inv_ready, 0, __ATOMIC_RELEASE);
+	uc_close(c);
+	__atomic_store_n(&s->inv_id, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&s->bcast, 0, __ATOMIC_RELAXED);
+	pthread_mutex_lock(&s->run_mx);
+	s->inv_run[0] = 0;
+	pthread_mutex_unlock(&s->run_mx);
+	tracking_moved(s);
+}
+
+/* the invalidation connection: RESP3, its id published for the fetch connections to
+ * redirect to, then nothing but pushes */
+static void *inv_loop(void *arg)
 {
 	struct up_srv *s = arg;
 	struct up_col *uc = s->uc;
@@ -2944,8 +3131,15 @@ static void *inv_main(void *arg)
 #endif
 	while (!uc->stop) {
 		struct rv v;
-		int rc;
+		int rc, gone = __atomic_load_n(&s->gone, __ATOMIC_ACQUIRE);
 
+		/* gone: closed, not dialled; the slot took another address: dialled again */
+		if (c.fd >= 0 && (gone || c.incarn != __atomic_load_n(&s->incarn, __ATOMIC_ACQUIRE)))
+			inv_down(s, &c);
+		if (gone) {
+			nap_ms(200);
+			continue;
+		}
 		if (c.fd < 0) {
 			long long dl = now_ms() + uc->timeout_ms;
 			const char *av[2] = { "CLIENT", "ID" };
@@ -2954,6 +3148,8 @@ static void *inv_main(void *arg)
 			if (uc_connect(&c, dl) != 0) {
 				int w;
 
+				if (__atomic_load_n(&s->is_sentinel, __ATOMIC_RELAXED))
+					return NULL;       /* a sentinel: no data to track */
 				for (w = 0; w < 10 && !uc->stop; w++)
 					nap_ms(100);
 				continue;
@@ -2994,29 +3190,22 @@ static void *inv_main(void *arg)
 			__atomic_store_n(&s->inv_id, v.n, __ATOMIC_RELEASE);
 			rv_free(&v);
 			tracking_moved(s);
-			__atomic_store_n(&s->inv_ready, 1, __ATOMIC_RELEASE);   /* S431 */
+			__atomic_store_n(&s->inv_ready, 1, __ATOMIC_RELEASE);
 			LM_NOTICE("collection '%s': tracking on - %s's "
 				"invalidations reach connection %lld on server "
 				"%.12s\n", uc->name, s->addr, s->inv_id, c.run_id);
-			if (uc->through)               /* AR1 */
+			if (uc->through)
 				bcast_on(s, &c, now_ms() + uc->timeout_ms);
 		}
 		rc = read_reply(&c, &v, now_ms() + 1000);
-		rewarm_tick(uc);               /* S421: at most once a second quiet */
+		rewarm_tick(uc);               /* at most once a second when quiet */
 		if (rc == -2)
 			continue;                  /* quiet: nothing changed */
 		if (rc != 0) {
 			LM_WARN("collection '%s': the tracking connection to %s "
 				"was lost - the copies fetched from it are dropped\n",
 				uc->name, s->addr);
-			__atomic_store_n(&s->inv_ready, 0, __ATOMIC_RELEASE);   /* S431 */
-			uc_close(&c);
-			__atomic_store_n(&s->inv_id, 0, __ATOMIC_RELEASE);
-			__atomic_store_n(&s->bcast, 0, __ATOMIC_RELAXED);   /* AR1 */
-			pthread_mutex_lock(&s->run_mx);
-			s->inv_run[0] = 0;
-			pthread_mutex_unlock(&s->run_mx);
-			tracking_moved(s);
+			inv_down(s, &c);
 			continue;
 		}
 		rv_free(&v);                   /* not a push: nothing asked */
@@ -3026,13 +3215,17 @@ static void *inv_main(void *arg)
 	return NULL;
 }
 
-/* S382: an upstream's health, on its first fetch thread once a second.
- * Where a replica is asked for, ROLE again every 10 s - roles move at a
- * failover - and an upstream refused for its role is dialled again every
- * 10 s, so a demoted master comes back.  With others to take its fetches,
- * an upstream never reached yet is dialled at once, so pick() knows it, and
- * one that failed every 2 s; with one upstream every fetch dials, as before
- * S382 */
+/* inv_quit says the thread is over, so a reused slot starts another */
+static void *inv_main(void *arg)
+{
+	struct up_srv *s = arg;
+
+	inv_loop(arg);
+	__atomic_store_n(&s->inv_quit, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+/* an upstream's health, on its first fetch thread once a second */
 static void srv_tick(struct uconn *c)
 {
 	struct up_srv *s = c->s;
@@ -3041,6 +3234,8 @@ static void srv_tick(struct uconn *c)
 	long long chk = __atomic_load_n(&s->checked_ms, __ATOMIC_RELAXED);
 	int st = srv_state(s);
 
+	if (__atomic_load_n(&s->gone, __ATOMIC_ACQUIRE))
+		return;                        /* not dialled while gone */
 	if (c->fd >= 0) {
 		if (now - chk < 10000)
 			return;
@@ -3048,10 +3243,9 @@ static void srv_tick(struct uconn *c)
 			/* failed, or refused now: no fetch on it */
 			if (role_check(c, dl) != 0 || srv_state(s) == PC_UPS_OFF)
 				uc_close(c);
-		} else if (uc->nsrv > 1) {
-			/* several upstreams: a PING says this one still answers
-			 * - an idle connection to a dead server says nothing,
-			 * and failover must not wait for traffic to find out */
+		} else if (srv_n(uc) > 1) {
+			/* several upstreams: a PING says this one still answers - failover must
+			 * not wait for traffic to find a dead server behind an idle connection */
 			const char *av[1] = { "PING" };
 			size_t al[1] = { 4 };
 			struct rv v;
@@ -3066,11 +3260,9 @@ static void srv_tick(struct uconn *c)
 		}
 		return;
 	}
-	if (uc->nsrv > 1) {
-		/* several: this first connection is kept, so each upstream's
-		 * health is known without traffic - dialled again at once when
-		 * it closes, every 2 s while it fails, every 10 s while it is
-		 * refused (a master, a perfcached) */
+	if (srv_n(uc) > 1) {
+		/* several: this first connection is kept, so each upstream's health is known
+		 * without traffic; re-dialled at once, every 2 s while failing, 10 s while refused */
 		long long gap = st == PC_UPS_OFF && !__atomic_load_n(&s->failing,
 			__ATOMIC_RELAXED) ? 10000 : 2000;
 
@@ -3078,8 +3270,8 @@ static void srv_tick(struct uconn *c)
 			c->backoff_until = now_ms();
 		return;
 	}
-	/* one upstream: every fetch dials, as before S382; refused, ROLE
-	 * again every 10 s, so a demoted master comes back */
+	/* one upstream: every fetch dials; refused, ROLE again every 10 s, so a demoted master
+	 * comes back */
 	if (st == PC_UPS_OFF && !__atomic_load_n(&s->failing, __ATOMIC_RELAXED) &&
 	    now - chk >= 10000 && uc_connect(c, dl) != 0)
 		c->backoff_until = now_ms();
@@ -3092,8 +3284,7 @@ static void unbusy(struct up_srv *s)
 		s->busy--;
 }
 
-/* a fetch on @s failed: once more on another upstream that serves (S382),
- * else the waiters get the error */
+/* a fetch on @s failed: once more on another upstream that serves, else the waiters get the error */
 static void fail_or_retry(struct up_srv *s, struct up_key *e)
 {
 	struct up_col *uc = s->uc;
@@ -3101,9 +3292,10 @@ static void fail_or_retry(struct up_srv *s, struct up_key *e)
 
 	pthread_mutex_lock(&uc->mx);
 	unbusy(s);
-	o = e->tried ? NULL : pick(uc, s);
+	o = e->tried ? NULL : pick_key(uc, e->key, e->klen, s);
 	if (o) {
 		e->tried = 1;
+		e->ask = 0;                    /* ASKING was for the node the ASK named */
 		enqueue(o, e);
 		pthread_mutex_unlock(&uc->mx);
 		return;
@@ -3154,12 +3346,14 @@ static void *conn_main(void *arg)
 			if (!s->qhead)
 				s->qtail = NULL;
 			s->queued--;
-			/* S382: refused or unreachable since it was queued here -
-			 * another upstream that serves takes it */
-			if (srv_state(s) == PC_UPS_OFF) {
-				struct up_srv *o = pick(uc, s);
+			/* refused or unreachable since it was queued here: another upstream that
+			 * serves takes it; a redirect that names this one is read here, once */
+			if (srv_state(s) == PC_UPS_OFF && (!e->redirs ||
+			    __atomic_load_n(&s->failing, __ATOMIC_RELAXED))) {
+				struct up_srv *o = pick_key(uc, e->key, e->klen, s);
 
 				if (o) {
+					e->ask = 0;
 					enqueue(o, e);
 					pthread_mutex_unlock(&uc->mx);
 					continue;
@@ -3168,17 +3362,20 @@ static void *conn_main(void *arg)
 			s->busy++;
 		}
 		pthread_mutex_unlock(&uc->mx);
+		/* gone, or the slot took another address: nothing held open */
+		if (c.fd >= 0 && (__atomic_load_n(&s->gone, __ATOMIC_ACQUIRE) ||
+		    c.incarn != __atomic_load_n(&s->incarn, __ATOMIC_ACQUIRE)))
+			uc_close(&c);
 
-		/* the shadow's own upkeep, on the first thread: expired
-		 * copies reaped, the table widened as it fills; and S382's
-		 * health of this upstream */
+		/* the shadow's own upkeep on the first thread (expired copies reaped, the table
+		 * widened as it fills), and this upstream's health */
 		if (s->thr[0] == pthread_self() && now_ms() >= next_tick) {
 			next_tick = now_ms() + 1000;
 			pcache_ht_sweep(s->shadow, get_ticks(), NULL, NULL);
 			pcache_ht_grow_at(s->shadow, 75, 1024);
 			srv_tick(&c);
-			/* S382 part 2: failover decides once a second too, so a
-			 * switch (and a preempt) happens without traffic */
+			/* failover decides once a second too, so a switch (and a preempt)
+			 * happens without traffic */
 			if (s->idx == 0 && uc->mode == PC_UP_MODE_FAILOVER) {
 				pthread_mutex_lock(&uc->mx);
 				fo_eval(uc);
@@ -3187,10 +3384,10 @@ static void *conn_main(void *arg)
 		}
 		if (!e)
 			continue;
-		if (srv_state(s) == PC_UPS_OFF &&
+		if (srv_state(s) == PC_UPS_OFF && !e->redirs &&
 		    !__atomic_load_n(&s->failing, __ATOMIC_RELAXED)) {
-			/* a master, a replica cut off, or a perfcached (S384) -
-			 * and nothing else serves: refused, not asked */
+			/* a master, a replica cut off, or a perfcached, and nothing else
+			 * serves: refused, not asked */
 			ST_ADD(uc->errors, 1);
 			ST_ADD(s->errors, 1);
 			fail_or_retry(s, e);
@@ -3206,17 +3403,48 @@ static void *conn_main(void *arg)
 		}
 		ST_ADD(uc->fetches, 1);
 		ST_ADD(s->fetches, 1);
+		c.redir = e->redirs > 0;
 		rc = fetch(&c, e);
-		if (rc == 0) {
-			/* ST2: it stopped at a PRESENT marker, and a read or a
-			 * change joined meanwhile: once more, for the value -
-			 * the entry stays in flight, its waiters with it */
+		c.redir = 0;
+		if (rc == -5) {                /* MOVED or ASK: to the node it names */
+			int k = -1;
+
+			if (e->ask)
+				ST_ADD(uc->cl_asked, 1);
+			else {
+				ST_ADD(uc->cl_moved, 1);
+				cl_kick(uc);
+			}
+			if (e->redirs < 3 && !uc->stop)
+				k = uc->discover == PC_UP_DISC_NO ? cl_srv_find(uc, e->rhost, e->rport)
+					: srv_add(uc, e->rhost, e->rport, UPO_CLUSTER);
 			pthread_mutex_lock(&uc->mx);
 			unbusy(s);
-			/* S424: overtaken by an invalidation of the key - what it
-			 * stored may be older than the change: dropped, and the
-			 * key fetched again (its waiters stay); three rounds at
-			 * most, then the copy is kept for the waiters */
+			if (k >= 0) {
+				e->redirs++;
+				enqueue(&uc->srv[k], e);
+				pthread_mutex_unlock(&uc->mx);
+				continue;
+			}
+			pthread_mutex_unlock(&uc->mx);
+			ST_ADD(uc->errors, 1);
+			ST_ADD(s->errors, 1);
+			finish(uc, e, PC_UPV_ERROR);
+			continue;
+		}
+		if (rc == -6) {                /* TRYAGAIN, CLUSTERDOWN: the connection stands */
+			ST_ADD(uc->errors, 1);
+			ST_ADD(s->errors, 1);
+			fail_or_retry(s, e);
+			continue;
+		}
+		if (rc == 0) {
+			/* it stopped at a PRESENT marker and a read or a change joined meanwhile:
+			 * once more for the value, the entry staying in flight with its waiters */
+			pthread_mutex_lock(&uc->mx);
+			unbusy(s);
+			/* overtaken by an invalidation, the stored copy may predate the change:
+			 * dropped and refetched (waiters stay), three rounds at most, then kept */
 			if (e->inv && e->rounds < 3) {
 				str ik;
 
@@ -3224,7 +3452,7 @@ static void *conn_main(void *arg)
 				ik.len = (int)e->klen;
 				e->inv = 0;
 				e->rounds++;
-				rm_begin(uc);                      /* S435 */
+				rm_begin(uc);
 				pcache_ht_remove(s->shadow, &ik);
 				rm_end(uc);
 				enqueue(s, e);
@@ -3233,13 +3461,8 @@ static void *conn_main(void *arg)
 				continue;
 			}
 			if (e->inv) {
-				/* S433: ...but no longer than an untracked fill.  The
-				 * change that overtook it spent its invalidation on
-				 * this fetch, and nothing else will reach the copy:
-				 * kept whole, it answered the value before the key's
-				 * last change until the key changed again (eight
-				 * writers on one key, fetches slower than the writes:
-				 * upwritethroughtest 15, "Redis v46, node 'v47'") */
+				/* ...but no longer than an untracked fill: the change that overtook
+				 * it spent its invalidation here; nothing else would reach the copy */
 				str ik;
 				unsigned char kf = 0, km = 0;
 				unsigned int kx = 0, cap = ttl_ticks(uc->neg_ms > 0 ?
@@ -3258,19 +3481,15 @@ static void *conn_main(void *arg)
 				ST_ADD(uc->refetches, 1);
 				continue;
 			}
-			/* S431: a re-warm's copy that landed untracked anyway, or on
-			 * a connection armed before this server's tracking moved
-			 * while the fetch was out (a loss: its invalidations go
-			 * nowhere; or the flush took it and the name was not
-			 * collected): it goes, and the name is queued again - the
-			 * run fetches it from a server whose tracking is settled */
+			/* a re-warm's copy that landed untracked, or on a connection armed before
+			 * the tracking moved: dropped and queued again, for a settled server */
 			if (e->rw && (fill_capped || c.gen !=
 			        __atomic_load_n(&s->inv_gen, __ATOMIC_ACQUIRE))) {
 				str ik;
 
 				ik.s = e->key;
 				ik.len = (int)e->klen;
-				rm_begin(uc);                      /* S435 */
+				rm_begin(uc);
 				pcache_ht_remove(s->shadow, &ik);
 				rm_end(uc);
 				rewarm_add_locked(uc, e->key, e->klen);
@@ -3296,26 +3515,27 @@ static void *conn_main(void *arg)
 	return NULL;
 }
 
-/* ---- write-through (S385, DESIGN 12mf) --------------------------------------
- * upstream_writes = through: a client write to the collection goes to the
- * upstream's MASTER first.  One thread per collection (wr_main) holds one
- * RESP2 connection to it and takes the queued writes in the order the
- * workers queued them.  Each write is pipelined with a read-back of its
- * keys (TYPE, PTTL and the value), and the worker that queued it makes the
- * fleet hold exactly what Redis holds after it (UPD_WT, wt_apply) - so the
- * local state follows Redis's even when the client has gone meanwhile -
- * then the parked command answers with Redis's own reply.  Unknown commands
- * (upstream_unknown = pass) are classified by Redis's COMMAND INFO: a write
- * the same way, a read on a replica by the pass reader (pr_main).
- * Checks never scale with traffic: the master and RedisJSON are looked for
- * at the start, at a reconnect and after a refusal, at most once per
- * backoff step (1 s doubling to 10 s; RedisJSON missing: every 60 s). */
+/* ---- write-through: a client write goes to the upstream's MASTER first (one writer thread and
+ * RESP2 connection per collection), is read back, and the fleet holds what Redis holds ---- */
 
-#define WT_BATCH       32              /* writes per pipelined round (AR3) */
+#define WT_BATCH       32              /* writes per pipelined round */
 #define WT_ROLE_MS     10000           /* the master's ROLE, while idle */
 #define WT_BACKOFF_MAX 10000
 #define WT_JSON_MS     60000           /* RedisJSON missing: asked again */
-#define WT_OWNED_MS    60000           /* AR4: the fleet's own keys counted */
+#define WT_OWNED_MS    60000           /* the fleet's own keys counted */
+
+/* tests only: PERFCACHED_TEST_WT_OWNED_MS=<ms> walks that often */
+static long long wt_owned_ms(void)
+{
+	static long long ms = -1;
+
+	if (ms < 0) {
+		const char *e = getenv("PERFCACHED_TEST_WT_OWNED_MS");
+
+		ms = e && atoll(e) > 0 ? atoll(e) : WT_OWNED_MS;
+	}
+	return ms;
+}
 #define WT_UNK_CACHE   128             /* commands classed per collection */
 
 
@@ -3344,13 +3564,11 @@ static int wb_put(struct wbuf *b, const void *p, size_t n)
 	return 0;
 }
 
-/* S385 stats: set on the writer thread - only its writes are counted by
- * command (the pass reader's are reads) */
+/* set on the writer thread: only its writes are counted by command (the pass reader's are reads) */
 static __thread int wt_is_writer;
 
-/* printable ASCII of @s[@n] into @d (a key or Redis's text may hold
- * anything; the page and the log want neither control bytes nor UTF-8
- * cut in half) */
+/* printable ASCII of @s[@n] into @d: the page and the log want neither control bytes nor
+ * UTF-8 cut in half */
 static void wt_asc(char *d, size_t dn, const char *s, size_t n)
 {
 	size_t i;
@@ -3478,8 +3696,8 @@ static void wt_finish(struct up_col *uc, struct up_wjob *j, int wst,
 	d.kind = UPD_WT;
 	d.id = j->id;
 	d.col = uc->idx;
-	d.wseq = ++uc->wt_seq;             /* S429: the writer thread alone counts */
-	d.fwd = j->fwd;                    /* 12nt: the drain acks the asker */
+	d.wseq = ++uc->wt_seq;             /* the writer thread alone counts */
+	d.fwd = j->fwd;                    /* the drain acks the asker */
 	j->fwd = NULL;
 	d.wst = wst;
 	d.ival = ival;
@@ -3499,7 +3717,7 @@ static void wt_finish(struct up_col *uc, struct up_wjob *j, int wst,
 static void wt_fail(struct up_col *uc, struct up_wjob *j, const char *msg)
 {
 	ST_ADD(uc->wt_failed, 1);
-	if (j->upfill) {                   /* AR4 */
+	if (j->upfill) {
 		ST_ADD(uc->upf_errors, 1);
 		ST_ADD(uc->upf_answered, 1);
 	}
@@ -3507,8 +3725,7 @@ static void wt_fail(struct up_col *uc, struct up_wjob *j, const char *msg)
 	wt_finish(uc, j, UPW_R_ERR, msg, strlen(msg), 0, NULL, 0);
 }
 
-/* AR2: the time a write must have left to be sent - a quarter of
- * upstream_timeout_ms, at least 5 ms */
+/* the time a write must have left to be sent: a quarter of upstream_timeout_ms, at least 5 ms */
 static long long wt_need_ms(const struct up_col *uc)
 {
 	long long need = uc->timeout_ms / 4;
@@ -3519,7 +3736,7 @@ static long long wt_need_ms(const struct up_col *uc)
 static void wt_job_free(struct up_wjob *j)
 {
 	if (j)
-		free(j->fwd);                  /* 12nt: a context not handed over */
+		free(j->fwd);                  /* a context not handed over */
 	free(j);
 }
 
@@ -3532,7 +3749,7 @@ static void wt_why(struct up_col *uc, const char *fmt, const char *a)
 
 /* is @s's address the one a replica names as its master?  By name, then by
  * the addresses both resolve to (a replica names its master by IP) */
-static int same_host(const char *a, const char *b)
+int same_host(const char *a, const char *b)
 {
 	struct addrinfo hints, *ra = NULL, *rb = NULL, *x, *y;
 	int same = 0;
@@ -3540,7 +3757,7 @@ static int same_host(const char *a, const char *b)
 	if (!strcasecmp(a, b))
 		return 1;
 	memset(&hints, 0, sizeof hints);
-	hints.ai_family = pc_resolve_family();     /* 12np: no AAAA without IPv6 */
+	hints.ai_family = pc_resolve_family();     /* no AAAA without IPv6 */
 	hints.ai_socktype = SOCK_STREAM;
 	if (getaddrinfo(a, NULL, &hints, &ra) != 0)
 		return 0;
@@ -3563,9 +3780,8 @@ static int same_host(const char *a, const char *b)
 	return same;
 }
 
-/* RedisJSON on the master: COMMAND INFO JSON.SET JSON.DEL (an ordinary ACL
- * user may run it; MODULE LIST is @admin).  1 yes, 0 no, -1 the connection
- * failed */
+/* RedisJSON on the master: COMMAND INFO JSON.SET JSON.DEL (MODULE LIST is @admin, this is not).
+ * 1 yes, 0 no, -1 the connection failed */
 static int wt_json_check(struct uconn *c)
 {
 	struct up_col *uc = c->uc;
@@ -3583,25 +3799,37 @@ static int wt_json_check(struct uconn *c)
 	return yes;
 }
 
-/* the master among the listed upstreams: every one asked ROLE (a replica
- * also says which master it follows); one master is it, two are decided by
- * the replicas, none or a tie is no target.  On success *@c is connected to
- * it.  The caller rate-limits */
+/* the sentinels name a master, and it is not @s */
+static int wt_sen_moved(struct up_col *uc, const struct up_srv *s)
+{
+	int sm;
+
+	if (!__atomic_load_n(&uc->sen_started, __ATOMIC_ACQUIRE))
+		return 0;
+	sm = __atomic_load_n(&uc->sen_master, __ATOMIC_ACQUIRE);
+	return sm >= 0 && sm != s->idx;
+}
+
+/* the master among the listed upstreams, by ROLE: one master is it, two are decided by the
+ * replicas they follow, none or a tie is no target; on success *@c is connected to it */
 static int wt_discover(struct up_col *uc, struct uconn *c)
 {
-	int masters[PC_UP_MAX_SRV], nm = 0, j, k, pick = -1, state;
+	int masters[PC_UP_MAX_SRV], nm = 0, j, k, pick = -1, state, sm;
 	long long dl;
 
 	uc_close(c);
-	for (j = 0; j < uc->nsrv; j++) {
+	for (j = 0; j < srv_n(uc); j++) {
 		struct uconn p;
 
+		if (__atomic_load_n(&uc->srv[j].gone, __ATOMIC_RELAXED) ||
+		    __atomic_load_n(&uc->srv[j].is_sentinel, __ATOMIC_RELAXED))
+			continue;              /* out of the topology, or no data */
 		memset(&p, 0, sizeof p);
 		p.uc = uc;
 		p.s = &uc->srv[j];
 		p.fd = -1;
 		p.wr = 1;
-		p.wcred = 1;                   /* AR7: the writer's */
+		p.wcred = 1;
 		dl = now_ms() + uc->timeout_ms;
 		if (uc_connect(&p, dl) != 0)
 			continue;
@@ -3610,18 +3838,24 @@ static int wt_discover(struct up_col *uc, struct uconn *c)
 		uc_close(&p);
 		free(p.buf);
 	}
-	if (nm == 1)
+	sm = __atomic_load_n(&uc->sen_started, __ATOMIC_ACQUIRE) ?
+		__atomic_load_n(&uc->sen_master, __ATOMIC_ACQUIRE) : -1;
+	if (sm >= 0) {                     /* the master the sentinels name, no other */
+		for (k = 0; k < nm; k++)
+			if (masters[k] == sm)
+				pick = sm;
+	} else if (nm == 1)
 		pick = masters[0];
 	else if (nm > 1) {
-		/* S385's split-brain guard: the master the serving replicas
-		 * follow; a master nobody follows is one cut off */
+		/* split-brain guard: the master the serving replicas follow; a master nobody
+		 * follows is cut off */
 		int votes[PC_UP_MAX_SRV], best = -1, tie = 0;
 
 		for (k = 0; k < nm; k++) {
 			struct up_srv *m = &uc->srv[masters[k]];
 
 			votes[k] = 0;
-			for (j = 0; j < uc->nsrv; j++) {
+			for (j = 0; j < srv_n(uc); j++) {
 				struct up_srv *r = &uc->srv[j];
 				char mh[64];
 
@@ -3696,16 +3930,15 @@ static int wt_discover(struct up_col *uc, struct uconn *c)
 	return pick >= 0 ? 0 : -1;
 }
 
-/* one key's read-back, its replies already read: TYPE's name, PTTL, and the
- * value asked with them (the guess); 1 a second ask is needed (*@need the
- * command), 0 *@rb filled */
+/* one key's read-back, its replies read: TYPE's name, PTTL and the value asked with them (the
+ * guess); 1 a second ask is needed (*@need the command), 0 *@rb filled */
 static int rb_from(struct up_col *uc, const char *tname, const struct rv *tt,
 		const struct rv *gv, int asked, struct up_rb *rb, int *need)
 {
 	long long pttl = tt->t == ':' ? tt->n : -1;
 	int want;
 
-	rb->exp = pttl >= 0 ? pttl_ticks(pttl) : 0;   /* S449: as its copies */
+	rb->exp = pttl >= 0 ? pttl_ticks(pttl) : 0;   /* as its copies */
 	if (!strcmp(tname, "none") || pttl == -2) {
 		rb->what = UPRB_GONE;
 		return 0;
@@ -3776,9 +4009,8 @@ static int rb_send(struct uconn *c, long long dl, const char *k, size_t kl,
 	return send_cmd(c, dl, 2, a3, l3);
 }
 
-/* read one key's read-back (its replies follow in order), a second ask on
- * the same connection when the guess was the wrong type.  0 ok, <0 the
- * connection (read_reply's code) */
+/* read one key's read-back (its replies follow in order), asking again on the same connection
+ * when the guess was the wrong type.  0 ok, <0 the connection (read_reply's code) */
 static int rb_read(struct uconn *c, long long dl, const char *k, size_t kl,
 		int guess, struct up_rb *rb)
 {
@@ -3936,7 +4168,7 @@ static const struct uk_ent *uk_class(struct uconn *c, struct uk_cache *uk,
 			e->why = "a blocking command";
 		} else if (rv_has(fl, "pubsub") || rv_has(cat, "@pubsub")) {
 			e->flags |= UK_REFUSE;
-			e->why = "pub/sub - not bridged (S387)";
+			e->why = "pub/sub - not bridged";
 		} else if (rv_has(cat, "@transaction") || rv_has(fl, "no_multi") ||
 		    rv_has(cat, "@scripting")) {
 			e->flags |= UK_REFUSE;
@@ -4011,14 +4243,10 @@ static int uk_keys(struct uconn *c, const struct uk_ent *e, int argc,
 
 /* ---- the writer --------------------------------------------------------- */
 
-/* AR2: a write whose deadline went (all but a quarter) while it queued */
+/* a write whose deadline went (all but a quarter) while it queued */
 #define WT_EXPIRED_MSG "upstream: the write waited too long for the master " \
 	"(under a quarter of upstream_timeout_ms left) - not applied"
 
-/* run one write on the master: the command (and its second, if any), each
- * key's read-back after it, all in one round trip; the worker is told.  0
- * done (whatever Redis answered), -1 the connection failed (the job is
- * answered with the error; the caller reconnects) */
 /* the commands after a job's first - @n2 of its trailing ones, then the
  * read-back of every key */
 static int wt_send_rest(struct uconn *c, long long dl,
@@ -4037,13 +4265,8 @@ static int wt_send_rest(struct uconn *c, long long dl,
 	return 0;
 }
 
-/* ---- S400: what Redis's value replaces ------------------------------------
- * An upfill whose NX Redis declined reads Redis's value back, and wt_apply
- * stores it as the fleet's record on every member.  Before that, it is
- * compared with the value the sweep offered: the same, the same with
- * another expiry, or different (another value, another type, or Redis no
- * longer holds it).  `upfill <col> check` makes the same comparison on its
- * own connection and applies nothing. */
+/* ---- what Redis's value replaces: an upfill whose NX Redis declined compares Redis's value with
+ * the one the sweep offered (same, retimed, differed); `upfill <col> check` only compares ---- */
 #define UPF_SAME     0
 #define UPF_RETIMED  1
 #define UPF_DIFFERED 2
@@ -4121,10 +4344,8 @@ static const unsigned char jsp_out[256] = { [' '] = 1, ['\t'] = 1, ['\n'] = 1,
 	['\r'] = 1, ['"'] = 1 };
 static const unsigned char jsp_in[256] = { ['"'] = 1, ['\\'] = 1 };
 
-/* the same document spelt with other spacing, settled without parsing:
- * byte for byte, whitespace outside strings skipped - equal runs of plain
- * bytes in one tight loop, the special ones one at a time.  1 the same
- * text, 0 not decided here (the walk below decides) */
+/* the same document spelt with other spacing, settled without parsing: byte for byte, whitespace
+ * outside strings skipped.  1 the same text, 0 not decided here (the walk decides) */
 static int json_same_text(const char *a, size_t al, const char *b, size_t bl)
 {
 	size_t i = 0, j = 0;
@@ -4172,9 +4393,8 @@ static int json_same_text(const char *a, size_t al, const char *b, size_t bl)
 	}
 }
 
-/* two string tokens: their raw spellings first, unescaped only when a
- * backslash lets two spellings be one value.  1 equal, 0 not, -1 not
- * decided (out of memory, a bad escape) */
+/* two string tokens: raw spellings first, unescaped only when a backslash lets two spellings be
+ * one value.  1 equal, 0 not, -1 not decided (out of memory, a bad escape) */
 static int jstreq(const char *ab, const struct pc_jtok *x, const char *bb,
 		const struct pc_jtok *y)
 {
@@ -4213,9 +4433,8 @@ static int jkey_cmp(const void *p, const void *q)
 	return c ? c : a->n - b->n;
 }
 
-/* the value token of the member of y (b[ib]) named as a[ka], or -1 none,
- * -2 not decided.  *@ix is built at the first call (sorted raw names;
- * NULL with *@esc set when a name holds a backslash - then a scan) */
+/* the value token of y's (b[ib]) member named as a[ka]: -1 none, -2 not decided.  *@ix is built at
+ * the first call (sorted raw names; NULL with *@esc set when a name holds a backslash: a scan) */
 static int jfind(const char *ab, const struct pc_jtok *a, int ka,
 		const char *bb, const struct pc_jtok *b, int nb, int ib,
 		struct jkey **ix, int *nix, int *esc)
@@ -4255,9 +4474,8 @@ static int jfind(const char *ab, const struct pc_jtok *a, int ka,
 	return -1;
 }
 
-/* are a[ia] and b[ib] the same JSON value: members by name in any order,
- * elements in order, strings unescaped, numbers by value.  1 yes, 0 no,
- * -1 not decided here (too deep, out of memory) */
+/* are a[ia] and b[ib] the same JSON value (members by name in any order, elements in order,
+ * strings unescaped, numbers by value)?  1 yes, 0 no, -1 not decided (too deep, no memory) */
 static int jeq(const char *ab, const struct pc_jtok *a, int na, int ia,
 		const char *bb, const struct pc_jtok *b, int nb, int ib, int depth)
 {
@@ -4290,9 +4508,8 @@ static int jeq(const char *ab, const struct pc_jtok *a, int na, int ia,
 				return r;
 		return 1;
 	}
-	/* an object: each of x's members in y by name - in the same place
-	 * first (RedisJSON keeps members in the order they were written),
-	 * looked up when it is not there */
+	/* an object: each of x's members in y by name - in the same place first (RedisJSON keeps the
+	 * written order), looked up when it is not there */
 	r = 1;
 	for (i = ia + 1, j = ib + 1; r == 1 && i < na && a[i].start < x->end;
 	     i = jnext(a, na, i + 1)) {
@@ -4314,10 +4531,8 @@ static int jeq(const char *ab, const struct pc_jtok *a, int na, int ia,
 	return r;
 }
 
-/* the walk's tokens: one buffer a thread, reused - a document of n bytes
- * has at most n / 2 + 1 of them (every value but the first follows a
- * [, : or , and takes a byte).  One larger than UPF_JTOK_KEEP is freed
- * after use, so a rare big document pins nothing */
+/* the walk's tokens: one buffer a thread, reused (n bytes hold at most n / 2 + 1 tokens); one
+ * larger than UPF_JTOK_KEEP is freed after use, so a rare big document pins nothing */
 #define UPF_JTOK_KEEP 65536
 static __thread struct pc_jtok *jtok;
 static __thread size_t jtok_cap;
@@ -4329,10 +4544,8 @@ static void json_same_release(void)
 	jtok_cap = 0;
 }
 
-/* two documents: 1 the same JSON value, 0 not, -1 not decided (deeper than
- * the walk goes, refused by the tokenizer, out of memory) - counted
- * uncompared, never different (S402).  *@walked: the text alone did not
- * settle it */
+/* two documents: 1 the same JSON value, 0 not, -1 not decided (too deep, refused by the tokenizer,
+ * no memory) - counted uncompared, never different.  *@walked: the text alone did not settle it */
 static int json_same(const char *a, size_t al, const char *b, size_t bl,
 		int *walked)
 {
@@ -4362,7 +4575,7 @@ static int json_same(const char *a, size_t al, const char *b, size_t bl,
 	return r;
 }
 
-#define UPF_UNCOMPARED 4                /* S402: not decided - counted apart */
+#define UPF_UNCOMPARED 4                /* not decided: counted apart */
 #define UPF_HOW_TEXT   0                /* the bytes (or the text pass) said */
 #define UPF_HOW_WALKED 1                /* a document walked */
 
@@ -4405,9 +4618,8 @@ static void upf_exp_txt(char *d, size_t dn, unsigned int exp)
 		snprintf(d, dn, "in %u s", exp > now ? exp - now : 0);
 }
 
-/* count one comparison; a value that differs is named (never its bytes:
- * a collection may hold credentials), at most UPF_NAME_MAX a sweep.  In a
- * check, Redis lacking the key means a run would write it */
+/* count one comparison; a differing value is named (never its bytes: a collection may hold
+ * credentials), at most UPF_NAME_MAX a sweep; in a check a key Redis lacks means a run writes it */
 static void upf_judge(struct up_col *uc, const char *k, size_t kl,
 		const char *v, size_t vl, int json, unsigned int exp,
 		const struct up_rb *rb)
@@ -4417,11 +4629,11 @@ static void upf_judge(struct up_col *uc, const char *k, size_t kl,
 
 	if (r == UPF_MISSING && !uc->upf_check)
 		r = UPF_DIFFERED;              /* declined, then deleted: gone here too */
-	if (r == UPF_UNCOMPARED) {         /* S402: never folded into differed */
+	if (r == UPF_UNCOMPARED) {         /* never folded into differed */
 		ST_ADD(uc->upf_uncompared, 1);
 		return;
 	}
-	if (r != UPF_MISSING)              /* S402: how a verdict on a key Redis had came */
+	if (r != UPF_MISSING)              /* how a verdict on a key Redis had came */
 		ST_ADD(*(how == UPF_HOW_WALKED ? &uc->upf_cmp_walked :
 			&uc->upf_cmp_text), 1);
 	ST_ADD(*(r == UPF_SAME ? &uc->upf_same : r == UPF_RETIMED ?
@@ -4453,15 +4665,8 @@ static void upf_judge(struct up_col *uc, const char *k, size_t kl,
 		(rb->fl & PCACHE_F_HASH) ? "a hash" : "a string", rb->vlen, e2);
 }
 
-/* ---- S402: the comparison on the sweep's own thread ------------------------
- * The writer carries every write-through write of the collection; a
- * document's walk there held the clients' writes behind it (S400's bench,
- * 12nk).  It hands pc-upf-<col> copies of the key, the value offered and
- * Redis's read-back, and goes on - the verdict only feeds counters and the
- * log, and the read-back is applied as before.  The queue is bounded by
- * entries and bytes; the writer never waits on it, and a key that does
- * not fit is counted uncompared.  The sweep's thread drains it between
- * keys and in its pacing sleeps, and the sweep is done when it is empty. */
+/* ---- the comparison on the sweep's own thread: the writer hands it copies over a bounded queue and
+ * goes on (a document's walk there held the clients' writes); what does not fit is uncompared ---- */
 #define UPF_CQ_MAX   1024
 #define UPF_CQ_BYTES (8u << 20)
 
@@ -4572,15 +4777,12 @@ static void upf_nap(struct up_col *uc, int ms)
 	nap_ms(ms);
 }
 
-/* AR4: an upfill job with trailing commands sends them only after its
- * first command's answer (its PEXPIRE only where the NX applied) - it is
- * never pipelined behind or ahead of another job */
+/* an upfill job with trailing commands sends them only after its first command's answer (its
+ * PEXPIRE only where the NX applied): never pipelined behind or ahead of another job */
 #define WT_EARLY(j) ((j)->upfill && (j)->n2)
 
-/* AR2: a job that waited (almost) its whole deadline in the queue: not
- * sent, so certainly not applied - sent with a few ms left it would time
- * out too, and the next one behind it, each an uncertain "may or may
- * not".  1 failed here, 0 it may go */
+/* a job that waited (almost) its whole deadline in the queue is not sent, so certainly not applied
+ * (sent with a few ms left it would time out, and the next behind it).  1 failed here, 0 it may go */
 static int wt_expired(struct up_col *uc, struct up_wjob *j, long long now)
 {
 	if (j->t0 + uc->timeout_ms - now >= wt_need_ms(uc))
@@ -4590,9 +4792,8 @@ static int wt_expired(struct up_col *uc, struct up_wjob *j, long long now)
 	return 1;
 }
 
-/* a job's commands on the wire: its first, then - unless it waits for the
- * first's answer - the trailing ones and the read-backs.  0, or -1 the
- * connection failed (how much went out is not known) */
+/* a job's commands on the wire: its first, then (unless it waits for the first's answer) the
+ * trailing ones and the read-backs.  0, or -1 the connection failed (how much went out is unknown) */
 static int wt_put(struct uconn *c, const struct up_wjob *j, const int *kidx,
 		int nk, long long dl)
 {
@@ -4604,21 +4805,39 @@ static int wt_put(struct uconn *c, const struct up_wjob *j, const int *kidx,
 }
 
 #define WT_GET_DEMOTED -4              /* READONLY: the master stepped down */
+#define WT_GET_MOVED   -5              /* MOVED: not applied, not answered */
+#define WT_MOVED_MSG "upstream: the Redis Cluster moved the key's slot - write not applied, retry"
 
-/* a sent job's answer: its replies read in order, the fleet told, the
- * client answered.  0, or <0 the job failed here and the connection is
- * closed (WT_GET_DEMOTED: it answered READONLY) */
+/* the replies of a job sent behind its first, which said MOVED - each says it too */
+static int wt_skip(struct uconn *c, long long dl, const struct up_wjob *j, int nk)
+{
+	struct rv v;
+	int n = WT_EARLY(j) ? 0 : j->n2, k, rc;
+
+	if (!WT_EARLY(j))
+		for (k = 0; k < nk; k++)
+			n += j->guess == UPWG_GONE ? 2 : 3;
+	for (k = 0; k < n; k++) {
+		if ((rc = read_reply(c, &v, dl)) != 0)
+			return rc;
+		rv_free(&v);
+	}
+	return 0;
+}
+
+/* a sent job's answer: its replies read in order, the fleet told, the client answered.  0, or <0
+ * the job failed here and the connection is closed (WT_GET_DEMOTED: it answered READONLY) */
 static int wt_get(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 		const int *kidx, int nk)
 {
-	long long dl = j->t0 + uc->timeout_ms;     /* AR2: from the queueing */
+	long long dl = j->t0 + uc->timeout_ms;     /* from the queueing */
 	struct up_rb *rb = NULL;
 	struct wbuf out = { NULL, 0, 0 };
 	struct rv v, v2;
 	size_t sp = 0, ep = 0;
 	long long ival;
 	int rc, k, isnil, iserr;
-	/* AR4: an upfill's trailing PEXPIRE waits for its NX's answer */
+	/* an upfill's trailing PEXPIRE waits for its NX's answer */
 	int n2 = j->n2, early = WT_EARLY(j);
 	char em[160];
 	size_t eml = 0;
@@ -4644,12 +4863,49 @@ static int wt_get(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 		free(out.p);
 		LM_WARN("collection '%s': %s answers READONLY - it is no longer "
 			"the master\n", uc->name, c->s->addr);
+		if (uc->cluster)
+			cl_kick(uc);
 		wt_fail(uc, j, "upstream: the master stepped down - write not "
 			"applied, retry");
 		uc_close(c);
 		__atomic_store_n(&uc->w_master, -1, __ATOMIC_RELAXED);
 		__atomic_store_n(&uc->w_state, UPWS_DOWN, __ATOMIC_RELAXED);
 		return WT_GET_DEMOTED;
+	}
+	if (iserr && uc->cluster && v.s && ((v.len > 6 && !strncmp(v.s, "MOVED ", 6)) ||
+	    (v.len > 4 && !strncmp(v.s, "ASK ", 4)))) {
+		/* not applied: the slot is another node's (re-run once there), or migrating
+		 * (refused: its re-run would need ASKING before every command) */
+		char t[160], *sp, *col;
+		int ask = v.s[0] == 'A';
+
+		snprintf(t, sizeof t, "%.*s", (int)(v.len < sizeof t - 1 ? v.len : sizeof t - 1),
+			v.s);
+		rv_free(&v);
+		free(out.p);
+		if ((rc = wt_skip(c, dl, j, nk)) != 0) {
+			uc_close(c);
+			wt_fail(uc, j, "upstream: the connection to the master failed - write not "
+				"applied (the Redis Cluster moved the key's slot)");
+			return rc;
+		}
+		cl_kick(uc);
+		ST_ADD(uc->cl_moved, 1);
+		sp = strchr(t, ' ') ? strchr(strchr(t, ' ') + 1, ' ') : NULL;
+		col = sp ? strrchr(sp + 1, ':') : NULL;
+		if (ask || j->moved || !col || (size_t)(col - sp - 1) >= sizeof j->mhost ||
+		    atoi(col + 1) <= 0 || atoi(col + 1) > 65535 ||
+		    (col == sp + 1 && strlen(c->s->host) >= sizeof j->mhost)) {
+			wt_fail(uc, j, ask ? "upstream: the key's slot is migrating in the Redis "
+				"Cluster - write not applied, retry" : "upstream: the Redis Cluster "
+				"moved the key's slot again - write not applied, retry");
+			return 0;
+		}
+		*col = 0;
+		snprintf(j->mhost, sizeof j->mhost, "%.63s", col == sp + 1 ? c->s->host : sp + 1);
+		j->mport = atoi(col + 1);
+		j->moved = 1;
+		return WT_GET_MOVED;
 	}
 	if (iserr && j->json && v.s && v.len >= 15 &&
 	    !strncmp(v.s, "ERR unknown command", 19 <= v.len ? 19 : v.len)) {
@@ -4661,8 +4917,7 @@ static int wt_get(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 	}
 	rv_free(&v);
 	if (early) {
-		/* AR4: the PEXPIRE only where the NX applied - a value Redis
-		 * kept keeps Redis's expiry */
+		/* the PEXPIRE only where the NX applied: a value Redis kept keeps Redis's expiry */
 		if (iserr || isnil)
 			n2 = 0;
 		if (wt_send_rest(c, dl, j, kidx, nk, n2) != 0)
@@ -4682,10 +4937,10 @@ static int wt_get(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 		if ((rc = rb_read(c, dl, j->argv[kidx[k]], j->argl[kidx[k]],
 		        j->guess, &rb[k])) != 0)
 			goto io_rc;
-	if (j->upfill) {                   /* AR4 */
+	if (j->upfill) {
 		ST_ADD(*(iserr ? &uc->upf_errors : isnil ? &uc->upf_kept :
 			&uc->upf_written), 1);
-		if (!iserr && isnil) {             /* S400, S402: compared there */
+		if (!iserr && isnil) {             /* compared on the sweep's thread */
 			if (nk == 1 && rb[0].key)
 				upf_handoff(uc, j, &rb[0]);
 			else
@@ -4694,9 +4949,8 @@ static int wt_get(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 		ST_ADD(uc->upf_answered, 1);
 	}
 	if (iserr || (isnil && !j->upfill)) {
-		/* refused or not applied: the fleet keeps what it had - but an
-		 * upfill's NX that Redis declined reads the key back all the
-		 * same: Redis's value wins (AR4) */
+		/* refused or not applied: the fleet keeps what it had - but an upfill's NX that
+		 * Redis declined reads the key back all the same: Redis's value wins */
 		rb_free(rb, nk);
 		rb = NULL;
 		nk = 0;
@@ -4750,17 +5004,15 @@ static int wt_run(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 		return -1;
 	}
 	ST_ADD(uc->wt_fwd, 1);
-	return wt_get(uc, c, j, kidx, nk) < 0 ? -1 : 0;
+	{
+		int rc = wt_get(uc, c, j, kidx, nk);
+
+		return rc == WT_GET_MOVED ? rc : rc < 0 ? -1 : 0;
+	}
 }
 
-/* AR3: a run of plain jobs pipelined - every job's commands first, then
- * the answers in the same order: per-key order holds (one connection,
- * Redis answers in order) and the run costs one round trip, not one a
- * write.  A send that fails: that job may or may not have been applied,
- * the ones after it were never sent - not applied.  An answer that fails:
- * that job and every one sent after it may or may not have been applied.
- * READONLY: the jobs sent with it went to a replica - not applied.  0, or
- * -1 the connection failed (every job answered) */
+/* a run of plain jobs pipelined, then the answers in order: per-key order holds (one connection) and
+ * the run costs one round trip.  0, or -1 the connection failed (every job answered) */
 static int wt_pipe(struct up_col *uc, struct uconn *c, struct up_wjob **js,
 		int n)
 {
@@ -4809,7 +5061,7 @@ static int wt_pipe(struct up_col *uc, struct uconn *c, struct up_wjob **js,
 			continue;
 		}
 		k = wt_get(uc, c, js[i], js[i]->kidx, js[i]->nkeys);
-		if (k < 0)
+		if (k < 0 && k != WT_GET_MOVED)
 			dead = k;                  /* it answered; the conn is closed */
 	}
 	free(go);
@@ -4818,6 +5070,151 @@ static int wt_pipe(struct up_col *uc, struct uconn *c, struct up_wjob **js,
 		return -1;
 	}
 	return 0;
+}
+
+/* the master of a job's slot: its index, -1 none known, -2 no shard serves the slot, -3 its keys
+ * are in different slots (Redis would answer CROSSSLOT) */
+static int wr_slot_master(struct up_col *uc, const struct up_wjob *j)
+{
+	int k, slot = -1, m = -1;
+
+	for (k = 0; k < j->nkeys; k++) {
+		int sl = pc_key_slot(j->argv[j->kidx[k]], j->argl[j->kidx[k]]);
+
+		if (slot >= 0 && sl != slot)
+			return -3;
+		slot = sl;
+	}
+	if (slot < 0)
+		return -1;
+	pthread_mutex_lock(&uc->mx);
+	if (uc->cmap) {
+		unsigned char sh = uc->cmap->sh[slot];
+
+		m = sh == UP_NOSHARD ? -2 : uc->cmap->master[sh];
+	}
+	pthread_mutex_unlock(&uc->mx);
+	return m;
+}
+
+/* the writer's connection to master @m, opened when first needed; NULL unreachable, or no longer
+ * a master (the map asked again) */
+static struct uconn *wr_conn(struct up_col *uc, struct uconn *wc, int m)
+{
+	struct uconn *c = &wc[m];
+
+	if (c->uc && c->fd >= 0 &&
+	    c->incarn != __atomic_load_n(&uc->srv[m].incarn, __ATOMIC_ACQUIRE))
+		uc_close(c);                   /* the slot took another address */
+	if (c->uc && c->fd >= 0)
+		return c;
+	if (!c->uc) {
+		c->uc = uc;
+		c->s = &uc->srv[m];
+		c->fd = -1;
+		c->wr = 1;
+		c->wcred = 1;
+	}
+	/* one that failed lately fails fast (a dead host's timeout once a second, not once a job) and
+	 * the map is asked again: its slots may have a new master */
+	if (c->backoff_until && now_ms() < c->backoff_until)
+		return NULL;
+	if (uc_connect(c, now_ms() + uc->timeout_ms) != 0 ||
+	    __atomic_load_n(&uc->srv[m].role, __ATOMIC_RELAXED) != UPR_MASTER) {
+		uc_close(c);
+		c->backoff_until = now_ms() + 1000;
+		cl_kick(uc);
+		return NULL;
+	}
+	c->backoff_until = 0;
+	if (__atomic_load_n(&uc->w_json, __ATOMIC_RELAXED) <= 0) {
+		int js = wt_json_check(c);
+
+		if (js < 0) {
+			uc_close(c);
+			return NULL;
+		}
+		__atomic_store_n(&uc->w_json, js, __ATOMIC_RELAXED);
+	}
+	__atomic_store_n(&uc->w_state, UPWS_OK, __ATOMIC_RELAXED);
+	return c;
+}
+
+/* a job a MOVED sent back, run once on the node it names */
+static void wr_moved(struct up_col *uc, struct uconn *wc, struct up_wjob *j)
+{
+	int k = uc->discover == PC_UP_DISC_NO ? cl_srv_find(uc, j->mhost, j->mport)
+		: srv_add(uc, j->mhost, j->mport, UPO_CLUSTER);
+	struct uconn *c = k >= 0 ? wr_conn(uc, wc, k) : NULL;
+
+	j->moved = 2;
+	if (!c) {
+		wt_fail(uc, j, "upstream: the node the Redis Cluster moved the key's slot "
+			"to is not reachable - write not applied");
+		return;
+	}
+	(void)wt_run(uc, c, j, j->kidx, j->nkeys);
+}
+
+/* a batch for a Redis Cluster: each job to its slot's master over that master's own connection,
+ * one master's run of plain jobs pipelined, the MOVED ones re-run once where it says */
+static void wr_cluster(struct up_col *uc, struct up_wjob **batch, int nb, struct uconn *wc)
+{
+	int tgt[WT_BATCH], i, k;
+
+	for (i = 0; i < nb; i++)
+		tgt[i] = batch[i]->unk ? -4 : wr_slot_master(uc, batch[i]);
+	for (i = 0; i < nb; i++) {
+		struct up_wjob *j = batch[i];
+		int n = 1, json = __atomic_load_n(&uc->w_json, __ATOMIC_RELAXED);
+		struct uconn *c;
+
+		__atomic_store_n(&uc->w_inflight, nb - i, __ATOMIC_RELAXED);
+		if (tgt[i] < 0) {
+			if (tgt[i] == -1 || tgt[i] == -2) {
+				__atomic_store_n(&uc->w_state, UPWS_NOMASTER, __ATOMIC_RELAXED);
+				cl_kick(uc);           /* nothing sent, so no MOVED will ask */
+			}
+			wt_fail(uc, j, tgt[i] == -4 ? "upstream: a command perfcached does not "
+				"know is not passed to a Redis Cluster" : tgt[i] == -3 ?
+				"upstream: CROSSSLOT the keys of this write are in different slots "
+				"of the Redis Cluster - not applied" : tgt[i] == -2 ? "upstream: no "
+				"node of the Redis Cluster serves the key's slot - write not applied"
+				: "upstream: no master known for the key's slot - write not applied");
+			wt_job_free(j);
+			continue;
+		}
+		if (j->json && !json) {
+			ST_ADD(uc->wt_json_refused, 1);
+			wt_fail(uc, j, "upstream: the Redis Cluster has no RedisJSON - JSON "
+				"writes are not forwarded");
+			wt_job_free(j);
+			continue;
+		}
+		if (!(c = wr_conn(uc, wc, tgt[i]))) {
+			char msg[200];
+
+			snprintf(msg, sizeof msg, "upstream: %.80s, the master of the key's slot, "
+				"is not reachable - write not applied", uc->srv[tgt[i]].addr);
+			__atomic_store_n(&uc->w_state, UPWS_DOWN, __ATOMIC_RELAXED);
+			wt_fail(uc, j, msg);
+			wt_job_free(j);
+			continue;
+		}
+		while (i + n < nb && tgt[i + n] == tgt[i] && !WT_EARLY(j) &&
+		       !WT_EARLY(batch[i + n]) && !(batch[i + n]->json && !json))
+			n++;
+		if (n > 1)
+			(void)wt_pipe(uc, c, batch + i, n);
+		else
+			(void)wt_run(uc, c, j, j->kidx, j->nkeys);
+		for (k = 0; k < n; k++) {
+			if (batch[i + k]->moved == 1)
+				wr_moved(uc, wc, batch[i + k]);
+			wt_job_free(batch[i + k]);
+		}
+		i += n - 1;
+	}
 }
 
 static void pr_queue(struct up_col *uc, struct up_wjob *j);
@@ -4985,7 +5382,7 @@ static struct up_wjob *wt_job_new(const struct pc_upfw *fw)
 /* Redis's error text without its '-' and line end, for the native doors */
 static __thread char wt_rerr_buf[256];
 
-/* S385: a write on a write-through collection */
+/* a write on a write-through collection */
 static int wt_gate(struct up_col *uc, const char *const *keys,
 		const size_t *kl, int nkeys, int verdict, struct pc_upg *g,
 		const struct pc_upfw *fw)
@@ -5067,8 +5464,8 @@ static int wt_gate(struct up_col *uc, const char *const *keys,
 	pthread_mutex_lock(&uc->mx);
 	if (uc->wq_n + __atomic_load_n(&uc->w_inflight, __ATOMIC_RELAXED) >=
 	    uc->wq_max) {
-		/* AR2: past upstream_write_queue - refused now, certainly not
-		 * applied, instead of parked behind a master that is slow */
+		/* past upstream_write_queue: refused now, certainly not applied, instead of
+		 * parked behind a slow master */
 		static __thread char qmsg[160];
 
 		pthread_mutex_unlock(&uc->mx);
@@ -5088,10 +5485,8 @@ static int wt_gate(struct up_col *uc, const char *const *keys,
 	return PC_UPG_HELD;
 }
 
-/* 12nt TC-2: is @fw a write the forward plane carries as one of its ops
- * (handle_fwd_op's 0-5: SET [NX|XX] [EX], DEL, INCRBY/DECRBY, EXPIRE,
- * PERSIST)?  A hash write, a JSON write or an MSET is not: those run
- * through where the client is, as before. */
+/* is @fw a write the forward plane carries as one of its ops (SET [NX|XX] [EX], DEL, INCRBY/DECRBY,
+ * EXPIRE, PERSIST)?  Hash, JSON and MSET writes run through where the client is */
 static int fw_plane_op(const struct pc_upfw *fw)
 {
 	static const char *const ops[] = { "SET", "DEL", "INCRBY", "DECRBY",
@@ -5114,15 +5509,20 @@ int pc_upstream_gate_fw(pcache_htable_t *ht, const char *col, size_t collen,
 	struct up_col *uc;
 
 	memset(g, 0, sizeof *g);
+	relay_drop();                      /* one re-run's, never the next command's */
+	if (rl_cur && verdict != PC_UPV_NONE) {
+		rl_live = rl_cur;
+		rl_cur = NULL;
+		pcache_ht_set_relay(ht, rl_live);
+	}
 	if (!ncols)
 		return PC_UPG_PROCEED;
 	uc = col_of(col, collen);
 	if (uc && uc->through && verdict != PC_UPV_WT && fw && !fw->refuse &&
 	    !fw->unk && nkeys == 1 && fw_plane_op(fw) && pc_store_shard_enabled(ht) &&
 	    pc_cluster_enabled() && pc_shard_owner(col, collen, keys[0], kl[0]) != 0)
-		/* 12nt TC-2: in shard mode the OWNER runs the write-through -
-		 * the op forwards as every write does (pc_fwd_begin) and the
-		 * owner's handle_fwd_op hands it to pc_upstream_fwd_through */
+		/* in shard mode the OWNER runs the write-through: the op forwards as every write
+		 * does and the owner's handle_fwd_op hands it to pc_upstream_fwd_through */
 		return PC_UPG_PROCEED;
 	if (uc && uc->through && (verdict == PC_UPV_WT || (fw && fw->unk) ||
 	    cls == UPC_MUTATE || cls == UPC_PLAIN || del))
@@ -5173,15 +5573,8 @@ int pc_upstream_through(const char *col, size_t collen)
 	return uc && uc->through;
 }
 
-/* S418: a record of a through collection that arrived from a peer is
- * Redis's by construction - its author stored it only after Redis
- * confirmed the write - so the copy is marked "t" HERE, on arrival:
- * passively (never re-propagated, off the WAL, like the copy itself) and
- * with the record's own version.  The author's mark travels as a second
- * record, in a push of its own, and an invalidation landing between the
- * two left a copy without its mark that the owned count and the upfill
- * then took for the fleet's own (staging, 2026-10-15: one key written
- * through on .247, its copy on .245 unmarked for good). */
+/* a peer's record of a through collection is Redis's by construction (its author stored it after
+ * Redis confirmed), so it is marked "t" here on arrival, passively and with the record's version */
 void pc_upstream_note_copy(const char *col, size_t collen, const char *k,
 		size_t kl, unsigned int exp, unsigned long long ver)
 {
@@ -5241,10 +5634,8 @@ int pc_upstream_resp_pass(const char *col, size_t collen, char *const *argv,
 	return rc;
 }
 
-/* on the worker that queued the write, before its command answers: the
- * fleet holds what Redis holds - a value as its record (owned, with Redis's
- * expiry), gone as gone (a short no-fall entry covers the replicas that
- * have not applied the delete yet), a type it cannot hold left to Redis */
+/* on the worker that queued the write, before its command answers: the fleet holds what Redis
+ * holds (a value as its record, gone as gone with a short no-fall cover, other types left to Redis) */
 static void wt_apply(struct up_col *uc, const struct up_done *d)
 {
 	pcache_htable_t *ht = pc_store_find(uc->name, uc->nlen);
@@ -5264,8 +5655,8 @@ static void wt_apply(struct up_col *uc, const struct up_done *d)
 			continue;
 		k.s = r->key;
 		k.len = (int)r->klen;
-		/* S429: a read-back older than the newest applied for this key
-		 * (another worker applied a later write first) is not applied */
+		/* a read-back older than the newest applied for this key (another worker applied
+		 * a later write first) is not applied */
 		if (uc->order && d->wseq) {
 			struct up_order *o;
 
@@ -5282,33 +5673,27 @@ static void wt_apply(struct up_col *uc, const struct up_done *d)
 			o->seq = d->wseq;
 		}
 		if (r->what == UPRB_VALUE) {
-			/* S435: the record lands BEFORE the copies go - a read
-			 * on another worker finds the one or the other.  The
-			 * copies first left a moment with neither, and a read
-			 * the gate had let through on a copy answered nil */
+			/* the record lands BEFORE the copies go, so a read on another worker
+			 * finds the one or the other, never neither */
 			if (pc_verb_store_local(ht, &k, r->val, r->vlen, r->exp,
 			        r->fl) == 0) {
-				nofall_put_m(uc, &k, r->exp, "t");     /* AR1 */
-				echo_note(uc, k.s, (size_t)k.len);   /* S422 */
+				nofall_put_m(uc, &k, r->exp, "t");
+				echo_note(uc, k.s, (size_t)k.len);
 			}
 			sh_remove(uc, &k);
 		} else if (r->what == UPRB_GONE) {
 			long long cover = uc->max_lag_ms > 2000 ? uc->max_lag_ms : 2000;
 
-			/* S451: a delete has its echo too, and the echo drops
-			 * the "g" mark (inv_apply) - the read after it went to a
-			 * replica that may still hold the key, and answered the
-			 * value just deleted (AR13 on rc9).  Noted BEFORE the
-			 * mark, so an echo that takes the mark finds the window
-			 * open and the read goes to the master */
+			/* a delete's echo drops the "g" mark, and a read could reach a replica
+			 * still holding the key: noted first, so that read goes to the master */
 			echo_note(uc, k.s, (size_t)k.len);
-			rm_begin(uc);                      /* S435 */
+			rm_begin(uc);
 			sh_remove(uc, &k);
 			pc_verb_remove_local(ht, &k);
-			nofall_put_m(uc, &k, ttl_ticks(cover), "g");   /* AR1 */
+			nofall_put_m(uc, &k, ttl_ticks(cover), "g");
 			rm_end(uc);
 		} else {
-			rm_begin(uc);                      /* S435 */
+			rm_begin(uc);
 			sh_remove(uc, &k);
 			pc_verb_remove_local(ht, &k);
 			if (nf)
@@ -5326,14 +5711,16 @@ static void *wr_main(void *arg)
 	struct uconn c;
 	struct uk_cache *uk = calloc(1, sizeof *uk);
 	long long next_try = 0, backoff = 1000, next_role = 0, next_json = 0;
-	long long next_own = 0;            /* AR4 */
+	long long next_own = 0;
+
+	struct uconn *wc = calloc(PC_UP_MAX_SRV, sizeof *wc);   /* a master each */
 
 	memset(&c, 0, sizeof c);
 	c.uc = uc;
 	c.s = &uc->srv[0];
 	c.fd = -1;
 	c.wr = 1;
-	c.wcred = 1;                       /* AR7 */
+	c.wcred = 1;
 	wt_is_writer = 1;                  /* its writes are counted by command */
 	rv_max = (size_t)uc->pass_max;
 #ifdef __linux__
@@ -5362,8 +5749,8 @@ static void *wr_main(void *arg)
 			break;
 		}
 		{
-			/* S403: this thread's CPU, once a loop - once a second idle,
-			 * once a batch busy; its share of five minutes is in stats */
+			/* this thread's CPU, once a loop (once a second idle, once a batch
+			 * busy); stats show its share of five minutes */
 			struct timespec tc;
 
 			if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tc) == 0)
@@ -5377,13 +5764,37 @@ static void *wr_main(void *arg)
 			uc->wq_head = uc->wq_head->next;
 			uc->wq_n--;
 		}
-		/* AR2: still waiting for the master, so still under the bound */
+		/* still waiting for the master, so still under the bound */
 		__atomic_store_n(&uc->w_inflight, nb, __ATOMIC_RELAXED);
 		if (!uc->wq_head)
 			uc->wq_tail = NULL;
 		pthread_mutex_unlock(&uc->mx);
 
 		now = now_ms();
+		if (wc && __atomic_load_n(&uc->cluster, __ATOMIC_ACQUIRE)) {
+			if (c.fd >= 0)
+				uc_close(&c);
+			if (now >= next_own) {
+				next_own = now + wt_owned_ms();
+				wt_count_owned(uc);
+			}
+			wr_cluster(uc, batch, nb, wc);
+			__atomic_store_n(&uc->w_inflight, 0, __ATOMIC_RELAXED);
+			continue;
+		}
+		/* its master left the topology (or its slot took another address), or the
+		 * sentinels name another */
+		if (c.fd >= 0 && (__atomic_load_n(&c.s->gone, __ATOMIC_RELAXED) ||
+		    c.incarn != __atomic_load_n(&c.s->incarn, __ATOMIC_ACQUIRE) ||
+		    wt_sen_moved(uc, c.s))) {
+			LM_WARN("collection '%s': %s is no longer the master (%s) - looking "
+				"again\n", uc->name, c.peer, wt_sen_moved(uc, c.s) ?
+				"the sentinels name another" : "gone from the topology");
+			uc_close(&c);
+			__atomic_store_n(&uc->w_master, -1, __ATOMIC_RELAXED);
+			__atomic_store_n(&uc->w_state, UPWS_DOWN, __ATOMIC_RELAXED);
+			next_try = 0;
+		}
 		/* the target: at the start, after a failure (backoff), and the
 		 * master's ROLE every 10 s while connected */
 		if (c.fd >= 0 && now >= next_role) {
@@ -5425,8 +5836,8 @@ static void *wr_main(void *arg)
 				uc_close(&c);
 		}
 		if (now >= next_own) {
-			/* AR4: the keys the fleet still owns here, for /stats */
-			next_own = now + WT_OWNED_MS;
+			/* the keys the fleet still owns here, for /stats */
+			next_own = now + wt_owned_ms();
 			wt_count_owned(uc);
 		}
 		for (i = 0; i < nb; i++) {
@@ -5435,10 +5846,8 @@ static void *wr_main(void *arg)
 
 			__atomic_store_n(&uc->w_inflight, nb - i, __ATOMIC_RELAXED);
 
-			/* AR3: the plain jobs that follow it go with it, one round
-			 * trip - not an unknown command (classed first), not an
-			 * upfill that waits for its first answer, not a JSON write
-			 * the master cannot take */
+			/* the plain jobs that follow go with it in one round trip - not an unknown
+			 * command, a waiting upfill, or a JSON write the master cannot take */
 			while (c.fd >= 0 && i + n < nb && !j->unk && !WT_EARLY(j) &&
 			       !batch[i + n]->unk && !WT_EARLY(batch[i + n]) &&
 			       !(j->json && !__atomic_load_n(&uc->w_json,
@@ -5454,8 +5863,11 @@ static void *wr_main(void *arg)
 					__atomic_store_n(&uc->w_master, -1,
 						__ATOMIC_RELAXED);
 				}
-				for (k = 0; k < n; k++)
+				for (k = 0; k < n; k++) {
+					if (batch[i + k]->moved == 1)       /* MOVED, no map yet */
+						wt_fail(uc, batch[i + k], WT_MOVED_MSG);
 					wt_job_free(batch[i + k]);
+				}
 				i += n - 1;
 				continue;
 			}
@@ -5463,13 +5875,8 @@ static void *wr_main(void *arg)
 			if (c.fd < 0) {
 				char msg[200];
 
-				/* AR2: behind a write that timed out and took the
-				 * connection with it, the rest of the batch had spent
-				 * their deadline queueing - that is the queue's
-				 * expiry, answered and counted as wt_run does, not an
-				 * unreachable master.  Which writes shared the timed-out
-				 * one's batch is timing: GitLab 110394's check-asan told
-				 * nine of them "no master reachable" */
+				/* behind a write that timed out and took the connection, the rest of
+				 * the batch spent its deadline queueing: expired, not unreachable */
 				if (wt_expired(uc, j, now_ms())) {
 					wt_job_free(j);
 					continue;
@@ -5497,6 +5904,10 @@ static void *wr_main(void *arg)
 				rc = wt_unknown(uc, &c, uk, j);
 			else
 				rc = wt_run(uc, &c, j, j->kidx, j->nkeys);
+			if (rc == WT_GET_MOVED) {          /* MOVED, no map yet */
+				wt_fail(uc, j, WT_MOVED_MSG);
+				rc = 0;
+			}
 			if (rc == 1)
 				continue;          /* the pass reader has it */
 			if (rc < 0 && c.fd >= 0 && j->unk)
@@ -5515,6 +5926,16 @@ static void *wr_main(void *arg)
 	uc_close(&c);
 	free(c.buf);
 	free(uk);
+	if (wc) {
+		int m;
+
+		for (m = 0; m < PC_UP_MAX_SRV; m++) {
+			if (wc[m].uc)
+				uc_close(&wc[m]);
+			free(wc[m].buf);
+		}
+		free(wc);
+	}
 	return NULL;
 }
 
@@ -5523,7 +5944,7 @@ static void *wr_main(void *arg)
 static void pr_queue(struct up_col *uc, struct up_wjob *j)
 {
 	pthread_mutex_lock(&uc->mx);
-	if (uc->pr_n >= uc->wq_max) {          /* AR2: the same bound */
+	if (uc->pr_n >= uc->wq_max) {          /* the same bound */
 		pthread_mutex_unlock(&uc->mx);
 		ST_ADD(uc->wt_qfull, 1);
 		wt_fail(uc, j, "upstream: the pass reader's queue is full - the "
@@ -5598,10 +6019,11 @@ static void *pr_main(void *arg)
 			wt_job_free(j);
 			continue;
 		}
-		if (c.fd >= 0 && c.s != s)
+		if (c.fd >= 0 && (c.s != s ||
+		    c.incarn != __atomic_load_n(&s->incarn, __ATOMIC_ACQUIRE)))
 			uc_close(&c);
 		c.s = s;
-		dl = j->t0 + uc->timeout_ms;      /* AR2: from the queueing */
+		dl = j->t0 + uc->timeout_ms;      /* from the queueing */
 		if (dl - now_ms() < wt_need_ms(uc)) {
 			ST_ADD(uc->wt_qexpired, 1);
 			wt_fail(uc, j, "upstream: the command waited too long for a "
@@ -5646,9 +6068,8 @@ static void *pr_main(void *arg)
 
 static int pull_worker;                /* round-robin over the workers */
 
-/* S401: when a sweep that has moved @done keys and @bytes since @t0 (mono
- * ms) may go on - the later of what upstream_drain_rate (keys) and
- * upstream_drain_mb_rate (bytes) allow; 0 for either is no cap */
+/* when a sweep that has moved @done keys and @bytes since @t0 (mono ms) may go on: the later of
+ * what upstream_drain_rate (keys) and upstream_drain_mb_rate (bytes) allow; 0 for either is no cap */
 static long long sweep_due(const struct up_col *uc, long long t0,
 		long long done, long long bytes)
 {
@@ -5697,14 +6118,13 @@ static void pull_post(struct up_col *uc, const char *k, size_t kl,
 	d.vlen = vl;
 	d.exp = exp;
 	d.fl = fl;
-	__atomic_add_fetch(&uc->dr_bytes, (long long)vl, __ATOMIC_RELAXED);  /* S401 */
+	__atomic_add_fetch(&uc->dr_bytes, (long long)vl, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&uc->drain_inflight, 1, __ATOMIC_RELAXED);
 	post_done(w, &d);
 }
 
-/* read one batch of keys: TYPE, PTTL and GET for all of them in one
- * pipeline, then HGETALL / JSON.GET for the hashes and documents in a
- * second.  0, or <0 the connection failed (the batch is read again) */
+/* read one batch of keys: TYPE, PTTL and GET for all in one pipeline, then HGETALL / JSON.GET for
+ * the hashes and documents in a second.  0, or <0 the connection failed (the batch is read again) */
 static int drain_batch(struct uconn *c, char **ks, size_t *kl, int n)
 {
 	struct up_col *uc = c->uc;
@@ -5758,7 +6178,7 @@ static int drain_batch(struct uconn *c, char **ks, size_t *kl, int n)
 			rv_free(&gv);
 			continue;
 		}
-		exps[i] = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;   /* S449 */
+		exps[i] = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;
 		if (!strcmp(tname, "string")) {
 			if (gv.t == '$' || gv.t == '+')
 				pull_post(uc, ks[i], kl[i], gv.s, gv.len, exps[i], 0);
@@ -5829,24 +6249,32 @@ static void *drain_main(void *arg)
 {
 	struct up_col *uc = arg;
 	struct uconn c;
+	struct up_srv *tg[PC_UP_MAX_SRV];
 	long long t0 = now_ms(), done = 0;
-	int p, failures = 0;
+	int p, t, ntg = 0, failures = 0;   /* tg: the servers swept, one a shard */
 
 	memset(&c, 0, sizeof c);
 	c.uc = uc;
-	pthread_mutex_lock(&uc->mx);           /* S382: one that serves */
-	c.s = pick(uc, NULL);
-	if (!c.s)
-		c.s = &uc->srv[0];
+	pthread_mutex_lock(&uc->mx);           /* one that serves */
+	if (uc->cluster && uc->cmap) {         /* a server of each shard, a SCAN each */
+		for (t = 0; t < uc->cmap->nsh; t++)
+			if ((tg[ntg] = pick_in(uc, NULL, uc->cmap->nodes[t])) != NULL)
+				ntg++;
+			else
+				LM_WARN("collection '%s': the drain sweep has no server for shard %d of "
+					"the Redis Cluster - its keys are not swept\n", uc->name, t);
+	} else if ((tg[0] = pick(uc, NULL)) != NULL)
+		ntg = 1;
+	if (!ntg)
+		tg[ntg++] = &uc->srv[0];
 	pthread_mutex_unlock(&uc->mx);
+	c.s = tg[0];
 	c.fd = -1;
-	/* never tracked: what the sweep reads goes straight into the
-	 * collection, not into the shadow, so there is no copy for an
-	 * invalidation to drop - and tracking it would make the upstream
-	 * remember every key of the family for this client and send an
-	 * invalidation for each later write to any of them */
+	/* never tracked: the sweep writes the collection, not the shadow (nothing to drop);
+	 * tracking would make the upstream push an invalidation per later write to any key */
 	c.notrack = 1;
 	fill_capped = 0;
+	fill_gen_set = 0;
 #ifdef __linux__
 	{
 		char tn[16];
@@ -5860,11 +6288,22 @@ static void *drain_main(void *arg)
 		"the fleet has not taken it over (at most %d keys and %d MB a "
 		"second)\n", uc->name, uc->npat, uc->drain_rate,
 		uc->drain_mb_rate);
-	for (p = 0; p < uc->npat && !uc->drain_stop; p++) {
+	for (p = 0; p < uc->npat * ntg && !uc->drain_stop; p++) {
 		char cur[32] = "0";
+		int q = p % uc->npat;          /* each pattern on each shard's server */
+		unsigned int inc = __atomic_load_n(&tg[p / uc->npat]->incarn, __ATOMIC_ACQUIRE);
 
+		if (c.s != tg[p / uc->npat] || (c.fd >= 0 && c.incarn != inc)) {
+			uc_close(&c);
+			c.s = tg[p / uc->npat];
+		}
 		do {
-			const char *av[6] = { "SCAN", cur, "MATCH", uc->pat[p],
+			/* its slot took another address: the cursor is not its */
+			if (__atomic_load_n(&c.s->incarn, __ATOMIC_ACQUIRE) != inc) {
+				uc_close(&c);
+				break;
+			}
+			const char *av[6] = { "SCAN", cur, "MATCH", uc->pat[q],
 				"COUNT", "256" };
 			size_t al[6];
 			long long dl = now_ms() + uc->timeout_ms * 4LL;
@@ -5876,7 +6315,7 @@ static void *drain_main(void *arg)
 			al[0] = 4;
 			al[1] = strlen(cur);
 			al[2] = 5;
-			al[3] = (size_t)uc->patlen[p];
+			al[3] = (size_t)uc->patlen[q];
 			al[4] = 5;
 			al[5] = 3;
 			if (c.fd < 0 && uc_connect(&c, dl) != 0)
@@ -5908,11 +6347,8 @@ static void *drain_main(void *arg)
 				for (i = 0; ok && i < n; i++)
 					ok = ks[i] != NULL;
 				if (ok) {
-					/* 12nt TC-4 (0.7.1): the sweep takes over the
-					 * keys that belong HERE - the owner's share in
-					 * shard, a holder's in spread; the rest are
-					 * their owners' sweeps' (every node runs its
-					 * own), skipped before the GET */
+					/* the sweep takes the keys that belong HERE (the owner's
+					 * in shard, a holder's in spread); the rest are skipped */
 					pcache_htable_t *ht = pc_store_find(uc->name,
 						uc->nlen);
 					int m = 0;
@@ -5946,8 +6382,7 @@ static void *drain_main(void *arg)
 			}
 			if (!ok)
 				goto retry;
-			/* the rate caps, keys and bytes (S401): the upstream may
-			 * be production */
+			/* the rate caps, keys and bytes: the upstream may be production */
 			{
 				long long want = sweep_due(uc, t0, done,
 					__atomic_load_n(&uc->dr_bytes, __ATOMIC_RELAXED));
@@ -5988,28 +6423,8 @@ out:
 	return NULL;
 }
 
-/* ---- AR4: the keys the fleet owned before through, to Redis -----------------
- * A key written under upstream_writes = allow is the fleet's own: Redis may
- * never have had it, and under through it stays fleet-only - a field
- * update inside it fails in Redis, which has no root to update.  Which keys
- * those are is read from the COLLECTION, not from the no-fall companion: a
- * local record inside upstream_prefixes is the fleet's own unless its
- * companion entry says Redis holds its state ("t" written through, "g"
- * found gone).  The companion's "1" is left only where the fleet took a key
- * over from Redis (an overwrite, a promote) - a key Redis never had gets
- * none, and the first walk of "1"s found nothing to upfill (0.6.4-rc2's
- * CI, upwritethroughtest 14); a walk of the collection also finds keys an
- * older build wrote under allow.  The writer counts them a minute apart
- * (/stats fleet_owned); the upfill sweep, started by hand on ONE node,
- * collects them and queues each to the master THROUGH THE WRITER, so it is ordered
- * with the clients' writes: SET ... NX [PX] for a string or a counter (its
- * value on this node), JSON.SET $ ... NX and, only where that applied, a
- * PEXPIRE for a document.  NX: a value Redis holds meanwhile wins, and
- * the read-back makes the fleet hold whichever Redis kept - the key is
- * then written through ("t") like any other.  A hash (Redis has no NX for
- * a whole one), a rate-limit or a lock record (perfcached's own) is
- * skipped and counted.  Paced by upstream_drain_rate, and never more than
- * half of upstream_write_queue at once: the clients' writes keep room. */
+/* ---- upfill: the keys the fleet owns (no companion "t"/"g") go to the master THROUGH THE WRITER as
+ * SET/JSON.SET ... NX, so Redis's value wins; hashes, locks and rate limits are skipped ---- */
 
 struct upf_keys {
 	const struct up_col *uc;
@@ -6018,9 +6433,8 @@ struct upf_keys {
 	int n, cap;
 };
 
-/* the walk of the COLLECTION: every live record inside upstream_prefixes.
- * The companion is not read here - this runs under the collection's bucket
- * lock; upf_filter reads it afterwards, with no lock held */
+/* the walk of the COLLECTION: every live record inside upstream_prefixes; the companion is read
+ * afterwards (upf_filter) with no lock held, not under this bucket lock */
 static int upf_collect(const str *key, const str *val,
 		const struct pcache_rec_meta *mt, void *ctx)
 {
@@ -6098,13 +6512,57 @@ static void upf_release(struct upf_keys *uk)
 	uk->n = uk->cap = 0;
 }
 
-/* the writer, a minute apart: how many keys the fleet still owns here */
+static int own_cmp(const void *a, const void *b)
+{
+	unsigned long long x = *(const unsigned long long *)a;
+	unsigned long long y = *(const unsigned long long *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+/* the writer, a minute apart: how many keys the fleet still owns here - only a key unmarked at
+ * this walk and the one before (a write in flight holds its record a moment before its "t") */
 static void wt_count_owned(struct up_col *uc)
 {
 	struct upf_keys uk;
+	unsigned long long *h = NULL;
+	long long n = 0;
+	int i, j, l;
 
 	upf_gather(uc, &uk);
-	__atomic_store_n(&uc->wt_owned, (long long)uk.n, __ATOMIC_RELAXED);
+	if (uk.n && !(h = malloc((size_t)uk.n * sizeof *h))) {
+		upf_release(&uk);
+		return;                        /* the last count stands */
+	}
+	for (i = 0; i < uk.n; i++) {
+		unsigned long long x = 1469598103934665603ULL;   /* FNV-1a */
+
+		for (l = 0; l < uk.k[i].len; l++)
+			x = (x ^ (unsigned char)uk.k[i].s[l]) * 1099511628211ULL;
+		h[i] = x;
+	}
+	if (uk.n > 1)
+		qsort(h, (size_t)uk.n, sizeof *h, own_cmp);
+	pthread_mutex_lock(&uc->own_mx);
+	if (!uc->own_seen)
+		n = uk.n;
+	else
+		for (i = 0, j = 0; i < uk.n && j < uc->own_prev_n; )
+			if (h[i] < uc->own_prev[j])
+				i++;
+			else if (h[i] > uc->own_prev[j])
+				j++;
+			else {
+				n++;
+				i++;
+				j++;
+			}
+	free(uc->own_prev);
+	uc->own_prev = h;
+	uc->own_prev_n = uk.n;
+	uc->own_seen = 1;
+	pthread_mutex_unlock(&uc->own_mx);
+	__atomic_store_n(&uc->wt_owned, n, __ATOMIC_RELAXED);
 	upf_release(&uk);
 }
 
@@ -6170,15 +6628,14 @@ static int upf_one(struct up_col *uc, pcache_htable_t *ht, const str *k,
 	fw.nk = 1;
 	fw.kidx = k1;
 	j = wt_job_new(&fw);
-	*vlen = (size_t)v.len;             /* S401: what the byte rate counts */
+	*vlen = (size_t)v.len;             /* what the byte rate counts */
 	free(v.s);
 	if (!j)
 		return -1;
 	j->upfill = 1;
-	j->upf_vi = (fl & PCACHE_F_JSON) ? 3 : 2;  /* S400: SET k v / JSON.SET k $ v */
+	j->upf_vi = (fl & PCACHE_F_JSON) ? 3 : 2;  /* SET k v / JSON.SET k $ v */
 	j->upf_exp = exp;
-	/* its read-back is applied on a worker - a registered one (there is
-	 * no worker 0: 0.6.3's first CI) */
+	/* its read-back is applied on a registered worker (there is no worker 0) */
 	j->worker = inv_worker();
 	if (j->worker < 0) {
 		wt_job_free(j);
@@ -6193,10 +6650,8 @@ static int upf_one(struct up_col *uc, pcache_htable_t *ht, const str *k,
 	return 0;
 }
 
-/* S400: `check` - one owned key read from the master on the sweep's own
- * connection (RESP2 and never tracked, as the pass reader's; the read
- * credentials) and compared; nothing written, nothing applied.  0 compared,
- * 1 skipped (its type), -2 gone here meanwhile, -1 the read failed */
+/* `check`: one owned key read from the master on the sweep's own untracked RESP2 connection and
+ * compared, nothing applied.  0 compared, 1 skipped (its type), -2 gone here, -1 the read failed */
 static int upf_check_one(struct up_col *uc, pcache_htable_t *ht,
 		struct uconn *c, const str *k, size_t *vlen)
 {
@@ -6219,7 +6674,7 @@ static int upf_check_one(struct up_col *uc, pcache_htable_t *ht,
 	}
 	json = !!(fl & PCACHE_F_JSON);
 	g = json ? UPWG_JSON : UPWG_STRING;
-	*vlen = (size_t)v.len;             /* S401 */
+	*vlen = (size_t)v.len;
 	dl = now_ms() + uc->timeout_ms;
 	memset(&rb, 0, sizeof rb);
 	if ((c->fd < 0 && uc_connect(c, dl) != 0) ||
@@ -6250,7 +6705,7 @@ static void *upf_main(void *arg)
 	long long t0 = now_ms(), done = 0;
 	int i, m;
 
-	/* S400: a check reads the writer's master itself */
+	/* a check reads the writer's master itself */
 	memset(&c, 0, sizeof c);
 	c.uc = uc;
 	c.fd = -1;
@@ -6285,9 +6740,9 @@ static void *upf_main(void *arg)
 			uc->drain_mb_rate);
 	for (i = 0; i < uk.n && !uc->upf_stop && !uc->stop; i++) {
 		int r;
-		size_t vl = 0;                 /* S401 */
+		size_t vl = 0;
 
-		if (uc->upf_check) {           /* S400: counted as compared */
+		if (uc->upf_check) {           /* counted as compared */
 			r = c.s ? upf_check_one(uc, ht, &c, &uk.k[i], &vl) : -1;
 			if (r == 1)
 				ST_ADD(uc->upf_skipped, 1);
@@ -6298,48 +6753,43 @@ static void *upf_main(void *arg)
 				nap_ms(250);       /* not once a key at a dead master */
 			}
 		} else {
-			/* half the write queue at most: the clients' writes keep
-			 * room */
+			/* half the write queue at most: the clients' writes keep room */
 			while (!uc->upf_stop && !uc->stop &&
 			       uc->wq_n + __atomic_load_n(&uc->w_inflight,
 			       __ATOMIC_RELAXED) >= (uc->wq_max + 1) / 2)
-				upf_nap(uc, 5);    /* S402: comparisons go on */
+				upf_nap(uc, 5);    /* comparisons go on */
 			if (uc->upf_stop || uc->stop)
 				break;
 			r = upf_one(uc, ht, &uk.k[i], &vl);
 			ST_ADD(*(r == 0 ? &uc->upf_queued : r == 1 ?
 				&uc->upf_skipped : r == -2 ? &uc->upf_gone :
 				&uc->upf_errors), 1);
-			upf_drain_q(uc, 1);        /* S402 */
+			upf_drain_q(uc, 1);
 		}
 		done++;
 		if (r == 0)
 			__atomic_add_fetch(&uc->upf_bytes, (long long)vl,
-				__ATOMIC_RELAXED);         /* S401 */
+				__ATOMIC_RELAXED);
 		{
-			/* the caps, keys and bytes (S401) */
+			/* the caps, keys and bytes */
 			long long want = sweep_due(uc, t0, done,
 				__atomic_load_n(&uc->upf_bytes, __ATOMIC_RELAXED));
 
 			while (now_ms() < want && !uc->upf_stop && !uc->stop)
 				upf_nap(uc, (int)(want - now_ms() < 50 ?
-					want - now_ms() : 50));   /* S402 */
+					want - now_ms() : 50));
 		}
 	}
 	upf_release(&uk);
 	uc_close(&c);
 	free(c.buf);
-	/* the writer finishes what was queued before the state is final, and
-	 * every comparison it handed over is made (S402) */
+	/* the writer finishes what was queued before the state is final, and every comparison it
+	 * handed over is made */
 	while (!uc->stop && ST_GET(uc->upf_answered) < ST_GET(uc->upf_queued))
 		upf_nap(uc, 10);
 	upf_drain_q(uc, !uc->stop);
-	json_same_release();               /* S400: this thread's walk buffer -
-	                                    * after its last comparison */
-	/* the count before the state: "done" means fleet_owned says what is
-	 * left.  It was taken after, and a reader that saw done read the count
-	 * from before the sweep (GitLab 111557 core1, upwritethroughtest 14:
-	 * fleet_owned 4, the three written still counted) */
+	json_same_release();               /* this thread's walk buffer, after its last comparison */
+	/* the count before the state: "done" means fleet_owned already says what is left */
 	wt_count_owned(uc);
 	uc->upf_state = uc->upf_stop ? UPDR_STOPPED : UPDR_DONE;
 	uc->upf_t1 = (long long)time(NULL);
@@ -6402,6 +6852,11 @@ int pc_upstream_upfill_ctl(const char *col, size_t collen, int stop,
 		*msg = "an upfill sweep is already running";
 		return -1;
 	}
+	if (check && __atomic_load_n(&uc->cluster, __ATOMIC_ACQUIRE)) {
+		*msg = "upfill check reads one master - not built for a Redis Cluster yet; "
+			"the upfill itself writes each key to its slot's master";
+		return -1;
+	}
 	if (check && __atomic_load_n(&uc->w_master, __ATOMIC_RELAXED) < 0) {
 		*msg = "upfill check reads the upstream's master - the writer has "
 			"none now (see upstream.write_through.state)";
@@ -6412,10 +6867,10 @@ int pc_upstream_upfill_ctl(const char *col, size_t collen, int stop,
 		uc->upf_joinable = 0;
 	}
 	uc->upf_stop = 0;
-	uc->upf_check = check;             /* S400 */
+	uc->upf_check = check;
 	uc->upf_same = uc->upf_retimed = uc->upf_differed = uc->upf_missing = 0;
-	uc->upf_cmp_text = uc->upf_cmp_walked = uc->upf_uncompared = 0;  /* S402 */
-	__atomic_store_n(&uc->upf_bytes, 0, __ATOMIC_RELAXED);          /* S401 */
+	uc->upf_cmp_text = uc->upf_cmp_walked = uc->upf_uncompared = 0;
+	__atomic_store_n(&uc->upf_bytes, 0, __ATOMIC_RELAXED);
 	uc->upf_named = 0;
 	uc->upf_state = UPDR_RUNNING;
 	uc->upf_t0 = (long long)time(NULL);
@@ -6433,10 +6888,8 @@ int pc_upstream_upfill_ctl(const char *col, size_t collen, int stop,
 	return 0;
 }
 
-/* S348: the refusal message when @col refuses writes, counted; NULL when
- * it takes them (or has no upstream).  Every mutation path asks this
- * beside the node's own refusal, so a write the gate never classified
- * (MSET, a CMD method) is refused all the same. */
+/* the refusal message when @col refuses writes, counted; NULL when it takes them.  Every mutation
+ * path asks this, so a write the gate never classified (MSET, a CMD method) is refused too */
 const char *pc_upstream_write_refusal(const char *col, size_t collen)
 {
 	struct up_col *uc;
@@ -6450,7 +6903,7 @@ const char *pc_upstream_write_refusal(const char *col, size_t collen)
 	return uc->refuse_msg;
 }
 
-/* S348: the same, not counted - for the cluster's config digest */
+/* the same, not counted - for the cluster's config digest */
 int pc_upstream_refuses_writes(const char *col, size_t collen)
 {
 	struct up_col *uc = ncols ? col_of(col, collen) : NULL;
@@ -6476,7 +6929,7 @@ int pc_upstream_drain_ctl(const char *col, size_t collen, int stop,
 		*msg = "stopping";
 		return 0;
 	}
-	if (uc->refuse) {                                      /* S348 */
+	if (uc->refuse) {
 		*msg = "a drain sweep takes the upstream's keys over - it writes "
 			"them - and this collection refuses writes (upstream_writes = "
 			"refuse)";
@@ -6485,6 +6938,18 @@ int pc_upstream_drain_ctl(const char *col, size_t collen, int stop,
 	if (uc->drain_state == UPDR_RUNNING) {
 		*msg = "a drain sweep is already running";
 		return -1;
+	}
+	if (__atomic_load_n(&uc->cluster, __ATOMIC_ACQUIRE)) {
+		int none;
+
+		pthread_mutex_lock(&uc->mx);
+		none = !uc->cmap;
+		pthread_mutex_unlock(&uc->mx);
+		if (none) {
+			*msg = "the Redis Cluster's slots are not mapped yet - try again in a few "
+				"seconds";
+			return -1;
+		}
 	}
 	if (uc->drain_joinable) {
 		pthread_join(uc->drain_thr, NULL);
@@ -6496,8 +6961,8 @@ int pc_upstream_drain_ctl(const char *col, size_t collen, int stop,
 	uc->drain_t1 = 0;
 	uc->dr_scanned = uc->dr_pulled = uc->dr_owned = uc->dr_absent =
 		uc->dr_wrongtype = uc->dr_toobig = uc->dr_errors = 0;
-	uc->dr_elsewhere = 0;                  /* 12nt TC-4 */
-	__atomic_store_n(&uc->dr_bytes, 0, __ATOMIC_RELAXED);  /* S401 */
+	uc->dr_elsewhere = 0;
+	__atomic_store_n(&uc->dr_bytes, 0, __ATOMIC_RELAXED);
 	if (pthread_create(&uc->drain_thr, NULL, drain_main, uc) != 0) {
 		uc->drain_state = UPDR_FAILED;
 		*msg = "cannot start the drain thread";
@@ -6510,13 +6975,13 @@ int pc_upstream_drain_ctl(const char *col, size_t collen, int stop,
 
 /* ---- init / shutdown --------------------------------------------------- */
 
-/* redis://[user@]host:port[/db] - IP6-2: the host an IPv6 literal in
- * brackets too, "redis://[::1]:6379" */
+/* redis://[user@]host:port[/db], the host an IPv6 literal in brackets too ("redis://[::1]:6379");
+ * rediss:// the same, over TLS */
 static int parse_url(struct up_srv *s, const char *url)
 {
-	const char *p = url + 8, *at = strchr(p, '@'), *slash;
+	const char *p = url + (strncmp(url, "rediss://", 9) ? 8 : 9), *at = strchr(p, '@'), *slash;
 
-	if (strncmp(url, "redis://", 8))
+	if (strncmp(url, "redis://", 8) && strncmp(url, "rediss://", 9))
 		return -1;
 	if (at) {
 		size_t ul = (size_t)(at - p);
@@ -6557,7 +7022,7 @@ static int parse_url(struct up_srv *s, const char *url)
 	return 0;
 }
 
-/* S382: `upstream = url[, url...]` - each into its own up_srv */
+/* `upstream = url[, url...]`, each into its own up_srv */
 static int parse_urls(struct up_col *uc, const char *list)
 {
 	const char *p = list;
@@ -6622,6 +7087,256 @@ static int parse_prefixes(struct up_col *uc, const char *list)
 	return uc->npat ? 0 : -1;
 }
 
+/* does @s, a configured server named by host, answer at @ip (the address a ROLE, a sentinel or a
+ * cluster gives for it)?  Not yet connected: what its name resolves to */
+static int srv_answers_at(struct up_srv *s, const char *ip)
+{
+	char pi[sizeof s->peer_ip];
+
+	if (s->origin != UPO_CONFIG)
+		return 0;
+	pthread_mutex_lock(&s->run_mx);
+	memcpy(pi, s->peer_ip, sizeof pi);
+	pthread_mutex_unlock(&s->run_mx);
+	return pi[0] ? !strcmp(pi, ip) : same_host(s->host, ip);
+}
+
+/* under add_mx, every slot taken or no room for another's copies: the discovered one gone longest,
+ * if past the quarantine (what began at its address is over) */
+static int srv_reusable(struct up_col *uc)
+{
+	long long now = now_ms(), q = 2LL * uc->timeout_ms + 1000, best = 0;
+	int k, n = srv_n(uc), pick = -1;
+
+	pthread_mutex_lock(&uc->mx);
+	for (k = 0; k < n; k++) {
+		struct up_srv *s = &uc->srv[k];
+		long long t = __atomic_load_n(&s->gone_ms, __ATOMIC_RELAXED);
+
+		if (s->origin != UPO_CONFIG && __atomic_load_n(&s->gone, __ATOMIC_ACQUIRE) &&
+		    now - t >= q && !s->qhead && !s->busy && (pick < 0 || t < best)) {
+			pick = k;
+			best = t;
+		}
+	}
+	pthread_mutex_unlock(&uc->mx);
+	return pick;
+}
+
+/* slot @k, gone past the quarantine, takes @host:@port as a new server: its threads (idle while
+ * gone) start over at the new address, its shadow empty */
+static int srv_reuse(struct up_col *uc, int k, const char *host, int port, int origin,
+		const char *why)
+{
+	struct up_srv *s = &uc->srv[k];
+	char was[sizeof s->addr];
+	long long ago = (now_ms() - __atomic_load_n(&s->gone_ms, __ATOMIC_RELAXED)) / 1000;
+
+	memcpy(was, s->addr, sizeof was);
+	pthread_mutex_lock(&s->run_mx);
+	strcpy(s->host, host);
+	s->port = port;
+	snprintf(s->addr, sizeof s->addr, strchr(host, ':') ? "[%s]:%d" : "%s:%d", host, port);
+	s->peer_ip[0] = 0;
+	s->behind[0] = 0;
+	s->inv_run[0] = 0;
+	s->mhost[0] = 0;
+	pthread_mutex_unlock(&s->run_mx);
+	pthread_mutex_lock(&uc->mx);
+	s->slots[0] = 0;
+	pthread_mutex_unlock(&uc->mx);
+	__atomic_store_n(&s->origin, origin, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->direct, -1, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->role_by, -1, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->shard, -1, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->lag_ms, -1, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->role, UPR_UNKNOWN, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->link_down, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->failing, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->is_pc, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->is_cluster, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->is_sentinel, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->checked_ms, 0, __ATOMIC_RELAXED);
+	{
+		int *iz[] = { &s->mport, &s->behind_said, &s->other_said, &s->refused_said,
+			&s->lag_said, &s->pc_said, &s->cluster_said };
+		unsigned long long *uz[] = { &s->other_server, &s->fetches, &s->errors,
+			&s->timeouts, &s->connects, &s->lat_us_sum, &s->lat_n,
+			&s->invalidations, &s->flushes };
+		size_t j;
+
+		for (j = 0; j < sizeof iz / sizeof *iz; j++)
+			__atomic_store_n(iz[j], 0, __ATOMIC_RELAXED);
+		for (j = 0; j < sizeof uz / sizeof *uz; j++)
+			__atomic_store_n(uz[j], 0, __ATOMIC_RELAXED);
+	}
+	flush_shadow(s);                   /* a late fill from the old address */
+	__atomic_add_fetch(&s->inv_gen, 1, __ATOMIC_ACQ_REL);
+	__atomic_add_fetch(&s->incarn, 1, __ATOMIC_ACQ_REL);
+	if (s->has_inv && __atomic_load_n(&s->inv_quit, __ATOMIC_ACQUIRE)) {
+		pthread_join(s->inv_thr, NULL);    /* it stopped for the old server (no RESP3 ...) */
+		s->has_inv = 0;
+	}
+	if (uc->tracking && !s->has_inv) {
+		__atomic_store_n(&s->inv_quit, 0, __ATOMIC_RELAXED);
+		s->has_inv = pthread_create(&s->inv_thr, NULL, inv_main, s) == 0;
+	}
+	__atomic_store_n(&s->gone, 0, __ATOMIC_RELEASE);
+	pthread_mutex_unlock(&uc->add_mx);
+	LM_NOTICE("collection '%s': upstream %s added - %s - in the slot of %s, gone from "
+		"the topology %lld s ago (%s)\n", uc->name, s->addr,
+		origin == UPO_SENTINEL ? "a sentinel names it" : origin == UPO_CLUSTER ?
+		"the Redis Cluster names it" : "its master's ROLE names it", was, ago, why);
+	return k;
+}
+
+/* a server the topology names and the config did not: a free slot, the seed's database and user,
+ * its shadow chained after the last, its threads, then the count */
+int srv_add(struct up_col *uc, const char *host, int port, int origin)
+{
+	struct up_srv *s, *seed = &uc->srv[0];
+	int n, k, j;
+
+	n = srv_n(uc);
+	for (k = 0; k < n; k++)                /* a configured one by another name */
+		if (uc->srv[k].origin == UPO_CONFIG && uc->srv[k].port == port &&
+		    strcmp(uc->srv[k].host, host) && srv_answers_at(&uc->srv[k], host))
+			return k;
+	pthread_mutex_lock(&uc->add_mx);
+	n = srv_n(uc);
+	for (k = 0; k < n; k++)
+		if (uc->srv[k].port == port && !strcmp(uc->srv[k].host, host)) {
+			if (__atomic_exchange_n(&uc->srv[k].gone, 0, __ATOMIC_RELAXED))
+				LM_NOTICE("collection '%s': upstream %s is back in the "
+					"topology\n", uc->name, uc->srv[k].addr);
+			pthread_mutex_unlock(&uc->add_mx);
+			return k;
+		}
+	if (n >= PC_UP_MAX_SRV && strlen(host) < sizeof s->host &&
+	    (k = srv_reusable(uc)) >= 0)
+		return srv_reuse(uc, k, host, port, origin,   /* unlocks add_mx */
+			"every slot taken");
+	if (n >= PC_UP_MAX_SRV || strlen(host) >= sizeof s->host) {
+		if (!uc->full_said++)
+			LM_WARN("collection '%s': the topology names more upstreams than "
+				"the %d this node holds - %s:%d and any after it are not "
+				"used\n", uc->name, PC_UP_MAX_SRV, host, port);
+		pthread_mutex_unlock(&uc->add_mx);
+		return -1;
+	}
+	s = &uc->srv[n];
+	strcpy(s->host, host);
+	s->port = port;
+	s->db = seed->db;
+	memcpy(s->user, seed->user, sizeof s->user);
+	snprintf(s->addr, sizeof s->addr, strchr(host, ':') ? "[%s]:%d" : "%s:%d", host, port);
+	s->uc = uc;
+	s->idx = n;
+	s->lag_ms = -1;
+	s->direct = -1;
+	s->shard = -1;
+	s->role_by = -1;
+	s->origin = origin;
+	s->shadow = pcache_htable_new((unsigned int)uc->shadow_log2);
+	if (!s->shadow && (k = srv_reusable(uc)) >= 0)
+		return srv_reuse(uc, k, host, port, origin, "no room in the arena for another "
+			"slot's copies");
+	if (!s->shadow) {
+		if (!uc->full_said++)
+			LM_WARN("collection '%s': no room in the arena for %s:%d's copies (a table "
+				"of 2^%d buckets) - it and any after it are not used; raise arena_mb\n",
+				uc->name, host, port, uc->shadow_log2);
+		pthread_mutex_unlock(&uc->add_mx);
+		return -1;
+	}
+	pthread_cond_init(&s->cv, NULL);
+	pthread_mutex_init(&s->run_mx, NULL);
+	if (uc->tracking && pthread_create(&s->inv_thr, NULL, inv_main, s) == 0)
+		s->has_inv = 1;
+	for (j = 0; j < uc->conns; j++)
+		if (pthread_create(&s->thr[j], NULL, conn_main, s) == 0)
+			s->nthr++;
+	pcache_ht_set_shadow(uc->srv[n - 1].shadow, s->shadow);
+	__atomic_store_n(&uc->nsrv, n + 1, __ATOMIC_RELEASE);
+	pthread_mutex_unlock(&uc->add_mx);
+	LM_NOTICE("collection '%s': upstream %s added - %s\n", uc->name, s->addr,
+		origin == UPO_SENTINEL ? "a sentinel names it" : origin == UPO_CLUSTER ?
+		"the Redis Cluster names it" : "its master's ROLE names it");
+	return n;
+}
+
+/* a discovered server the topology no longer names: off, its slot kept, and what it fetched
+ * dropped - it may no longer follow the master */
+void srv_gone(struct up_srv *s)
+{
+	if (s->origin == UPO_CONFIG)
+		return;
+	pthread_mutex_lock(&s->uc->add_mx);    /* srv_reusable sees gone together with its time */
+	if (__atomic_load_n(&s->gone, __ATOMIC_RELAXED)) {
+		pthread_mutex_unlock(&s->uc->add_mx);
+		return;
+	}
+	__atomic_store_n(&s->gone_ms, now_ms(), __ATOMIC_RELAXED);
+	__atomic_store_n(&s->gone, 1, __ATOMIC_RELEASE);
+	pthread_mutex_unlock(&s->uc->add_mx);
+	__atomic_add_fetch(&s->inv_gen, 1, __ATOMIC_ACQ_REL);   /* a fetch in flight: capped */
+	flush_shadow(s);
+	LM_NOTICE("collection '%s': upstream %s left the topology - not used, its copies "
+		"dropped\n", s->uc->name, s->addr);
+}
+
+/* the replicas a master's ROLE names, used as upstream_discover says: under auto only when the master
+ * answers at its configured address (no proxy), and not for write-through, whose reads must not move */
+void srv_discovered(struct up_srv *m, char hosts[][64], const int *ports, int n)
+{
+	struct up_col *uc = m->uc;
+	int use = uc->discover == PC_UP_DISC_YES || (uc->discover == PC_UP_DISC_AUTO &&
+		__atomic_load_n(&m->direct, __ATOMIC_RELAXED) == 1 && !uc->through);
+	int seen[PC_UP_MAX_SRV] = { 0 }, i, k, nn;
+	char b[sizeof m->behind];
+	size_t bl = 0;
+
+	if (uc->discover == PC_UP_DISC_NO || __atomic_load_n(&uc->cluster, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&m->is_cluster, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&uc->sen_started, __ATOMIC_ACQUIRE))
+		return;                        /* the cluster's or the sentinels' topology */
+	b[0] = 0;
+	for (i = 0; i < n; i++) {
+		if (bl < sizeof b)
+			bl += (size_t)snprintf(b + bl, sizeof b - bl, "%s%s:%d", i ? "," : "",
+				hosts[i], ports[i]);
+		if (use && (k = srv_add(uc, hosts[i], ports[i], UPO_ROLE)) >= 0) {
+			seen[k] = 1;
+			if (uc->srv[k].origin == UPO_ROLE)
+				__atomic_store_n(&uc->srv[k].role_by, m->idx, __ATOMIC_RELAXED);
+		}
+	}
+	pthread_mutex_lock(&m->run_mx);
+	memcpy(m->behind, b, sizeof b);
+	pthread_mutex_unlock(&m->run_mx);
+	if (!use && n && !__atomic_exchange_n(&m->behind_said, 1, __ATOMIC_RELAXED)) {
+		if (uc->discover == PC_UP_DISC_AUTO && uc->through &&
+		    __atomic_load_n(&m->direct, __ATOMIC_RELAXED) == 1)
+			LM_NOTICE("collection '%s': upstream %s names %d replica(s) - shown, "
+				"not used: a write-through collection reads only the upstreams "
+				"its config names (upstream_discover = yes uses them)\n",
+				uc->name, m->addr, n);
+		else
+			LM_NOTICE("collection '%s': upstream %s answers from another address - a "
+				"proxy - so the %d replica(s) its ROLE names are shown, not used "
+				"(upstream_discover = auto)\n", uc->name, m->addr, n);
+	}
+	nn = srv_n(uc);
+	for (k = 0; k < nn; k++) {             /* the replicas it (or the file) named, not itself */
+		int by = __atomic_load_n(&uc->srv[k].role_by, __ATOMIC_RELAXED);
+
+		if (uc->srv[k].origin == UPO_ROLE && !seen[k] && k != m->idx &&
+		    (by < 0 || by == m->idx))
+			srv_gone(&uc->srv[k]);
+	}
+	topo_save(uc);
+}
+
 int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 {
 	int i, j, k;
@@ -6653,14 +7368,9 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 				cc->name);
 			return -1;
 		}
-		/* the collection must decide its keys HERE - or, since 0.7.1
-		 * (DESIGN 12nt), at the key's OWNER: in shard mode a miss pulls
-		 * from the owner and the owner fetches (TC-1).  A proxy or spread
-		 * collection still places a key where this node's shadow means
-		 * nothing (TC-3 for spread). */
+		/* the collection decides its keys here, or at the key's owner (shard: a miss
+		 * pulls from the owner; spread: the K holders fetch); not a proxy collection */
 		if (pc_store_proxy_enabled(ht)) {
-			/* 12nt TC-3 (0.7.1): spread is allowed - the K holders
-			 * fetch and hold, as the owner does in shard */
 			LM_ERR("upstream: [collection %s] read-through needs a "
 				"store, eager, shard or spread collection (not "
 				"proxy)\n", cc->name);
@@ -6675,7 +7385,7 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 		memcpy(uc->name, cc->name, uc->nlen);
 		uc->nflen = (size_t)snprintf(uc->nf, sizeof uc->nf, "%s.nofall",
 			cc->name);
-		uc->refuse = cc->up_refuse_writes;            /* S348 */
+		uc->refuse = cc->up_refuse_writes;
 		if (uc->nflen >= sizeof uc->nf ||
 		    (!uc->refuse && !pc_store_find(uc->nf, uc->nflen))) {
 			LM_ERR("upstream: the companion '%s' does not exist\n",
@@ -6696,29 +7406,29 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 			memcpy(hb, uc->srv[0].addr, sizeof hb);
 			snprintf(uc->refuse_msg, sizeof uc->refuse_msg, "collection "
 				"'%s' is a read-through of %.200s%s and refuses writes "
-				"(upstream_writes = refuse)", cc->name, hb, uc->nsrv > 1 ?
+				"(upstream_writes = refuse)", cc->name, hb, srv_n(uc) > 1 ?
 				" and its other upstreams" : "");
 		}
-		uc->role_req = cc->up_role;                   /* S382 */
+		uc->role_req = cc->up_role;
 		uc->master_fallback = cc->up_master_fallback;
 		uc->max_lag_ms = cc->up_max_lag_ms;
-		uc->allow_pc = cc->up_allow_pc;               /* S384 */
-		uc->through = cc->up_write_through;           /* S385 */
+		uc->allow_pc = cc->up_allow_pc;
+		uc->through = cc->up_write_through;
 		uc->unknown_pass = cc->up_write_through &&
 			cc->up_unknown == PC_UP_UNKNOWN_PASS;
-		uc->wq_max = cc->up_write_queue > 0 ? cc->up_write_queue : 10000;   /* AR2 */
+		uc->wq_max = cc->up_write_queue > 0 ? cc->up_write_queue : 10000;
 		uc->pass_max = (cc->up_pass_max_kb > 0 ? cc->up_pass_max_kb : 1024)
 			* 1024;
 		uc->w_master = -1;
 		uc->w_json = -1;
 		uc->w_state = UPWS_STARTING;
-		uc->mode = cc->up_mode;                       /* S382 part 2 */
+		uc->mode = cc->up_mode;
 		uc->preempt = cc->up_preempt;
 		uc->hold_ms = (long long)cc->up_preempt_hold_s * 1000;
 		uc->active = -1;
 		uc->primary = 0;
 		if (cc->up_primary)
-			for (k = 0; k < uc->nsrv; k++)
+			for (k = 0; k < srv_n(uc); k++)
 				if (!strcmp(uc->srv[k].addr, cc->up_primary))
 					uc->primary = k;
 		if (parse_prefixes(uc, cc->up_prefixes) != 0) {
@@ -6727,18 +7437,18 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 				UP_MAX_PREFIXES);
 			return -1;
 		}
-		uc->password = cc->up_password;               /* S383 */
-		uc->wuser = cc->up_wuser;                     /* AR7 */
+		uc->password = cc->up_password;
+		uc->wuser = cc->up_wuser;
 		uc->wpassword = cc->up_wpassword;
 		uc->neg_ms = cc->up_negative_ms;
-		uc->rewarm_max = cc->up_rewarm_max;              /* S421 */
-		/* S422: at least twice the lag a tracked replica may echo with */
+		uc->rewarm_max = cc->up_rewarm_max;
+		/* at least twice the lag a tracked replica may echo with */
 		uc->echo_ms = cc->up_echo_ms;
 		if (uc->echo_ms > 0 && uc->max_lag_ms * 2 > uc->echo_ms)
 			uc->echo_ms = uc->max_lag_ms * 2;
 		if (uc->echo_ms > 0 && cc->up_write_through)
 			uc->echo = calloc(UP_ECHO_N, sizeof *uc->echo);
-		if (cc->up_write_through) {                      /* S429 */
+		if (cc->up_write_through) {
 			int l;
 
 			uc->order = calloc(UP_ORDER_N, sizeof *uc->order);
@@ -6750,15 +7460,39 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 		uc->tracking = cc->up_tracking;
 		uc->on_error = cc->up_on_error;
 		uc->drain_rate = cc->up_drain_rate;
-		uc->drain_mb_rate = cc->up_drain_mb_rate;      /* S401 */
-		uc->wt_owned = -1;                            /* AR4 */
+		uc->drain_mb_rate = cc->up_drain_mb_rate;
+		uc->wt_owned = -1;
 		log2 = cc->buckets_log2 > 0 ? cc->buckets_log2 : 12;
-		for (k = 0; k < uc->nsrv; k++) {
+		uc->shadow_log2 = log2;
+		uc->discover = cc->up_discover;
+		uc->sen_master = -1;
+		uc->smaster = cc->up_smaster;
+		uc->spassword = cc->up_spassword;
+		pthread_mutex_init(&uc->sen_mx, NULL);
+		pthread_mutex_init(&uc->tls_mx, NULL);
+		if (cc->up_tls) {                             /* rediss:// */
+			char te[300];
+
+			uc->tls = uptls_new(cc->up_tls_ca, cc->up_tls_cert, cc->up_tls_key,
+				cc->up_tls_verify, te, sizeof te);
+			if (!uc->tls) {
+				LM_ERR("upstream: [collection %s] %s\n", cc->name, te);
+				return -1;
+			}
+			uc->tls_name = cc->up_tls_name;
+			uc->tls_ca = cc->up_tls_ca;
+			uc->tls_cert = cc->up_tls_cert;
+			uc->tls_key = cc->up_tls_key;
+			uc->tls_verify = cc->up_tls_verify;
+		}
+		pthread_mutex_init(&uc->add_mx, NULL);
+		for (k = 0; k < srv_n(uc); k++) {
 			struct up_srv *s = &uc->srv[k];
 
 			s->uc = uc;
 			s->idx = k;
 			s->lag_ms = -1;
+			s->direct = -1;
 			s->shadow = pcache_htable_new((unsigned int)log2);
 			if (!s->shadow) {
 				LM_ERR("upstream: no memory for '%s''s shadow table\n",
@@ -6767,18 +7501,19 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 			}
 			pthread_cond_init(&s->cv, NULL);
 			pthread_mutex_init(&s->run_mx, NULL);
-			/* S382: the chain - each table names the next */
+			/* the chain: each table names the next */
 			if (k)
 				pcache_ht_set_shadow(uc->srv[k - 1].shadow, s->shadow);
 		}
 		pthread_mutex_init(&uc->mx, NULL);
-		pthread_mutex_init(&uc->upf_qmx, NULL);        /* S402 */
-		pthread_cond_init(&uc->wcv, NULL);            /* S385 */
+		pthread_mutex_init(&uc->upf_qmx, NULL);
+		pthread_mutex_init(&uc->own_mx, NULL);
+		pthread_cond_init(&uc->wcv, NULL);
 		pthread_cond_init(&uc->prcv, NULL);
 		ncols++;
 		pcache_ht_set_shadow_gate(ht, shadow_ok, uc);
 		pcache_ht_set_shadow(ht, uc->srv[0].shadow);
-		for (k = 0; k < uc->nsrv; k++) {
+		for (k = 0; k < srv_n(uc); k++) {
 			struct up_srv *s = &uc->srv[k];
 
 			if (uc->tracking) {
@@ -6798,8 +7533,8 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 				s->nthr++;
 			}
 		}
-		/* S385: the writer starts now, not on the first write - the
-		 * master and RedisJSON are known before any traffic */
+		/* the writer starts now, not on the first write: the master and RedisJSON
+		 * are known before any traffic */
 		if (uc->through) {
 			if (pthread_create(&uc->wthr, NULL, wr_main, uc) != 0) {
 				LM_ERR("upstream: cannot start the writer for '%s'\n",
@@ -6821,7 +7556,7 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 			size_t ll = 0;
 
 			list[0] = 0;
-			for (k = 0; k < uc->nsrv && ll < sizeof list; k++)
+			for (k = 0; k < srv_n(uc) && ll < sizeof list; k++)
 				ll += (size_t)snprintf(list + ll, sizeof list - ll,
 					"%s%.24s:%d", k ? ", " : "", uc->srv[k].host,
 					uc->srv[k].port);
@@ -6831,7 +7566,7 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 				uc->srv[0].db, uc->role_req == PC_UP_ROLE_REPLICA ?
 				(uc->master_fallback ? ", replicas (the master while "
 				"none serves)" : ", replicas only") : "", uc->npat,
-				uc->conns, uc->nsrv > 1 ? " each" : "", uc->neg_ms,
+				uc->conns, srv_n(uc) > 1 ? " each" : "", uc->neg_ms,
 				uc->timeout_ms,
 				uc->on_error == PC_UP_ON_ERROR_MISS ? "miss" : "error",
 				uc->through ? (uc->unknown_pass ? "WRITE-THROUGH to its "
@@ -6841,12 +7576,14 @@ int pc_upstream_init(const struct pc_config *cfg, int nworkers)
 				"writes it");
 		}
 	}
-	/* S421: the names a clean stop saved re-warm now (the pacer runs on
-	 * the invalidation threads once they connect) */
+	/* the names a clean stop saved re-warm now (the pacer runs on the invalidation threads once
+	 * they connect) */
 	snprintf(up_state_dir, sizeof up_state_dir, "%s",
 		cfg->state_dir ? cfg->state_dir : "");
-	for (i = 0; i < ncols; i++)
+	for (i = 0; i < ncols; i++) {
 		rewarm_load(&up_cols[i], up_state_dir);
+		topo_load(&up_cols[i], up_state_dir);
+	}
 	return 0;
 }
 
@@ -6857,23 +7594,23 @@ void pc_upstream_shutdown(void)
 	for (i = 0; i < ncols; i++) {
 		struct up_col *uc = &up_cols[i];
 
-		/* S421: the names held, taken while the shadows are still whole -
-		 * a closing tracked connection drops its upstream's copies */
+		/* the names held, taken while the shadows are still whole: a closing tracked
+		 * connection drops its upstream's copies */
 		rewarm_save(uc, up_state_dir);
 		uc->drain_stop = 1;
-		uc->upf_stop = 1;                             /* AR4 */
+		uc->upf_stop = 1;
 		if (uc->drain_joinable) {
 			pthread_join(uc->drain_thr, NULL);
 			uc->drain_joinable = 0;
 		}
 		pthread_mutex_lock(&uc->mx);
 		uc->stop = 1;
-		for (k = 0; k < uc->nsrv; k++)
+		for (k = 0; k < srv_n(uc); k++)
 			pthread_cond_broadcast(&uc->srv[k].cv);
-		pthread_cond_broadcast(&uc->wcv);             /* S385 */
+		pthread_cond_broadcast(&uc->wcv);
 		pthread_cond_broadcast(&uc->prcv);
 		pthread_mutex_unlock(&uc->mx);
-		if (uc->upf_joinable) {                       /* AR4 */
+		if (uc->upf_joinable) {
 			pthread_join(uc->upf_thr, NULL);
 			uc->upf_joinable = 0;
 		}
@@ -6885,7 +7622,7 @@ void pc_upstream_shutdown(void)
 			pthread_join(uc->rthr, NULL);
 			uc->has_rthr = 0;
 		}
-		for (k = 0; k < uc->nsrv; k++) {
+		for (k = 0; k < srv_n(uc); k++) {
 			struct up_srv *s = &uc->srv[k];
 
 			for (j = 0; j < s->nthr; j++)
@@ -6899,14 +7636,8 @@ void pc_upstream_shutdown(void)
 	}
 }
 
-/* ---- S421: the names held across a clean restart ---------------------------
- * The shadow (the copies fetched) is not persisted and the records written
- * through are dropped at the first gap, so a restarted node was cold.  A
- * clean stop writes the NAMES of what it held - every upstream's shadow
- * (its absent marks excluded) and whatever the re-warm list still had - to
- * <state_dir>/upstream-rewarm-<collection>, newest fetched first, at most
- * upstream_rewarm_max; the start reads the file onto the re-warm list and
- * removes it (one shot: a crash loop does not re-warm from stale names). */
+/* ---- the names held across a clean restart: a clean stop writes the held copies' names, newest
+ * first, to <state_dir>/upstream-rewarm-<col>; the start queues them and deletes it (one shot) ---- */
 struct rw_names {
 	str *k;
 	unsigned int *wt;
@@ -6961,7 +7692,7 @@ static void rewarm_save(struct up_col *uc, const char *state_dir)
 
 	if (!state_dir || !*state_dir || !uc->through || uc->rewarm_max <= 0)
 		return;
-	for (k = 0; k < uc->nsrv; k++)
+	for (k = 0; k < srv_n(uc); k++)
 		if (uc->srv[k].shadow)
 			pcache_ht_iter_meta(uc->srv[k].shadow, rw_collect, &r);
 	/* what the re-warm list still had: it was wanted, keep wanting it */

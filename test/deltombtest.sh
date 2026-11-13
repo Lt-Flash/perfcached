@@ -1,22 +1,6 @@
 #!/bin/sh
-# deltombtest.sh - S209: a write and a delete microseconds apart do not
-# leave the key on the peers.
-#
-# The write-path push batches for up to REPL_FLUSH_MS (3 ms) while a
-# tombstone goes at once, so a set and its delete closer than the flush
-# reach the peers in the WRONG order: the tombstone removes nothing, the
-# batched set lands after it, and the key resurrects on every peer - for
-# good, since the sweep repairs presence, not absence.  Found gating the
-# staging RGSs, whose de-registration is exactly set-then-delete.
-#
-# The tombstone now carries the delete's version and the peers refuse a
-# copy that is not newer than it (S209, fix B).  This suite drives the
-# pair through ONE connection with no delay - the shape that hid it from
-# perfcli, whose invocations are seconds apart - and asserts on EVERY
-# member, never only on the node the client held.  Both delete paths,
-# the plain del and the root jdel.  A pair seconds apart stays correct,
-# and a set alone still replicates (the positive control).
-# Usage: test/deltombtest.sh [./perfcached]
+# deltombtest.sh - a set and its delete microseconds apart on one connection leave the key on no
+# member (the tombstone carries the delete's version); both delete paths.  Usage: test/deltombtest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 SEC=dt-client-secret
@@ -61,11 +45,9 @@ start() {
 	done
 	echo "node $1 did not start"; tail -3 "$D/n$1.log"; return 1
 }
-# perfcli's own complaint is kept (not /dev/null): an err that survives the
-# retries is reported WITH it - GitLab 110084 said only "n1=err", once
+# perfcli's own complaint is kept: an err that survives the retries is reported with it
 cli() { timeout 30 ./perfcli -h 127.0.51.$1 -p 1798$1 -a $SEC -q 2>"$D/cli.err.$1"; }
-# exists, not get: under redis_types = strict a get of a JSON document is
-# WRONGTYPE (S280), which would read as "no" - a false green
+# exists, not get: under redis_types = strict a get of a JSON document is WRONGTYPE, a false green
 found1() {
 	printf '%s\n' "{\"method\":\"exists\",\"params\":{\"col\":\"c\",\"key\":\"$2\"}}" | cli "$1" | head -1 | tee "$D/cli.out.$1" |
 		python3 -c 'import json,sys
@@ -74,8 +56,7 @@ try:
     print("err" if "error" in r else "yes" if r.get("exists") else "no")
 except Exception: print("err")'
 }
-# a fresh perfcli connection right behind another can be refused for a
-# moment; that is the CLIENT, so an err is asked again before it counts
+# a fresh perfcli connection right behind another can be refused for a moment: retry an err first
 found() { # found <node> <key> -> yes|no|err
 	_r=$(found1 "$1" "$2"); _t=0
 	while [ "$_r" = err ] && [ $_t -lt 3 ]; do sleep 0.1; _r=$(found1 "$1" "$2"); _t=$((_t+1)); done
@@ -85,10 +66,8 @@ found() { # found <node> <key> -> yes|no|err
 peers_up() { printf '%s\n' '{"method":"stats"}' | cli "$1" | head -1 | python3 -c 'import json,sys
 try: print((json.load(sys.stdin).get("cluster") or {}).get("peers_up", -1))
 except Exception: print(-1)'; }
-# READY, not only peered: a node that joined holding nothing reports
-# recovering for its first ~2 s (the bootstrap check), and a probe sent then is
-# told "node is not READY (recovering)" - GitLab 110112 deltombtest, GitHub
-# 38000859316 routedpairtest: both read as the fleet misbehaving
+# READY, not only peered: a node that joined holding nothing reports recovering for ~2 s and
+# refuses probes
 upready() { printf '%s\n' '{"method":"stats"}' | cli "$1" | head -1 | python3 -c 'import json,sys
 try: r = json.load(sys.stdin); print("%s:%s" % ((r.get("cluster") or {}).get("peers_up", -1), r.get("state")))
 except Exception: print(-1)'; }
@@ -108,8 +87,8 @@ pair() { # pair <node> <key> <del-json> [write-json]
 	[ -n "$_w" ] || _w="{\"method\":\"set\",\"params\":{\"col\":\"c\",\"key\":\"$2\",\"value\":\"v\"}}"
 	printf '%s\n%s\n' "$_w" "$3" | cli "$1" >/dev/null
 }
-# every member must say absent at every sample across 2.5 s - the batch
-# flushes at 3 ms, the apply follows, so a resurrection shows by 100 ms
+# every member must say absent at every sample across 2.5 s: the batch flushes at 3 ms, so a
+# resurrection shows by 100 ms
 absent_everywhere() { # absent_everywhere <key> -> "" or the offending samples
 	_bad=""
 	for t in 1 2 3 4 5; do
@@ -127,8 +106,8 @@ r=$(absent_everywhere pd)
 [ -z "$r" ] && ok "set then del on one connection: the key is absent on all three members, every sample" \
 	|| bad "set then del: the key came back somewhere ($r)"
 
-# the RGS shape: a DOCUMENT, then its root delete (S280: a root jdel
-# refuses a plain string under strict, as Redis's JSON.DEL does)
+# a document, then its root delete (a root jdel refuses a plain string under strict, as Redis's
+# JSON.DEL does)
 pair 1 "pj" '{"method":"jdel","params":{"col":"c","key":"pj","path":"$"}}' \
 	'{"method":"jset","params":{"col":"c","key":"pj","path":"$","val":{"s":"v"}}}'
 r=$(absent_everywhere pj)
@@ -157,9 +136,7 @@ except Exception: print("err")')
 	&& ok "a peer counted the refused set as tombstoned (recv_tombstoned=$tomb)" \
 	|| bad "no peer reports a refused-as-tombstoned copy (recv_tombstoned=$tomb)"
 
-# on a failure, what the three nodes' cluster planes did - the probes' "not
-# READY (recovering)" (GitLab 110102, GitHub 38000859316) is a node that
-# rejoined holding nothing, and only the node logs say why it rejoined
+# on a failure, what the three cluster planes did: only the node logs say why one rejoined
 if [ $fail -gt 0 ]; then
 	for i in 1 2 3; do
 		echo "  --- n$i: cluster / state lines"

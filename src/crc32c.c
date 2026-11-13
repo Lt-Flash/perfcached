@@ -1,16 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * crc32c.c - CRC32C (Castagnoli): the slice-by-8 table in software, the
- * CPU's instruction where there is one (SSE 4.2, ARMv8 CRC), chosen once.
- * The WAL's, the snapshot's and recovery's checksum.  Moved from wal.c
- * unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* crc32c.c - CRC32C (Castagnoli) for the WAL, snapshot and recovery: slice-by-8 in
+ * software, the CPU's instruction (SSE 4.2, ARMv8 CRC) where there is one. */
 #include <stdint.h>
 #include <string.h>
 #include "crc32c.h"
-
-/* ---- CRC32C: slice-by-8 software + per-arch hardware dispatch ---------- */
 
 static uint32_t crc_tab[8][256];
 
@@ -69,7 +63,7 @@ static uint32_t crc32c_hw(uint32_t crc, const unsigned char *p, size_t n)
 	return ~crc;
 }
 static int hw_ok(void) { return __builtin_cpu_supports("sse4.2"); }
-/* S466: three independent chains overlap in the CRC unit - ~2x on 207 */
+/* three independent chains overlap in the CRC unit */
 __attribute__((target("sse4.2")))
 static void crc32c_x3_hw(const unsigned char *const p[3], const size_t n[3],
 		uint32_t out[3])
@@ -174,7 +168,6 @@ void pc_crc32c_x3(const unsigned char *const p[3], const size_t n[3],
 		crc32c_x3_hw(p, n, out);
 }
 
-/* the backend, chosen now (pc_wal_init: said once at start): its name */
 const char *pc_crc32c_select(void)
 {
 	crc_init_tab();

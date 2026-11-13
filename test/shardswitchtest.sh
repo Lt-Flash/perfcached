@@ -1,30 +1,13 @@
 #!/bin/sh
-# shardswitchtest.sh — ownership now comes from the map (wiring step D).
-#
-# The failure this is built around is not a crash, it is a SILENT
-# FALLBACK: pc_shard_owner consults the map and falls back to the
-# fleet's own HRW when it cannot.  If the map never arrives, every
-# existing test still passes - because the fallback is the code that
-# worked before.  So the first thing asserted is that map-based
-# placement is actually being used.
-#
-#  1. the map is used, and the HRW fallback stops being reached
-#  2. every node agrees on where a key lives.  Two nodes disagreeing
-#     about an owner is split ownership, which puts one key in two
-#     places - the thing the whole control plane exists to prevent
-#  3. keys written through one node are readable through every other
-#  4. it survives a node leaving: the map republishes, ownership moves
-#     once, and reads still resolve
-# Usage: test/shardswitchtest.sh [./perfcached]
+# shardswitchtest.sh - shard ownership comes from the map, not a silent HRW fallback: every node agrees
+# on a key's owner, a write anywhere reads everywhere, and a node leaving moves ownership once.
 set -u
 
 BIN=${1:-./perfcached}
 SEC=sw-client-secret
 D=$(mktemp -d /var/tmp/pcsw.XXXXXX)
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a reused pid
+# never hits a stranger; the name pattern is only a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -95,7 +78,14 @@ except Exception: print("ERR")'; }
 
 mk 1; mk 2; mk 3
 start 1 && start 2 && start 3 || { echo "fleet did not start"; exit 1; }
-sleep 8
+# a joiner is CONNECTING until its links answer: up to 30 s for every node ready, seeing the others,
+# and node 1's map caught up with them (it republishes once a member is READY)
+st() { cli $1 -q -j '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1)" != "ready 2" ] || [ "$(st 2)" != "ready 2" ] || [ "$(st 3)" != "ready 2" ] ||
+	[ "$(q 1 map.usable)" != True ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
 # ---- 1. the map is ACTUALLY used --------------------------------------
 for i in 1 2 3 4 5 6 7 8 9 10; do put 1 "sk$i" "v$i"; done
@@ -142,18 +132,13 @@ sleep 1
          (n1=$(get 1 crosskey) n3=$(get 3 crosskey))"
 
 # ---- 4. a node leaves: the map moves ownership once -------------------
-# Compared as an EPOCH, term first.  Raw seq only orders within a term:
-# if the node killed happens to be the master, a standby promotes under
-# a NEW term and the sequence legitimately restarts at 1, which reads as
-# the map going backwards when it has in fact moved forwards.
+# compared as an EPOCH, term first: a promoted standby restarts seq at 1 under a new term
 epoch_gt() {  # epoch_gt T1 S1 T2 S2  -> true when (T1,S1) > (T2,S2)
 	[ "${1:-0}" -gt "${3:-0}" ] 2>/dev/null && return 0
 	[ "${1:-0}" = "${3:-0}" ] && [ "${2:-0}" -gt "${4:-0}" ] 2>/dev/null
 }
 surv() {	# first live node of 1,2 - a break-loop, not `| head -1`:
-	# head exits after its line, and the next iteration's echo then
-	# writes a closed pipe - one "echo: I/O error" per wait tick all
-	# over slow-runner CI logs (the value was correct throughout)
+	# head exits after its line, and the next echo would write a closed pipe ("echo: I/O error")
 	for n in 1 2; do
 		pgrep -f "$D/n$n.conf" >/dev/null && { echo $n; return; }
 	done
@@ -169,9 +154,8 @@ while [ $i -lt 40 ]; do
 	sleep 1; i=$((i+1))
 done
 SURV=$(surv)
-# an empty SURV is not a timing problem to ride out - both survivors
-# are gone (daemons died, or something external killed them); say so
-# instead of letting set -u abort mid-helper with "parameter not set"
+# an empty SURV is not timing: both survivors are gone, so say so instead of letting set -u abort
+# mid-helper
 [ -n "${SURV:-}" ] || {
 	echo "shardswitchtest: ABORT - neither node 1 nor 2 is alive after the loss" >&2
 	exit 1; }
@@ -183,12 +167,8 @@ epoch_gt "$T2" "$SEQ2" "$T1" "$SEQ1" \
 N=$(q $SURV map.nodes)
 [ "${N:-0}" = "2" ] && ok "the map now names 2 nodes" \
 	|| bad "the map still names $N node(s) after one left"
-# Write-then-read with a deadline, not sleep-and-hope: right after the
-# loss the survivors are mid-housekeeping, and on a loaded host a fixed
-# 1s window (plus the client's own timeout) measures the HOST, not the
-# daemon.  The put is re-issued each tick - its reply is discarded by
-# the helper, so a legal settling-window refusal would silently strand
-# a single attempt.
+# write-then-read with a deadline, re-issuing the put each tick: right after the loss a legal
+# settling-window refusal would strand a single attempt, and a fixed window measures the host
 i=0
 while [ $i -lt 20 ]; do
 	put $SURV afterloss stillhere

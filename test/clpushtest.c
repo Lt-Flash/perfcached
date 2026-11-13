@@ -1,27 +1,5 @@
-/*
- * clpushtest.c - the per-thread write-path push groups (M5).
- *
- * S110 moved these groups off a shared per-peer mutex and onto the
- * thread that fills them, which is what took the write path out of
- * futex.  The cases here are the ways that could go wrong silently:
- *   - a group sealed with another thread's records in it, which is the
- *     whole property S110 bought
- *   - a slot that changed hands keeping what was gathered for the peer
- *     that left, so a newcomer receives a stranger's writes
- *   - a flush that leaves a partial group behind, so a lone write sits
- *     unsent past its interval
- *   - the open count drifting, which decides whether the cluster loop
- *     bothers to send the flush RPC at all
- *   - S253: a non-holder key noted in a DIFFERENT group from its record
- *     (the ack would then confirm a datagram that never carried it), an
- *     ack taken from the wrong peer or for a reused slot, and parked
- *     keys that never leave the table
- *
- * No socket: a group leaves through a callback that records it, which
- * is exactly how cluster.c passes seal_send in production.
- *
- * Build: cc -o clpushtest test/clpushtest.c src/clpush.o -lpthread
- */
+/* clpushtest.c - the per-thread write-path push groups: a group seals only its own thread's
+ * records, a slot changing hands forgets the old peer's, flushes leave nothing; the ack table. */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -168,9 +146,8 @@ int main(void)
 		"D4 a thread flushing its own slot never touches another's");
 
 	/* ---- E. two threads at once, each in its own slot ------------------ */
-	/* cap AND flush_bytes both far beyond 100 records, so neither
-	 * send point is reached and what is left in each group is
-	 * exactly what its own thread put there. */
+	/* cap and flush_bytes far beyond 100 records: neither send point fires, so
+	 * each group holds exactly what its own thread put there */
 	clpush_init(&P, 4, HDR, 100000, 100000, 3);
 	{
 		pthread_t t1, t2;
@@ -193,22 +170,8 @@ int main(void)
 	clpush_fini(&P);
 	chk(clpush_open(&P) == 0, "E5 fini leaves nothing open");
 
-	/* ---- the buffer is sized from the FIRST record ------------------
-	 *
-	 * clpush_append allocates hdr + flush_bytes + n on the first record
-	 * for a slot and never grows it, but the pre-append guard tests
-	 * qlen + n against CAP.  cap is the wire's gather ceiling and has
-	 * nothing to do with what was allocated, so a small first record
-	 * followed by a larger one walks off the end of the malloc while
-	 * every check in the function passes.
-	 *
-	 * The comment above the malloc asserted this was unreachable
-	 * ("the pre-append guard keeps qlen + n inside cap"), which is the
-	 * reason it survived: the invariant was written down instead of
-	 * enforced.
-	 *
-	 * Under ASan the unfixed code reports a heap-buffer-overflow here.
-	 * Plain, it silently corrupts whatever follows the 81-byte block. */
+	/* ---- the buffer is sized from the FIRST record and never grows, while the guard tests
+	 * qlen + n against cap: a small first record then a larger one must not overrun it */
 	{
 		struct rec_send r;
 		pc_addr to;
@@ -229,9 +192,8 @@ int main(void)
 		clpush_init(&B, 4, 9, 8192, 64, 1000);
 		clpush_append(&B, 0, 0, &to, small, sizeof small, 1000,
 			recording_send_b, &r);
-		/* qlen is 17 now, and 17 + 4096 <= 8192, so no flush fires and
-		 * the memcpy writes 4096 bytes at offset 17 of an 81-byte
-		 * buffer */
+		/* qlen is 17 and 17 + 4096 <= 8192: no flush fires, so an unfixed
+		 * append writes 4096 bytes at offset 17 of the 81-byte buffer */
 		clpush_append(&B, 0, 0, &to, big, sizeof big, 1000,
 			recording_send_b, &r);
 		chk(1, "H1 a small record then a large one did not overflow");
@@ -239,7 +201,7 @@ int main(void)
 		SENDP = NULL;
 	}
 
-	/* --- S253: non-holder keys and the ack table ------------------- */
+	/* --- non-holder keys and the ack table ------------------------- */
 	{
 		struct rec_send r;
 		pc_addr to = A(7), other = A(8);

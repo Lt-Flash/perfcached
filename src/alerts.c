@@ -1,29 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * alerts.c - S352b: the node's own alert conditions (alerts.h).
- *
- * Every condition is evaluated on the maintenance thread once a second
- * against figures the daemon already keeps; nothing here touches a
- * worker.  A condition must HOLD for its hold time before it is raised
- * (an fsync average above 4x the probe for five minutes, an upstream down
- * for a minute) and stay AWAY for its clear time before it is cleared, so
- * a flapping figure does not mail every second.  Events - records the WAL
- * lost, writes refused for want of memory - raise on the second they
- * happen and clear after five quiet minutes.
- *
- * One mutex guards the keys, the ring and the digest; the tick holds it
- * throughout (a few microseconds), /stats takes it to copy the ring out.
- *
- * S352c (DESIGN 12le): the fleet side.  A node that cannot mail - no
- * [mail] of its own - hands each alert it would mail to the ELECTED mailer
- * (pc_cluster_mailer: the lowest ready node id that can mail), which mails
- * it naming the origin; the cluster thread hands relays in through a small
- * inbox of their own, drained here.  FLEET events - a member silent, failed
- * or gone, one missing from the fleet's size, the fleet below a majority -
- * are raised by every member that sees them and mailed by the elected
- * mailer alone, so a fleet sends one mail per event, not one per member.
- */
+/* alerts.c - the node's own alerts, evaluated on the maintenance thread once a second (A.mx guards
+ * them); a node without [mail] relays to the elected mailer, which alone mails fleet events */
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -39,21 +17,22 @@
 
 #include "compat/dprint.h"
 #include "alerts.h"
-#include "winctr.h"            /* S385 */
+#include "tls.h"
+#include "winctr.h"
 #include "cluster.h"
-#include "iostat.h"                   /* S379 */
+#include "iostat.h"
 #include "mail.h"
 #include "ptree.h"
 #include "recover.h"
 #include "upstream.h"
 #include "version.h"
 #include "wal.h"
-#include "rdb.h"                        /* S437 */
-#include "store.h"                      /* S436 */
+#include "rdb.h"
+#include "store.h"
 #include "core/pcache_arena.h"
-#include "hostmon.h"                  /* S380: the host monitor (wave 1) */
-#include "hostlink.h"                 /* S465 */
-#include "memguard.h"                 /* S406 */
+#include "hostmon.h"
+#include "hostlink.h"
+#include "memguard.h"
 
 #define KEYLEN 48
 #define MAILW  40                     /* the ring's "what the mail did" */
@@ -73,13 +52,12 @@ struct akey {
 	long long since_wall;              /* raised at (wall ms) */
 	long long true_since, false_since; /* monotonic ms; 0 = not in that phase */
 	long long last_mail;               /* monotonic ms of the last mailed raise */
-	int fleet;                         /* S352c: a fleet event - the elected
-	                                    * mailer's to send */
+	int fleet;                         /* a fleet event - the elected mailer's to send */
 	int oneoff;                        /* an event (event()): nothing clears it */
-	long long pend_since;              /* S352c: waiting for a mailer since */
+	long long pend_since;              /* waiting for a mailer since */
 	int pend_slot;                     /* and its ring entry */
 	char text[PC_ALERT_TEXT];
-	/* S377: the problem as a whole - when it began, its worst, the value
+	/* the problem as a whole - when it began, its worst, the value
 	 * when it cleared, and the mail its resolve answers */
 	long long ep_wall, ep_mono;
 	int worst_level;
@@ -95,8 +73,7 @@ struct dent {
 	int level, cleared, event, from;   /* from: 0 this node, else the origin */
 	int again;                         /* a raise of a problem already mailed */
 	char key[48], host[64];
-	char text[PC_ALERT_TEXT];          /* a raise: what happened; a clear:
-	                                    * what was wrong, at its worst */
+	char text[PC_ALERT_TEXT];          /* a raise: what happened; a clear: what was wrong, at worst */
 	char now[PC_ALERT_TEXT];           /* a clear: the value now, "" unknown */
 	long long started, at;             /* wall ms: the problem's start; this */
 	char ref[160];                     /* a clear: the mail of its problem */
@@ -118,7 +95,7 @@ struct rmem {
 struct aring {
 	long long ts;                      /* wall ms */
 	int level, cleared;
-	int from;                          /* S352c: 0, or the node that relayed it */
+	int from;                          /* 0, or the node that relayed it */
 	char key[KEYLEN];
 	char text[PC_ALERT_TEXT];
 	char mail[MAILW];                  /* what became of it, by mail */
@@ -130,22 +107,23 @@ static struct {
 	int nk;
 	struct aring r[PC_ALERT_RING];
 	int rnext, rn;
-	/* the digest being collected (S377: entries, mailed per origin) */
+	/* the digest being collected: entries, mailed per origin */
 	struct dent dq[DMAX];
 	int dn, dmore;
 	long long ddeadline;
-	struct rmem rm[RMEM];              /* S377: relayed problems mailed */
-	int fleet_size, fleet_ready;       /* S377: for the mail's header */
+	struct rmem rm[RMEM];              /* relayed problems mailed */
+	int fleet_size, fleet_ready;       /* for the mail's header */
 	char self_ip[48];
-	char http_addr[64];                /* S377: the status page's link */
+	char http_addr[64];                /* the status page's link */
 	int http_port;
-	long long walloss_t[3];            /* S377: the last wal.loss starts */
+	long long walloss_t[3];            /* the last wal.loss starts */
 	int test_said;
 	/* [mail]'s rules */
 	int mail_level;
 	long long min_interval, digest;
 	int fast;                          /* PERFCACHED_ALERT_FAST */
-	struct pc_alerts_conf al;          /* S380: [alerts] */
+	int no_busy;                       /* PERFCACHED_ALERT_NO_HOST_BUSY */
+	struct pc_alerts_conf al;          /* [alerts] */
 	/* what the previous tick saw */
 	unsigned long long wal_dropped, wal_overruns;
 	unsigned long nomem;
@@ -153,29 +131,26 @@ static struct {
 	unsigned long long fs_n[61], fs_sum[61];  /* fsync totals, 1 per second */
 	int fs_i, fs_have;
 	char host[128];
-	/* S352c */
 	int mailer, mailer_self;           /* the elected mailer, this tick */
 	unsigned int relay_seq;
 	unsigned long long relayed_in, relayed_out, relay_dropped;
-	unsigned long long base_in, base_out, base_drop;   /* S358 */
+	unsigned long long base_in, base_out, base_drop;
 	long long nmr_said;                /* "no mailer reachable" last logged */
 	unsigned long nmr_quiet;           /* and since then, unlogged */
 	int fleet_seen;                    /* the most members listed */
 	struct pc_member *mem;             /* pc_cluster_members' scratch */
-	unsigned long long tomb_gaps;      /* AR15: cluster.peer_absent said */
-	long long link_dropped;            /* S465: since host.link went critical */
+	unsigned long long tomb_gaps;      /* cluster.peer_absent said */
+	long long link_dropped;            /* since host.link went critical */
 } A = { .mx = PTHREAD_MUTEX_INITIALIZER };
 
-static int link_pct_pub = -1, link_lvl_pub;   /* S465: read by the cluster thread */
+static int link_pct_pub = -1, link_lvl_pub;   /* read by the cluster thread */
 
-/* S380, S377 (below) */
 static struct akey *key_find(const char *key, int create);
 static int hw_level(const char *key, int pct, int warn, int crit);
 static void link_init(const struct pc_config *cfg);
 
-/* S352c: relays the cluster thread heard, for the tick.  A lock of their
- * own, never held while anything else is called, so the cluster thread
- * cannot wait on the tick and the tick never waits on it for long. */
+/* relays the cluster thread heard, for the tick: a lock of their own, never held while anything
+ * else is called, so neither thread waits on the other for long */
 static struct {
 	pthread_mutex_t mx;
 	struct pc_alert_relay q[INBOX];
@@ -215,8 +190,9 @@ void pc_alerts_init(const struct pc_config *cfg)
 {
 	const char *f = getenv("PERFCACHED_ALERT_FAST");
 	const char *th = getenv("PERFCACHED_ALERT_TEST_HOST");
+	const char *nb = getenv("PERFCACHED_ALERT_NO_HOST_BUSY");
 
-	A.mail_level = cfg->mail.level;    /* S377: info is 0; config defaults it */
+	A.mail_level = cfg->mail.level;    /* info is 0; config defaults it */
 	{
 		int li;
 
@@ -231,22 +207,31 @@ void pc_alerts_init(const struct pc_config *cfg)
 	A.min_interval = S(cfg->mail.min_interval_s);
 	A.digest = S(cfg->mail.digest_s);
 	A.fast = f ? atoi(f) : 0;
-	A.al = cfg->alerts;                /* S380 */
+	A.al = cfg->alerts;
 	hm_io_init(cfg->wal_dir ? cfg->wal_dir : cfg->state_dir);
-	link_init(cfg);                    /* S465 */
+	/* test hook: a suite on a shared runner is not about its CPU or disk - past 99% there
+	 * they mailed alarms the suite never expected */
+	A.no_busy = nb && *nb;
+	if (A.no_busy) {
+		HM.io_ok = 0;
+		snprintf(HM.io_why, sizeof HM.io_why, "PERFCACHED_ALERT_NO_HOST_BUSY (a test "
+			"setting)");
+	}
+	link_init(cfg);
 	if (gethostname(A.host, sizeof A.host - 1) != 0)
 		snprintf(A.host, sizeof A.host, "perfcached");
-	/* S377 test hook: a host name as long as they come, for the subject's
-	 * cut (alerttest D) */
+	/* test hook: a host name as long as they come, for the subject's cut */
 	if (th && *th)
 		snprintf(A.host, sizeof A.host, "%s", th);
-	/* a relay's sequence starts somewhere a restart is unlikely to have
-	 * been lately, so the mailer's duplicate check never takes a new
-	 * relay for an old one */
+	/* a relay's sequence starts somewhere a restart is unlikely to have been lately, so the
+	 * mailer's duplicate check never takes a new relay for an old one */
 	A.relay_seq = (unsigned int)wall_ms();
 	if (A.fast > 1)
 		LM_NOTICE("alerts: PERFCACHED_ALERT_FAST=%d - hold and clear "
 			"times divided by %d (a test setting)\n", A.fast, A.fast);
+	if (A.no_busy)
+		LM_NOTICE("alerts: PERFCACHED_ALERT_NO_HOST_BUSY - the host's CPU and disk "
+			"busy are not watched (a test setting)\n");
 }
 
 static struct aring *ring_next(void)
@@ -272,17 +257,13 @@ static void ring_add(const struct akey *k, int cleared, const char *mail)
 	snprintf(e->mail, sizeof e->mail, "%s", mail);
 }
 
-/* ---- S377: the mail a person can read (DESIGN 12lu) --------------------- */
+/* ---- the mail a person can read -------------------------------------------- */
 
-/* What each kind of alert is called in a subject, what the node does about
- * it by itself, what a person should do, and the alert that raises it.  A
- * key matches exactly, or by prefix where the entry ends in '.' or is
- * "fleet.node".  The docs list the same table. */
+/* per alert kind: its subject title, what the node does, what to do, the raising key (the docs
+ * list the same table); a key matches exactly, or by prefix if it ends in '.' or is "fleet.node" */
 static const struct acat {
 	const char *key;
-	const char *title, *title_failed;  /* node.state: the title when its
-	                                    * text says FAILED (a heal that
-	                                    * stalled is critical, still a heal) */
+	const char *title, *title_failed;  /* node.state's title when its text says FAILED */
 	const char *node;                  /* "The node": NULL when nothing */
 	const char *todo;                  /* "What to do" */
 	const char *cause;                 /* raised by this key, NULL */
@@ -290,7 +271,7 @@ static const struct acat {
 	{ "node.start", "node started", NULL, NULL,
 	  "Nothing, if the start was planned.  After an unclean stop, find out "
 	  "why it stopped: its log before the stop, the system journal.", NULL },
-	{ "node.reconcile", "reconcile without a witness", NULL,       /* S388 */
+	{ "node.reconcile", "reconcile without a witness", NULL,
 	  "Serves on; keeps the records it replayed at its start from the "
 	  "peers' pulls and repairs until its reconcile can finish - which "
 	  "it cannot: every live peer restarted after it went down, so none "
@@ -309,7 +290,7 @@ static const struct acat {
 	  "The disk under the WAL is slower than the write rate (iostat -x 1).  "
 	  "To stop it recurring, raise [wal] ring_kb or move the log to faster "
 	  "storage.", NULL },
-	{ "wal.capacity", "WAL filling faster than snapshots free it", NULL, /* S437 */
+	{ "wal.capacity", "WAL filling faster than snapshots free it", NULL,
 	  "Serves normally, and asks for snapshots back to back.  If the log "
 	  "fills before one frees it, acknowledged writes are lost and the "
 	  "node refuses writes while it heals (wal.loss).",
@@ -317,6 +298,12 @@ static const struct acat {
 	  "applies it - or lower the write load.  The WAL card shows its size "
 	  "and how fast it fills; if the snapshot is the slow side, raise "
 	  "rdb_mb_s.", NULL },
+	{ "tls.cert", "TLS certificate expiring", "TLS certificate expired",
+	  "Serves as before until it expires; then every TLS client refuses the "
+	  "handshake and the TLS doors serve nobody.",
+	  "Renew the certificate at [listen] tls_cert and tls_key, then "
+	  "systemctl reload perfcached (or perfcli reload): the new pair is "
+	  "read without a restart.", NULL },
 	{ "wal.fsync", "WAL fsync slow", NULL, NULL,
 	  "Check the disk holding the WAL (iostat -x 1) and what else writes "
 	  "to it.  If it stays this slow under load, the log can fall behind "
@@ -325,7 +312,7 @@ static const struct acat {
 	  "Refuses each write that does not fit; reads are served.",
 	  "Raise [memory] arena_mb, or find what is filling the arena "
 	  "(/stats collections).", NULL },
-	{ "clients.refused", "new connections refused at the memory floor", NULL, /* S406 */
+	{ "clients.refused", "new connections refused at the memory floor", NULL,
 	  "Serves the connections it has; each new one is refused, as at "
 	  "max_clients, until memory above the floor is free again.",
 	  "The alert names the limit and where it comes from.  Under a cgroup "
@@ -340,7 +327,7 @@ static const struct acat {
 	{ "host.io", "disk busy", NULL, NULL,
 	  "Find what keeps the device busy (iostat -x 1, iotop).  The WAL needs "
 	  "it to keep up with the write rate.", NULL },
-	{ "host.link", "network link busy", NULL,                     /* S465 */
+	{ "host.link", "network link busy", NULL,
 	  "Serves on; requests and replication wait in the link's queues, and "
 	  "datagrams that do not fit are dropped and repaired later.",
 	  "An active-backup bond with an idle slave doubles with 802.3ad "
@@ -349,7 +336,7 @@ static const struct acat {
 	{ "host.memory", "host memory high", NULL, NULL,
 	  "Find what uses the memory - the alert names perfcached's own share "
 	  "of it.", NULL },
-	{ "io.epoll_busy", "epoll workers busy", NULL,                /* S379 */
+	{ "io.epoll_busy", "epoll workers busy", NULL,
 	  "Serves on; requests wait longer while its workers are busy.",
 	  "Where io_uring is usable here (the alert says), change io = epoll "
 	  "to io = io_uring in [daemon] and restart this node: it takes about "
@@ -358,7 +345,7 @@ static const struct acat {
 	  "kernel.io_uring_disabled = 0, a kernel 6.0 or later.  A slow disk, "
 	  "memory pressure or CPU steal keeps a worker busy too: epoll is the "
 	  "lever this node has, not necessarily the cause.", NULL },
-	{ "write.", "write-through", NULL,                            /* S385 */
+	{ "write.", "write-through", NULL,
 	  "Writes go to the upstream's master first and are read back; with "
 	  "no master every write is refused (reads still answer), without "
 	  "RedisJSON there every JSON write is.  The master and RedisJSON are "
@@ -373,7 +360,7 @@ static const struct acat {
 	  "know - see which on the page, and whether it should.", NULL },
 	{ "upstream.", "read-through upstream", NULL,
 	  "Answers what it holds; with several upstreams the others take the "
-	  "fetches (S382), with none a miss answers from the negative cache "
+	  "fetches, with none a miss answers from the negative cache "
 	  "until one is back.",
 	  "Check that the upstream answers (redis-cli -h <host> -p <port> PING "
 	  "and ROLE) and that its user may track.  A replica refused as a "
@@ -384,14 +371,14 @@ static const struct acat {
 	  "again.  A perfcached as the upstream is a daisy-chain (refused, a "
 	  "ring of them storms): point upstream at Redis, or set "
 	  "upstream_allow_perfcached = yes for one deliberate hop.", NULL },
-	{ "chain.", "read-through daisy-chain", NULL,                  /* S384 */
+	{ "chain.", "read-through daisy-chain", NULL,
 	  "Answers another perfcached's read-through from what it holds; "
 	  "never fetches onward for it (one hop), so that node sees a miss "
 	  "for whatever this one has not fetched itself.",
 	  "Point the other perfcached's upstream at Redis itself, as this node "
 	  "reads it - a daisy-chain of read-throughs serves its far end only "
 	  "what the middle already holds.", NULL },
-	{ "config.", "fleet settings differ", NULL,                    /* AR11 */
+	{ "config.", "fleet settings differ", NULL,
 	  "Serves on, each member by its own settings - so the fleet behaves "
 	  "unevenly: writes through a member on allow never reach Redis, a "
 	  "member that fsyncs less loses more in a crash, a member without "
@@ -399,7 +386,7 @@ static const struct acat {
 	  "Make the setting the same on every member (the alert names it and "
 	  "the member that differs), then restart that member - one at a "
 	  "time, as any configuration change.", NULL },
-	{ "cluster.autoscale", "autoscale modes differ across the fleet", /* S436 */
+	{ "cluster.autoscale", "autoscale modes differ across the fleet",
 	  NULL,
 	  "Serves on, each member sizing the collection by its own mode: "
 	  "under auto a member shrinks a table the others keep, so one "
@@ -409,7 +396,7 @@ static const struct acat {
 	  "so a difference that stays is a fault - compare autoscale and "
 	  "autoscale_gen in each member's /stats collections, and set the "
 	  "mode again with the autoscale verb.", NULL },
-	{ "cluster.tombstones", "deletes or expiries forgotten early", NULL, /* AR15, S443 */
+	{ "cluster.tombstones", "deletes or expiries forgotten early", NULL,
 	  "Serves on.  A member away while the cap dropped deletes is not "
 	  "told of them when it returns: a key deleted then may come back "
 	  "from its copy.  A dropped expiry matters less: the copy expires "
@@ -418,7 +405,7 @@ static const struct acat {
 	  "expiries (an eager collection's) times tombstone_retain_s - the "
 	  "GUIDE sizes it - or lower tombstone_retain_s.  The alert's text says "
 	  "how many were expiries.", NULL },
-	{ "cluster.acks_stuck", "a member confirms no more deletes", NULL,  /* 12ny AT-11 */
+	{ "cluster.acks_stuck", "a member confirms no more deletes", NULL,
 	  "Serves on.  Every delete of that origin since the member's mark "
 	  "stopped is kept for it, on every node, until it confirms them or "
 	  "the time rule and the cap drop them - then the member is asked to "
@@ -443,6 +430,12 @@ static const struct acat {
 	{ "fleet.missing", "fleet members missing", NULL, NULL,
 	  "Start the missing members, or take them out of the fleet if they "
 	  "are gone for good.", NULL },
+	{ "cluster.admission_stuck", "a joiner's links do not answer", NULL,
+	  "The master holds it CONNECTING - no clients, no replication, no data - and "
+	  "admits the next; it goes ONLINE by itself once every link answers both ways.",
+	  "Fix the path the text names between the joiner and that member: a firewall "
+	  "rule, an advertise address or port the other cannot reach, or a closed "
+	  "relay port (UDP or TCP), frame lane or cluster port TCP.", NULL },
 	{ "fleet.majority", "fleet below majority", NULL,
 	  "Without a majority the fleet elects no master and changes no map "
 	  "until members return.",
@@ -478,7 +471,7 @@ static const char *title_of(const char *key, const char *text)
 static int key_is_event(const char *key)
 {
 	return !strcmp(key, "node.start") || !strcmp(key, "test.event") ||
-		!strcmp(key, "cluster.peer_absent");             /* AR15 */
+		!strcmp(key, "cluster.peer_absent");
 }
 
 static void html_esc(FILE *f, const char *s)
@@ -1093,7 +1086,7 @@ static void digest_flush(int force)
 
 	if (!A.dn || (!force && mono_ms() < A.ddeadline))
 		return;
-	/* S377: one mail per origin node, its alerts worst first */
+	/* one mail per origin node, its alerts worst first */
 	for (i = 0; i < A.dn; i++) {
 		if (done[i])
 			continue;
@@ -1116,10 +1109,8 @@ static void digest_flush(int force)
 	A.dmore = 0;
 }
 
-/* S352c: an alert that should go out and that no member can mail - said
- * in the log when it starts and at most every ten minutes while it lasts
- * (the alert's own line is there already), kept in the ring.  The tick
- * starts it again whenever a mailer is reachable. */
+/* an alert no member can mail: logged when it starts and at most every ten minutes while
+ * it lasts, kept in the ring */
 static void unreachable(const char *text, char *w, size_t wn)
 {
 	long long now = mono_ms();
@@ -1142,7 +1133,7 @@ static void unreachable(const char *text, char *w, size_t wn)
 	A.nmr_quiet = 0;
 }
 
-/* S352c: hand a raise or a clear to the elected mailer; 0 when it went */
+/* hand a raise or a clear to the elected mailer; 0 when it went */
 static int relay_out(const struct akey *k, int cleared, char *w, size_t wn)
 {
 	struct pc_alert_relay r;
@@ -1164,11 +1155,8 @@ static int relay_out(const struct akey *k, int cleared, char *w, size_t wn)
 	return -1;
 }
 
-/* S352c: one raise or clear that is due by mail, out the way this node
- * has: its own mailer, the elected mailer by relay, or - for a fleet event
- * on any node but the elected mailer - nothing, the mailer has it.  @w the
- * ring's words.  1 when it went, 0 when no mailer is reachable now, -1
- * when it cannot go (a lone node without [mail], a relay that failed). */
+/* one raise or clear due by mail: own mailer, the elected mailer by relay, or nothing (a fleet event off
+ * the mailer).  1 went, 0 not now (no mailer, or a raise's relay failed), -1 cannot go; @w the ring's words */
 static int deliver(struct akey *k, int cleared, char *w, size_t wn)
 {
 	if (k->fleet && !(A.mailer_self && pc_mail_ready())) {
@@ -1178,17 +1166,18 @@ static int deliver(struct akey *k, int cleared, char *w, size_t wn)
 		return 1;
 	}
 	if (pc_mail_ready()) {
-		digest_own(k, cleared);                 /* S377 */
+		digest_own(k, cleared);
 		snprintf(w, wn, "mailed");
 		return 1;
 	}
 	if (!pc_cluster_enabled()) {
-		snprintf(w, wn, "no mailer");          /* S352b: a lone node */
+		snprintf(w, wn, "no mailer");          /* a lone node */
 		return -1;
 	}
 	if (!A.mailer)
 		return 0;
-	return relay_out(k, cleared, w, wn) == 0 ? 1 : -1;
+	/* nothing went, so a raise waits and retries as if no mailer were heard yet */
+	return relay_out(k, cleared, w, wn) == 0 ? 1 : cleared ? -1 : 0;
 }
 
 /* where a raise goes by mail; @w gets the ring's words for it */
@@ -1204,9 +1193,8 @@ static void mail_raise(struct akey *k, long long now, int worse, char *w,
 			snprintf(w, wn, "below level");
 			return;
 		}
-		/* min_interval quiets a REPEAT; a condition that got worse
-		 * (healing -> failed) is news and goes out whatever the
-		 * window says */
+		/* min_interval quiets a REPEAT; a condition that got worse (healing -> failed) is
+		 * news and goes out whatever the window says */
 		if (!worse && k->last_mail && now - k->last_mail < A.min_interval) {
 			snprintf(w, wn, "suppressed");
 			return;
@@ -1214,10 +1202,8 @@ static void mail_raise(struct akey *k, long long now, int worse, char *w,
 	}
 	r = deliver(k, 0, w, wn);
 	if (r == 0) {
-		/* S352c: a node just started, or just joined, has not heard
-		 * the fleet's beats yet - its own start is raised the second
-		 * it is ready.  The raise waits PEND_MS for a mailer, and the
-		 * ring entry says what became of it then (pend_tick). */
+		/* a node just started or joined has not heard the fleet's beats yet: the raise waits
+		 * PEND_MS for a mailer, and pend_tick tells the ring entry what became of it */
 		k->pend_since = now;
 		snprintf(w, wn, "%s", PEND_WORD);
 	} else if (r > 0) {
@@ -1233,7 +1219,7 @@ static void mail_clear(struct akey *k, char *w, size_t wn)
 		unreachable(k->text, w, wn);
 }
 
-/* S352c: the ring entry of a raise that waited, told what became of it */
+/* the ring entry of a raise that waited, told what became of it */
 static void pend_word(const struct akey *k, const char *w)
 {
 	struct aring *e = &A.r[k->pend_slot];
@@ -1243,7 +1229,7 @@ static void pend_word(const struct akey *k, const char *w)
 		snprintf(e->mail, sizeof e->mail, "%s", w);
 }
 
-/* S352c: the raises waiting for a mailer - out as soon as one is heard,
+/* the raises waiting for a mailer - out as soon as one is heard,
  * "no mailer reachable" once PEND_MS has passed without one */
 static void pend_tick(void)
 {
@@ -1296,7 +1282,7 @@ static struct akey *key_find(const char *key, int create)
 	}
 	memset(&A.k[i], 0, sizeof A.k[i]);
 	snprintf(A.k[i].key, sizeof A.k[i].key, "%s", key);
-	A.k[i].fleet = !strncmp(key, "fleet.", 6);     /* S352c */
+	A.k[i].fleet = !strncmp(key, "fleet.", 6);
 	return &A.k[i];
 }
 
@@ -1310,7 +1296,7 @@ static void raise_now(struct akey *k, int level, const char *text, long long now
 		k->pend_since = 0;
 	}
 
-	/* S377: a new problem (or any one-off) starts its record */
+	/* a new problem (or any one-off) starts its record */
 	if (!k->active || k->oneoff) {
 		k->ep_wall = wall_ms();
 		k->ep_mono = now;
@@ -1333,16 +1319,15 @@ static void raise_now(struct akey *k, int level, const char *text, long long now
 	k->level = level;
 	k->since_wall = wall_ms();
 	snprintf(k->text, sizeof k->text, "%s", text);
-	/* a one-off tells of something past - the node's own start after an
-	 * unclean stop, which it has recovered from: WARNING in the log, its
-	 * level in the text, so a CRITICAL line still means a failure NOW */
+	/* a one-off tells of something past (a start after an unclean stop): WARNING in the log,
+	 * its level in the text, so a CRITICAL line still means a failure NOW */
 	if (level >= PC_AL_CRITICAL && !k->oneoff)
 		LM_CRIT("alert: %s\n", text);
 	else if (level >= PC_AL_WARNING)
 		LM_WARN("alert%s: %s\n", level >= PC_AL_CRITICAL ? " (critical)"
 			: "", text);
 	else
-		LM_NOTICE("alert (info): %s\n", text);       /* S377 */
+		LM_NOTICE("alert (info): %s\n", text);
 	mail_raise(k, now, worse, w, sizeof w);
 	ring_add(k, 0, w);
 	if (k->pend_since)
@@ -1366,6 +1351,9 @@ static void cond(const char *key, int on, int level, long long hold,
 		if (k->active) {
 			if (level != k->level)     /* worse, or better: said again */
 				raise_now(k, level, text, now);
+			else if (!strncmp(key, "config.", 7) && text && strcmp(k->text, text))
+				/* who differs moved (a member heard late): the words follow, unsaid */
+				snprintf(k->text, sizeof k->text, "%s", text);
 		} else if (now - k->true_since >= T(hold)) {
 			raise_now(k, level, text, now);
 		}
@@ -1374,7 +1362,7 @@ static void cond(const char *key, int on, int level, long long hold,
 	k->true_since = 0;
 	if (!k->active)
 		return;
-	/* S377: the value now, for its resolve - where the text IS a measure */
+	/* the value now, for its resolve - where the text IS a measure */
 	if (text && text[0] && (!strncmp(key, "host.", 5) ||
 	    !strncmp(key, "io.", 3) ||
 	    !strcmp(key, "memory.arena") || !strcmp(key, "wal.fsync")))
@@ -1419,7 +1407,7 @@ static void check_node(void)
 			pc_node_reason_text(pc_node_reason()));
 		cond("node.state", 1, PC_AL_CRITICAL, 0, 0, t);
 	} else if (st == PC_NST_HEALING) {
-		/* S377: healing is the node's own repair - a warning, critical
+		/* healing is the node's own repair - a warning, critical
 		 * only when it has not healed in ten minutes */
 		struct akey *hk = key_find("node.state", 0);
 		int lv = hk && hk->active && mono_ms() - hk->ep_mono >= T(S(600)) ?
@@ -1441,16 +1429,15 @@ static void check_node(void)
 			snprintf(t, sizeof t, "started (perfcached %s) after an "
 				"UNCLEAN stop - %ld WAL records were replayed above "
 				"the last snapshot", PC_VERSION, w);
-			/* S377: it is up again - look today why it stopped */
+			/* it is up again - look today why it stopped */
 			event("node.start", PC_AL_WARNING, t);
 		} else {
 			snprintf(t, sizeof t, "started (perfcached %s), ready",
 				PC_VERSION);
-			event("node.start", PC_AL_INFO, t);    /* S377: routine */
+			event("node.start", PC_AL_INFO, t);    /* routine */
 		}
 	}
-	/* S388: a reconcile with no witness waits for a restart of THIS node -
-	 * the header said it and the log once; now the alerts (and the mail) */
+	/* a reconcile with no witness waits for a restart of THIS node */
 	if (pc_cluster_enabled()) {
 		struct pc_cl_stats cs;
 
@@ -1461,10 +1448,19 @@ static void check_node(void)
 			(long long)cs.reconcile_no_witness_s);
 		cond("node.reconcile", cs.reconcile_no_witness_s >= 30,
 			PC_AL_WARNING, 0, S(30), t);
+		/* on the master, a joiner held CONNECTING past CONNECT_MS */
+		{
+			char w[200];
+
+			pc_cluster_admission_stuck_text(w, sizeof w);
+			snprintf(t, sizeof t, "%llu joiner(s) held CONNECTING: %.140s",
+				(unsigned long long)cs.admission_stuck, w);
+			cond("cluster.admission_stuck", cs.admission_stuck > 0,
+				PC_AL_WARNING, 0, S(30), t);
+		}
 	}
-	/* S377: PERFCACHED_ALERT_TEST_EVENT=<text> raises one test event
-	 * (level PERFCACHED_ALERT_TEST_LEVEL, warning by default) once ready -
-	 * for the suites: what a mail does with any text */
+	/* PERFCACHED_ALERT_TEST_EVENT=<text> raises one test event once ready (level
+	 * PERFCACHED_ALERT_TEST_LEVEL, warning by default): what a mail does with any text */
 	if (!A.test_said && st == PC_NST_READY) {
 		const char *te = getenv("PERFCACHED_ALERT_TEST_EVENT");
 		const char *tl = getenv("PERFCACHED_ALERT_TEST_LEVEL");
@@ -1491,9 +1487,8 @@ static void check_wal(void)
 	dd = ws.dropped - A.wal_dropped;
 	dov = ws.overruns - A.wal_overruns;
 	if (A.primed) {
-		/* S377: the node heals a loss by itself (HEALING, a snapshot) -
-		 * a warning; the third within an hour is critical, it will
-		 * keep happening until someone changes the disk or the ring */
+		/* the node heals a loss by itself (HEALING, a snapshot) - a warning; the third within an
+		 * hour is critical, it will keep happening until someone changes the disk or the ring */
 		struct akey *wk = key_find("wal.loss", 0);
 		long long nm = mono_ms();
 		int wi, inhour = wk && wk->active ? 0 : 1;   /* the one starting now */
@@ -1513,9 +1508,8 @@ static void check_wal(void)
 	A.wal_dropped = ws.dropped;
 	A.wal_overruns = ws.overruns;
 
-	/* the fsync mean over the last minute against what the start-up
-	 * probe measured - S351's window is five minutes; a minute here,
-	 * held for five, says "it has been slow for five minutes" */
+	/* the fsync mean over the last minute against the start-up probe; held for five minutes,
+	 * it says "slow for five minutes" */
 	pc_wal_fsync_observed(&ob);
 	A.fs_n[A.fs_i] = ob.fsync_n;
 	A.fs_sum[A.fs_i] = ob.sum_us;
@@ -1526,9 +1520,7 @@ static void check_wal(void)
 	if (A.fs_have == 61 && ob.probe_p50_us) {
 		unsigned long long n = ob.fsync_n - A.fs_n[j];
 		unsigned long long avg = n ? (ob.sum_us - A.fs_sum[j]) / n : 0;
-		/* the ratio to one decimal: the resolved line of a mail read
-		 * "0x the 3163 us measured at start" for 2506 us (operator,
-		 * 2026-10-16) - an integer ratio has no "0.8x" */
+		/* the ratio to one decimal: an integer ratio has no "0.8x" */
 		unsigned long long r10 = avg * 10 / ob.probe_p50_us;
 
 		snprintf(t, sizeof t, "WAL fsync averages %llu us over the last "
@@ -1538,21 +1530,8 @@ static void check_wal(void)
 			PC_AL_WARNING, S(300), S(60), t);
 	}
 
-	/* S437: the log's room against the snapshots that free it.  The WAL
-	 * asks for a snapshot by itself and logs a line (S224's rate trigger,
-	 * RV-13's sizing warning); this is what an operator is shown and
-	 * mailed.  Either:
-	 *  - the whole ring fills faster than one snapshot takes - undersized:
-	 *    overruns and heals are certain while the load lasts.  Held a
-	 *    minute; or
-	 *  - the free segments last less than twice the last snapshot's
-	 *    duration at the current fill rate - the trigger is firing back to
-	 *    back, and one slower snapshot overruns the ring.  Firing alone is
-	 *    only the WAL asking for the next snapshot (GUIDE); HOLDING is the
-	 *    news, so five minutes - at a minute walsizetest's healthy 64 MB
-	 *    ring raised it while snapshots ran back to back for a few
-	 *    seconds (GitHub 39952740047).
-	 * Cleared after five. */
+	/* the log's room against the snapshots that free it: the ring fills faster than one snapshot
+	 * takes (held a minute), or free segments last under twice the last snapshot (held five) */
 	{
 		struct pc_rdb_stats rs;
 		int on = 0;
@@ -1585,6 +1564,22 @@ static void check_wal(void)
 	}
 }
 
+/* the TLS doors' certificate - a warning 14 days before it runs out, critical after */
+static void check_tls(void)
+{
+	struct pc_tls_stats ts;
+	char t[PC_ALERT_TEXT];
+	long long left;
+
+	pc_tls_stats(&ts);
+	if (!ts.loaded || !ts.not_after)
+		return;
+	left = ts.not_after - (long long)time(NULL);
+	snprintf(t, sizeof t, left > 0 ? "%.120s expires in %lld day(s)" :
+		"%.120s expired %lld day(s) ago", ts.cert, (left > 0 ? left : -left) / 86400);
+	cond("tls.cert", left < 14LL * 86400, left <= 0 ? PC_AL_CRITICAL : PC_AL_WARNING, 0, S(60), t);
+}
+
 static void check_memory(void)
 {
 	struct pcache_arena_pressure pr;
@@ -1615,8 +1610,6 @@ static void check_memory(void)
 		return;
 	held = pcache_arena_held_bytes();
 	{
-		/* S380: the operator's thresholds (0.6.0: under 10% left a
-		 * warning, under 1% critical) */
 		int used = held >= mx ? 100 : (int)(held * 100 / mx);
 		int lv = hw_level("memory.arena", used, A.al.arena_warn,
 			A.al.arena_crit);
@@ -1631,11 +1624,10 @@ static void check_memory(void)
 }
 
 
-/* ---- S380: the host's high-water alarms --------------------------------- */
+/* ---- the host's high-water alarms ------------------------------------------- */
 
-/* the level a high-water condition is at: critical from @crit, a warning
- * from @warn, and HM_HYST points of hysteresis under the level it already
- * holds, so a value sitting on a line does not flap.  0 = none. */
+/* the level a high-water condition is at: critical from @crit, a warning from @warn, with HM_HYST
+ * points of hysteresis under the level it holds so a value on a line does not flap; 0 = none */
 static int hw_level(const char *key, int pct, int warn, int crit)
 {
 	struct akey *k = key_find(key, 0);
@@ -1648,13 +1640,8 @@ static int hw_level(const char *key, int pct, int warn, int crit)
 	return 0;
 }
 
-/* S377 test hook: PERFCACHED_ALERT_TEST_COND=<file> is a condition the
- * suites drive - the file's first line "warning <text>" or "critical
- * <text>" raises it at that level (a change of level is mailed again),
- * anything else clears it.  Read before the alerts lock, as S380's files
- * are; @lvl -1 when the hook is off.  The arena cannot stand in: a freed
- * cell stays held until reclaim retires its chunk, so it does not clear
- * on a test's clock */
+/* test hook: PERFCACHED_ALERT_TEST_COND=<file>, first line "warning <text>" or "critical <text>",
+ * raises it at that level, anything else clears it; -1 when the hook is off.  Read unlocked. */
 static int test_cond_read(char *t, size_t cap)
 {
 	const char *p = getenv("PERFCACHED_ALERT_TEST_COND");
@@ -1692,11 +1679,8 @@ static int test_cond_read(char *t, size_t cap)
 	return lvl;
 }
 
-/* S379: a node on epoll whose busiest worker runs out of time is told
- * the lever it has - io_uring where the host can run it, else what refused
- * it.  It says what it measured, not why: a slow disk, memory pressure or
- * CPU steal keeps a worker busy too.  Never on io_uring.  @busy: the
- * busiest worker's share of the last minute, read before the lock */
+/* an epoll node whose busiest worker runs out of time is told the lever it has (io_uring, or
+ * what refused it); never on io_uring.  @busy: the busiest worker's share of the last minute */
 static void check_io(int busy)
 {
 	const struct pc_io_backend *b = &pc_io_backend;
@@ -1718,7 +1702,27 @@ static void check_io(int busy)
 		S(60), t);
 }
 
-/* S465: auto's address - the cluster's advertise, else a listener's own */
+/* what the host receives is handled on as many CPUs as the NIC has
+ * queues, and on one if all its interrupts land there */
+static void link_queues_warn(int workers)
+{
+	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	int want = ncpu > 0 && ncpu < workers ? (int)ncpu : workers;
+
+	if (!HL.on)
+		return;
+	if (HL.rx_queues > 0 && HL.rx_queues < want)
+		LM_WARN("link: %s has %d receive queue(s) for %d workers - what this "
+			"host receives is handled on that many CPUs; give it one a core "
+			"(ethtool -L %s combined <N>, or the VM NIC's multiqueue), "
+			"PRODUCTION.md section 7\n", HL.phys, HL.rx_queues, workers,
+			HL.phys);
+	if (HL.irqs > 1 && HL.irq_cpus == 1)
+		LM_WARN("link: all %d interrupts of %s land on one CPU - run "
+			"irqbalance or spread them, PRODUCTION.md section 7\n", HL.irqs,
+			HL.phys);
+}
+
 static void link_init(const struct pc_config *cfg)
 {
 	const char *addr = cfg->cl_advertise;
@@ -1740,9 +1744,10 @@ static void link_init(const struct pc_config *cfg)
 	else
 		LM_NOTICE("link: %s, speed unknown - its traffic is counted, not "
 			"judged ([daemon] link_speed_mbps sets it)\n", HL.path);
+	link_queues_warn(cfg->workers);
 }
 
-/* S465: the busier direction's minute against the speed; critical at once
+/* the busier direction's minute against the speed; critical at once
  * when cluster datagrams drop while the link is at its critical level */
 static void check_link(const struct hl_obs *o)
 {
@@ -1816,9 +1821,8 @@ static void check_host(const struct hm_obs *o)
 	if (HM.mem_pct >= 0) {
 		lv = hw_level("host.memory", HM.mem_pct, A.al.mem_warn,
 			A.al.mem_crit);
-		/* ~160 bytes in practice; the result is checked, as the relay's
-		 * is, because six 64-bit figures can in theory outrun the
-		 * 200-byte text and -Wformat-truncation says so */
+		/* the result is checked: six 64-bit figures can in theory outrun the 200-byte text
+		 * (-Wformat-truncation) */
 		if (HM.huge_kb) {
 			if (snprintf(t, sizeof t, "host memory %d%% used (%llu of %llu "
 				"MB available beside %llu MB of huge pages), perfcached "
@@ -1838,7 +1842,7 @@ static void check_host(const struct hm_obs *o)
 	}
 }
 
-/* S381: the CPUs this process may use - its affinity, capped by a cgroup
+/* the CPUs this process may use - its affinity, capped by a cgroup
  * cpu.max quota on its own cgroup or an ancestor (a container's limit) */
 double pc_process_cpus(void)
 {
@@ -1907,7 +1911,7 @@ static void tw_ll(struct pc_tw *out, const char *k, int ok, long long v)
 		pc_tw_nil(out);
 }
 
-/* S465: alerts.host.link - nil until a device has two samples */
+/* alerts.host.link - nil until a device has two samples */
 static void link_tree(struct pc_tw *out)
 {
 	int got = HL.on && HL.have > 1;
@@ -1929,15 +1933,19 @@ static void link_tree(struct pc_tw *out)
 	tw_pct(out, "tx_peak_pct", got ? HL.tx_peak_pct : -1);
 	tw_ll(out, "drops_s", got, HL.drops_ps);
 	tw_ll(out, "udp_rcvbuf_errors_s", got, HL.udperr_ps);
+	tw_ll(out, "tcp_retrans_s", got, HL.retrans_ps);
+	tw_pct(out, "rx_queues", HL.on ? HL.rx_queues : -1);
+	tw_pct(out, "irqs", HL.on ? HL.irqs : -1);
+	tw_pct(out, "irq_cpus", HL.on ? HL.irq_cpus : -1);
 	pc_tw_end(out);
 }
 
-/* S382: why an upstream of a read-through collection is not used now */
+/* why an upstream of a read-through collection is not used now */
 static const char *up_why(const struct pc_up_srv_health *s)
 {
 	if (s->state != PC_UPS_OFF)
 		return s->conns_up ? NULL : "unreachable";
-	if (s->perfcached)                     /* S384 */
+	if (s->perfcached)
 		return "a perfcached: daisy-chaining off (upstream_allow_perfcached)";
 	if (s->role == 1)
 		return "a master - not used (upstream_role = replica)";
@@ -1956,7 +1964,7 @@ static void check_upstreams(void)
 	char key[KEYLEN], t[PC_ALERT_TEXT];
 	int i, j, n = pc_upstream_count();
 
-	static unsigned long long chain_seen[8];    /* S384: per collection */
+	static unsigned long long chain_seen[8];    /* per collection */
 
 	for (i = 0; i < n; i++) {
 		int down, trk, by_design;
@@ -1964,10 +1972,8 @@ static void check_upstreams(void)
 
 		if (pc_upstream_health(i, &h) != 0)
 			continue;
-		/* S384: another perfcached read this read-through collection
-		 * through us - a daisy-chain, cut here: its misses got what we
-		 * hold, nothing fetched onward.  Raised by any such read, cleared
-		 * after five quiet minutes */
+		/* another perfcached reads this read-through collection through us: a daisy-chain, cut
+		 * here (its misses get what we hold); cleared after five quiet minutes */
 		if (i < 8) {
 			unsigned long long d = h.chained - chain_seen[i];
 
@@ -1980,7 +1986,7 @@ static void check_upstreams(void)
 			cond(key, d > 0, PC_AL_WARNING, 0, S(300), t);
 		}
 		if (h.through) {
-			/* S385: write-through.  No target: every write is refused
+			/* write-through with no target: every write is refused
 			 * - critical, clients are getting errors */
 			static const char *const wsn[] = { "", "starting",
 				"no listed upstream says master",
@@ -2002,9 +2008,8 @@ static void check_upstreams(void)
 				"RedisJSON - JSON writes are refused, not forwarded", h.col);
 			cond(key, h.w_json == 0 && h.w_target >= 0, PC_AL_WARNING,
 				S(10), S(60), t);
-			/* passed-through writes over a tenth of the forwarded ones in
-			 * five minutes: a client relies on commands this node only
-			 * relays - worth knowing which */
+			/* passed-through writes over a tenth of the forwarded ones in five minutes: a client
+			 * relies on commands this node only relays */
 			snprintf(wk, sizeof wk, "col.%.64s.upw.passed_writes", h.col);
 			pw = pc_win_delta(wk, h.w_passed, 0, NULL);
 			snprintf(wk, sizeof wk, "col.%.64s.upw.forwarded", h.col);
@@ -2016,10 +2021,8 @@ static void check_upstreams(void)
 				h.col, pw < 0 ? 0 : pw, fw < 0 ? 0 : fw);
 			cond(key, pw >= 0 && fw >= 20 && pw * 10 > fw, PC_AL_WARNING,
 				S(60), S(300), t);
-			/* AR2: writes refused at a full write-through queue, or
-			 * answered "not applied" after waiting out
-			 * upstream_timeout_ms - the master is slower than the
-			 * writes arriving at it */
+			/* writes refused at a full write-through queue, or "not applied" after
+			 * upstream_timeout_ms: the master is slower than the writes arriving at it */
 			{
 				long long qf, qe;
 
@@ -2037,7 +2040,7 @@ static void check_upstreams(void)
 					h.col, qf < 0 ? 0 : qf, qe < 0 ? 0 : qe);
 				cond(key, qf > 0 || qe > 0, PC_AL_WARNING, S(10), S(300), t);
 			}
-			/* AR1: without broadcast tracking a change another Redis
+			/* without broadcast tracking a change another Redis
 			 * client makes to a key written through here is not seen */
 			snprintf(key, sizeof key, "write.%s.tracking", h.col);
 			snprintf(t, sizeof t, "collection %.20s writes through but "
@@ -2047,7 +2050,7 @@ static void check_upstreams(void)
 			cond(key, h.w_bcast != 1, PC_AL_WARNING, S(60), S(60), t);
 		}
 		if (h.nsrv <= 1) {
-			/* one upstream: 0.6.0's alert, its reason said (S382) */
+			/* one upstream: its reason said */
 			why = up_why(&h.srv[0]);
 			down = h.conns_up == 0 || h.srv[0].state == PC_UPS_OFF;
 			trk = h.tracking_wanted && !h.tracking_on;
@@ -2065,20 +2068,17 @@ static void check_upstreams(void)
 			cond(key, down || trk, PC_AL_WARNING, S(60), S(60), t);
 			continue;
 		}
-		/* S382: several - each its own warning; none serving is
-		 * critical; the master serving because no replica does is a
-		 * warning for as long as it lasts */
+		/* several: each its own warning; none serving is critical; the master serving
+		 * because no replica does is a warning for as long as it lasts */
 		for (j = 0; j < h.nsrv; j++) {
 			const struct pc_up_srv_health *u = &h.srv[j];
 
 			if (u->state == PC_UPS_UNKNOWN)
 				continue;              /* not reached yet: not judged */
-			/* a master under upstream_role = replica is skipped by
-			 * design - listed so the collection follows the upstream's
-			 * failover.  The page shows it; no alert (.master below
-			 * covers it serving as the fallback) */
-			by_design = u->state == PC_UPS_OFF && u->role == 1 &&
-				!u->perfcached;
+			/* a master under upstream_role = replica is skipped by design (listed to follow
+			 * failover); no alert - .master below covers it serving as the fallback */
+			by_design = (u->state == PC_UPS_OFF && u->role == 1 &&
+				!u->perfcached) || u->quiet;          /* a sentinel, gone */
 			why = up_why(u);
 			trk = h.tracking_wanted && !u->tracking_on &&
 				u->state != PC_UPS_OFF;
@@ -2100,9 +2100,8 @@ static void check_upstreams(void)
 			"serves (%d configured) - misses are answered as its on_error "
 			"says", h.col, h.nsrv);
 		cond(key, !h.serving && !h.fallback, PC_AL_CRITICAL, S(60), S(60), t);
-		/* S382 part 2: failed over - the primary not serving and
-		 * another active; cleared once the primary serves again
-		 * (with upstream_preempt it then takes over) */
+		/* failed over: the primary not serving and another active; cleared once the
+		 * primary serves again (with upstream_preempt it then takes over) */
 		snprintf(key, sizeof key, "upstream.%s.failover", h.col);
 		if (h.failover && h.active >= 0 && h.active != h.primary) {
 			const struct pc_up_srv_health *pp = &h.srv[h.primary],
@@ -2130,13 +2129,8 @@ static void check_upstreams(void)
 	}
 }
 
-/* S352c: the FLEET as this node sees it - pc_cluster_members(), the list
- * /members and the page's fleet grid read.  Each member that went silent,
- * failed, stalled, left or was dropped is an alert of its own, a warning;
- * members missing from the fleet's size are one; fewer ready than a
- * majority of it is critical.  The fleet's size is S341's, the header's:
- * [cluster] expect when set, else the most members this node has listed.
- * Raised on every member that sees it, mailed by the elected mailer only. */
+/* the FLEET as this node sees it: each member silent, failed, stalled, left or dropped is a
+ * warning, missing members one more, under a majority ready critical; the mailer mails them */
 static void check_fleet(void)
 {
 	char key[KEYLEN], t[PC_ALERT_TEXT], ab[INET_ADDRSTRLEN];
@@ -2163,7 +2157,7 @@ static void check_fleet(void)
 		if (m->is_self) {
 			ready++;                       /* READY, by the gate above */
 			if (!inet_ntop(AF_INET, &m->addr, A.self_ip, sizeof A.self_ip))
-				A.self_ip[0] = 0;          /* S377: the mail's header */
+				A.self_ip[0] = 0;          /* the mail's header */
 			continue;
 		}
 		if (!inet_ntop(AF_INET, &m->addr, ab, sizeof ab))
@@ -2217,7 +2211,7 @@ static void check_fleet(void)
 			cond(key, 0, 0, 0, S(30), "");
 		}
 	}
-	A.fleet_size = size;                   /* S377: the mail's header */
+	A.fleet_size = size;                   /* the mail's header */
 	A.fleet_ready = ready;
 	snprintf(t, sizeof t, "%d member(s) missing - %d listed of the fleet's "
 		"%d (%s)", size - n, n, size, expect >= size ? "[cluster] expect"
@@ -2231,10 +2225,8 @@ static void check_fleet(void)
 	}
 }
 
-/* AR11 (DESIGN 12ms, AR6): a setting the fleet must agree on that a member
- * holds differently.  Per setting, the value most live members hold is the
- * fleet's (a tie: this node's); every member holding another is named, on
- * every node.  Members that report no settings (before 0.6.5) are left out */
+/* a setting the fleet must agree on that a member holds differently, named on every node;
+ * members that report no settings are left out */
 static void check_config(void)
 {
 	const struct pc_cfgsig *e;
@@ -2327,12 +2319,8 @@ static void check_config(void)
 	}
 }
 
-/* S436: the autoscale modes set at runtime are fleet state - announced, and
- * re-sent to every member every few seconds.  Raised while a live member
- * reports another digest of them for longer than that heals (held 30 s), or
- * while modes are set here and a member too old to take them is in the
- * fleet.  A member that does not report the digest (its settings take
- * every keepalive slot) is not compared. */
+/* runtime autoscale modes are fleet state, re-sent every few seconds: raised while a live member
+ * reports another digest past that (held 30 s), or a member too old to take them is present */
 static void check_autoscale(void)
 {
 	char t[PC_ALERT_TEXT], dif[96], old[96], ab[INET_ADDRSTRLEN];
@@ -2386,15 +2374,14 @@ static void check_autoscale(void)
 		nd || no ? t : "");
 }
 
-/* AR15: the tombstone table's limits - deletes its cap dropped before
- * tombstone_retain_s, and a member back after a silence longer than the
- * table covers.  Either way a delete may come back from a returning copy */
-/* S443: a count clamped into 32 bits, for a text that must fit */
+/* a count clamped into 32 bits, for a text that must fit */
 static unsigned int u32c(long long v)
 {
 	return v < 0 ? 0u : v > 4294967295LL ? 4294967295u : (unsigned int)v;
 }
 
+/* the tombstone table's limits: deletes its cap dropped before tombstone_retain_s, and a member
+ * back after a longer silence than it covers - either way a delete may come back */
 static void check_tombstones(void)
 {
 	struct pc_tomb_alert ta;
@@ -2403,13 +2390,11 @@ static void check_tombstones(void)
 
 	if (!pc_cluster_enabled() || !pc_cluster_tomb_alert(&ta))
 		return;
-	/* counters that start with the process: from 0 (re-cut 1's lesson -
-	 * otherwise a node up under a minute never says it) */
+	/* counters that start with the process: from 0, or a node up
+	 * under a minute never says it */
 	de = pc_win_delta("cluster.tomb_dropped_early", ta.dropped_early, 1, NULL);
 	nd = pc_win_delta("cluster.tomb_noted", ta.noted, 1, NULL);
-	/* S443: how many of them were EXPIRIES (an eager collection's reaped
-	 * keys) - it said "deletes" for all of them, and called the 5-minute
-	 * count of notes the level the cap was "full at" */
+	/* how many of them were EXPIRIES (an eager collection's reaped keys) */
 	dx = pc_win_delta("cluster.tomb_dropped_early_exp",
 		ta.dropped_early_expiries, 1, NULL);
 	if (de < 0)
@@ -2425,9 +2410,7 @@ static void check_tombstones(void)
 		"against tombstone_retain_max %u", u32c(de), ta.retain_s,
 		u32c(de - dx), u32c(dx), u32c(nd), ta.max);
 	cond("cluster.tombstones", de > 0, PC_AL_WARNING, S(10), S(300), t);
-	/* 12ny AT-11: a member whose mark of an origin's deletes stands still
-	 * while the others confirm - what this alert used to show only once
-	 * the cap bit, by its symptom */
+	/* a member whose mark of an origin's deletes stands still while the others confirm */
 	{
 		struct pc_ack_hold hv[PC_ACK_HOLD_MAX];
 		int hn = pc_cluster_acks_holds(hv, PC_ACK_HOLD_MAX), j, w = -1;
@@ -2451,7 +2434,7 @@ static void check_tombstones(void)
 	}
 }
 
-/* S352c: one relay from another node - this node mails it, by its own
+/* one relay from another node - this node mails it, by its own
  * [mail] level, naming the origin, and keeps it in its ring */
 static void relay_in(const struct pc_alert_relay *r)
 {
@@ -2474,7 +2457,7 @@ static void relay_in(const struct pc_alert_relay *r)
 	} else if (lvl < A.mail_level) {
 		snprintf(e->mail, sizeof e->mail, "below level");
 	} else {
-		digest_relay(r, lvl);                   /* S377 */
+		digest_relay(r, lvl);
 		snprintf(e->mail, sizeof e->mail, "mailed");
 	}
 }
@@ -2509,11 +2492,13 @@ void pc_alerts_tick(void)
 	IB.dropped = 0;
 	pthread_mutex_unlock(&IB.mx);
 
-	hm_read(&ho, mono_ms());               /* S380: the files, unlocked */
-	hl_read(&lo, mono_ms());               /* S465 */
-	tcl = test_cond_read(tct, sizeof tct); /* S377: a suite's, unlocked too */
-	/* S379: its own lock, not ours; the minute shrinks under
-	 * PERFCACHED_ALERT_FAST like S380's, to 3 samples at the least */
+	hm_read(&ho, mono_ms());               /* the files, unlocked */
+	if (A.no_busy)
+		ho.stat_ok = 0;
+	hl_read(&lo, mono_ms());
+	tcl = test_cond_read(tct, sizeof tct); /* a suite's, unlocked too */
+	/* its own lock, not ours; the minute shrinks under
+	 * PERFCACHED_ALERT_FAST, to 3 samples at the least */
 	busy = pc_iobusy_max_pct(A.fast > 1 ? (60 / A.fast > 3 ? 60 / A.fast : 3)
 		: 60);
 	pthread_mutex_lock(&A.mx);
@@ -2527,17 +2512,18 @@ void pc_alerts_tick(void)
 	check_node();
 	check_wal();
 	check_memory();
-	check_host(&ho);                       /* S380 */
-	check_link(&lo);                       /* S465 */
-	check_io(busy);                        /* S379 */
+	check_tls();
+	check_host(&ho);
+	check_link(&lo);
+	check_io(busy);
 	if (tcl >= 0)
 		cond("test.cond", tcl > 0, tcl > 0 ? tcl : PC_AL_WARNING, 0, S(60),
 			tct[0] ? tct : "the test condition");
 	check_upstreams();
 	check_fleet();
-	check_tombstones();                       /* AR15 */
-	check_config();                           /* AR11 */
-	check_autoscale();                        /* S436 */
+	check_tombstones();
+	check_config();
+	check_autoscale();
 	A.primed = 1;
 	digest_flush(0);
 	pthread_mutex_unlock(&A.mx);
@@ -2598,7 +2584,7 @@ void pc_alerts_stats_tree(struct pc_tw *out)
 	pthread_mutex_lock(&A.mx);
 	pc_tw_key(out, "alerts");
 	pc_tw_map(out);
-	/* S380: what the high-water alarms measure, and their thresholds */
+	/* what the high-water alarms measure, and their thresholds */
 	pc_tw_key(out, "host");
 	pc_tw_map(out);
 	tw_pct(out, "cpu_busy_pct", HM.cpu_pct);
@@ -2612,7 +2598,7 @@ void pc_alerts_stats_tree(struct pc_tw *out)
 	pc_tw_key(out, "disk_unwatched");
 	pc_tw_str(out, HM.io_ok ? "" : HM.io_why);
 	tw_pct(out, "memory_used_pct", HM.mem_pct);
-	link_tree(out);                                      /* S465 */
+	link_tree(out);
 	pc_tw_key(out, "thresholds");
 	pc_tw_map(out);
 	tw_pct(out, "cpu_warn_pct", A.al.cpu_warn);
@@ -2623,14 +2609,13 @@ void pc_alerts_stats_tree(struct pc_tw *out)
 	tw_pct(out, "memory_crit_pct", A.al.mem_crit);
 	tw_pct(out, "arena_warn_pct", A.al.arena_warn);
 	tw_pct(out, "arena_crit_pct", A.al.arena_crit);
-	tw_pct(out, "epoll_busy_pct", A.al.epoll_busy);     /* S379 */
-	tw_pct(out, "link_warn_pct", A.al.link_warn);        /* S465 */
+	tw_pct(out, "epoll_busy_pct", A.al.epoll_busy);
+	tw_pct(out, "link_warn_pct", A.al.link_warn);
 	tw_pct(out, "link_crit_pct", A.al.link_crit);
 	pc_tw_end(out);
 	pc_tw_end(out);
-	/* S352c: where this node's own alerts go - "this node", "node N"
-	 * (relayed to the elected mailer) or "none"; and the node that mails
-	 * the fleet's events, 0 = none */
+	/* where this node's own alerts go - "this node", "node N" (relayed to the elected mailer)
+	 * or "none"; and the node that mails the fleet's events, 0 = none */
 	if (pc_mail_ready())
 		snprintf(mw, sizeof mw, "this node");
 	else if (A.mailer > 0 && !A.mailer_self)
@@ -2680,7 +2665,7 @@ void pc_alerts_stats_tree(struct pc_tw *out)
 		pc_tw_str(out, e->text);
 		pc_tw_key(out, "mail");
 		pc_tw_str(out, e->mail[0] ? e->mail : "-");
-		pc_tw_key(out, "from_node");           /* S352c: 0 = this node's */
+		pc_tw_key(out, "from_node");           /* 0 = this node's */
 		pc_tw_i64(out, e->from);
 		pc_tw_end(out);
 	}

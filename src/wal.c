@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * wal.c — the write-ahead log (task S13).  See wal.h for the contract
- * and the on-disk format.
- */
+/* wal.c - the write-ahead log; the contract and on-disk format are in wal.h */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,22 +12,22 @@
 #include <sys/stat.h>
 #include <sys/eventfd.h>
 #include <sys/statvfs.h>
-#include <pthread.h>                    /* S466 step 2: the grower */
+#include <pthread.h>                    /* the segment grower thread */
 
 #include "compat/dprint.h"
 #include "compat/pt.h"
 #include "compat/timer.h"
-#include "winctr.h"                     /* S351 */
+#include "winctr.h"
 #include "walprobe.h"
 #include "wal.h"
-#include "store.h"                      /* G5: pc_store_durable_name */
+#include "store.h"                      /* pc_store_durable_name */
 #include "walring.h"
 #include "daemon.h"                       /* pc_worker_id() */
 #include "rdb.h"                        /* safe marker + save request */
 #include "core/pcache_arena.h"          /* PCACHE_CELL_MAX: the record ceiling */
-#include "core/pcache_htable.h"         /* S240: pcache_last_del_ver */
-#include "resident.h"                   /* S265 */
-#include <sys/mman.h>                   /* S265: mlock */
+#include "core/pcache_htable.h"         /* pcache_last_del_ver */
+#include "resident.h"
+#include <sys/mman.h>                   /* mlock */
 #include "walfmt.h"                     /* the record ceiling, LE fields */
 
 #define MAX_THREADS 520
@@ -64,89 +61,66 @@ static struct {
 	unsigned long long seq;           /* the global stamp */
 	unsigned long long appended, bytes, late, recycles, synced_seq,
 		pending_hi;
-	/* 12ny AT-3b: the lowest and highest seq a full ring dropped - never
-	 * cleared, read against the last snapshot's marker */
+	/* the lowest and highest seq a full ring dropped - never cleared, read
+	 * against the last snapshot's marker */
 	unsigned long long drop_lo, drop_hi;
-	/* fixed-size ring accounting: the files ARE all the space there
-	 * will ever be (no on-the-fly resize - a grow would stall the
-	 * workers), so "free" = segments whose records sit at or below
-	 * the last COMPLETED snapshot marker, and FULL = the pump must
-	 * overwrite one that is not free (those records stop being
-	 * replayable).  Warn near full, error+count at full; both kick a
-	 * snapshot, which is what frees space. */
+	/* a segment is free once its records sit at or below the last COMPLETED
+	 * snapshot marker; FULL = the pump must overwrite one that is not */
 	unsigned long long *seg_first, *seg_last;  /* per segment, by idx */
 	uint32_t *seg_gen;
-	/* CONTROL: our pg_control.  The spans above used to live only here
-	 * in RAM, so after a restart every one of them read zero, seg_hot()
-	 * answered "cold" for every segment and the rule this comment
-	 * describes was not enforced at all.  Both sides of the comparison
-	 * have to survive a restart - PostgreSQL keeps the REDO point in
-	 * pg_control, RocksDB keeps per-log bounds in the MANIFEST.  Written
-	 * at activation and rotation only, which already pay an fdatasync;
-	 * NEVER on the append path. */
+	/* CONTROL keeps the spans above across a restart (like pg_control),
+	 * written only at activation and rotation - never on the append path */
 	int ctrl_fd;
-	/* observed fsync cost - the pump is the only writer, stats the only
-	 * reader, so plain longs are enough (a torn read reports a slightly
-	 * stale mean, never a wrong decision) */
+	/* observed fsync cost: the pump writes, stats reads - plain longs, as a
+	 * torn read only reports a slightly stale mean */
 	unsigned long long fsync_n, fsync_us_sum, fsync_us_max;
 	unsigned long long fsync_ewma_us;   /* recent cost, 1/8 weight */
-	struct pc_winmax fsync_wmax;        /* S351: worst of the last 5 min */
+	struct pc_winmax fsync_wmax;        /* worst of the last 5 min */
 	int probe_warned;
 	unsigned long long overruns;
 	int free_segs;
 	int pressure_warned;
-	/* S224: how fast the ring fills - an EWMA of the seconds one segment
-	 * takes, measured rotation to rotation (0 = not measured yet) - and
-	 * whether the rate trigger has said so this episode */
+	/* fill rate: an EWMA of the seconds one segment takes, rotation to
+	 * rotation (0 = unmeasured), and whether the rate trigger said so */
 	long long rot_last_us;
 	double seg_ewma_s;
 	int rate_warned;
-	long long sizing_warned_us;        /* RV-13: last "cannot keep up" */
+	long long sizing_warned_us;        /* last "cannot keep up" warning */
 	int dropped_any;               /* has this WAL ever dropped? */
 	int shed;                      /* already taken out of service */
-	/* S229: healing - see wal_heal_step() */
+	/* healing - see wal_heal_step() */
 	int healing, heal_gave_up;
 	long long heal_t0_us, heal_req_us, last_heal_ms;
 	unsigned long long heal_mark, heal_err0, heals;
-	/* S306 step 3: when the last HEAL_RING heals ended (monotonic ms,
-	 * a ring - so heals_recent counts honestly up to 64, not up to the
-	 * threshold), and when routine healing was last said */
+	/* when the last HEAL_RING heals ended (monotonic ms; a ring, so
+	 * heals_recent counts to 64), and when routine healing was said */
 	long long heal_end_ms[64];
 	long long heal_routine_said_ms;
-	int failed;                    /* S215: the device refused a write or
-	                                * a sync; sticky, nothing is appended
-	                                * or synced after it */
+	int failed;                    /* the device refused a write or sync:
+	                                * sticky; no append or sync after it */
 	int failed_errno;
 	unsigned long long ctrl_errors;
-	/* a ring drop is a write the CLIENT was told succeeded that will
-	 * not be in the WAL.  It was counted and nothing else - a counter
-	 * nobody reads is not a signal, so the pump shouts as well.  The
-	 * shout lives here and not at the drop site: that site is the
-	 * worker's hot path, and logging per drop under the load that
-	 * causes drops would be worse than the drops. */
+	/* ring drops are logged by the pump, not at the drop site: that is the
+	 * worker's hot path, and logging per drop would deepen the overload */
 	unsigned long long dropped_reported;
 	long long drop_log_us;
-	/* S265: the pump's stage buffer, made at init with the rings so
-	 * both are resident (and, with the arena, locked) from the start */
+	/* the pump's stage buffer, made at init with the rings so both are
+	 * resident (and, with the arena, locked) from the start */
 	unsigned char *stage;
 	size_t stage_cap;
 	int pin;                          /* lock the buffers (arena is) */
 	unsigned long long locked_bytes;  /* 0 = not locked */
 	int lock_errno;
-	/* S456: fsync = always waits on a full ring instead of dropping */
+	/* fsync = always waits on a full ring instead of dropping */
 	int pump_w, pump_gone;            /* the pump's ring; drain over */
 	unsigned long long ring_waits, ring_wait_us;
-	/* S466: on_full = heal keeps S229's drop-then-heal; the workers'
-	 * slots (0 = every thread) wait unbounded; the pump's wait for a free
-	 * segment - when it began (0 = none), the last urgent request */
+	/* on_full = heal drops, then heals; workers' slots (0 = every thread)
+	 * wait unbounded; the pump's wait for a segment: start, last ask */
 	int on_full_heal, work_lo, work_hi, full_gave_up, full_hot;
 	long long full_t0_us, full_req_us;
 	unsigned long long full_waits, full_wait_us;
-	/* S466 step 2: the ring follows the load, from nseg_min (the
-	 * configured floor, always kept) up to nseg_max.  cur is the active
-	 * slot.  A slot is provisioned off the pump by grow_main and adopted
-	 * at the pump's next pass (grow_req / grow_done: the slot + 1);
-	 * low_since_us times the quiet that retires one again */
+	/* the ring grows nseg_min..nseg_max: grow_main provisions a slot off
+	 * the pump, adopted at its next pass (grow_req/grow_done = slot + 1) */
 	int nseg_min, nseg_max, cur;
 	int grow_req, grow_done, grow_err, grow_stop, grow_thr_on;
 	long long grow_after_us, low_since_us, shrink_us;
@@ -184,8 +158,8 @@ static int seg_write_header(int fd, uint32_t gen)
 	return 0;
 }
 
-/* provision one segment: REAL zero writes end to end - fallocate does
- * not provision thin/sparse/COW backends, a write does (DESIGN par 7) */
+/* provision one segment with real zero writes: fallocate does not
+ * provision thin/sparse/COW backends, a write does */
 static int seg_provision(int idx)
 {
 	char path[512], *z;
@@ -205,12 +179,8 @@ static int seg_provision(int idx)
 		ssize_t n = write(fd, z, left > (1 << 20) ? (1 << 20) : (size_t)left);
 
 		if (n <= 0) {
-			/* Leave NOTHING behind.  The usual reason to be here
-			 * is ENOSPC, and a partial segment would hold the
-			 * space it already took after the daemon exits - so a
-			 * refused start would leave the filesystem full for
-			 * everything else on it, and a supervisor's retry
-			 * would re-fill whatever had been freed. */
+			/* leave nothing behind: on ENOSPC a partial segment
+			 * would keep its space after the refused start */
 			int e = errno;
 
 			free(z);
@@ -229,24 +199,14 @@ static int seg_provision(int idx)
 	close(fd);
 	return 0;
 }
-/* CONTROL is written by the activation below; defined with the rest
- * of the control-file handling further down. */
 static void ctrl_write(void);
 
-/* defined with the rest of the shed handling further down */
 static void wal_shed_once(int why);
 static void wal_storage_failed(const char *what, int err);
 static int wal_can_heal(void);
 
-/* Every fdatasync goes through here: it stamps the in-flight marker the
- * hang watchdog reads, and records what the call actually cost.  The
- * cost is the point - the startup probe cannot see past a write-back
- * cache, and this is the only measurement taken while the daemon is
- * under its real load.
- *
- * S215: and it returns what the device ANSWERED, with errno kept across
- * the timing code.  It returned void, and four callers moved the durable
- * watermark behind it whatever had happened. */
+/* every fdatasync goes through here: it stamps the marker the hang
+ * watchdog reads and records the cost under real load, errno kept */
 static int wal_fdatasync_timed(long long now)
 {
 	long long dur;
@@ -264,9 +224,8 @@ static int wal_fdatasync_timed(long long now)
 	if ((unsigned long long)dur > W.fsync_us_max)
 		W.fsync_us_max = (unsigned long long)dur;
 	pc_winmax_note(&W.fsync_wmax, get_ticks(), (unsigned long long)dur);
-	/* EWMA, 1/8 weight: tracks what fsync costs NOW.  The lifetime
-	 * mean above cannot notice a device degrading - a cache that
-	 * fills after an hour of fast syncs is averaged into silence. */
+	/* EWMA, 1/8 weight: what fsync costs now - the lifetime mean cannot
+	 * notice a device degrading */
 	W.fsync_ewma_us = W.fsync_ewma_us ?
 		(W.fsync_ewma_us * 7 + (unsigned long long)dur) / 8 :
 		(unsigned long long)dur;
@@ -274,24 +233,8 @@ static int wal_fdatasync_timed(long long now)
 	return rc;
 }
 
-/*
- * S215: the ONE place the durable watermark moves.  Sync, and only when
- * the device says yes, advance - the always arm, the everysec arm, the
- * sync barrier and shutdown each did both halves themselves, and none of
- * them looked at the first.
- *
- * A refusal is never retried.  After a failed fsync Linux marks the
- * dirty pages clean and reports the error once, so a second fdatasync
- * on this descriptor can return 0 having written nothing (the 2018
- * PostgreSQL finding): carrying on would turn a loss the kernel REPORTED
- * into one nobody will ever hear about.  So the first refusal fails the
- * node, W.failed is sticky, and the watermark stays where the device
- * last agreed to it for the rest of this process's life.
- *
- * @claim 0 is the rotation's sync: it runs BETWEEN a record taking its
- * place in pending_hi and that record being appended, so it has the
- * same duty to stop on a refusal and no right to move the watermark.
- */
+/* the only place the durable watermark moves, on the device's yes (not
+ * for @claim 0, the rotation's); a refusal fails the node, never retried */
 static int wal_sync_commit(long long now, int claim)
 {
 	if (W.failed)
@@ -327,7 +270,7 @@ static int seg_activate(int idx, uint32_t gen)
 		close(W.fd);
 	W.fd = fd;
 	W.gen = gen;
-	W.cur = idx;                       /* S466 step 2 */
+	W.cur = idx;
 	W.off = PC_WAL_HDR;
 	if (W.seg_first) {
 		W.seg_first[idx] = W.pending_hi + 1;
@@ -340,11 +283,8 @@ static int seg_activate(int idx, uint32_t gen)
 }
 
 /* ---- CONTROL: the durable half of the recycling rule ------------------- */
-/* Fixed-size, single-pwrite, CRC-checked.  A torn or absent CONTROL is
- * not an error: the spans read as unknown, every segment is then judged
- * hot, and that is the conservative direction - an old WAL directory
- * still starts.  Layout: magic, fmt, crc(of everything from nseg on),
- * nseg, next_seq, then {gen, pad, first, last} per segment. */
+/* single pwrite, CRC-checked: a torn or absent CONTROL reads as unknown,
+ * so every segment is judged hot - the conservative direction */
 #define PC_WAL_CTRL_MAGIC 0x50435743u          /* "PCWC" */
 #define PC_WAL_CTRL_FMT   1u
 #define CTRL_HDR  24
@@ -395,12 +335,8 @@ static void ctrl_write(void)
 			strerror(errno));
 		return;
 	}
-	/* S215: checked, logged and counted - and NOT a node failure, which
-	 * is deliberate.  CONTROL is rewritten WHOLE at offset 0 each time,
-	 * so the next write re-dirties every page of it and the next sync
-	 * speaks for all of it: the one case where trying again is sound.
-	 * And a stale or torn CONTROL has a safe reading - ctrl_read()
-	 * answers 0 and recovery falls back to scanning. */
+	/* not a node failure: CONTROL is rewritten whole, so the next sync
+	 * covers all of it, and a torn one only sends recovery to the scan */
 	if (fdatasync(W.ctrl_fd) != 0) {
 		W.ctrl_errors++;
 		LM_ERR("wal: CONTROL sync failed (%s) - the recycling rule "
@@ -409,9 +345,8 @@ static void ctrl_write(void)
 	}
 }
 
-/* S466 step 2: whatever count the file records (the ring grows and
- * shrinks) - @gen/@first/@last hold WAL_SEG_CAP entries, *@n gets the
- * count; returns the recorded sequence, or 0 for absent/torn */
+/* @gen/@first/@last hold WAL_SEG_CAP entries, *@n gets the recorded count;
+ * returns the recorded sequence, or 0 for absent/torn */
 static unsigned long long ctrl_read(const char *dir, int *n, uint32_t *gen,
 		unsigned long long *first, unsigned long long *last)
 {
@@ -451,11 +386,6 @@ static unsigned long long ctrl_read(const char *dir, int *n, uint32_t *gen,
 	return seq;
 }
 
-/* Read the sequence before the WAL exists.  The post-recovery
- * checkpoint records "the WAL sequence at walk start" as its marker,
- * and it runs BEFORE pc_wal_init(), so without this it stamps 0 - which
- * a slow-storage run showed in 11 of 12 snapshots, making all 12
- * restarts replay the whole WAL. */
 void pc_wal_fsync_observed(struct pc_wal_fsync_obs *out)
 {
 	const struct pc_wal_probe *pp = pc_wal_probe_result();
@@ -463,7 +393,7 @@ void pc_wal_fsync_observed(struct pc_wal_fsync_obs *out)
 	memset(out, 0, sizeof *out);
 	out->fsync_n = W.fsync_n;
 	out->max_us = W.fsync_us_max;
-	out->sum_us = W.fsync_us_sum;                               /* S351 */
+	out->sum_us = W.fsync_us_sum;
 	out->win_max_us = pc_winmax_get(&W.fsync_wmax, get_ticks());
 	out->avg_us = W.fsync_n ? W.fsync_us_sum / W.fsync_n : 0;
 	out->recent_us = W.fsync_ewma_us;
@@ -473,22 +403,20 @@ void pc_wal_fsync_observed(struct pc_wal_fsync_obs *out)
 		out->recent_us >= out->probe_p50_us * 4;
 }
 
+/* the post-recovery checkpoint runs before pc_wal_init() and stamps the
+ * WAL sequence as its marker, so the sequence is read from CONTROL first */
 void pc_wal_preload_seq(const char *dir, int segments)
 {
 	int n;
 	unsigned long long s = ctrl_read(dir, &n, NULL, NULL, NULL);
 
-	(void)segments;                    /* S466 step 2: the file's count */
+	(void)segments;                    /* CONTROL's count rules */
 	if (s > W.seq)
 		W.seq = s;
 }
 
-/* CONTROL is only rewritten where a sync is already being paid - at
- * activation, at rotation and at shutdown - so between those points it
- * is a LOWER BOUND, exactly like PostgreSQL's pg_control between
- * checkpoints.  The replay is what moves it forward: RocksDB likewise
- * recovers its sequence by reading the log, not from the MANIFEST.
- * Call with the highest sequence recovery saw, before the checkpoint. */
+/* CONTROL's sequence is a lower bound between rotations; the replay moves
+ * it forward - call with the highest seq recovery saw, before the checkpoint */
 void pc_wal_seq_atleast(unsigned long long seq)
 {
 	if (seq > W.seq)
@@ -506,9 +434,8 @@ static int seg_hot(int i, unsigned long long marker)
 		last > marker;
 }
 
-/* S466 step 2: the slot to activate next - the oldest generation among
- * the ring's slots other than the active one, a slot never used (gen 0)
- * first; in a fixed ring that is (gen + 1) % nseg, as it always was */
+/* the slot to activate next: the oldest generation other than the active
+ * slot, a never-used one (gen 0) first - in a fixed ring, (gen + 1) % nseg */
 static int next_slot(void)
 {
 	int i, best = -1;
@@ -522,8 +449,8 @@ static int next_slot(void)
 	return best < 0 ? 0 : best;
 }
 
-/* S466 step 2: a slot is provisioned here, off the pump - zero-writing
- * one takes seconds on a disk, and the pump must keep draining */
+/* a slot is provisioned here, off the pump - zero-writing one takes
+ * seconds on a disk, and the pump must keep draining */
 static void *grow_main(void *a)
 {
 	struct timespec ts = { 0, 50000000 };
@@ -545,9 +472,8 @@ static void *grow_main(void *a)
 	return NULL;
 }
 
-/* S466 step 2: at a rotation - ask for a slot when the log is half full,
- * or when its free segments would last under three snapshots at the
- * current rate; never past the cap, nor into the WAL's last free space */
+/* at a rotation, ask for a slot when the log is half full or its free
+ * segments last under three snapshots; never past the cap or the disk's room */
 static void grow_check(void)
 {
 	struct pc_rdb_stats rs;
@@ -579,8 +505,8 @@ static void grow_check(void)
 	__atomic_store_n(&W.grow_req, W.nseg + 1, __ATOMIC_RELEASE);
 }
 
-/* S466 step 2: each pump pass - a slot grow_main has provisioned joins the
- * ring (a new slot's generation 0 makes it the next one used) */
+/* each pump pass: a slot grow_main has provisioned joins the ring (a new
+ * slot's generation 0 makes it the next one used) */
 static void grow_adopt(void)
 {
 	int want = __atomic_load_n(&W.grow_req, __ATOMIC_ACQUIRE), idx, err;
@@ -610,15 +536,8 @@ static void grow_adopt(void)
 	__atomic_store_n(&W.grow_done, 0, __ATOMIC_RELEASE);
 }
 
-/* S466 step 2: once a second - after shrink_us with the floor's worth of
- * segments enough (no more than half of nseg_min hot), one slot goes,
- * then one more every 10 s while the quiet holds; above the cap (a
- * lowered configuration) without the wait.  What goes is a COLD slot -
- * every record in it below the last snapshot's marker - other than the
- * active one; the top slot's file is renamed onto it (an open descriptor
- * follows the rename) so the slots stay 0..nseg-1.  A crash between the
- * steps loses nothing: recovery reads every segment file by its header's
- * generation, whatever its name, and checkpoints */
+/* after shrink_us of quiet a cold slot goes, then one per 10 s, the top file
+ * renamed onto it; a crash between is safe - recovery goes by headers */
 static void shrink_check(long long now)
 {
 	unsigned long long marker;
@@ -659,9 +578,8 @@ static void shrink_check(long long now)
 	if (k != top) {
 		seg_path(tpath, sizeof tpath, top);
 		if (rename(tpath, path) != 0) {
-			/* k is gone and the top stays: k is provisioned again
-			 * (it was cold - nothing lost), or a rotation onto it
-			 * would find no file */
+			/* k is gone, the top stays: provision k again (it was
+			 * cold), or a rotation onto it would find no file */
 			LM_WARN("wal: cannot move %s onto %s (%s) - provisioning "
 				"%s again\n", tpath, path, strerror(errno), path);
 			if (seg_provision(k) != 0)
@@ -695,18 +613,14 @@ static int seg_rotate(void)
 {
 	int idx;
 
-	/* fsync what the old generation holds before moving on - counted
-	 * like every other, a rotation sync costs what the device costs.
-	 * S215: and a refused one stops the rotation - closing a generation
-	 * the device did not take, and recycling a segment behind it, is
-	 * the same lie as moving the watermark. */
+	/* sync the old generation first; a refusal stops the rotation, as
+	 * recycling behind it would lose what the device did not take */
 	if (wal_sync_commit(wall_now_us(), 0) != 0)
 		return -1;
 
 	{
-		/* S224: one rotation = one segment filled, so the interval
-		 * between rotations IS the fill rate.  Smoothed, because one
-		 * burst should not look like a trend. */
+		/* one rotation = one segment filled, so the interval is
+		 * the fill rate - smoothed, so a burst is not a trend */
 		long long now = wall_now_us();
 
 		if (W.rot_last_us) {
@@ -728,8 +642,6 @@ static int seg_rotate(void)
 			/* FULL: every segment holds un-snapshotted records -
 			 * this overwrite makes seqs %llu..%llu unreplayable */
 			W.overruns++;
-			/* S466: say what the node then does - it heals where
-			 * it can (S229), and the line used to say FAILED */
 			LM_CRIT("wal: FULL - no free segment: overwriting "
 				"segment %d (seqs %llu..%llu, NEWER than the "
 				"last completed snapshot marker %llu); those "
@@ -748,12 +660,8 @@ static int seg_rotate(void)
 			/* an already-running save returns 1 - that IS the
 			 * goal, so the return is honestly ignorable */
 			pc_rdb_request_save();
-			/* Same event as a ring drop: acknowledged writes that
-			 * will not be there after a restart.  The decree in
-			 * DESIGN section 7 - overwrite and count it - predates
-			 * the rule that a drop FAILS the node, and kept the
-			 * struggling node in service destroying data while
-			 * healthy peers waited on it. */
+			/* the same loss as a ring drop: acknowledged
+			 * writes that a restart will not bring back */
 			wal_shed_once(PC_WAL_SHED_LOSS);
 		} else if (!have_rdb) {
 			LM_INFO("wal: recycling segment %d for generation %u "
@@ -761,18 +669,8 @@ static int seg_rotate(void)
 				"ring)\n", idx, W.gen + 1);
 		}
 	}
-	/*
-	 * S224: THE PRESSURE, AT EVERY ROTATION - NOT ONLY ONCE THE RING HAS
-	 * WRAPPED.  Both triggers used to live inside the wrap branch above,
-	 * so on the first lap round a fresh ring nothing counted the free
-	 * segments at all, and a node with `save = off` (or rules slower than
-	 * its write rate) reached its first wrap with every segment hot and
-	 * overran on the spot - FAILED - without either trigger having had a
-	 * chance.  Measured: the rate trigger firing for the first time at the
-	 * wrap with three segments left, a snapshot needing more than that,
-	 * overrun.  A segment never written is not hot (seg_hot wants a first
-	 * seq), so counting every rotation is right on the first lap too.
-	 */
+	/* counted at every rotation, not only after a wrap, or the first lap
+	 * overruns unwarned; a never-written segment is not hot */
 	if (pc_rdb_dir()[0] != 0) {
 		unsigned long long marker = pc_rdb_safe_marker();
 		int i, hot = 0;
@@ -796,22 +694,8 @@ static int seg_rotate(void)
 		} else if (W.free_segs * 2 >= W.nseg) {
 			W.pressure_warned = 0;
 		}
-		/*
-		 * S224: THE RATE TRIGGER, beside the fixed quarter.
-		 *
-		 * A snapshot frees only segments below the marker it
-		 * STARTED at; everything written while it runs lands
-		 * above that marker.  So it has to begin while the free
-		 * space outlasts it: free segments x seconds per segment
-		 * against the last snapshot's measured duration, with
-		 * twice that as the margin - the next one can be slower,
-		 * the table having grown.  The quarter alone fires too
-		 * late by construction on a fleet whose snapshot takes
-		 * longer than its last quarter of WAL takes to fill, and
-		 * nothing said so.  Asked again at every rotation while
-		 * it holds: sustained pressure wants snapshots back to
-		 * back, and a request during a running save is a no-op.
-		 */
+		/* rate trigger: a snapshot frees only what predates its
+		 * start; begin it while free space outlasts twice the last */
 		if (W.seg_ewma_s > 0) {
 			struct pc_rdb_stats rs;
 			double full_in_ms = W.free_segs * W.seg_ewma_s * 1000;
@@ -835,26 +719,14 @@ static int seg_rotate(void)
 			} else if (full_in_ms >= 4.0 * (double)rs.last_dur_ms) {
 				W.rate_warned = 0;
 			}
-			/*
-			 * RV-13: the case no trigger can help.  A snapshot frees
-			 * only what was written before it began, so if the last one
-			 * took longer than the WHOLE ring takes to fill at the
-			 * current rate, then however early it starts the ring fills
-			 * before it lands: an overrun, and a heal (S229), again and
-			 * again.  Measured on a 64 MB/s snapshot writer: an armed
-			 * rate trigger fired with 4 segments free and the node still
-			 * overran.  That is sizing, so say so - at most every ten
-			 * minutes, with both figures and the three fixes.
-			 */
+			/* sizing, not a trigger: a snapshot slower than the
+			 * whole ring's fill time can never land in time */
 			{
 				double ring_ms = W.nseg * W.seg_ewma_s * 1000;
 				long long now_us = wall_now_us();
 
-				/* the first one always: this clock counts from
-				 * BOOT, so "ten minutes since 0" silenced it on
-				 * any host up less than ten minutes - every fresh
-				 * CI runner, and a node on a fresh VM (GitHub's
-				 * walsizetest, rc38 and rc39) */
+				/* the first always: the clock counts from boot,
+				 * so a 10 min gap from 0 hid it on new hosts */
 				if (rs.last_dur_ms > 0 && (double)rs.last_dur_ms > ring_ms &&
 				        (!W.sizing_warned_us ||
 				         now_us - W.sizing_warned_us >= 600LL * 1000000)) {
@@ -876,7 +748,7 @@ static int seg_rotate(void)
 		}
 	}
 	if (pc_rdb_dir()[0] != 0)
-		grow_check();                  /* S466 step 2 */
+		grow_check();
 	return seg_activate(idx, W.gen + 1);
 }
 
@@ -897,7 +769,7 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	snprintf(W.dir, sizeof W.dir, "%s", dir);
 	W.mode = mode;
 	W.seg_bytes = (long long)segment_mb << 20;
-	/* S466 step 2: the slots for a ring that may grow to the cap */
+	/* the slots for a ring that may grow to the cap */
 	W.nseg_min = segments;
 	if (W.nseg_max < segments)
 		W.nseg_max = segments;
@@ -911,9 +783,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	W.cur = -1;
 	W.fd = -1;
 	W.ctrl_fd = -1;
-	/* resume, do not restart: the sequence is what every marker and
-	 * every span is expressed in, so numbering from 1 again after a
-	 * restart makes all of them incomparable */
+	/* resume the sequence: every marker and span is in it, so numbering
+	 * from 1 after a restart would make them incomparable */
 	{
 		int nrec;
 		unsigned long long c = ctrl_read(dir, &nrec, W.seg_gen,
@@ -921,10 +792,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 
 		if (c > W.seq)          /* never below what the replay saw */
 			W.seq = c;
-		/* S466 step 2: a ring that grew keeps its slots; a segment file
-		 * past the recorded count with a header is one (a stale
-		 * CONTROL) - one without is a provisioning that was cut
-		 * short, removed */
+		/* a file past the recorded count with a header is a slot (stale
+		 * CONTROL); one without is a cut-short provisioning, removed */
 		W.nseg = segments > nrec ? segments : nrec;
 		for (i = W.nseg; i < WAL_SEG_CAP; i++) {
 			unsigned char h[PC_WAL_HDR];
@@ -947,19 +816,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 		W.free_segs = W.nseg;
 	}
 	W.pending_hi = W.synced_seq = W.seq;
-	/* S438: a span CONTROL holds OPEN (last 0) is the segment that was
-	 * active when the previous process stopped without a shutdown -
-	 * killed, crashed, the power gone; a clean stop closes it
-	 * (pc_wal_shutdown).  No segment is active yet, and a rotation only
-	 * closes the one it leaves, so nothing ever closed it: seg_hot() read
-	 * its last record as the live high-water, newer than any snapshot,
-	 * for good - it never counted free, and one lap later its recycle was
-	 * an "overrun" of records a snapshot had long covered, the node FAILED
-	 * until S229 healed it (245, 2026-10-23 22:32:07: "overwriting segment
-	 * 0 (seqs 12094314..0, NEWER than the last completed snapshot marker
-	 * 14019756)").  Its records all predate this start, and the replay
-	 * read every one (pc_wal_seq_atleast), so the resumed sequence bounds
-	 * them; one opened and never written to holds none. */
+	/* a span left OPEN (last 0) was active at a stop without a shutdown and
+	 * nothing else closes it; the resumed seq bounds its records */
 	{
 		int open_n = 0;
 
@@ -981,29 +839,24 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	if (nthreads > MAX_THREADS)
 		return -1;
 	for (i = 0; i < nthreads; i++) {
-		/* S266: a ring per thread, sized by what the thread writes -
-		 * the caller knows which slot is which; NULL = all ring_kb */
+		/* a ring per thread, sized by what the thread writes - the
+		 * caller knows which slot is which; NULL = all ring_kb */
 		W.rings[i].size = (uint32_t)(ring_kb_of && ring_kb_of[i] > 0
 			? ring_kb_of[i] : ring_kb) << 10;
 		W.rings[i].buf = malloc(W.rings[i].size);
 		if (!W.rings[i].buf)
 			return -1;
-		/* S265: touch it now.  A ring this size is its own lazily
-		 * faulted mapping, so its pages became resident only as the
-		 * head first passed them: RSS rose with every byte logged
-		 * until each ring had wrapped once - ~0.7 MB/h on the test
-		 * fleet, a soak "leak" after every restart.  Resident from the
-		 * start, the node's RSS says what it will cost. */
+		/* touched now, so RSS shows the ring's full cost from
+		 * the start rather than a slow 'leak' until it wraps */
 		pc_touch_pages(W.rings[i].buf, W.rings[i].size);
 	}
 	W.stage_cap = 4u << 20;
-	W.stage = malloc(2 * W.stage_cap);        /* S466: and the write buffer after it */
+	W.stage = malloc(2 * W.stage_cap);        /* and the write buffer after it */
 	if (!W.stage)
 		return -1;
 	pc_touch_pages(W.stage, 2 * W.stage_cap);
-	/* S265: with the arena locked, the WAL's buffers are locked too -
-	 * all of them or none.  What a failure means (refuse, or unlock the
-	 * arena as well) is the daemon's call; this only reports it. */
+	/* with the arena locked, the WAL's buffers are too - all or none;
+	 * what a failure means is the daemon's call, this only reports it */
 	if (W.pin) {
 		unsigned long long want = 2 * W.stage_cap;
 		int j, ok = mlock(W.stage, 2 * W.stage_cap) == 0;
@@ -1021,10 +874,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 				(void)munlock(W.rings[j].buf, W.rings[j].size);
 		}
 	}
-	/* S174: a record larger than the ring can never be written to it -
-	 * it is dropped and shouted about at ~1 Hz, but by then the client
-	 * has its OK.  Small rings are deliberate (the drop test pins one
-	 * at 64 KB), so this is said at startup rather than refused. */
+	/* a record larger than the ring is dropped after its client got OK;
+	 * small rings are deliberate, so this warns rather than refuses */
 	if ((long)ring_kb * 1024 <= MAX_REC)
 		LM_WARN("wal: ring_kb = %d holds %ld KB, less than one maximum "
 			"record (%ld KB) - a write larger than about %ld KB is "
@@ -1044,14 +895,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 				strerror(errno));
 	}
 
-	/* Is there room, BEFORE writing a single byte?  Provisioning is
-	 * real zero writes (fallocate does not commit thin/sparse/COW
-	 * backends), so without this the check IS the write: the daemon
-	 * fills the filesystem, then discovers it cannot finish.  Count
-	 * only the segments actually missing - a restart re-provisions
-	 * nothing - and ask for a little headroom, because the rdb shares
-	 * this volume and a WAL that exactly fits leaves no room for the
-	 * snapshot that makes it recyclable. */
+	/* check for room before writing a byte: provisioning is real writes,
+	 * so without this the daemon fills the filesystem, then fails */
 	{
 		struct statvfs vfs;
 		long long need = 0;
@@ -1082,7 +927,7 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	}
 
 	/* provision missing segments; find the highest existing gen so a
-	 * restart continues the generation sequence (replay is S15's) */
+	 * restart continues the generation sequence */
 	for (i = 0; i < W.nseg; i++) {
 		seg_path(path, sizeof path, i);
 		if (stat(path, &st) != 0 || st.st_size != W.seg_bytes) {
@@ -1100,9 +945,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 			if (fd >= 0) {
 				if (read(fd, h, sizeof h) == (ssize_t)sizeof h &&
 				        r32(h) == PC_WAL_MAGIC) {
-					/* S466 step 2: next_slot() reads the
-					 * generations - from the headers where
-					 * CONTROL had none */
+					/* next_slot() reads the generations;
+					 * headers fill in what CONTROL lacks */
 					if (!W.seg_gen[i])
 						W.seg_gen[i] = r32(h + 4);
 					if (r32(h + 4) >= best_gen) {
@@ -1116,14 +960,10 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	}
 	(void)start_idx;
 	{
-		int idx = next_slot();             /* S466 step 2 */
+		int idx = next_slot();
 
-		/* Until CONTROL existed this path could not ask: the spans
-		 * were per-process, so on a restart it claimed the next slot
-		 * round-robin and the fifth start overwrote what the first
-		 * had written.  It was safe only because daemon.c checkpoints
-		 * before calling us - an invariant held by call order rather
-		 * than by the rule.  Now it is held by the rule. */
+		/* enforced here by the rule, not only by daemon.c
+		 * checkpointing before calling us */
 		if (pc_rdb_dir()[0] != 0 && seg_hot(idx, pc_rdb_safe_marker())) {
 			W.overruns++;
 			LM_CRIT("wal: FULL at startup - segment %d still holds "
@@ -1144,7 +984,7 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	}
 	W.enabled = 1;
 	W.last_fsync_us = wall_now_us();
-	{                                       /* S466 step 2 */
+	{
 		const char *e = getenv("PERFCACHED_WAL_SHRINK_S");
 
 		W.shrink_us = (e && atoi(e) > 0 ? atoi(e) : 300) * 1000000LL;
@@ -1217,11 +1057,8 @@ int pc_wal_tight(int resume)
 
 static __thread unsigned char *scratch;
 
-/* S456, S466: a full ring waits for the pump rather than drop a write its
- * client is told succeeded - under every policy unless on_full = heal
- * (fsync = always waits regardless), never on the pump's ring.  A worker
- * waits as long as it takes; another thread PC_WAL_OTHER_WAIT_MS at most,
- * so a cluster thread is not held off its peers */
+/* a full ring waits instead of dropping (on_full = heal drops unless fsync =
+ * always); non-workers at most PC_WAL_OTHER_WAIT_MS, not to stall peers */
 static int ring_wait(struct ring *r, uint32_t need)
 {
 	struct timespec ts = { 0, 50000 };
@@ -1253,7 +1090,7 @@ static int ring_wait(struct ring *r, uint32_t need)
 	return 1;
 }
 
-/* 12ny AT-3b: a seq a full ring dropped - it holds a number, and the
+/* a seq a full ring dropped - it holds a number, and the
  * synced watermark passes over it */
 static void note_drop(unsigned long long seq)
 {
@@ -1270,9 +1107,8 @@ static void note_drop(unsigned long long seq)
 		;
 }
 
-/* the record's seq once it is in a ring (or dropped by a full one - see
- * note_drop); 0 when nothing is logged by design (no WAL, a cache
- * collection, no ring); PC_WAL_SEQ_NEVER when it could not be */
+/* the record's seq once in a ring (or dropped by a full one); 0 when
+ * nothing is logged by design, PC_WAL_SEQ_NEVER when it could not be */
 static unsigned long long produce(int type, const char *col, const char *key,
 		int klen, const char *val, int vlen, unsigned int expires_ticks,
 		unsigned long long ver, unsigned char flags)
@@ -1285,17 +1121,14 @@ static unsigned long long produce(int type, const char *col, const char *key,
 	int collen = (int)strlen(col);
 	unsigned long long seq = 0;
 
-	/* S215: after the device refused, nothing more goes to the rings -
-	 * the pump has stopped, and a ring left to fill would report the
-	 * node's own refusal as drops, once a second, for ever */
+	/* after the device refused nothing goes to the rings: the pump has
+	 * stopped, and a filling ring would report the refusal as drops */
 	if (!W.enabled)
 		return 0;
 	if (__atomic_load_n(&W.failed, __ATOMIC_ACQUIRE))
 		return PC_WAL_SEQ_NEVER;
-	/* G5: a cache collection's records never reach the WAL (its creates,
-	 * drops and renames still do - the collection set is the replay's).
-	 * One load while no collection is a cache.  AT-3b: nor does a
-	 * numbered delete's skip it - the replay needs its numbering */
+	/* a cache collection's records skip the WAL, not its creates, drops,
+	 * renames or numbered deletes - the replay needs those */
 	if (type != PC_WAL_T_COL_CREATE && type != PC_WAL_T_COL_DROP &&
 	    type != PC_WAL_T_COL_RENAME && type != PC_WAL_T_DEL_N &&
 	    !pc_store_durable_name(col, (size_t)collen))
@@ -1352,7 +1185,7 @@ static unsigned long long produce(int type, const char *col, const char *key,
 			p += 8;
 		}
 		if (hdr == 33u)
-			*p++ = flags;              /* S280: the record's type */
+			*p++ = flags;              /* the record's type */
 		memcpy(p, col, (size_t)collen);
 		p += collen;
 		memcpy(p, key, (size_t)klen);
@@ -1373,12 +1206,9 @@ static unsigned long long produce(int type, const char *col, const char *key,
 		}
 		if (free_ < need) {
 			r->dropped++;              /* on_full = heal, or a wait gave up */
-			note_drop(seq);            /* AT-3b */
-			/* S306: and wake the pump.  A full ring returned here
-			 * before the wake below, so once every ring was full no
-			 * producer woke a sleeping pump at all: it ran on its
-			 * own timeout, one batch per 20 ms (~150k rec/s on 222,
-			 * pc-wal 2/3 idle while the rings dropped). */
+			note_drop(seq);
+			/* wake the pump here too: with every ring full
+			 * nothing else wakes it, one batch per nap */
 			if (__atomic_load_n(&W.sleeping, __ATOMIC_ACQUIRE) &&
 			        W.wake_efd > 0)
 				if (write(W.wake_efd, &one, sizeof one) < 0) { /* best effort */ }
@@ -1396,7 +1226,7 @@ static unsigned long long produce(int type, const char *col, const char *key,
 		__atomic_store_n(&r->tail, tail + need, __ATOMIC_RELEASE);
 	}
 	if (pc_wal_wrote)
-		*pc_wal_wrote = 1;                 /* S466: its connection writes */
+		*pc_wal_wrote = 1;                 /* its connection writes */
 	if (__atomic_load_n(&W.sleeping, __ATOMIC_ACQUIRE) && W.wake_efd > 0)
 		if (write(W.wake_efd, &one, sizeof one) < 0) { /* best effort */ }
 	return seq;
@@ -1420,9 +1250,8 @@ void pc_wal_upsert_fl(const char *col, const char *key, int klen,
 
 void pc_wal_del(const char *col, const char *key, int klen)
 {
-	/* S240: with the version the remove just stamped under the lock -
-	 * every caller logs right after its remove, in the same thread, as
-	 * the upserts read pcache_last_ver */
+	/* with the version the remove just stamped under the lock: every
+	 * caller logs right after its remove, in the same thread */
 	{
 		unsigned char v[PC_WAL_DEL_VERLEN];
 
@@ -1438,7 +1267,7 @@ unsigned long long pc_wal_del_n(const char *col, const char *key, int klen,
 {
 	unsigned char v[PC_WAL_DELN_VLEN];
 
-	w64(v, ver);                       /* S240's, as a DEL's */
+	w64(v, ver);                       /* as a DEL's version */
 	w64(v + 8, oid);
 	w32(v + 16, incarn);
 	w64(v + 20, seq);
@@ -1463,9 +1292,8 @@ unsigned long long pc_wal_durable_seq(unsigned long long covered)
 	return s > covered ? s : covered;
 }
 
-/* S69: the collection set.  A create carries buckets_log2 as its single
- * value byte; both carry a placeholder key, because a record with no key
- * has no shape in this format. */
+/* a create carries buckets_log2 as its one value byte; both carry a
+ * placeholder key - a record with no key has no shape in this format */
 void pc_wal_col_create(const char *col, int buckets_log2)
 {
 	char bl = (char)buckets_log2;
@@ -1478,8 +1306,6 @@ void pc_wal_col_drop(const char *col)
 	produce(PC_WAL_T_COL_DROP, col, ".", 1, NULL, 0, 0, 0, 0);
 }
 
-/* S69: records written before this are logged under @from and records
- * after it under @to, so the replay must meet this record between them */
 void pc_wal_set_pin(int pin)
 {
 	W.pin = pin;
@@ -1507,6 +1333,8 @@ int pc_wal_enabled(void)
 	return W.enabled;
 }
 
+/* records before this are logged under @from and after it under @to, so
+ * the replay must meet this record between them */
 void pc_wal_col_rename(const char *from, const char *to)
 {
 	produce(PC_WAL_T_COL_RENAME, from, ".", 1, to, (int)strlen(to), 0, 0, 0);
@@ -1522,9 +1350,10 @@ void pc_wal_touch(const char *col, const char *key, int klen,
 /* ---- the WAL thread pump ----------------------------------------------- */
 
 struct batch_rec {
-	unsigned char *bytes;             /* full record incl. header */
-	uint32_t len;
+	uint32_t pos;                     /* the record's head in its ring */
+	uint32_t len;                     /* full record incl. header */
 	uint64_t seq;
+	int ring;
 };
 
 static int cmp_seq(const void *a, const void *b)
@@ -1535,36 +1364,15 @@ static int cmp_seq(const void *a, const void *b)
 }
 
 
-/*
- * The limit IS the limit: the first acknowledged write this node drops
- * marks it FAILED.
- *
- * Two softer rules were tried and both were wrong.  "N seconds in a
- * row" is defeated by the shape it most needs to catch - a ring that
- * fills, drains and fills again never strings N together, so an
- * oscillating WAL sheds writes in bursts for ever and never trips.  A
- * window ("3 of the last 10") survives that, but it still spends two
- * seconds of acknowledged data buying tolerance for a fault that has
- * already happened.
- *
- * There is no acceptable rate of losing acknowledged writes.  One is
- * the contract broken.  A node that does it is finished until an
- * operator has looked at it - and with a probe-sized ring or
- * fsync = everysec it should never happen at all, so if it does, the
- * blip is the symptom and not the excuse.
- */
+/* the first dropped acknowledged write sheds the node: a run of N seconds
+ * misses a ring that oscillates, and a window still spends acknowledged data */
 
-/* Set by the cluster layer so wal.c does not have to know about node
- * states; a build without a cluster simply keeps the default no-op and
- * still gets the CRIT. */
+/* set by the cluster layer so wal.c need not know node states; without a
+ * cluster the no-op stays and the CRIT is still logged */
 static void wal_shed_noop(int why) { (void)why; }
 static void (*W_shed_cb)(int) = wal_shed_noop;
 static void pc_wal_shed_cb(int why) { W_shed_cb(why); }
 
-/* A ring drop and a segment overrun are the SAME event wearing two
- * costumes: an acknowledged write that will not be there after a
- * restart.  Both take the node out of service, once - the caller has
- * already said which one it was and why. */
 static void wal_shed_noop_heal(int phase) { (void)phase; }
 static void (*W_heal_cb)(int) = wal_shed_noop_heal;
 static int W_heal_installed;
@@ -1587,24 +1395,8 @@ static unsigned long long wal_lost_total(void)
 	return d;
 }
 
-/*
- * S229: a LOSS - a ring drop or a segment overrun - heals, where it can.
- *
- * Every write path stores to the table FIRST and enqueues to the WAL
- * after, so a record the WAL lost is missing from the LOG, not from
- * memory: a snapshot that STARTS after the last loss captures it, and its
- * marker makes the WAL before it unnecessary.  So the node refuses writes
- * (HEALING - out of selection, still serving reads, still in the map, so
- * nothing re-shards), waits for the rings to drain, takes an unthrottled
- * snapshot, and returns to READY by itself once one that began after the
- * last loss has been PUBLISHED.  The operator's decision (DESIGN 12fx):
- * out of write service temporarily, not FAILED until a restart.
- *
- * It does not heal what a snapshot cannot: with no snapshot directory
- * there is nothing to heal from, and a device that refused a write (IO,
- * S215) is not a device to trust with the heal.  Both shed as before -
- * FAILED - and so does a heal whose snapshot fails.
- */
+/* a loss heals: the table still holds what the log lost, so the node refuses
+ * writes until a snapshot begun after it lands; no rdb dir or IO = FAILED */
 static int wal_can_heal(void)
 {
 	return W_heal_installed && !W.heal_gave_up && pc_rdb_dir()[0] != 0 &&
@@ -1633,10 +1425,9 @@ static void wal_shed_once(int why)
 	pc_wal_shed_cb(why);
 }
 
-/* the heal's steps, one per pump pass (WAL thread) */
 #define HEAL_RING ((int)(sizeof W.heal_end_ms / sizeof W.heal_end_ms[0]))
 
-/* S306 step 3: how many heals ended within the window (0..HEAL_RING) */
+/* how many heals ended within the window (0..HEAL_RING) */
 static int heals_recent(long long now_ms)
 {
 	int i, n = 0;
@@ -1648,11 +1439,8 @@ static int heals_recent(long long now_ms)
 	return n;
 }
 
-/* S306 step 3: S229 heals in place and the operator kept it (12fx, 12ia) -
- * clients never wait.  What was missing is saying when healing stopped
- * being a rare backstop: each heal is a full snapshot and a spell of
- * refused writes, and a node that heals on every burst is undersized,
- * not unlucky.  Said once per window, with what to change. */
+/* each heal is a full snapshot and a spell of refused writes, so routine
+ * healing means an undersized node - said once per window, with the fix */
 static void heal_routine_note(void)
 {
 	long long now = pc_rdb_mono_us() / 1000;
@@ -1679,6 +1467,7 @@ static void heal_routine_note(void)
 		W.mode == PC_WFSYNC_NO ? "no" : "everysec");
 }
 
+/* the heal's steps, one per pump pass (WAL thread) */
 static void wal_heal_step(void)
 {
 	struct pc_rdb_stats rs;
@@ -1686,10 +1475,8 @@ static void wal_heal_step(void)
 	int i;
 
 	if (!W.healing) {
-		/* every pass, not the once-a-second drop report: each moment
-		 * between the loss and the refusal is more writes accepted
-		 * that the heal must then cover.  heal_mark is what the last
-		 * heal made durable (0 before the first). */
+		/* every pass: each moment before the refusal adds
+		 * writes to cover; heal_mark = what the last heal covered */
 		if (!wal_can_heal() || wal_lost_total() <= W.heal_mark)
 			return;
 		wal_shed_once(PC_WAL_SHED_LOSS);
@@ -1741,15 +1528,8 @@ static void wal_heal_step(void)
 	W_heal_cb(0);
 }
 
-/* S215: the device refused an append, a rotation or a sync.  The same
- * event as the two above - what was acknowledged may not be there after
- * a restart - and the same answer, with one difference: this one also
- * stops the WAL itself (W.failed), because the descriptor that refused
- * cannot be trusted to refuse again (see wal_sync_commit).
- *
- * It used to be `W.enabled = 0` for the append and the rotation, and
- * nothing at all for the sync: the node went on acknowledging writes
- * that went nowhere, and `sync` said persistence was not configured. */
+/* the device refused an append, a rotation or a sync: shed like a loss,
+ * and stop the WAL (W.failed) - that descriptor cannot be trusted again */
 static void wal_storage_failed(const char *what, int err)
 {
 	if (__atomic_load_n(&W.failed, __ATOMIC_ACQUIRE))
@@ -1774,16 +1554,14 @@ void pc_wal_on_shed(void (*fn)(int why))
 	if (!fn)
 		return;
 	W_shed_cb = fn;
-	/* The WAL can shed before the cluster plane exists: a startup
-	 * overrun is found inside pc_wal_init(), and pc_cluster_init()
-	 * installs this callback afterwards.  Deliver it now rather than
-	 * letting the no-op swallow the one event that must not be. */
+	/* a startup overrun sheds inside pc_wal_init(), before this callback
+	 * is installed - deliver it now */
 	if (W.shed)
 		fn(W.shed);
 }
 
-/* S466: the sorted batch copied into the write buffer (the stage's second half),
- * one pwrite a batch - an iovec a record (S306) was 61% kernel fault-in */
+/* the batch, in seq order, copied into the write buffer (the stage's second
+ * half) for one pwrite - an iovec per record was mostly kernel fault-in */
 static size_t wal_pend;
 
 static int append_flush(void)
@@ -1807,13 +1585,17 @@ static int append_flush(void)
 	return 0;
 }
 
-static int append_rec(unsigned char *p, size_t n)
+/* a record copied from its ring straight into the write buffer, and its
+ * ring's room given back - a ring's records go in its own order */
+static unsigned char *take_rec(const struct batch_rec *br)
 {
-	if (wal_pend + n > W.stage_cap && append_flush() != 0)
-		return -1;
-	memcpy(W.stage + W.stage_cap + wal_pend, p, n);
-	wal_pend += n;
-	return 0;
+	struct ring *r = &W.rings[br->ring];
+	unsigned char *d = W.stage + W.stage_cap + wal_pend;
+
+	walring_copy(r->buf, r->size, br->pos % r->size, d, br->len);
+	__atomic_store_n(&r->head, br->pos + br->len, __ATOMIC_RELEASE);
+	wal_pend += br->len;
+	return d;
 }
 
 static int rings_empty(void);
@@ -1826,9 +1608,8 @@ static void seq_note(uint64_t seq)
 		W.pending_hi = seq;
 }
 
-/* S466: would the next rotation overwrite a segment no completed snapshot
- * covers (the FULL overrun of seg_rotate)?  Only once the ring has
- * wrapped, and only with snapshots to wait for */
+/* would the next rotation overwrite a segment no completed snapshot
+ * covers?  Only with snapshots to wait for */
 static int next_hot(void)
 {
 	if (pc_rdb_dir()[0] == 0)
@@ -1852,8 +1633,8 @@ static void full_end(void)
 	W.full_gave_up = 0;
 }
 
-/* S466: on_full = wait - a pass rotates at most once, and while the next
- * segment is uncovered it takes only the active one's room (full_note) */
+/* on_full = wait: a pass rotates at most once, and while the next segment
+ * is uncovered it takes only the active one's room (full_note) */
 static size_t full_cap(size_t stage_cap)
 {
 	size_t one = (size_t)(W.seg_bytes - PC_WAL_HDR);
@@ -1878,7 +1659,7 @@ static size_t full_cap(size_t stage_cap)
 }
 
 /* writers wait only when that cap left records in the rings; after
- * WAL_FULL_WAIT_MAX_MS the overrun and its heal, as before */
+ * WAL_FULL_WAIT_MAX_MS the overrun and its heal */
 static void full_note(int left)
 {
 	long long t;
@@ -1908,7 +1689,7 @@ int pc_wal_pump(void)
 {
 	static struct batch_rec recs[BATCH_MAX];
 	unsigned char *stage = W.stage;
-	size_t stage_len = 0, stage_cap = W.stage_cap;
+	size_t stage_len = 0, stage_cap = W.stage_cap;    /* the batch's bytes, and their cap */
 	int i, nrec = 0, left = 0;
 	long long now;
 
@@ -1916,17 +1697,17 @@ int pc_wal_pump(void)
 		return 1000;
 	if (!stage)
 		return 1000;
-	grow_adopt();                                     /* S466 step 2 */
-	stage_cap = full_cap(stage_cap);                  /* S466 */
+	grow_adopt();
+	stage_cap = full_cap(stage_cap);
 
-	/* drain every ring into the stage buffer */
+	/* every ring's records, by place: copied once, in seq order, below */
 	for (i = 0; i < W.nrings && nrec < BATCH_MAX; i++) {
 		struct ring *r = &W.rings[i];
 		uint32_t head = r->head;
 		uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
 
 		while (head != tail && nrec < BATCH_MAX) {
-			unsigned char hdr[PC_WAL_RECHDR];
+			unsigned char hdr[PC_WAL_RECHDR], sq[8];
 			uint32_t pos = head % r->size, len, total;
 
 			walring_copy(r->buf, r->size, pos, hdr,
@@ -1937,17 +1718,16 @@ int pc_wal_pump(void)
 				left = 1;
 				break;
 			}
-			walring_copy(r->buf, r->size, pos, stage + stage_len,
-				total);
-			recs[nrec].bytes = stage + stage_len;
+			walring_copy(r->buf, r->size, (pos + PC_WAL_RECHDR +
+				1 + 1 + 2 + 4 + 8) % r->size, sq, 8);
+			recs[nrec].pos = head;
 			recs[nrec].len = total;
-			recs[nrec].seq = r64(stage + stage_len + PC_WAL_RECHDR +
-				1 + 1 + 2 + 4 + 8);
+			recs[nrec].seq = r64(sq);
+			recs[nrec].ring = i;
 			stage_len += total;
 			nrec++;
 			head += total;
 		}
-		__atomic_store_n(&r->head, head, __ATOMIC_RELEASE);
 	}
 	full_note(left);
 
@@ -1955,29 +1735,33 @@ int pc_wal_pump(void)
 		qsort(recs, (size_t)nrec, sizeof recs[0], cmp_seq);
 		for (i = 0; i < nrec; i++) {
 			struct batch_rec *br = &recs[i];
+			unsigned char *d1;
 			uint32_t crc;
 
-			/* S466: three that all land in this segment are checksummed at once */
+			/* three that fit this segment: checksummed at once */
 			if (i + 3 <= nrec && W.off + (long long)wal_pend + br[0].len +
 			        br[1].len + br[2].len <= W.seg_bytes) {
 				const unsigned char *p[3];
+				unsigned char *d[3];
 				size_t n[3];
 				uint32_t c[3];
 				int k;
 
+				if (wal_pend + br[0].len + br[1].len + br[2].len >
+				        W.stage_cap && append_flush() != 0) {
+					wal_storage_failed("append", errno);
+					return 1000;
+				}
 				for (k = 0; k < 3; k++) {
 					seq_note(br[k].seq);
-					w32(br[k].bytes + 8, W.gen);
-					p[k] = br[k].bytes + 8;
+					d[k] = take_rec(&br[k]);
+					w32(d[k] + 8, W.gen);
+					p[k] = d[k] + 8;
 					n[k] = br[k].len - 8;
 				}
 				pc_crc32c_x3(p, n, c);
 				for (k = 0; k < 3; k++) {
-					w32(br[k].bytes + 4, c[k]);
-					if (append_rec(br[k].bytes, br[k].len) != 0) {
-						wal_storage_failed("append", errno);
-						return 1000;
-					}
+					w32(d[k] + 4, c[k]);
 					W.appended++;
 					W.bytes += br[k].len;
 				}
@@ -1986,10 +1770,8 @@ int pc_wal_pump(void)
 			}
 			seq_note(br->seq);
 
-			/* rotate FIRST, stamp after: the gen echo must be the
-			 * generation of the segment the record actually lands in
-			 * (stamping before rotation fenced every rotated
-			 * segment's first record as stale - caught by waltest) */
+			/* rotate first, stamp after: the gen echo must be the
+			 * generation of the segment the record lands in */
 			if (W.off + (long long)wal_pend + br->len > W.seg_bytes) {
 				/* what is queued belongs to THIS segment */
 				if (append_flush() != 0) {
@@ -2004,13 +1786,14 @@ int pc_wal_pump(void)
 					return 1000;
 				}
 			}
-			w32(br->bytes + 8, W.gen);
-			crc = pc_crc32c(0, br->bytes + 8, br->len - 8);
-			w32(br->bytes + 4, crc);
-			if (append_rec(br->bytes, br->len) != 0) {
+			if (wal_pend + br->len > W.stage_cap && append_flush() != 0) {
 				wal_storage_failed("append", errno);
 				return 1000;
 			}
+			d1 = take_rec(br);
+			w32(d1 + 8, W.gen);
+			crc = pc_crc32c(0, d1 + 8, br->len - 8);
+			w32(d1 + 4, crc);
 			W.appended++;
 			W.bytes += br->len;
 		}
@@ -2022,11 +1805,8 @@ int pc_wal_pump(void)
 	}
 
 	now = wall_now_us();
-	/* ~1 Hz: has the ring dropped anything since we last said so? */
-	/* The probe promised a latency; the device is delivering another.
-	 * Say it ONCE, with both numbers - an operator who sized fsync
-	 * policy from the startup line has no other way to learn it was
-	 * measuring a cache. */
+	/* the probe promised one latency and the device delivers another: say
+	 * so once, with both numbers - the startup probe measured a cache */
 	if (!W.probe_warned && W.fsync_n >= 20) {
 		const struct pc_wal_probe *pp = pc_wal_probe_result();
 		unsigned long long avg = W.fsync_ewma_us;
@@ -2046,10 +1826,11 @@ int pc_wal_pump(void)
 				avg / (unsigned long long)pp->fsync_p50_us);
 		}
 	}
+	/* ~1 Hz: has the ring dropped anything since we last said so? */
 	if (now - W.drop_log_us >= 1000000) {
 		unsigned long long d = 0;
 
-		shrink_check(now);                         /* S466 step 2 */
+		shrink_check(now);
 		for (i = 0; i < W.nrings; i++)
 			d += W.rings[i].dropped;
 		if (d > W.dropped_reported) {
@@ -2066,35 +1847,8 @@ int pc_wal_pump(void)
 		}
 		W.drop_log_us = now;
 
-		/*
-		 * SUSTAINED dropping takes the node OUT OF SERVICE.
-		 *
-		 * A full ring is not a hiccup that drains itself.  If
-		 * arrivals outpace the pump it stays full, every write is
-		 * acknowledged and discarded, and the node goes on
-		 * advertising itself as healthy - it will sit there losing
-		 * data for as long as the load lasts.
-		 *
-		 * Refusing each write instead (-TRYAGAIN) does not fix that
-		 * and can make it worse: the node stays in the client map,
-		 * every refusal still costs a parse and a dispatch, and a
-		 * retrying client raises the arrival rate exactly when it
-		 * needs to fall.  That is an avalanche, not backpressure.
-		 *
-		 * Leaving the map is what actually sheds load:
-		 * pc_clsel_eligible() selects READY nodes only, so peers and
-		 * clients route to healthy nodes and the arrival rate here
-		 * collapses to nothing.  Reads already served from memory
-		 * stay correct; what stops is being handed NEW writes this
-		 * node cannot honour.
-		 *
-		 * FAILED is terminal by design (pc_node_state_set refuses
-		 * to leave it except to DRAINING), so this needs an operator:
-		 * the device could not keep up, and coming back without
-		 * changing ring_kb, the fsync mode or the offered load would
-		 * only lose data again.  The FIRST dropped write trips it -
-		 * the two softer rules that were tried are argued above.
-		 */
+		/* without a heal, out of service: leaving the map sheds the
+		 * load, where refusing each write invites retries */
 		if (W.dropped_any && !W.shed && !W.healing && !wal_can_heal()) {
 			LM_CRIT("wal: dropped %llu acknowledged write(s) - "
 				"marking this node FAILED.  It stays a member "
@@ -2105,11 +1859,8 @@ int pc_wal_pump(void)
 				"fsync = everysec.\n", d);
 			wal_shed_once(PC_WAL_SHED_LOSS);
 		}
-		/* S229: where it can heal, wal_heal_step() alone starts heals,
-		 * from the loss counters against what the last heal covered.
-		 * This once-a-second report must not: drops it learns of
-		 * AFTER a heal completed were covered by that heal, and a
-		 * heal started from them was a second, spurious one. */
+		/* where it can heal, only wal_heal_step() starts heals: drops
+		 * learnt here after a heal completed were covered by it */
 	}
 	if (W.mode == PC_WFSYNC_ALWAYS && nrec) { /* NOLINT(bugprone-branch-clone) */
 		wal_sync_commit(now, 1);
@@ -2128,13 +1879,11 @@ int pc_wal_pump(void)
 		__atomic_store_n(&W.sync_req, 0, __ATOMIC_RELEASE);
 	}
 
-	wal_heal_step();                   /* S229 */
-	/* S306: a round that stopped at BATCH_MAX or the stage's size left
-	 * records behind - drain again NOW, not after a 20 ms nap.  With
-	 * the full-ring wake missing as well, that nap was the WAL's write
-	 * ceiling: one batch of 4,096 per 20 ms. */
+	wal_heal_step();
+	/* a round that stopped at BATCH_MAX or the stage's size left records
+	 * behind - drain again now, not after a 20 ms nap */
 	if (W.full_t0_us && !W.full_gave_up)
-		return 2;                      /* S466: a snapshot frees room soon */
+		return 2;                      /* a snapshot frees room soon */
 	if (nrec && !rings_empty())
 		return 0;
 	if (W.mode == PC_WFSYNC_ALWAYS)
@@ -2163,17 +1912,15 @@ void pc_wal_shutdown(void)
 	while (!rings_empty() && spins++ < 1000)
 		pc_wal_pump();
 	pc_wal_pump();
-	__atomic_store_n(&W.pump_gone, 1, __ATOMIC_RELEASE);   /* S456 */
-	/* S215: nobody is left to refuse a write to, so a refusal here is
-	 * a line in the log - but the line is owed, and the watermark stays */
+	__atomic_store_n(&W.pump_gone, 1, __ATOMIC_RELEASE);
+	/* nobody is left to refuse a write to, so a refusal here is a line in
+	 * the log - but the line is owed, and the watermark stays */
 	if (!W.failed && wal_sync_commit(wall_now_us(), 1) != 0)
 		LM_CRIT("wal: the shutdown sync failed - records after seq "
 			"%llu may not be on the device\n", W.synced_seq);
-	/* AFTER the drain, or CONTROL records a sequence the shutdown was
-	 * about to move: this is the one point where it can be exact
-	 * rather than the lower bound it is between rotations.  Close the
-	 * active segment's span first, for the same reason. */
-	__atomic_store_n(&W.grow_stop, 1, __ATOMIC_RELEASE);   /* S466 step 2 */
+	/* after the drain: here CONTROL can be exact, not a lower bound; the
+	 * active segment's span is closed first for the same reason */
+	__atomic_store_n(&W.grow_stop, 1, __ATOMIC_RELEASE);
 	if (W.seg_last && W.nseg > 0 && W.cur >= 0)
 		W.seg_last[W.cur] = W.pending_hi;
 	ctrl_write();
@@ -2187,11 +1934,8 @@ void pc_wal_shutdown(void)
 		"%llu late\n", W.appended, W.bytes, d, W.late);
 }
 
-/* the sync verb: block (bounded) until everything APPENDED so far is
- * fdatasync'd.  Worker-callable: sets the barrier flag, kicks the WAL
- * thread, and polls the synced watermark.  0 = synced, 1 = WAL off,
- * -1 = timeout, -2 = the device refused a write or a sync (S215): what
- * was appended after the watermark will not be synced by this process. */
+/* the sync verb (worker-callable): block, bounded, until all appended is
+ * synced; 0 = synced, 1 = WAL off, -1 = timeout, -2 = the device refused */
 int pc_wal_sync(int timeout_ms)
 {
 	unsigned long long target;
@@ -2206,8 +1950,8 @@ int pc_wal_sync(int timeout_ms)
 	while (waited < timeout_ms) {
 		if (W.synced_seq >= target)
 			return 0;
-		/* S215: the watermark will never reach it - say so now, not
-		 * after the caller's timeout */
+		/* the watermark will never reach it - say so now, not after the
+		 * caller's timeout */
 		if (__atomic_load_n(&W.failed, __ATOMIC_ACQUIRE))
 			return -2;
 		__atomic_store_n(&W.sync_req, 1, __ATOMIC_RELEASE);
@@ -2236,7 +1980,7 @@ void pc_wal_get_stats(struct pc_wal_stats *out)
 	out->dropped = d;
 	out->ring_waits = __atomic_load_n(&W.ring_waits, __ATOMIC_RELAXED);
 	out->ring_wait_ms = __atomic_load_n(&W.ring_wait_us, __ATOMIC_RELAXED) / 1000;
-	{                                                 /* S466 */
+	{
 		long long t0 = W.full_t0_us;
 
 		out->full_waits = W.full_waits;
@@ -2248,17 +1992,14 @@ void pc_wal_get_stats(struct pc_wal_stats *out)
 	out->late = W.late;
 	out->overruns = W.overruns;
 	out->free_segments = W.seg_first ? W.free_segs : 0;
-	out->segments = W.seg_first ? W.nseg : 0;              /* S437 */
-	out->segments_min = W.seg_first ? W.nseg_min : 0;      /* S466 step 2 */
+	out->segments = W.seg_first ? W.nseg : 0;
+	out->segments_min = W.seg_first ? W.nseg_min : 0;
 	out->segments_max = W.seg_first ? W.nseg_max : 0;
 	out->grown = W.grown;
 	out->retired = W.retired;
 	out->segment_bytes = W.seg_first ? (unsigned long long)W.seg_bytes : 0;
-	/* S224: the fill rate, and how long the free segments last at it.
-	 * An idle ring's EWMA would keep its last busy value for ever, so
-	 * the time since the last rotation is a floor on the interval: the
-	 * figure decays when writes stop instead of reading "about to fill"
-	 * all night. */
+	/* fill rate and how long the free segments last at it; the time since
+	 * the last rotation is a floor, so an idle ring's figure decays */
 	{
 		double s = W.seg_ewma_s;
 		long long now = wall_now_us();
@@ -2270,7 +2011,7 @@ void pc_wal_get_stats(struct pc_wal_stats *out)
 				s = idle;
 			out->fill_mb_s = (double)W.seg_bytes / 1048576.0 / s;
 			out->full_in_s = W.free_segs * s;
-			out->ring_fill_s = W.nseg * s;         /* RV-13 */
+			out->ring_fill_s = W.nseg * s;
 		} else {
 			out->fill_mb_s = 0;
 			out->ring_fill_s = -1;
@@ -2283,11 +2024,11 @@ void pc_wal_get_stats(struct pc_wal_stats *out)
 	out->ctrl_errors = W.ctrl_errors;
 	out->last_seq = W.seq;
 	out->synced_seq = W.synced_seq;
-	out->pending_hi = W.pending_hi;                  /* S145 */
-	out->heals = W.heals;                            /* S229 */
+	out->pending_hi = W.pending_hi;
+	out->heals = W.heals;
 	out->healing = W.healing;
 	out->last_heal_ms = W.last_heal_ms;
-	out->heals_recent = heals_recent(pc_rdb_mono_us() / 1000);  /* S306 */
+	out->heals_recent = heals_recent(pc_rdb_mono_us() / 1000);
 	out->heal_routine = out->heals_recent >= PC_WAL_HEAL_ROUTINE;
 	{
 		unsigned long long lost = wal_lost_total();

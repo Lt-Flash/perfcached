@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * upgverify.c - an upgrade artifact's checks: read it whole (a regular
- * file, bounded), read its signature (64 bytes, or 128 hex characters),
- * verify it against the built-in release keys and [upgrade]
- * trusted_keys, and -K's report.  Moved from upgrade.c unchanged (the
- * 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* upgverify.c - an upgrade artifact's checks: read it and its signature, verify it against the
+ * built-in release keys and [upgrade] trusted_keys, and -K's report. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

@@ -1,25 +1,6 @@
 #!/bin/sh
-# lanetest.sh - S36 step b: in discovery = unicast nothing larger than
-# the path MTU goes as a datagram - it goes over the TCP frame lane.
-#
-# A cloud path MTU is ~1,460 bytes and some environments drop IP
-# fragments; a 40 KB datagram is ~30 fragments, so one lost fragment
-# (or a fragment filter) loses all of it.  The rig: three network
-# namespaces on a bridge with MTU 1,400, and on every node's link a tc
-# filter that drops the FIRST fragment of every fragmented packet (MF
-# set) - no fragmented datagram can ever be reassembled:
-#   1  lane on (the default, max_datagram = 1400): a fleet forms; a
-#      40,000-byte value written on node A reads on B and C within a few
-#      seconds (the eager push rode the lane); lane frames sent, none
-#      dropped
-#   2  the control, lane off (max_datagram = 0): the fleet cannot even
-#      form - membership's own frames (~2.6 KB for three nodes) fragment
-#      and are dropped - or, if it does, the 40 KB write does not
-#      arrive; either way proof the rig drops fragments, so arm 1's pass
-#      is the lane and not a lenient network
-# Needs root, ip netns and tc; SKIPs loudly without them - a skip is not
-# a pass.
-# Usage: test/lanetest.sh [./perfcached]
+# lanetest.sh - in discovery = unicast nothing over the path MTU goes as a datagram: it rides the TCP
+# frame lane, on a rig that drops every fragment, with the lane off as the control.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=$(readlink -f "${1:-./perfcached}")
@@ -138,8 +119,12 @@ wait_for 6 '[ "$(biglen 2 big1)" = 40000 ] && [ "$(biglen 3 big1)" = 40000 ]' \
 # the value can cross before node 1's /stats shows the frames that carried it
 wait_for 5 '[ "$(st 1 "r[\"cluster\"][\"lane\"][\"sent_frames\"]")" -gt 0 ] 2>/dev/null' || true
 LS=$(st 1 'r["cluster"]["lane"]["sent_frames"]'); LD=$(st 1 'r["cluster"]["lane"]["dropped_full"] + r["cluster"]["lane"]["dropped_stale"]')
-[ "${LS:-0}" -gt 0 ] 2>/dev/null && [ "$LD" = 0 ] && ok "node 1 sent $LS frame(s) by the lane, none dropped" \
-	|| bad "lane figures on node 1: sent $LS, dropped $LD"
+# or by the relay port's TCP: admission proves it before ONLINE, so replication groups over
+# max_datagram may take it instead of the lane - TCP either way, and the control shows datagrams fail
+RP=$(grep -c "replication to node [0-9]* now uses its relay port" "$D/n1.log" 2>/dev/null)
+if [ "${LS:-0}" -gt 0 ] 2>/dev/null && [ "$LD" = 0 ]; then ok "node 1 sent $LS frame(s) by the lane, none dropped"
+elif [ "${LS:-0}" = 0 ] && [ "${RP:-0}" -ge 1 ] && [ "$LD" = 0 ]; then ok "node 1 replicated by its peers' relay ports (TCP), the lane idle"
+else bad "lane figures on node 1: sent $LS, dropped $LD; relay-port switches $RP"; fi
 stopall
 
 echo "--- 2: the control - lane off, every frame a datagram"
@@ -152,10 +137,6 @@ if wait_for 40 formed; then
 		&& ok "without the lane the 40,000-byte value did not cross - the rig drops fragments, so arm 1 was the lane" \
 		|| bad "the big value crossed without the lane (node 2: $B2, node 3: $B3) - the rig does not drop fragments and proves nothing"
 else
-	# membership itself sends frames over the MTU (the join's answer
-	# and the map are ~2.6 KB for three nodes): with them fragmented
-	# and dropped, a fleet cannot form at all - the cloud failure the
-	# lane exists for, and proof the rig drops what it should
 	ok "without the lane the fleet cannot even form - its ~2.6 KB membership frames fragment and are dropped (arm 1 formed on the same rig)"
 fi
 stopall

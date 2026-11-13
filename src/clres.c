@@ -1,12 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clres.c - id reservations for departed members.  See clres.h.
- *
- * Every body came out of cluster.c unchanged; what differs is that the
- * table is reached through a pointer, the clock and the TTL are passed
- * in, and the one log line stayed behind with the caller.
- */
+/* clres.c - id reservations for departed members.  See clres.h. */
 #include <string.h>
 
 #include "clres.h"
@@ -40,7 +34,7 @@ int clres_note(struct clres *r, int id, struct in_addr addr,
 	if (slot < 0)
 		slot = 0;
 	r->e[slot].addr = addr;
-	r->e[slot].why = CLRES_GONE_UNKNOWN;     /* S293: the caller says */
+	r->e[slot].why = CLRES_GONE_UNKNOWN;     /* the caller says */
 	r->e[slot].silent_s = 0;
 	r->e[slot].has_ident = has_ident;
 	memcpy(r->e[slot].ident, ident, CLRES_IDENT_LEN);

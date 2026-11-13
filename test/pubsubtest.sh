@@ -1,11 +1,6 @@
 #!/bin/sh
-# pubsubtest.sh - PS1/PS2: pub/sub over RESP2 on one node.  Subscriptions
-# live on the connection; a publish reaches every local subscriber, on
-# whichever worker owns it; patterns match as redis matches them; a
-# subscribed connection is gated to the pub/sub verbs; a subscriber that
-# cannot keep up dies at the output cap; accepted sockets carry TCP
-# keepalive.  PS4: the native door, through test/pcnative.py's line idiom
-# and through hand-read frames.  Usage: test/pubsubtest.sh [./perfcached]
+# pubsubtest.sh - pub/sub over RESP2 and the native door on one node: delivery across workers, patterns,
+# the subscribed-mode gate, the output cap, TCP keepalive.  Usage: test/pubsubtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -103,10 +98,8 @@ for pat in ("h[ae]llo", "h[^e]llo", "h\\*llo", "h?llo", "[a-c]x", "a*c", "zed*",
 vec = [("h[ae]llo", "hallo", 1), ("h[ae]llo", "hillo", 0), ("h[^e]llo", "hallo", 1), ("h[^e]llo", "hello", 0),
        ("h\\*llo", "h*llo", 1), ("h\\*llo", "hxllo", 0), ("h?llo", "hxllo", 1), ("h?llo", "hllo", 0),
        ("[a-c]x", "bx", 1), ("[a-c]x", "dx", 0), ("a*c", "abbbc", 1), ("a*c", "ac", 1), ("a*c", "abd", 0),
-       # a trailing '*' matches the EMPTY tail, as redis does: news* matches
-       # news itself, not only news-something.  Found by mutation: an engine
-       # that required one character here passed every vector above.  The
-       # channels stay off n* so the pattern subscriber C is not disturbed.
+       # a trailing '*' matches the EMPTY tail, as redis does (zed* matches zed); the
+       # channels stay off n* so the pattern subscriber C is not disturbed
        ("zed*", "zed", 1), ("zed*", "zedx", 1), ("zed*", "ze", 0), ("*", "zq", 1)]
 good = True
 for pat, ch, want in vec:
@@ -123,19 +116,16 @@ for pat, ch, want in vec:
         good = False; res.append(("FAIL", "pattern %r vs %r: want %d got %d (publish count %s, seen %r)" % (pat, ch, want, got, n, sorted(seen))))
 ok(good, "pattern matching agrees with redis on the vectors")
 P.close()
-# one connection subscribed by channel AND by a matching pattern gets BOTH
-# frames and is counted twice - redis's own behaviour, the count is
-# deliveries, not distinct clients
+# one connection subscribed by channel AND by a matching pattern gets BOTH frames
+# and counts twice, as in redis: the count is deliveries, not distinct clients
 Dup = R(); Dup.cmd("SUBSCRIBE", "dupch"); Dup.cmd("PSUBSCRIBE", "dup*")
 ok(B.cmd("PUBLISH", "dupch", "d1") == 2, "a connection matched by channel and pattern counts twice in PUBLISH's answer")
 f1, f2 = Dup.read(), Dup.read()
 ok(sorted([f1[0], f2[0]]) == ["message", "pmessage"] and f1[-1] == "d1" and f2[-1] == "d1",
    "and receives a message frame and a pmessage frame (%r, %r)" % (f1, f2))
 Dup.close()
-# a hostile pattern must not stall the engine: the first matcher was
-# exponential in '*' and ran for minutes under the engine lock; the engine's
-# own matcher is O(pattern x channel).  And an OPEN set must not read past
-# the pattern: "[a" is closed at the pattern's end, so it matches "a" only.
+# a hostile pattern must not stall the engine (the matcher is O(pattern x channel)),
+# and an open set must not read past the pattern: "[a" matches "a" only
 H = R(timeout=10); H.cmd("PSUBSCRIBE", "*a" * 16 + "*b"); H.cmd("PSUBSCRIBE", "[q")
 B.s.settimeout(3)
 t0 = time.time()
@@ -166,11 +156,8 @@ m = urllib.request.urlopen("http://127.0.0.1:18471/metrics", timeout=5).read().d
 ok("perfcached_pubsub_subscribers 7" in m and "perfcached_pubsub_published_total" in m, "/metrics carries the subscriber gauge and the counters")
 # slow subscriber: never reads; 8 MB cap
 S = R(timeout=10); S.cmd("SUBSCRIBE", "big")
-# PIPELINED, so one read on the delivering worker carries many publishes and
-# several of them are handed to the subscriber after the cap has closed it -
-# which is what a real publisher does, and what made one slow subscriber
-# count thousands of kills.  A one-at-a-time loop let the close finish
-# between publishes and could not tell the two apart.
+# pipelined, so several publishes reach the subscriber after the cap closed it:
+# one slow subscriber must still count one kill
 payload = "x" * 4096
 # the cap is 8 MB of staged output, but out + wire + the kernel's send and
 # receive buffers absorb ~26 MB before it can bite: send ~49 MB
@@ -180,10 +167,8 @@ B.s.settimeout(30)
 B.s.sendall(frame * N)
 replies = [B.read() for _ in range(N)]
 B.s.settimeout(5)
-# no assertion on WHEN the counts drop to 0: a subscriber that shares the
-# publisher's worker is torn down only after the whole pipeline is read, so
-# every publish still counts it - redis closes over-limit clients
-# asynchronously too.  What is promised is below: one kill, counted once.
+# no assertion on WHEN the counts drop to 0: a subscriber on the publisher's worker is
+# torn down only after the whole pipeline is read (redis closes asynchronously too)
 ok(replies[0] == 1, "the pipelined publishes reach the subscriber (%d of %d counted it)" % (replies.count(1), N))
 S.s.settimeout(5)
 try:
@@ -200,7 +185,7 @@ time.sleep(0.5)
 st = json.load(urllib.request.urlopen("http://127.0.0.1:18471/stats", timeout=5)).get("pubsub", {})
 ok(st.get("slow_kills") == 1, "and counted as ONE slow kill, however many messages were still handed to it while it closed (%r)" % st.get("slow_kills"))
 ok(st.get("alloc_failed") == 0, "and no allocation failure was counted for it (%r)" % st.get("alloc_failed"))
-# ---- PS4: the native door - first through pcnative's line idiom ----
+# ---- the native door - first through pcnative's line idiom ----
 J = socket.create_connection(("127.0.0.1", 17471), timeout=5); jf = pcnative.wrap(J)
 def jcmd(obj):
     jf.write((json.dumps(obj) + "\n").encode()); jf.flush(); return json.loads(jf.readline())
@@ -256,7 +241,7 @@ s = socket.create_connection(("127.0.0.1", 17472)); s.sendall(b"*2\r\n$9\r\nSUBS
 import subprocess; out = subprocess.run(["ss", "-tno", "state", "established", "( sport = :17472 )"], capture_output=True, text=True).stdout
 print("keepalive" in out); s.close()' 2>/dev/null)
 [ "$K" = True ] && ok "accepted sockets carry TCP keepalive ([listen] keepalive_s)" || bad "no keepalive timer on the daemon's side of a subscriber socket"
-# ---- PS4: through libperfd ----
+# ---- through libperfd ----
 if [ -x "$CLI" ]; then
 	"$CLI" 17471 > "$D/cli.out" 2>&1; crc=$?
 	grep -E "^  (ok|FAIL|\()" "$D/cli.out"

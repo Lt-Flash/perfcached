@@ -1,31 +1,6 @@
 #!/bin/sh
-# walordertest.sh - S240: after a crash, every key holds the value it was
-# SERVING, whatever order its records reached the WAL.
-#
-# A write takes its WAL sequence after its table op commits, outside the
-# key's lock, and each worker has its own ring: two workers writing ONE
-# key can log them in the opposite order to their versions (wal_late
-# counts every out-of-order record, but cannot tell a same-key one from
-# the harmless cross-ring interleaving).  Replay applied records in LOG
-# order, blind to the version each carries, so an inverted pair restored
-# the OLDER value - an acknowledged later write lost.
-#
-# Each round turns every key into a race: C connections (spread over the
-# workers) write the same K keys in the same order, released together,
-# so each key gets C near-simultaneous writes.  Every other round one of
-# the connections DELETES every key instead, so deletes race the sets and
-# a key's served state may be absent.  Then `sync`, read every
-# key as served, kill -9, restart from the WAL alone (no snapshot: save =
-# off), and read again.  A key whose replayed value differs from the one
-# served before the kill is an inversion replayed.  A round in which the
-# ring dropped anything is discarded (a drop loses records for another
-# reason).  FAIL-FIRST: the build before S240 replays in log order.
-# The expirer round (3, 7) is where 0.4.6's CI found an EXPIRE's WAL
-# record carrying a racing SET's version, so the SET was refused on
-# replay as older than what it met (5 of 20,000 on a loaded runner; the
-# window is a few hundred ns and is not hit on an idle box - run the
-# round repeatedly under load: test/walordertest.sh ./perfcached 3 3).
-# Usage: test/walordertest.sh [./perfcached] [rounds] [first-round]
+# walordertest.sh - after a crash every key holds the value it was SERVING, whatever order its records
+# reached the WAL: C racing writers (and deletes) per key, sync, kill -9, replay with save = off.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -78,17 +53,15 @@ DRV="$D/drv.py"
 cat > "$DRV" <<'PY'
 # drv.py <port> <op> [round]: race | read
 import json, pcnative, socket, sys, time
-# S270: fork, spelled out - Python 3.14 made forkserver the Linux default,
-# which re-imports the main script, and this one is fed on stdin
+# fork, spelled out: Python 3.14 made forkserver the Linux default, which re-imports
+# the main script, and this one is fed on stdin
 from multiprocessing import get_context
 _mp = get_context("fork")
 Barrier, Process = _mp.Barrier, _mp.Process
 port, op = int(sys.argv[1]), sys.argv[2]
 K, C = 20000, 8
-# a round's KIND, by its number: 1 sets; 2 sets + a deleter; 3 sets + an
-# EXPIRER (EXPIRE k 1 - lapsed by the time the node restarts: a TOUCH
-# record whose expiry is in the past); 0 sets + a deleter, with LONG keys
-# (600 bytes: past the replay's 512-byte tombstone key buffer)
+# a round's kind by its number: 1 sets; 2 sets + a deleter; 3 sets + an EXPIRER (EXPIRE k 1);
+# 0 sets + a deleter with 600-byte keys, past the replay's 512-byte tombstone key buffer
 def kind(rnd):
     return int(rnd) % 4
 def key(i, rnd):
@@ -102,9 +75,8 @@ def writer(c, rnd, bar, mix):
     s, f = conn()
     call(s, f, "ping")                       # connected before the release
     bar.wait()
-    # a mixed round: connection 0 DELETES (or, kind 3, EXPIREs in 1 s)
-    # every key while the others set it, so each key's served state may be
-    # absent - and must replay so
+    # a mixed round: connection 0 deletes (kind 3: expires) every key while the others set
+    # it, so a key's served state may be absent - and must replay so
     dele = mix and c == 0
     def req(i):
         if dele and kind(rnd) == 3:
@@ -159,11 +131,8 @@ while [ $r -le $ROUNDS ]; do
 import json, sys
 a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
 print(sum(1 for k in a if a[k] != b.get(k)))' "$D/before.json" "$D/after.json")
-	# what kind of wrong, when there is one: served vs replayed, per key -
-	# absent->present is a delete undone, present->absent a write lost,
-	# present->other an older value winning - and the node's own replay
-	# summary.  rc49 GitHub check: 1 of 20,000 long keys, not reproduced
-	# on 222 in 440,000; the next one has to say which it was.
+	# what kind of wrong: absent->present is a delete undone, present->absent a write lost,
+	# present->other an older value winning - plus the node's own replay summary
 	[ "${INV:-0}" != 0 ] && python3 -c '
 import json, sys
 a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
@@ -176,8 +145,8 @@ import json, sys
 a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
 print(" ".join(k for k in a if a[k] != b.get(k)))' "$D/before.json" "$D/after.json" | tr " " "\n" | head -3 |
 		while read -r id; do
-			# S447: every WAL record of the key, with its seq and version
-			# - which record the replay took, and why
+			# every WAL record of the key, with its seq and version - which record the
+			# replay took, and why
 			kn=$(printf 'k%05d' "$id")
 			# the name repeats every round: the LAST records are this
 			# round's, and each value is on the line after its record
@@ -185,10 +154,8 @@ print(" ".join(k for k in a if a[k] != b.get(k)))' "$D/before.json" "$D/after.js
 			"$BIN" -W "$D/wal" 2>/dev/null | grep -F -A1 "c/$kn" | grep -v '^--$' |
 				sed 's/xxxxxxxxx*/x.../' | tail -20 | cut -c1-160 | sed "s/^/       /"
 		done
-	# the snapshot the replay started from: a record at or below its marker
-	# is not replayed - the snapshot must hold it.  v0.7.3-rc4 GitLab: the
-	# key's last upsert was in the WAL, the replay gave the key deleted,
-	# 308,416 records were below the marker - which side was it on?
+	# the snapshot the replay started from: a record at or below its marker is not replayed - the
+	# snapshot must hold it
 	[ "${INV:-0}" != 0 ] && {
 		for f in $(find "$D" -name dump.rdb 2>/dev/null); do
 			echo "     snapshot $f: $("$BIN" -R "$f" 2>&1 | head -1)"

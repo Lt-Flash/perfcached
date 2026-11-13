@@ -1,24 +1,5 @@
-/*
- * clwiretest.c - the sealed datagram and the beat frames (M6).
- *
- * Every cluster datagram is sealed under the cluster PSK, and the only
- * thing standing between a fleet and a forged frame is that open()
- * refuses everything it should:
- *   - a flipped ciphertext byte, which the Poly1305 tag must catch
- *   - a flipped nonce, which is associated data and must fail the same way
- *   - the wrong key entirely, which is what a node from another fleet has
- *   - a version byte from a build that framed datagrams differently -
- *     cluster.h is explicit that these are DROPPED, not half-read
- *
- * The beat frames are here too because they cross threads under a
- * seqlock: the peer thread writes, the watchdog re-seals the last pair
- * when the peer thread has gone quiet.
- *
- * No socket: sealing is separate from sending, which is the whole point
- * of the split.
- *
- * Build: cc -o clwiretest test/clwiretest.c src/clwire.o -lsodium
- */
+/* clwiretest.c - the sealed cluster datagram: open() refuses a flipped ciphertext or nonce byte,
+ * the wrong key and another version; the beat frames re-sealed across threads under a seqlock. */
 #include <pthread.h>
 #include <sodium.h>
 #include <stdio.h>
@@ -26,10 +7,8 @@
 
 #include "../src/clwire.h"
 
-/* Seal with a header of our choosing, so a frame can be cryptographically
- * VALID and still carry a wrong magic or version.  Flipping those bytes
- * after sealing proves nothing: the header is associated data, so the tag
- * refuses it anyway and the explicit checks are never exercised. */
+/* a header of our choosing, so a frame can be cryptographically VALID with a wrong magic or
+ * version: the header is associated data, so flipping it after sealing only tests the tag */
 static size_t seal_with_hdr(const uint8_t *psk, unsigned char magic,
 		unsigned char ver, const unsigned char *pt, size_t n,
 		unsigned char *out)
@@ -38,15 +17,15 @@ static size_t seal_with_hdr(const uint8_t *psk, unsigned char magic,
 
 	out[0] = magic;
 	out[1] = ver;
-	memset(out + 2, 0, 17);            /* S302: no cluster id, no flags */
+	memset(out + 2, 0, 17);            /* no cluster id, no flags */
 	clwire_nonce(out + CLWIRE_NONCE_OFF);
-	memset(out + CLWIRE_ID_OFF, 0, HDR_LEN - CLWIRE_ID_OFF);   /* CH-1 */
+	memset(out + CLWIRE_ID_OFF, 0, HDR_LEN - CLWIRE_ID_OFF);
 	crypto_aead_xchacha20poly1305_ietf_encrypt(out + HDR_LEN, &clen,
 		pt, n, out, HDR_LEN, NULL, out + CLWIRE_NONCE_OFF, psk);
 	return HDR_LEN + (size_t)clen;
 }
 
-/* S461: a thread that takes a lane (twice: it keeps the first), then seals */
+/* a thread that takes a lane (twice: it keeps the first), then seals */
 struct lane_try { const uint8_t *psk; unsigned char ct[HDR_LEN + 64]; size_t cl; };
 static void *lane_thread(void *arg)
 {
@@ -112,7 +91,7 @@ int main(void)
 		size_t altlen;
 
 		altlen = seal_with_hdr(k1, 0xA1, 5, (const unsigned char *)msg,
-			n, alt);                   /* CH-8: 5 is now the OLD one */
+			n, alt);                   /* 5 is now the old version */
 		chk(clwire_open(k1, alt, altlen, pt, &ptlen) != 0,
 			"B5 a VALIDLY sealed frame of another version is DROPPED - "
 			"the version check, not the tag, is what refuses it");
@@ -144,7 +123,7 @@ int main(void)
 	chk(len2 == len && memcmp(sealed + CLWIRE_NONCE_OFF, seen[0], CLWIRE_NONCE_LEN) != 0,
 		"C2 sealing the same plaintext twice does not repeat a nonce");
 
-	/* ---- S302. the cluster id rides the header, authenticated ----------- */
+	/* ---- the cluster id rides the header, authenticated ----------------- */
 	{
 		unsigned char cid[CLWIRE_CID_LEN], got[CLWIRE_CID_LEN];
 		static const unsigned char zero16[16];
@@ -214,7 +193,7 @@ int main(void)
 		chk(clwire_sent_ms(&W) == 12345, "E7 the emission stamp round-trips");
 	}
 
-	/* ---- F. the sender's lane (S461) --------------------------------- */
+	/* ---- F. the sender's lane ----------------------------------------- */
 	{
 		struct lane_try t;
 		pthread_t th;

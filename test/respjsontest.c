@@ -1,28 +1,5 @@
-/* respjsontest.c - RedisJSON on the RESP door (respjson.c; the 0.7.2 split,
- * wave 1): the JSON core (pc_json_rmw) and the placement are stubbed, the
- * JSON validator is the real one; every reply byte for byte.
- *
- *   A  the path's spellings: none (the document, bare), `$...` (v2, an
- *      array-shaped reply), `.x`, `x`, `.` and `[i]` (legacy, bare); an
- *      empty or a too-long path refused; the key too long; the key noted
- *   B  JSON.SET: NX, XX and EX passed to the core; EX 0 and an unknown
- *      option refused; the arity.  NX on a present leaf, XX on an absent
- *      one or key, answer nil; the wrong-type text in Redis's words, a
- *      stored value that is not JSON as WRONGTYPE, any other error as -ERR
- *   C  JSON.GET's answers: a missing key nil; a missing path [] on a `$`
- *      path and an error on a legacy one; a whole value that is not JSON
- *      WRONGTYPE
- *   D  JSON.NUMINCRBY: the new value as [n] or n; a non-integer refused
- *   E  JSON.ARRAPPEND: one core call per value, the last count answered (in
- *      an array on a `$` path); an error stops it
- *   F  JSON.DEL: the root of a document through the delete core (1, then
- *      0); the root of a plain string under strict types is WRONGTYPE; a
- *      path through the JSON core
- *   G  a key another node holds - a proxy non-holder, a shard non-owner - is
- *      refused by name, the core never called
- *   H  JSON.DEBUG: HELP; MEMORY's size, 0 for a missing key, WRONGTYPE for a
- *      value that is not JSON; anything else refused
- */
+/* respjsontest.c - RedisJSON on the RESP door (respjson.c), each reply byte for byte: the JSON core
+ * and placement stubbed, the JSON validator real. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -110,6 +87,14 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 }
 
 int pc_cluster_enabled(void) { return cl_on; }
+/* the pull for a read-through or spread JSON.GET - never taken here */
+int pc_jget_park(pcache_htable_t *ht, const char *key, size_t klen,
+		const char *path, size_t plen, int shape, unsigned int *park)
+{
+	(void)ht; (void)key; (void)klen; (void)path; (void)plen; (void)shape;
+	(void)park;
+	return 0;
+}
 int pc_store_proxy_enabled(pcache_htable_t *ht) { (void)ht; return proxy_on; }
 int pc_store_shard_enabled(pcache_htable_t *ht) { (void)ht; return shard_on; }
 int pc_store_types_strict(pcache_htable_t *ht) { (void)ht; return strict; }
@@ -187,7 +172,7 @@ int main(void)
 {
 	static char longpath[600], longkey[KEY_MAX + 2];
 
-	/* A */
+	/* A: paths - none, `$...` (array reply), legacy `.x` `x` `.` `[i]`; bad paths, long key */
 	answer(0, "{\"a\":1}", NULL);
 	RUN(rh_json, "JSON.GET", "k");
 	CHK(is("$7\r\n{\"a\":1}\r\n") && got.op == PC_JOP_GET && !strcmp(got.path, "$"),
@@ -219,7 +204,7 @@ int main(void)
 	RUN(rh_json, "JSON.GET", longkey);
 	CHK(is("-ERR key too long\r\n"), "A: a key over KEY_MAX refused");
 
-	/* B */
+	/* B: JSON.SET - NX, XX, EX to the core; EX 0, unknown option, arity; the error words */
 	answer(0, NULL, NULL);
 	RUN(rh_json, "JSON.SET", "k", "$", "{\"a\":1}", "NX");
 	CHK(is("+OK\r\n") && got.op == PC_JOP_SET && got.nx && !got.xx &&
@@ -254,7 +239,7 @@ int main(void)
 	CHK(is("-WRONGTYPE the value at this key is not a JSON document\r\n"),
 		"B: a stored value that is not JSON - WRONGTYPE");
 
-	/* C */
+	/* C: JSON.GET - missing key nil, missing path [] or an error, non-JSON value WRONGTYPE */
 	answer(1, NULL, NULL);
 	RUN(rh_json, "JSON.GET", "k");
 	CHK(is("$-1\r\n"), "C: a missing key - nil");
@@ -267,7 +252,7 @@ int main(void)
 	CHK(is("-WRONGTYPE the value at this key is not a JSON document\r\n"),
 		"C: a whole value that is not JSON - WRONGTYPE");
 
-	/* D */
+	/* D: JSON.NUMINCRBY - the new value as [n] or n; a non-integer refused */
 	answer(0, NULL, NULL);
 	ans.nv = 7;
 	RUN(rh_json, "JSON.NUMINCRBY", "k", "$.n", "5");
@@ -280,7 +265,7 @@ int main(void)
 	RUN(rh_json, "JSON.NUMINCRBY", "k", "$.n");
 	CHK(is("-ERR wrong number of arguments for this JSON command\r\n"), "D: the arity");
 
-	/* E */
+	/* E: JSON.ARRAPPEND - a core call per value, the last count answered; an error stops it */
 	answer(0, NULL, NULL);
 	RUN(rh_json, "JSON.ARRAPPEND", "k", "$.a", "1", "2", "3");
 	CHK(is("*1\r\n:3\r\n") && got.calls == 3 && got.op == PC_JOP_APPEND &&
@@ -291,7 +276,7 @@ int main(void)
 	RUN(rh_json, "JSON.ARRAPPEND", "k", "$.a", "1", "2", "3");
 	CHK(is("-ERR array append failed\r\n") && got.calls == 2, "E: an error stops it");
 
-	/* F */
+	/* F: JSON.DEL - a document's root via the delete core, a plain string WRONGTYPE, a path */
 	answer(0, NULL, NULL);
 	flags = PCACHE_F_JSON;
 	dels = 0;
@@ -315,7 +300,7 @@ int main(void)
 	RUN(rh_json, "JSON.DEL", "k", "$.a");
 	CHK(is(":0\r\n"), "F: an absent path - 0");
 
-	/* G */
+	/* G: a key another node holds is refused by name, the core never called */
 	answer(0, "1", NULL);
 	cl_on = 1;
 	proxy_on = 1;
@@ -337,7 +322,7 @@ int main(void)
 	CHK(is("+OK\r\n"), "G: one this node owns is served");
 	cl_on = shard_on = 0;
 
-	/* H */
+	/* H: JSON.DEBUG - HELP; MEMORY's size, 0 if missing, WRONGTYPE if not JSON; else refused */
 	RUN(rh_json_debug, "JSON.DEBUG", "help");
 	CHK(is("*2\r\n$53\r\nJSON.DEBUG MEMORY <key> [path] - reports memory usage\r\n"
 		"$30\r\nJSON.DEBUG HELP - this message\r\n"), "H: HELP");

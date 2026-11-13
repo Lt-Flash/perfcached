@@ -1,8 +1,6 @@
 #!/bin/sh
-# policybench.sh — the S34 spreading policies, side by side.
-# Starts a three-node fleet, then runs every policy with the same
-# client count and workload so the table compares like with like.
-# usage: bench/policybench.sh [./perfcached] [./policybench]
+# policybench.sh [./perfcached] [./policybench] - the spreading policies side by side on a
+# three-node fleet, the same clients and workload for each.
 set -u
 BIN=${1:-./perfcached}
 PB=${2:-./policybench}
@@ -13,9 +11,8 @@ SECRET=pb-client-secret
 P1= P2= P3=
 rm -rf "$D"; mkdir -p "$D"
 
-# PROVENANCE: refuse to measure a build that cannot name itself - an
-# unstamped binary is how a table ends up quoting figures nobody can
-# reproduce.
+# refuse to measure a build that cannot name itself: an unstamped binary's figures cannot be
+# reproduced
 BINREV=$("$BIN" -V 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')
 if [ -z "$BINREV" ] || [ "$BINREV" = unknown ]; then
 	echo "POLICYBENCH: refusing to measure an unstamped build ($BINREV)" >&2

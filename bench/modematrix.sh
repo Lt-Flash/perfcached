@@ -1,28 +1,6 @@
 #!/bin/sh
-# modematrix.sh — every collection mode, measured the same way, through
-# a REAL client, plus a node failure in each.
-#
-# The load generator is mmclient, which drives libperfd: it learns the
-# fleet, holds standby connections, and can route each key to its owner.
-# Every mode is therefore measured TWICE - once as a plain client that
-# talks to one node, once cluster-aware - because on shard the
-# difference is the whole story, and on proxy there is deliberately
-# none.  One operation at a time: an application's latency is per
-# request, and pipelining hides exactly the round trip this exposes.
-#
-# Also measured per mode: where the keys landed, per-node memory (a
-# single node's arena says nothing about a mode that spreads), whether
-# the fleet converged, what a read costs on a node that did NOT write
-# the data (100% GET with the fill skipped, through node 2), and what
-# killing the node that HOLDS the data costs - read back through a
-# survivor, with the victim's death asserted, because a failure test
-# that cannot fail proves nothing.
-#
-# Every figure for a mode comes from ONE run of that mode, in the order
-# written here.  Mixing runs is how a page ends up claiming a throughput
-# from one fleet and a key census from another.
-#
-# usage: bench/modematrix.sh [./perfcached] [./mmclient] [./perfcli]
+# modematrix.sh - every collection mode through mmclient (libperfd), plain and cluster-aware, one op at
+# a time; plus placement, memory, a cross-node read and a holder kill, all from ONE run per mode.
 set -u
 
 BIN=${1:-./perfcached}
@@ -36,11 +14,8 @@ P1= P2= P3=
 
 rm -rf "$D"; mkdir -p "$D"
 
-# PROVENANCE.  The numbers are only worth as much as the build that
-# produced them, so stamp the BINARY's revision (not the tree's - they
-# differ the moment you run an older binary against a newer checkout)
-# and refuse to run one that cannot name itself.  An unstamped build is
-# how a page ends up quoting figures nobody can reproduce.
+# stamp the BINARY's revision (not the tree's) and refuse one that cannot name itself: an unstamped
+# build yields figures nobody can reproduce
 BINREV=$("$BIN" -V 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')
 if [ -z "$BINREV" ] || [ "$BINREV" = unknown ]; then
 	echo "MODEMATRIX: refusing to measure an unstamped build ($BINREV) - \
@@ -51,9 +26,8 @@ fi
 trap 'for v in "$P1" "$P2" "$P3"; do [ -n "$v" ] && kill -9 $v 2>/dev/null; \
      done' EXIT TERM INT
 
-# PORT PRE-FLIGHT: SO_REUSEPORT means a fleet left behind by an
-# interrupted run binds ALONGSIDE this one rather than failing, and the
-# kernel then splits requests between two unrelated fleets.  Refuse.
+# SO_REUSEPORT lets a fleet left by an interrupted run bind ALONGSIDE this one, and the kernel then
+# splits requests between the two: refuse
 ports_free() { # ports_free <port>...
 	for pf in "$@"; do
 		if ss -ltn 2>/dev/null | grep -q ":$pf[[:space:]]"; then
@@ -135,22 +109,13 @@ run_mode() { # run_mode <label> <cluster-block>
 	start_fleet "$2"
 
 	# --- the same work twice: plain client, then cluster-aware ------
-	# Two runs per mode on ONE wire.  There used to be four - each of
-	# the daemon's two dialects x plain/cluster-aware - but since S317
-	# the data verbs ride their fixed-layout frames and nothing else, so
-	# the wire column measured a dialect that no longer exists.  What
-	# is left is the cluster cost: a forwarded op against a routed one.
-	# mmclient's ninth argument is the old wire slot, accepted and
-	# ignored; it is passed as 0 so the tenth (nofill) keeps its place.
+	# mmclient's ninth argument (an old wire slot) is ignored; 0 keeps the tenth (nofill) in place
 	drive() { # drive <route>
 		"$MM" "$(addr 1)" "$(port 1)" "$SECRET" c "$KEYS" "$VAL" 90 \
 			"$1" 0 2>>"$D/$LABEL.err"
 	}
-	# Forwards attributable to THIS run, not the mode's lifetime total.
-	# The claim "routing removes the hop" needs the plain and the routed
-	# run counted separately; a single lifetime total cannot show it, and
-	# quoting one from a side experiment is how the page ended up with a
-	# forward count nothing could reproduce.
+	# forwards attributable to THIS run, not the mode's lifetime total, so the plain and routed runs
+	# are counted separately
 	fwdtot() {
 		tf=0
 		for n in 1 2 3; do
@@ -164,12 +129,8 @@ run_mode() { # run_mode <label> <cluster-block>
 		fb=$(fwdtot)
 		echo "$od fwdrun=$((fb - fa))"
 	}
-	# WARM-UP, discarded.  The first fill into a proxy collection pays
-	# probe-before-place on every key, so an unwarmed first run reads
-	# ~2.5x slower than the ones after it - measured with routing OFF
-	# throughout, so it is the locator warming and nothing else.  Left
-	# in, it would have shown up as a routing benefit that does not
-	# exist (proxy is not routed at all).
+	# warm-up, discarded: the first fill into a proxy collection pays probe-before-place on every key
+	# and reads ~2.5x slower, which would pass for a routing benefit
 	drive 0 >/dev/null 2>&1
 
 	PLAIN=$(drivef 0); ROUTED=$(drivef 1)
@@ -207,12 +168,7 @@ run_mode() { # run_mode <label> <cluster-block>
 	done
 
 	# --- cross-node read: the cost on a node that did NOT write ------
-	# 100% GET with the fill SKIPPED, so it reads the keyspace node 1
-	# wrote.  Ordering is deliberate: after placement and vitals, so it
-	# cannot distort them, and before the kill, because in store mode
-	# what this pulls onto node 2 is exactly what node 2 still has when
-	# node 1 dies - the two rows have to be read together.
-	# (route=0, the ignored ninth slot, nofill=1)
+	# fill skipped (nofill=1); after the vitals and before the kill, whose store row it explains
 	XR=$("$MM" "$(addr 2)" "$(port 2)" "$SECRET" c "$KEYS" "$VAL" 100 0 0 1 \
 		2>>"$D/$LABEL.err")
 	echo "  xnode read via node2: $XR" >&2
@@ -220,13 +176,8 @@ run_mode() { # run_mode <label> <cluster-block>
 	# --- failure: kill the node that HOLDS the data -----------------
 	VICTIM=$P1
 	kill -9 $P1 2>/dev/null; P1=
-	# WAIT FOR THE FLEET TO NOTICE - do not guess.  PEER_PURGE_MS is
-	# 6000, so the fixed `sleep 6` this replaces sat exactly on the
-	# detection boundary: proxy reported "writes still accepted" in one
-	# run and "refused" in the next, from the same code, because the
-	# sample landed on either side of the purge.  Poll the survivor's
-	# own membership view and record how long it took, so the degraded
-	# columns describe the steady state rather than the race.
+	# wait for the survivor's membership view to drop the victim, and record how long: a fixed sleep sat
+	# on PEER_PURGE_MS and sampled either side of the purge
 	DET=""; t=0
 	while [ $t -lt 30 ]; do
 		M=$(members 2)
@@ -245,21 +196,14 @@ is meaningless" >&2
 	else
 		DEAD=yes
 	fi
-	# HOW MUCH DATA SURVIVED - read the ORIGINAL keyspace through a
-	# survivor with the fill SKIPPED.  The previous version let mmclient
-	# fill first and then read back the 200 keys it had just written,
-	# which reports 0 lost for EVERY mode including shard, where a third
-	# of the keyspace had certainly gone.  A test that writes what it is
-	# about to read cannot measure loss - the same defect this harness
-	# already fixed once by killing the holder instead of an idle node.
+	# how much data survived: the ORIGINAL keyspace read through a survivor with the fill skipped
+	# (a test that writes what it is about to read cannot measure loss)
 	SURV=$("$MM" "$(addr 2)" "$(port 2)" "$SECRET" c "$KEYS" "$VAL" 100 0 0 1 \
 		2>>"$D/$LABEL.err")
 	MISS=$(field "$SURV" missed)
 	[ -n "$MISS" ] || MISS="?"
-	# ...and, separately, whether the degraded fleet still takes a write
-	# at all.  A FRESH key, so that no locator left over from before the
-	# kill points it at the dead node, and read back rather than trusted:
-	# assert the effect, not the reply.
+	# ...and whether the degraded fleet still takes a write: a FRESH key (no stale locator points it at
+	# the dead node), read back rather than trusted
 	"$CLI" -h "$(addr 2)" -p "$(port 2)" -a "$SECRET" \
 		-j '{"method":"set","params":{"col":"c","key":"pc-afterkill","value":"alive"}}' \
 		>/dev/null 2>&1

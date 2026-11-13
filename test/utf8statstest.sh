@@ -1,18 +1,6 @@
 #!/bin/sh
-# utf8statstest.sh - S182: /stats is valid UTF-8 whatever a client stores.
-#
-# JSON text must be valid UTF-8 (RFC 8259).  pc_jw_str escapes quotes,
-# backslashes and control bytes and passes everything from 0x20 up
-# through raw, which is right for a string the daemon composed and wrong
-# for one carrying CLIENT bytes: the slow log keeps up to four arguments
-# of the command it sampled, and a client row keeps the name the client
-# announced.  Store a binary value, have that command sampled as slow,
-# and the WHOLE of /stats stops parsing - a monitoring integration is
-# exactly the strict reader that breaks.  Seen on the fleet 2026-09-20.
-#
-# Fail-first: with pc_jw_str in those fields, python's utf-8 decoder
-# fails on the /stats body at the slow log's argv.
-# Usage: test/utf8statstest.sh [./perfcached]
+# utf8statstest.sh - /stats is valid UTF-8 (RFC 8259) whatever a client stores: client bytes in the slow
+# log's argv and client names must be escaped, or the whole body stops parsing.
 set -u
 
 BIN=${1:-./perfcached}
@@ -91,11 +79,8 @@ except Exception as ex:
 
 sl = st.get("slowlog") or []
 (ok if sl else bad)("the slow log captured the commands (%d entries)" % len(sl))
-# the replacement character is the POINT: the bytes are shown as
-# unrepresentable rather than dropped or passed through raw
-# Checked in the RAW body: a decode with errors="replace" manufactures
-# U+FFFD by itself, so asking the decoded text would pass on the
-# broken build too - the instrument must be able to fail.
+# the replacement character is the point (shown, not dropped or passed raw), checked
+# in the RAW body: a decode with errors="replace" would make U+FFFD by itself
 (ok if b"\\ufffd" in raw else bad)(
     "the DAEMON escaped them as \\ufffd - a broken build emits the raw byte")
 

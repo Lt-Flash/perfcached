@@ -1,23 +1,6 @@
 #!/bin/sh
-# spreadcoldtest.sh - S156: a spread node that comes back EMPTY must end
-# up holding its share of the keyspace, not all of it.
-#
-# Measured before this existed (2026-09-15, three nodes, K=2, 3,000
-# keys): the returning node was streamed the boot sender's WHOLE store
-# and then the other holder's set-repair added the rest - 3,000 of 3,000
-# within 18 s, fleet 7,006 where K x N is 6,000 - and the reclaim pass
-# trimmed the surplus at 64 keys a sweep.  The boot pull (bulk_serve_boot
-# / boot_cb) streamed every record of every eager collection with no
-# regard for who holds what under spread.
-#
-# THE CLAIM: after a cold restart and settle, the returning node holds
-# about its share (2/3 of N at K=2, P=3), the fleet holds about K x N,
-# and every key is still readable through the returning node - the fix
-# must not buy the bound with data.  Eager is the control: the same
-# restart under eager must still hand the node EVERYTHING, or the scope
-# leaked into the mode that has no shares.
-#
-# Usage: test/spreadcoldtest.sh [./perfcached]
+# spreadcoldtest.sh - a spread node back EMPTY ends up with its share (about 2/3 of N at K=2), not all of
+# it, every key still readable through it; eager, the control, still hands it everything.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

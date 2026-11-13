@@ -1,13 +1,6 @@
 #!/bin/sh
-# prototest.sh — S7 verification: the native door end to end over a live
-# daemon, one protocol (S317: the JSON-RPC text dialect is gone).
-# CMD frames: ping round-trip, pipelined replies matched by id, raw bytes
-# (NUL, 0xFF, quotes, control bytes) ride a bulk untouched, error frames
-# that keep the connection usable (unknown method, malformed tree, missing
-# method), the first-byte rule (a letter is RESP; anything that is neither
-# a frame nor RESP gets the one-line refusal and the close), oversize
-# frame teardown.  Fixed-layout verbs: framed ping echo (NULs included),
-# pipelining, unknown-verb error flag.  Usage: test/prototest.sh [./perfcached]
+# prototest.sh - the native door end to end over a live daemon: CMD frames, raw bytes in bulks, error
+# frames that keep the connection, the first-byte rule, oversize teardown, fixed-layout verbs.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -185,15 +178,15 @@ check("invalid request + recovery",
       rs[3][2]["pong"] is True)
 s.close()
 
-# 9. RED: the first-byte rule.  A LETTER first byte is a RESP inline
-# command (S29, the netcat leg), so a typed typo answers -ERR loudly.
+# 9. RED: the first-byte rule - a LETTER first byte is a RESP inline command, so a
+# typed typo answers -ERR loudly
 s = conn()
 s.sendall(b"XYZZY\n")
 check("letter sniff answers RESP -ERR",
     s.recv(64).startswith(b"-ERR unknown command 'XYZZY'"))
 s.close()
 # A byte that is neither a frame nor RESP is told so in one plain line,
-# then the connection is closed (S317): true garbage...
+# then the connection is closed: true garbage...
 s = conn()
 s.sendall(b"\x01\x02\x03\n")
 got = read_all(s)

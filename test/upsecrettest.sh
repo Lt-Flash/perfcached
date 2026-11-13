@@ -1,19 +1,6 @@
 #!/bin/sh
-# upsecrettest.sh - S383 (0.6.1): the upstream's password belongs to the
-# read-through collection (`upstream_password`), so one perfcached fronts
-# several Redis servers, each with its own - reached by its clients through
-# the one server.  Two fakes (test/fakeupstream.py), each with its own
-# password; three collections over RESP (SELECT 0, 1, 2):
-#   ca -> fake A with A's password, cb -> fake B with B's, cc -> fake A
-#   with a WRONG password.
-#  1. ca reads A's value, cb reads B's - each with its own password
-#  2. cc's AUTH is refused by A: its read answers an error, the log says so
-#  3. no password is in the log, /stats, /metrics or the -E dump
-#  4. config: [secrets] upstream is refused, saying where it moved; an
-#     upstream_password without an upstream, or empty, is refused
-#  and nothing is written to either fake.
-# Fail-first: 0.6.0.1 refuses upstream_password as an unknown key.
-# Usage: test/upsecrettest.sh ./perfcached
+# upsecrettest.sh - the upstream password belongs to each read-through collection: one daemon fronts
+# several Redis servers with their own; a wrong one is refused, and none reaches a log or /stats.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -110,8 +97,7 @@ if grep -q "perfcached ready" "$D/n.log"; then
 	grep -q "upstream cc: AUTH refused by 127.0.0.1:$PA" "$D/n.log" && ok "2. the log says A refused cc's AUTH" ||
 		bad "2. log: $(grep -m2 -i 'auth' "$D/n.log")"
 	curl -s "http://127.0.0.1:$HTTP/stats" > "$D/stats.json" 2>/dev/null
-	# S407 part 3: the page is static now (pagedump's, no data in it); the
-	# data surfaces the daemon serves are /stats and /metrics
+	# the page is static (no data in it); the data surfaces the daemon serves are /stats and /metrics
 	curl -s "http://127.0.0.1:$HTTP/metrics" > "$D/metrics.txt" 2>/dev/null
 	kill $PID 2>/dev/null; wait $PID 2>/dev/null; PID=
 else

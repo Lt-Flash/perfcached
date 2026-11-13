@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * rdb.c — the RDB snapshot (task S14).  See rdb.h.
- */
+/* rdb.c - the RDB snapshot.  See rdb.h. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,16 +29,14 @@ static struct {
 	volatile int save_req;
 	volatile int running;
 	unsigned long long saves, last_bytes, last_marker, seq_at_last;
-	/* the marker of the last COMPLETED snapshot - last_marker is
-	 * stamped at walk start and must not gate WAL recycling until the
-	 * rename lands */
+	/* the marker of the last COMPLETED snapshot: last_marker is stamped at walk start and must
+	 * not gate WAL recycling until the rename lands */
 	unsigned long long safe_marker;
-	unsigned long long save_errors;    /* S215 */
+	unsigned long long save_errors;
 	long long last_dur_ms, last_unix, last_save_mono_s;
-	long long retry_after_s;           /* S215: a failed save backs off */
-	/* S229: when the last COMPLETED snapshot started (monotonic us) - a
-	 * heal needs one that began after its losses, not one already
-	 * running when they happened - and an urgent request's flag */
+	long long retry_after_s;           /* a failed save backs off */
+	/* when the last COMPLETED snapshot started (monotonic us), as a heal needs one begun after
+	 * its losses; and an urgent request's flag */
 	long long last_start_us;
 	volatile int urgent;
 } R;
@@ -82,9 +78,8 @@ static void wr_flush(struct wr *w)
 		off += (size_t)r;
 	}
 	w->n = 0;
-	/* the rate limiter: sleep off any budget deficit.  Granularity is
-	 * one buffer (64K); the walk callback may hold the overflow lock
-	 * while we sleep - bounded by 64K/budget, accepted and documented */
+	/* the rate limiter sleeps off any budget deficit, a 64K buffer at a time; the walk callback
+	 * may hold the overflow lock meanwhile, bounded by 64K/budget */
 	if (w->budget > 0) {
 		double ahead = (double)w->total -
 			w->budget * ((double)(mono_us() - w->t0) / 1e6);
@@ -135,7 +130,7 @@ struct walk_ctx {
 	unsigned int now_ticks;
 	uint64_t now_wall;
 	long written;
-	pcache_htable_t *other;        /* S453: a draining resize's other table */
+	pcache_htable_t *other;        /* a draining resize's other table */
 	int other_old;                 /* it is the old one: only a NEWER copy wins */
 };
 
@@ -152,7 +147,7 @@ static int walk_cb(const str *key, const str *val,
 			return 0;                  /* expired: skip at write time */
 		wall = c->now_wall + (mt->expires - c->now_ticks);
 	}
-	/* S453: of a key's two copies only the newer is written - the loader
+	/* of a key's two copies only the newer is written - the loader
 	 * keeps whichever comes last */
 	if (c->other) {
 		unsigned long long ov;
@@ -166,7 +161,7 @@ static int walk_cb(const str *key, const str *val,
 	put32(c->w, (uint32_t)val->len);
 	put64(c->w, wall);
 	put64(c->w, mt->ver);
-	put8(c->w, (uint8_t)(mt->rflags & PCACHE_F_CARRY));   /* S280 */
+	put8(c->w, (uint8_t)(mt->rflags & PCACHE_F_CARRY));
 	wr_put(c->w, key->s, (size_t)key->len);
 	wr_put(c->w, val->s, (size_t)val->len);
 	c->written++;
@@ -187,9 +182,8 @@ static int rdb_save(void)
 	snprintf(fin, sizeof fin, "%s/" PC_RDB_FILE, R.dir);
 	w.fd = open(tmp, O_CREAT | O_EXCL | O_WRONLY, 0600);
 	if (w.fd < 0 && errno == EEXIST) {
-		/* RV-14: our own name, from a snapshot a previous process with
-		 * this pid did not finish - dead by definition, since only one
-		 * save runs at a time here.  Once, then as before. */
+		/* our own name, from a snapshot a previous process with this pid did not finish -
+		 * dead, as only one save runs at a time here */
 		LM_WARN("rdb: %s exists - a dead snapshot's temp under this "
 			"pid; removing it\n", tmp);
 		unlink(tmp);
@@ -205,7 +199,7 @@ static int rdb_save(void)
 	/* the consistency marker: the WAL sequence at WALK START */
 	pc_wal_get_stats(&ws);
 	R.last_marker = ws.last_seq;
-	/* 12ny AT-3b: and the marks applied by now - the walk below sees
+	/* and the marks applied by now - the walk below sees
 	 * every delete they count (ackstate.h) */
 	pc_ack_capture();
 
@@ -218,19 +212,19 @@ static int rdb_save(void)
 	ctx.now_ticks = get_ticks();
 	ctx.now_wall = (uint64_t)time(NULL);
 	ctx.written = 0;
-	pc_qs_enter();                     /* S150 B: a table in hand per walk */
+	pc_qs_enter();                     /* a table in hand per walk */
 	for (i = 0; i < pc_store_count() && !w.failed; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		if (!pc_store_durable_idx(i))
-			continue;   /* G5: a cache collection - never in the snapshot */
+			continue;   /* a cache collection - never in the snapshot */
 		const char *name = pc_store_name(i);
 		pcache_htable_t *live, *old;
 
 		put8(&w, 1);
 		put8(&w, (uint8_t)strlen(name));
 		wr_put(&w, name, strlen(name));
-		/* S453: a resize still draining holds records the live table has
+		/* a resize still draining holds records the live table has
 		 * not taken yet - their WAL records are below the marker */
 		pc_store_walk_begin(i, &live, &old);
 		if (old) {
@@ -266,7 +260,7 @@ static int rdb_save(void)
 		unlink(tmp);
 		return -1;
 	}
-	/* S215: NFS and friends report write-back errors at close */
+	/* NFS and friends report write-back errors at close */
 	if (close(w.fd) != 0) {
 		LM_ERR("rdb: close failed (%s)\n", strerror(errno));
 		unlink(tmp);
@@ -278,25 +272,8 @@ static int rdb_save(void)
 		unlink(tmp);
 		return -1;
 	}
-	/* the crash-safe half of rotation: the DIRECTORY entry must be
-	 * durable too (NFS rename semantics included) */
-	/*
-	 * S215: and if it is NOT, the snapshot is not published.  The sync
-	 * was unchecked, an open() failure skipped it in silence, and
-	 * safe_marker moved either way - the value the WAL consults before
-	 * it overwrites a segment.  So a rename that never reached the disk
-	 * licensed the WAL to destroy the only other copy of those records.
-	 *
-	 * The renamed file stays where it is: it is complete and
-	 * checksummed, and after a crash the directory holds it or its
-	 * predecessor - either of which the WAL, still holding everything
-	 * past the OLD marker, can top up.  Not a node failure: nothing
-	 * acknowledged is lost while the WAL keeps its segments, and if it
-	 * runs out of them the overrun rule fails the node on its own
-	 * evidence.  A later snapshot publishes normally: its rename
-	 * re-dirties the directory, so its sync speaks for the directory as
-	 * it then is.
-	 */
+	/* the DIRECTORY entry must be durable too, or the snapshot is not published (safe_marker
+	 * frees WAL segments); the renamed, complete file stays for a later save */
 	dirfd = open(R.dir, O_RDONLY | O_DIRECTORY);
 	if (dirfd < 0 || fsync(dirfd) != 0) {
 		LM_ERR("rdb: the snapshot was written but its directory "
@@ -312,24 +289,19 @@ static int rdb_save(void)
 
 	R.saves++;
 	R.safe_marker = R.last_marker;  /* coverage is real only now */
-	/* 12ny AT-3b: the marks that go with it.  Not a failed save - the
-	 * snapshot is published; a restart without them rebuilds its marks
-	 * from the replay alone, lower */
+	/* the marks that go with it; failing them is not a failed save - a restart rebuilds its
+	 * marks from the replay alone, lower */
 	if (pc_ack_save(R.dir, R.last_marker) != 0)
 		LM_WARN("rdb: the watermarks for marker %llu could not be "
 			"written beside the snapshot (%s) - a restart counts "
 			"its deletes from the WAL alone\n", R.last_marker,
 			strerror(errno));
 	R.last_bytes = w.total;
-	/* only a snapshot written at the budget says how long the NEXT one
-	 * will take - which S224's rate trigger, RV-13's warning and RV-12's
-	 * alert all ask.  An unthrottled one (a heal's, a clean stop's) took
-	 * 5 ms on tmpfs where the budgeted one took 3 s, and after a heal all
-	 * three believed snapshots were free: the trigger fired late, inviting
-	 * the next overrun and the next heal. */
+	/* only a snapshot written at the budget says how long the NEXT takes (the rate trigger, its
+	 * warning and alert ask); an unthrottled one would read as free */
 	if (R.budget_mb_s > 0)
 		R.last_dur_ms = (mono_us() - t0) / 1000;
-	R.last_start_us = t0;              /* S229: every save, the heal's too */
+	R.last_start_us = t0;              /* every save, the heal's too */
 	R.last_unix = (long long)time(NULL);
 	R.seq_at_last = ws.last_seq;
 	R.last_save_mono_s = mono_us() / 1000000;
@@ -341,9 +313,6 @@ static int rdb_save(void)
 
 /* ---- triggers + the thread body ---------------------------------------- */
 
-/* the longest rule interval = the worst-case gap between snapshots,
- * i.e. how much WAL must fit between them (the sizing verb's basis);
- * 0 = no automatic snapshots configured */
 /* the WAL-recycle boundary: everything at or below this seq is inside
  * the last COMPLETED snapshot; 0 = no snapshot has completed yet */
 unsigned long long pc_rdb_safe_marker(void)
@@ -351,24 +320,16 @@ unsigned long long pc_rdb_safe_marker(void)
 	return R.safe_marker;
 }
 
-/*
- * S334: until this process completed a snapshot of its own, the safe
- * marker read 0 - and the post-recovery checkpoint, which sets it, runs
- * only when recovery brought records back.  An EMPTY node therefore
- * started every time with marker 0 while the snapshot it had just loaded
- * covered the WAL's old records, and once its restarts had cycled
- * through every segment, pc_wal_init found the oldest one "holding seqs
- * NEWER than the last completed snapshot", called the WAL full and
- * FAILED the node (PROD AU, 0.5.6 roll: generation 9 of 8 segments,
- * seqs 1..1 under the loaded snapshot's marker 6).  The snapshot on disk
- * is a completed one; what it covers is covered.
- */
+/* a loaded snapshot is a completed one, so its marker seeds the safe marker: an EMPTY node would
+ * otherwise restart at 0 until its WAL, cycled through, read as full and FAILED it */
 void pc_rdb_seed_marker(unsigned long long marker)
 {
 	if (marker > R.safe_marker)
 		R.safe_marker = marker;
 }
 
+/* the longest rule interval: the worst-case gap between snapshots, how much WAL must fit between
+ * them (the sizing verb's basis); 0 = no automatic snapshots configured */
 int pc_rdb_max_interval_s(void)
 {
 	int i, mx = 0;
@@ -379,16 +340,8 @@ int pc_rdb_max_interval_s(void)
 	return mx;
 }
 
-/*
- * RV-14: a snapshot killed mid-write leaves its temp file, and nothing
- * removed it: another table-sized file on the WAL's volume for every
- * such crash.  Worse, the name is PC_RDB_FILE.tmp.<pid>, opened O_EXCL, so
- * a daemon that comes back with the SAME pid - every time, in a container,
- * where it is pid 1 - found its own name taken and could not write a
- * snapshot again: every save failed, and since S229 every heal with it.
- * Nothing else writes in this directory, so every temp file here at
- * start is a dead one.
- */
+/* every temp file here at start is a dead snapshot's (nothing else writes here): each costs a
+ * table's size, and a same-pid restart (pid 1 in a container) would find its O_EXCL name taken */
 static void rdb_sweep_temps(const char *dir)
 {
 	static const char pfx[] = PC_RDB_FILE ".tmp.";
@@ -419,7 +372,7 @@ int pc_rdb_init(const char *dir, const struct pc_rdb_rule *rules,
 		int nrules, int max_mb_s, double probe_mb_s)
 {
 	snprintf(R.dir, sizeof R.dir, "%s", dir);
-	rdb_sweep_temps(R.dir);            /* RV-14 */
+	rdb_sweep_temps(R.dir);
 	if (nrules > PC_RDB_MAX_RULES)
 		nrules = PC_RDB_MAX_RULES;
 	memcpy(R.rules, rules, (size_t)nrules * sizeof *rules);
@@ -461,18 +414,14 @@ void pc_rdb_thread(volatile int *stop)
 					break;
 				}
 		}
-		/* S215: a failed save left last_save_mono_s where it was, so
-		 * the rule stayed satisfied and the whole table was walked
-		 * again 250 ms later, for as long as the device was broken.
-		 * A rule waits out the back-off; an operator's `save` does
-		 * not. */
+		/* a failed save leaves its rule satisfied, so a rule waits out the back-off rather
+		 * than walk the table every 250 ms; an operator's `save` does not wait */
 		if (fire && !R.save_req &&
 		        mono_us() / 1000000 < R.retry_after_s)
 			fire = 0;
 		if (fire) {
-			/* S229: a heal's snapshot is unthrottled, as a clean
-			 * stop's is (S222) - the node refuses writes until it
-			 * lands, so the budget's courtesy to the WAL buys nothing */
+			/* a heal's snapshot is unthrottled, as a clean stop's: the node refuses
+			 * writes until it lands, so the budget buys nothing */
 			int urgent = R.urgent;
 			double budget = R.budget_mb_s;
 
@@ -516,13 +465,12 @@ int pc_rdb_save_sync(void)
 	if (rc != 0)
 		R.save_errors++;
 	if (rc == 0)
-		pc_store_persist();   /* S69: see the note on pc_store_rename */
+		pc_store_persist();   /* see the note on pc_store_rename */
 	return rc;
 }
 
-/* S229: a snapshot the WAL's heal waits for - unthrottled, and asked for
- * even while one runs: that one started before the losses it must cover,
- * so the next pass takes another */
+/* a snapshot the WAL's heal waits for: unthrottled, and asked for even while one runs (that one
+ * began before the losses it must cover, so the next pass takes another) */
 void pc_rdb_request_urgent(void)
 {
 	R.urgent = 1;
@@ -559,11 +507,11 @@ void pc_rdb_get_stats(struct pc_rdb_stats *out)
 	out->save_errors = R.save_errors;
 	out->last_dur_ms = R.last_dur_ms;
 	out->last_unix = R.last_unix;
-	out->last_start_us = R.last_start_us;      /* S229 */
+	out->last_start_us = R.last_start_us;
 	out->last_age_s = R.saves ? mono_us() / 1000000 - R.last_save_mono_s : -1;
 }
 
-/* ---- validate (tests, -R; S15 builds the loader on this walk) ---------- */
+/* ---- validate (tests, -R; the loader builds on this walk) -------------- */
 
 static uint32_t rd32(const unsigned char *p)
 {
@@ -606,7 +554,7 @@ long pc_rdb_validate(const char *dir, unsigned long long *marker,
 
 	fmt = rd32(data + 4);
 	if (rd32(data) == PC_RDB_MAGIC && fmt > PC_RDB_FMT) {
-		/* UP3: written by a newer build - not damage, and named so */
+		/* written by a newer build - not damage, and named so */
 		*why = "newer-format";
 		goto bad;
 	}

@@ -1,14 +1,5 @@
-/*
- * clhisttest.c — the identity history (step 3b).
- *
- * It answers "have we seen this node before", which is what separates
- * STARTING from RECOVERING - and which the node itself cannot answer,
- * since one whose state directory was wiped sincerely believes it is
- * new.  The tests cover the two ways that answer goes wrong: losing it
- * across a promotion, and letting it grow without bound.
- *
- * Build: cc -o clhisttest test/clhisttest.c src/clhist.o
- */
+/* clhisttest.c - the identity history that tells STARTING from RECOVERING: kept across a promotion
+ * to the backup, bounded with least-recently-seen eviction, duplicates refused. */
 #include <stdio.h>
 #include <string.h>
 

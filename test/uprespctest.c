@@ -1,19 +1,5 @@
-/* uprespctest.c - the upstream's RESP reply parser (uprespc.c; the 0.7.2
- * split, wave 1): one RESP2 or RESP3 reply from a buffer, as the upstream
- * connections read them.
- *
- *   A  the scalars: simple string, error, integer, bulk, RESP2's null bulk,
- *      RESP3's null, double / big number / boolean as text, verbatim (its
- *      "txt:" prefix dropped); is_ok
- *   B  the aggregates: array, map (two elements an entry), set, push (the
- *      invalidation tracking sends), an attribute skipped for the value it
- *      annotates, a null array
- *   C  incomplete input - a split line, a short bulk, an aggregate missing
- *      an element - is "need more" (0) with the position unmoved; one
- *      buffer holding two replies parses them in turn
- *   D  what is refused: a line without its CR, nesting past 8, a bulk
- *      larger than this thread's rv_max (-3, and it resumes at the default)
- */
+/* uprespctest.c - the upstream's RESP reply parser (uprespc.c): one RESP2 or RESP3 reply from a
+ * buffer, as the upstream connections read them. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/uprespc.h"
@@ -44,7 +30,7 @@ int main(void)
 	size_t pos;
 	int rc;
 
-	/* A */
+	/* A: scalars - string, error, integer, bulk, both nulls, double/bignum/boolean, verbatim */
 	rc = parse("+OK\r\n", &pos, &v);
 	CHK(rc == 1 && v.t == '+' && str_is(&v, "OK") && pos == 5 && is_ok(&v),
 		"A: +OK - a simple string, and is_ok");
@@ -75,7 +61,7 @@ int main(void)
 	CHK(rc == 1 && v.t == '=' && str_is(&v, "abcd") && pos == 14,
 		"A: =8 txt:abcd - verbatim, the format prefix dropped");
 
-	/* B */
+	/* B: aggregates - array, map, set, push, an attribute skipped, a null array */
 	rc = parse("*2\r\n$1\r\na\r\n:7\r\n", &pos, &v);
 	CHK(rc == 1 && v.t == '*' && v.n == 2 && v.nel == 2 &&
 		str_is(&v.el[0], "a") && v.el[1].t == ':' && v.el[1].n == 7,
@@ -101,7 +87,7 @@ int main(void)
 	rc = parse("*-1\r\n", &pos, &v);
 	CHK(rc == 1 && v.t == '_' && pos == 5, "B: *-1 - a null array reads as null");
 
-	/* C */
+	/* C: incomplete input is "need more" (0), position unmoved; two replies parse in turn */
 	rc = parse("+OK", &pos, &v);
 	CHK(rc == 0 && pos == 0, "C: a line without its end is need-more, the position unmoved");
 	rc = parse("$5\r\nhel", &pos, &v);
@@ -121,7 +107,7 @@ int main(void)
 		CHK(rc == 0 && p == 9, "C: then need-more");
 	}
 
-	/* D */
+	/* D: refused - a line without CR, nesting past 8, a bulk over this thread's rv_max (-3) */
 	rc = parse("+OK\n", &pos, &v);
 	CHK(rc == -1, "D: a line without its CR is malformed");
 	rc = parse("*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n:1\r\n",

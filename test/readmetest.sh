@@ -1,10 +1,6 @@
 #!/bin/sh
-# readmetest.sh - the README's status names the version being built, and
-# the ChangeLog has a release banner for it.  A status that says "release
-# candidate 16" while version.h says rc17 is the drift a reader punishes
-# with distrust; this makes it a red build instead (check-fast runs on
-# every push and gates a tag).  The README wraps at 72 columns, so the
-# status sentence is matched with its line breaks folded.
+# readmetest.sh - the README's status, the ChangeLog banner, the APKBUILD and libperfd's version all
+# agree with version.h (the README's 72-column wrap folded).
 set -u
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
@@ -35,19 +31,15 @@ if grep -qE "^=+ Release $V =+$" ChangeLog; then
 else
 	bad "ChangeLog has no 'Release $V' banner"
 fi
-# 0.7.1-rc1 (and 0.6.6 before it): the version commit missed the Alpine
-# APKBUILD - alpine-pkg-check names the tarball after version.h and abuild
-# found no source for the APKBUILD's older pkgver
+# the Alpine APKBUILD's pkgver must follow version.h: alpine-pkg-check names the tarball after it
 P=$(sed -n 's/^pkgver=//p' contrib/alpine/APKBUILD 2>/dev/null)
 if [ "$P" = "$V" ]; then
 	ok "contrib/alpine/APKBUILD pkgver is $V"
 else
 	bad "contrib/alpine/APKBUILD pkgver is '$P', version.h says $V"
 fi
-# libperfd's version - the dashboard's -V reports it: the drift reached v0.7.2-rc1
-# before anything said so (GitLab 111796 admin-image).  Said on every push from here
-# 0.7.4.1: a fourth number is the daemon's alone.  0.7.4.4-rc9, the operator: a client-only
-# fix may take libperfd ahead of the daemon's first three numbers, never behind them
+# libperfd's version (the dashboard's -V reports it): a client-only fix may take it ahead of the
+# daemon's first three numbers, never behind; a fourth number is the daemon's alone
 L=$(sed -n 's/^#define PERFD_VERSION "\(.*\)"/\1/p' lib/perfd.h 2>/dev/null)
 B=$(printf '%s' "$LINE" | cut -d. -f1-3)
 if [ -n "$L" ] && [ "$(printf '%s\n%s\n' "$B" "$L" | sort -V | head -n 1)" = "$B" ]; then
@@ -55,8 +47,8 @@ if [ -n "$L" ] && [ "$(printf '%s\n%s\n' "$B" "$L" | sort -V | head -n 1)" = "$B
 else
 	bad "lib/perfd.h PERFD_VERSION is '$L', version.h says $V - libperfd must be $B or later (the dashboard's -V reports libperfd's)"
 fi
-# the numeric defines build the version fact /members shows (UP1) - they
-# must spell PC_VERSION, the fourth number when it is not 0
+# the numeric defines build the version fact /members shows: they must spell PC_VERSION, the fourth
+# number when it is not 0
 vn() { sed -n "s/^#define PC_VERSION_$1 \([0-9]*\).*/\1/p" src/version.h; }
 N="$(vn MAJOR).$(vn MINOR).$(vn PATCH)"
 [ "$(vn TWEAK)" = 0 ] || N="$N.$(vn TWEAK)"

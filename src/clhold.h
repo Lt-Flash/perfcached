@@ -1,15 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clhold.h - S394's hold-check frames (clmsg.h M_HOLD_Q / M_HOLD_A): the
- * codec, as clpull is the pull's.  cluster.c keeps the batch, the pending
- * slots and the answers' outcomes; this writes and reads the bytes.  Pure,
- * any thread, no logging (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- *
- *   M_HOLD_Q  [type][node2][collen1][col][n2] + n x ([req4][klen2][key])
- *   M_HOLD_A  [type][node2][n2] + n x ([req4][held1][ver8])
- * Numbers big-endian.
- */
+/* clhold.h - the hold-check frames' codec (clmsg.h M_HOLD_Q / M_HOLD_A); cluster.c keeps the
+ * batch and the outcomes.  Pure, any thread, no logging; numbers big-endian. */
 #ifndef PC_CLHOLD_H
 #define PC_CLHOLD_H
 
@@ -21,7 +13,7 @@
 #define CLHOLD_A_HDR   5
 #define CLHOLD_A_ENTRY 13
 
-/* a query being written into @buf */
+/* M_HOLD_Q [type][node2][collen1][col][n2] + n x ([req4][klen2][key]), written into @buf */
 struct clhold_qw {
 	unsigned char *buf;
 	size_t cap, len, nat;              /* its length; where its count goes */
@@ -56,7 +48,8 @@ int clhold_q_open(struct clhold_qr *r, const unsigned char *p, size_t n);
 int clhold_q_next(struct clhold_qr *r, uint32_t *req, const char **key,
 		size_t *klen);
 
-/* answers: the header's length; one entry's end; the count written in */
+/* M_HOLD_A [type][node2][n2] + n x ([req4][held1][ver8]): the header's length; one entry's
+ * end; the count written in */
 size_t clhold_a_begin(unsigned char *buf, unsigned int node);
 size_t clhold_a_put(unsigned char *buf, size_t at, uint32_t req, int held,
 		unsigned long long ver);

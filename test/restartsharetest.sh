@@ -1,25 +1,6 @@
 #!/bin/sh
-# restartsharetest.sh - RV-4e: a shard, spread or proxy node restarting
-# from a SNAPSHOT plus a WAL TAIL, and holding only its share.
-#
-# RV-4's map (DESIGN 12gb): snapshots were exercised only in eager and on
-# single nodes; masterlosstest restarts shard and spread nodes from a WAL
-# alone, and proxy had no restart suite.  Per mode, three nodes with a
-# WAL (save = off: the ONLY snapshot is the one asked for):
-#   1. 600 keys a000-a599 through node 1, placed by the mode;
-#   2. a member (not the master) takes a snapshot (`save`), and then a
-#      TAIL lands after it: a000-a099 overwritten, a100-a149 deleted,
-#      b000-b199 new - the WAL made durable on every node (`sync`);
-#   3. kill -9 the member, restart it: its log must show BOTH halves -
-#      records from the snapshot and records applied from the WAL;
-#   4. once the master has ADMITTED the restarted node and every node
-#      routes by the same usable map (see admitted() below), within
-#      150 s: every key reads the same through all three nodes
-#      (a000-a099 the new value, a100-a149 absent, a150-a599 and b the
-#      value written), the fleet holds exactly K copies of each of the
-#      750 live keys (shard 1, spread 2, proxy 1), and the member holds
-#      exactly the share it held before the kill.
-# Usage: test/restartsharetest.sh [./perfcached]
+# restartsharetest.sh - a shard, spread or proxy node restarted from a snapshot plus a WAL tail serves every key
+# as its peers do and holds exactly its old share.  Usage: test/restartsharetest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -141,17 +122,8 @@ print(bad)
 PY
 }
 ent() { st $1 'c["entries"]'; }
-# admitted <V>: the restarted node is back IN THE FLEET, not merely up.
-# Its node state reads ready at once, but its cluster role stays
-# "joining" while the master holds the join: a fast restart and a clone
-# of its identity file are told apart by waiting for the old incarnation
-# to lapse (S108) - about 6 s after a kill -9, which sends no goodbye.
-# In that window the old incarnation leaves the map and the node's keys
-# can read absent through the other nodes.  Judging reads there judged
-# the hold, not the restart: GitHub failed the shard case twice (rc63,
-# 0.4.0), each time with the victim still "joining" at the final read.
-# So: the victim is a member (or master), and all three route by the
-# same usable map.
+# admitted <V>: the restarted node is back in the fleet, not merely up: a member (or master), all
+# three on the same usable map.  Until the old incarnation lapses (~6 s) its keys can read absent.
 admitted() {
 	case "$(st $1 'r["cluster"]["role"]')" in member|master) ;; *) return 1;; esac
 	m1=$(st 1 '"%s/%s" % (r["cluster"]["map"]["usable"], r["cluster"]["map"]["seq"])')
@@ -160,9 +132,7 @@ admitted() {
 	[ "$m1" = "$m2" ] && [ "$m2" = "$m3" ] && case "$m1" in True/*) return 0;; esac
 	return 1
 }
-# which map each node routes by, and what it logged about it, when reads
-# stay wrong (rc51 GitHub check-asan, shard: node 1 answered none of node
-# 2's 267 keys for 150 s after node 2's restart, nodes 2 and 3 all 800)
+# which map each node routes by, and what it logged about it, when reads stay wrong
 map_dump() {
 	for n in 1 2 3; do
 		echo "      node $n: $(st $n '"role %s, map %s, peers up %s, sync %s, state %s" % (r["cluster"].get("role"), json.dumps(r["cluster"].get("map")), sum(1 for p in r["cluster"]["peers"] if p.get("up")), json.dumps(r["cluster"].get("sync")), r.get("state"))')"
@@ -178,9 +148,8 @@ run() { # run <label> <K> <cluster lines> <collection lines>
 	ready3 || { bad "$1: the fleet did not form"; return; }
 	W=$(op 1 set a 0 600 v1)
 	sleep 3
-	# the victim: a member holding keys - the master is RV-4b's case - or,
-	# where placement put everything on one node (proxy fills the
-	# ingress first), that node whatever its role
+	# the victim: a member holding keys (the master is another suite's case) or, where placement put
+	# everything on one node, that node whatever its role
 	V=3; [ "$(st 3 'r["cluster"]["role"]')" = master ] && V=2
 	[ "$(ent $V)" = 0 ] && for n in 1 2 3; do [ "$(ent $n)" -gt 0 ] && V=$n; done
 	# 2: the snapshot, then the tail after it
@@ -220,8 +189,8 @@ run() { # run <label> <K> <cluster lines> <collection lines>
 		|| bad "$1: the fleet holds $S (want $((750 * $2))); node $V holds $(ent $V), held $EV before the kill"
 	P=$(cat "$D"/*.pid 2>/dev/null)
 	kill -9 $P 2>/dev/null
-	# a kill -9 lands when the node leaves its syscall: rc15 GitLab repl2's
-	# next arm found node 1's port still taken.  Reap each one first.
+	# a kill -9 lands when the node leaves its syscall: reap each one, or the next arm finds the port
+	# taken
 	for p in $P; do wait "$p" 2>/dev/null; done
 	rm -rf "$D"; D=
 }

@@ -1,11 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- *
- * clmig.c - the migration in-flight window.  See clmig.h.
- */
+ * clmig.c - the migration plane's window, gather buffer and wire codecs (see clmig.h). */
 #include <stdlib.h>
 #include <string.h>
 
-#include "clcodec.h"                 /* the shared LE codec - see M10 */
+#include "clcodec.h"                 /* the shared LE codec */
 #include "clmig.h"
 
 void clmig_reset(struct clmig *m)
@@ -35,9 +33,7 @@ uint16_t clmig_ack(struct clmig *m, uint32_t req)
 {
 	size_t j;
 
-	/* req 0 marks a free slot, so it can never name a real datagram;
-	 * without this an ack carrying 0 would retire the first free slot
-	 * and report its (zero) records as delivered. */
+	/* req 0 marks a free slot: an ack carrying 0 must not retire one */
 	if (!req)
 		return 0;
 	for (j = 0; j < sizeof m->out / sizeof m->out[0]; j++) {
@@ -188,7 +184,6 @@ void clmig_rec_write(unsigned char *p, const struct clmig_rec *r)
 	size_t body = (size_t)r->collen + r->klen + r->vlen;
 	struct pc_wcur c;
 
-	/* the header has ONE definition, and this is not it */
 	clmig_rec_hdr_write(p, r);
 	pc_wcur_init(&c, p + CLMIG_RHDR, body);
 	pc_wraw(&c, r->col, r->collen);
@@ -207,7 +202,6 @@ int clmig_rec_parse(const unsigned char *p, size_t n, size_t *off,
 	if (!pc_rfits(&c, CLMIG_RHDR))
 		return 0;
 	clmig_rec_hdr_parse(p + o, r);
-	/* truncated: stop the walk rather than read past the datagram */
 	if (o + CLMIG_RHDR + r->collen + r->klen + r->vlen > n)
 		return 0;
 	r->col = (const char *)p + o + CLMIG_RHDR;
@@ -232,7 +226,7 @@ unsigned int clmig_group_node(const unsigned char *g)
 	return pc_g16(g + 5);
 }
 
-/* ---- the frames the records travel in.  See clmig.h. -------------- */
+/* ---- the frames the records travel in ---------------------------------- */
 
 size_t clmig_group_hdr(unsigned char *buf, size_t cap, unsigned char type,
 		uint32_t req, int node, unsigned int count)
@@ -318,7 +312,6 @@ int clmig_ack_parse(const unsigned char *p, size_t n, uint32_t *req,
 		return 0;
 	*req = pc_ru32(&c);
 	*ok = pc_ru8(&c);
-	/* the count is an additive tail: an older peer sends six bytes */
 	*stored = pc_rfits(&c, 2) ? (unsigned int)pc_ru16(&c) : 0;
 	return 1;
 }

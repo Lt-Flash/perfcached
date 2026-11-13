@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* obs.c — see obs.h.  Formats here belong to Redis, not to us: the
- * Grafana Redis datasource parses them, so every emitter mirrors the
- * redis shape byte for byte. */
+/* obs.c - see obs.h.  The formats belong to Redis: the Grafana Redis datasource parses them,
+ * so every emitter mirrors the Redis shape byte for byte. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +16,12 @@
 #include "compat/timer.h"              /* get_ticks() */
 #include "compat/dprint.h"             /* LM_INFO for the query log */
 #include "obs.h"
-#include "resident.h"                   /* S265 */
-#include "clunk.h"                     /* S165 */
+#include "resident.h"
+#include "clunk.h"
 #include "fnv1a.h"                     /* the one FNV-1a */
 
 #define OBS_CMDS   64                  /* distinct command names per row */
-#define OBS_NAME   PC_OBS_NAME          /* S159: shared with obs.h */
+#define OBS_NAME   PC_OBS_NAME
 #define OBS_MERGE  (OBS_CMDS * 2)      /* merged rows a reader keeps */
 #define OBS_SLOWN  128                 /* slow entries per worker ring */
 #define OBS_ARGN   4                   /* argv kept per slow entry */
@@ -33,10 +32,9 @@ struct cmdrow {
 	char name[OBS_NAME];
 	unsigned int nlen;
 	unsigned long long calls, usec, max;
-	unsigned long long hist[PC_OBS_HIST];   /* S159/S183: latency buckets */
-	/* S194: one snapshot of the cumulative figures per minute, written
-	 * by the 1 Hz tick, plus a max per minute - the only one of the
-	 * three that cannot be recovered by subtraction. */
+	unsigned long long hist[PC_OBS_HIST];   /* latency buckets */
+	/* per-minute snapshots of the cumulative figures, plus a max per minute: the one figure
+	 * that cannot be recovered by subtraction */
 	unsigned long long s_calls[PC_OBS_WIN], s_usec[PC_OBS_WIN];
 	unsigned long long s_hist[PC_OBS_WIN][PC_OBS_HIST];
 	unsigned long long w_max[PC_OBS_WIN];
@@ -51,22 +49,22 @@ struct slowent {
 	int argc;                          /* real argc, pre-truncation */
 	char argv[OBS_ARGN][OBS_ARGLEN];
 	unsigned int arglen[OBS_ARGN];
-	char addr[48];
+	char addr[PC_ADDR_STRLEN];
 	char name[OBS_NAME];
 };
 
 struct connrow {
 	struct connrow *next, *prev;
 	unsigned long long id;
-	char addr[48];
+	char addr[PC_ADDR_STRLEN];
 	int fd, resp_only;
 	unsigned int created, last;        /* ticks */
 	char name[OBS_NAME];
 	unsigned int nlen;
 	char lastcmd[OBS_NAME];
 	unsigned int lastcmdlen;
-	unsigned long long cmds;           /* S70: requests this connection carried */
-	/* S160: for /clients */
+	unsigned long long cmds;           /* requests this connection carried */
+	/* for /clients */
 	const char *door, *dialect;        /* "native" | "resp" | "http"; dialect "?" until sniffed */
 	int encrypted;
 	size_t pending;                    /* bytes staged for the socket */
@@ -74,12 +72,12 @@ struct connrow {
 	/* CLIENT SETINFO: the client library's own name and version, what
 	 * identifies a client behind a proxy that hides its address */
 	char libname[OBS_LIB], libver[OBS_LIB];
-	int wk;                            /* S460: the worker counted for, 1..N; 0 none */
+	int wk;                            /* the worker counted for, 1..N; 0 none */
 };
 
 static int obs_rows;                   /* workers + 1 shared spare */
 static struct cmdrow *obs_cmds;        /* [obs_rows][OBS_CMDS] */
-/* S194: which minute slot the write path is filling, and when it began */
+/* which minute slot the write path is filling, and when it began */
 static unsigned int obs_win_slot;
 static unsigned int obs_win_at;
 static struct slowent *obs_slow;       /* [obs_rows][OBS_SLOWN] */
@@ -93,7 +91,7 @@ static struct connrow *obs_cl_head;
 static int obs_cl_n;
 static unsigned long long obs_cl_id;
 
-/* S165: a worker's unknown-command table, stale when its epoch is not
+/* a worker's unknown-command table, stale when its epoch is not
  * the current one (a reset bumps it, the owner clears on next write) */
 struct unkw {
 	unsigned int epoch;
@@ -110,7 +108,7 @@ static struct { unsigned char d, n; char name[CLUNK_NAME]; } obs_unk_seen[OBS_UN
 static int obs_unk_nseen, obs_unk_capped;
 
 static unsigned long long obs_prev_total;
-static int *obs_wkc, obs_nwk;         /* S460: live native connections per worker */
+static int *obs_wkc, obs_nwk;         /* live native connections per worker */
 static unsigned long long obs_inst;
 
 int pc_obs_init(int nworkers, long long slowlog_usec)
@@ -119,10 +117,10 @@ int pc_obs_init(int nworkers, long long slowlog_usec)
 	obs_cmds = calloc((size_t)obs_rows * OBS_CMDS, sizeof *obs_cmds);
 	obs_slow = calloc((size_t)obs_rows * OBS_SLOWN, sizeof *obs_slow);
 	obs_slowpos = calloc((size_t)obs_rows, sizeof *obs_slowpos);
-	obs_unk = calloc((size_t)obs_rows, sizeof *obs_unk);   /* S165 */
+	obs_unk = calloc((size_t)obs_rows, sizeof *obs_unk);
 	obs_nwk = nworkers;
 	obs_wkc = calloc((size_t)nworkers + 2, sizeof *obs_wkc);
-	/* S265: resident now, not a row at a time as verbs are first seen */
+	/* resident now, not a row at a time as verbs are first seen */
 	pc_touch_pages(obs_cmds, (size_t)obs_rows * OBS_CMDS * sizeof *obs_cmds);
 	pc_touch_pages(obs_slow, (size_t)obs_rows * OBS_SLOWN * sizeof *obs_slow);
 	obs_slow_thresh = slowlog_usec;
@@ -145,12 +143,8 @@ unsigned long long pc_obs_usec_now(void)
 		(unsigned long long)(t.tv_nsec / 1000);
 }
 
-/*
- * S183: the bucket a duration lands in - its octave, and which EIGHTH
- * of that octave.  Below PC_OBS_SUB microseconds each value keeps its
- * own slot; above it, bucket = (octave - 1) * SUB + eighth, and the
- * last slot takes everything past the top octave.
- */
+/* the bucket is the octave and which eighth of it; below PC_OBS_SUB us each value has its own
+ * slot, and the last slot takes everything past the top octave */
 static int obs_bucket(unsigned long long usec)
 {
 	int oct, sub, idx, sh;
@@ -160,12 +154,7 @@ static int obs_bucket(unsigned long long usec)
 	oct = 63 - __builtin_clzll(usec);            /* floor(log2) */
 	sh = oct - 3;                                /* SUB = 1 << 3 */
 	sub = (int)((usec >> sh) & (PC_OBS_SUB - 1));
-	/* the exact slots below cover everything under 2^3, so the first
-	 * octave that can reach here is 3 and the index continues straight
-	 * on from them: (oct - 2) * SUB, not (oct - 1).  With (oct - 1) the
-	 * eight slots between them were unreachable and their bounds
-	 * computed backwards - /metrics then published a le= sequence that
-	 * fell before it rose, which cmdstatstest caught. */
+	/* octave 3 is the first that reaches here, so the index continues right after the exact slots */
 	idx = (oct - 2) * PC_OBS_SUB + sub;
 	return idx < PC_OBS_HIST - 1 ? idx : PC_OBS_HIST - 1;
 }
@@ -203,7 +192,6 @@ unsigned long long pc_obs_hist_hi(int k)
 	 * above, so this never collapses to a zero-width bucket */
 }
 
-/* S159: the slot a name owns on this worker's row - found or claimed */
 void *pc_obs_cmd_slot(const char *name, size_t nlen)
 {
 	struct cmdrow *r;
@@ -243,9 +231,9 @@ void pc_obs_cmd_at(void *slot, unsigned long long usec)
 	e->calls++;
 	e->usec += usec;
 	e->hist[obs_bucket(usec)]++;
-	if (usec > e->max)                     /* S183: the real slowest call */
+	if (usec > e->max)
 		e->max = usec;
-	{                                      /* S194: and within the minute */
+	{                                      /* and the max within the minute */
 		unsigned int w = __atomic_load_n(&obs_win_slot, __ATOMIC_RELAXED);
 
 		if (usec > e->w_max[w])
@@ -280,10 +268,10 @@ void pc_obs_cmd(const char *name, size_t nlen, unsigned long long usec)
 		}
 		e->calls++;
 		e->usec += usec;
-		e->hist[obs_bucket(usec)]++;   /* S159 */
-		if (usec > e->max)             /* S183 */
+		e->hist[obs_bucket(usec)]++;
+		if (usec > e->max)
 			e->max = usec;
-		{                              /* S194 */
+		{
 			unsigned int w = __atomic_load_n(&obs_win_slot,
 				__ATOMIC_RELAXED);
 
@@ -296,10 +284,8 @@ void pc_obs_cmd(const char *name, size_t nlen, unsigned long long usec)
 	 * monitoring, not accounting */
 }
 
-/* S159: the rows merged by name across the workers - the one walk
- * every reader shares: INFO commandstats and latencystats, /stats
- * commands, the /metrics series.  The space is small enough to do the
- * quadratic thing simply. */
+/* the one merge every reader shares (INFO commandstats and latencystats, /stats, /metrics);
+ * the space is small enough for the quadratic walk */
 int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
 {
 	int n = 0, row, i, j, k;
@@ -327,13 +313,10 @@ int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
 			out[j].usec += r[i].usec;
 			for (k = 0; k < PC_OBS_HIST; k++)
 				out[j].hist[k] += r[i].hist[k];
-			if (r[i].max > out[j].max)     /* S183 */
+			if (r[i].max > out[j].max)
 				out[j].max = r[i].max;
-			/* S194: the window is the difference from the OLDEST
-			 * snapshot this row still holds.  A row younger than
-			 * one roll has no snapshot at all, and its window is
-			 * then everything it has - which is the truth: it
-			 * has only existed for this long. */
+			/* the window is the difference from the OLDEST snapshot the row holds; a row younger
+			 * than one roll has none, and its window is everything it has */
 			{
 				unsigned int w, old_slot = PC_OBS_WIN;
 				unsigned int oldest = 0, nowt = (unsigned int)get_ticks();
@@ -363,13 +346,8 @@ int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
 					for (k = 0; k < PC_OBS_HIST; k++)
 						out[j].w_hist[k] += r[i].hist[k];
 				}
-				/* S197: the max spans the SAME slots as the calls.
-				 * w_calls counts from the oldest snapshot, taken at
-				 * the END of old_slot, so every call in old_slot
-				 * is outside the window - and its max must be too.
-				 * Scanning all five slots reported "no calls in the
-				 * window, slowest call 250 us" for a verb last used
-				 * six minutes ago, and the page sorted on it. */
+				/* the max spans the same slots as the calls: the oldest snapshot is taken at the
+				 * END of old_slot, so old_slot's calls and its max are outside the window */
 				for (w = 0; w < PC_OBS_WIN; w++) {
 					if (w == old_slot)
 						continue;
@@ -382,13 +360,8 @@ int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
 	return n;
 }
 
-/* the bucket bound, in us, the p-th permille falls under: the smallest
- * k whose cumulative count reaches ceil(calls * p / 1000), answered as
- * 2^k.  The top bucket has no bound: it answers 32768 and the true
- * figure is higher. */
-/* S194: over ANY histogram and call count, so the cumulative view and
- * the five-minute window share one implementation - two copies of a
- * percentile is two chances to have a different one. */
+/* the value at the p-th permille of any histogram, interpolated inside the bucket the rank lands
+ * in (as histogram_quantile does); one implementation for the cumulative and window views */
 static unsigned long long obs_pct_of(const unsigned long long *hist,
 		unsigned long long calls, unsigned long long max,
 		unsigned int permille)
@@ -407,11 +380,6 @@ static unsigned long long obs_pct_of(const unsigned long long *hist,
 		cum += hist[k];
 		if (cum < need)
 			continue;
-		/* S183: INTERPOLATE inside the bucket.  Returning its upper
-		 * bound made every figure a power of two and told a reader
-		 * nothing; the rank's position within the bucket is the
-		 * best estimate of the value, and it is what
-		 * histogram_quantile does over Prometheus buckets. */
 		lo = obs_hist_lo(k);
 		hi = pc_obs_hist_hi(k);
 		if (hi <= lo || !hist[k])
@@ -419,22 +387,17 @@ static unsigned long long obs_pct_of(const unsigned long long *hist,
 		else
 			v = lo + ((hi - lo) * (need - before) +
 				hist[k] - 1) / hist[k];
-		/* never past the slowest call actually seen: the bucket's
-		 * top is wider than its contents, so a p99 of data that
-		 * peaked at 299 us was reading 317 */
+		/* never past the slowest call actually seen: a bucket is wider than its contents */
 		if (max && v > max)
 			v = max;
-		/* S259: never below 1 us either.  A call faster than a
-		 * microsecond is recorded as 0 and its percentile read 0; it
-		 * took AT MOST 1 us, and Redis 7 reports 0.001 ms there -
-		 * the shape INFO latencystats readers expect (rc51 GitHub:
-		 * "p50=0.000" on a fast runner) */
+		/* never below 1 us either: a sub-microsecond call is recorded as 0 but took at most
+		 * 1 us, and Redis 7 reports 0.001 ms there */
 		return v ? v : 1;
 	}
 	return pc_obs_hist_hi(PC_OBS_HIST - 2);
 }
 
-/* S259: a max of calls that were all sub-microsecond reads 0; floor it
+/* a max of calls that were all sub-microsecond reads 0; floor it
  * with the percentiles, so it is never below them */
 static long long obs_max_us(unsigned long long max, unsigned long long calls)
 {
@@ -470,8 +433,7 @@ void pc_obs_cmdstats(struct pc_jw *w)
 	}
 }
 
-/* S159: Redis 7's shape - latencystat_<cmd>:p50=<ms>,p99=<ms>,p99.9=<ms>
- * - each figure the log2 bucket bound the percentile falls under */
+/* Redis 7's shape: latencystat_<cmd>:p50=<ms>,p99=<ms>,p99.9=<ms> */
 void pc_obs_latencystats(struct pc_jw *w)
 {
 	struct pc_obs_cmdsum out[OBS_MERGE];
@@ -489,9 +451,7 @@ void pc_obs_latencystats(struct pc_jw *w)
 	}
 }
 
-/* S159: the same rows as a tree array for the stats reply (the native
- * `stats` method, rendered as JSON for /stats) - calls, usec, the three
- * percentile bounds in us and the buckets themselves */
+/* the same rows as a tree array for the native `stats` reply (rendered as JSON for /stats) */
 void pc_obs_commands_tree(struct pc_tw *w)
 {
 	struct pc_obs_cmdsum out[OBS_MERGE];
@@ -502,14 +462,8 @@ void pc_obs_commands_tree(struct pc_tw *w)
 		pc_tw_map(w);
 		pc_tw_key(w, "name");
 		pc_tw_bulk(w, out[i].name, out[i].nlen);
-		/* S189: the DIALECT beside the verb, because the name alone
-		 * cannot carry it.  A Redis command name may contain a dot -
-		 * JSON.GET, TS.ADD and FT.SEARCH are real - so a dotted row
-		 * name was ambiguous between a native method and a RESP
-		 * client's JSON.GET, and a reader had no way to tell.  A row
-		 * is cmd:<method> (a CMD request), bin:<verb> (a fixed-layout
-		 * verb) or a bare RESP name; the name stays the key a scraper
-		 * joins on, these two are what a human reads ("get (cmd)"). */
+		/* the dialect beside the verb: a Redis command name may contain a dot (JSON.GET), so the
+		 * name alone cannot tell a native method from RESP; the name stays the join key */
 		{
 			unsigned int d = 0;
 
@@ -536,12 +490,10 @@ void pc_obs_commands_tree(struct pc_tw *w)
 		pc_tw_i64(w, (long long)obs_pct_us(&out[i], 990));
 		pc_tw_key(w, "p999_us");
 		pc_tw_i64(w, (long long)obs_pct_us(&out[i], 999));
-		/* S183: exact, not the bound of a bucket */
+		/* exact, not a bucket bound */
 		pc_tw_key(w, "max_us");
 		pc_tw_i64(w, obs_max_us(out[i].max, out[i].calls));
-		/* S194: and the same four over the last five minutes, which
-		 * is what a dashboard is read for.  The cumulative fields
-		 * above stay for /metrics and for anyone joining on them. */
+		/* the same four over the last five minutes, which is what a dashboard is read for */
 		pc_tw_key(w, "win_s");
 		pc_tw_i64(w, (long long)out[i].w_secs);
 		pc_tw_key(w, "win_calls");
@@ -580,11 +532,10 @@ unsigned long long pc_obs_total_calls(void)
 	return t;
 }
 
-/* ---- S65: the query log ------------------------------------------------ */
+/* ---- the query log ------------------------------------------------ */
 
-/* The ceiling nobody may raise: at 1.8M ops/s a line per operation is
- * megabytes a second of journal, so sampling is part of the feature and
- * this cap is the backstop behind it.  Policy, not a knob. */
+/* at 1.8M ops/s a line per operation is megabytes a second of journal: sampling is the
+ * feature and this cap its backstop.  Policy, not a knob. */
 #define QLOG_MAX_PER_SEC 1000
 static int qlog_every;                 /* 0 off, 1 all, N one-in-N */
 static int qlog_keys;                  /* 0 no, 1 hashed, 2 full */
@@ -636,16 +587,14 @@ void pc_obs_qlog(const char *dialect, void *row, const char *verb,
 		snprintf(kb, sizeof kb, " key=#%08x", (unsigned int)(h ^ (h >> 32)));
 		ks = kb;
 	}
-	/* the outcome is what an operator chasing a miss is reading for
-	 * (S65): hit, miss, ok or err, before the latency */
+	/* the outcome (hit, miss, ok or err) before the latency: what a miss hunt reads for */
 	LM_INFO("query: %s %s %.*s %.*s%s %s %llu us%s\n", dialect,
 		cr ? cr->addr : "-", (int)vlen, verb, (int)clen, clen ? col : "-",
 		ks, outcome ? outcome : "ok", usec, ss);
 }
 
-/* roll the window: snapshot the cumulative figures into the slot we are
- * LEAVING, then clear the slot we are about to fill.  Maintenance
- * thread, once a minute. */
+/* snapshot the cumulative figures into the slot we are LEAVING and clear the one about to be
+ * filled; maintenance thread, once a minute */
 static void obs_win_roll(unsigned int now)
 {
 	unsigned int cur = __atomic_load_n(&obs_win_slot, __ATOMIC_RELAXED);
@@ -683,7 +632,7 @@ void pc_obs_tick_1hz(void)
 	obs_inst = t - obs_prev_total;
 	obs_prev_total = t;
 
-	{                                      /* S194: a slot a minute */
+	{                                      /* a slot a minute */
 		unsigned int now = (unsigned int)get_ticks();
 
 		if (!obs_win_at)
@@ -707,7 +656,7 @@ void *pc_obs_conn_add(const struct sockaddr *sa, socklen_t slen, int fd,
 
 	if (!r)
 		return NULL;
-	if (sa && sa->sa_family == AF_INET) {    /* IP6-2: IPv6 clients too */
+	if (sa && (sa->sa_family == AF_INET || sa->sa_family == AF_INET6)) {
 		pc_addr in;
 
 		if (pc_addr_from_sa(&in, sa, slen) == 0)
@@ -846,7 +795,6 @@ int pc_obs_conn_count(void)
 	return obs_cl_n;
 }
 
-/* S460: workers 1..N's live native connections into @out[0..N-1]; N */
 int pc_obs_worker_conns(int *out, int max)
 {
 	int i, n = obs_nwk < max ? obs_nwk : max;
@@ -856,8 +804,7 @@ int pc_obs_worker_conns(int *out, int max)
 	return n;
 }
 
-/* S160: active first - the most recently touched connection leads, so
- * the busy ones sit at the top of a capped table */
+/* active first: the most recently touched connection leads a capped table */
 static int clients_cmp(const void *a, const void *b)
 {
 	const struct connrow *x = *(const struct connrow *const *)a;
@@ -940,7 +887,7 @@ void pc_obs_client_list(struct pc_jw *w, unsigned int now_ticks)
 
 	pthread_mutex_lock(&obs_cl_mu);
 	for (r = obs_cl_head; r; r = r->next) {
-		char line[352];
+		char line[512];
 		int ln = snprintf(line, sizeof line,
 			"id=%llu addr=%s fd=%d name=%.*s age=%u idle=%u "
 			"flags=N db=0 sub=0 psub=0 multi=-1 cmd=%.*s "
@@ -952,6 +899,10 @@ void pc_obs_client_list(struct pc_jw *w, unsigned int now_ticks)
 			r->lastcmdlen ? r->lastcmd : "NULL",
 			r->libname, r->libver);
 
+		if (ln < 0)
+			continue;
+		if ((size_t)ln >= sizeof line)  /* snprintf says what it would have written */
+			ln = (int)sizeof line - 1;
 		pc_jw_raw(w, line, (size_t)ln);
 	}
 	pthread_mutex_unlock(&obs_cl_mu);
@@ -959,13 +910,8 @@ void pc_obs_client_list(struct pc_jw *w, unsigned int now_ticks)
 
 /* ---- slow log ----------------------------------------------------------- */
 
-/* A credential never reaches the slow ring.  The ring is what SLOWLOG
- * GET, /stats and the page's slow log card all read, so this is the one
- * place that covers the three; a renderer that forgot would leak it.
- * Every argument of AUTH is secret (a password, or a username and a
- * password), and so are the two after an AUTH inside HELLO.  Each is
- * stored as OBS_REDACTED; how many arguments there were is kept, since
- * the entry's shape is what the Grafana datasource parses. */
+/* A credential never reaches the slow ring that SLOWLOG GET, /stats and the page all read:
+ * AUTH's arguments and the two after AUTH inside HELLO become OBS_REDACTED, argc kept. */
 #define OBS_REDACTED "(redacted)"
 
 static int obs_is(const char *s, size_t n, const char *lit)
@@ -994,11 +940,8 @@ static unsigned int obs_secret_args(char *const *argv, const size_t *argl,
 		return ~1u;                    /* everything after the verb */
 	if (!obs_is(argv[0], argl[0], "HELLO"))
 		return 0;
-	/* HELLO [protover [AUTH user pass] [SETNAME name]], walked from the
-	 * FIRST argument rather than after the version: a client that
-	 * leaves the version out gets an error, and its password must not
-	 * be kept on the way.  SETNAME's value is skipped, so a client
-	 * named "AUTH" does not hide the next two arguments. */
+	/* HELLO [protover [AUTH user pass] [SETNAME name]], walked from argv[1] so a missing version
+	 * still redacts; SETNAME's value is skipped, so a client named "AUTH" hides nothing */
 	for (i = 1; i < nargs && i < OBS_ARGN; ) {
 		if (obs_is(argv[i], argl[i], "AUTH")) {
 			m |= 3u << (i + 1);
@@ -1019,7 +962,7 @@ void pc_obs_slow(char *const *argv, const size_t *argl, int nargs,
 	struct slowent *e;
 	unsigned int secret;
 	int row, i;
-	long long th = __atomic_load_n(&obs_slow_thresh, __ATOMIC_RELAXED);   /* 12nw: reloadable */
+	long long th = __atomic_load_n(&obs_slow_thresh, __ATOMIC_RELAXED);   /* reloadable */
 
 	if (!obs_slow || th < 0 || usec < (unsigned long long)th)
 		return;
@@ -1120,8 +1063,7 @@ void pc_obs_slowlog_get(struct pc_jw *w, int want)
 	}
 }
 
-/* S159: the slow log as a tree array for the stats reply - the six
- * fields SLOWLOG GET answers, in its order, as maps */
+/* the slow log as a tree array: SLOWLOG GET's six fields, in its order, as maps */
 void pc_obs_slowlog_tree(struct pc_tw *w, int want)
 {
 	const struct slowent *ents[512];
@@ -1163,7 +1105,6 @@ int pc_obs_slow_would(unsigned long long usec)
 	return obs_slow && th >= 0 && usec >= (unsigned long long)th;
 }
 
-/* 12nw: a config reload's slowlog_usec */
 void pc_obs_set_slowlog(long long usec)
 {
 	__atomic_store_n(&obs_slow_thresh, usec, __ATOMIC_RELAXED);
@@ -1181,7 +1122,7 @@ void pc_obs_slowlog_reset(void)
 	__atomic_add_fetch(&obs_slow_epoch, 1, __ATOMIC_RELAXED);
 }
 
-/* ---- S165: unknown commands ------------------------------------------ */
+/* ---- unknown commands ------------------------------------------ */
 
 static struct unkw *unk_row(void)
 {
@@ -1301,9 +1242,8 @@ void pc_obs_unknown_totals(unsigned long long tot[CLUNK_DIALECTS],
 	}
 }
 
-/* S358: what the resets put out of reach (rows of an old epoch are not
- * read again) - added back for /metrics.  Written only by the reset,
- * which the daemon serialises; read fuzzily like the rows themselves. */
+/* what the resets put out of reach, added back for /metrics; written only by the reset (which
+ * the daemon serialises), read fuzzily like the rows */
 static unsigned long long obs_unk_carry[CLUNK_DIALECTS], obs_unk_carry_pre;
 
 void pc_obs_unknown_totals_raw(unsigned long long tot[CLUNK_DIALECTS],
@@ -1330,7 +1270,7 @@ void pc_obs_unknown_reset(void)
 	__atomic_add_fetch(&obs_unk_gen, 1, __ATOMIC_RELAXED);
 }
 
-/* S70: for the connection log - the address exactly as CLIENT LIST shows
+/* for the connection log - the address exactly as CLIENT LIST shows
  * it, and how many requests the connection carried before it closed */
 const char *pc_obs_conn_addr(void *row)
 {

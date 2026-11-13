@@ -1,14 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clapply.c - S217: replica apply sharded by key hash.  See clapply.h.
- *
- * The ring is a byte ring, one producer (the receiver) and one consumer
- * (the apply thread): head and tail are single-writer atomics, the same
- * shape as the WAL's per-writer rings.  An item is a fixed header and
- * the record's bytes; an item never wraps - a header with len 0 at the
- * end of the buffer says "start over".
- */
+/* clapply.c - replica apply sharded by key hash: one byte ring per apply thread, the receiver
+ * its only producer; an item never wraps, a header with len 0 at the end says "start over". */
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,39 +16,8 @@
 #define clapply_pause() do {} while (0)
 #endif
 
-/*
- * S220: how long a consumer LOOKS before it sleeps.
- *
- * It used to take the mutex the instant its ring ran dry.  At ~1 us a
- * record, with N rings each seeing 1/N of them, that is a sleep and a
- * wake per record - and the wake is the PRODUCER's to pay, on the one
- * thread that must also drain the socket.  Measured on an idle 16-core
- * receiver under ~1.3M records/s offered, apply_threads = 4:
- *
- *                      applied     drops   us/rec   ctx switches
- *   sleeping at once      55%     27,716     3.16   1 per 13 records
- *   spinning first        99%        748     2.19   1 per 93 records
- *
- * perf put `clapply_push` at 9.5% of the whole daemon on the receiving
- * thread, and compiling the wake-up out entirely cut CPU per record
- * from 3.16 us to 1.43 - over half the receiver's time was the signal
- * path.  Removing it is not the answer though: with nothing to wake
- * them the consumers wait out their 50 ms and the rings back up (45%
- * applied, 34,781 dropped).  Looking first is.
- *
- * 4096 iterations is a few tens of microseconds - sized to cover the
- * gap between records on ONE ring at these rates, so the common case
- * needs no syscall at all and, because `sleeping` stays clear, the
- * producer skips the mutex too.  512 was tried first and was not
- * enough at four rings (75% applied, 16,101 dropped).
- *
- * What it costs when there is nothing to do: each consumer wakes on
- * its 50 ms timer, looks for a few tens of microseconds and sleeps
- * again - measured at 14 ticks per 20 s for four threads, 0.7% of one
- * core, against a daemon with no apply threads at all.  A consumer is
- * on a core of its own, which is the premise of having asked for the
- * thread.
- */
+/* a consumer spins a few tens of us before it sleeps - the gap between records on one ring -
+ * so `sleeping` stays clear and the producer, which also drains the socket, skips the wake */
 #define CLAPPLY_SPIN 4096
 
 struct hdr {
@@ -64,7 +26,7 @@ struct hdr {
 	unsigned long long ver;
 	struct clapply_grp *grp;
 	int passive;
-	unsigned char flags;           /* S280 */
+	unsigned char flags;
 };
 
 #define HDR ((unsigned int)sizeof(struct hdr))
@@ -175,24 +137,15 @@ int clapply_push(struct clapply *a, const struct clapply_rec *rec,
 		unsigned int head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
 		unsigned int room = (head + r->cap - tail - 1) % r->cap;
 
-		/* An item never wraps.  Strictly below cap, so tail never sits
-		 * AT the end: the indices stay in [0, cap) and full and empty
-		 * stay distinct (one byte is kept back). */
+		/* strictly below cap, so tail never sits at the end and full and
+		 * empty stay distinct (one byte is kept back) */
 		if (tail + need < r->cap) {
 			if (room >= need)
 				break;
 		} else if (head <= tail && head > 0) {
-			/* It does not fit before the end: a wrap marker goes
-			 * there (when a header fits; the consumer treats a tail
-			 * end too short for one the same way) and the item
-			 * starts at 0.  Only with the unread data all BEHIND
-			 * tail - head <= tail - and head off 0: with head at 0
-			 * the wrapped tail would meet it and read as empty over
-			 * unread data.  Whether the item then fits at 0 is the
-			 * ordinary test above, on the next turn; the consumer
-			 * moves head to 0 when it reaches the marker, and an
-			 * empty ring wraps in one turn. */
-			memset(&h, 0, sizeof h);   /* len 0 = wrap */
+			/* wrap only with the unread data all behind tail and head off 0:
+			 * with head at 0 the wrapped tail would meet it and read as empty */
+			memset(&h, 0, sizeof h);
 			if (r->cap - tail >= HDR)
 				memcpy(r->buf + tail, &h, HDR);
 			tail = 0;
@@ -222,14 +175,10 @@ int clapply_push(struct clapply *a, const struct clapply_rec *rec,
 	memcpy(p + HDR + rec->collen, rec->key, rec->klen);
 	if (rec->vlen)
 		memcpy(p + HDR + rec->collen + rec->klen, rec->val, rec->vlen);
-	/* SEQ_CST on the tail store and the sleeping load, and on their
-	 * mirror in clapply_take(): with release/acquire alone each side
-	 * could miss the other's store and the consumer sleep through a
-	 * push (bounded by its 50 ms timed wait, but a bound is not an
-	 * answer) */
+	/* SEQ_CST here and in clapply_take(): with release/acquire alone each side
+	 * could miss the other's store and the consumer sleep through a push */
 	__atomic_store_n(&r->tail, tail + need, __ATOMIC_SEQ_CST);
 	a->dispatched++;
-	/* wake a sleeping consumer */
 	if (__atomic_load_n(&r->sleeping, __ATOMIC_SEQ_CST)) {
 		pthread_mutex_lock(&r->mx);
 		pthread_cond_signal(&r->cv);
@@ -268,7 +217,7 @@ int clapply_take(struct clapply *a, int idx, volatile int *stop,
 		}
 		if (*stop)
 			return 0;
-		/* S220: look before sleeping - see CLAPPLY_SPIN */
+		/* look before sleeping - see CLAPPLY_SPIN */
 		{
 			unsigned int sp;
 

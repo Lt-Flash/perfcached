@@ -1,42 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clres.h - id reservations for departed members (M12, slice 1).  S90.
- *
- * When a member leaves this node's view, the master remembers the id it
- * had and the address and identity that held it.  A node coming back
- * within the window claims its old id instead of being given a fresh
- * one, which is what keeps a restart from renumbering the fleet.
- *
- * The table is a fixed array: bounded so a churning fleet cannot grow
- * it, and expiring so ids return to the pool.  Full means evict the
- * entry that expires soonest - reservations are a courtesy, and the one
- * closest to lapsing is the one whose owner is least likely to return.
- *
- * A claim matches IDENTITY FIRST, then address, and that order is the
- * whole point: a node's identity file survives a move, its address does
- * not.  `how` names which matched so the caller can say so in its log.
- *
- * Pure, in the M-series sense: the caller owns the table, passes the
- * clock, and does the logging.  Every rule here - the expiry boundary,
- * the refresh-in-place, the eviction choice, identity beating address -
- * is then a case in test/clrestest.c rather than something only a fleet
- * can show.
- */
+/* clres.h - id reservations for departed members, so a node back within the window
+ * claims its old id instead of renumbering the fleet.  The caller owns the table. */
 #ifndef PC_CLRES_H
 #define PC_CLRES_H
 
 #include <netinet/in.h>
 
-#define CLRES_MAX        256       /* S299: = PC_CL_MAXPEER, the peer
-                                    * table's bound - 64 here left a fleet
-                                    * of more than 64 departures unable to
-                                    * hold all their ids */
+#define CLRES_MAX        256       /* = PC_CL_MAXPEER, the peer table's bound */
 #define CLRES_IDENT_LEN  16
 
-/* S293: WHY a member left - the page said "said goodbye" for all three,
- * and a node that went silent (its container died) read as one an
- * operator had stopped cleanly */
+/* WHY a member left, so one that went silent does not read as cleanly stopped */
 enum {
 	CLRES_GONE_UNKNOWN = 0,
 	CLRES_GONE_GOODBYE,                /* it sent GOODBYE */
@@ -50,27 +24,21 @@ struct clres_ent {
 	int has_ident;
 	int id;                            /* 0 = the slot is unused */
 	long long until_ms;
-	int why;                           /* S293: CLRES_GONE_* */
-	int silent_s;                      /* S293: how long it was silent */
+	int why;                           /* CLRES_GONE_* */
+	int silent_s;                      /* how long it was silent */
 };
 
 struct clres {
 	struct clres_ent e[CLRES_MAX];
 };
 
-/* Remember @id, held by @addr / @ident, until now + ttl_ms.
- *
- * @ident must point at CLRES_IDENT_LEN bytes; @has_ident says whether
- * they mean anything (they are stored either way, as they were).
- * An entry for the SAME ADDRESS is refreshed in place, live or lapsed.
- *
- * Returns 1 if it recorded, 0 if @id was 0 and there was nothing to
- * remember - the caller logs on 1. */
+/* Remember @id for @addr / @ident (CLRES_IDENT_LEN bytes even without @has_ident)
+ * until now + ttl_ms; the same address refreshes in place.  1 if recorded, 0 if @id 0. */
 int clres_note(struct clres *r, int id, struct in_addr addr,
 		const unsigned char *ident, int has_ident,
 		long long now, long long ttl_ms);
 
-/* S293: record why the member @id (just noted) left, and for a silent
+/* record why the member @id (just noted) left, and for a silent
  * one how long it had been quiet.  A no-op if @id holds no entry. */
 void clres_why(struct clres *r, int id, int why, int silent_s);
 
@@ -81,9 +49,8 @@ const char *clres_why_name(int why);
  * entry is live while until_ms > now, so it lapses AT until_ms. */
 int clres_holds(const struct clres *r, int id, long long now);
 
-/* Claim a reservation and CONSUME it.  @ident may be NULL, in which
- * case only the address can match.  On a match *how is set to
- * "identity" or "address" and the id returned; 0 if nothing matched. */
+/* Claim and CONSUME a reservation: IDENTITY first (it survives a move), then
+ * address; @ident NULL matches by address only.  *how says which; 0 if none. */
 int clres_take(struct clres *r, const unsigned char *ident,
 		const struct in_addr *addr, long long now, const char **how);
 

@@ -1,29 +1,6 @@
 #!/bin/sh
-# clusteridtest.sh - S302: a cluster id, so two clusters never merge.
-#
-# Before S302 two fleets that shared a multicast group, a secret and a
-# config were indistinguishable and folded into one, data and all.  Now
-# the founder mints an id, members adopt it, every datagram carries it in
-# its authenticated header, and an established id refuses every other.
-#
-#   1  cold start: three nodes with no id start together - ONE cluster,
-#      one id (a UUID v7), established after the 30 s provisional
-#      window (two founders of one cold start settle into one; they must
-#      not split)
-#   2  never merge: fleet B forms on its own group, outlives its window,
-#      stops, and restarts on fleet A's group - same secret, same config.
-#      They stay two; both count foreign datagrams.  (0.4.0: they fold.)
-#   3  pinned ids: two fleets pinned to different ids on one group stay
-#      two from the first second
-#   4  a pin that disagrees with the state directory refuses the start
-#   5  a FORCED cold-start race (two founders that cannot hear each other
-#      until both have founded) ends as one cluster; then a member cut
-#      from that master promotes behind the cut and the master steps
-#      down to it - and nobody mints a new id.  (Shard mode with declared
-#      collections, as standbypassovertest - where this was caught.)  The first S302 build
-#      dropped a provisional id on every join request, so the master
-#      re-founded under a new id its own members refused as foreign.
-# Usage: test/clusteridtest.sh [./perfcached] [./netcutshim.so]
+# clusteridtest.sh - a cluster id, so two clusters never merge: the founder mints it, members adopt
+# it, an established id refuses every other, and a forced founder race ends as one cluster.
 set -u
 BIN=${1:-./perfcached}
 SHIM=${2:-./netcutshim.so}
@@ -38,9 +15,8 @@ pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 
-# each group its own port: a wildcard-bound socket on Linux hears every
-# group joined on its port on the host (IP_MULTICAST_ALL), so two groups
-# sharing a port on one host are not two networks
+# each group its own port: a wildcard-bound socket hears every group joined on its port on the
+# host (IP_MULTICAST_ALL), so two groups sharing a port are not two networks
 conf() { # conf <name> <n> <group> [pin]
 	cat > "$D/$1.conf" <<EOF
 [daemon]
@@ -162,20 +138,22 @@ if [ ! -f "$SHIM" ]; then
 	bad "no netcut shim at $SHIM - part 5 not run"
 else
 	# shard mode with declared collections, as standbypassovertest runs
-	# (where this was caught)
 	for n in 9 10 11; do
 		conf r$n $n 239.255.77.98
 		sed -i -e 's/^\[collection 0\]$/[collection c]/' -e '/^mode = eager$/d' \
 			-e 's/^\[cluster\]$/[cluster]\nmode = shard\ncollections = c/' "$D/r$n.conf"
 	done
-	echo "cut 127.0.5.11" > "$D/cut9"; echo "cut 127.0.5.9" > "$D/cut11"; : > "$D/cut10"
-	for n in 9 10 11; do
-		LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut$n" PC_NETCUT_LOG="$D/cutlog$n" \
-			"$BIN" -f "$D/r$n.conf" >> "$D/r$n.log" 2>&1 &
-		P=$!; PIDS="$PIDS $P"; eval "PR$n=$P"
-	done
+	echo "cut 127.0.5.11 rst" > "$D/cut9"; echo "cut 127.0.5.9 rst" > "$D/cut11"; : > "$D/cut10"
+	# node 10 starts once both have founded: a blank node hearing its beat would join through it
+	rstart() {
+		LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut$1" PC_NETCUT_LOG="$D/cutlog$1" \
+			"$BIN" -f "$D/r$1.conf" >> "$D/r$1.log" 2>&1 &
+		P=$!; PIDS="$PIDS $P"; eval "PR$1=$P"
+	}
+	rstart 9; rstart 11
 	wait_for 20 'grep -q "founded the cluster" "$D/r9.log" && grep -q "founded the cluster" "$D/r11.log"' \
 		&& ok "the race is forced: nodes 9 and 11 both founded" || bad "the race was not forced"
+	rstart 10
 	: > "$D/cut9"; : > "$D/cut11"
 	wait_for 30 '[ "$(members 9)" = 3 ] && [ "$(members 10)" = 3 ] && [ "$(members 11)" = 3 ] && [ "$(stat 9 cluster_id)" = "$(stat 11 cluster_id)" ]' \
 		&& ok "it ends as one cluster with one id ($(stat 9 cluster_id))" \
@@ -184,19 +162,15 @@ else
 	wait_for 30 '[ "$(nstate 9)$(nstate 10)$(nstate 11)" = readyreadyready ]' \
 		|| bad "the three nodes never all reported ready ($(nstate 9) $(nstate 10) $(nstate 11))"
 	M=; for n in 9 10 11; do [ "$(stat $n role)" = master ] && M=$n; done
-	# cut the member with the HIGHEST address: a member whose master goes
-	# silent promotes only if no live peer it still sees has a higher
-	# address (membership_tick), so this one promotes behind the cut and
-	# the master then steps down to its higher term without being able
-	# to reach it
+	# cut the member with the HIGHEST address: it alone promotes behind the cut (no live peer
+	# above it), and the master then steps down to its higher term
 	B=; for n in 9 10 11; do [ "$n" != "$M" ] && B=$n; done
 	F0=$(cat "$D"/r*.log | grep -c "founded cluster")
 	S0=$(grep -c "stepping down - node [0-9]* holds term" "$D/r$M.log")
-	# it loses the master AND the other member: since S36 e3 a member
-	# that loses only its master asks the others first, and holds while
-	# one still hears it - cut from everyone, nobody vouches, it promotes
+	# it loses the master AND the other member: a member losing only its master asks the
+	# others first and holds while one still hears it
 	O=; for n in 9 10 11; do [ "$n" != "$M" ] && [ "$n" != "$B" ] && O=$n; done
-	echo "cut 127.0.5.$M 127.0.5.$O" > "$D/cut$B"
+	echo "cut 127.0.5.$M 127.0.5.$O rst" > "$D/cut$B"
 	sleep 15
 	: > "$D/cut$B"
 	wait_for 30 '[ "$(members 9)" = 3 ] && [ "$(members 10)" = 3 ] && [ "$(members 11)" = 3 ] && [ "$(stat 9 cluster_id)" = "$(stat 10 cluster_id)" ] && [ "$(stat 10 cluster_id)" = "$(stat 11 cluster_id)" ]' \

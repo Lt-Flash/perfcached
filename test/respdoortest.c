@@ -1,30 +1,5 @@
-/* respdoortest.c - the RESP door's framing (respdoor.c; the 0.7.2 split,
- * wave 1): the verb layer, the parking, the walk and the observers are
- * stubbed, proto.c's reply staging captured.
- *
- *   A  multibulk: one command and the bytes it consumed; arguments by
- *      length (a CRLF inside a bulk is data); bare LF accepted; *0
- *      consumed with no command; two pipelined, one at a time; incomplete
- *      at every stage is 0; malformed - a count that is not a number, over
- *      PC_RESP_MAXARGS, no header in 16 bytes, not a bulk, a negative or
- *      oversized length, junk after a bulk - is -1
- *   B  inline: words split on spaces and tabs, CRLF or LF; an empty line
- *      consumed with no command; incomplete is 0; 64 KB with no newline -1
- *   C  the outcomes: the reply staged; QUIT closes after it; a reply too
- *      large refused by name; a verb's -1 drops the connection; a command
- *      parked on a pull stages nothing, is consumed and holds the
- *      connection (S332) - and is answered as a miss, nothing held, when
- *      the park table refuses; a walk begun stages nothing, or
- *      refuses for memory; a read-through hold leaves the command in the
- *      buffer, uncounted; a command run clears the hold's verdicts; G8:
- *      an MGET waiting on lookups elsewhere is consumed, stages nothing and
- *      holds the connection (counted now - it does not run again), and one
- *      the door cannot attach for memory is refused
- *   D  the observers (S53, S159): each command counted under its name with
- *      its time from the carried clock - one clock read a command - and
- *      logged as err, miss, hit or ok by its reply
- *   E  resp_ll_span: signs, the 17-character bound, junk and empty refused
- */
+/* respdoortest.c - the RESP door's framing, with the verb layer, the parking, the walk and the
+ * observers stubbed and proto.c's reply staging captured. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,7 +50,7 @@ int park_add(struct pc_conn *c, unsigned int req, const char *id,
 	return park_ok && bin == PARK_RESP ? 0 : -1;
 }
 
-/* G8: the mget a verb parked, and the door's attach */
+/* the mget a verb parked, and the door's attach */
 static char mget_obj;
 static int mget_parked, mget_attach_ok = 1, mget_attached, mget_freed;
 struct pc_mget *pc_mget_take(void)
@@ -110,9 +85,8 @@ void pc_obs_cmd(const char *name, size_t nlen, unsigned long long usec)
 	last_dt = usec;
 }
 
-/* S467: the door resolves a row once per name (pc_obs_cmd_slot) and counts
- * on it (pc_obs_cmd_at) - the stub rows keep the name as sent, never
- * reused, so the three readings above stay what they were */
+/* the door resolves a row once per name and counts on it; the stub rows keep the name as
+ * sent, never reused, so the three readings above stay what they were */
 static char stub_row[64][32];
 static int stub_rows;
 
@@ -239,7 +213,7 @@ int main(void)
 	long long v;
 	int rc;
 
-	/* A */
+	/* A: multibulk - lengths, bare LF, *0, pipelining, incomplete is 0, malformed is -1 */
 	rc = FRAME("*1\r\n$4\r\nPING\r\n");
 	CHK(rc == 14 && verb_calls == 1 && verb_nargs == 1 && !strcmp(verb_argv[0], "PING") &&
 		staged("+PONG\r\n"), "A: *1 PING - 14 bytes consumed, the reply staged");
@@ -280,7 +254,7 @@ int main(void)
 	CHK(FRAME("*1\r\n$1048577\r\n") == -1, "A: a length over PC_MAX_REQ - -1");
 	CHK(FRAME("*1\r\n$4\r\nPINGxx") == -1, "A: junk where the CRLF belongs - -1");
 
-	/* B */
+	/* B: inline - words on spaces and tabs, empty line, incomplete 0, 64 KB with no newline -1 */
 	rc = FRAME("PING\r\n");
 	CHK(rc == 6 && verb_nargs == 1 && !strcmp(verb_argv[0], "PING"), "B: inline PING - 6 bytes");
 	rc = FRAME("SET  k \t v\r\n");
@@ -298,7 +272,7 @@ int main(void)
 		CHK(frame_at(runaway, sizeof runaway, 0) == -1, "B: 64 KB and no newline - -1");
 	}
 
-	/* C */
+	/* C: the outcomes - staged, QUIT, too large, -1 drops, parked, walk, hold, a waiting MGET */
 	rc = FRAME("*1\r\n$4\r\nQUIT\r\n");
 	CHK(rc == 14 && c.close_after == 1 && staged("+PONG\r\n"), "C: QUIT - answered, then closed");
 	rc = FRAME("*1\r\n$3\r\nBIG\r\n");
@@ -343,7 +317,7 @@ int main(void)
 		"C: G8 - no memory to attach it: freed, refused");
 	mget_attach_ok = 1;
 
-	/* D */
+	/* D: the observers - each command counted by name with one clock read, logged by its reply */
 	obs_carry = 0;
 	fake_us = 100;
 	cmds = 0;
@@ -361,7 +335,7 @@ int main(void)
 	FRAME("*1\r\n$4\r\nPING\r\n");
 	CHK(!strcmp(last_outcome, "ok"), "D: anything else - ok");
 
-	/* E */
+	/* E: resp_ll_span - signs, the 17-character bound, junk and empty refused */
 	CHK(resp_ll_span("123", 3, &v) == 0 && v == 123, "E: 123");
 	CHK(resp_ll_span("-5", 2, &v) == 0 && v == -5 && resp_ll_span("+7", 2, &v) == 0 && v == 7,
 		"E: -5 and +7");

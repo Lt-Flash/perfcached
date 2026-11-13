@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respjson.c - RedisJSON on the RESP door (S86): JSON.SET, JSON.GET,
- * JSON.DEL, JSON.NUMINCRBY, JSON.ARRAPPEND and JSON.DEBUG, mapped onto the
- * native path operations (pc_json_rmw).  Moved from verbs.c unchanged (the
- * 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* respjson.c - RedisJSON on the RESP door (JSON.SET/GET/DEL/NUMINCRBY/ARRAPPEND/
+ * DEBUG), mapped onto the native path operations (pc_json_rmw) */
 #include <stdio.h>
 #include <string.h>
 
@@ -18,21 +14,8 @@
 #include "respout.h"
 #include "verbsint.h"
 
-/* ---- S86: RedisJSON on the RESP door ---------------------------
- * JSON.SET key path value [NX|XX] [EX seconds], JSON.GET key [path],
- * JSON.DEL key [path], JSON.NUMINCRBY key path n, JSON.ARRAPPEND key
- * path value..., JSON.DEBUG HELP | MEMORY key [path] - mapped onto
- * the native path operations (pc_json_rmw: a read-modify-write
- * under the key's mutex stripe).  Paths are the engine's pinned
- * subset: `$`, `.name`, `[index]`; RedisJSON's two spellings are
- * accepted - a `$` path answers v2 style (a JSON array of the
- * matches), a legacy `.path` or bare `path` answers the bare value.
- * EX is an extension: the native set takes a TTL, so JSON.SET +
- * EXPIRE collapse into one round trip; without it the key's expiry
- * is preserved, as RedisJSON does.  Served where the key is local
- * (store and eager collections; a shard owner or proxy holder); a
- * key this node would have to forward is refused by name rather
- * than half-served - the native door forwards it. */
+/* ---- RedisJSON on the RESP door ---------------------------------
+ * JSON.SET's EX is an extension (SET + EXPIRE in one trip); without it, expiry stays */
 int rh_json_debug(struct resp_ctx *c)
 {
 	if (c->nargs >= 2 && resp_is(c->argv[1], c->argl[1], "HELP")) {
@@ -178,6 +161,14 @@ int rh_json(struct resp_ctx *c)
 			return 0;
 		}
 	}
+	/* a read-through key's shard owner, or a spread holder, is pulled
+	 * from - the reply rendered when the document lands */
+	if (op == PC_JOP_GET && pc_jget_park(c->ht, k.s, (size_t)k.len,
+	        jpath, (size_t)jplen, (rootpath ? 1 : 0) | (v2 ? 2 : 0),
+	        c->park_req)) {
+		resp_err(c->out, "busy");          /* the park's fallback */
+		return 0;
+	}
 	/* a key this node would forward (proxy non-holder, shard
 	 * non-owner) is not served here - said, not half-done */
 	if (pc_cluster_enabled() &&
@@ -194,8 +185,8 @@ int rh_json(struct resp_ctx *c)
 	if (op == PC_JOP_DEL && rootpath) {
 		unsigned char fl = 0;
 
-		/* S280: JSON.DEL of a whole string is RedisJSON's wrong-type
-		 * refusal, as every other JSON verb on it is */
+		/* JSON.DEL of a whole string is RedisJSON's wrong-type refusal,
+		 * as every other JSON verb on it is */
 		if (pc_store_types_strict(c->ht) &&
 		        pcache_ht_getflags(c->ht, &k, &fl) == 0 &&
 		        !(fl & PCACHE_F_JSON)) {
@@ -240,7 +231,7 @@ int rh_json(struct resp_ctx *c)
 			resp_nil(c->out);
 			return 0;
 		}
-		if (fmsg == pc_json_wrongtype_msg)       /* S280 */
+		if (fmsg == pc_json_wrongtype_msg)
 			resp_err_line(c->out, fmsg);
 		else if (fmsg == jp_strerror(PC_JP_E_DOC))
 			resp_err_code(c->out, "WRONGTYPE", "the value at this "
@@ -267,29 +258,40 @@ int rh_json(struct resp_ctx *c)
 		}
 		break;
 	default:                       /* GET */
-		if (rc2 == 1) {
-			/* a missing key is nil; a missing path is [] on a
-			 * $ path and an error on a legacy one, as RedisJSON */
-			if (rootpath)
-				resp_nil(c->out);
-			else if (v2)
-				resp_bulk_lit(c->out, "[]");
-			else
-				resp_err(c->out, "path does not exist");
-		} else if (rootpath &&
-		        !pc_jp_valid_value(frag, (size_t)fraglen)) {
-			/* the whole value came back and it is not JSON: a
-			 * plain SET lives here, not a document */
-			resp_err_code(c->out, "WRONGTYPE", "the value at this key "
-				"is not a JSON document");
-		} else if (v2) {
-			pc_jw_lit(c->out, "$");
-			pc_jw_i64(c->out, (long long)fraglen + 2);
-			pc_jw_lit(c->out, "\r\n[");
-			pc_jw_raw(c->out, frag, (size_t)fraglen);
-			pc_jw_lit(c->out, "]\r\n");
-		} else
-			resp_bulk(c->out, frag, (size_t)fraglen);
+		pc_resp_jget_reply(c->out, rc2 == 1 ? 1 : 0, frag, fraglen,
+			rootpath, v2);
 	}
 	return 0;
+}
+
+void pc_resp_jget_reply(struct pc_jw *out, int st, const char *frag,
+		int fraglen, int rootpath, int v2)
+{
+	if (st == 3) {
+		resp_err_line(out, pc_json_wrongtype_msg);
+	} else if (st == 2) {
+		resp_err(out, "holder timed out or rejected");
+	} else if (st == 1) {
+		/* a missing key is nil; a missing path is [] on a
+		 * $ path and an error on a legacy one, as RedisJSON */
+		if (rootpath)
+			resp_nil(out);
+		else if (v2)
+			resp_bulk_lit(out, "[]");
+		else
+			resp_err(out, "path does not exist");
+	} else if (rootpath &&
+	        !pc_jp_valid_value(frag, (size_t)fraglen)) {
+		/* the whole value came back and it is not JSON: a
+		 * plain SET lives here, not a document */
+		resp_err_code(out, "WRONGTYPE", "the value at this key "
+			"is not a JSON document");
+	} else if (v2) {
+		pc_jw_lit(out, "$");
+		pc_jw_i64(out, (long long)fraglen + 2);
+		pc_jw_lit(out, "\r\n[");
+		pc_jw_raw(out, frag, (size_t)fraglen);
+		pc_jw_lit(out, "]\r\n");
+	} else
+		resp_bulk(out, frag, (size_t)fraglen);
 }

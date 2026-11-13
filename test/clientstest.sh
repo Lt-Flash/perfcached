@@ -1,16 +1,6 @@
 #!/bin/sh
-# clientstest.sh - S160: /clients, the (HTTP, JSON) table behind the
-# status page's clients strip.  One connection per door lands in the
-# table with its door, dialect and wire - on the native door a CMD
-# request (through test/pcnative.py) and a fixed-layout verb both read
-# dialect `binary`, told apart by last_cmd; a named RESP client carries its name; a
-# subscriber its subscription count; a closed connection leaves; a
-# subscriber that stops reading shows pending output bytes and is then
-# gone (closed at the output cap, PC_MAX_OUTQ); the total agrees with
-# /stats clients.open, which excludes HTTP as the table does; the page
-# carries the strip and the panel.
-# Fail-first: v0.4.0-rc1 answers 404 to /clients.
-# Usage: test/clientstest.sh [./perfcached]
+# clientstest.sh - /clients, the JSON table behind the page's clients strip: each connection with its door,
+# dialect, wire, name or subscriptions, gone when closed, its total agreeing with /stats clients.open.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -134,8 +124,7 @@ for _ in range(50):
 check(gone, "and is gone once the output cap closes it")
 check(get("/stats").get("pubsub", {}).get("slow_kills", 0) >= 1, "counted as a slow kill on /stats")
 
-# CLIENT SETINFO - a library's name and version, what a client library sends
-# on connect; the first gap S165's unknown-command card caught on staging
+# CLIENT SETINFO: the library name and version a client library sends on connect
 li = socket.create_connection(("127.0.0.1", RESP), timeout=5); lf = li.makefile("rwb")
 def lcmd(*a):
     lf.write(resp(*a)); lf.flush(); return lf.readline().decode().rstrip("\r\n")
@@ -160,15 +149,14 @@ page = subprocess.check_output([os.environ.get("PAGEDUMP", "./pagedump")]).decod
 check("id=clmetric" in page and "fleet-wide" in page and "id=clpanel" in page and "id=clfilter" in page,
       "the page carries the clients strip, the panel and its filter")
 check("function drawSlow(" in page and "id=slwrap" in page and "id=cmdbycalls" in page, "the page carries the slow log section and the commands table's sort by calls")
-# the panel's functions must be TOP LEVEL: the click handler and tick() call
-# loadClients() from outside drawStats(), and declared inside it (S160 to
-# 069480f) they did not exist for them - the table never filled.  No JS
-# engine here, so the placement is what is checked: after drawStats' end.
+# the panel's functions must be TOP LEVEL (the click handler and tick() call them from
+# outside drawStats()); with no JS engine here, the check is that they follow its end
 end_ds = page.find("sizePlane();trend();}")
 check(end_ds > 0 and page.find("function loadClients(") > end_ds and page.find("function drawClients(") > end_ds,
       "loadClients / drawClients are declared after drawStats() ends, where the panel can call them")
 check("/clients" in page, "the footer names /clients")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"

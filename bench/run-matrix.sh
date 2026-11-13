@@ -1,20 +1,6 @@
 #!/bin/sh
-# run-matrix.sh — the full 4-container measurement battery against a
-# topology started by containers-up.sh.  Every leg runs INSIDE a
-# container: perfcached legs over pcnode1's own loopback, redis legs
-# from pcnode1 across the bridge veth (worth ~10-20us on a baseline;
-# noted with the results, and irrelevant against the ms-scale effects
-# the matrix exists to show).  See bench/CONTAINERS.md for what each
-# leg measures and the results achieved.
-#
-#   bench/run-matrix.sh [results-file]
-#
-# Legs: store-mode latency/throughput (vs redis), CPU under load,
-# KEYS/SCAN stall probes (vs redis), store-mode pull convergence,
-# proxy-mode spread + rebalancer convergence timeline, memory census.
-# If pcredis-aof is up (containers-up.sh ... wal), the durability legs
-# run too.  RUN_RECOVERY=1 adds the kill -9 crash-recovery proof (it
-# restarts pcnode2).
+# run-matrix.sh - the measurement battery against a containers-up.sh fleet, every leg inside a
+# container (see bench/CONTAINERS.md).  Usage: [RUN_RECOVERY=1] bench/run-matrix.sh [results-file]
 set -eu
 
 OUT=${1:-bench/results-containers-$(date +%Y%m%d-%H%M).txt}
@@ -27,8 +13,7 @@ REDIS_IP=10.99.0.20
 
 say() { echo "$@" | tee -a "$OUT"; }
 x1() { $RT exec pcnode1 "$@"; }
-# proto: bin = perfcached's data verbs on their fixed-layout frames
-# (src/proto.h), the path libperfd's typed verbs ride; resp = Redis
+# proto: bin = the data verbs on their fixed-layout frames (src/proto.h); resp = Redis
 pcb() { # pcb <node> <proto bin|resp> <host> <port> <col> <conns> <depth> <getpct> <label> [extra-flag]
 	r=$($RT exec pcnode$1 pcbench -h "$3" -p "$4" -P "$2" -C "$5" \
 		-c "$6" -d "$7" -M "$8" -n $KEYS -v $VAL -T $SECS -w 2 -q ${10:-})
@@ -70,11 +55,8 @@ while :; do
 	sleep 10
 done
 say "-- proxy mode: the full leg battery through ONE ingress (node1) --"
-# -N everywhere: the keyspace is already filled; a refill through a
-# node with an empty locator would place DUPLICATE copies of
-# remotely-held keys.  GET legs run FIRST: the reads warm the
-# ingress's locator, so the SET legs that follow exercise the real
-# forwarded-write plane (holder-serialized), not placement races.
+# -N everywhere: a refill through a node with an empty locator would place duplicate copies.  GET
+# legs first, to warm the ingress's locator so the SET legs exercise the forwarded-write plane.
 pcb 1 bin 127.0.0.1 6479 px 4 1 100 "px GET rtt d1       " -N
 pcb 2 bin 127.0.0.1 6479 px 4 1 100 "px GET d1 via node2 " -N
 pcb 1 bin 127.0.0.1 6479 px 8 32 100 "px GET piped 8x32   " -N
@@ -83,9 +65,7 @@ pcb 1 bin 127.0.0.1 6479 px 8 32 0  "px SET piped 8x32   " -N
 pcb 1 bin 127.0.0.1 6479 px 8 32 90 "px MIX 90/10 8x32   " -N
 say "   px spread after the write legs: $(entries 1 px) / $(entries 2 px) / $(entries 3 px)"
 
-# ---- store mode: latency + throughput, perfcached vs redis --------------
-# one native arm: the daemon speaks the binary protocol only (S317), and
-# pcbench -P bin drives the data verbs on their fixed-layout frames
+# ---- store mode: latency + throughput, perfcached (binary frames) vs redis -------
 say "-- store mode (col b), pcnode1 loopback, binary frames --"
 x1 pcbench -h 127.0.0.1 -p 6479 -P bin -C b -F -n $KEYS -v $VAL
 pcb 1 bin  127.0.0.1 6479 b 4 1  100 "bin  GET rtt d1     "
@@ -118,9 +98,8 @@ wait $LOADPID || true
 say "   load leg during sampling: $(cat /tmp/pc-cpu-load.txt)"
 rm -f /tmp/pc-cpu-load.txt
 
-# ---- the KEYS/SCAN stall probes (the production outage mechanism) -------
-# stallprobe's "perf" selector is perfcached's native door (CMD frames
-# through test/pcnative.py, which the image ships beside the probe)
+# ---- the KEYS/SCAN stall probes; stallprobe's "perf" selector is the native door (CMD frames
+# through test/pcnative.py, shipped beside the probe)
 say "-- stall probes: sampler RTTs while a 2nd connection storms --"
 say "· perfcached scan storm:"
 x1 python3 /usr/local/bin/stallprobe.py perf 127.0.0.1 6479 b scan $KEYS | tee -a "$OUT"
@@ -165,9 +144,8 @@ if $RT inspect pcredis-aof >/dev/null 2>&1; then
 	pcb 1 resp 10.99.0.21 6379 b 8 32 0 "aof  SET piped      "
 	if [ "${RUN_RECOVERY:-0}" = 1 ]; then
 		say "-- crash recovery: kill -9 pcnode2, restart, census --"
-		# census the PROXY shard: placed/forwarded/migrated stores are
-		# WAL-logged.  (Store-mode PULLED copies are passive and not
-		# persisted by design - re-pullable from peers on miss.)
+		# census the proxy collection: its stores are WAL-logged (store-mode pulled copies are not, by
+		# design)
 		B4=$(entries 2 px)
 		$RT kill -s KILL pcnode2 >/dev/null
 		T0=$(date +%s%N)

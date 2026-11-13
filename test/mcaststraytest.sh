@@ -1,19 +1,6 @@
 #!/bin/sh
-# mcaststraytest.sh - the multicast socket takes the group's datagrams only.
-# Every node binds it to ANY:port beside every other daemon on the host
-# (REUSEADDR), so a unicast datagram for a local address nothing is bound to
-# - a node just killed, its restart not up yet - was delivered to one of
-# them and handled as its own: failovertest's bounce saw a node serve its
-# own forward that way, storing a key it does not own and acking it.  Now
-# the datagram's destination (IP_PKTINFO) decides: not the group, dropped,
-# counted in mcast_stray and said once a minute per sender.
-# A two-node multicast fleet; an ALIVE sealed with the fleet's secret, sent
-# by clinject from 127.0.146.9 to 127.0.146.9 - an address no node is bound
-# to, so it reaches a node's multicast socket only.
-#   1  a node counts it as a stray, and says so
-#   2  no node takes the sender as a peer - before, the ALIVE made it one
-# The group's own traffic is the control: the fleet forms and stays whole.
-# Usage: test/mcaststraytest.sh [./perfcached] [./clinject]
+# mcaststraytest.sh - the multicast socket takes the group's datagrams only: a unicast datagram to an
+# unbound local address is dropped by its destination (IP_PKTINFO), counted in mcast_stray and logged.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

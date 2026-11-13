@@ -1,22 +1,6 @@
 #!/bin/sh
-# v6doortest.sh - 12np IP6-2: the client doors on IPv6.  The fleet stays
-# IPv4 (IP6-3 is the cluster's); clients may come over either family.
-#  A. a node whose native, RESP and http doors listen on [::1] only: -C
-#     takes them and says IPv6 is usable; perfcli, a RESP client and an
-#     http client reach it over ::1; 127.0.0.1 does not
-#  B. dual-stack doors ([::]:port, IPV6_V6ONLY off): an IPv4 client
-#     arrives as ::ffff:127.0.0.1 and is matched against an IPv4
-#     resp_allow as the IPv4 address it is; ::1 is refused by that list
-#     (and the refusal names ::1); http_allow = ::1 lets ::1 in and
-#     keeps 127.0.0.1 out; resp_allow with "[::1]/128" lets ::1 in; a
-#     prefix past 128 and a non-address are refused at -C
-#  C. an upstream at redis://[::1]:port: the read fetches through it, and
-#     /stats names it in brackets
-#  D. a client on ::1 writes through one member's [::1] RESP door and
-#     reads the key on another member's - the fleet formed on 127.0.88.x
-# Needs IPv6 on this host (a bind to [::1]): a loud SKIP without it, and
-# FAILED under GitLab CI, where every runner has it.
-# Usage: test/v6doortest.sh [./perfcached] [./perfcli]
+# v6doortest.sh - the client doors on IPv6 ([::1] only, dual-stack with the allow lists, an upstream
+# on [::1], a fleet on IPv4); SKIP without IPv6, FAIL under CI.  Usage: test/v6doortest.sh [./perfcached] [./perfcli]
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -123,8 +107,8 @@ chmod 600 "$D/a.conf"
 	bad "A. -C rc $rc: $(grep -iE 'net:|error|refus' "$D/a.C" | head -2)"
 if start a; then
 	PA=$PID
-	# plaintext: a loopback door under plaintext = loopback carries no PSK
-	# (a Noise handshake there is refused, on 127.0.0.1 as on ::1)
+	# plaintext: a loopback door under plaintext = loopback carries no PSK (a Noise handshake there is
+	# refused, on 127.0.0.1 as on ::1)
 	r=$("$CLI" -q -h ::1 -p 16201 set c k1 v1 2>&1)
 	g=$("$CLI" -q -h ::1 -p 16201 get c k1 2>&1)
 	case "$g" in *v1*) ok "A. the native door on [::1]: perfcli set, then get '$g'";;
@@ -132,6 +116,9 @@ if start a; then
 	cl resp ::1 16202 SET r1 x > /dev/null
 	g=$(cl resp ::1 16202 GET r1)
 	[ "$g" = x ] && ok "A. the RESP door on [::1]: SET, then GET '$g'" || bad "A. RESP on ::1: '$g'"
+	g=$(cl resp ::1 16202 CLIENT LIST)
+	case "$g" in *"addr=[::1]:"*) ok "A. CLIENT LIST names an IPv6 client by its address";;
+	*) bad "A. CLIENT LIST over ::1: '$(echo "$g" | head -c 160)'";; esac
 	u=$(cl http ::1 16203 /stats 's["io"]["ipv6"]["usable"]')
 	[ "$u" = True ] && ok "A. the http door on [::1]: /stats io.ipv6.usable $u" || bad "A. http on ::1: '$u'"
 	g=$(cl resp 127.0.0.1 16202 PING)

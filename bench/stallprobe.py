@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
-# stallprobe.py — the KEYS/SCAN outage-mechanism probe.
-#
-# One connection samples GET and SET round-trips at ~1ms cadence; two
-# seconds in, a second connection fires the storm (KEYS or a full SCAN
-# iteration).  If the server executes the storm on its only execution
-# thread (Redis), every sampled op during it stalls for the storm's
-# whole duration - the production 40s outage in miniature.  A server
-# that walks lock-free on one worker (perfcached) must stay flat.
-#
-# usage: stallprobe.py resp|perf <host> <port> <col> keys|scan [nkeys]
-# The keyspace (k%08u, filled beforehand) is sampled uniformly.
-# "perf" is perfcached's native door: the binary protocol (CMD frames
-# carrying a params tree), spoken through test/pcnative.py - the
-# Perf class below keeps writing JSON-RPC lines and reading reply
-# lines, and the helper does the framing.  "resp" is RESP, for Redis
-# or perfcached's RESP door alike.
+# stallprobe.py resp|perf <host> <port> <col> keys|scan [nkeys] - GET/SET round-trips sampled at ~1 ms
+# while a second connection storms; a server running the storm on its only thread stalls every sample.
 import json, os, random, socket, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 '..', 'test'))
@@ -58,10 +44,8 @@ class Resp:
     def get(self, k): return self.cmd("GET", k)
     def set(self, k, v): return self.cmd("SET", k, v)
     def storm_keys(self):
-        # drain the multi-bulk reply RAW, counting newlines: building
-        # 200k python objects through 400k readline calls once billed
-        # ~10s of CLIENT time to the storm window (keys carry no
-        # newlines, so 2 lines per element is exact)
+        # drain the multi-bulk reply RAW, counting newlines (2 per element; keys carry none): parsing
+        # 200k python objects billed seconds of CLIENT time to the storm window
         self.f.write(b"*2\r\n$4\r\nKEYS\r\n$1\r\n*\r\n"); self.f.flush()
         hdr = self.f.readline()
         if hdr[:1] != b"*":
@@ -98,15 +82,12 @@ class Perf:
     def set(self, k, v):
         return self.rpc("set", {"col": col, "key": k, "value": v})
     def storm_keys(self):
-        # the daemon CAPS one keys reply at 100k (a bounded-reply guard
-        # Redis lacks); "fullwalk" storms the whole table via a
-        # no-match pattern - the complete O(N) walk, empty reply
+        # the daemon caps one keys reply at 100k; "fullwalk" storms the whole table with a no-match
+        # pattern - the complete O(N) walk, empty reply
         if storm == "fullwalk":
             return len(self.rpc("keys", {"col": col,
                 "match": "no-such-prefix*", "limit": 100000})["keys"])
-        # a 100k listing also exceeds the 1MB reply cap (bounded
-        # replies by design; SCAN is the enumeration path) - the
-        # capped storm lists 50k
+        # a 100k listing also exceeds the 1MB reply cap, so the capped storm lists 50k
         return len(self.rpc("keys", {"col": col,
             "limit": min(nkeys * 2, 50000)})["keys"])
     def storm_scan(self):
@@ -120,17 +101,11 @@ class Perf:
 C = Resp if proto == "resp" else Perf
 
 # ---- the storm PROCESS ---------------------------------------------------
-# A separate process, not a thread: the storm's reply parsing must not
-# share the sampler's GIL, or parse work inflates the sampled RTTs and
-# the numbers stop being about the server.
+# a process, not a thread: parsing under the sampler's GIL would inflate the sampled RTTs
 
 def run_storm(q):
-    # Every exit path must put SOMETHING on the queue.  The parent waits
-    # on q.get(), so a storm that raises - a server that refuses the
-    # verb, a closed socket - is indistinguishable from a storm still
-    # running: one probe sat blocked for seven hours on zero seconds of
-    # CPU because KEYS came back "-ERR reply too large" and the
-    # traceback went to a pipe nobody was reading.
+    # every exit path must put SOMETHING on the queue: the parent blocks on q.get(), so a storm that
+    # raised would look like one still running
     try:
         c = C()
         time.sleep(2.0)
@@ -143,9 +118,8 @@ def run_storm(q):
 
 import multiprocessing
 import queue
-# explicit fork context: python 3.14 defaults to forkserver, which
-# re-imports this guard-less script and recurses.  Linux-only tool,
-# no threads are alive at fork time - fork is the right method.
+# explicit fork context: python 3.14 defaults to forkserver, which re-imports this guard-less script
+# and recurses; no threads are alive at fork time
 mp = multiprocessing.get_context("fork")
 mq = mp.Queue()
 st = mp.Process(target=run_storm, args=(mq,))

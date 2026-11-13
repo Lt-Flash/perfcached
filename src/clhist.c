@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clhist.c — the identity history: bounded, LRU, and cheap to be wrong.
- */
+/* clhist.c - the identity history: bounded, LRU, and cheap to be wrong. */
 #include <stddef.h>
 #include <string.h>
 

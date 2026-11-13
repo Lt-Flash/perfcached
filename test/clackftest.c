@@ -1,15 +1,5 @@
-/* clackftest.c - 12ny AT-4: the members' announced marks (clackf.c).
- *
- *   A  reports and the lowest: two members, one space - the min is the
- *      lower; a member that has not reported the space makes it 0
- *   B  a new incarnation forgets what the old one said
- *   C  a mark that goes DOWN is taken, and counted
- *   D  a keepalive without the group clears the member's marks
- *   E  a member forgotten is not counted; asking with it gives 0
- *   F  the bounds: CLACKF_MEMBERS members, CLACKF_SPACES spaces each
- *   G  each walks every mark
- *   H  AT-8: each keepalive's stamp returns the one before
- *   I  AT-11: a mark's moved time, the head, the stuck members */
+/* clackftest.c - the members' announced marks (clackf.c): the lowest over members, incarnations,
+ * keepalives, forgetting, bounds, walking, and when a member was heard or a mark moved. */
 #include <stdio.h>
 #include <stdlib.h>
 #include "../src/clackf.h"
@@ -33,7 +23,7 @@ int main(void)
 	uint64_t two[2] = { 0xA, 0xB }, three[3] = { 0xA, 0xB, 0xC }, v = 0;
 	unsigned int i, n = 0;
 
-	/* ---- A */
+	/* ---- A: two members, one space - the min is the lower; one not reporting makes it 0 */
 	clackf_member(f, 0xA, 1);
 	clackf_member(f, 0xB, 1);
 	clackf_report(f, 0xA, 0x1111, 7, 100, 0);
@@ -45,7 +35,7 @@ int main(void)
 	CHK(clackf_min(f, 0x1111, 8, two, 2) == 0, "A: another incarnation of the origin is another space: 0");
 	CHK(clackf_min(f, 0x1111, 7, two, 0) == 0, "A: no members: 0");
 
-	/* ---- B */
+	/* ---- B: a new incarnation forgets what the old one said */
 	CHK(clackf_member(f, 0xB, 1) == 0 && clackf_mark(f, 0xB, 0x1111, 7, &v),
 		"B: the same incarnation again keeps its marks");
 	CHK(clackf_member(f, 0xB, 2) == 1 && !clackf_mark(f, 0xB, 0x1111, 7, &v) &&
@@ -54,18 +44,18 @@ int main(void)
 	clackf_report(f, 0xB, 0x1111, 7, 90, 0);
 	CHK(clackf_min(f, 0x1111, 7, two, 2) == 90, "B: it reports again (90): the lowest is 90");
 
-	/* ---- C */
+	/* ---- C: a mark that goes DOWN is taken, and counted */
 	CHK(clackf_report(f, 0xA, 0x1111, 7, 50, 0) == 1 && clackf_min(f, 0x1111, 7, two, 2) == 50,
 		"C: A goes down to 50 (a state older than it said): taken, the lowest follows");
 	clackf_get_stats(f, &st);
 	CHK(st.lowered == 1 && st.resets == 1, "C: counted - lowered %llu, resets %llu", st.lowered, st.resets);
 
-	/* ---- D */
+	/* ---- D: a keepalive without the group clears the member's marks */
 	clackf_clear(f, 0xA);
 	CHK(!clackf_mark(f, 0xA, 0x1111, 7, &v) && clackf_min(f, 0x1111, 7, two, 2) == 0,
 		"D: A's keepalive comes without the group: its marks cleared, nothing confirmed");
 
-	/* ---- E */
+	/* ---- E: a member forgotten is not counted; asking with it gives 0 */
 	clackf_forget(f, 0xC);
 	clackf_get_stats(f, &st);
 	CHK(st.members == 2 && clackf_min(f, 0x1111, 7, three, 3) == 0,
@@ -73,7 +63,7 @@ int main(void)
 	CHK(clackf_report(f, 0xC, 0x1111, 7, 5, 0) == -1, "E: a report from a member not announced is refused");
 	clackf_free(f);
 
-	/* ---- F */
+	/* ---- F: the bounds - CLACKF_MEMBERS members, CLACKF_SPACES spaces each */
 	f = clackf_new();
 	for (i = 0; i < CLACKF_MEMBERS; i++)
 		clackf_member(f, 1000 + i, 1);
@@ -85,14 +75,14 @@ int main(void)
 	clackf_get_stats(f, &st);
 	CHK(st.refused == 2 && st.marks == CLACKF_SPACES, "F: refused %llu, marks %u", st.refused, st.marks);
 
-	/* ---- G */
+	/* ---- G: each walks every mark */
 	clackf_report(f, 1001, 1, 1, 1, 0);
 	clackf_report(f, 1002, 1, 1, 1, 0);
 	clackf_each(f, count_cb, &n);
 	CHK(n == CLACKF_SPACES + 2, "G: each walks all %u marks", n);
 	clackf_free(f);
 
-	/* ---- H: AT-8, when a member was heard before */
+	/* ---- H: each keepalive's stamp returns the one before */
 	f = clackf_new();
 	CHK(clackf_heard(f, 0xA, 1000) == 0, "H: a member not in the table: 0, and nothing kept");
 	clackf_member(f, 0xA, 1);
@@ -106,7 +96,7 @@ int main(void)
 	CHK(clackf_heard(f, 0xB, 9) == 7, "H: the member moved into a forgotten one's slot keeps its own (7)");
 	clackf_free(f);
 
-	/* ---- I: AT-11, when a mark moved, the head, the stuck */
+	/* ---- I: when a mark moved, the head, the stuck members */
 	{
 		uint64_t m3[3] = { 0xA, 0xB, 0xC };
 		struct clackf_stuck sk[2];

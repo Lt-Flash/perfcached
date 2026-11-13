@@ -1,21 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clackf.c - 12ny AT-4: the members' announced marks.  See clackf.h.
- */
+/* clackf.c - the members' announced marks.  See clackf.h. */
 #include <stdlib.h>
 #include <string.h>
 #include "clackf.h"
 
 struct fmark { uint64_t oid; uint32_t sincarn; uint64_t mark;
-	long long moved; };                /* AT-11: when it last changed */
+	long long moved; };                /* when it last changed */
 
 struct fmember {
 	uint64_t member;
 	uint32_t incarn;
 	unsigned int n, cap;
 	struct fmark *m;
-	long long heard;               /* AT-8: its last keepalive */
+	long long heard;               /* its last keepalive */
 };
 
 struct clackf {

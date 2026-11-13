@@ -1,40 +1,5 @@
-/*
- * rpsbench.c - a RESP pub/sub driver: the same client against Redis and
- * perfcached's RESP door, written from the protocol (no Redis code).
- *
- *   rpsbench [-H host] [-p port] [-B sub_host] [-b sub_port] [-S subs]
- *            [-s sub_threads] [-P pub_conns] [-t pub_threads] [-d secs]
- *            [-v valsize] [-r rate/s] [-w window] [-x server_pid] [-G]
- *
- * -B/-b send the subscribers to another node than the publishers (a
- * fleet's relay, a cluster's bus); by default both use -H/-p.  Run it on
- * one host either way, so the latency is read against one clock.
- *
- * Subscribers SUBSCRIBE to "bench" first; publishers start only when every
- * subscription is confirmed.  Each payload carries [send ns][publisher
- * id][seq], so every subscriber measures latency (one clock read per
- * read() batch, so a batch's messages share its arrival time) and counts
- * per-publisher gaps and reorders.  -r 0 is a closed loop with <window>
- * PUBLISHes in flight per connection; -r N paces to N/s in total.  One
- * second of warm-up, then <secs> measured, then a drain: publishers settle
- * their in-flight, subscribers catch up.
- *
- * FAN-OUT INVERTS REQUEST/RESPONSE: one publish is N deliveries, so the
- * driver saturates first.  It reports its own CPU (drv_cores) and its
- * busiest thread (busiest_thr): near 1.00 means that cell measured the
- * client.  With -x it reads the server process's CPU and context switches
- * over the same window.
- *
- * One RESULT line: pub_s (publishes acknowledged/s), deliv_s (messages
- * read/s), p50/p99/p999/max latency in µs, acked, expected (acked x subs),
- * got, lost (expected - got after the drain), recv_ok (the receiver
- * counts PUBLISH answered sum to expected), gaps, ooo (reordered), eof
- * (subscribers the server closed), bad, errs (error replies), drain_s,
- * srv_cores, srv_ctxsw_s, drv_cores, busiest_thr.
- *
- * -G publishes a sequence gap every 1000 messages: the gap counter's
- * fail check (4 publishers x 4 subscribers x 37 = 592 over 150k).
- */
+/* rpsbench.c - a RESP pub/sub driver for Redis and perfcached alike, written from the protocol.
+ * Fan-out saturates the driver first: busiest_thr near 1.00 means the cell measured the client. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -57,7 +22,7 @@
 #define HB 1216
 #define RBUF (256 * 1024)
 #define OBUF (256 * 1024)
-#define HDR 20
+#define HDR 20                     /* payload head: send ns, publisher id, seq */
 
 static const char *g_host = "127.0.0.1", *g_sub_host;
 static int g_port = 6379, g_sub_port, g_subs = 1, g_sthr = 1, g_pubs = 4, g_pthr = 1;

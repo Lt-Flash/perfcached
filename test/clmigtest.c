@@ -1,12 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- *
- * clmigtest.c - the migration in-flight window (M10 slice 1).
- *
- * The window is what makes a lost migration datagram accountable in
- * RECORDS rather than datagrams, and what decides when one is re-sent.
- * Both are testable with no socket at all, because clmig_retransmit()
- * hands the caller the offsets and this file supplies its own sender.
- */
+ * clmigtest.c - the migration in-flight window (lost records counted in RECORDS, re-send timing),
+ * the gather buffer, the record codec and the frames' golden layouts; no socket needed. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,10 +118,8 @@ int main(void)
 	chk(clmig_ack(&m, 77) == 5, "G2 ack returns its records");
 	chk(clmig_track(&m, 78, 6, 800, 2000) == 1, "G3 the slot is reusable");
 
-	/* H. a REUSED slot gets a fresh retry budget.  Without this, a slot
-	 * whose previous occupant spent its re-sends would be given up on
-	 * immediately - the datagram would go out once and never again.
-	 * (mutation: drop `retx = 0` from clmig_track) */
+	/* H. a REUSED slot gets a fresh retry budget, or a slot whose previous occupant
+	 * spent its re-sends would send its datagram once and never again */
 	clmig_reset(&m);
 	clmig_track(&m, 10, 1, 0, 1000);
 	{
@@ -147,10 +139,8 @@ int main(void)
 			"H3 and the NEW occupant gets a fresh retry budget");
 	}
 
-	/* I. one sweep, one re-send.  Without refreshing sent_ms every sweep
-	 * would re-send the same datagram again, flooding the peer at tick
-	 * rate instead of once per CLMIG_RETX_MS.
-	 * (mutation: drop `sent_ms = now` from clmig_retransmit) */
+	/* I. one sweep, one re-send: without sent_ms refreshed each sweep the peer is
+	 * flooded at tick rate instead of once per CLMIG_RETX_MS */
 	clmig_reset(&m);
 	clmig_track(&m, 20, 1, 0, 1000);
 	{
@@ -165,9 +155,8 @@ int main(void)
 		chk(nsent == 1, "I4 exactly one datagram left in all that");
 	}
 
-	/* ---- the gather buffer (slice 2) ---------------------------------
-	 * One group becomes one datagram.  The buffer owns the framing and
-	 * the sizes; the caller owns what a header and a record contain. */
+	/* ---- the gather buffer: one group is one datagram; the buffer owns framing
+	 * and sizes, the caller what a header and a record contain */
 	{
 		struct clmig_buf g;
 		unsigned char *hdr = NULL;
@@ -205,9 +194,7 @@ int main(void)
 			"J6 a record larger than the batch is refused");
 		chk(g.len == 0, "J6 and nothing was written");
 
-		/* J6b. the batch cap must also stop an APPEND into a group
-		 * that is already open - not just the opening of a new one.
-		 * (mutation: drop the second cap check in clmig_open_for) */
+		/* J6b. the batch cap also stops an APPEND into an open group */
 		clmig_buf_reset(&g);
 		rc = clmig_open_for(&g, 100, 9, 100000, &hdr);
 		chk(rc == 1, "J6b a group opens");
@@ -230,11 +217,8 @@ int main(void)
 			clmig_record_done(&g, 100, 7);
 		}
 		off = 0; groups = 0; k = 0;
-		/* BOUNDED.  A broken walk (one that does not advance past the
-		 * len2 prefix, say) drifts onto garbage lengths and spins for
-		 * ever; a test that hangs reports nothing at all, so it must
-		 * fail instead.  Found by mutation - the unbounded version
-		 * took the whole run down with it. */
+		/* bounded: a walk that does not advance spins on garbage lengths
+		 * for ever, and a hung test reports nothing */
 		while (clmig_group_walk(&g, &off, &gp, &gn)) {
 			groups++;
 			k += pc_g16(gp + 7);
@@ -257,10 +241,7 @@ int main(void)
 		chk(g.b == NULL, "J8 free releases it");
 	}
 
-	/* ---- the record codec (slice 3) ----------------------------------
-	 * The sender wrote this layout by hand and the receiver decoded it
-	 * by hand, in two places that had to change together.  Now one
-	 * codec does both, so a round trip can pin the format. */
+	/* ---- the record codec: one codec writes and reads the layout, so a round trip pins it */
 	{
 		struct clmig_buf g;
 		struct clmig_rec w, r;
@@ -363,12 +344,8 @@ int main(void)
 			chk(ro == 9, "K4 and a refused parse does not advance");
 		}
 
-		/* K5. Parse from a TIGHTLY sized heap buffer.  The checks above
-		 * all read inside one big allocation, so a parser that reads
-		 * past `n` still lands on valid memory and no assertion can
-		 * see it.  Copying the datagram into a malloc(gn) makes an
-		 * overread a heap overflow, which ASan catches - that is what
-		 * covers the header-length check, not a comparison. */
+		/* K5. inside one big allocation an overread lands on valid memory; out of
+		 * an exactly-sized malloc it is a heap overflow ASan catches */
 		{
 			unsigned char *tight = malloc(gn);
 			size_t ro = 9;
@@ -380,12 +357,7 @@ int main(void)
 					"K5 parses out of an exactly-sized buffer");
 				free(tight);
 			}
-			/* A buffer ALLOCATED at exactly the short length.  The
-			 * previous version passed a small `n` against a big
-			 * allocation, so a parser that ignored the header-length
-			 * check still read inside valid memory and even ASan saw
-			 * nothing.  Only an exactly-sized allocation makes the
-			 * overread a heap overflow. */
+			/* exactly the short length: skipping the length check overreads */
 			{
 				size_t small = CLMIG_RHDR - 1;
 				unsigned char *tiny = malloc(small);
@@ -404,14 +376,8 @@ int main(void)
 		clmig_buf_free(&g);
 	}
 
-	/* ---- the GOLDEN record layout ------------------------------------
-	 *
-	 * Captured from clmig_rec_write() before the cursor rewrite.  The
-	 * round-trip cases above pair write against parse, so they would
-	 * still pass if every offset moved together - and a moved record
-	 * layout is a fleet-wide incompatibility, not a test to update.
-	 * Re-pinned deliberately for S280 (PC_CL_VER 4): the flags byte - the
-	 * record's type - after the version. */
+	/* ---- the GOLDEN record layout: round trips pass if every offset moves together, and a
+	 * moved layout breaks the fleet; the flags byte (record type) follows the version */
 	{
 	static const unsigned char GOLD[] = {
 		0xcd, 0xab, 0x34, 0x12, 0x08, 0x07, 0x00, 0x08, 0x00, 0x00, 0x00, 0x10,
@@ -426,7 +392,7 @@ int main(void)
 		memset(&r, 0, sizeof r);
 		r.ttl_left = 0x1234abcd; r.collen = 8; r.klen = 7; r.vlen = 8;
 		r.ver = 0xfedcba9876543210ULL;
-		r.flags = 0x04;                /* S280: PCACHE_F_JSON */
+		r.flags = 0x04;                /* PCACHE_F_JSON */
 		r.col = "sessions"; r.key = "abc-123"; r.val = "{\"v\":42}";
 		clmig_rec_write(g, &r);
 		chk(clmig_rec_size(8, 7, 8) == sizeof GOLD,
@@ -434,13 +400,8 @@ int main(void)
 		chk(memcmp(g, GOLD, sizeof GOLD) == 0,
 			"GOLDEN record bytes unchanged on the wire");
 	}
-	/* ---- the frames the records travel in ------------------------
-	 *
-	 * ref_* below are the byte writes copied verbatim from mig_cb's
-	 * group header, handle_migrate's ack and the single-record shape
-	 * as cluster.c had them.  The group and the single LOOK alike and
-	 * are not - the single has no count and orders its fields
-	 * differently - which is why both are pinned here. */
+	/* ---- the frames the records travel in, as cluster.c wrote them: group and single
+	 * look alike but are not (the single has no count, other field order) */
 	{
 		unsigned char x[256], y[256];
 		struct clmig_single sg;

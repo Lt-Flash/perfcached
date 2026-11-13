@@ -1,22 +1,5 @@
-/* walscantest.c - the WAL's reader (walscan.c; the 0.7.2 split, wave 1):
- * segments written byte by byte here in the format wal.h describes, read
- * back through pc_wal_scan and pc_wal_dump.
- *
- *   A  two segments read in generation order, not file order; each type's
- *      header - the version where it carries one, the upsert's flags byte
- *      - and the zeroed space after the last record read as the end; a
- *      file without the magic ignored
- *   B  the dump: one line a record, the delete's version from its value,
- *      the JSON flag, the summary with the order
- *   C  where reading stops, and what it says: a record cut short, a
- *      checksum that does not match, a length past the ceiling ("torn"),
- *      a recycled segment's leftover of another generation
- *      ("stale-gen"), lengths that do not add up ("torn")
- *   D  a newer build's record type, its framing sound - handed on
- *      unparsed, the records after it still read; the dump says so
- *   E  the callback stops the scan; no segment at all is 0 records; the
- *      dump names a sequence that went backwards
- */
+/* walscantest.c - the WAL's reader (walscan.c): segments written byte by byte in wal.h's format,
+ * read back through pc_wal_scan and pc_wal_dump. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -170,7 +153,7 @@ int main(void)
 	if (!mkdtemp(dir))
 		return 2;
 
-	/* A */
+	/* A: generation order; each type's header; zeroed space is the end; no magic: ignored */
 	w64(v8, 42);
 	na = rec(a, 5, PC_WAL_T_UPSERT, "c", "k1", "v1", 2, 1000, 1, 0, 0);
 	na += rec(a + na, 5, PC_WAL_T_DEL, "c", "k1", v8, 8, 0, 2, 0, 0);
@@ -204,7 +187,7 @@ int main(void)
 	CHK(g.type[3] == PC_WAL_T_TOUCH_V && g.ver[3] == 100 && g.exp[3] == 2000 && g.vlen[3] == 0,
 		"A: a touch with its version");
 
-	/* B */
+	/* B: the dump - a line a record, the delete's version, the JSON flag, the summary */
 	CHK(dump() == 0 && strstr(dumped, "seq=1 upsert c/k1 vlen=2 exp=1000\n   val=v1\n") &&
 		strstr(dumped, "seq=2 del c/k1 vlen=8 exp=0 ver=42\n") &&
 		strstr(dumped, "seq=3 upsert c/k2 vlen=2 exp=0 ver=99 type=json\n   val={}\n") &&
@@ -213,7 +196,7 @@ int main(void)
 		"B: the dump - a line a record, the delete's version, the JSON flag, the summary");
 	clear();
 
-	/* C */
+	/* C: where reading stops - cut short, bad checksum, past the ceiling, stale-gen, lengths */
 	r1 = rec(a, 1, PC_WAL_T_UPSERT, "c", "k1", "v1", 2, 0, 1, 0, 0);
 	na = r1 + rec(a + r1, 1, PC_WAL_T_UPSERT, "c", "k2", "v2", 2, 0, 2, 0, 0);
 	seg(0, 1, a, na - 3);
@@ -246,9 +229,9 @@ int main(void)
 		CHK(n == 0 && !strcmp(why, "torn"), "C: a sound frame whose lengths do not add up - torn");
 	}
 
-	/* D */
+	/* D: a newer build's record type - handed on unparsed, the records after it still read */
 	na = rec(a, 3, PC_WAL_T_UPSERT, "c", "k1", "v1", 2, 0, 1, 0, 0);
-	na += rec(a + na, 3, 200, "zz", "future", "!", 1, 0, 2, 0, 0);   /* 9 is DEL_N since AT-3b */
+	na += rec(a + na, 3, 200, "zz", "future", "!", 1, 0, 2, 0, 0);   /* 9 is DEL_N */
 	na += rec(a + na, 3, PC_WAL_T_UPSERT, "c", "k3", "v3", 2, 0, 3, 0, 0);
 	seg(0, 3, a, na);
 	n = scan(&g, &why);
@@ -258,7 +241,7 @@ int main(void)
 		strstr(dumped, "wal-dump: 3 records, stop=end, seq-order=ascending, unknown-type=1 (a newer build wrote them)\n"),
 		"D: the dump says so, and the order holds around it");
 
-	/* E */
+	/* E: the callback stops the scan; no segment is 0 records; a sequence going backwards */
 	memset(&g, 0, sizeof g);
 	g.stop_at = 2;
 	n = pc_wal_scan(dir, cb, &g, &why);

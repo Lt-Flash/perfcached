@@ -1,17 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * reload.c - see reload.h and DESIGN 12nw.
- *
- * The comparison is by KEY, not by field: the parser records every
- * key = value it reads as a keyed digest (config.c, pc_config_load_km), the
- * daemon keeps the set it started with, and a reload diffs a fresh read
- * against it.  A key added, removed or given another value counts as
- * changed, so a key deleted to fall back to its default is seen too.  The
- * whitelist below is the whole of what a running daemon can take; anything
- * else that changed refuses the reload, names the keys and leaves the
- * running configuration exactly as it was.
- */
+/* reload.c - the comparison is by KEY: a key added, removed or given another value counts as
+ * changed.  The whitelist below is the whole of what a running daemon can take. */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -24,6 +14,8 @@
 #include <sys/types.h>
 
 #include "reload.h"
+#include "tls.h"
+#include "upstream.h"                  /* the rediss:// files */
 #include "obs.h"
 #include "compat/dprint.h"
 
@@ -40,6 +32,10 @@ static const struct {
 	{ "secrets", "client",       PC_RL_CLIENT,        "the client secrets" },
 	{ "daemon",  "log_level",    PC_RL_LOGLEVEL,      "log_level" },
 	{ "daemon",  "slowlog_usec", PC_RL_SLOWLOG,       "slowlog_usec" },
+	{ "listen",  "tls_cert",     PC_RL_TLS,           "the TLS certificate" },
+	{ "listen",  "tls_key",      PC_RL_TLS,           "the TLS certificate" },
+	{ "listen",  "tls_min",      PC_RL_TLS,           "the TLS certificate" },
+	{ "listen",  "auth_needs_tls", PC_RL_AUTH_TLS,    "auth_needs_tls" },
 };
 #define NRL ((int)(sizeof RL / sizeof RL[0]))
 
@@ -69,16 +65,22 @@ static const char *result_dir(const char *state_dir)
 	return state_dir && *state_dir ? state_dir : NULL;
 }
 
-void pc_reload_init(const char *path, struct pc_keymap *boot,
-		const char *state_dir)
+/* <dir>/reload, the same for the daemon and -H; "" with no dir or one too long */
+static void result_file(const char *state_dir, char *buf, size_t cap)
 {
 	const char *d = result_dir(state_dir);
 
+	buf[0] = 0;
+	if (d && snprintf(buf, cap, "%s/reload", d) >= (int)cap)
+		buf[0] = 0;
+}
+
+void pc_reload_init(const char *path, struct pc_keymap *boot,
+		const char *state_dir)
+{
 	snprintf(RLPATH, sizeof RLPATH, "%s", path ? path : "");
 	BASE = boot;
-	RLFILE[0] = 0;
-	if (d)
-		snprintf(RLFILE, sizeof RLFILE, "%s/reload", d);
+	result_file(state_dir, RLFILE, sizeof RLFILE);
 }
 
 void pc_reload_ask(void)
@@ -218,7 +220,7 @@ int pc_reload_run(char *msg, size_t ml)
 	struct pc_config nc;
 	char refused[400] = "", applied[300] = "", err[200] = "";
 	unsigned int bits = 0;
-	int i, rc = 1;
+	int i, rc = 1, up = 0;
 
 	pthread_mutex_lock(&RLMX);
 	RLGEN++;
@@ -253,22 +255,51 @@ int pc_reload_run(char *msg, size_t ml)
 		snprintf(msg, ml, "reload refused: %s changed and cannot be reloaded - restart to "
 			"apply %s; nothing changed%s", refused,
 			strchr(refused, ',') ? "them" : "it",
-			/* S432: the map has a runtime verb, and its maps outrank the
+			/* the map has a runtime verb, and its maps outrank the
 			 * file across a restart too */
 			strstr(refused, "] resp_collections") ?
 			" (a RESP DB index moves without a restart: perfcli map "
 			"<index> <collection>; runtime maps outrank resp_collections)" : "");
 		goto drop;
 	}
-	if (!bits) {
+	{       /* the rediss:// collections' files too - staged first, applied below */
+		char ue[400];
+
+		if ((up = pc_upstream_tls_stage(ue, sizeof ue)) < 0) {
+			snprintf(msg, ml, "reload failed: upstream TLS: %s - nothing changed", ue);
+			goto drop;
+		}
+		if (up)
+			note_what(applied, sizeof applied, "the upstreams' TLS files");
+	}
+	/* a renewal changes the files, not the config - with a TLS door, every
+	 * reload reads the pair again; one that does not load changes nothing */
+	for (i = 0; i < nc.n_listen && !nc.listen[i].tls; i++)
+		;
+	if (i < nc.n_listen) {
+		char te[300];
+
+		if (pc_tls_stage(nc.tls_cert, nc.tls_key, nc.tls_min13, te, sizeof te) != 0) {
+			snprintf(msg, ml, "reload failed: TLS: %s - nothing changed", te);
+			pc_upstream_tls_commit(0);
+			goto drop;
+		}
+		bits |= PC_RL_TLS;
+		note_what(applied, sizeof applied, "the TLS certificate");
+	}
+	if (!bits && !up) {
 		snprintf(msg, ml, "reload: nothing changed");
 		rc = 0;
 		goto drop;
 	}
-	if (pc_live_reload(&nc, bits, err, sizeof err) != 0) {
+	if (bits && pc_live_reload(&nc, bits, err, sizeof err) != 0) {
 		snprintf(msg, ml, "reload failed: %s - nothing changed", err);
+		pc_tls_commit(0);
+		pc_upstream_tls_commit(0);
 		goto drop;
 	}
+	pc_tls_commit(1);                  /* the door's pair, staged above: now */
+	pc_upstream_tls_commit(1);
 	if (bits & PC_RL_LOGLEVEL)
 		__atomic_store_n(&compat_log_level, nc.log_level, __ATOMIC_RELAXED);
 	if (bits & PC_RL_SLOWLOG)
@@ -324,8 +355,7 @@ static unsigned long long read_gen(const char *file, long *pid, int *ok,
 int pc_reload_client(const char *path, long pid)
 {
 	struct pc_config c;
-	char file[1100], msg[600];
-	const char *d;
+	char file[sizeof RLFILE], msg[600];
 	unsigned long long g0, g;
 	long fpid = 0;                     /* read_gen sets it only when there is a file */
 	int ok, i;
@@ -334,20 +364,15 @@ int pc_reload_client(const char *path, long pid)
 		fprintf(stderr, "perfcached -H: no daemon pid given\n");
 		return 1;
 	}
-	/* the file must load before the daemon is asked - the same check -C
-	 * makes, so a broken file is refused here with its line numbers.  Only
-	 * its errors are shown: the notices describe listeners the reload
-	 * does not touch, and systemctl prints whatever this says */
+	/* the file must load before the daemon is asked (the -C check, with line numbers); errors
+	 * only: the notices describe listeners a reload does not touch, and systemctl prints all */
 	compat_log_level = L_ERR;
 	if (pc_config_load(path, &c) != 0) {
 		fprintf(stderr, "perfcached -H: %s does not load - not reloaded\n", path);
 		pc_config_free(&c);
 		return 1;
 	}
-	d = result_dir(c.state_dir);
-	file[0] = 0;
-	if (d)
-		snprintf(file, sizeof file, "%s/reload", d);
+	result_file(c.state_dir, file, sizeof file);
 	pc_config_wipe_secrets(&c);
 	pc_config_free(&c);
 	g0 = file[0] ? read_gen(file, &fpid, &ok, NULL, 0) : 0;
@@ -358,8 +383,8 @@ int pc_reload_client(const char *path, long pid)
 		return 1;
 	}
 	if (!file[0]) {
-		printf("perfcached -H: asked %ld to reload; with no RUNTIME_DIRECTORY and no "
-			"state_dir its answer is only in its log\n", pid);
+		printf("perfcached -H: asked %ld to reload; with no RUNTIME_DIRECTORY or state_dir "
+			"(or one too long for a path) its answer is only in its log\n", pid);
 		return 0;
 	}
 	for (i = 0; i < 300; i++) {    /* 30 s: a client secret takes an Argon2id run */

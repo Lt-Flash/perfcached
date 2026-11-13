@@ -1,21 +1,5 @@
-/* respcltest.c - the RESP door's CLUSTER commands (respcl.c; the 0.7.2
- * split, wave 1), without a fleet: the members, the placement and the
- * helpers verbs.c owns are stubbed here, and rh_cluster answers into a
- * buffer.
- *
- *   A  KEYSLOT: Redis's own examples (somekey 11058, foo{hash_tag} 2515),
- *      a hash tag keeps keys together, the arity refused
- *   B  standalone (no members): INFO says disabled and fail, MYID and
- *      NODES refuse
- *   C  two members, slots 0-8191 on this node and 8192-16383 on node 2:
- *      INFO enabled and ok with two nodes; MYID from the persisted
- *      identity and incarnation; SLOTS byte for byte - each range with
- *      the RESP door's port (the native one when a member gossips none)
- *      and a 40-hex id (the node number for a member without identity);
- *      the same reply again from the cache (S75); every slot alternating
- *      owners gives 16384 ranges
- *   D  an unknown subcommand is counted (S165) and refused
- */
+/* respcltest.c - the RESP door's CLUSTER commands without a fleet: the members, the placement and
+ * verbs.c's helpers are stubbed, and rh_cluster answers into a buffer. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -106,7 +90,7 @@ int main(void)
 {
 	int i;
 
-	/* A */
+	/* A: KEYSLOT - Redis's own examples, hash tags keep keys together, the arity refused */
 	cluster("KEYSLOT", "somekey");
 	CHK(is(":11058\r\n"), "A: KEYSLOT somekey = 11058, as Redis");
 	cluster("KEYSLOT", "foo{hash_tag}");
@@ -123,7 +107,7 @@ int main(void)
 	cluster("KEYSLOT", NULL);
 	CHK(has("wrong number of arguments") && out.buf[0] == '-', "A: KEYSLOT without a key refused");
 
-	/* B */
+	/* B: standalone - INFO says disabled and fail, MYID and NODES refuse */
 	fleet_n = 0;
 	cluster("INFO", NULL);
 	CHK(has("cluster_enabled:0") && has("cluster_state:fail") &&
@@ -133,7 +117,7 @@ int main(void)
 	cluster("NODES", NULL);
 	CHK(is("-ERR This instance has cluster support disabled\r\n"), "B: NODES refused");
 
-	/* C */
+	/* C: two members - INFO, MYID, SLOTS byte for byte, cached, 16384 ranges when alternating */
 	memset(fleet, 0, sizeof fleet);
 	fleet[0].node = 1;
 	fleet[0].is_self = 1;
@@ -171,7 +155,7 @@ int main(void)
 	CHK(!strncmp(out.buf, "*16384\r\n", 8) && pc_resp_slots_builds == 2,
 		"C: every slot alternating owners - 16384 ranges, built afresh");
 
-	/* D */
+	/* D: an unknown subcommand is counted and refused */
 	unk_calls = 0;
 	cluster("BOGUS", NULL);
 	CHK(unk_calls == 1 && is("-ERR unsupported CLUSTER subcommand\r\n"),

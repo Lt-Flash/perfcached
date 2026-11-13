@@ -1,33 +1,6 @@
 #!/bin/sh
-# stagetest.sh - UP5/UP6n (0.6.5, DESIGN 12nf): who vouches for a build.
-#  K. perfcached -K <artifact> - offline, what the root helper asks the
-#     INSTALLED binary:
-#     1. a test key's signature: refused with no configuration (only the
-#        release key is built in), GOOD under -f with that key in
-#        [upgrade] trusted_keys, the sha256 hashlib's;
-#     2. the hex form of the same signature reads the same;
-#     3. one byte of the artifact changed: BAD;
-#     4. no .sig: NONE, refused - accepted only with allow_unsigned = yes;
-#     5. a 63-byte .sig: UNREADABLE;
-#     6. -E names the built-in release key - DESIGN 12nf's - and the
-#        configured ones; a 63-character key is refused at -C.
-#  S. upgrade_stage / upgrade_status on a running node (UP6n):
-#     1. unprivileged: refused;
-#     2. a signed build in chunks: published as upgrade/staged/<sha256>
-#        .tar.gz byte for byte, its .sig and .meta beside it, listed by
-#        upgrade_status with version, size and signer - and -K offline
-#        reads what was staged as GOOD (the helper's view of it);
-#     3. signed by a key nobody trusts, or a sha256 that is not the
-#        file's: refused at the end, nothing staged, the part removed;
-#     4. unsigned: refused at begin (allow_unsigned = no);
-#     5. a chunk out of order: refused; a second upload while one is in
-#        progress: refused, then abort, then it begins;
-#     6. three builds staged: the oldest pruned, two kept;
-#     7. perfcli upgrade-stage <tarball> <version>: the same, from the
-#        command line, and upgrade_status names it.
-# FAIL-FIRST: 0.6.4 has no -K, no [upgrade] and no upgrade_stage - every
-# check fails.
-# Usage: test/stagetest.sh [./perfcached] [./perfcli]
+# stagetest.sh - who vouches for a build: perfcached -K verifies an artifact's signature offline,
+# upgrade_stage publishes only signed, trusted builds.  Usage: test/stagetest.sh [./perfcached] [./perfcli]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -241,9 +214,8 @@ r=$("$CLI" -q -h 127.0.0.1 -p 16598 -E stage-enable upgrade-stage "$D/d.tar.gz" 
 [ $rc -eq 1 ] && echo "$r" | grep -q 'the version is' && ok "S7. a version with a quote: refused by libperfd before it is sent (exit 1)" || bad "S7. odd version: exit $rc: $r"
 grep -q -E 'ERROR|CRIT' "$D/n.log" && bad "S. the node logged: $(grep -m2 -E 'ERROR|CRIT' "$D/n.log" | tr '\n' '|')" || ok "S. no ERROR or CRIT in the node's log"
 
-# ---- S7. a package install refuses the stage (PD-9, DESIGN 12nr) -----------------
-# this node's binary is ./perfcached with no marker: "local".  Told it is a package install, it
-# refuses upgrade_stage with the package manager named, and upgrade_status says the mode.
+# ---- S7. a package install refuses the stage, naming the package manager; upgrade_status says
+# the install mode
 [ "$(status 's["install_mode"]')" = local ] && ok "S7. this node detects itself as a local install" || bad "S7. install_mode: $(status 's["install_mode"]')"
 kill $PID 2>/dev/null; wait $PID 2>/dev/null; PID=
 sed -i 's|^state_dir = .*|&\ninstall_mode = package|' "$D/c.conf"
@@ -255,18 +227,13 @@ i=0; while [ $i -lt 300 ] && [ "$(grep -c "perfcached ready" "$D/n.log")" -lt 2 
 r=$(up stage-enable "$D/a.tar.gz" "$D/a.tar.gz.sig" 0.6.6)
 echo "$r" | grep -q "package install" && echo "$r" | grep -q "package manager" && ok "S7. upgrade_stage on a package install: refused, the package manager named" || bad "S7. stage on a package install: $r"
 [ -z "$(ls "$D/st/upgrade/staging" 2>/dev/null)" ] && ok "S7. nothing was staged" || bad "S7. staging holds: $(ls "$D/st/upgrade/staging")"
-# ---- S8. perfcli fleet-status (UP8's first piece) ---------------------------------
+# ---- S8. perfcli fleet-status ---------------------------------------------------
 r=$("$CLI" -q -h 127.0.0.1 -p 16598 fleet-status 2>&1); rc=$?
 echo "$r" | grep -q "^node " && echo "$r" | grep -E "127.0.0.1:16598 +[0-9.]+ +this +package +0.6.8 0.6.7" > /dev/null && [ $rc -eq 0 ] &&
 	ok "S8. fleet-status: this node, its version, install mode package, the two staged builds newest first (0.6.8 0.6.7 - S7 staged d.tar.gz as 0.6.8)" || bad "S8. fleet-status rc=$rc: $(echo "$r" | tr '\n' '|')"
 
-# ---- S9. UP7b: upgrade_revert, upgrade_status.previous / .switching / .live_prefix ------------
-# A local install has no prefix: live_prefix null, previous null (no result on record), switching null,
-# and upgrade_revert refused.  Told it is a prefix install with a results_dir of its own, the helper's
-# records (written here by the test, as root would) give it a previous; the revert is refused while this
-# node does not run the build the helper switched to, written with force, and the request file says
-# op=revert and to=<the previous prefix>.  The helper taking the request (the file gone, no result yet)
-# shows as switching; its result ends it and becomes the new previous.
+# ---- S9. upgrade_revert, upgrade_status.previous / .switching / .live_prefix: refused on a local
+# install; on a prefix install the helper's records give a previous and a revert request
 rev() { python3 - "$@" <<'PY' 2>&1
 import json, socket, sys
 import pcnative

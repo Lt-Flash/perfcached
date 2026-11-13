@@ -1,18 +1,5 @@
-/* rollload - UP7c (DESIGN 12ns, 12ne UP10): load through libperfd while a
- * fleet is rolled, counting what the roll must not cost.
- *
- *   rollload <host> <port> <secret> <col> <threads> <keys> <seconds> <outfile>
- *
- * Each thread holds a cluster-aware handle (spares, so a node's restart is
- * a failover inside the library) and loops until SIGTERM or <seconds>:
- * half of its requests GET a pre-filled key "roll:p:<k>" whose value is
- * "p<k>" - a miss or another value is a loss; half SET "roll:w:<k>" to
- * "w<k>" (the same value every time, so any copy is right) and record
- * that the key was written.  At the end it writes to <outfile>:
- *   ops=N errors=N misses=N wrong=N failovers=N written=<bitmap as hex>
- * and exits 0 when errors, misses and wrong are all 0.  set, get and del
- * are idempotent, so the library retries them once on a standby when the
- * node it used goes away - the roll's restarts must never surface. */
+/* rollload.c - load through libperfd while a fleet is rolled: GETs of pre-filled keys and
+ * idempotent SETs; exits 0 only if no error, miss or wrong value surfaced. */
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>

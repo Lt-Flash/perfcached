@@ -1,18 +1,5 @@
-/*
- * clsendtest.c - the cluster plane's send path (M14, wave 4).
- *
- * What goes wrong here goes wrong silently: a datagram sealed under the
- * wrong key is dropped by every peer without a word, one sent to a
- * departed node's address is a write that never lands, and a broadcast
- * that skips a live peer or reaches a dead one is only ever visible as a
- * member that "sometimes" lags.  So every case opens what was sent.
- *
- * No socket: clsend_init() takes the transmit as a function, and this
- * one records what would have gone out - rule 7 of doc/MODULARITY.md.
- *
- * Build: cc -o clsendtest test/clsendtest.c src/clsend.o src/clpeers.o
- *        src/clwire.o -lsodium
- */
+/* clsendtest.c - the cluster plane's send path: every case opens what was sent (the key it was
+ * sealed under, the address, the peers a broadcast reached), captured by a recording transmit. */
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>

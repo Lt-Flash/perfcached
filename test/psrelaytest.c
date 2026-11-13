@@ -1,10 +1,5 @@
-/*
- * psrelaytest.c - the relay's sequence accounting (src/psrelay.h), driven
- * deterministically: reordering is not loss, a real gap is counted once and
- * exactly, a duplicate is dropped, a restart is not a gap.  The first block
- * runs the SHIPPED 0.4.0-rc1 rule on the same arrivals to show what it got
- * wrong - that rule is written out here as the reference it was.
- */
+/* psrelaytest.c - the relay's sequence accounting: reordering is not loss, a gap counts once, a
+ * duplicate is dropped, a restart is no gap; the first block shows the old one-mark rule fail. */
 #include <stdio.h>
 #include <string.h>
 #include "psrelay.h"
@@ -12,7 +7,7 @@
 static int pass, fail;
 #define CHK(c, m) do { if (c) pass++; else { fail++; printf("  FAIL %s\n", m); } } while (0)
 
-/* 0.4.0-rc1's receiver rule, as shipped: one high-water mark per node */
+/* the old receiver rule, kept as the reference: one high-water mark per node */
 static unsigned long long rc1_seen;
 static int rc1_used;
 static unsigned long long rc1_accept(unsigned long long seq)
@@ -133,7 +128,7 @@ int main(void)
 			"epoch, lane and counter round-trip; the counter wraps at 40 bits");
 	}
 
-	/* ---- PS11: the path to one peer ---- */
+	/* ---- the path to one peer ---- */
 	{
 		struct psr_path pa;
 		long long now = 1000000;
@@ -165,9 +160,8 @@ int main(void)
 			"path: becoming direct is reported once");
 		CHK(!psr_path_probe_due(&pa, now + 500, 778) && psr_path_probe_due(&pa, now + 1010, 779),
 			"path: while direct it is re-confirmed every second");
-		/* the answers stop.  Ticks run a little over a second apart and
-		 * each probes before it decides: the tick that sends the third
-		 * unanswered probe must still be direct */
+		/* the answers stop; ticks run a little over a second apart and probe before
+		 * deciding, so the tick sending the third unanswered probe is still direct */
 		{
 			int k, flips = 0, fell = 0, direct3 = 0;
 

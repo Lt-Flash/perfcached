@@ -1,39 +1,14 @@
 #!/bin/sh
-# pressuretest.sh — S47: memory pressure must be VISIBLE before it bites.
-#
-# arena_mb is a real bound (b1e71f1): a full node refuses writes.  This
-# suite proves the operator can see the cliff coming and the recovery
-# happening:
-#   1. the stats memory block carries the pressure surface: tier,
-#      headroom_pct, nomem (writes refused arena-full), and a reclaim
-#      block (retired / pages_freed / released_bytes / cold_bytes /
-#      flushes / giveback)
-#   2. filling to refusal raises nomem and drives headroom_pct to ~0,
-#      and the refusal is the honest "cache full" error
-#   3. drain + a quiet window gives memory back (released_bytes grows,
-#      headroom recovers) - reclaim driven by a workload, not a unit.
-#      NOTE the arena_cap_mb > arena_mb config: the huge-page
-#      RESERVATION is mlocked, and mlock/MADV_DONTNEED are mutually
-#      exclusive (EINVAL), so a node that never grows past its
-#      reservation can never give anything back.  What comes back is
-#      the malloc'd page overflow above the reservation - so the
-#      workload has to create some.
-#   4. reclaim_floor_mb holds a floor under give-back (the HG-v3
-#      hsize_min adoption): the floored node keeps >= floor held while
-#      the unfloored one shrinks below it - the control matters, a
-#      node that cannot shrink AT ALL would satisfy any floor
-#   5. a floor wider than the arena cap is refused at config time
-# Usage: test/pressuretest.sh [./perfcached]
+# pressuretest.sh - memory pressure is VISIBLE before it bites: the stats pressure surface, an honest
+# "cache full" at the bound, give-back after a drain, and a reclaim_floor_mb floor that holds.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
 BIN=${1:-./perfcached}
 SEC=press-client-secret
 D=$(mktemp -d /var/tmp/pcpr.XXXXXX)
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a reused pid
+# never hits a stranger; the name pattern is only a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -75,10 +50,8 @@ start() {
 	return 1
 }
 
-# drive <node> <op> ... - one connection, many ops, python speaks the
-# native door through pcnative.  Ops: fill <n> <ttl> (60KB values,
-# prints stored/full), drain <n> (dels), mem <field> (prints
-# stats.memory.<field>, dotted path allowed, MISSING when absent)
+# drive <node> <op> ... - one native connection, many ops: fill <n> <ttl> (60KB values, prints
+# stored/full), drain <n>, mem <field> (stats.memory.<field>, dotted, MISSING when absent)
 drive() {
 	n=$1; shift
 	python3 - "$n" "$@" <<'PYEOF'
@@ -175,6 +148,7 @@ ACS=$(drive 1 mem at_ceiling_since)
 	|| bad "S98: at_ceiling_since not a timestamp ($ACS)"
 
 # ---- 3. drain + quiet gives memory back -------------------------------
+# what comes back is the page overflow above the mlocked reservation, so the fill must grow past it
 drive 1 drain 900 >/dev/null
 sleep 6
 R1=$(drive 1 mem reclaim.released_bytes)
@@ -184,17 +158,14 @@ H2=$(drive 1 mem headroom_pct)
 [ "${H2:-0}" -gt "${H1:-0}" ] 2>/dev/null \
 	&& ok "headroom recovered ($H1 -> $H2)" \
 	|| bad "headroom did not recover ($H1 -> $H2)"
-# S98: the latch clears on the next carve that SUCCEEDS - enough writes
-# to need a fresh chunk, not one that the kept chunk can absorb
+# the latch clears on the next carve that SUCCEEDS - enough writes to need a fresh chunk, not one the
+# kept chunk can absorb
 drive 1 fill 20 0 >/dev/null
 AC=$(drive 1 mem at_ceiling)
 case "$AC" in False|false) ok "S98: at_ceiling cleared once a carve succeeded";; *) bad "S98: at_ceiling still latched after a successful carve ($AC)";; esac
 
-# ---- 3b. S96: a run of cold groups is punched in ONE call --------------
-# Provable only when the reservation is NOT pinned: mlock and
-# MADV_DONTNEED are exclusive, and a pinned reservation latches
-# giveback_off on its first punch.  That case says so, loudly, rather
-# than passing on nothing.  The counters themselves must exist either way.
+# ---- 3b. a run of cold groups is punched in ONE call -------------------
+# provable only with an unpinned reservation (a pinned one latches giveback_off); counters exist either way
 PC=$(drive 1 mem reclaim.punch_calls); PG=$(drive 1 mem reclaim.punch_groups)
 case "$PC$PG" in *MISSING*|*DRIVEFAIL*) bad "punch counters missing (calls=$PC groups=$PG)";;
 	*) ok "punch counters present (calls=$PC groups=$PG)";; esac
@@ -209,6 +180,7 @@ PE=$(drive 1 mem pool_empty)
 	|| bad "S94: pool_empty missing or nonzero ($PE)"
 
 # ---- 4. the shrink floor holds ----------------------------------------
+# the unfloored control must shrink below the floor: a node that cannot shrink satisfies any floor
 FLOOR=$((32 * 1048576))
 if [ "$N2UP" = 1 ]; then
 	drive 2 fill 900 0 >/dev/null
@@ -228,9 +200,8 @@ case "$HELD1" in ''|*[!0-9]*) bad "unfloored held unreadable ($HELD1)";;
 	|| bad "unfloored node never shrank ($HELD1) - the floor check
 	         above proves nothing";; esac
 
-# ---- 5. the pinned reservation is an OPERATOR-VISIBLE fact ------------
-# mlock and MADV_DONTNEED cannot both apply to the reservation, so a
-# refused punch is expected here - and must be reported, not swallowed.
+# ---- 5. the pinned reservation is a VISIBLE fact ----------------------
+# mlock and MADV_DONTNEED exclude each other, so a refused punch is expected - and must be reported
 GB=$(drive 1 mem reclaim.giveback_off)
 case "$GB" in true|false|True|False) ok "giveback_off is reported ($GB)";;
 	*) bad "giveback_off missing ($GB)";; esac

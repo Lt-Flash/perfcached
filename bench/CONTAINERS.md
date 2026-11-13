@@ -46,7 +46,7 @@ both runtimes.  The Redis containers share the bridge but are **not
 cluster members** — they never see the membership plane (and could not
 join it: joining takes the cluster secret); they exist purely as the
 comparison target the bench client talks RESP to.  Every perfcached
-node serves two collections:
+node serves three collections; the matrix measures the first two:
 
 - **`b` — store mode with pull**: a local miss fetches the value from
   a peer and KEEPS the copy (replicate-on-demand; every node converges
@@ -56,6 +56,9 @@ node serves two collections:
   without storing, writes forward to the holder, and the ~10 s
   rebalancer levels the fleet by live utilization — fleet capacity is
   the sum of the arenas.
+- **`sh` — shard mode**: ownership is computed, not remembered, so it
+  is the one mode that moves keys when membership changes; the
+  reshard fault test (`test/reshardtest.sh`) uses it.
 
 ## 1. Prerequisites
 
@@ -76,7 +79,10 @@ runs INSIDE the container):
 
     docker build --platform linux/amd64 -f bench/Containerfile.debian \
         --build-arg REV=$(git rev-parse --short HEAD) \
-        -t perfcached:bench .
+        -t perfcached:debian .
+
+`bench/containers-up.sh` runs `perfcached:debian`; `IMAGE=` names
+another image.
 
 **Why glibc and nothing else**, at +48.5 MB (53.5 -> 102 MB): musl's
 allocator serialises libperfd's per-reply malloc, so a musl-built
@@ -105,7 +111,7 @@ it for every fleet it ever built, and nobody noticed for a month.
 **Alpine again, from 0.5.0.** The collapse was allocations on the
 request path, not musl itself: a malloc per reply in libperfd, and in
 the daemon a 256 KB buffer and a document copy per JSON command.
-S283 and S284 removed them - the daemon's JSON verbs and libperfd's
+0.4.0 removed them - the daemon's JSON verbs and libperfd's
 calls on a warm handle now allocate nothing, and CI counts it
 (`test/jsonalloctest.sh`, `test/liballoctest.sh`).
 `bench/Containerfile.alpine` builds the small image; CI builds both
@@ -119,20 +125,20 @@ image over:
 
     podman build --platform linux/amd64 -f bench/Containerfile.debian \
         --build-arg REV=$(git rev-parse --short HEAD) \
-        -t perfcached:bench .
+        -t perfcached:debian .
     podman save --format oci-archive -o /var/tmp/perfcached-bench.oci \
-        localhost/perfcached:bench
+        localhost/perfcached:debian
     nerdctl load -i /var/tmp/perfcached-bench.oci
-    nerdctl tag localhost/perfcached:bench perfcached:bench
+    nerdctl tag localhost/perfcached:debian perfcached:debian
 
 The `tag` line matters: podman names the loaded image
-`localhost/perfcached:bench`, and a bare `perfcached:bench` would
+`localhost/perfcached:debian`, and a bare `perfcached:debian` would
 otherwise send nerdctl to Docker Hub instead of the local store.
 
 Pin `--platform` always: a poisoned multi-arch cache once produced an
 arm/v7 image with x86 binaries inside.  Smoke-test the result:
 
-    nerdctl run --rm perfcached:bench -V      # or docker run
+    nerdctl run --rm perfcached:debian -V      # or docker run
 
 Container note: the runtime's default RLIMIT_MEMLOCK (64 KB) makes the
 arena's mlock fail into a "continuing unpinned" warning.  The bring-up
@@ -242,9 +248,9 @@ local within a single 5 s pass (200,000 copies kept), after which
 reads are 59 µs and never leave the node.  Proxy reads never converge
 by design — ~250 µs is their steady state, the price of fleet-sized
 capacity.  (Pulls continue until full convergence; a keyspace whose
-TTLs expire faster than it is read may never fully converge — the
-planned eager-store mode closes that gap by pushing copies in the
-background.)
+TTLs expire faster than it is read may never fully converge — eager
+mode, `mode = eager`, built since, closes that gap by pushing copies
+to every peer.)
 
 The proxy tax is the datagram round-trip to the holder and, pipelined,
 the peer-plane serialization — proxy is the CAPACITY plane; hot data
@@ -288,9 +294,9 @@ per op under musl's allocator (~50× throughput loss; scratch is now
 per-thread), a per-message input-buffer memmove quadratic in pipeline
 depth (13% of a piped run; drains now consume by offset), and a WAL
 autosize that happily provisioned 2 GB/node until the filesystem
-filled (the bench pins 8 × 64 MB; a free-space guard in autosize is
-an open item).  If you rerun this matrix on an older revision, expect
-to rediscover them.
+filled (the bench pins 8 × 64 MB; the WAL now refuses to start when
+the filesystem cannot hold its segments).  If you rerun this matrix
+on an older revision, expect to rediscover them.
 
 ## 8. Teardown
 

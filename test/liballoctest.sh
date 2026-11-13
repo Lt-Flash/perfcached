@@ -1,29 +1,6 @@
 #!/bin/sh
-# liballoctest.sh - S284: libperfd allocates nothing per call on a warm
-# handle.
-#
-# An application links libperfd and brings its own allocator - on Alpine
-# that is musl's, which serialises every malloc across threads (a
-# musl-built client peaked at two threads, 20.6x behind glibc at eight,
-# 2026-08).  perfcached cannot swap the host's allocator, so the library
-# must not allocate per call.  libperfd 0.3.0 did, on every call: a
-# malloc'd copy of every reply (ping included), the hash request's
-# encoding, a heap writer for the JSON calls' requests and the reply
-# reader's node array - 1 to 4 per call, counted with this suite's
-# driver.  The reply is now borrowed from the handle until its next call,
-# the requests are built in the handle's scratch and the reader's node
-# array is lent by the handle.
-#
-# test/liballoc (libperfd, allocshim.so preloaded into it) runs 2,000 of
-# each call on a warm handle and reports allocations per call:
-#   0. positive control: the shim counts the driver's own malloc
-#   1. every call: 0 - except perfd_get, perfd_jget and perfd_hget, whose
-#      result is malloc'd for the caller by contract: exactly 1.  Their
-#      S353 twins perfd_get_buf / jget_buf / hget_buf copy into the
-#      caller's buffer: 0.  A call
-#      that failed is a failure here, not a zero.
-# Fail-first: libperfd 0.3.0 (the 0.4.6 release) allocates 1-4 per call.
-# Usage: test/liballoctest.sh [./perfcached] [./liballoc] [./allocshim.so]
+# liballoctest.sh - libperfd allocates nothing per call on a warm handle (test/liballoc under allocshim.so),
+# except results malloc'd by contract.  Usage: test/liballoctest.sh [./perfcached] [./liballoc] [./allocshim.so]
 set -u
 BIN=${1:-./perfcached}
 DRV=${2:-./liballoc}

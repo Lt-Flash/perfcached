@@ -1,25 +1,6 @@
 #!/bin/sh
-# expirereaptest.sh - S333: a key that EXPIRED and was REAPED, then written
-# again on another thread, replays with the value it was serving.
-#
-# The standalone build's version clock is per thread (S252): a write
-# floors its version on the key's record under the bucket lock, and a
-# DELETE publishes its version to the shared clock, because afterwards
-# there is no record to floor on.  The expiry sweep removed records too,
-# and published nothing: an EXPIRE's touch stamped by a busy thread,
-# lapsed and reaped, then a SET of the key on a quieter thread stamped
-# BELOW it - and the WAL replay, by version (S240), put the touch's past
-# expiry back over the SET.  An acknowledged write gone after a restart:
-# walordertest's expirer round on Alpine, v0.5.6 GitHub, 192 of 20,000.
-#
-# Made certain, not timed: ONE connection (one worker) writes 2,000 junk
-# keys before each key's SET + EXPIRE 1, so only its thread's clock
-# climbs; the sweep reaps them; then each key is written once from a NEW
-# connection - about half land on the other worker, whose clock is near
-# zero.  sync, kill -9, restart from the WAL alone, read.  Before S333
-# about half the keys come back absent (none lost: 2^-40); the clustered
-# edition's clock is one shared counter, so it passes either way.
-# Usage: test/expirereaptest.sh [./perfcached]
+# expirereaptest.sh - a key EXPIRED and REAPED, then written again on another thread (a per-thread
+# version clock nearer zero), replays from the WAL with the value it was serving.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -46,9 +27,8 @@ client = exr-client
 tcp = 127.0.0.1:$PORT
 plaintext = loopback
 [collection c]
-# sized for the 80,000 junk keys, and no autoscale: a resize copy would
-# drop the lapsed keys itself (they do not travel) and count them on the
-# outgoing table - the sweep has to be what reaps them here
+# sized for the 80,000 junk keys, no autoscale: a resize copy would drop the lapsed
+# keys itself, and the sweep has to be what reaps them here
 buckets_log2 = 15
 autoscale = off
 [wal]

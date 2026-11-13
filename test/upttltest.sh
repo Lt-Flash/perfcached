@@ -1,26 +1,6 @@
 #!/bin/sh
-# upttltest.sh - S449: a read-through copy never outlives the upstream's key.
-#
-# A fetched copy took the key's time left (PTTL, ms) rounded UP to whole
-# seconds, on a clock that ticks in whole seconds - so it answered for up to
-# a second after the upstream had expired the key.  Staging, 2026-10-25: a
-# registration's device_info expired in Redis, EXISTS through perfcached
-# still said 1, and the script's JSON.SET $.status went to Redis and was
-# refused ("new objects must be created at the root").  Now the copy's
-# expiry is the last tick boundary at or before the key's deadline: it goes
-# no later than the key, and is held for all but that fraction of a tick.
-# One node, collection 0 reading through from test/fakeupstream.py (which
-# expires its keys lazily and pushes no invalidation for an expiry - the
-# copy lives by its own deadline alone):
-#   1. ten keys probed by EXISTS (a present mark) and ten read by GET (a
-#      value copy), their TTLs 100 ms apart across a second, so a rounding
-#      up overshoots on most whatever the clock's phase: polled every 40 ms
-#      past their deadlines, none answers after the upstream's deadline
-#   2. the copies did serve - the upstream was asked about any one key in
-#      under half the polls (each poll would ask, held nothing; the last
-#      fraction of a tick before the deadline does ask, by design)
-# FAIL-FIRST: before S449 most keys answer up to a second past the deadline.
-# Usage: test/upttltest.sh [./perfcached]
+# upttltest.sh - a read-through copy (value or present mark) never outlives the upstream's key: it
+# expires at the last tick at or before the deadline, yet still serves.  Usage: test/upttltest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=$(readlink -f "${1:-./perfcached}")

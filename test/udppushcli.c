@@ -1,13 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- * udppushcli.c - PS5 through libperfd: a handle takes its pub/sub
- * deliveries over UDP and hands them to the same notify hook, with the
- * same text (the NOTIFY tree rendered as JSON, S317), as the connection
- * would; a blocking handle and an async one;
- * gaps counted when the socket overflows; a stranger's datagram refused;
- * a stream kept alive by the timer acks while idle, and one that stops
- * acking pruned - subscriptions gone, the hook told, no re-subscription.
- * Usage: udppushcli <port> <port of a door with pubsub_udp = no>
- * (plaintext loopback doors of a standalone daemon) */
+ * udppushcli.c - libperfd pub/sub over UDP, blocking and async: hook text, gaps, strangers refused,
+ * acked idle streams kept, silent ones pruned.  Args: a door's port, one with pubsub_udp = no */
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,7 +46,7 @@ static void on_notify(const char *json, size_t len, void *ctx)
 	}
 	if (len > 2000)
 		h->big++;
-	/* a payload byte that is not UTF-8 renders as U+FFFD (D4) */
+	/* a payload byte that is not UTF-8 renders as U+FFFD */
 	if (strstr(buf, "\"payload\":\"\\u0000\\ufffd\""))
 		h->fffd++;
 	snprintf(want, sizeof want, "\"payload\":\"m%d\"", h->next);
@@ -245,9 +238,8 @@ int main(int argc, char **argv)
 	t0 = now_ms();
 	n = perfd_pubsub_udp(a, 0, 3000);
 	OK(n == 0, "perfd_pubsub_udp on an async handle submits the request (%s)", n ? perfd_error(a) : "ok");
-	/* the daemon sends its first probe while it answers: read the UDP
-	 * socket BEFORE the reply is taken off the connection, which is the
-	 * order an event loop can see them in */
+	/* the daemon's first probe comes while it answers: read the UDP socket BEFORE the reply is
+	 * taken off the connection, the order an event loop can see them in */
 	perfd_push(a);
 	{
 		struct pollfd pf;

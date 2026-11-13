@@ -1,55 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING
- *
- * clustersim.c — S42f: the mastership state machine under adverse
- * message schedules, with no network and no wall clock.
- *
- * WHY THIS EXISTS, given S42a-e already work.  The staged plan said to
- * build this only if the container/loopback suites proved too slow or
- * too flaky to iterate on, and they did not: a-e all passed on the real
- * rigs and every failure was a harness bug, not rig flakiness.  What
- * they CANNOT do is the rest of that paragraph - drive the same
- * schedule twice.  A partition on a live fleet happens once, at
- * whatever moment the scheduler chose; a split brain that needs two
- * promotions inside one detection interval is not something you can ask
- * a live rig for.  Here the schedule IS the input, and a seed replays
- * it exactly.
- *
- * WHAT IS REAL AND WHAT IS MODELLED, stated plainly because a
- * simulator that blurs this is worse than none:
- *
- *   REAL - the shipped decision functions, called directly:
- *     pc_term_cmp, pc_term_must_stepdown  (src/clterm.c)
- *     pc_clmap_epoch_cmp                  (src/clmap.c)
- *   MODELLED - everything else: nodes, their roles, the message queue,
- *     delivery order, partitions.  This simulates the PROTOCOL around
- *     those rules; it does not run the daemon.
- *
- * So a green run means "the rules compose correctly under this
- * schedule", never "the daemon does this".  Which brings us to:
- *
- * THE STEP-DOWN RULE IS NOT WIRED IN THE DAEMON.  clterm.h states rule
- * 3 - "a master that observes a HIGHER term steps down immediately and
- * unconditionally" - but cluster.c's map handler only LOGS it:
- *
- *     if (C.role == PC_ROLE_MASTER && ... m.term > pc_term_current()) {
- *             LM_WARN("... the step-down rule is not wired yet\n");
- *     }
- *     C.map = m;  C.map_valid = 1;      // adopts the map
- *                                       // ...and never touches C.role
- *
- * The master adopts the newer map, keeps the role, and beat_pump() goes
- * on sending M_MASTER_ALIVE.  So this runs BOTH models:
- *
- *   MODE_WIRED    rule 3 as clterm.h specifies
- *   MODE_ASIS     rule 3 as cluster.c behaves today (adopt, keep role)
- *
- * and asserts that the second one really does strand two masters.  That
- * is the fail-first half: a simulator that cannot demonstrate the bug it
- * is meant to guard against has proved nothing when it later goes green.
- *
- * usage: ./clustersim [seeds]        (default 2000)
- */
+ * clustersim.c - the shipped term and epoch rules in a modelled mastership protocol under seeded,
+ * replayable schedules: MODE_WIRED steps down on a higher term, MODE_ASIS keeps the role. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,20 +17,13 @@ enum { MODE_WIRED = 0, MODE_ASIS = 1 };
 
 struct node {
 	uint16_t id;
-	/* Address ordering, drawn from the SEED rather than taken from the
-	 * node index.  Index would be an artifact: node 0 always founds the
-	 * cluster, so the freshly promoted node always had the higher index
-	 * and a stale master could never win the address tiebreak - the
-	 * as-is arm reported zero stale winners for a reason that was
-	 * entirely the model's. */
+	/* address order is drawn from the seed: node 0 always founds, so index order
+	 * would never let a stale master win the address tiebreak */
 	int      addr;
 	uint32_t term;                 /* highest term this node has SEEN */
 	uint32_t map_term, map_seq;    /* the epoch it currently holds */
-	/* The term this node CLAIMED when it promoted, which is NOT the
-	 * same as the epoch it holds: a stale master adopts a newer map
-	 * (cluster.c: C.map = m) while keeping its role, so map_term rises
-	 * and stops witnessing how stale the MASTER is.  Asking the wrong
-	 * one of these made the as-is arm report zero stale winners. */
+	/* the term claimed at promotion, not the epoch held: a stale master adopting a
+	 * newer map keeps its role, so map_term no longer shows how stale it is */
 	uint32_t claim_term;
 	int      is_master;
 	int      up;
@@ -126,9 +71,8 @@ static void trace_ev(struct sim *s, uint64_t what)
 
 /* ---- the protocol under test ------------------------------------- */
 
-/* @a publishes its map to everyone it can reach, with per-link loss and
- * delay drawn from the seed.  Reorder is implicit: delays differ per
- * link, and the queue is drained by delivery tick. */
+/* @a publishes its map to everyone it can reach, loss and delay per link from the seed;
+ * differing delays reorder, and the queue drains by delivery tick */
 static void publish(struct sim *s, int a)
 {
 	int b;
@@ -181,19 +125,8 @@ static int seen_by(const struct sim *s, int a)
 	return n;
 }
 
-/*
- * THE KEEPALIVE CURE, which the first version of this file left out
- * entirely - and that omission made it report a bug the daemon does not
- * have.  handle_master_alive ranks two masters by member count and then
- * by ADDRESS, which is a total order, so it resolves an equal-term
- * collision that rule 3 (a strict inequality) cannot touch.  Modelling
- * rule 3 alone showed 1296/2000 equal-term schedules "unresolved"; the
- * daemon resolves them in about two seconds.  A simulator that raises
- * false alarms is no better than one that goes falsely green.
- *
- * Node index stands in for address ordering: higher index wins, exactly
- * as `addr_cmp(from, &C.self_addr) > 0` yields to the higher address.
- */
+/* the keepalive cure: handle_master_alive ranks two masters by member count, then address (a
+ * total order, here node index), so it resolves the equal-term collision rule 3 cannot */
 static void keepalive(struct sim *s, int from, int to)
 {
 	struct node *d = &s->n[to], *f = &s->n[from];
@@ -231,9 +164,8 @@ static void deliver(struct sim *s, const struct msg *m)
 
 	if (!d->up)
 		return;
-	/* the term always goes through the observation path first: a node
-	 * learns from a term even when it refuses the map (cluster.c calls
-	 * pc_term_observe before the epoch comparison) */
+	/* a node learns a term even when it refuses the map: pc_term_observe
+	 * runs before the epoch comparison */
 	if (m->term > d->term && m->term - d->term < PC_TERM_MAX_JUMP)
 		d->term = m->term;
 
@@ -250,8 +182,7 @@ static void deliver(struct sim *s, const struct msg *m)
 	d->map_term = m->term;
 	d->map_seq = m->seq;
 	trace_ev(s, 0xABCDu ^ ((uint64_t)m->to << 16) ^ m->term);
-	/* MODE_ASIS: the map is adopted and the role is NOT touched -
-	 * exactly what cluster.c does today */
+	/* MODE_ASIS: the map is adopted and the role is NOT touched */
 }
 
 static int masters(const struct sim *s)
@@ -264,20 +195,8 @@ static int masters(const struct sim *s)
 	return n;
 }
 
-/* Which fault this run stages.  They are NOT the same scenario and
- * conflating them is how the first version of this file produced a
- * meaningless red:
- *
- *  SC_PARTITION  the fleet splits.  A master that is merely isolated
- *                STAYS master at its existing term - it does not
- *                re-promote itself - so the side without one promotes
- *                and the two sides end at DIFFERENT terms.  Rule 3 has
- *                a strict inequality to work with, and must converge.
- *  SC_DUALCLAIM  the master DIES and the fleet splits in the same
- *                window, so both sides promote from the same highest
- *                seen term and claim the SAME next one.  Rule 3 is
- *                `theirs > mine`; equal terms give it nothing to act on.
- *                Reachable, and not covered by any rule in clterm.h. */
+/* SC_PARTITION: an isolated master keeps its term, the other side promotes, rule 3 must converge;
+ * SC_DUALCLAIM: the master dies as the fleet splits, so both sides claim the SAME next term */
 enum { SC_PARTITION = 0, SC_DUALCLAIM = 1 };
 
 /* One run: stage the fault, heal, then quiesce.
@@ -302,14 +221,8 @@ static int run_one(struct sim *s, uint64_t seed, int mode, int scenario,
 		s->n[i].addr = s->n[j].addr;
 		s->n[j].addr = t;
 	}
-	/* Node 0 founds the cluster - and the fleet must AGREE before any
-	 * fault is staged.  Without this the run is not testing what it
-	 * says: with 25% loss, a node that never received the founder's
-	 * map still believes term 0, so when it promotes it claims term 1
-	 * and collides with the founder.  That is a real hazard, but it is
-	 * the equal-term one that SC_DUALCLAIM exists to stage - letting it
-	 * leak in here made 460 of 2000 partition runs fail for a reason
-	 * that had nothing to do with rule 3. */
+	/* the fleet agrees on the founder's map before any fault, or a node that missed it
+	 * claims term 1 and stages the equal-term collision SC_DUALCLAIM is for */
 	promote(s, 0);
 	for (step = 0; step < 400; step++) {
 		int agreed = 1;
@@ -337,10 +250,8 @@ static int run_one(struct sim *s, uint64_t seed, int mode, int scenario,
 		if (b != a) { s->cut[a][b] = 1; s->cut[b][a] = 1; }
 
 	if (scenario == SC_PARTITION) {
-		/* Whichever side has no master promotes ONE node - the
-		 * lowest id, which is what pick_backup() settles on.  The
-		 * side that still HAS the master leaves it alone: an
-		 * isolated master keeps serving at the term it holds. */
+		/* the side without a master promotes ONE node, the lowest id (as
+		 * pick_backup() does); an isolated master keeps serving at its term */
 		if (s->n[a].is_master) {
 			for (b = 0; b < s->nn; b++)
 				if (b != a) { promote(s, b); break; }
@@ -367,10 +278,8 @@ static int run_one(struct sim *s, uint64_t seed, int mode, int scenario,
 			}
 	}
 
-	/* HEAL, then let everyone re-publish until the queue drains.  The
-	 * keepalive runs EVERY tick and the map only when a master
-	 * publishes - the 1 Hz vs on-change asymmetry that decided the real
-	 * outcome, so the model has to carry it. */
+	/* heal, then re-publish until the queue drains: the keepalive runs every tick, the
+	 * map only on publish - the asymmetry that decides the outcome */
 	memset(s->cut, 0, sizeof s->cut);
 	for (step = 0; step < 60; step++) {
 		int x, y;
@@ -391,10 +300,8 @@ static int run_one(struct sim *s, uint64_t seed, int mode, int scenario,
 	}
 	if (trace)
 		*trace = s->trace;
-	/* Did a STALE master win?  Counting masters is not the question -
-	 * the keepalive cure converges the fleet either way, it just picks
-	 * the wrong node when nothing is term-aware.  This is the same
-	 * correction stepdowntest needed. */
+	/* did a STALE master win?  The keepalive cure converges either way; without
+	 * term awareness it just seats the wrong node */
 	if (wrong) {
 		int i2;
 
@@ -465,14 +372,8 @@ int main(int argc, char **argv)
 		wired_split, seeds, asis_split, seeds,
 		wired_stale, seeds, asis_stale, seeds);
 
-	/*
-	 * FAIL-FIRST, and NOT on the master count.  The keepalive cure is a
-	 * total order, so it converges the fleet with or without anything
-	 * term-aware - it just seats the wrong node.  Counting masters
-	 * therefore cannot tell the two builds apart, which is exactly the
-	 * false green the first stepdowntest walked into.  The
-	 * discriminating question is WHO won.
-	 */
+	/* fail-first on WHO won, not the master count: the keepalive cure converges
+	 * with or without the step-down rule, it just seats the wrong node */
 	if (asis_stale > 0) {
 		printf("  ok   the simulator DETECTS the gap: with nothing "
 			"term-aware, a STALE master won\n"
@@ -497,14 +398,8 @@ int main(int argc, char **argv)
 		fail++;
 	}
 
-	/* ---- 3. the equal-term dual claim ------------------------------
-	 * Rule 3 is a strict inequality, so two nodes promoting from the
-	 * same seen term hold the SAME term and it has nothing to say.  The
-	 * member-count/address cure does - it is a total order - and the
-	 * daemon resolves this in about two seconds
-	 * (test/dualclaimtest.sh).  Modelling rule 3 ALONE made this file
-	 * report 1296/2000 "unresolved": a bug the product does not have.
-	 */
+	/* ---- 3. the equal-term dual claim: rule 3 is a strict inequality and says nothing;
+	 * the member-count/address cure resolves it (test/dualclaimtest.sh) */
 	printf("       master death + split (equal terms), NOT resolved: "
 		"%ld/%ld\n", dual_split, seeds);
 	if (dual_split == 0) {
@@ -524,10 +419,8 @@ int main(int argc, char **argv)
 		uint32_t mine = 7;
 		int rc = pc_term_cmp(mine, mine + PC_TERM_MAX_JUMP + 1000);
 
-		/* the guard lives in pc_term_observe (stateful); what is
-		 * asserted here is the pure half: an absurd term still
-		 * compares as AHEAD, so the guard - not the comparison - is
-		 * what must refuse it.  A silent clamp in cmp would hide it. */
+		/* the guard lives in pc_term_observe: an absurd term still compares
+		 * AHEAD, so the guard, not a silent clamp in cmp, must refuse it */
 		if (rc == PC_TERM_AHEAD) {
 			printf("  ok   an absurd term compares AHEAD - refusing "
 				"it is the guard's job, not cmp's\n");

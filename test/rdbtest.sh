@@ -1,9 +1,6 @@
 #!/bin/sh
-# rdbtest.sh — S14 verification: snapshots trigger by rule and by verb,
-# land atomically (rename + dir fsync, no temp debris), validate by CRC,
-# skip expired entries, honour the writer's rate budget, and record the
-# WAL marker consistency needs.  Reds: corrupt snapshot detected; rules
-# that should NOT fire, don't.  Usage: test/rdbtest.sh [./perfcached]
+# rdbtest.sh - snapshots by rule and by verb: atomic, CRC-validated, expired entries skipped, rate
+# budget honoured, WAL marker recorded; corruption detected.  Usage: test/rdbtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -70,24 +67,17 @@ def call(m, **p):
     if p: r["params"]=p
     f.write(json.dumps(r).encode()+b"\n"); f.flush()
     return json.loads(f.readline())
-# dying FIRST: rule "2 1" may save 2 s after the start, and 200 sets on
-# a slow host (an alpine container on a busy runner) took long enough
-# that the save caught dying alive - 201 records, 1 run of 20, 10-12
+# dying FIRST: rule "2 1" may save 2 s after the start, and 200 sets on a slow host
+# can take long enough for the save to catch dying alive
 call("set", col="th", key="dying", value="x", ttl=1)
 for i in range(200):
     call("set", col="th", key="k%03d"%i, value="v"*100)
-# a save covering all 201 writes may fire before dying expires - under
-# ASan on a busy runner it did (GitLab 110380, 2026-10-13: 201 records).
-# So: wait until dying has certainly expired (ttl 1 s, whole-second ticks),
-# THEN write a trigger - the save that covers it (marker 202) is taken
-# after the expiry, whatever the runner's speed
+# a save covering all 201 writes may fire before dying expires: wait until it has, THEN
+# write a trigger, so the save covering it (marker 202) comes after the expiry
 time.sleep(2.5)                       # dying expired (unswept is fine)
 call("set", col="th", key="trigger", value="t")
-# Wait on the COMPLETED snapshot: last_marker is stamped when a save's walk
-# STARTS (rdb.c), safe_marker only once its rename has landed.  Gating on
-# last_marker let the check pass while the save covering 202 was still
-# writing - GitLab 110993 (rc2, the 225 runner): running true, the temp file
-# on disk, and dump.rdb still the marker-201 save with 200 records.
+# wait on the COMPLETED snapshot: last_marker is stamped when a save's walk starts,
+# safe_marker only once its rename has landed
 deadline = time.time() + 10
 while time.time() < deadline:
     st = call("stats")["result"]["rdb"]

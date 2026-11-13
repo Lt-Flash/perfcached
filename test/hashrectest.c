@@ -1,12 +1,5 @@
-/* hashrectest.c - S313: the hash record's pure functions (src/hashrec.c).
- *
- * Set/replace/append, HSETNX, delete down to empty, the iteration order
- * (insertion, an update keeps its place), HINCRBY with Redis's integer
- * rules and overflow refusal, HINCRBYFLOAT's arithmetic and its text
- * ("10.5", "5000", no trailing zeros), the size ceiling, and a validator
- * that refuses every truncation and every wrong header.  Fail-first: the
- * module does not exist before S313.
- */
+/* hashrectest.c - the hash record's pure functions (src/hashrec.c): set, HSETNX, delete, order,
+ * HINCRBY/HINCRBYFLOAT, the size ceiling, and a validator refusing every truncation. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,13 +146,8 @@ int main(void)
 	OK(!pc_hr_valid(B, (size_t)n, NULL), "a count that lies is refused");
 	OK(pc_hr_valid(A, (size_t)n, &cnt) && cnt == 2, "and the real one is valid");
 
-	/* the ceiling is part of the format: a well-formed record over
-	 * PC_HR_MAX is refused, because every reader sizes its scratch by
-	 * PC_HR_MAX and the recover and cluster-apply paths stamp F_HASH on
-	 * a value of any cell size (S318 review, 10-04).  8286 seven-byte
-	 * entries (a one-byte name, an empty value) are 58,010 bytes; the
-	 * same bytes cut to 8284 entries are 57,996 and valid - the
-	 * positive control for the refusal. */
+	/* the ceiling is part of the format: every reader sizes its scratch by PC_HR_MAX, so a
+	 * well-formed record over it is refused; 8284 entries (57,996 bytes) is the control */
 	{
 		static unsigned char big[PC_HR_HDR + 7 * 8286];
 		unsigned int k, over = 8286, under = 8284;

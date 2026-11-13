@@ -1,28 +1,6 @@
 #!/bin/sh
-# stagerelaytest.sh - UP6n (0.6.5, DESIGN 12nf): a build staged on one node
-# reaches the members, and each verifies it itself.
-# Three eager nodes.  Nodes 1 and 2 trust a test key ([upgrade]
-# trusted_keys); node 3 trusts only the release key built in.
-#  1. a build signed by the test key, uploaded to node 1: staged there,
-#     and the end says it went to 2 members;
-#  2. node 2 stages it byte for byte, its own check naming the signer;
-#  3. node 3 refuses it - it verifies with ITS keys, not node 1's word -
-#     and stages nothing;
-#  4. node 1's upgrade_status relay names node 2 staged, node 3 refused;
-#  5. a member does not relay a build it received (no loop): node 2's
-#     relay table stays empty;
-#  6. UPS's upgrade fact: node 1's members name node 2 "staged" with the
-#     build's first four hex digits, node 3 "idle" with none, and every
-#     helper "absent" (none is installed on a test host);
-#  7. M_UPG_SWITCH / M_UPG_ACK: node 1 asks node 2 to install it - node 2
-#     holds it but has no helper, and says so; asks node 3 - not staged
-#     there, and it says so.  (A member's ask never forces; the accepted
-#     path is switchtest's 8.)
-#  8. facts are never compared (UP1): the members' upgrade facts differ
-#     now - node 2 staged, node 3 idle - and no node raises a config.*
-#     alert over it (tombstonetest F covers equal facts; this, unequal).
-# FAIL-FIRST: 0.6.4 has no upgrade_stage - nothing stages anywhere.
-# Usage: test/stagerelaytest.sh [./perfcached]
+# stagerelaytest.sh - a build staged on one node reaches the members and each verifies it with its OWN keys;
+# relays do not loop, switch asks are answered, and unequal upgrade facts raise no config alert.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -91,6 +69,8 @@ i=0; while [ $i -lt 120 ]; do
 	sleep 0.5; i=$((i+1))
 done
 [ "$(st 1 'r["cluster"]["peers_up"]')" = 2 ] || { bad "the fleet did not form: peers_up $(st 1 'r["cluster"]["peers_up"]')/$(st 2 'r["cluster"]["peers_up"]')/$(st 3 'r["cluster"]["peers_up"]')"; echo "stagerelaytest: $pass passed, $fail failed"; exit 1; }
+# peers_up counts a joiner still CONNECTING, and the stage is offered to members: all ready first
+i=0; while [ $i -lt 60 ] && [ "$(st 1 'r["state"]')$(st 2 'r["state"]')$(st 3 'r["state"]')" != readyreadyready ]; do sleep 0.5; i=$((i+1)); done
 sleep 3                                       # the members' facts ride their next ALIVE
 
 head -c 1500000 /dev/urandom > "$D/a.tar.gz"
@@ -147,10 +127,8 @@ m = r.get("members", []) if isinstance(r, dict) else r
 print(sorted((x.get("advertise") or x.get("addr"), (x.get("upgrade") or {}).get("state"), (x.get("upgrade") or {}).get("staged"), (x.get("upgrade") or {}).get("helper")) for x in m))
 PY
 )
-	# all three before judging: each node refreshes its own fact on its
-	# own 5-s phase (fact_tick), so node 2's staged fact can reach node 1
-	# before node 1's own tick has run - waiting on node 2's alone failed
-	# GitHub's check-asan once (node 1 still idle)
+	# all three before judging: each node refreshes its own fact on its own 5-s phase, so node 2's
+	# staged fact can reach node 1 before node 1's own tick
 	echo "$M" | grep -q -F "('127.0.79.2', 'staged', '$(echo "$SHA" | cut -c 1-4)', 'absent')" &&
 		echo "$M" | grep -q -F "('127.0.79.1', 'staged', '$(echo "$SHA" | cut -c 1-4)', 'absent')" &&
 		echo "$M" | grep -q -F "('127.0.79.3', 'idle', None, 'absent')" && break

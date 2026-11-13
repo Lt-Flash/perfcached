@@ -1,35 +1,5 @@
-/* cfgchecktest.c - the config's rules (cfgcheck.c; the 0.7.2 split, wave
- * 1): cfg_validate on configs built here, each from one valid base with
- * one thing changed; the log stubbed, so what is refused and what is only
- * warned of is read back by its words.
- *
- *   A  the base - valid, nothing said; an alert warning not below its
- *      critical
- *   B  collections: none, a size missing, a name twice; standalone, a
- *      fleet mode and pull said and dropped
- *   C  secrets: none; the cluster's equal to a client's; a client's twice;
- *      a short one and allow_create with no enable secret - warned only
- *   D  listeners: none; RESP off-box with no allow-list; RESP on loopback,
- *      announced; its password equal to a client secret; HTTP off-box
- *      with no allow-list; an HTTP allow-list with no HTTP listener
- *   E  read-through: no prefixes; the no-fall companion made; failover's
- *      primary found in the list (user@ and /db stripped) or not; a
- *      refusing collection has no companion; write-through passes unknown
- *      commands
- *   F  memory: the ceiling below the arena, the floor above the ceiling,
- *      pin = require with a heap backing
- *   G  the cluster: no discovery; unicast's derived ports; unicast with no
- *      port; the set without a mode; spread without K, or K = 1; a local
- *      collection outside the set; the set's member with no block made,
- *      the mode stamped; a local mode contradicting; mode with no
- *      [cluster]
- *   H  [mail]: no server; a user with no password; complete; tls_verify
- *      off, said; a mail password with no [mail]
- *   I  the file world-readable - warned, by its path
- *   J  the relay port's threads: auto = half the workers, rounded up, at
- *      most one per sending lane; a number kept; the loader's default auto
- *   K  the WAL's segments_max below its floor refused, above it kept
- */
+/* cfgchecktest.c - the config rules (cfg_validate): each case is one valid base with one thing
+ * changed, and what is refused or only warned of is read back from the stubbed log by its words. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,7 +53,7 @@ static void base(void)
 	cfg.alerts.mem_warn = cfg.alerts.arena_warn = 65;
 	cfg.alerts.cpu_crit = cfg.alerts.io_crit = 75;
 	cfg.alerts.mem_crit = cfg.alerts.arena_crit = 75;
-	cfg.alerts.link_warn = 80;                     /* S465 */
+	cfg.alerts.link_warn = 80;
 	cfg.alerts.link_crit = 95;
 	cfg.col[0].name = "c";
 	cfg.col[0].buckets_log2 = 16;
@@ -125,7 +95,7 @@ int main(void)
 {
 	char tmp[64];
 
-	/* A */
+	/* A: the base is valid and silent; an alert warning not below its critical */
 	base();
 	CHK(check() == 0 && !errs && !warns && !notices, "A: the base config - valid, nothing said");
 	CHK(ps.line == 0, "A: the rules' errors carry no line number");
@@ -137,7 +107,7 @@ int main(void)
 	CHK(refused("[alerts] link_warn_pct must be below link_crit_pct"),
 		"A: the link's warning at its critical - refused (S465)");
 
-	/* B */
+	/* B: collections - none, a size missing, a name twice; standalone with fleet settings */
 	base();
 	cfg.n_col = 0;
 	CHK(refused("no collections configured"), "B: no collections - refused");
@@ -155,7 +125,7 @@ int main(void)
 		strstr(logbuf, "pull = 1 ignored") && cfg.col[0].mode == PC_MODE_STORE && !cfg.col[0].pull,
 		"B: standalone, mode = proxy and pull = 1 - dropped, each said, running as store");
 
-	/* C */
+	/* C: secrets - none, the cluster's equal to a client's, one twice; weak ones only warned */
 	base();
 	cfg.n_client_secrets = 0;
 	CHK(refused("no client secret configured"), "C: no client secret - refused");
@@ -178,7 +148,7 @@ int main(void)
 		strstr(logbuf, "allow_create is ON and no [secrets] enable is set"),
 		"C: a short secret, allow_create with no enable secret - warned, not refused");
 
-	/* D */
+	/* D: listeners - none, RESP and HTTP off-box without an allow-list, RESP password reuse */
 	base();
 	cfg.n_listen = 0;
 	CHK(refused("no listeners configured"), "D: no listeners - refused");
@@ -211,7 +181,7 @@ int main(void)
 	CHK(refused("http_allow is set but no 'http = addr:port' listener exists"),
 		"D: an HTTP allow-list with no HTTP listener - refused");
 
-	/* E */
+	/* E: read-through - prefixes, the no-fall companion, failover's primary, write-through */
 	base();
 	cfg.col[0].upstream = "redis://10.0.0.1:6379";
 	CHK(refused("[collection c] upstream needs upstream_prefixes"), "E: an upstream with no prefixes - refused");
@@ -263,7 +233,7 @@ int main(void)
 	CHK(refused("[collection c] upstream_writes needs upstream ="),
 		"E: upstream_writes with no upstream - refused");
 
-	/* F */
+	/* F: memory - ceiling below the arena, floor above the ceiling, pin with a heap backing */
 	base();
 	cfg.arena_mb = 1024;
 	cfg.arena_cap_mb = 512;
@@ -278,7 +248,7 @@ int main(void)
 	cfg.backing_heap = 1;
 	CHK(refused("pin = require needs backing = own"), "F: pin = require on a heap backing - refused");
 
-	/* G */
+	/* G: the cluster - discovery, unicast ports, the set, spread's K, local collection modes */
 	base();
 	cluster();
 	cfg.cl_unicast = 0;
@@ -346,7 +316,7 @@ int main(void)
 	CHK(refused("[cluster] mode/collections without a [cluster] section"),
 		"G: a cluster mode with no [cluster] - refused");
 
-	/* H */
+	/* H: [mail] - no server, a user without password, tls_verify off, a stray password */
 	base();
 	cfg.mail_on = 1;
 	CHK(refused("[mail] needs smtp = smtp://host:port or smtps://host:port"), "H: [mail] with no server - refused");
@@ -371,7 +341,7 @@ int main(void)
 	CHK(check() == 0 && warns == 1 && strstr(logbuf, "[secrets] mail is set but there is no [mail] section"),
 		"H: a mail password with no [mail] - warned, unused");
 
-	/* I */
+	/* I: a world-readable config file is warned of by its path */
 	snprintf(tmp, sizeof tmp, "/tmp/cfgchecktest.XXXXXX");
 	{
 		int fd = mkstemp(tmp);
@@ -390,7 +360,7 @@ int main(void)
 	CHK(check() == 0 && !warns, "I: mode 640 - nothing said");
 	unlink(tmp);
 
-	/* J */
+	/* J: relay threads - auto = half the workers rounded up, at most one a lane, or a number */
 	{
 		static const int wk[][2] = { { 12, 6 }, { 7, 4 }, { 2, 1 }, { 1, 1 },
 			{ 64, CLWIRE_LANES } };
@@ -435,7 +405,7 @@ int main(void)
 		}
 	}
 
-	/* K: S466 step 2 - a cap below the floor is refused, at or above it kept */
+	/* K: the WAL's segments_max below its floor is refused, at or above it kept */
 	base();
 	cfg.wal_segments = 8;
 	cfg.wal_segments_max = 4;

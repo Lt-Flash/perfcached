@@ -1,10 +1,6 @@
 #!/bin/sh
-# image-admin.sh - S413 part 1: build the admin image (perfcached-dashboard
-# + perfcli + nginx) with podman or docker, prove it runs, and save it as a
-# tar beside the release artifacts.  A host with neither container engine
-# SKIPS loudly, as alpine-check.sh does.
-#
-# Usage: tools/image-admin.sh [outdir]          -> <outdir>/perfcached-admin-<ver>.tar
+# image-admin.sh [outdir] - build the admin image (perfcached-dashboard + perfcli + nginx), prove it runs and
+# save <outdir>/perfcached-admin-<ver>.tar; SKIPS loudly without podman or docker.
 set -u
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-/var/tmp/pcrel}
@@ -39,12 +35,8 @@ r=$($E run --rm -e PCD_SEEDS=127.0.0.1:6479 -e PCD_SECRET=x "$TAG" sh -c 'sed -n
 echo "$r" | grep -q "^127.0.0.1:6479" && echo "$r" | grep -q "^127.0.0.1:8090" && echo "$r" | grep -q "^127.0.0.1$" && echo "  ok   the config renders from the environment (seed, loopback listen, trusted proxy)" || { echo "image-admin: the rendered config: $(echo "$r" | tr '\n' '|')"; exit 1; }
 r=$($E run --rm -e PCD_SEEDS=127.0.0.1:6479 -e PCD_SECRET=x -e PCD_FRONT_PROXY=yes "$TAG" sh -c 'grep -c "X-Forwarded-For \$http_x_forwarded_for" /run/nginx/nginx.conf; grep -c proxy_add_x_forwarded_for /run/nginx/nginx.conf' 2>&1 | tr '\n' ' ')
 [ "$r" = "1 0 " ] && echo "  ok   PCD_FRONT_PROXY=yes: nginx passes X-Forwarded-For through" || { echo "image-admin: the front-proxy nginx config: '$r'"; exit 1; }
-# podman's docker-archive refuses to write over an archive that is there
-# ("doesn't support modifying existing images"): a second build of one
-# version - the tag pipeline after a hand build, an rc2 - died on it
-# only this version's image is left: the CI job copies perfcached-admin-*.tar
-# from here, and an older one beside it was published again (0.7.1-rc11
-# carried 0.7.0's) - and kept ~100 MB a version on the runner
+# only this version's image is left: podman's docker-archive will not overwrite an archive, and the CI
+# job publishes every perfcached-admin-*.tar found here
 rm -f "$OUT"/perfcached-admin-*.tar
 $E save -o "$OUT/perfcached-admin-$VER.tar" "$TAG" || { echo "image-admin: save"; exit 1; }
 echo "=== image-admin: $OUT/perfcached-admin-$VER.tar ($(du -h "$OUT/perfcached-admin-$VER.tar" | cut -f1))"

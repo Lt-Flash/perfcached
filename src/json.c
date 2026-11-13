@@ -3,9 +3,7 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * json.c — the in-house JSON codec (task S7).  See json.h.
- */
+/* json.c - the in-house JSON codec.  See json.h. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -169,9 +167,8 @@ int pc_json_get(const char *buf, const struct pc_jtok *t, int ntok,
 	for (i = obj + 1; i < ntok; i++) {
 		if (t[i].parent != obj)
 			continue;                  /* nested subtrees skipped by parent */
-		/* direct children alternate key, value, key, value... - only
-		 * even positions are keys (a VALUE whose text equals the key
-		 * name must not match) */
+		/* direct children alternate key, value: only even positions are keys (a VALUE whose
+		 * text equals the key name must not match) */
 		if ((child++ & 1) == 0 && t[i].type == PC_J_STR &&
 		        (size_t)(t[i].end - t[i].start) == klen &&
 		        !memcmp(buf + t[i].start, key, klen) && i + 1 < ntok)
@@ -207,10 +204,8 @@ int pc_json_unescape(const char *buf, const struct pc_jtok *tok,
 	size_t n = 0;
 	int u;
 
-	/* the decoded length never exceeds the source span (every escape
-	 * shrinks or stays: \uXXXX is 6 source bytes -> at most 3), so the
-	 * bound is checked per write against the ACTUAL bytes about to land,
-	 * not a fixed worst-case headroom. */
+	/* the decoded length never exceeds the source span (\uXXXX: 6 source bytes -> at most 3),
+	 * so the bound is checked per write against the ACTUAL bytes about to land */
 #define PUT1(ch) do { if (n + 1 > outcap) return -1; out[n++] = (ch); } while (0)
 	while (s < e) {
 		if (*s != '\\') {
@@ -364,9 +359,8 @@ void pc_jw_str(struct pc_jw *w, const char *s, size_t n)
 
 void pc_jw_i64(struct pc_jw *w, long long v)
 {
-	/* by hand, not snprintf: every reply number goes through here (the
-	 * RESP length headers, every figure in stats and members), and
-	 * vfprintf was 2% of a GET's worker CPU on its own */
+	/* by hand, not snprintf: every reply number goes through here (RESP length headers, every
+	 * figure in stats), and vfprintf was 2% of a GET's worker CPU on its own */
 	char num[24], *p;
 	unsigned long long u = v < 0 ? 0ULL - (unsigned long long)v
 		: (unsigned long long)v, t;
@@ -375,9 +369,8 @@ void pc_jw_i64(struct pc_jw *w, long long v)
 
 	for (t = u; t >= 10; t /= 10)
 		n++;
-	/* S322: straight into the buffer when the number fits - formatting
-	 * into a stack array first cost a memcpy call per number, and every
-	 * RESP bulk header carries one */
+	/* straight into the buffer when the number fits: a stack array first costs a memcpy call
+	 * per number, and every RESP bulk header carries one */
 	direct = w->len + n <= w->cap;
 	p = direct ? w->buf + w->len + n : num + sizeof num;
 	do {
@@ -392,28 +385,8 @@ void pc_jw_i64(struct pc_jw *w, long long v)
 		pc_jw_raw_slow(w, p, n);
 }
 
-/*
- * S182: like pc_jw_str, but a byte that cannot be part of a valid UTF-8
- * sequence is emitted as U+FFFD instead of raw.
- *
- * JSON text must be valid UTF-8 (RFC 8259), and pc_jw_str passes every
- * byte from 0x20 up through untouched - which is right for a string the
- * daemon composed and wrong for one that carries CLIENT bytes.  The
- * slow log keeps up to four arguments of the command it sampled, and a
- * client row keeps the last command and the library name the client
- * announced: store a binary value, have that SET sampled as slow, and
- * /stats stops being parseable.  Seen on the fleet 2026-09-20 with the
- * operator's production keyspace, whose large values are binary - a
- * strict reader fails, and a monitoring integration is exactly a strict
- * reader.
- *
- * Replacement rather than an escape: these fields are a DIAGNOSTIC
- * sample, already truncated at OBS_ARGLEN and already redacted where a
- * secret was recognised, so byte fidelity is not what they are for.
- * Since S317 every path that DOES need fidelity carries bytes on the
- * binary wire (ptree.h); this renderer serves the HTTP door and the
- * libperfd API edge, where JSON is a view, not the record.
- */
+/* like pc_jw_str, but a byte that cannot be part of valid UTF-8 becomes U+FFFD: client bytes in a
+ * diagnostic sample (slow log, client rows) need no fidelity and must not break strict readers */
 void pc_jw_str_utf8(struct pc_jw *w, const char *s, size_t n)
 {
 	static const char hx[] = "0123456789abcdef";

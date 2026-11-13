@@ -1,4 +1,4 @@
-/* sha1.c - S170a: SHA-1 per FIPS 180-4 section 6.1.  See sha1.h. */
+/* sha1.c - SHA-1 per FIPS 180-4 section 6.1.  See sha1.h. */
 #include <stdint.h>
 #include <string.h>
 

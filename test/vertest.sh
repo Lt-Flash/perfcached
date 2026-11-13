@@ -1,23 +1,6 @@
 #!/bin/sh
-# vertest.sh — task A1: a record's version survives death.
-#
-# `ver` is the Lamport stamp that says which copy of a key is newer.  It
-# is assigned on every local write and, until this task, lived only in
-# RAM: recovery re-stored every record and the table stamped each one
-# with a FRESH tick.  Recovery runs before the node joins the cluster
-# (daemon.c: pc_recover well ahead of pc_cluster_init), so the clock was
-# still at 0 and a rejoiner's whole dataset came back numbered 1..N while
-# the fleet it was about to rejoin sat in the billions.  Every recovered
-# record would lose the first comparison anyone made.
-#
-#  1. a write's version is visible, and successive writes increase it
-#  2. THE POINT: after a restart every key's version is what it was
-#  3. the clock resumes ABOVE the recovered data - a post-recovery write
-#     outranks every record that came back
-#  4. cross-version: a store written by a PRE-A1 binary still replays,
-#     numbered 0, instead of being discarded (run only when that binary
-#     is passed as $2)
-# Usage: test/vertest.sh [./perfcached] [./perfcached.pre]
+# vertest.sh - a record's version (`ver`, its Lamport stamp) survives a restart through snapshot and
+# WAL, and the clock resumes above the recovered data.  Usage: test/vertest.sh [./perfcached] [./perfcached.pre]
 set -u
 # absolute, not $(dirname "$0"): rpc() runs its python from inside $D
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -105,8 +88,7 @@ PY
 (cd "$D" && rpc p1.py) && ok "a write stamps a version, and it advances" \
 	|| bad "versions are not visible or do not advance"
 
-# more keys, a snapshot, then a WAL tail on top of it - so recovery has
-# to carry the version through BOTH paths, not just one
+# more keys, a snapshot, then a WAL tail on top: recovery must carry the version through both paths
 cat > "$D/p1b.py" <<'PY'
 import time
 call("save")
@@ -151,7 +133,7 @@ grep -q "lamport" "$D/log" && ok "recovery reported the restored clock" \
 	|| bad "recovery said nothing about the clock it restored"
 stopd
 
-# ---- 4. cross-version: a pre-A1 store still replays -------------------
+# ---- 4. cross-version: an older binary's store still replays, numbered 0 ---
 if [ -n "$PRE" ] && [ -x "$PRE" ]; then
 	rm -rf "$D/wal"; mkdir -p "$D/wal"
 	start "$PRE"

@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clpull.c - the PULL plane's wire frames.  See clpull.h.
- */
+/* clpull.c - the PULL plane's wire frames.  See clpull.h. */
 #include <string.h>
 
 #include "clpull.h"

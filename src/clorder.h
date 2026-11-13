@@ -1,7 +1,5 @@
-/*
- * clorder.h - S461: a replicated set and a replicated delete of one key,
- * applied on two threads in any interleaving, end as one thread would.
- */
+/* clorder.h - a replicated set and a replicated delete of one key, applied on
+ * two threads in any interleaving, end as one thread would. */
 #ifndef PC_CLORDER_H
 #define PC_CLORDER_H
 
@@ -26,7 +24,7 @@ int clorder_set(pcache_htable_t *ht, const str *k, const str *v,
  * Read @tv after the store - the bucket lock orders it after a racing delete's plant */
 int clorder_take_back(pcache_htable_t *ht, const str *k, unsigned long long ver,
 		unsigned long long tv);
-/* its tombstone already planted; @shadow is a resize filling (S69), or NULL.
+/* its tombstone already planted; @shadow is a resize filling, or NULL.
  * 1 = removed from @ht */
 int clorder_del(pcache_htable_t *ht, pcache_htable_t *shadow, const str *k,
 		unsigned long long ver);

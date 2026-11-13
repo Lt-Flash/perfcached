@@ -1,14 +1,6 @@
 #!/bin/sh
-# memguardtest.sh - S366: the memory guard refuses new client connections
-# while less than the floor stays free, the way max_clients refuses (Redis's
-# exact text on RESP, an error frame on the native door), counts and logs
-# it once a spell, keeps every held connection and the HTTP door answering,
-# leaves the refusing state only past the hysteresis, and is off when
-# memory_floor = off.  max_clients' default counts memory.  The limit is
-# read from /proc/meminfo, cgroup v2 and cgroup v1 - fed here through the
-# test hooks PERFCACHED_TEST_MEMINFO / _PROC_CGROUP / _CGROUP_ROOT.
-# Fail-first: 0.5.6.4 has no guard, no hooks and no clients.memory.
-# Usage: test/memguardtest.sh [./perfcached]
+# memguardtest.sh - the memory guard refuses new clients while free memory is below the floor (meminfo, cgroup
+# v2 and v1, via test hooks) and leaves past the hysteresis.  Usage: test/memguardtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -45,8 +37,8 @@ CONF
 	chmod 640 "$D/$1.conf"
 }
 
-# the soft descriptor limit in a CI job is 1024 (GitLab 110082): raise it to the
-# hard one, so the memory-derived limit is the smaller one wherever that allows
+# a CI job's soft descriptor limit is 1024: raise it to the hard one, so the memory-derived limit
+# is the smaller wherever that allows
 ulimit -n "$(ulimit -H -n)" 2>/dev/null
 start() {  # start <name> - env from the caller
 	"$BIN" -f "$D/$1.conf" -D > "$D/$1.log" 2>&1 & P=$!
@@ -176,8 +168,6 @@ stop
 # ---- B: memory_floor = off - nothing refuses ------------------------------
 printf 'MemTotal:        1048576 kB\nMemAvailable:     51200 kB\n' > "$D/meminfo"
 conf b "memory_floor = off" 17394
-# the hooks: exported - a VAR=x prefix on a FUNCTION call does not reach
-# the commands inside it under dash
 export PERFCACHED_TEST_MEMINFO=$D/meminfo PERFCACHED_TEST_PROC_CGROUP=$D/cgroupA PERFCACHED_TEST_CGROUP_ROOT=$D/cgA
 start b || bad "daemon b did not start"
 grep -q "the client guard is OFF" "$D/b.log" && ok "memory_floor = off says so at boot" || bad "no 'guard is OFF' line"
@@ -197,8 +187,6 @@ printf 'anon 400000000\nfile 100\ninactive_file 10485760\nactive_file 5\n' > "$D
 echo "0::/svc.slice/pc.service" > "$D/cgroup2"
 printf 'MemTotal:        4194304 kB\nMemAvailable:     3145728 kB\n' > "$D/meminfo"
 conf c "" 17394
-# the hooks: exported - a VAR=x prefix on a FUNCTION call does not reach
-# the commands inside it under dash
 export PERFCACHED_TEST_MEMINFO=$D/meminfo PERFCACHED_TEST_PROC_CGROUP=$D/cgroup2 PERFCACHED_TEST_CGROUP_ROOT=$D/cg2
 start c || bad "daemon c did not start"
 grep -q "memory: limit 768 MB (cgroup v2 /svc.slice)" "$D/c.log" && ok "cgroup v2: the limited level binds and is named" || bad "v2 line: $(grep 'memory: limit' "$D/c.log")"
@@ -217,8 +205,6 @@ echo 524288000 > "$D/cg1/memory/grp/memory.usage_in_bytes"
 printf 'cache 1\ninactive_file 7\ntotal_inactive_file 20971520\n' > "$D/cg1/memory/grp/memory.stat"
 printf '12:pids:/x\n5:cpu,cpuacct:/y\n4:memory:/grp\n0::/\n' > "$D/cgroup1"
 conf d "memory_floor = 200 MB" 17394
-# the hooks: exported - a VAR=x prefix on a FUNCTION call does not reach
-# the commands inside it under dash
 export PERFCACHED_TEST_MEMINFO=$D/meminfo PERFCACHED_TEST_PROC_CGROUP=$D/cgroup1 PERFCACHED_TEST_CGROUP_ROOT=$D/cg1
 start d || bad "daemon d did not start"
 grep -q "memory: limit 1024 MB (cgroup v1 /grp)" "$D/d.log" && ok "cgroup v1: the memory controller's path, its limit named" || bad "v1 line: $(grep 'memory: limit' "$D/d.log")"
@@ -229,7 +215,7 @@ print(m['available'], m['floor'])")
 [ "$r" = "$((1073741824 - 524288000 + 20971520)) $((200 * MB))" ] && ok "v1 headroom uses total_inactive_file ($r)" || bad "v1 figures: $r"
 stop
 
-# ---- G: S406 - a cgroup limit that can never hold the floor, the arena and the process
+# ---- G: a cgroup limit that can never hold the floor, the arena and the process
 mkdir -p "$D/cg3/tiny"
 echo 100663296 > "$D/cg3/tiny/memory.max"                         # 96 MB
 echo 10485760 > "$D/cg3/tiny/memory.current"
@@ -244,15 +230,8 @@ timeout 20 "$BIN" -f "$D/g.conf" -D > "$D/g.log" 2>&1; rc=$?
 [ $rc -ne 0 ] && grep -q "cannot hold this node.*refusing to start" "$D/g.log" && ! grep -q "perfcached ready" "$D/g.log" \
 	&& ok "S406: the daemon refuses to start under it, the sum in its line" || bad "S406 start: rc $rc, $(grep 'memory:' "$D/g.log" | tail -2)"
 
-# ---- F: ST1 - a hugetlb pool and an arena on it -------------------------------
-# The pool is allocated at boot and never counted in MemAvailable: under a
-# meminfo limit it comes off MemTotal, and an arena on MAP_HUGETLB commits
-# from it - its uncommitted part claims ordinary memory only as surplus pages
-# beyond the pool's free ones, and only with nr_overcommit_hugepages > 0.
-# The shape is a production VM's: 2 GB, 512 x 2 MB pages, arena 1024 MB with
-# 120 MB committed, MemAvailable 645 MB.  0.5.6.6 took room = 645 - 296
-# (15% of 1973) - 904 (reserved - committed) and refused every client.
-# PERFCACHED_TEST_ARENA stands in for the arena (this host has no pool).
+# ---- F: a hugetlb pool (never in MemAvailable) and an arena on it, a 2 GB VM's shape;
+# PERFCACHED_TEST_ARENA stands in for the arena
 hugemem() {  # hugemem <HugePages_Free>
 	printf 'MemTotal:        2020368 kB\nMemFree:          125320 kB\nMemAvailable:     661016 kB\nHugePages_Total:     512\nHugePages_Free:      %d\nHugePages_Rsvd:        0\nHugepagesize:       2048 kB\n' "$1" > "$D/meminfo"
 }
@@ -283,8 +262,8 @@ set -- $r
 [ "$2" = "$LIM_F" ] && [ "$4" = "$FLOOR_F" ] && ok "ST1: /stats limit $2 and floor $4 (15% of the limit without the pool)" || bad "ST1: limit/floor: $r (want $LIM_F / $FLOOR_F)"
 [ "$5" = 0 ] && [ "$6" = $((1024 * MB)) ] && [ "$7" = $((904 * MB)) ] && ok "ST1: overcommit 0 - the uncommitted hugetlb part is no claim on memory (reserve 0, pool $6, free $7)" || bad "ST1: reserve/pool: $r"
 [ "$8" = False ] && echo "$r" | grep -q "PONG" && ok "ST1: the production shape admits clients (refusing $8)" || bad "ST1: the production shape refuses: $r"
-# the MEMORY figure, whichever basis wins: a runner whose descriptor limit
-# is lower (GitHub: 65536) derives max_clients from descriptors
+# the memory figure, whichever basis wins: a runner with a lower descriptor limit derives
+# max_clients from descriptors
 N=$(grep -o 'clients: max_clients .*memory for ~[0-9]* idle' "$D/f.log" | sed -E 's/.*memory for ~([0-9]+) idle/\1/')
 [ -n "$N" ] && [ "$N" -gt 50000 ] && ok "ST1: the memory figure for max_clients does not subtract the hugetlb arena twice (~$N)" || bad "ST1: max_clients line: $(grep 'clients: max_clients' "$D/f.log")"
 stop

@@ -1,20 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * pubsub.h - the pub/sub engine (PS1): subscriptions live on the
- * connection that made them, a publish is delivered to every local
- * subscriber by the worker that OWNS each connection, and the fleet
- * relay (PS3) hands a node the messages published elsewhere.
- *
- * Every entry point here takes the connection as an opaque pointer -
- * the engine never touches a connection itself.  Delivery goes through
- * proto.c (pc_conn_pubsub_push / pc_conn_kill) on the owner's thread:
- * a publish on worker A hands worker B a message through B's queue and
- * eventfd, and B resolves its own subscribers when it drains, so no
- * connection pointer ever crosses a thread.  Subscribe, unsubscribe and
- * the close hook take the global lock; publish takes it once to find
- * out who is subscribed and then lets go.
- */
+/* pubsub.h - pub/sub engine: subscriptions live on their connection and every
+ * delivery runs on the worker that owns it, so no connection crosses a thread */
 #ifndef PC_PUBSUB_H
 #define PC_PUBSUB_H
 #include <stddef.h>
@@ -37,10 +24,8 @@ int pc_pubsub_count(void *conn);                /* 0 = not in subscribed mode */
 void pc_pubsub_conn_closed(void *conn);         /* proto.c, on teardown */
 
 /* ---- publish and delivery ------------------------------------------- */
-/* local receivers.  @origin: 0 a client's publish here (relayed to the
- * fleet), 1 a message that arrived from a peer (delivered, never relayed
- * again), 2 a local-only event - a keyspace notification (PS8), which
- * every node emits for what it applies and none relays. */
+/* @origin: 0 a local client's publish (relayed to the fleet), 1 from a peer
+ * (never relayed again), 2 a local-only keyspace notification (never relayed) */
 int pc_pubsub_publish(const char *chan, size_t clen, const char *data,
 		size_t dlen, int origin);
 void pc_pubsub_drain(int worker);               /* the worker's eventfd turn */
@@ -77,38 +62,30 @@ struct pc_pubsub_stats {
 };
 void pc_pubsub_stats(struct pc_pubsub_stats *out);
 
-/* the reserved prefix: internal events (PS6) publish under it, clients
- * may subscribe to it and may not publish into it */
+/* the reserved prefix: internal events publish under it; clients may subscribe
+ * to it but not publish into it */
 #define PC_PUBSUB_RESERVED "__pc."
 
-/* provided by cluster.c (PS3): relay a publish to every live peer on the
- * sealed unicast plane.  Returns peers sent to, 0 with no cluster, -1
- * when the frame does not fit a datagram (delivered locally, not relayed). */
+/* cluster.c: relay a publish to every live peer; returns peers sent to, 0 with no
+ * cluster, -1 when the frame does not fit a datagram (delivered locally only) */
 int  pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 		size_t dlen);
-/* PS12, provided by cluster.c: this node gained its first subscription to
- * a name - tell every live peer.  @h1/@h2 are the filter hashes of an
- * exact name; a pattern travels as its string. */
+/* cluster.c: tell every live peer this node gained its first subscription to a
+ * name; @h1/@h2 are an exact name's filter hashes, a pattern travels as text */
 void pc_cluster_pubsub_interest_add(uint64_t version, int pattern,
 		const char *name, size_t nlen, uint32_t h1, uint32_t h2);
-/* PS12: what this node tells its peers it wants relayed (psinterest.h).
- * set_interest is called once, before the workers start; version is 0 when
- * the node wants everything; full writes the full state (the wire form in
- * psinterest.h) and returns its length, 0 when @cap is too small; tick
- * rebuilds the filter at most every 30 s once a name has gone. */
+/* relay interest advertised to peers (psinterest.h): set once before the workers
+ * start; version 0 = wants everything; full returns 0 when @cap is too small */
 void pc_pubsub_set_interest(int on);
 uint64_t pc_pubsub_interest_version(void);
 size_t pc_pubsub_interest_full(unsigned char *out, size_t cap);
-void pc_pubsub_interest_tick(long long now_ms);
+void pc_pubsub_interest_tick(long long now_ms);   /* rebuilds at most every 30 s */
 /* the relay's own bookkeeping, from cluster.c */
 void pc_pubsub_relay_account(unsigned long long sent, unsigned long long lost,
 		unsigned long long dropped, unsigned long long duplicates);
 
-/* the native door's NOTIFY tree for one message, or one message under
- * one pattern (proto.c pc_conn_pubsub_push): built by the first native
- * subscriber a delivery loop meets and reused by the rest, since it
- * depends on nothing about the connection.  The caller zeroes it and
- * frees buf after the loop. */
+/* the native door's NOTIFY tree for one message: built by the first native
+ * subscriber, reused by the rest; the caller zeroes it and frees buf after */
 struct pc_ps_note {
 	char *buf;
 	size_t len;
@@ -120,27 +97,19 @@ struct pc_ps_note {
 int  pc_conn_pubsub_push(void *conn, const char *pat, size_t plen,
 		const char *chan, size_t clen, const char *data, size_t dlen,
 		const char *resp_frame, size_t flen, struct pc_ps_note *note);
-/* the push's answer: 0 delivered; SLOW = the connection's output is at the
- * cap (close it, count a slow kill); NOMEM = an allocation failed on this
- * side (skip it, keep the connection); BROKEN = the socket failed (close
- * it, not a slow kill) */
+/* push result: SLOW = output at its cap (close, count a slow kill); NOMEM = our
+ * allocation failed (skip, keep the conn); BROKEN = socket failed (close only) */
 #define PC_PS_PUSH_SLOW   (-1)
 #define PC_PS_PUSH_NOMEM  (-2)
 #define PC_PS_PUSH_BROKEN (-3)
-/* closes the connection from its owner's thread; 1 when THIS call started
- * the close, 0 when it was already closing - so a dying subscriber that is
- * handed ten more messages is one kill, not eleven */
+/* closes from the owner's thread; 1 when THIS call started the close, 0 when
+ * already closing, so a dying subscriber is killed once, not per message */
 int pc_conn_kill(void *conn, const char *why);
 /* a staged push's flush failed (SLOW or BROKEN): close and count it as the
  * push itself would have been */
 void pc_pubsub_push_failed(void *conn, int rc);
-/* Publisher pressure.  A door's publish that leaves a target worker's
- * queue at half its cap or more sets pc_ps_pressed for the command that
- * made it; the connection then takes the targets (pressure_take), asks
- * to wait on them (pressure_wait answers 1 when every one is already
- * below a quarter, and otherwise registers this worker to be woken by
- * their drains), stops reading, and asks again when woken.  Relayed and
- * keyspace messages never press: nothing upstream of them can wait. */
+/* a client publish leaving a target queue at >= half its cap sets pc_ps_pressed;
+ * pressure_wait answers 1 once every target is below a quarter, else arms a wake */
 #define PC_PS_MASK_WORDS 8
 extern __thread int pc_ps_pressed;
 int  pc_pubsub_pressure_take(uint64_t *mask);   /* mask may be NULL */
@@ -151,5 +120,5 @@ void pc_pubsub_pause_note(void);
  * once as it starts, flush before it waits */
 void pc_pubsub_defer_wakes(void);
 void pc_pubsub_flush_wakes(void);
-void pc_conn_subs_note(void *conn, int n);   /* S160: for /clients */
+void pc_conn_subs_note(void *conn, int n);   /* for /clients */
 #endif /* PC_PUBSUB_H */

@@ -1,24 +1,6 @@
 #!/bin/sh
-# aheadtest.sh - S166: the arena commits 2 MB groups AHEAD of the chunk
-# frontier, so a client's write never populates one.
-#
-# What it is about: a carve that crosses into an uncommitted group calls
-# MADV_POPULATE_WRITE over the whole 2 MB, on the worker holding the
-# client's write.  Measured 2026-09-20 on an idle 16-vCPU box: 1.0-3.2 ms
-# on 4K pages, 2.2-4.0 ms on THP; the 4-vCPU fleet logged a 10.1 ms SET.
-# The reclaim tick (1/s) now keeps PCACHE_AHEAD_GROUPS groups committed
-# above the frontier, and the give-back leaves that window alone.
-#
-# The assertion is the PROPERTY, not a latency: `commits_inline` counts
-# groups a carve had to commit itself.  A latency threshold would be a
-# flake on a busy box; the counter is exact and says the same thing.
-#
-# The shape matters: arena_mb is the INITIAL commit and arena_cap_mb the
-# reservation, so writing past arena_mb is what makes the frontier cross
-# into groups nobody committed yet.  The writes go in steps with a tick
-# between them - growth faster than 1/s outruns any window by design and
-# is counted, not prevented.
-# Usage: test/aheadtest.sh [./perfcached]
+# aheadtest.sh - the arena commits 2 MB groups AHEAD of the chunk frontier, so a client's write never
+# populates one: asserted by the exact commits_inline counter, not a latency, writing past arena_mb.
 set -u
 
 BIN=${1:-./perfcached}
@@ -75,12 +57,8 @@ def mem():
 
 m0 = mem()
 TIER = m0.get("tier", "?")
-# The four backing tiers commit differently, so the property differs:
-#   MAP_HUGETLB  - the ahead window is SKIPPED on purpose (a finite pool
-#                  shared with the host; group_secure owns those pages)
-#   THP advise / THP collapse / plain 4K - all commit through
-#                  pcache_mem_commit, so the window applies
-#   no arena     - there is no reservation at all; nothing to commit
+# MAP_HUGETLB skips the ahead window (a finite pool shared with the host); the THP and
+# plain 4K tiers commit through pcache_mem_commit, so the window applies
 HUGETLB = "MAP_HUGETLB" in TIER
 # a heap-backed daemon reports no tier at all ("unknown"/"none"): there is
 # no reservation, so neither counter can move
@@ -92,10 +70,8 @@ if "commits_inline" not in m0 or "commits_ahead" not in m0 or "commits_index" no
     sys.exit(1)
 
 s = socket.create_connection(("127.0.0.1", 17694), 8); s.settimeout(30)
-# read-only: the writes go out through s.sendall.  Python 3.14's "rwb"
-# file reads a reply line ~20x slower (Alpine 3.24: a 20,000-SET step
-# took 0.95 s instead of 0.05), which stretched the index steps until the
-# ahead window lapsed between two carves - S273, never the daemon
+# read-only (writes go out through s.sendall): Python 3.14's "rwb" file reads a reply
+# line ~20x slower, long enough for the ahead window to lapse between two carves
 f = s.makefile("rb")
 
 def write(n, base, val, pfx):
@@ -106,13 +82,8 @@ def write(n, base, val, pfx):
     for _ in range(n):
         f.readline()
 
-# Two growths, because the arena has two frontiers and they are committed
-# by different threads.  RECORDS: 24 MB past a 16 MB initial commit, 2 MB
-# at a time with a tick between, carved upward by the worker taking the
-# write.  INDEX: 160,000 small keys so the 4,096-bucket table splits over
-# and over, carved DOWNWARD from the top of the reservation by the
-# maintenance thread's growth slice.  A step per tick either way: growth
-# faster than the tick outruns any window by design.
+# two growths, one per arena frontier: records carved upward by the writing worker, the
+# index carved downward by the maintenance thread; one step per tick, so no window is outrun
 for step in range(12):
     write(250, step * 250, b"v" * 8192, b"ahead")
     time.sleep(1.2)
@@ -135,10 +106,8 @@ elif NOARENA:
 else:
     (ok if ahead > 0 else bad)("the reclaim tick committed groups ahead of the frontier (%d)" % ahead)
     (ok if inline == 0 else bad)("no carve had to commit a group itself (commits_inline +%d)" % inline)
-    # The index zone is NOT windowed (S168 withdrawn): a table split
-    # commits its own groups, on the maintenance thread rather than on a
-    # client's write.  The test pins that it is counted where it lands,
-    # so the two costs can never be confused again.
+    # the index zone is not windowed: a table split commits its own groups on the
+    # maintenance thread, counted apart from the client-side commits
     idx = m1["commits_index"] - m0["commits_index"]
     (ok if idx > 0 else bad)("the index zone's splits committed their own groups, counted apart (%d)" % idx)
 (ok if m1["nomem"] == 0 else bad)("no write was refused for memory (nomem %d)" % m1["nomem"])

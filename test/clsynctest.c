@@ -1,16 +1,5 @@
-/*
- * clsynctest.c — staging a map change past the backup (step 3).
- *
- * Every test is a way "the backup is never behind the fleet" could stop
- * being true:
- *   - publishing something the backup never committed to
- *   - a late ack for an abandoned change committing its replacement
- *   - a reused sequence putting two different maps at one epoch
- *   - a promoted backup silently dropping a change it had already acked
- *   - a lost standby blocking the cluster instead of degrading it
- *
- * Build: cc -o clsynctest test/clsynctest.c src/clsync.o
- */
+/* clsynctest.c - staging a map change past the backup, so it is never behind the fleet: no
+ * uncommitted publish, stale ack, reused sequence or dropped acked change; no standby degrades. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,13 +134,8 @@ int main(void)
 	CHK(pc_clsync_owed(&s, &t, &q),
 		"a huge sequence in an OLDER term cleared the debt");
 
-	/* ---- the wire envelope ---------------------------------------
-	 *
-	 * [type][maplen4][map][histlen4][hist].  The three refusals below
-	 * lived inline in cluster.c where nothing could reach them, and a
-	 * control-state sync is what a promoted standby rebuilds the fleet
-	 * from - a frame that parses loosely is worse here than most
-	 * places.  Buffers are sized EXACTLY so ASan can see an overread. */
+	/* ---- the wire envelope [type][maplen4][map][histlen4][hist]: a promoted standby rebuilds
+	 * the fleet from it, so parsing is strict; exact-size buffers let ASan see an overread */
 	{
 		const unsigned char MAP[] = { 0xde, 0xad, 0xbe, 0xef, 0x11 };
 		const unsigned char HIST[] = { 0x01, 0x02, 0x03 };

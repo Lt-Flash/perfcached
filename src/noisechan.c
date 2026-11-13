@@ -1,13 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * noisechan.c - the client doors' Noise channel, the responder's side
- * (S25'): a client's handshake (message 1 checked against every client
- * secret, or the cluster's; message 2 staged), then its transport records
- * decrypted onto the connection's input.  Moved from proto.c unchanged
- * (the 0.7.2 split, wave 1 - doc/MODULARITY.md); the buffers are proto.c's
- * (protoint.h), the crypto pc_noise.c's.
- */
+/* noisechan.c - the client doors' Noise channel, responder side: message 1 checked against
+ * every client secret (or the cluster's), message 2 staged, then records decrypted. */
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -16,12 +10,11 @@
 #include "pc_noise.h"
 #include "proto.h"                      /* struct pc_psk_ctx, PC_BIN_* */
 #include "protoint.h"
-#include "logrl.h"                     /* CH-17 */
-#include "daemon.h"                    /* S468: pc_nat_bin_records */
+#include "logrl.h"
+#include "daemon.h"                    /* pc_nat_bin_records */
 
-/* CH-17: a refused handshake is a line per connection, which whoever
- * can reach the door writes - said through the shared limit, keyed by the
- * client's address (unix-socket clients share one key) */
+/* a refused handshake is a line per connection that anyone reaching the door can write:
+ * said through the shared limit, keyed by the client's address (unix clients share one) */
 static int hs_say(const struct pc_conn *c, int reason)
 {
 	pc_addr a;
@@ -42,7 +35,7 @@ static int pa_refuse(struct pc_conn *c, const char *why)
 	return -1;
 }
 
-/* S468: after a granted msg2 the client's first record must be PC_HS_SWITCH
+/* after a granted msg2 the client's first record must be PC_HS_SWITCH
  * under the session keys - a replayed msg1 cannot make one */
 static int plain_switch(struct pc_conn *c)
 {
@@ -84,12 +77,8 @@ int channel_handshake(struct pc_conn *c)
 		return 0;
 	if (c->pa_stage)
 		return plain_switch(c);
-	/* S339: a client with no secret sends its first request in the
-	 * clear, and the binary header's first two bytes (magic 0x9E, ver
-	 * 1) read little-endian as a 414-byte handshake - inside the bounds
-	 * below, so the door waited for 416 bytes that never came and the
-	 * client sat until its own 30 s timeout.  A real message 1 is 50
-	 * bytes and never opens like this. */
+	/* a secretless client's first request in the clear reads as a 414-byte handshake
+	 * (its magic and version); a real message 1 is 50 bytes, so refuse, never wait */
 	if ((unsigned char)c->raw[0] == PC_BIN_MAGIC &&
 	    (unsigned char)c->raw[1] == PC_BIN_VER)
 		return -1;
@@ -125,7 +114,7 @@ int channel_handshake(struct pc_conn *c)
 		if (pc_hs_read_msg1(&c->hs, psk->cluster, noise, noise_len,
 		        pay, &pl) == 0)
 			matched = 1;
-		else if (psk->have_cluster_accept) {    /* CH-7 */
+		else if (psk->have_cluster_accept) {
 			pc_hs_init_responder(&c->hs, &key_id, 1);
 			if (pc_hs_read_msg1(&c->hs, psk->cluster_accept, noise,
 			        noise_len, pay, &pl) == 0)
@@ -147,7 +136,7 @@ int channel_handshake(struct pc_conn *c)
 		return -1;
 	}
 
-	/* S468: plaintext for a client that asks, on a door that allows it */
+	/* plaintext for a client that asks, on a door that allows it */
 	plain = c->pa_ok && key_id == PC_PRIN_CLIENT && pl >= 2 && pay[1] == PC_HS_PLAIN;
 	status[0] = 0x00;
 	status[1] = PC_HS_PLAIN;
@@ -188,7 +177,7 @@ int channel_records(struct pc_conn *c)
 			rlen, pt);
 		if (pl < 0)
 			return -1;             /* bad tag: tampered / desynced */
-		{                              /* S468: per thread, folded */
+		{                              /* per thread, folded */
 			static __thread unsigned int n;
 
 			if (++n == 1 || n == 65) {

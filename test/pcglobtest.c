@@ -1,17 +1,5 @@
-/* pcglobtest.c - the key glob (pcglob.c; the 0.7.2 split, wave 1): what
- * KEYS, SCAN MATCH and the read-through allow-list match with.
- *
- *   A  the plain cases: an empty pattern, a lone *, literal bytes (case
- *      counts), ? for exactly one byte
- *   B  * anywhere, backtracking across several, and a pattern longer than
- *      the string
- *   C  classes: a set, a range, ^ and ! negation, ] first is literal, a
- *      trailing - is literal, a backslash inside escapes; an unterminated
- *      class matches nothing
- *   D  backslash escapes outside a class; a trailing backslash is literal
- *   E  lengths, not terminators: a NUL byte inside is an ordinary byte;
- *      pc_glob_match answers as pc_glob
- */
+/* pcglobtest.c - the key glob (pcglob.c) that KEYS, SCAN MATCH and the read-through allow-list
+ * match with. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/pcglob.h"
@@ -26,7 +14,7 @@ static int m(const char *p, const char *s)
 }
 
 static const struct { const char *p, *s; int want; const char *why; } cases[] = {
-	/* A */
+	/* A: an empty pattern, a lone *, literal bytes (case counts), ? for exactly one byte */
 	{ "", "", 1, "A: an empty pattern matches the empty key" },
 	{ "", "a", 0, "A: and nothing else" },
 	{ "*", "", 1, "A: * matches the empty key" },
@@ -37,7 +25,7 @@ static const struct { const char *p, *s; int want; const char *why; } cases[] = 
 	{ "h?llo", "hallo", 1, "A: ? is one byte" },
 	{ "h?llo", "hllo", 0, "A: exactly one" },
 	{ "h?llo", "heello", 0, "A: not two" },
-	/* B */
+	/* B: * anywhere, backtracking across several, a pattern longer than the string */
 	{ "h*llo", "hllo", 1, "B: * may be empty" },
 	{ "h*llo", "heeeello", 1, "B: or many" },
 	{ "*:sess", "user:42:sess", 1, "B: * first" },
@@ -49,7 +37,7 @@ static const struct { const char *p, *s; int want; const char *why; } cases[] = 
 		"B: many stars, no b - answered, and no" },
 	{ "a*", "", 0, "B: a pattern needing a byte the key lacks" },
 	{ "ab*", "a", 0, "B: a pattern longer than the key" },
-	/* C */
+	/* C: classes - set, range, ^ and ! negation, literal ] and -, escapes, unterminated */
 	{ "h[ae]llo", "hello", 1, "C: a set" },
 	{ "h[ae]llo", "hillo", 0, "C: a byte outside it" },
 	{ "h[a-c]llo", "hbllo", 1, "C: a range" },
@@ -65,7 +53,7 @@ static const struct { const char *p, *s; int want; const char *why; } cases[] = 
 	{ "[\\]]", "]", 1, "C: a backslash inside escapes" },
 	{ "[abc", "a", 0, "C: an unterminated class matches nothing" },
 	{ "x[abc", "xa", 0, "C: anywhere" },
-	/* D */
+	/* D: backslash escapes outside a class; a trailing backslash is literal */
 	{ "h\\*llo", "h*llo", 1, "D: \\* is a literal star" },
 	{ "h\\*llo", "hello", 0, "D: and only that" },
 	{ "h\\?", "h?", 1, "D: \\? a literal question mark" },
@@ -81,7 +69,7 @@ int main(void)
 		CHK(m(cases[i].p, cases[i].s) == cases[i].want, "%s ('%s' vs '%s')",
 			cases[i].why, cases[i].p, cases[i].s);
 
-	/* E */
+	/* E: lengths, not terminators - a NUL byte is ordinary; pc_glob_match answers as pc_glob */
 	CHK(pc_glob("a?c", 3, "a\0c", 3) == 1, "E: a NUL inside the key is one byte for ?");
 	CHK(pc_glob("a\0*", 3, "a\0bc", 4) == 1, "E: and a literal byte in the pattern");
 	CHK(pc_glob("abc", 2, "ab", 2) == 1, "E: only the given lengths are read");

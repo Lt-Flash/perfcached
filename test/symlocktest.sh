@@ -1,24 +1,6 @@
 #!/bin/sh
-# symlocktest.sh - S170a: Symfony's Lock scripts, approved by SHA1 and run
-# natively (no Lua) on a lock record.
-#
-#   1  one node: the scenario in test/symlockscen.py - probe, write and
-#      read locks, conflict, re-acquire, promotion and demotion, refresh,
-#      release, expiry by the members' ms, the ARGV-time variants, a string
-#      key (false, untouched), a hash key (WRONGTYPE) - answers line by
-#      line what redis 8.10.2 answered running Symfony's own bodies;
-#      SCRIPT LOAD of every Symfony body names it by the same SHA1 the
-#      daemon approves; an unknown SHA is NOSCRIPT, an unapproved body is
-#      refused on EVAL and SCRIPT LOAD; SCRIPT EXISTS; a lock survives a
-#      restart (WAL) and TYPE says zset
-#   2  a shard fleet of three: acquire through one non-owner, conflict
-#      through the other, release through the other - decided at the owner
-#   3  an eager fleet of three, 30 rounds: two clients on two nodes acquire
-#      one lock at once - exactly one gets it every round
-#   4  the gate: beside a node without the feature (a variant of this tree
-#      that does not advertise it, or $2), EVALSHA is refused naming it
-# Fail-first: 0.4.6 answers "unknown command" to EVALSHA.
-# Usage: test/symlocktest.sh [./perfcached] [older-perfcached-for-part-4]
+# symlocktest.sh - Symfony's Lock scripts approved by SHA1 and run natively: redis's answers, decided at the owner,
+# one winner per race, gated per member.  Usage: test/symlocktest.sh [./perfcached] [older-perfcached-for-part-4]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -110,6 +92,18 @@ fleet() {
 		done
 		[ $good = 1 ] && return 0
 		sleep 0.5; i=$((i+1))
+	done
+	return 1
+}
+formed() { # every listed node ready and seeing the others (a CONNECTING joiner is listed already), up to 30 s
+	i=0; while [ $i -lt 300 ]; do
+		good=1
+		for x in "$@"; do
+			fs=$(curl -s "http://127.0.0.1:1789$x/stats" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null)
+			[ "$fs" = "ready $(($# - 1))" ] || good=0
+		done
+		[ $good = 1 ] && return 0
+		sleep 0.1; i=$((i+1))
 	done
 	return 1
 }
@@ -237,7 +231,7 @@ echo "part 2: a shard fleet of three - decided at the owner"
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n shard; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the shard fleet did not form"; echo "symlocktest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+formed 1 2 3
 L=$(owned_by 1 slock) || { bad "no key of 60 is owned by node 1"; echo "symlocktest: $pass passed, $fail failed"; exit 1; }
 echo "  key $L is owned by node 1"
 eq "acquire through node 2" "$(e 2 save "$L" "$(now)" tokA 300000)" 1
@@ -255,8 +249,7 @@ echo "part 3: an eager fleet of three - 30 races, one holder each"
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n eager; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the eager fleet did not form"; echo "symlocktest: $pass passed, $fail failed"; exit 1; }
-# the deciders must agree first: rc18 GitLab core1 had both racers win 17 of
-# 30 rounds 2 s after the members listed three - most likely before the map settled
+# the deciders must agree first: racing before the map settles lets both racers win
 settled || bad "the eager fleet's maps did not settle: $(maps | tr '\n' '|')"
 python3 - > "$D/race.out" 2>&1 <<'PY'
 import socket, threading, time
@@ -297,8 +290,8 @@ if [ -z "$OLD" ]; then
 	mkdir -p "$D/t"
 	tar -cf - --exclude=./.git --exclude='*.o' --exclude='*.a' . 2>/dev/null |
 		(cd "$D/t" && tar -xf -) || { bad "cannot copy the tree"; exit 1; }
-	# self_features(): "... | CLMEMB_FEAT_SLOCK | CLMEMB_FEAT_STAGE;" since
-	# UP6n - the lock bit goes, the rest of the line stays
+	# self_features() ends "... | CLMEMB_FEAT_SLOCK | CLMEMB_FEAT_STAGE;": the lock bit goes, the rest
+	# of the line stays
 	sed -i 's/CLMEMB_FEAT_SLOCK | CLMEMB_FEAT_STAGE;/CLMEMB_FEAT_STAGE;/' "$D/t/src/cluster.c"
 	grep -q 'CLMEMB_FEAT_HREAD |' "$D/t/src/cluster.c" && ! grep -q 'CLMEMB_FEAT_SLOCK |' "$D/t/src/cluster.c" \
 		|| { bad "the variant still advertises the lock feature"; exit 1; }
@@ -313,7 +306,7 @@ if [ -n "$OLD" ] && [ -x "$OLD" ]; then
 	for n in 1 2 3; do rm -rf "$D/s$n"; conf $n eager; done
 	start 1 "$BIN" && start 2 "$BIN" && start 3 "$OLD" || exit 1
 	fleet 1 2 3 || { bad "the mixed fleet did not form"; echo "symlocktest: $pass passed, $fail failed"; exit 1; }
-	sleep 2
+	formed 1 2 3
 	g=$(e 1 save G "$(now)" tokA 300000)
 	case "$g" in *"need every node in the fleet on 0.5.0 or later - node "*) ok "4. refused, naming the node: $g";;
 		*) bad "4. with an older member EVALSHA answered: $g";; esac

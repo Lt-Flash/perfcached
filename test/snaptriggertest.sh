@@ -1,42 +1,6 @@
 #!/bin/sh
-# snaptriggertest.sh - S224: the WAL asks for a snapshot EARLY enough.
-#
-# A snapshot frees only the WAL segments below the marker it STARTED at;
-# everything written while it runs lands above that marker.  So a WAL
-# under write pressure must ask for a snapshot while its free space still
-# outlasts one.  The old trigger fired at a fixed quarter free: on a node
-# whose snapshot takes longer than that last quarter takes to fill it was
-# too late by construction - the ring overruns, and an overrun takes the
-# node out of write service (FAILED until restarted; HEALING until a
-# snapshot lands since S229).  S224 adds a rate trigger:
-# free segments x seconds per segment against twice the last snapshot's
-# measured duration.
-#
-# Asserted, one node, an 8 x 1 MB ring, snapshots throttled to 1 MB/s
-# (rdb_mb_s) so one of a ~4 MB table takes about four seconds, the table
-# then overwritten at a paced ~0.6 MB/s for 30 s.  The numbers are chosen,
-# not found: the quarter fires with 2 segments (~3.3 s) left against a
-# snapshot of 4.2 s or more, so it MUST overrun; the rate trigger fires
-# near 5 left, a snapshot uses at most ~3, and back-to-back ones need ~6
-# of the 8 - so a timely trigger can keep up and a late one cannot:
-#   1. `save = 0 N` is refused, and the refusal says why;
-#   2. under that load the rate trigger fires (it says so in the log),
-#      snapshots keep coming, and the ring NEVER overruns - the node stays
-#      writable;
-#   3. stats.wal publishes the fill rate and the time to full while it
-#      runs, and the rate decays once the writes stop;
-#   4. FAIL-FIRST, a step of the run: the same load on a build with the
-#      rate trigger short-circuited (the quarter alone) overruns.
-# RV-12: the alert S224 documents must be writable from /metrics, not only
-# from /stats.  The README's rule, evaluated here on scraped values:
-#   perfcached_wal_full_in_seconds >= 0
-#     and perfcached_wal_full_in_seconds < 2 * perfcached_rdb_last_duration_seconds
-#   5. on the fresh node, before any snapshot: the rdb series exist (0
-#      saves, 0 s duration, age -1) and the rule is quiet;
-#   6. under the load above it FIRES - sampled every 0.25 s, since it holds
-#      only between a trigger and the snapshot that answers it - and after
-#      it, the series agree with /stats.
-# Usage: test/snaptriggertest.sh [./perfcached]
+# snaptriggertest.sh - a WAL under write pressure asks for a snapshot early enough that the ring never overruns,
+# and the README's alert rule fires from /metrics.  Usage: test/snaptriggertest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -85,10 +49,8 @@ segment_mb = 1
 segments = 8
 save = $1
 rdb_mb_s = 1
-# the fill is 4 MB in quick batches: a 1 MB producer ring overflows,
-# DROPS acknowledged writes, and a drop takes the node out of write
-# service (S58; S229 heals it) - while it lasts every write is refused
-# and this whole test measures nothing.  Seen.
+# the fill is 4 MB in quick batches: a 1 MB ring would drop acked writes and take the
+# node out of write service, and the test would measure nothing
 ring_kb = 16384
 EOF
 	chmod 600 "$D/n.conf"
@@ -177,11 +139,8 @@ def batch(start, n):
         # or a node that failed half way looks like a node under load
         if not (json.loads(f.readline()).get("result") or {}).get("stored"):
             refused += 1
-# the fill in batches of 200, each read back before the next: one 4 MB
-# burst written before any reply is read deadlocks once the unread
-# replies of the daemon fill the socket buffers - it stops reading, the
-# writer blocks.  Loopback buffers here held the burst; those of the
-# GitHub runner did not (rc32 check red: seq stuck at 2463 of 4000).
+# the fill in batches of 200, each read back before the next: a 4 MB burst written
+# before any reply is read deadlocks once the unread replies fill the socket buffers
 for s0 in range(0, 4000, 200):
     batch(s0, 200)
 f.write(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"save\"}\n"); f.flush(); f.readline()
@@ -208,7 +167,7 @@ conf "1 10000"
 echo "--- 2. an 8 MB ring under ~0.6 MB/s against a ~4 s snapshot"
 conf off
 start "$BIN" || { bad "did not start"; echo "snaptriggertest: $pass passed, $fail failed"; exit 1; }
-# ---- 5. RV-12: the rule's series, before any snapshot -------------------
+# ---- 5. the rule's series, before any snapshot ------------------------------
 A=$(alert)
 echo "    fresh node: $A"
 case "$A" in
@@ -242,7 +201,7 @@ grep -q "filling faster than a snapshot can keep up" "$D/n.log" \
 	|| bad "the log filled: $O overrun(s), writers held $FW0 time(s)"
 case "$FILL" in ''|'?'|0|0.0) bad "no fill rate published mid-load ($FILL)";;
 	*) ok "stats.wal published it while it ran: filling at $FILL MB/s, full in $FULL s";; esac
-# ---- 6. RV-12: the rule fired under the load, and agrees with /stats ----
+# ---- 6. the rule fired under the load, and agrees with /stats ----------------
 wait $SP
 echo "    sampler: $(cat "$D/sampler.out")"
 set -- $(cat "$D/sampler.out")
@@ -252,10 +211,8 @@ set -- $(cat "$D/sampler.out")
 [ "${6:-0}" -gt 0 ] 2>/dev/null \
 	&& ok "RV-12: perfcached_rdb_in_progress showed the snapshots running ($6 samples)" \
 	|| bad "RV-12: in_progress never read 1 across $SAVES snapshots"
-# /stats and /metrics read back to back, bracketed by a second /stats: a
-# snapshot finishing between the reads (they keep coming for a few seconds
-# after the load) moves both, and is a retry, not a disagreement.  Seen:
-# the first cut compared against a /stats read five seconds stale.
+# /stats and /metrics back to back, bracketed by a second /stats: a snapshot finishing between the
+# reads moves both, and is a retry, not a disagreement
 i=0
 while [ $i -lt 5 ]; do
 	S1=$(wal saves); D1=$(wal last_dur_ms); A=$(alert); S2=$(wal saves)
@@ -286,7 +243,7 @@ load 30 > "$D/load2.out" 2>&1
 echo "    driver: $(tail -2 "$D/load2.out" | tr '\n' ' ')"
 O=$(wal overruns); FW=$(wal full_waits); SAVES=$(wal saves)
 echo "    quarter only: overruns $O, full-log waits $FW, snapshots $SAVES"
-# S466: on_full = wait holds the writers rather than overrun - either is the log filling
+# on_full = wait holds the writers rather than overrun: either is the log filling
 if [ "$O" -gt 0 ] 2>/dev/null || [ "$FW" -gt 0 ] 2>/dev/null; then
 	ok "the quarter alone fills the log (overruns $O, writers held $FW times) - which is what the rate trigger prevents"
 else

@@ -1,7 +1,7 @@
 """symlockscen.py <resp-port> - the Symfony lock scenario of
 test/symlocktest.sh: every step through EVALSHA of the approved scripts,
 one line per step, "<step> -> <reply>".  The same steps were run against
-redis 8.10.2 with Symfony's bodies loaded (2026-10-05); symlocktest.sh
+redis 8.10.2 with Symfony's bodies loaded; symlocktest.sh
 holds those answers and compares.  One change for perfcached: a key's own
 expiry is whole seconds here (members keep ms), so the "key gone" check
 after a 300 ms lock waits 1.3 s, not 0.5 s - the member check stays at 0.5."""

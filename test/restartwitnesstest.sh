@@ -1,27 +1,6 @@
 #!/bin/sh
-# restartwitnesstest.sh - S274: a node says whether a restart of it NOW
-# would be witnessed, and the reconcile then does what it said.
-#
-# S223's rule: a restarted eager node reconciles its replayed records only
-# if some live peer was up since before it went down (by WITNESS_GRACE_MS);
-# with none, the pass is SKIPPED - nothing dropped, but a key deleted
-# during the outage survives.  rc54's roll restarted 246 inside that grace.
-# Nothing told the operator; the roll script waits 50 s by hand.  Now
-# /stats cluster.restart = {safe, witnesses, safe_in_ms} is the node's own
-# answer, computed from the same predicate with its error bars.
-#
-# Three eager nodes with a WAL, 200 keys:
-#   1. just formed: no peer has been up long enough - every node says
-#      NOT safe, with a wait of about the grace (> 30 s, < 45 s)
-#   2. restart node 1 then: its reconcile is SKIPPED - the prediction held
-#   3. once the wait has passed, nodes 2 and 3 say safe, 2 witnesses each
-#   4. restart node 2 then: its reconcile finds a witness - the prediction
-#      held the other way
-#   5. node 2, just restarted, is a witness to nobody yet: node 3 counts
-#      one witness (node 1 is old enough by then), not two
-# The standalone edition refuses [cluster]: SKIPPED, loudly.
-# Fail-first: a build before S274 has no cluster.restart - 1, 3, 5 fail.
-# Usage: test/restartwitnesstest.sh [./perfcached]
+# restartwitnesstest.sh - cluster.restart says whether a restart now would be witnessed, the reconcile does what
+# it said, an open reconcile guards its last witness.  Usage: test/restartwitnesstest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -59,8 +38,8 @@ plaintext = loopback
 multicast = 239.255.78.15:18975
 advertise = 127.0.30.$1
 mode = eager
-# S392/S393: the open pass is the subject - a clean stop leaves a snapshot
-# (S222), which would end it by the fast path in seconds; walk, at 64/s
+# the open pass is the subject - a clean stop leaves a snapshot, which would end it
+# by the fast path in seconds; walk, at 64/s
 reconcile_fast = no
 reconcile_rate_max = 64
 collections = 0
@@ -119,15 +98,8 @@ for i in range(200):
 PY
 sleep 2.5                                  # the WAL's everysec, on every node
 
-# 1: the wait is the whole margin - the S223 grace (30 s) + one alive-
-# stamp period (10 s) + uptime's truncation (1 s) = 41 s from the peer's
-# boot - so wait + the youngest peer's uptime is 41 s, give or take the
-# second uptime_s truncates.  (Without the margin it is 30: a node would
-# say "safe" while its own death estimate could still miss the witness.)
-# Two truncations, not one: the peer's boot is known from its uptime in
-# whole seconds too, so the sum reads down to 39 s - and the reads, a node
-# at a time, skew it by a few hundred ms (v0.7.3-rc5 GitLab fault3 under
-# ASan: 39,499 ms against a 39.5 s floor).  38.5 s still tells 41 from 30.
+# 1: the wait is the whole margin, grace 30 s + one alive-stamp period 10 s + 1 s = 41 s from the
+# peer's boot; two whole-second truncations and staggered reads put the floor at 38.5 s
 R1=$(st 1 'json.dumps(c.get("restart"))'); W1=$(st 1 'c["restart"]["safe_in_ms"]')
 U23=$(for n in 2 3; do st $n 'r["process"]["uptime_s"]'; done | sort -n | head -1)
 T=$(( ${W1:-0} + ${U23:-0} * 1000 ))
@@ -140,9 +112,7 @@ stop1 1; start 1 2 || exit 1; ready3
 settled 1 && [ "$(st 1 'c.get("reconcile_skipped")')" = True ] \
 	&& ok "2. restarted inside the grace: node 1's reconcile was SKIPPED, as it said" \
 	|| bad "2. node 1 restarted inside the grace: skipped=$(st 1 'c.get("reconcile_skipped")') witness=$(st 1 'c.get("reconcile_witness")')"
-# 3: wait out node 2's own verdict, and node 3's - they started apart, so
-# one says safe up to a second or so before the other (v0.7.2-rc3, GitLab
-# 111802 fault3: node 2 safe, node 3 398 ms short of it when looked at)
+# 3: wait out nodes 2 and 3 alike: they started apart, so one says safe a second before the other
 i=0; while [ $i -lt 60 ] && { [ "$(st 2 'c["restart"]["safe"]')" != True ] ||
 	[ "$(st 3 'c["restart"]["safe"]')" != True ]; }; do sleep 1; i=$((i+1)); done
 [ "$(st 2 'c["restart"]["safe"]')" = True ] && [ "$(st 3 'c["restart"]["safe"]')" = True ] \
@@ -159,14 +129,8 @@ W3=$(st 3 'c["restart"]["witnesses"]')
 [ "${W3:-9}" -le 1 ] 2>/dev/null \
 	&& ok "5. node 2, just restarted, is no witness yet: node 3 counts $W3 witness(es), not 2" \
 	|| bad "5. node 3 counts $W3 witnesses right after node 2's restart (want <= 1)"
-# ---- ST8: a reconcile in progress makes its witnesses unsafe to restart -----
-# 2026-10-10, production: a rolling restart went on while the first node's
-# reconcile was still asking; both its witnesses restarted, and its pass
-# waited for good - every peer now booted after its outage.  A node with a
-# reconcile open stamps every frame (CLWIRE_F_RECONCILING); a peer then says
-# restart.safe false with waits_for naming it.  A pass left with no witness
-# says so (cluster.reconcile_no_witness_s, one WARNING after 30 s) and is
-# released by restarting the node itself once that is witnessed.
+# ---- a reconcile in progress makes its witnesses unsafe to restart (restart.safe false, waits_for
+# naming it); a pass left with no witness warns once and is released by restarting its node
 nid() { st $1 'c["node"]'; }
 wait_safe() { i=0; while [ $i -lt ${2:-90} ] && [ "$(st $1 'c["restart"]["safe"]')" != True ]; do sleep 1; i=$((i+1)); done; }
 wait_safe 1; wait_safe 3
@@ -192,13 +156,10 @@ for i in range(3000):
 PY
 start 1 3 || exit 1
 ready3
-# 6 (narrowed in 0.5.7.1): node 1's pass has TWO live witnesses - either may
-# restart, one at a time; once one has, the other is its LAST witness and
-# must not.  A peer names its only live witness in its keepalive.
+# 6: node 1's pass has two live witnesses: either may restart, one at a time; then the other is
+# its last witness and must not.  A peer names its only live witness in its keepalive.
 i=0; while [ $i -lt 40 ] && [ "$(st 1 'c.get("reconcile_witnesses_live")')" != 2 ]; do sleep 0.25; i=$((i+1)); done
-# the peers learn it from node 1's keepalive, a beat later: wait for both
-# to see it before reading them (GitHub 39952740047: read at the moment
-# node 1 counted 2, node 2 still named itself node 1's last witness)
+# the peers learn it from node 1's keepalive a beat later: wait for both before reading them
 i=0; while [ $i -lt 20 ] && [ "$(st 2 'c["restart"]["waits_for"]')$(st 3 'c["restart"]["waits_for"]')" != "[][]" ]; do sleep 0.25; i=$((i+1)); done
 W2=$(st 2 'json.dumps(c["restart"])'); W3=$(st 3 'json.dumps(c["restart"])')
 [ "$(st 1 'c.get("reconcile_witnesses_live")')" = 2 ] \
@@ -225,9 +186,8 @@ print("%s %s" % (m[0].get("reconciling"), m[0].get("sole_witness")) if m else "n
 # 7: restart node 3 anyway - node 1's pass is left with no witness
 stop1 3; start 3 2 || exit 1
 ready3
-# the cluster's own line, once; S388's alert says the same words 30 s
-# later ("alert: reconcile has had no witness"), a second line on a
-# runner slow enough that the check comes after it (GitHub 39944094455)
+# the cluster's own line, once; the alert says the same words 30 s later, a second line on a slow
+# runner
 i=0; while [ $i -lt 50 ] && ! grep -q "cluster: reconcile has had no witness" "$D/n1.log"; do sleep 1; i=$((i+1)); done
 NW=$(st 1 'c.get("reconcile_no_witness_s")')
 [ "${NW:-0}" -ge 30 ] 2>/dev/null && [ "$(grep -c "cluster: reconcile has had no witness" "$D/n1.log")" = 1 ] \

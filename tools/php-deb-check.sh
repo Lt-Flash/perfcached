@@ -1,9 +1,6 @@
 #!/bin/sh
-# php-deb-check.sh - PE-6: php8.3-perfcached built from the committed tree and proven on a
-# clean Debian 13 with Sury's PHP 8.3, in throwaway containers; a host with neither podman nor docker SKIPS loudly.
-#   tools/php-deb-check.sh            on the host
-#   tools/php-deb-check.sh --build    inside: libperfd0, libperfd-dev, php8.3-perfcached
-#   tools/php-deb-check.sh --install  inside: install, load, remove, purge, install again
+# php-deb-check.sh [--build|--install] - php8.3-perfcached built from the committed tree and proven
+# on a clean Debian 13 with Sury's PHP 8.3 in containers; no podman or docker SKIPS loudly.
 set -u
 DEBIAN=${DEBIAN:-13}
 fail() { echo "php-deb-check: FAILED - $*"; exit 1; }

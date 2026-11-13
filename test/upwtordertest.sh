@@ -1,17 +1,6 @@
 #!/bin/sh
-# upwtordertest.sh - S429 (0.7.1; 0.7.1-rc1's upwritethroughtest 15, under
-# ASan): writes to one key from many clients at once, written through.  The
-# read-backs come back from Redis in the order Redis applied the writes, but
-# each is applied on the worker that queued its write - two could be applied
-# the other way round, and the node keep the older value ("Redis v46, node
-# v45") with nothing left to correct it.  S429 stamps each completion in the
-# writer's order and skips a read-back older than one already applied.
-#   A. 30 rounds of 8 clients writing one key at once behind a slow master:
-#      after each round the node answers what Redis holds
-#   B. stale_readbacks_skipped counts the read-backs that came in late (the
-#      race this suite exists for happened - a pass on a quiet runner where
-#      it never did is reported, not counted as proof)
-# Usage: test/upwtordertest.sh [./perfcached]
+# upwtordertest.sh - concurrent writes through to one key: read-backs older than one already applied
+# are skipped, so the node answers what Redis holds.  Usage: test/upwtordertest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)

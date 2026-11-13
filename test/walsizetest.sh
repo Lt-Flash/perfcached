@@ -1,27 +1,6 @@
 #!/bin/sh
-# walsizetest.sh - RV-13: a WAL too small for its snapshots says so.
-#
-# A snapshot frees only the WAL written before it began.  If one takes
-# longer than the WHOLE ring takes to fill at the current write rate, no
-# trigger - the quarter or S224's rate trigger - can start it early
-# enough: the ring fills first, overruns, and the node heals (S229), again
-# and again.  RV-13 measured it: a 64 MB/s snapshot writer overran with its
-# rate trigger armed and firing at 4 free segments.  That is sizing, and
-# nothing said so.
-#
-# Two runs of one load (a 3 MB table of 4 KB values, a ~3 s snapshot at
-# rdb_mb_s = 1, then overwrites from two connections paced to ~5 MB/s):
-#   1. a 4 x 1 MB ring - it fills in ~0.8 s: the node warns, once, naming
-#      the snapshot's duration and the ring's fill time, and
-#      perfcached_wal_ring_fill_seconds reads below the snapshot duration;
-#   2. a 64 x 1 MB ring - ~13 s to fill: no warning.
-# S437: /stats and /metrics give the ring's shape (4 segments of 1 MB =
-# 4 MB) and its use, and the wal.capacity alert is raised in run 1 (the
-# whole ring fills faster than one snapshot takes) and not in run 2 - its
-# minute's hold is 3 s here (PERFCACHED_ALERT_FAST=20).
-# FAIL-FIRST: the build before RV-13 has neither the warning nor the gauge;
-# the build before S437 has no segments/size_mb, no gauges and no alert.
-# Usage: test/walsizetest.sh [./perfcached]
+# walsizetest.sh - a WAL ring that fills faster than one snapshot takes warns once, its gauges say
+# so and the wal.capacity alert is raised; a big enough ring stays quiet.  Usage: test/walsizetest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -62,7 +41,7 @@ segment_mb = 1
 segments = $1
 ring_kb = 16384
 save = off
-# S466: the default waits rather than lose a record; this test is about the heal
+# the default waits rather than lose a record; this test is about the heal
 on_full = heal
 rdb_mb_s = 1
 CONF
@@ -91,11 +70,8 @@ for _ in range(200):
     if r["saves"] >= 1 and not r["running"]: break
     time.sleep(0.1)
 print("DUR_MS=%d" % st()["rdb"]["last_dur_ms"])
-# overwrites from TWO connections for 12 s, the lowest whole-ring fill
-# time seen.  One connection reached ~2 MB/s - the ring at 2.6 s against a
-# 3.1 s snapshot, too thin a margin for a slower runner; a 6 MB table for a
-# longer snapshot overran the 4 MB ring during the prefill instead, and
-# its heal's unthrottled snapshot (5 ms) is not a planning figure.
+# overwrites from TWO connections for 12 s: one connection's ~2 MB/s fills the ring
+# too close to the 3.1 s snapshot time for a slower runner
 import os, threading
 low = [None]; stop = [False]
 def writer(k):
@@ -107,15 +83,14 @@ def writer(k):
             "params": {"col": "c", "key": "k%05d" % (j % 750), "value": v}}) + "\n" for j in range(i, i + 120, 2)).encode()); wf.flush()
         for _ in range(60): wf.readline()
         i += 120
-        # PACED: ~2.4 MB/s each, ~5 MB/s together, so each arm clears the
-        # snapshot's 3.1 s by ~4x - unpaced, two writers filled even the
-        # control ring in under 3 s, and the warning there was right
+        # PACED: ~2.4 MB/s each, ~5 MB/s together, so each arm clears the snapshot's 3.1 s
+        # by ~4x (unpaced, two writers fill even the control ring in under 3 s)
         rest = 0.1 - (time.time() - tick)
         if rest > 0: time.sleep(rest)
 ts = [threading.Thread(target=writer, args=(k,)) for k in (0, 1)]
 [t.start() for t in ts]
 t0 = time.time(); alert = [None]
-# the alert wants its 3 s unbroken: a slow host (GitLab 112775, alpine) needs longer
+# the alert wants its 3 s unbroken: a slow host needs longer
 limit = int(os.environ.get("ALERT_WAIT_S", 12))
 while time.time() - t0 < 12 or (alert[0] is None and time.time() - t0 < limit):
     sn = st()
@@ -130,7 +105,7 @@ low = low[0]
 print("RING_FILL_LOW=%s" % low)
 m = urllib.request.urlopen("http://127.0.0.1:%d/metrics" % hport, timeout=5).read().decode()
 print("METRIC=%s" % any(l.startswith("perfcached_wal_ring_fill_seconds ") for l in m.splitlines()))
-# S437
+# the ring's shape in /stats and the WAL gauges in /metrics
 w = st()["wal"]
 print("SHAPE=%s/%s/%s/%s" % (w.get("segments"), w.get("segment_mb"), w.get("size_mb"),
     "pct" if isinstance(w.get("used_pct"), int) and 0 <= w["used_pct"] <= 100 else w.get("used_pct")))
@@ -161,9 +136,8 @@ python3 -c "import sys; sys.exit(0 if $LOW is not None and 0 <= $LOW < $DUR / 10
 	|| bad "S437: /stats wal segments/segment_mb/size_mb/used_pct: $(val small SHAPE) (want 4/1/4/pct)"
 [ "$(val small GAUGES)" = "4/4194304/ratio" ] && ok "S437: /metrics has the segments, the size in bytes and the used ratio" \
 	|| bad "S437: /metrics perfcached_wal_segments/size_bytes/used_ratio: $(val small GAUGES)"
-# either of its two comparisons raises it, and its text is the first's:
-# early in the load the rate is still low and the free segments ran out
-# first (GitHub 39952740047), later the whole ring fills faster too
+# either comparison raises it and its text is the first's: early in the load the free segments run
+# out first, later the whole ring fills faster too
 case "$(val small ALERT)" in "warning: the whole WAL (4 x 1 MB) fills in "*|"warning: the WAL's "*" free segment(s) of 4 (1 MB each) last "*) \
 	ok "S437: the wal.capacity alert was raised - $(val small ALERT | cut -c1-140)";;
 	*) bad "S437: no wal.capacity alert while the ring filled faster than a snapshot: $(val small ALERT)";; esac

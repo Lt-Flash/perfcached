@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respsrv.c - the RESP door's connection and server commands: PING (PS2's
- * array form in subscribed mode), AUTH (S33), HELLO (RESP2 only), INFO
- * (the sections the Grafana Redis datasource and rtpengine read) and TIME
- * (S48).  Moved from verbs.c unchanged (the 0.7.2 split, wave 1 -
- * doc/MODULARITY.md).
- */
+/* respsrv.c - the RESP door's connection and server commands: PING, AUTH, HELLO (RESP2 only),
+ * INFO (the sections the Grafana Redis datasource and rtpengine read) and TIME. */
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -26,7 +21,7 @@
 int rh_ping(struct resp_ctx *c)
 {
 	if (pc_pubsub_count(c->conn) > 0) {
-		/* PS2: in subscribed mode a PING answers as an array, the
+		/* in subscribed mode a PING answers as an array, the
 		 * shape predis's pubSubLoop reads */
 		resp_arr(c->out, 2);
 		resp_bulk(c->out, "pong", 4);
@@ -45,18 +40,18 @@ int rh_ping(struct resp_ctx *c)
 
 int rh_auth(struct resp_ctx *c)
 {
-	/* On the native plaintext listener the handshake IS the
-	 * authentication (5.1) and there is no password plane - same
-	 * answer a requirepass-less Redis gives.  On a RESP listener
-	 * (S33) there is no handshake, so an optional password is the
-	 * strongest in-band control the dialect allows.  Accept both
-	 * RESP2 forms: AUTH <pw> and the ACL-style AUTH <user> <pw>
-	 * (any username - we have one principal). */
+	/* a RESP listener has no handshake, so an optional password is the strongest in-band
+	 * control; both RESP2 forms: AUTH <pw> and AUTH <user> <pw> (any user - one principal) */
 	const char *pw;
 	size_t pwn;
 
 	if (!pc_resp_password_set()) {
 		resp_err(c->out, "Client sent AUTH, but no password is set");
+		return 0;
+	}
+	if (pc_auth_needs_tls() && !pc_conn_secure(c->conn)) {
+		PC_RESP_BUMP(pc_resp_authfail);
+		resp_err(c->out, "AUTH needs TLS here (auth_needs_tls = yes) - use the TLS RESP door");
 		return 0;
 	}
 	if (c->nargs == 2) {
@@ -119,11 +114,8 @@ int rh_info(struct resp_ctx *c)
 	size_t secl = c->nargs >= 2 ? c->argl[1] : 0;
 	int all;
 
-	/* Redis semantics, which the Grafana Redis datasource RELIES
-	 * on: INFO <section> returns ONLY that section (the plugin's
-	 * commandstats panel got every section appended and rendered
-	 * nothing); bare INFO returns the default set, which
-	 * excludes commandstats; "all"/"everything" include it. */
+	/* the Grafana Redis datasource relies on it: INFO <section> returns ONLY that section; bare
+	 * INFO the default set, without commandstats; "all"/"everything" include it */
 	if (sec && (resp_is(sec, secl, "all") ||
 	        resp_is(sec, secl, "everything") ||
 	        resp_is(sec, secl, "default")))
@@ -133,7 +125,7 @@ int rh_info(struct resp_ctx *c)
 #define INFO_WANT(_n) (!sec || resp_is(sec, secl, _n))
 	pc_jw_init(&b, c->scratch, c->scratch_cap);
 	if (INFO_WANT("server")) {
-		/* S74: redis_mode is where a cluster-aware client
+		/* redis_mode is where a cluster-aware client
 		 * decides whether to fetch the slot map at all */
 		pc_jw_lit(&b, "# Server\r\nredis_version:7.0.0\r\n"
 			"redis_mode:");
@@ -141,28 +133,22 @@ int rh_info(struct resp_ctx *c)
 		pc_jw_lit(&b, "\r\nperfcached_version:" PC_VERSION "\r\n"
 			"perfcached_dialect:resp2-compat\r\n");
 	}
-	/* The Replication section is NOT decoration: rtpengine asks
-	 * INFO at startup purely to learn whether the server is a
-	 * master, and REFUSES TO START without a role line - found by
-	 * pointing a real rtpengine at us.  A perfcached node is
-	 * always writable, so the honest answer is master with no
-	 * replicas: redundancy lives in the collection modes. */
+	/* rtpengine refuses to start without a role line; a node is always writable, so it is
+	 * master with no replicas - redundancy lives in the collection modes */
 	if (INFO_WANT("replication"))
 		pc_jw_lit(&b, "# Replication\r\nrole:master\r\n"
 			"connected_slaves:0\r\n"
 			"master_failover_state:no-failover\r\n"
 			"master_repl_offset:0\r\n");
-	/* S74: the other field clients decide from.  A section that
-	 * is absent or empty reads as "no cluster" to anything that
-	 * parses it - which it was. */
+	/* the other field clients decide from: an absent or empty
+	 * section reads as "no cluster" */
 	if (INFO_WANT("cluster")) {
 		pc_jw_lit(&b, "# Cluster\r\ncluster_enabled:");
 		pc_jw_i64(&b, resp_cluster_on());
 		pc_jw_lit(&b, "\r\n");
 	}
-	/* S53: the fields the Grafana summary panels read.
-	 * used_memory is the arena's HELD bytes - the figure sized
-	 * against arena_mb, not a malloc guess. */
+	/* the fields the Grafana summary panels read; used_memory is
+	 * the arena's HELD bytes, the figure sized against arena_mb */
 	if (INFO_WANT("clients")) {
 		pc_jw_lit(&b, "# Clients\r\nconnected_clients:");
 		pc_jw_i64(&b, pc_obs_conn_count());
@@ -182,7 +168,7 @@ int rh_info(struct resp_ctx *c)
 
 		for (ci = 0; ci < pc_store_count(); ci++) {
 			if (!pc_store_live(ci))
-				continue;   /* S69: a dropped collection */
+				continue;   /* a dropped collection */
 			pcache_ht_totals_t ct;
 
 			pcache_ht_totals(pc_store_ht(ci), &ct);
@@ -205,18 +191,14 @@ int rh_info(struct resp_ctx *c)
 		pc_obs_cmdstats(&b);
 	}
 	if (all || (sec && resp_is(sec, secl, "latencystats"))) {
-		pc_jw_lit(&b, "# Latencystats\r\n");   /* S159 */
+		pc_jw_lit(&b, "# Latencystats\r\n");
 		pc_obs_latencystats(&b);
 	}
 	if (INFO_WANT("keyspace")) {
 		int ci;
 
-		/* S69: EVERY collection this door can reach, each under
-		 * the index that reaches it.  Reporting only the
-		 * selected one made a node holding live data read as
-		 * one empty database to every Redis-native monitor - a
-		 * flat zero line through an outage and a normal day
-		 * alike. */
+		/* EVERY collection this door can reach, under its index: the selected one alone
+		 * makes a node with live data read as empty to Redis-native monitors */
 		pc_jw_lit(&b, "# Keyspace\r\n");
 		for (ci = 0; ci < pc_store_count(); ci++) {
 			pcache_ht_totals_t tot;
@@ -249,8 +231,8 @@ int rh_info(struct resp_ctx *c)
 	return 0;
 }
 
-/* S48: TIME is collection-independent (17.2M calls/day measured on
- * the realtime instance) - answer before the collection resolves */
+/* TIME is collection-independent and called very often - answer before the
+ * collection resolves */
 int rh_time(struct resp_ctx *c)
 {
 	struct timespec tw;

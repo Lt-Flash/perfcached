@@ -1,13 +1,6 @@
 #!/bin/sh
-# idcollidetest.sh - CH-12: an ALIVE claiming an id a live member at
-# another address holds is counted and said, not refused.  Two halves of
-# a split can each admit a joiner under one id, and that already ends in a
-# map no node decodes; refusing would only make the nodes disagree in
-# silence.  A forged claim looks the same, so the suite plays one: an
-# ALIVE from 127.0.143.9 (clinject) claiming node 2's id.
-#   1  node 1 counts it (id_collisions) and names both addresses in its log
-#   2  the fleet is whole again once the false claim's slot has aged out
-# Usage: test/idcollidetest.sh [./perfcached] [./clinject]
+# idcollidetest.sh - an ALIVE claiming an id a live member at another address holds is counted
+# (id_collisions) and logged, not refused: refusing would only make the nodes disagree in silence.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

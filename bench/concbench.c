@@ -1,21 +1,5 @@
-/*
- * concbench.c — N CONCURRENT libperfd connections to one cluster.
- *
- * The mode matrix drives a single connection one operation at a time,
- * which is what an application's latency looks like but not what a
- * fleet of them costs.  pcbench's RTT arms use four raw connections and
- * report roughly four times as much.  This closes the gap honestly: N
- * real client handles, each on its own thread, against the same
- * cluster, so per-connection cost and aggregate throughput can be read
- * off the same run.
- *
- * One handle per thread, never shared: libperfd owns a socket, a cipher
- * state and a reply queue per handle, and nothing about that is
- * thread-safe by design.
- *
- * usage: concbench <host> <port> <secret> <col> <threads> <ops-each>
- *                  <getpct> <route 0|1>
- */
+/* concbench.c - N CONCURRENT libperfd handles to one cluster, one per thread (never shared).
+ * usage: concbench <host> <port> <secret> <col> <threads> <ops-each> <getpct> <route 0|1> */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,10 +17,8 @@ struct arg {
 	unsigned int *hist;
 	long done, missed;
 	int err, fill_done;
-	double mix_start, mix_end;     /* the MEASURED window: timing the
-	                                * whole thread would charge the
-	                                * unmeasured fill against
-	                                * throughput and halve it */
+	double mix_start, mix_end;     /* the MEASURED window: timing the whole thread
+	                                * would charge the unmeasured fill and halve it */
 };
 
 static double now_s(void)
@@ -68,11 +50,8 @@ static void *worker(void *p)
 		a->err = 1;
 		return NULL;
 	}
-	/* FILL FIRST, unmeasured.  Without it the mix reads keys that were
-	 * never written: every GET is a fleet-wide miss with a pull behind
-	 * it, and the run measures a miss storm rather than the workload
-	 * (measured: 18000 of 20000 reads missing, throughput less than
-	 * half). */
+	/* FILL FIRST, unmeasured: otherwise every GET is a fleet-wide miss with a pull behind it,
+	 * and the run measures a miss storm rather than the workload */
 	for (i = 0; i < a->ops; i++) {
 		char k[40];
 

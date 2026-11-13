@@ -1,19 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * mail.c - S352: the alert mailer's transport (mail.h).
- *
- * One sender thread, one bounded queue.  Producers (the alert engine, the
- * mailtest verb) only take the mutex long enough to link a mail in; the
- * thread does every slow thing - DNS, connect, TLS, AUTH, the transfer -
- * with nothing else held.  A mail that cannot be sent is counted and its
- * error kept (the server's own words when it answered); it is not retried:
- * the alert it carried stays in the alert ring and is raised again if the
- * condition is still true after min_interval.
- *
- * The password is handed to libcurl and nowhere else: no message built
- * here, logged or returned ever contains it.
- */
+/* mail.c - the alert mailer: one sender thread does every slow step with nothing held; a failed
+ * mail is counted, not retried.  The password goes to libcurl and into no message built here */
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -33,8 +21,8 @@ struct mitem {
 	struct mitem *next;
 	char *subject;
 	char *body;                        /* text/plain */
-	char *html;                        /* S377: text/html, NULL = plain only */
-	char *from_name, *msgid, *in_reply_to, *references;    /* S377 */
+	char *html;                        /* text/html, NULL = plain only */
+	char *from_name, *msgid, *in_reply_to, *references;
 	unsigned int test_gen;             /* nonzero: the mailtest waiting on it */
 };
 
@@ -52,7 +40,7 @@ static struct {
 	int test_rc;
 	char test_reply[PC_MAIL_REPLY_MAX];
 	struct pc_mail_stats st;
-	unsigned long long base_sent, base_failed, base_dropped;   /* S358 reset */
+	unsigned long long base_sent, base_failed, base_dropped;
 	char host[128];
 } M = {
 	.mx = PTHREAD_MUTEX_INITIALIZER,
@@ -118,9 +106,8 @@ static int trace_cb(CURL *h, curl_infotype t, char *d, size_t n, void *u)
 	return 0;
 }
 
-/* S377: quoted-printable (RFC 2045): every line of the result is at most
- * 76 characters, so no SMTP line limit is ever near, and anything but
- * printable ASCII travels as =XX.  \n in @s is a line break (CRLF). */
+/* quoted-printable (RFC 2045): every line at most 76 characters, so no SMTP line limit is
+ * near, anything but printable ASCII as =XX; \n in @s is a line break (CRLF) */
 static void qp_put(FILE *f, const char *s)
 {
 	const unsigned char *p = (const unsigned char *)s;
@@ -158,7 +145,7 @@ static void qp_put(FILE *f, const char *s)
 		fputs("\r\n", f);
 }
 
-/* S377: a display name as an RFC 5322 quoted string - unquoted, a
+/* a display name as an RFC 5322 quoted string - unquoted, a
  * parenthesis is a comment Outlook hides; non-printing bytes become '?' */
 static void name_put(FILE *f, const char *n)
 {
@@ -214,7 +201,7 @@ static int send_one(const struct mitem *it, char *reply, size_t cap)
 	}
 	hdr_date(date, sizeof date);
 	fprintf(f, "Date: %s\r\nFrom: ", date);
-	if (it->from_name && it->from_name[0]) {        /* S377 */
+	if (it->from_name && it->from_name[0]) {
 		name_put(f, it->from_name);
 		/* a header line stays within 78 (RFC 5322 2.1.1): a long
 		 * host name folds before the address */
@@ -252,8 +239,8 @@ static int send_one(const struct mitem *it, char *reply, size_t cap)
 	if (it->references)
 		fprintf(f, "References: %s\r\n", it->references);
 	fputs("MIME-Version: 1.0\r\nX-Mailer: perfcached\r\n", f);
-	/* S377: quoted-printable parts (every line <= 76), and with HTML the
-	 * two as multipart/alternative - a client shows the richest it can */
+	/* quoted-printable parts, and with HTML the two as multipart/alternative
+	 * - a client shows the richest it can */
 	if (it->html) {
 		char b[64];
 
@@ -412,7 +399,7 @@ int pc_mail_start(const struct pc_mail_conf *mc)
 	M.c.pass = dupn(mc->pass);
 	M.c.from = dupn(mc->from);
 	M.c.ca_file = dupn(mc->ca_file);
-	/* S377: no default prefix - the From name and the subject say what a
+	/* no default prefix - the From name and the subject say what a
 	 * mail is; only one set in [mail] is put in front */
 	M.c.subject_prefix = dupn(mc->subject_prefix);
 	for (i = 0; i < mc->nto; i++)
@@ -475,7 +462,7 @@ static int enqueue(const char *subject, const char *body, unsigned int gen,
 	it = calloc(1, sizeof *it);
 	if (!it)
 		return -1;
-	if (m) {                                         /* S377 */
+	if (m) {
 		it->html = m->html ? strndup(m->html, PC_MAIL_BODY_MAX) : NULL;
 		it->from_name = m->from_name ? strndup(m->from_name, 128) : NULL;
 		it->msgid = m->msgid ? strndup(m->msgid, 200) : NULL;
@@ -498,7 +485,9 @@ static int enqueue(const char *subject, const char *body, unsigned int gen,
 	} else {
 		it->subject = strndup(subject, PC_MAIL_SUBJ_MAX);
 	}
-	it->body = strndup(body, PC_MAIL_BODY_MAX);
+	size_t bl = strlen(body);
+
+	it->body = strndup(body, bl < PC_MAIL_BODY_MAX ? bl : PC_MAIL_BODY_MAX);
 	it->test_gen = gen;
 	if (!it->subject || !it->body) {
 		item_free(it);
@@ -527,12 +516,12 @@ int pc_mail_send(const char *subject, const char *body)
 	return enqueue(subject, body, 0, NULL);
 }
 
-int pc_mail_send_msg(const struct pc_mail_msg *m)            /* S377 */
+int pc_mail_send_msg(const struct pc_mail_msg *m)
 {
 	return enqueue(m->subject, m->text, 0, m);
 }
 
-void pc_mail_msgid(char *buf, size_t cap)                  /* S377 */
+void pc_mail_msgid(char *buf, size_t cap)
 {
 	static unsigned int seq;
 
@@ -597,7 +586,7 @@ void pc_mail_get_stats(struct pc_mail_stats *st)
 	pthread_mutex_unlock(&M.mx);
 }
 
-/* S358: a stats reset starts the counters again; the last error and the
+/* a stats reset starts the counters again; the last error and the
  * times stay - they are facts, not counts */
 void pc_mail_stats_reset(void)
 {

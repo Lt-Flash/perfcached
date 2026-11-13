@@ -1,25 +1,4 @@
-/* respmaptest.c - S432 (0.7.1): the RESP door's DB-index map at runtime
- * (respmap.c), without a daemon.
- *
- *   A  the config alone: `0, 1:prod-redis, 2:th` (PROD's list) resolves
- *      0 -> "0", 1 -> prod-redis, 2 -> th, each from the config; 3 is
- *      refused (""); the effective list IS the config's
- *   B  map 0 prod-redis: the override replaces the bare 0, is listed FIRST
- *      (INFO keyspace reports prod-redis under 0, not 1), resolves as
- *      runtime; `was` names what the index reached before
- *   C  generations: an older change is ignored, an equal one settles on the
- *      larger name on every member, a newer one wins
- *   D  unmap: the index answers as the config says again, the tombstone
- *      is kept (the fleet sync sends it) and outranks an older map
- *   E  no list in the config (an open door): an override keeps the door
- *      open ("*" first) - every other index still reaches the collection
- *      of its own name, as OPEN
- *   F  persistence: the overrides and the tombstones survive a re-init
- *      from the state dir, and the Lamport clock resumes above them;
- *      count_file sees them without loading; a file that is not ours is
- *      refused, by init and by count_file
- *   G  refused: an index out of range, a name the list grammar cannot
- *      hold (',', ':', '*', a space, empty, too long) */
+/* respmaptest.c - the RESP door's DB-index map at runtime (respmap.c), without a daemon. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,7 +51,7 @@ int main(void)
 		return 1;
 	}
 
-	/* A */
+	/* A: the config alone - each index resolves from the config's list; one past it refused */
 	CHK(pc_respmap_ready() == 0, "A: not ready before init");
 	CHK(pc_respmap_init("0, 1:prod-redis, 2:th", dir) == 0 && pc_respmap_ready(),
 		"A: init with PROD's list and an empty state dir");
@@ -84,7 +63,7 @@ int main(void)
 	CHK(pc_respmap_overrides() == 0 && !strcmp(pc_respmap_config(), "0, 1:prod-redis, 2:th"),
 		"A: no overrides; the config's list kept as given");
 
-	/* B */
+	/* B: an override of 0 replaces the bare 0, is listed first, resolves as runtime */
 	CHK(pc_respmap_apply(0, "prod-redis", 10, 100, 1, was, sizeof was) == 1 &&
 		!strcmp(was, "0"), "B: map 0 prod-redis applied, was '%s'", was);
 	CHK(!strcmp(eff(), "0:prod-redis,1:prod-redis,2:th"),
@@ -93,7 +72,7 @@ int main(void)
 		"B: 0 -> prod-redis (runtime), 1 still -> prod-redis (config)");
 	CHK(pc_respmap_overrides() == 1, "B: one override");
 
-	/* C */
+	/* C: generations - older ignored, equal settles on the larger name, newer wins */
 	CHK(pc_respmap_apply(0, "th", 2, 99, 1, NULL, 0) == 0 && res(0, "prod-redis", PC_RESPMAP_RUNTIME),
 		"C: an older generation (99 < 100) is ignored");
 	CHK(pc_respmap_apply(0, "aaa", 3, 100, 1, NULL, 0) == 0 && res(0, "prod-redis", PC_RESPMAP_RUNTIME),
@@ -104,7 +83,7 @@ int main(void)
 		!strcmp(was, "zzz") && res(0, "prod-redis", PC_RESPMAP_RUNTIME),
 		"C: a newer generation wins (was '%s')", was);
 
-	/* D */
+	/* D: unmap - the config answers again; the tombstone kept for the sync outranks older */
 	CHK(pc_respmap_apply(0, "", 0, 102, 0, was, sizeof was) == 1 && !strcmp(was, "prod-redis") &&
 		res(0, "0", PC_RESPMAP_CONFIG) && !strcmp(eff(), "0, 1:prod-redis, 2:th"),
 		"D: unmap 0 - '0' from the config again, the list is the config's ('%s')", eff());
@@ -118,7 +97,7 @@ int main(void)
 		strstr(eff(), "5:th") == eff(), "D: map 5 th - an index the config never named ('%s')", eff());
 	CHK(pc_respmap_persist() == 0, "D: persisted");
 
-	/* F (the file D left: 0 a tombstone at 102, 5 -> th at 103) */
+	/* F: persistence of the file D left (0 a tombstone at 102, 5 -> th at 103) */
 	CHK(pc_respmap_count_file(dir) == 1, "F: count_file sees one override (the tombstone not counted)");
 	CHK(pc_respmap_init("0, 1:prod-redis, 2:th", dir) == 0 && res(5, "th", PC_RESPMAP_RUNTIME) &&
 		res(0, "0", PC_RESPMAP_CONFIG), "F: a re-init from the state dir: 5 -> th, 0 as the config says");
@@ -138,14 +117,14 @@ int main(void)
 	unlink(path);
 	CHK(pc_respmap_count_file(dir) == 0, "F: no file: 0");
 
-	/* E */
+	/* E: no list (an open door) - an override keeps "*" first; others reach their own name */
 	CHK(pc_respmap_init(NULL, dir) == 0 && pc_respmap_effective() == NULL &&
 		res(7, "7", PC_RESPMAP_OPEN), "E: no list - nothing published, 7 -> '7' (open)");
 	CHK(pc_respmap_apply(0, "prod-redis", 10, 200, 1, NULL, 0) == 1 &&
 		!strcmp(eff(), "*,0:prod-redis") && res(0, "prod-redis", PC_RESPMAP_RUNTIME) &&
 		res(7, "7", PC_RESPMAP_OPEN), "E: map 0 on an open door: '%s' - 7 still reaches '7'", eff());
 
-	/* G */
+	/* G: refused - an index out of range, a name the list grammar cannot hold */
 	CHK(pc_respmap_apply(-1, "x", 1, 300, 1, NULL, 0) == -1 &&
 		pc_respmap_apply(PC_RESPMAP_MAX, "x", 1, 300, 1, NULL, 0) == -1,
 		"G: index -1 and %d refused", PC_RESPMAP_MAX);

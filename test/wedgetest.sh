@@ -1,13 +1,6 @@
 #!/bin/sh
-# wedgetest.sh — a failed request must not disable the handle (S72).
-#
-# Starts one perfcached, lets the client connect and do a successful
-# write, RESTARTS the daemon under it, and checks the client is still
-# usable afterwards.  The failing request across the restart is
-# expected; a handle that answers "pipeline in progress" forever is
-# the defect.
-#
-# Usage: test/wedgetest.sh [./perfcached] [./wedgetest]
+# wedgetest.sh - a failed request must not disable the handle: the daemon restarts under a connected
+# client; after one expected failure it is usable again (never "pipeline in progress" forever).
 set -u
 BIN=${1:-./perfcached}
 WT=${2:-./wedgetest}

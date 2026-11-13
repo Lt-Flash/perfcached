@@ -1,52 +1,6 @@
 #!/bin/sh
-# tombstonetest.sh — S42e: a node returning with a WAL full of keys the
-# fleet deleted while it was down, tested AT THE TOMBSTONE BOUNDARY.
-#
-# WHAT WAS ALREADY COVERED, AND WHAT WAS NOT.  rejointest's obligation 3
-# already shows a deleted key not coming back - but it runs with
-# `eager = 1` and brings the node back about two seconds after the
-# delete, so BOTH possible protections are in play at once and the test
-# cannot say which one held.  `tombstone_ms` is a configured number
-# (100..60000, default 2000) and nothing had ever been run against its
-# boundary.
-#
-# WHAT THE CODE SAYS, and this suite exists to pin it:
-#
-#   - a tombstone is a LIVE BROADCAST plus a negative-cache entry on the
-#     nodes that RECEIVE it (cluster.c pc_tombstone_send / pc_neg_set).
-#     A node that is DOWN for the delete never receives one, and its WAL
-#     still holds the SET.  So the window does nothing whatsoever for
-#     the returning node's own copy.
-#   - what actually removes it is the B4 reconcile, which is EAGER-ONLY
-#     by design: "in plain store mode peers legitimately lack keys they
-#     never pulled, and absent-means-deleted would destroy live data".
-#
-# Which yields the claim this suite tests, and which is easy to get
-# backwards when reading the config:
-#
-#     tombstone_ms bounds how long the fleet HIDES a resurrection.
-#     It does not decide whether one happens.
-#
-# THREE ARMS, so no arm can pass by luck:
-#   A  eager,    returns LONG after the window -> keys stay deleted, and
-#                the reconcile counters must move (it worked, not luck)
-#   B  no eager, returns LONG after the window -> keys come back AND the
-#                resurrection SPREADS to a survivor that had deleted them
-#   C  no eager, returns WELL INSIDE the window -> keys come back just
-#                the same; the survivor merely still says absent, which
-#                is the masking, not a fix
-# B is A's control: it proves the WAL really carries the keys, so A's
-# pass cannot be an empty replay.
-#
-# S238 changed the store-mode answer.  The survivors now REMEMBER the
-# deletes (tombstone_retain_s) and replay them to a peer that comes back
-# from a silence, so the returning node's WAL copies are deleted by
-# version instead of served.  B and C pin the tombstone_ms claim itself,
-# so they run with that memory OFF (tombstone_retain_s = 0), as before;
-#   D  no eager, returns LONG after the window, retention ON (default) ->
-#                no key comes back, and the survivor still says absent
-#
-# usage: test/tombstonetest.sh [./perfcached]
+# tombstonetest.sh - a node back with a WAL full of keys the fleet deleted while it was down, at
+# the tombstone boundary: tombstone_ms bounds how long a resurrection is hidden, not if it happens.
 set -u
 
 BIN=${1:-./perfcached}
@@ -63,12 +17,8 @@ command -v ss >/dev/null 2>&1 && for pf in 17961 17962 17963; do
 done
 
 D=$(mktemp -d /var/tmp/pctb.XXXXXX)
-# INSTANCE-SCOPED cleanup: a prefix-glob pkill would murder a concurrent
-# twin (and once killed a live CI job).  Match this fixture's own dir.
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a reused
+# pid never hits a stranger; the name-bound pattern stays as a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill "$p"; done; pkill -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -95,7 +45,7 @@ pull_timeout_ms = 400
 tombstone_ms = $3
 tombstone_retain_s = ${4:-900}
 ${5:+tombstone_retain_max = $5}
-# 12ny AT-5: the time rule's suite (S238/S392/S443/S446) - no forgetting by marks
+# the time rule's suite - no forgetting by marks
 tombstone_acks = no
 mode = $_md
 collections = c
@@ -135,6 +85,17 @@ stat_of() { # stat_of <node> <field>
 try: print((json.load(sys.stdin).get("cluster") or {}).get("'"$2"'", -1))
 except Exception: print(-1)' 2>/dev/null || echo -1
 }
+# formed: nodes 1-3 ready, each seeing the other two, up to 30 s - a joiner is CONNECTING until
+# its links answer
+formed() {
+	i=0
+	while [ $i -lt 300 ]; do
+		fs=""; for n in 1 2 3; do fs="$fs$(call $n '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), (d.get("cluster") or {}).get("peers_up"))' 2>/dev/null)|"; done
+		[ "$fs" = "ready 2|ready 2|ready 2|" ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
 # how many of the N keys node <n> still answers "found" for
 alive_on() { # alive_on <node>
 	j=1
@@ -161,7 +122,6 @@ stop_all() {
 	rm -rf "$D"/w1 "$D"/w2 "$D"/w3
 }
 
-# ---- one arm --------------------------------------------------------
 # Returns via the globals A_BACK (keys alive on the returned node) and
 # A_PEER (keys alive on a survivor that deleted them).
 run_arm() { # run_arm <label> <eager> <tombstone_ms> <wait_before_return_s> [retain_s]
@@ -170,7 +130,7 @@ run_arm() { # run_arm <label> <eager> <tombstone_ms> <wait_before_return_s> [ret
 	stop_all
 	for i in 1 2 3; do mk $i "$ra_eager" "$ra_tomb" "$ra_ret"; done
 	for i in 1 2 3; do start $i "$ra_label-a" || return 1; done
-	sleep 5
+	formed
 
 	# fill through node1, then make sure a SURVIVOR has them too, so the
 	# delete below is a delete of data the fleet really holds
@@ -190,16 +150,8 @@ run_arm() { # run_arm <label> <eager> <tombstone_ms> <wait_before_return_s> [ret
 	     $N keys ($ra_pre2) - the delete would not be a real delete"
 	     return 1; }
 
-	# S223: node1's reconcile will only run with a WITNESS - a peer up at
-	# least 30 s (three sweep periods) before node1 went down, because only
-	# that peer saw the deletes.  This arm started all three together a few
-	# seconds ago, so wait until the survivors are old enough - 46 s:
-	# node1's death is estimated from its alive stamp, touched every ten
-	# beats, so it reads up to 10 s early and the effective grace is up
-	# to 40 s; killed
-	# earlier, node1 rightly skips the pass (a fleet that has only just
-	# formed has no witness) and the deletes come back BY DESIGN - the
-	# documented cost of the rule, not what this arm is testing.
+	# node1's reconcile runs only with a WITNESS up 30 s before it died; its death reads up to 10 s
+	# early, so wait 46 s - killed earlier, the deletes come back by design
 	i=0
 	while [ $i -lt 60 ]; do
 		up=$(call 2 '{"method":"stats"}' | python3 -c 'import json,sys
@@ -222,7 +174,6 @@ except Exception: print(0)' 2>/dev/null)
 		&& ok "arm $ra_label: all $N keys deleted on the survivors" \
 		|| bad "arm $ra_label: $ra_del2 key(s) survived the delete on node2"
 
-	# THE BOUNDARY: how long we wait before the node comes back
 	sleep "$ra_wait"
 	start 1 "$ra_label-b" || return 1
 	sleep 20                       # reconcile budget is 64 probes/tick
@@ -246,10 +197,8 @@ else
 	bad "A: eager - $A_BACK of $N deleted keys came back on the returning
 	     node despite the reconcile"
 fi
-# and prove WHY: the reconcile must actually have run, or A passed
-# because the WAL was empty rather than because anything worked
-# (GitLab 112775: the deletes' replay left a walk nothing to ask, probed 0; arm B
-# is the control that the WAL carried them)
+# and prove WHY: the reconcile must actually have run, or A passed because the WAL was empty
+# (the deletes' replay can leave a walk nothing to ask; arm B is the control)
 if [ "${A_PROBED:-0}" -gt 0 ] || [ "$A_FAST" = True ] || [ "${A_WALKED:-0}" -gt 0 ]; then
 	ok "A: the reconcile really ran (probed $A_PROBED key(s), fast $A_FAST, walked $A_WALKED)"
 else
@@ -293,7 +242,7 @@ else
 	     window - the tombstone is not suppressing the pull it should"
 fi
 
-# ---- arm D: no eager, well past the window, retention ON (S238) -------
+# ---- arm D: no eager, well past the window, retention ON -------
 run_arm D 0 2000 15 900 || { echo "tombstonetest: arm D did not run"; exit 1; }
 if [ "$A_BACK" = 0 ] && [ "$A_PEER" = 0 ]; then
 	ok "D: store mode with the deletes REMEMBERED - none of the $N came back on
@@ -304,18 +253,14 @@ else
 	     node and node2 answers for $A_PEER - the replay did not reach it"
 fi
 
-# ---- arm E: the table's limits reach the alerts (AR15) ----------------
-# A cap of 1,000 and 2,000 deletes: the cap drops the oldest before
-# tombstone_retain_s, so cluster.tombstones (warning) - with the count, the
-# cap and the window.  A member away longer than the 5-s window comes back:
-# a survivor raises cluster.peer_absent, an event (one-off).  0.6.4 only
-# logged both: neither reaches the alerts there.
+# ---- arm E: the table's limits reach the alerts ----------------
+# the cap drops entries early (cluster.tombstones); a member away past the window: peer_absent
 echo "--- arm E: tombstone_retain_s 5, tombstone_retain_max 1000, 2000 deletes; node3 away 8 s"
 stop_all
 export PERFCACHED_ALERT_FAST=60
 for i in 1 2 3; do mk $i 0 2000 5 1000; done
 for i in 1 2 3; do start $i E-a || { echo "tombstonetest: arm E did not start"; exit 1; }; done
-sleep 5
+formed
 al() { # al <node> <python expr over a = stats' alerts block>
 	call "$1" '{"method":"stats"}' | python3 -c 'import json,sys
 try:
@@ -337,7 +282,7 @@ i=0
 while [ $i -lt 30 ] && [ "$(al 1 "$q")" != True ]; do sleep 1; i=$((i + 1)); done
 if [ "$(al 1 "$q")" = True ]; then
 	ok "E: 2000 deletes past a cap of 1000 - cluster.tombstones raised: $(al 1 'next(x["text"] for x in a["active"] if x["key"] == "cluster.tombstones")')"
-	# S443: and it says they were deletes - none of them expiries
+	# and it says they were deletes - none of them expiries
 	case "$(al 1 'next(x["text"] for x in a["active"] if x["key"] == "cluster.tombstones")')" in
 	*" deletes, 0 expiries;"*) ok "E: the text says they were deletes, no expiries (S443)" ;;
 	*) bad "E: the text does not split deletes from expiries: $(al 1 'next(x["text"] for x in a["active"] if x["key"] == "cluster.tombstones")')" ;;
@@ -357,22 +302,14 @@ case "$r" in
 *) bad "E: no cluster.peer_absent on node1 after node3's 8-s absence: $r" ;;
 esac
 
-# ---- arm E2: the same cap filled by EXPIRIES (S443) ----------------------
-# An eager collection notes every key its sweep reaps as a delete at that
-# version (S392), so a TTL workload fills the table on its own: 2,000 keys
-# with a 1-s TTL past a cap of 1,000 (retained 120 s, so the drops are
-# early whatever the sweep's pace).  The alert and /stats must say EXPIRIES -
-# 245-247 read 12.4 million "deletes dropped" that were a TTL benchmark.
-# S444: 100 real deletes go first, and the expiries must not push them out.
-# FAIL-FIRST: the build before S443 says "deletes dropped" and has no
-# expiries figures; the build before S444 evicts the deletes.
+# ---- arm E2: the same cap filled by EXPIRIES ----------------------
+# an eager sweep notes each reaped key, so TTL keys fill the cap; the alert must say expiries
 echo "--- arm E2: eager, tombstone_retain_s 120, tombstone_retain_max 1000, 100 deletes, then 2000 keys with ttl 1"
 stop_all
 for i in 1 2 3; do mk $i 1 2000 120 1000; done
 for i in 1 2 3; do start $i E2 || { echo "tombstonetest: arm E2 did not start"; exit 1; }; done
-sleep 5
-# S444: 100 real deletes first - the expiries past the cap must not push
-# them out (they did: a delete was the shard's oldest, so the cap took it)
+formed
+# 100 real deletes first - the expiries past the cap must not push them out
 j=1
 while [ $j -le 100 ]; do
 	echo "{\"method\":\"set\",\"params\":{\"col\":\"c\",\"key\":\"td-$j\",\"value\":\"v\"}}"
@@ -402,29 +339,22 @@ try:
     print("%s %s %s %s %s" % (t.get("dropped_early"), t.get("dropped_early_expiries"), t.get("expiries"), t.get("win_dropped_early"), t.get("entries")))
 except Exception as e: print("err %s" % e)' 2>/dev/null)
 set -- $tr
-# at least the cap's overflow of node1's OWN 2,000 expiries; a replay to a
-# peer back from a silence carries no kind on the wire, so what node1 got
-# that way counts as deletes - the drops may hold some (GitLab 111796:
-# 1,334 dropped, 1,157 expiries)
+# at least the cap's overflow of node1's own expiries; a replay carries no kind on the wire,
+# so what node1 got that way counts as deletes
 if [ "${2:-x}" != None ] && [ "${2:-0}" -ge 1000 ] 2>/dev/null && [ "$2" -le "${1:-0}" ] 2>/dev/null && [ "${3:-None}" != None ] && [ "${4:-None}" != None ]; then
 	ok "E2: /stats: $1 dropped early, $2 of them expiries; $3 expiries kept; a 5-minute window ($4)"
 else
 	bad "E2: /stats tombstones_retained dropped_early/dropped_early_expiries/expiries/win_dropped_early: $tr"
 fi
-# S444: the 100 deletes are all still held - entries less the expiries
+# the 100 deletes are all still held - entries less the expiries
 if [ "${5:-x}" != x ] && [ "${3:-None}" != None ] && [ $(( ${5:-0} - ${3:-0} )) -ge 100 ] 2>/dev/null; then
 	ok "E2: the 100 deletes made before the expiries are all still held ($5 kept, $3 of them expiries) (S444)"
 else
 	bad "E2: deletes kept after the expiries past the cap: $(( ${5:-0} - ${3:-0} )), want at least 100 ($tr)"
 fi
 
-# ---- arm E3: a REPLAYED expiry stays an expiry (S446) --------------------
-# The catch-up to a peer back from a silence sends each retained entry as a
-# tombstone; it carried no kind, so the peer kept every replayed expiry as
-# a delete.  Node 3 is killed, 500 keys with a 1-s TTL are written and
-# expire on nodes 1 and 2 while it is away, and node 3 comes back: it never
-# held them, so every entry it keeps for them is a replay.
-# FAIL-FIRST: the build before S446 keeps them as deletes (expiries 0).
+# ---- arm E3: a REPLAYED expiry stays an expiry --------------------
+# node 3 is away while 500 keys expire on nodes 1 and 2: every entry it keeps for them is a replay
 echo "--- arm E3: node3 away while 500 keys expire on nodes 1 and 2; back, the replay keeps them as expiries"
 kill -9 "$(pidof_node 3)" 2>/dev/null
 sleep 1
@@ -449,19 +379,18 @@ else
 	bad "E3: node3 keeps $x3 expiries after the replay of 500 it never held - want at least 400"
 fi
 
-# ---- arm F: the settings the fleet must agree on (AR11) ------------------
-# Node3 fsyncs less ([wal] fsync = no) than nodes 1 and 2 (always).  The
-# keepalive carries each member's settings; "always" is the majority, so
-# every node raises config.wal.fsync - node1 naming node3, node3 saying it
-# is the one.  0.6.4 carries no settings and raises nothing.
+# ---- arm F: the settings the fleet must agree on ------------------
+# node3 fsyncs less than nodes 1 and 2, the majority: every node raises config.wal.fsync
 echo "--- arm F: node3 on [wal] fsync = no beside two on always"
 stop_all
 for i in 1 2 3; do mk $i 0 2000; done
 sed -i 's/^fsync = always$/fsync = no/' "$D/n3.conf"
 for i in 1 2 3; do start $i F-a || { echo "tombstonetest: arm F did not start"; exit 1; }; done
 q='[x["text"] for x in a["active"] if x["key"] == "config.wal.fsync"][:1]'
+# node3 may raise it before it hears node2, naming node1; its words follow once it does
 i=0
-while [ $i -lt 30 ] && { [ "$(al 1 "$q")" = "[]" ] || [ "$(al 3 "$q")" = "[]" ]; }; do
+while [ $i -lt 30 ] && { ! al 1 "$q" | grep -q "this node and 1 other(s) hold always" ||
+        ! al 3 "$q" | grep -q "differs here"; }; do
 	sleep 1; i=$((i + 1))
 done
 r1=$(al 1 "$q"); r3=$(al 3 "$q")
@@ -477,14 +406,14 @@ case "$r3" in
 esac
 r2=$(al 2 '[x["key"] for x in a["active"] if x["key"].startswith("config.") and x["key"] != "config.wal.fsync"]')
 [ "$r2" = "[]" ] && ok "F: no other setting is said to differ" || bad "F: other config alerts on node2: $r2"
-# UP1: the same keepalive carries each member's build - the version its binary says, the wire
-# epochs it speaks - in /members on every node; as facts they are never compared (r2 above)
+# the same keepalive carries each member's build (version, wire epochs) in /members on every
+# node; as facts they are never compared
 V=$("$BIN" -V | head -1 | awk '{print $2}')
 mv=$(call 1 '{"method":"members"}' | python3 -c 'import json,sys
 r = json.load(sys.stdin); m = r.get("members", []) if isinstance(r, dict) else r
 print(sorted(set((x.get("version"), tuple(x.get("wire_epochs") or [])) for x in m)), len(m))' 2>/dev/null)
-[ "$mv" = "[('$V', (2, 2))] 3" ] && ok "F: UP1 - all three members report version $V, wire epochs 2..2" \
-	|| bad "F: UP1 - /members versions $mv, want [('$V', (2, 2))] 3"
+[ "$mv" = "[('$V', (4, 4))] 3" ] && ok "F: UP1 - all three members report version $V, wire epochs 4..4" \
+	|| bad "F: UP1 - /members versions $mv, want [('$V', (4, 4))] 3"
 unset PERFCACHED_ALERT_FAST
 
 echo "tombstonetest: $pass passed, $fail failed"

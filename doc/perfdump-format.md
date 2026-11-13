@@ -1,29 +1,40 @@
-# perfdump file set, format version 1
+# perfdump file set, format version 2
 
 A dump is a directory. `manifest.json` names every chunk file with its
 collection, the bucket range its walker owned, its record and byte
 counts, a CRC-32 of its uncompressed bytes, its compression, and whether
 it is complete. A chunk is complete only once its trailer and its
-manifest entry are written: a restart re-dumps what is not complete.
+manifest entry are written. perfdump does not resume a dump: run again,
+it dumps every collection afresh and rewrites `manifest.json`, and a
+file of the earlier run that the new manifest does not name is left in
+the directory - give each dump an empty one.
 
 ## Chunk files
 
 `<collection>.<nnnn>.pcd`, or `.pcd.zst` when compressed (the same bytes
-through `zstd`; `zstd -dc` recovers them). Little-endian throughout.
+through `zstd`; `zstd -dc` recovers them); `nnnn` numbers the chunks
+across the whole dump. Little-endian throughout.
 
 ```
-"PCD1"                              magic, 4 bytes
+"PCD2"                              magic, 4 bytes
 record*:
   u32 klen                          key length
   u32 vlen                          value length
   u64 expiry                        absolute unix time in milliseconds, 0 = never
   u64 version                       the record's Lamport version as dumped
-  u8  flags                         bit 0 = a JSON document (S280); the rest 0
+  u8  type                          0 string, 1 JSON document, 2 rate limit
+                                    (RL.HIT), 3 hash, 4 lock (Symfony's zset)
   key[klen] value[vlen]
 trailer:
   u32 0xFFFFFFFF                    no record has a key this long
   u64 records                       the count in this file
 ```
+
+The type is the one the daemon's `dump` names in a record's `t` (none
+for a string) and `restore` takes back, so a hash comes back a hash, not
+a string holding its encoding.  No other type value exists, and klen +
+vlen never exceeds 262,080 bytes, the store's largest record:
+`perfload` and `--inspect` refuse a file that breaks either.
 
 The CRC-32 (IEEE, the zlib polynomial) covers everything from the magic
 to the end of the trailer, uncompressed. `perfdump --inspect DIR` reads
@@ -34,10 +45,10 @@ manifest.
 ## Manifest
 
 ```json
-{"format":"perfdump-format","format_version":1,"tool":"perfdump 0.1",
+{"format":"perfdump-format","format_version":2,"tool":"perfdump 0.2",
  "source":"192.0.2.10:6479","started":1788930000,"threads":4,
- "collections":[{"name":"sbcha","buckets":262144}],
- "files":[{"file":"sbcha.0000.pcd.zst","collection":"sbcha",
+ "collections":[{"name":"sessions","buckets":262144}],
+ "files":[{"file":"sessions.0000.pcd.zst","collection":"sessions",
            "bucket_lo":0,"bucket_hi":65536,"records":12345,"bytes":3456789,
            "crc32":1234567890,"zstd":3,"complete":true}],
  "records":12345,"bytes":3456789}
@@ -52,10 +63,10 @@ overflow leg).
 
 Each record once, with the value, expiry and version the daemon held
 when its chunk was read, while the table is quiet. A table that grows
-under the dump (the maintenance thread splits buckets once a collection
-passes four records a bucket) can repeat a record: a split moves half a
-bucket's records ahead of the walk's cursor, where the walk sees them
-again. That is the cursor's at-least-once contract under growth, the
+under the dump (a table splits buckets once it passes `[daemon]
+grow_at_pct` of its slots, by default 4.5 records a bucket) can repeat
+a record: a split moves half a bucket's records ahead of the walk's
+cursor, where the walk sees them again. That is the cursor's at-least-once contract under growth, the
 same one Redis `SCAN` has, and `perfload` upserts by version, so a
 repeated record costs bytes, never correctness.
 
@@ -79,9 +90,11 @@ during the dump is present as of its chunk.
 
 ## Loading it back
 
-`perfload DIR --to HOST:PORT` reads the manifest, verifies every
-complete chunk's count and CRC-32, and sends the records in `restore`
-batches with their expiry and version as the file holds them.  The
+`perfload DIR --to HOST:PORT --enable SECRET` (`restore` needs a
+privileged connection: `[secrets] enable`) reads the manifest, verifies
+every complete chunk's count and CRC-32, and sends the records in
+`restore` batches with their expiry, version and type as the file holds
+them; a chunk the manifest marks incomplete is skipped without a word.  The
 daemon rebases the expiry onto its own clock and installs the record
 under the file's version, so the copy a node ends up with is the copy
 the dump read, however many nodes or which mode the target has.
@@ -92,3 +105,17 @@ skips the chunks listed; `--restart` ignores the file.  The at-least-
 once repeats a growing table can put into a dump cost nothing on the
 way back: a record already held at the same version is refused by the
 store as "as old" and counted `older`, never installed twice.
+
+## Format versions
+
+`format_version` in the manifest and the magic of every chunk say which
+layout a dump has; a change to either layout or to the meaning of a
+field takes the next number, and the tools read their own number only.
+
+- **2** (perfdump 0.2): the byte after the version is the record's type,
+  every type the daemon dumps.
+- **1** (perfdump 0.1, magic `PCD1`): that byte was a flags byte whose
+  only bit marked a JSON document, so a hash, a rate limit or a lock
+  went into the file - and came back from it - as a string.
+  `perfload` 0.2 and `perfdump --inspect` refuse a format-1 dump with a
+  message saying so: dump the source again.

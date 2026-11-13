@@ -1,21 +1,11 @@
 #!/bin/sh
-# walobstest.sh — S63 part 3: the daemon measures its OWN fsyncs.
-#
-# The startup probe writes at most 16 MB in ~1.2s, so on storage with a
-# write-back cache in front of it - every VM running cache=writeback -
-# it measures the cache and reports a latency the device never delivers
-# under load.  Measured 2026-09-03 on Ceph: probe 139us p50, sustained
-# fio 3.7ms.  Only the running daemon is still measuring when that cache
-# fills, so it has to compare and say so.
-# Usage: test/walobstest.sh [./perfcached]
+# walobstest.sh - the daemon measures its own fsyncs and flags storage slower than its startup probe
+# (which a write-back cache can fool).  Usage: test/walobstest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
 BIN=${1:-./perfcached}
-# PCOBS_TMP points the fixture at a chosen filesystem.  The count
-# assertion below broke on a CI runner whose fsync is ~2us, and without
-# this there was no way to reproduce that speed locally - /dev/shm is
-# the same profile.
+# PCOBS_TMP points the fixture at a chosen filesystem (/dev/shm reproduces a ~2 us fsync)
 D=$(mktemp -d "${PCOBS_TMP:-/var/tmp}/pcobs.XXXXXX")
 CG=/sys/fs/cgroup/pcobs
 PID=
@@ -58,10 +48,8 @@ save = off
 buckets_log2 = 12
 CONF
 
-# One write per round trip.  The pump group-commits - one fdatasync per
-# DRAINED BATCH, not per record - so a pipelined burst of 200 writes
-# produced only TWO fsyncs and never came near the detector's 50-sample
-# gate.  Waiting for each reply forces each write into its own batch.
+# one write per round trip: the pump group-commits one fdatasync per drained batch, so a pipelined
+# burst never reaches the detector's 50-sample gate
 drive() {  # drive <n>
 	python3 - "$1" <<'PY'
 import json, pcnative, socket, sys
@@ -74,10 +62,7 @@ for i in range(n):
     f.readline()
 PY
 }
-# `sync` forces a barrier and WAITS for it, so N calls are N fsyncs.
-# Needed because the pump group-commits: under a throttle a burst of 250
-# writes drained as two batches and produced two fsyncs, so no amount of
-# extra traffic could reach the detector's sample gate.
+# `sync` forces a barrier and waits for it, so N calls are N fsyncs
 drive_synced() {  # drive_synced <n>
 	python3 - "$1" <<'PY'
 import json, pcnative, socket, sys
@@ -126,11 +111,8 @@ grep -q "perfcached ready" "$D/log" || { echo "daemon did not start"; tail -3 "$
 
 drive_synced 30
 N=$(obs fsync_n); A=$(obs fsync_avg_us); M=$(obs fsync_max_us); R=$(obs fsync_recent_us)
-# 30 barriers, so 30 fsyncs whatever the storage costs.  Counting the
-# fsyncs that ordinary writes happen to produce is NOT portable: the
-# pump group-commits, so the number falls out of device speed - this
-# assertion passed on 1.5ms storage and failed on a 2us CI runner where
-# seventy writes drained as two batches.
+# 30 barriers, so 30 fsyncs whatever the storage costs; ordinary writes give a count that depends
+# on device speed
 [ "$N" != MISSING ] && [ "$N" -ge 20 ] 2>/dev/null \
 	&& ok "the daemon counted its own fsyncs (n=$N)" \
 	|| bad "fsync_n absent or too low: $N"
@@ -138,12 +120,8 @@ N=$(obs fsync_n); A=$(obs fsync_avg_us); M=$(obs fsync_max_us); R=$(obs fsync_re
 	&& ok "mean fsync cost is measured (${A}us)" || bad "avg absent: $A"
 [ "$M" != MISSING ] && [ "$M" -ge "$A" ] 2>/dev/null \
 	&& ok "max >= mean (${M}us >= ${A}us)" || bad "max $M < avg $A"
-# The flag must AGREE with the figures it is computed from - probe p50,
-# the recent mean and the sample count, in ONE snapshot - whatever the
-# host is doing.  "Healthy storage: not flagged" was an assertion about
-# the host, not the daemon: on the CI runner a concurrent job made these
-# fsyncs average 10.7 ms against a sub-3 ms probe and the detector
-# flagged, correctly, and the suite went red on a tag (2026-09-09).
+# the flag must agree with the figures it is computed from (probe p50, recent mean, sample count,
+# one snapshot): whether this host's storage is healthy is not the daemon's property
 set -- $(obs4)
 PP=$1; RC=$2; NN=$3; FL=$4
 expect=false
@@ -153,15 +131,8 @@ expect=false
 	|| bad "flag $FL disagrees with the figures (probe ${PP}us, recent ${RC}us, n $NN)"
 [ "$FL" = true ] && echo "  ..   this host was contended during the phase: recent ${RC}us >= 4 x probe ${PP}us - the detector was right; the healthy-storage premise did not hold here"
 
-# The detector itself.  Probe ran unthrottled (fast); throttling AFTER
-# the daemon is ready is exactly the cache-fills-later shape.  Needs
-# root + cgroup v2 + a whole-disk device: an unbuildable fixture is a
-# SKIP said loudly, never a silent pass.
-# The disk that holds THIS fixture's WAL, by its parent device - not "/"'s
-# MAJ:MIN with the minor zeroed: after 224's reboot on 2026-10-14 "/" was
-# sdb1 (8:17), the arithmetic gave 8:0 - the /dn disk - and the WAL's disk
-# was never throttled (0.6.4-rc2's check-standalone: recent 1.7 ms against a
-# 3.4 ms probe, no divergence).
+# the detector: throttle after ready, the cache-fills-later shape.  Needs root, cgroup v2 and a
+# whole-disk device (else SKIP, loudly); the WAL's disk is found by its parent device.
 SRC=$(findmnt -n -o SOURCE --target "$D" 2>/dev/null | head -1)
 PK=$(lsblk -no PKNAME "$SRC" 2>/dev/null | head -1)
 DEV=$(lsblk -dno MAJ:MIN "/dev/${PK:-${SRC#/dev/}}" 2>/dev/null | tr -d ' ' | head -1)

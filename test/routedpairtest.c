@@ -1,24 +1,5 @@
-/* routedpairtest.c - S211: the delete behind a routed jset takes the
- * same road as the jset.
- *
- * With per-key routing on, jset/jget/set/get/ttl/expire went to the
- * key's owner over its own link while jdel and jincr went over the
- * primary link.  On an eager fleet the primary is a peer of the owner:
- * the jset was applied and acknowledged at the owner, its push to the
- * primary batched for up to 3 ms, and the jdel arriving at the primary
- * meanwhile found nothing to delete - so it deleted nothing, and the
- * push then put the document on every member.  Deterministic for any
- * key whose owner is not the node the handle dialled (2 of 3 keys on a
- * 3-node fleet), and invisible to anything that puts even a few ms
- * between the two calls - which is why perfcli never saw it.
- *
- * The proof is on EVERY member through per-node handles that do not
- * route, never on the handle under test - the shape that hid S209.
- * Legs: a routed jset then jdel (deleted, absent everywhere for 2.5 s);
- * a routed jset then jincr (2, and 2 on every member); the same pair
- * with routing OFF stays correct; a routed jset alone reaches every
- * member, so "absent" above cannot mean "never arrived".
- * Usage: routedpairtest host port secret   (see routedpairtest.sh) */
+/* routedpairtest.c - a routed jset's following jdel or jincr takes the same road (the key's owner),
+ * proved on every member through witness handles that do not route; see routedpairtest.sh. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,9 +67,8 @@ static int active_port(const perfd_t *p)
 	return -1;
 }
 
-/* a key whose owner is NOT the node the handle dialled - the shape that
- * splits the two roads.  0 ok, -1 = routing is off on this handle,
- * -2 = no such key in 200 (impossible on three live members) */
+/* a key whose owner is NOT the node the handle dialled: 0 ok, -1 routing is off on this
+ * handle, -2 no such key in 200 (impossible on three live members) */
 static int pick_key(perfd_t *p, const char *prefix, char *out, size_t cap,
 		int *owner_port)
 {
@@ -118,9 +98,8 @@ static int on_member(perfd_t *m, const char *key)
 	return rc;
 }
 
-/* every member must say absent at every sample across 2.5 s - the push
- * batch flushes at 3 ms and the apply follows, so a resurrection shows
- * by the first sample.  Returns "" or the offending samples. */
+/* every member says absent at every sample across 2.5 s: the push batch flushes at 3 ms, so a
+ * resurrection shows by the first sample; returns "" or the offending samples */
 static const char *absent_everywhere(perfd_t **m, const char *key)
 {
 	static char buf[512];
@@ -133,8 +112,7 @@ static const char *absent_everywhere(perfd_t **m, const char *key)
 		for (i = 0; i < 3; i++) {
 			int rc = on_member(m[i], key);
 
-			/* an err says WHY (perfd_error): GitHub 37956883045 read
-			 * "m3@500ms=err" once, and nothing said what failed */
+			/* an err says WHY (perfd_error), or nothing tells what failed */
 			if (rc != 0 && off < sizeof buf - 120)
 				off += (size_t)snprintf(buf + off,
 					sizeof buf - off, " m%d@%dms=%s%.80s%s", i + 1,
@@ -206,9 +184,8 @@ int main(int argc, char **argv)
 		goto done;
 	}
 
-	/* the witnesses: one bare handle per member AS THE HANDLE LEARNED
-	 * IT, no fleet, no routing - each one reads its node and nothing
-	 * else */
+	/* the witnesses: one bare handle per member as the handle learned it, no
+	 * fleet, no routing - each reads its own node only */
 	for (i = 0; i < 3; i++) {
 		int port = 0;
 
@@ -298,7 +275,7 @@ int main(int argc, char **argv)
 	}
 
 	/* ---- leg 3: the same pair with routing OFF stays correct - both
-	 * ops on the dialled node, the peers by S209's tombstone ---- */
+	 * ops on the dialled node, the peers by the tombstone ---- */
 	memset(&o, 0, sizeof o);
 	o.secrets = sec;
 	o.spares = -1;

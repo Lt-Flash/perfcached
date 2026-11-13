@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * doorlive.h - the doors' live settings (doorlive.c): the snapshot's
- * shape and what daemon.c needs of it - the first install at start, a
- * reload's, and the listener facts stats reads.  Internal to the daemon
- * (the 0.7.2 split, wave 1); daemon.h stays the API.
- */
+/* doorlive.h - the doors' live settings snapshot (doorlive.c), internal to the
+ * daemon; daemon.h stays the API. */
 #ifndef PC_DOORLIVE_H
 #define PC_DOORLIVE_H
 
@@ -19,6 +15,7 @@ struct pc_live {
 	char *resp_password;           /* NULL = none */
 	char *enable_secret[PC_MAX_CLIENT_SECRETS];
 	int n_enable_secrets;
+	int auth_needs_tls;
 };
 
 extern struct pc_live *LIVE;             /* the current one; read through live() */

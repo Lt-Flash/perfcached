@@ -1,22 +1,6 @@
 #!/bin/sh
-# pagelayouttest.sh - S342: the collections table fits its panel at desktop
-# widths, in a real browser.
-#
-# PROD 2026-10-07, the operator: "fix scrolling, it shouldn't appear" - the
-# collections table was 1,377 px in a 1,238 px panel at 1280 px and SIZES sat
-# under a horizontal scrollbar.  A layout cannot be asserted in js2py
-# (pagejstest.sh), so this drives headless Chromium through Playwright.
-#
-# One daemon with four collections, one of them named with S343's 32
-# characters.  Its /stats is served to the page FLEET-SHAPED - each
-# collection with three members' figures, 8-digit counters (so the "N here"
-# lines are as wide as a busy fleet makes them) and one read-through line -
-# by routing the page's own request: the shape PROD shows, without a fleet.
-# At 1280, 1440 and 1920 px: the panel does not scroll sideways, the page
-# body does not either, and the long name's row is drawn.
-# Playwright is not on the CI runner, so the suite SKIPS loudly there rather
-# than passing without running.  PW_PY names a python that has it.
-# Usage: test/pagelayouttest.sh [./perfcached]
+# pagelayouttest.sh - the collections table fits its panel at 1280-1920 px in headless Chromium
+# (Playwright, fleet-shaped /stats); SKIPS loudly without Playwright, PW_PY names a python with it.
 set -u
 BIN=${1:-./perfcached}
 PY=${PW_PY:-python3}
@@ -83,9 +67,8 @@ def fleet_shaped(route):
                              "absent": 110833, "fill_string": 1665, "fill_hash": 0, "fill_json": 0,
                              "shadow_hits": 2129, "negative_hits": 2306401, "shadow_entries": 8032,
                              "fetch_us_avg": 291, "errors": 0, "timeouts": 0,
-                             # 0.6.2: write-through's row - a table by command and the
-                             # last errors (its table took the page's 100% width and,
-                             # indented, overflowed the panel: a scrollbar on 245)
+                             # write-through's row - a table by command and the last errors, which must not
+                             # overflow the panel
                              "writes": "through", "mode": "balance", "role_required": "replica",
                              "upstreams": [{"addr": "10.9.9.%d:6379" % i, "role": "replica" if i != 14 else "master",
                                             "state": "serving" if i != 14 else "not used", "why": "" if i != 14 else "a master",
@@ -136,14 +119,11 @@ with sync_playwright() as pw:
             "%d px: the collections panel does not scroll sideways (table %d in a %d px panel; narrowest it can be %d)"
             % (w, m["sw"], m["cw"], m["mc"]))
         (ok if not m["body"] else bad)("%d px: nor does the page" % w)
-        # 0.6.2: the full-width rows (read-through, its links, writes) no
-        # longer size the columns - their text squeezed the name column and
-        # a 10-character name's "lb" fell to a second line at 1280
+        # the full-width rows (read-through, its links, writes) do not size the columns: a
+        # 10-character name's "lb" stays on its line at 1280
         (ok if m["lbline"] else bad)("%d px: prod-redis's 'lb' sits on its name's line (%s)" % (w, m["lbline"]))
-        # 0.6.2: every card on the plane holds its content - nothing past
-        # its edge (listeners overflowed by 14 px; text cut on purpose,
-        # with an ellipsis, does not count) - and the slow log and alerts
-        # sections do not scroll sideways
+        # every card on the plane holds its content (an ellipsis cut does not count), and the
+        # slow log and alerts sections do not scroll sideways
         cv = pg.evaluate("""() => { const out = [];
           const clipped = (e, c) => { for (let p = e.parentElement; p && p !== c; p = p.parentElement)
             if (getComputedStyle(p).overflow === 'hidden') return true; return false; };

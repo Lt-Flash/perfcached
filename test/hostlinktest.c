@@ -1,14 +1,5 @@
-/* hostlinktest.c - S465's link monitor (hostlink.c) against a fake /sys and
- * /proc (PERFCACHED_HOSTLINK_ROOT), on seconds made here.
- *
- *   A  the path: a VLAN to its active-backup bond to the active slave, its
- *      speed; an 802.3ad bond read as itself; off; a device with no counters
- *   B  the minute: known bytes a second give the share of the speed, the
- *      10-s peak, drops and the host's UDP RcvbufErrors a second; a speed of
- *      -1 counts bytes and gives no share; link_speed_mbps stands for it
- *   C  a failover: the active slave moves, the next resolution follows it
- *      and the minute starts again on the new device's counters
- */
+/* hostlinktest.c - the link monitor (hostlink.c) against a fake /sys and /proc
+ * (PERFCACHED_HOSTLINK_ROOT), on seconds made here. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,13 +67,52 @@ static void nic(const char *dev, int speed)
 		put(rel, "%llu\n", (unsigned long long)speed, NULL);
 }
 
+static unsigned long long retr;
+
 static void snmp(unsigned long long rcvbuf)
 {
-	char v[256];
+	char v[640];
 
-	snprintf(v, sizeof v, "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n"
-		"Udp: 10 0 0 10 %llu 0", rcvbuf);
+	snprintf(v, sizeof v, "Ip: Forwarding DefaultTTL\nIp: 1 64\n"
+		"Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails "
+		"EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n"
+		"Tcp: 1 200 120000 -1 5 5 0 0 2 100 100 %llu 0 0 0\n"
+		"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n"
+		"Udp: 10 0 0 10 %llu 0", retr, rcvbuf);
 	put("proc/net/snmp", "", 0, v);
+}
+
+/* @n receive queues (and as many transmit ones) on @dev */
+static void queues(const char *dev, int n)
+{
+	char rel[256];
+	int k;
+
+	for (k = 0; k < n; k++) {
+		snprintf(rel, sizeof rel, "sys/class/net/%s/queues/rx-%d/rps_cpus", dev, k);
+		put(rel, "", 0, "0");
+		snprintf(rel, sizeof rel, "sys/class/net/%s/queues/tx-%d/xps_cpus", dev, k);
+		put(rel, "", 0, "0");
+	}
+}
+
+/* an interrupt of @dev's device, its effective affinity (NULL = none) and
+ * its allowed list */
+static void irq(const char *dev, int n, const char *eff, const char *allowed)
+{
+	char rel[256], p[512];
+
+	snprintf(rel, sizeof rel, "sys/class/net/%s/device/msi_irqs/%d", dev, n);
+	put(rel, "", 0, "msix");
+	snprintf(rel, sizeof rel, "proc/irq/%d/effective_affinity_list", n);
+	if (eff)
+		put(rel, "", 0, eff);
+	else {
+		snprintf(p, sizeof p, "%s/%s", R, rel);
+		unlink(p);
+	}
+	snprintf(rel, sizeof rel, "proc/irq/%d/smp_affinity_list", n);
+	put(rel, "", 0, allowed);
 }
 
 /* @n seconds from @t0 (ms), each adding @rx/@tx bytes and @dr drops on @dev */
@@ -98,6 +128,7 @@ static long long run(const char *dev, long long t0, int n, unsigned long long *r
 		*tx += dtx;
 		*dr += ddr;
 		*ue += 3;
+		retr += 5;
 		ctr(dev, "rx_bytes", *rx);
 		ctr(dev, "tx_bytes", *tx);
 		ctr(dev, "rx_dropped", *dr);
@@ -131,7 +162,7 @@ int main(void)
 	nic("virt0", -1);
 	snmp(0);
 
-	/* A */
+	/* A: the path - VLAN, active-backup bond, its active slave; 802.3ad; off; no counters */
 	hl_init("bond0.20", 0, NULL);
 	CHK(HL.on && !strcmp(HL.path, "bond0.20 -> bond0 (active-backup) -> eno1") &&
 	    !strcmp(HL.phys, "eno1") && HL.speed_mbps == 10000,
@@ -145,7 +176,7 @@ int main(void)
 	hl_init("nosuch9", 0, NULL);
 	CHK(!HL.on && strstr(HL.why, "no counters"), "A: a device with no counters - '%s'", HL.why);
 
-	/* B */
+	/* B: the minute - share of the speed, 10-s peak, drops, RcvbufErrors; speed -1: no share */
 	hl_init("bond0.20", 0, NULL);
 	t = run("eno1", 100000, 1, &rx, &tx, &dr, &ue, 0, 0, 0);
 	CHK(HL.rx_pct < 0 && HL.have == 1, "B: one sample - no share yet");
@@ -154,8 +185,9 @@ int main(void)
 	CHK(HL.rx_bps == 625000000LL && HL.rx_pct == 50 && HL.tx_pct == 10 &&
 	    hl_pct() == 50, "B: 625 MB/s in, 125 MB/s out on 10 Gb/s - rx %d%%, tx %d%%",
 	    HL.rx_pct, HL.tx_pct);
-	CHK(HL.drops_ps == 7 && HL.udperr_ps == 3, "B: drops %lld/s, RcvbufErrors %lld/s",
-		HL.drops_ps, HL.udperr_ps);
+	CHK(HL.drops_ps == 7 && HL.udperr_ps == 3 && HL.retrans_ps == 5,
+		"B: drops %lld/s, RcvbufErrors %lld/s, TCP retransmits %lld/s",
+		HL.drops_ps, HL.udperr_ps, HL.retrans_ps);
 	t = run("eno1", t, 1, &rx, &tx, &dr, &ue, 1240000000ULL, 125000000ULL, 7);
 	CHK(HL.rx_peak_pct == 99 && HL.rx_pct < 60,
 		"B: one second at 1.24 GB/s - the 10-s peak %d%%, the minute %d%%",
@@ -170,7 +202,7 @@ int main(void)
 	CHK(HL.speed_mbps == 100 && HL.tx_pct == 16,
 		"B: link_speed_mbps = 100 stands for it - tx %d%%", HL.tx_pct);
 
-	/* C */
+	/* C: a failover - resolution follows the slave, the minute restarts on its counters */
 	hl_init("bond0.20", 0, NULL);
 	rx = tx = dr = 0;
 	ctr("eno1", "rx_bytes", 0);
@@ -187,6 +219,45 @@ int main(void)
 			HL.path);
 		t = run("eno2", t, 3, &rx2, &tx2, &dr2, &ue, 250000000, 0, 0);
 		CHK(HL.rx_pct == 20, "C: and eno2's own counters read - rx %d%%", HL.rx_pct);
+	}
+
+	/* D: the NIC's receive queues, MSI interrupts and their CPUs; TCP retransmits a second */
+	put("sys/class/net/bond0/bonding/active_slave", "", 0, "eno1");
+	queues("eno1", 4);
+	irq("eno1", 40, "2", "0-15");
+	irq("eno1", 41, "2", "0-15");
+	irq("eno1", 42, "2", "0-15");
+	irq("eno1", 43, "2", "0-15");
+	irq("eno1", 44, "2", "0-15");
+	hl_init("bond0.20", 0, NULL);
+	CHK(!strcmp(HL.phys, "eno1") && HL.rx_queues == 4 && HL.irqs == 5 && HL.irq_cpus == 1,
+		"D: eno1 - %d receive queues, %d interrupts, on %d CPU(s)", HL.rx_queues,
+		HL.irqs, HL.irq_cpus);
+	irq("eno1", 40, "0", "0-15");
+	irq("eno1", 41, "1", "0-15");
+	irq("eno1", 43, "3", "0-15");
+	irq("eno1", 44, NULL, "0-3,8");
+	hl_init("bond0.20", 0, NULL);
+	CHK(HL.irqs == 5 && HL.irq_cpus == 5,
+		"D: spread, one with no effective affinity read by its allowed list - %d CPUs",
+		HL.irq_cpus);
+	hl_init("bond1", 0, NULL);
+	CHK(HL.on && HL.rx_queues == -1 && HL.irqs == -1 && HL.irq_cpus == -1,
+		"D: an 802.3ad bond, no device of its own - no queues said (%d)", HL.rx_queues);
+	put("sys/class/net/eno2/device/vendor", "", 0, "0x8086");
+	queues("eno2", 1);
+	hl_init("bond0.20", 0, NULL);
+	rx = tx = dr = 0;
+	t = run("eno1", t + HL_RESOLVE_MS, 2, &rx, &tx, &dr, &ue, 1000, 0, 0);
+	put("sys/class/net/bond0/bonding/active_slave", "", 0, "eno2");
+	{
+		unsigned long long rx2 = 0, tx2 = 0, dr2 = 0;
+
+		ctr("eno2", "rx_bytes", 0);
+		t = run("eno2", t + HL_RESOLVE_MS, 1, &rx2, &tx2, &dr2, &ue, 0, 0, 0);
+		CHK(!strcmp(HL.phys, "eno2") && HL.rx_queues == 1 && HL.irqs == -1,
+			"D: a failover to eno2 reads its queues - %d, interrupts %d", HL.rx_queues,
+			HL.irqs);
 	}
 
 	snprintf(cmd, sizeof cmd, "rm -rf '%s'", R);

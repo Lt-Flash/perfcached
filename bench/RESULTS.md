@@ -16,7 +16,7 @@ itself, so a results file always says what produced it.
 **The client is `redis-benchmark`** for every Redis comparison — Redis's
 own tool, unmodified.  It drives both servers with the same workload:
 
-    redis-benchmark ──native RESP──> redis-server 8.0.2
+    redis-benchmark ──native RESP──> redis-server 8
     redis-benchmark ──native RESP──> perfcached's RESP door
 
 Nothing is translated or proxied on either path.  perfcached speaks
@@ -55,11 +55,12 @@ Verified on both podman and docker: the cluster tables were produced by
 this harness under **podman** on a 16-vCPU host, and an earlier run of
 the same tables under docker on an 8-vCPU one had the same shape.
 
-The other route is the **host** one, which is what produced the
-single-node tables (`bench/respbench.sh`).  Nothing in it is pre-baked
-either: the harness starts its own Redis, starts its own perfcached
-fleet, drives both with the same client, and tears everything down.  On
-Debian 13 / Ubuntu:
+The other route is **`bench/respbench.sh`**, which produced the
+loopback single-node table the README carried until 0.3.7
+(`results/respbench.tsv`).  Nothing in it is pre-baked either: the
+harness starts its own Redis, starts its own perfcached fleet, drives
+both with the same client, and tears everything down.  On Debian 13 /
+Ubuntu:
 
     # 1. a container runtime, and nothing else
     apt install -y podman        # or docker, or nerdctl + buildkitd
@@ -87,11 +88,12 @@ cannot build (no `buildkitd`, an AppArmor profile that will not load) is
 reported with the fix rather than failing later and blaming something
 else. Override with `RUNTIME=docker`.
 
-**Budget an hour** with `REPS=3`.  Thirteen arms — redis, two
-single-node arms, and each of the five modes measured twice, once
-through the node holding the data and once through a node holding none
-— at ten cells each, three runs per cell, plus a fleet start and stop
-per arm and a 32-second wait per mode for the reshard grace to expire.
+**Budget an hour** with `REPS=3`.  Eleven arms — redis, two
+single-node arms, and each of the four modes (store, eager, proxy,
+shard) measured twice, once through the node holding the data and once
+through a node holding none — at ten cells each, three runs per cell,
+plus a fleet start and stop per arm and a 32-second wait per mode for
+the reshard grace to expire.
 
 Drop to `REPS=1` for a smoke run, but do not compare arms with it — see
 the note on the noise floor below.  A quicker subset:
@@ -119,8 +121,10 @@ VM.  What should reproduce is the *shape*: the arms converging at
 pipeline 1, perfcached pulling ahead as depth grows, store and proxy
 staying in one band, eager's SET falling away from them at depth because
 it replicates on the write path, and shard falling well behind any
-client that cannot compute an owner.  If your shape differs, that is
-worth more than the absolute values.
+client that cannot compute an owner - the `perf3-shard-cold` rows:
+since 2026-09-12 the `perf3-shard` arm routes by default, and
+`SHARD_CLUSTER=0` drives it un-routed as `results/respbench.tsv` did.
+If your shape differs, that is worth more than the absolute values.
 
 **Cells must run for seconds, not milliseconds.**  An earlier version of
 the one-server table quoted 934,878 and 1,786,286 GET/s for the two
@@ -128,7 +132,8 @@ pipelined cells, and those exact figures had come out of two runs on
 different builds.  That was the harness, not repeatability:
 redis-benchmark times a run in whole milliseconds, and 100k requests at
 1.8M/s is a 56 ms run, so every figure it could print sat on a ~2%
-grid.  Cells now run for over a second (`n_for` sizes them).  The same
+grid.  Cells now run for over a second (requests scale with pipeline
+depth: `reqs` in respbench.sh, `n_for` in containerbench.sh).  The same
 lesson bit the container harness a second time: with `--threads`,
 redis-benchmark stops only on its 250 ms progress timer, so a cell that
 finishes in 1.25-2.5 s prints a rate up to 25% low.  Every cell there is
@@ -136,15 +141,17 @@ now sized to run for at least 10 seconds, and the cluster tables the
 README carried until 2026-09-12 were understated by up to one
 quarter-second step.
 
-## Across a real network — the caveats behind the table
+## Across a real network — the first cross-host run
 
 Loopback shares one machine, which flatters both servers and costs
 perfcached more than Redis: its workers compete with the client for
-cores where a single-threaded Redis does not.  The cross-host table
-(`bench/xhostbench.sh`, build `2db7baf`, median of 3, arms alternated
-so drift cannot favour either, MTU 9000 verified end to end with
-`ping -M do -s 8972` before anything is trusted) is the one a deployment
-gets.  Two things to take from it rather than from the loopback tables:
+cores where a single-threaded Redis does not.  The first cross-host
+table (`bench/xhostbench.sh`, build `2db7baf`, `results/xhostbench.tsv`,
+median of 3, arms alternated so drift cannot favour either, MTU 9000
+verified end to end with `ping -M do -s 8972` before anything is
+trusted) is the one a deployment gets; GUIDE's table is the 0.4.0 run
+of the same script (`results/xhostbench-0.4.0.tsv`).  Two things to
+take from the first run rather than from the loopback tables:
 
 **Loopback and the wire agree on SET** - x2.20 there, x2.22 here - and
 the wire costs perfcached a little more than Redis on GET, x1.67 there
@@ -170,6 +177,9 @@ Reproduce it with servers on one host and the client on another:
     [listen]
     resp_allow = 10.0.0.0/8
     resp = <server-ip>:17910
+    # redis-benchmark uses db 0, which is the collection named 0
+    [collection 0]
+    buckets_log2 = 17
 
     # on the client host, after checking the path MTU:
     ping -M do -s 8972 -c 3 <server-ip>
@@ -222,7 +232,7 @@ Redis reference itself moved 2-14% between runs.
 
 **The cold-read row for spread is the honest one now.**  0.4.0's
 `spread-cold` reads 380,409 GET/s at pipeline 64 against 0.3.7's
-2,657,723.  0.3.7's was the defect S156: a spread node restarting empty
+2,657,723.  0.3.7's was a defect: a spread node restarting empty
 was handed the WHOLE keyspace by the boot pull, so inside the bench
 window it read everything locally.  0.4.0 hands it its share (two keys
 in three), it pulls the rest, and the row is a pull rate like any
@@ -239,7 +249,7 @@ Checked as a same-host A/B on 2026-10-02 (`spread-ab-0.3.7.tsv`,
 each tree's own harness, its own Redis reference): 0.3.7 read 192,638 /
 446,665 / 365,417 GET/s at pipelines 1 / 16 / 64 and 0.4.0 192,485 /
 1,661,976 / 2,784,365 - the same per request, three to seven times
-more at depth.  It is the daemon, not the day.  The same A/B shows S156
+more at depth.  It is the daemon, not the day.  The same A/B shows that defect
 directly: the empty-node read was 2,863,088 on 0.3.7 (the whole-keyspace
 boot pull) and 392,980 on 0.4.0 (its share, the rest pulled).
 
@@ -270,7 +280,7 @@ Pipelined bulk cells (the wire table) moved far more bytes and disturbed
 nothing - the cost is per packet.  Run such cells on one host, or in a
 window agreed with whoever runs the network.
 
-## The 0.3.7 tables, one host — the readings (S162, 2026-09-16)
+## The 0.3.7 tables, one host — the readings (2026-09-16)
 
 **Why every table moved at once.**  Until 0.3.7 the README's Measured
 section mixed hosts: the one-server and network tables from a Debian
@@ -337,11 +347,11 @@ vCPUs.  The off-box `spread` table is the ceiling for the same daemon.
 77,513 at 47.36 ms - the two that go and get the key in the order
 every run has put them, and proxy's tail where 2026-09-12 left it.
 Spread's restarted node reads at 2,657,723: as tagged, 0.3.7 hands a
-spread joiner the boot sender's whole store (S156), so the node holds
+spread joiner the boot sender's whole store, so the node holds
 everything for the bench window.  The fix - the boot pull scoped to
-the joiner's share, `spreadcoldtest` guarding it - is on master after
-the tag and will move this cell to the pull path's figure in the next
-release's run.
+the joiner's share, `spreadcoldtest` guarding it - went in after the
+tag, and 0.4.0's run reads this cell at the pull path's figure
+(380,409, above).
 
 **`spread` at capacity** (`results/spreadbench-0.3.7.tsv`, the farm
 being the Ubuntu 24.04 host and an 8-core host, 24 cores).  The
@@ -360,11 +370,12 @@ equals P.
 
 ## The cluster modes through a Redis client — the readings
 
-**The first row of that table is real Redis, not a perfcached mode.** The
-harness starts its own `redis:8` container (persistence off), measures
-it, stops it, and then brings up a three-node perfcached fleet for each
-mode.  8 workers a node, 20k keys x 200 B, 50 clients, median of 3 runs
-per cell, every cell sized to run for at least 10 seconds.
+**The Redis figures with each table are real Redis, not a perfcached
+mode.**  The harness starts its own `redis:8` container (persistence
+off), measures it, stops it, and then brings up a three-node perfcached
+fleet for each mode.  8 workers a node, 20k keys x 200 B, 50 clients,
+median of 3 runs per cell, every cell sized to run for at least 10
+seconds.
 
 **There are two client stories and they are not interchangeable.**  The
 RESP client *does not route* — it dials one node, so every key that does
@@ -422,12 +433,14 @@ not logged.
 
 ## The cluster-aware client — the readings
 
-**The mode a Redis client drives at x0.19 comes within 2% of store on
-both operations once the client can route.**  That is the whole result:
-shard was never the slow mode, it was the mode whose client could not
-compute an owner.  Proxy trails on SET, and since 2026-09-05 so does
-eager - it writes to every peer on the write path, which is why its SET
-is about half of store's while its GET is level with it.
+**The mode a Redis client drives at x0.19 came within 2% of store on
+both operations once the client could route** (build `76fc29b`, the
+run above; 0.4.0's run puts shard's SET within 5% of store's).  That
+is the whole result: shard was never the slow mode, it was the mode
+whose client could not compute an owner.  Proxy trails on SET, and
+since 2026-09-05 so does eager - it writes to every peer on the write
+path, which is why its SET is about half of store's while its GET is
+level with it.
 
 Two things to keep straight about that table.  The `vs redis` column
 compares a fleet-aware client against a single-node one, so it is a
@@ -510,7 +523,7 @@ everything and pulls nothing.  A node in the steady state never keeps
 what it pulls: reading 3,000 keys through it twice pulled 993 and then
 993 again.  So the five-mode table's figure is the one to size an
 un-routed spread client from, and the over-holding after a cold start
-is S156 in the ledger.
+is the spread-restart defect, fixed in 0.4.0 (above).
 
 ## If you are putting a Redis client in front of shard mode
 
@@ -619,7 +632,7 @@ one repetition: `results/rpscmp-08b8d57.tsv`.
 | 64 subs, 20k/s: p50 | 1.38-1.66 ms | 1.82-2.18 ms | 1.38-1.41 ms | 0.36-0.38 ms | 0.29 s at 7.3k/s |
 | 64 subs, flat out: deliveries/s | 3.49-3.70M | 3.39-4.05M | 4.77M | 12.9-13.0M | 439k |
 
-**Nothing was lost on the current build** - every message published
+**Nothing was lost on e9b7fdb** - every message published
 was read, in order, in every cell.  **The build before lost most of what
 it accepted:** a worker wrote each delivered message the moment it was
 staged, one write(2) a message, so the worker owning a subscriber
@@ -692,11 +705,13 @@ alternating runs of that cell alone: 889e0f6 lost datagrams in 1 of 3
 across both.  B is busy writing 260-275k packets a second in that cell
 and its relay receive threads lose the race now and then.
 
-**Through Noise, on the native door.**  `bench/psnoise.sh` runs the
-native door's JSON-RPC dialect (pre-0.4.5; removed in 0.4.5) through
-libperfd (`bench/psbench.c`) against one
+**Through Noise, on the native door.**  `bench/psnoise.sh` runs pub/sub
+on the native door through libperfd (`bench/psbench.c`) against one
 daemon, plaintext (`plaintext = loopback`) and sealed (`plaintext =
-never`), on one host.  Rows, two repetitions: `results/psnoise-7253754.tsv`.
+never`), on one host.  Rows, two repetitions:
+`results/psnoise-7253754.tsv`, taken over the native door's JSON-RPC
+dialect (pre-0.4.5; removed in 0.4.5) - the script now speaks binary
+frames.
 
 | cell | plaintext | Noise | Noise / plaintext |
 |---|---|---|---|
@@ -717,6 +732,29 @@ The same cells on 889e0f6, before notifications were built once per
 message, took 3.73-3.74 server cores for the same 1.28M plaintext
 deliveries a second - 2.90-2.93 now - and delivered 206-213k a second
 of 1 KB payloads to 8 subscribers, against 525-605k now.
+
+## TLS on the RESP door — the rig (0.7.5)
+
+GUIDE's TLS table has no harness script in `bench/`; the header of
+`results/tlsbench-0.7.5.tsv` records the rig.  One node (`c611430e`,
+OpenSSL 3.5.7) on NUMA node 0 of a bare-metal 2x E5-2690 v2, 4
+workers, no WAL, serving a plaintext RESP door and a TLS one from the
+same process; `redis-benchmark` 8.0.2 on another host of the same
+model over 10G at MTU 9000 with `--threads 8 -c 64 -d 32 -r 1000000`,
+3,000,000 requests a cell at depth 1 and 20,000,000 at depth 16, three
+reps.  Server CPU is the process's utime + stime over each cell.  The
+handshake rows are 8 `openssl s_time -new` clients for 10 s, twice for
+each certificate.  The two doors, on a build with TLS (`perfcached -V`
+prints `tls: OpenSSL ...`):
+
+    [listen]
+    resp = <server-ip>:6379
+    resp = <server-ip>:6380 tls
+    resp_allow = <client-ip>/32
+    tls_cert = /etc/perfcached/tls/cert.pem
+    tls_key = /etc/perfcached/tls/key.pem
+    [collection 0]
+    buckets_log2 = 17
 
 ## What bounds a loopback read
 

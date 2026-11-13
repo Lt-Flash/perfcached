@@ -1,23 +1,6 @@
 #!/bin/sh
-# hugetlbtest.sh — S94: a punched-out hugetlb page is re-committed only
-# once it is secured; an empty pool refuses the re-commit, it never
-# faults blind (that fault is a SIGBUS - the daemon used to DIE here).
-#
-# Needs a real hugetlb pool: /sys/kernel/mm/hugepages/hugepages-2048kB/
-# free_hugepages readable and holding enough pages for a small arena
-# plus a few, and the daemon must actually land on tier 1.  Anything
-# else SKIPS, loudly - a container with no pool proves nothing either
-# way and must not read as green.
-#
-#  1. a tier-1 node fills its reservation, drains, and punches groups
-#     out (cold_bytes > 0; the pool's free count rises)
-#  2. the pool is drained FROM OUTSIDE (a holder mmaps every free page)
-#  3. the node is written to again: it must stay ALIVE, serve the writes
-#     from the 4K overflow or refuse them at the ceiling, and count the
-#     refused re-commits in stats.memory.pool_empty
-#  4. the holder lets go; the node serves again and is still alive
-# Before the fix step 3 killed the process (SIGBUS on the re-fault).
-# Usage: test/hugetlbtest.sh [./perfcached]
+# hugetlbtest.sh - with the hugetlb pool drained from outside, a punched-out page is not re-faulted (SIGBUS):
+# the node lives and counts pool_empty.  Needs a real pool, else SKIP.  Usage: test/hugetlbtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -25,10 +8,8 @@ SEC=htlb-client-secret
 SYS=/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages
 D=$(mktemp -d /var/tmp/pchl.XXXXXX)
 HOLDER=
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line; the
+# name-bound pattern is a fallback
 PIDS=""
 trap '[ -n "$HOLDER" ] && kill -9 $HOLDER 2>/dev/null; for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on

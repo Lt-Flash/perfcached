@@ -1,22 +1,6 @@
 #!/bin/sh
-# shrinktest.sh - S150 step D: a table that sits below shrink_at_pct of
-# its slot capacity past the cool-off is resized down - to the size
-# midway between the two thresholds, never below one segment - and the
-# old index goes back to the arena (B, C): retired, then punched out.
-#
-# Two collections: "0" at 2^18 with 100,000 keys (6% of its slots: it
-# shrinks to 2^16, the size where 100,000 keys sit at 25%, between the
-# 18% and 75% thresholds, so nothing fires again); "floor" at 2^14 with
-# nothing in it (it shrinks to 2^12, one segment, and stops there).
-# The cool-off (8 s) outlasts the fill, so the first decision sees the
-# full table - shorter, and an empty configured table shrinks before its
-# data arrives, which is the point of the 60 s default.
-# Both old indexes retire and their slots are punched; a create then
-# takes the punched slots back and the process RSS rises by what came
-# back - the exact RSS isolation of the punch itself is regiontest's.
-#
-# Fail-first: the tree before D refuses the config (no such knobs), and
-# with the knobs removed nothing ever shrinks.
+# shrinktest.sh - a table below shrink_at_pct past the cool-off is resized down (midway between the
+# thresholds, never below one segment) and its old index retired and punched back to the arena.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

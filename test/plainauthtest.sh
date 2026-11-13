@@ -1,18 +1,6 @@
 #!/bin/sh
-# plainauthtest.sh - S468 A: the native door authenticates with the Noise
-# handshake and, by default ([listen] encrypt = no), carries the requests in
-# the clear: libperfd asks in msg1, the node grants it in msg2, the client's
-# first record (the switch) proves it holds the session keys.
-#   1. with the right secret (perfcli blocking, natbench async): requests
-#      flow, no record is opened past the switch, the connections are counted
-#      plaintext, and the start says the door is readable on the network;
-#   2. a wrong secret is refused as before, and said;
-#   3. a client that does not ask (NB_ENCRYPT) is served encrypted there;
-#   4. a listener with encrypt=yes grants nothing: the same clients are
-#      served encrypted (perfcli and natbench alike);
-#   5. enable over the plaintext connection is refused - the privilege
-#      secret never crosses in the clear - and served over --encrypt.
-# usage: test/plainauthtest.sh [./perfcached] [./perfcli] [./natbench]
+# plainauthtest.sh - the native door authenticates with Noise, then by default speaks plaintext unless encrypt=yes
+# or the client does not ask.  usage: test/plainauthtest.sh [./perfcached] [./perfcli] [./natbench]
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -59,8 +47,8 @@ while [ $k -lt 100 ]; do
 done
 grep -q "perfcached ready" "$D/n.log" || { echo "plainauthtest: the node did not start"; tail -3 "$D/n.log"; exit 1; }
 
-# conns refused records requests: the door totals widen once a second.  Over
-# HTTP - a native connection to ask would count in the figures it reads
+# conns refused records requests: the door totals widen once a second.  Over HTTP: a native
+# connection would count in the figures it reads
 door() {
 	sleep 1.5
 	curl -s -m 5 "http://127.0.0.1:$HPORT/stats" |

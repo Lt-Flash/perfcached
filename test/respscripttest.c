@@ -1,24 +1,5 @@
-/* respscripttest.c - EVAL / EVALSHA / SCRIPT on the RESP door
- * (respscript.c; the 0.7.2 split, wave 1): the lock core (op_slock) is
- * stubbed, SHA1 is the real one, and two of Symfony's own script bodies
- * (test/symfony_lock.py) are sent as a client sends them.
- *
- *   A  EVAL of an approved body runs its script as C - PROBE, RELEASE with
- *      its token - Lua true as :1, false as nil, the key noted; any other
- *      body refused by name
- *   B  EVALSHA by name, upper case too: SAVE takes the token and the ttl
- *      and the clock; the _argv variants take "now" from ARGV[1] (seconds,
- *      floored to ms); EXISTS reads no ttl; ARGV[1] that is not a time and
- *      a ttl that is not whole milliseconds refused; an unknown name is
- *      Redis's NOSCRIPT
- *   C  the arguments: numkeys not a number or past the arguments, other
- *      than 1, too few ARGV, no key, the key too long, the arity
- *   D  every answer of the lock core: busy, the version gate (the node
- *      named), the collection mode, WRONGTYPE, TRYAGAIN, forward failed,
- *      a write refusal, a token too long, anything else
- *   E  SCRIPT LOAD answers an approved body's SHA and refuses any other;
- *      EXISTS per name; FLUSH OK; anything else refused
- */
+/* respscripttest.c - EVAL, EVALSHA and SCRIPT on the RESP door (respscript.c): lock core stubbed,
+ * SHA1 real, and two of Symfony's own script bodies sent as a client sends them. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -138,7 +119,7 @@ int main(void)
 {
 	static char longkey[KEY_MAX + 2];
 
-	/* A */
+	/* A: EVAL of an approved body runs it as C - true as :1, false as nil; others refused */
 	core(PC_OP_OK, 1, 0);
 	RUN(rh_eval, "EVAL", probe_body, "1", "lk");
 	CHK(is(":1\r\n") && got.script == PC_SLOCK_PROBE && got.now_arg == -1 &&
@@ -152,7 +133,7 @@ int main(void)
 	CHK(is("-ERR script not approved on this server: perfcached runs only the "
 		"Symfony Lock scripts it knows\r\n") && got.calls == 0, "A: any other body refused by name");
 
-	/* B */
+	/* B: EVALSHA by name - SAVE, the _argv variants' "now", EXISTS, bad times, NOSCRIPT */
 	core(PC_OP_OK, 1, 0);
 	RUN(rh_eval, "EVALSHA", SHA_SAVE, "1", "lk", "1700000000.5", "tok", "30000");
 	CHK(is(":1\r\n") && got.script == PC_SLOCK_SAVE && !strcmp(got.tok, "tok") &&
@@ -175,7 +156,7 @@ int main(void)
 	RUN(rh_eval, "EVALSHA", "0000000000000000000000000000000000000000", "1", "lk");
 	CHK(is("-NOSCRIPT No matching script. Please use EVAL.\r\n"), "B: an unknown name - NOSCRIPT");
 
-	/* C */
+	/* C: the arguments - numkeys bad or not 1, too few ARGV, no key, a long key, the arity */
 	RUN(rh_eval, "EVALSHA", SHA_PROBE, "x", "lk");
 	CHK(is("-ERR Number of keys can't be greater than number of args\r\n"), "C: numkeys not a number");
 	RUN(rh_eval, "EVALSHA", SHA_PROBE, "2", "lk");
@@ -194,7 +175,7 @@ int main(void)
 	RUN(rh_eval, "EVALSHA", SHA_PROBE);
 	CHK(is("-ERR wrong number of arguments for 'evalsha' command\r\n"), "C: EVALSHA's");
 
-	/* D */
+	/* D: every answer of the lock core, from busy and the version gate to a refusal */
 	core(PC_OP_PARKED, 0, 0);
 	RUN(rh_eval, "EVALSHA", SHA_PROBE, "1", "lk");
 	CHK(is("-ERR busy\r\n"), "D: parked - the fallback");
@@ -225,7 +206,7 @@ int main(void)
 	RUN(rh_eval, "EVALSHA", SHA_PROBE, "1", "lk");
 	CHK(is("-ERR lock script failed\r\n"), "D: anything else");
 
-	/* E */
+	/* E: SCRIPT LOAD answers an approved body's SHA only; EXISTS; FLUSH OK; else refused */
 	RUN(rh_script, "SCRIPT", "LOAD", probe_body);
 	CHK(is("$40\r\n" SHA_PROBE "\r\n"), "E: SCRIPT LOAD of PROBE - its SHA");
 	RUN(rh_script, "SCRIPT", "load", "return 1");

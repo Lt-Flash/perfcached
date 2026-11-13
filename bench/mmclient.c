@@ -1,32 +1,5 @@
-/*
- * mmclient.c — the mode matrix driven by a REAL client.
- *
- * pcbench speaks the wire directly from one connection, which measures
- * the daemon's pipelined ceiling but not what an application sees: it
- * cannot fail over, and it cannot route a key to its owner, so on
- * shard it pays a forward on most operations.  This drives the
- * same work through libperfd, so the matrix can show both the dumb and
- * the cluster-aware answer for every mode.
- *
- * One operation at a time, deliberately: an application's latency is
- * per request, and a pipelined number hides exactly the round trip
- * this is meant to expose.
- *
- * usage: mmclient <host> <port> <secret> <col> <keys> <valsize>
- *                 <getpct> <route 0|1> [ignored] [nofill 0|1]
- * prints: fill=<ops/s> mix=<ops/s> p50=<us> p99=<us> missed=<n>
- *
- * nofill skips the write phase and reads a keyspace someone else
- * filled.  Keys are named from the index alone, so a fill through one
- * node and a read through another address exactly the same records -
- * which is the only way to measure what a read costs on a node that
- * did NOT write the data.
- *
- * The ninth argument was the wire (binary 0|1) while the daemon had
- * two dialects; since S317 the data verbs ride their fixed-layout
- * frames and nothing else, so it is accepted and ignored - the slot
- * stays only so bench/modematrix.sh's argument order holds.
- */
+/* mmclient.c - the mode matrix driven through libperfd, one operation at a time: a pipelined
+ * number hides the round trip.  Keys come from the index, so nofill reads another node's fill. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,6 +65,7 @@ int main(int argc, char **argv)
 	vlen = atoi(argv[6]);
 	getpct = atoi(argv[7]);
 	route = atoi(argv[8]);
+	/* argv[9] is ignored; it keeps bench/modematrix.sh's argument order */
 	nofill = argc > 10 ? atoi(argv[10]) : 0;
 	sec[0] = argv[3];
 	sec[1] = NULL;

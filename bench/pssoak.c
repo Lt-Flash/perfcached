@@ -1,25 +1,5 @@
-/*
- * pssoak.c - a pub/sub soak driver: publishers, subscribers (exact,
- * pattern, UDP push) and churn over libperfd async handles, each surviving
- * its node's restart by reconnecting and subscribing again, each printing
- * its counters every 10 s so a run can be read as a time series.
- *
- *   pssoak pub   <host> <port> <secret|-> <id> <secs> <rate> <conns>
- *   pssoak sub   <host> <port> <secret|-> <id> <secs> <a|b> <exact|pattern|udp> <conns>
- *   pssoak churn <host> <port> <secret|-> <id> <secs> <ops/s>
- *
- * CHANNELS.  A publisher cycles k = 0..99 and publishes, per step,
- * soak.a.<k>, soak.b.<k>, soak.none.<k % 10> and churn.<k % 50>; its
- * payload is "P<id>.<conn>:<seq>" with seq counted per (publisher
- * connection, channel), so a subscriber can tell a gap from a reorder.
- * Subscribers of node a hold soak.a.*: exact = soak.a.0-9, pattern =
- * soak.a.*, udp = soak.a.10-19 over UDP pushes; gaps are tracked per
- * subscriber connection.  Nobody holds soak.none.*; churn subscribes
- * churn.k and drops churn.k+25 in turn, holding about 25.
- *
- * STATUS LINE, every 10 s and at the end:
- *   T <unix ms> <role> <id> key=value ...
- */
+/* pssoak.c - pub/sub soak: pssoak pub|sub|churn <host> <port> <secret|-> <id> <secs>, then pub
+ * <rate> <conns> | sub <a|b> <exact|pattern|udp> <conns> | churn <ops/s>; status every 10 s */
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -68,7 +48,6 @@ struct conn {
 	int churn_i;
 };
 
-/* counters */
 static unsigned long long c_pub_ok, c_pub_err, c_recv, c_gaps, c_reorder,
 	c_reconnects, c_prunes, c_udp_fail, c_sub_err, c_churn_ops;
 /* UDP figures of handles already dropped: a handle's own start at zero */

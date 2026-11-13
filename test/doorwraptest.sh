@@ -1,22 +1,6 @@
 #!/bin/sh
-# doorwraptest.sh - S360: a door total that wraps its 32 bits keeps
-# counting up.  The per-door connection and request totals are 32-bit
-# relaxed atomics (no cross-thread 64-bit atomics), and at a few thousand
-# requests a second one passes 4,294,967,295 in days; /stats then showed
-# its since-reset figure as cur - base: negative, printed as ~1.8e19.
-# They are widened to 64 bits on the read side now.
-#   - PERFCACHED_TEST_DOOR_START starts every door counter 1,000 below the
-#     wrap (the daemon logs that it did)
-#   - 500 RESP requests, a reset (the page's), 1,000 more: the RESP door's
-#     requests cross the wrap and read 1,000 since the reset
-#   - 1,500 requests on the native door (RESP dialect) cross it from the
-#     start: they read 1,500
-#   - every figure stays put across the maintenance thread's fold, and no
-#     total or 5-minute window reads negative or past 2^32
-# Fail-first: 0.5.6.3 has no PERFCACHED_TEST_DOOR_START.  The bug itself,
-# shown on 0.5.6.3 with gdb setting pc_resp_reqs 1,000 below the wrap:
-# 1,500 requests after a reset read -4294965796.
-# Usage: test/doorwraptest.sh [./perfcached]
+# doorwraptest.sh - a door total that wraps its 32 bits keeps counting up: since-reset figures,
+# the maintenance fold and 5-minute windows never read negative or past 2^32.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcdoorwrap.XXXXXX); P1=
@@ -71,8 +55,7 @@ pings(19491, 1500)                     # the native door's RESP dialect, from 1,
 time.sleep(0.3)
 st = stats()
 rq, nq = st["resp"]["requests"], st["native"]["resp"]["requests"]
-# 1001: the CONFIG RESETSTAT that reset the totals is itself counted after them (S407 part 3: it
-# replaced the HTTP POST, which the RESP door never counted)
+# 1001: the CONFIG RESETSTAT that reset the totals is itself counted after them
 check(rq == 1001, "the RESP door's requests crossed the wrap and read 1001 since the reset - the 1,000 pings and the reset's own request (%s)" % rq)
 check(nq == 1500, "the native door's RESP requests crossed it and read 1500 since the reset (%s)" % nq)
 check(sane(st["resp"]["conns"]) and sane(st["native"]["resp"]["conns"]),
@@ -84,6 +67,7 @@ st2 = stats()
 check(st2["resp"]["requests"] == 1001 and st2["native"]["resp"]["requests"] == 1500,
       "the figures stay put across the maintenance thread's fold (%s, %s)" % (st2["resp"]["requests"], st2["native"]["resp"]["requests"]))
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

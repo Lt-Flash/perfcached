@@ -1,44 +1,6 @@
 #!/bin/sh
-# idsrctest.sh - S143: [cluster] identity_source names ONE source and
-# refuses to start without it.
-#
-# A pod has no DMI uuid and no stable MAC, so the cascade fell through to
-# the identity file - which a cloned image or restored volume carries -
-# and a clone joined as the same member.  identity_source = env reads
-# $PERFCACHED_PLATFORM_KEY (a Deployment sets it to metadata.uid through
-# the downward API: a rescheduled pod is a NEW member); file uses the
-# identity file alone (a StatefulSet's PVC keeps it).
-#   1  env, key A: the node starts; restarted with key A it is the same
-#      identity, with key B a different one - even with the same state
-#      directory (the platform key is the authority, the file a cache)
-#   2  env with the variable unset: the start is REFUSED, and says why
-#   3  file: the identity survives a restart from the file, and the
-#      variable is ignored
-# S326 - a Proxmox VM's node was minted at random while its DMI uuid and
-# its MAC sat there, unique (auto derived only with a site_salt, and the
-# shipped unit's non-root daemon cannot read the 0400 uuid):
-#   4  auto, no site_salt: derived (v8) from the platform, the same across
-#      a restart; another state directory on the machine, another member
-#      (each mints its own node-salt); the SAME state directory moved to
-#      another path keeps its identity (the salt moves with it)
-#   5  a MINTED (v7) identity already on disk is kept under auto - an
-#      upgrade must not make the node a new member - and the log says the
-#      platform is there and how to switch
-#   6  identity_source = dmi as a non-root user, /sys closed to it: the
-#      copy in $RUNTIME_DIRECTORY (the unit's ExecStartPre) is read
-#   7  inside a container (container=docker) auto does not take the DMI
-#      uuid - it is the host's - and says so
-#   8  a LEGACY sixteen-byte identity whose version nibble reads 8 is kept
-#      under auto - no node salt beside it, so this scheme did not derive
-#      it - and no salt is minted, so the next start keeps it again
-#   9  an identity derived under a site_salt that is then removed is kept
-#      the same way
-# 4, 5, 7, 8 and 9 need a platform id this process can see; they say so
-# and skip where there is none.  FAIL-FIRST: before S326 auto derives
-# nothing without a salt (4, 5), dmi cannot read the copy (6), and the
-# container is not noticed (7); 331cde9 (v0.5.1's first cut) kept only a
-# v7 identity, so it re-derives 8 and 9.
-# Usage: test/idsrctest.sh [./perfcached]
+# idsrctest.sh - [cluster] identity_source: env/file/dmi name one source and refuse to start without
+# it; auto derives from the platform yet keeps an identity already on disk.  Usage: test/idsrctest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcids.XXXXXX)
@@ -122,8 +84,8 @@ F1=$(run pod-uid-cccc); F2=$(run pod-uid-dddd)
 [ -n "$F1" ] && [ "$F1" != REFUSED ] && [ "$F1" = "$F2" ] && ok "the file's identity survives a restart, whatever the variable says ($F1)" \
 	|| bad "file mode gave '$F1' then '$F2'"
 
-# what the daemon's auto cascade can see from here: a DMI uuid outside a
-# container, else a non-loopback MAC (S326)
+# what the daemon's auto cascade can see from here: a DMI uuid outside a container, else a
+# non-loopback MAC
 in_ctr() { [ -n "${container:-}" ] || [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -s /run/systemd/container ]; }
 dmi_ok() { ! in_ctr && [ -r /sys/class/dmi/id/product_uuid ] && [ -n "$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)" ]; }
 mac_ok() { for i in /sys/class/net/*; do [ "${i##*/}" = lo ] && continue
@@ -173,9 +135,8 @@ RUNAS=
 if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null 2>&1; then
 	RUNAS="setpriv --reuid=65534 --regid=65534 --clear-groups"
 fi
-# the premise: /sys is CLOSED to the daemon's user (the daemon reads /sys
-# first and the copy only when it cannot).  A CI runner whose image leaves
-# product_uuid world-readable would derive from the real uuid both times.
+# the premise: /sys is closed to the daemon's user (it reads the copy only when /sys fails); a
+# runner with a world-readable product_uuid would derive from the real uuid both times
 sys_open() { if [ -n "$RUNAS" ]; then $RUNAS sh -c 'cat /sys/class/dmi/id/product_uuid' >/dev/null 2>&1
 	else cat /sys/class/dmi/id/product_uuid >/dev/null 2>&1; fi; }
 if { [ "$(id -u)" != 0 ] || [ -n "$RUNAS" ]; } && sys_open; then
@@ -214,11 +175,8 @@ else
 fi
 
 echo "--- 8: a legacy sixteen-byte identity, version nibble 8, then auto (S326)"
-# The legacy form is sixteen random bytes: its version nibble is anything,
-# so "keep it only if it is v7" re-derived it fifteen times in sixteen -
-# the node a new member on upgrade (statedirtest case 7, red on GitHub
-# for v0.5.1).  What marks an identity THIS scheme derived is the node
-# salt beside it; with none, the identity came from before and is kept.
+# a legacy identity is sixteen random bytes, any version nibble: what marks one this scheme derived
+# is the node salt beside it, so with none it is kept
 if plat_ok; then
 	rm -rf "$D/state"; conf auto
 	printf '\021\042\063\104\125\146\212\273\314\335\356\377\001\002\003\004' > "$D/state/node-identity"

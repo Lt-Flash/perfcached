@@ -1,15 +1,6 @@
 #!/bin/sh
-# unknownfleettest.sh - S165: the unknown-command list is the FLEET's.
-# Three eager members.  An unknown CMD method (a native-door request,
-# through test/pcnative.py) sent twice to node 1 and once to node 2
-# appears on node 3's /stats as one row counted 3, with
-# node 3's own share 0 and each sender's share on its own page; every
-# node reports every member; the row names the member that saw it last.
-# Node 2 then dies: its share leaves node 3's list with it, and the
-# member count falls to 2.
-# Fail-first: v0.4.0-rc5 has no `unknown_commands` in /stats, and a build
-# without the M_UNKCMD exchange shows node 3 a list of its own only.
-# Usage: test/unknownfleettest.sh [./perfcached]
+# unknownfleettest.sh - the unknown-command list is the FLEET's: one row per command with each
+# member's share, every member reported, and a dead member's share leaving with it.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -116,6 +107,7 @@ check(wait(lambda: unk(5).get("members") == 2 and row(5).get("count") == 2, 30),
       "after node 4 dies node 5 shows 2 members and a count of 2 (%r, %r)" % (unk(5).get("members"), row(5).get("count")))
 check(row(5).get("here") == 0 and row(3).get("here") == 2, "the survivors' shares are unchanged")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"

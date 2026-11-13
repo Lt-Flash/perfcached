@@ -1,29 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clmesh.h - S36: `[cluster] discovery = unicast` - who the control
- * frames go to when there is no multicast group.
- *
- * AWS, GCP and Azure VPCs (and most Kubernetes pod networks) carry no
- * multicast.  Seven sends in cluster.c went to the group - every
- * node's ALIVE, the master's MASTER_ALIVE, a join request with no
- * target, the published map, GOODBYE and the beat watchdog's re-sends;
- * every data plane was already unicast to the live peers.  In unicast
- * mode those seven go, one sealed copy each, to the TARGET SET:
- *   - the seeds: `seeds = host[:port], ...`, DNS names re-resolved by a
- *     thread of their own every CLMESH_RESOLVE_MS and whenever asked
- *     (an instance replaced in a cloud comes back at a new address; a
- *     resolver that blocks for seconds must not stall the beat), and
- *   - every address this node has KNOWN - heard from (any admitted
- *     datagram), told about (a peer hint), or named by an adopted map -
- *     kept CLMESH_KNOWN_MS after it was last refreshed, so a member
- *     that went quiet is still beaten at while it may come back.
- * minus this node itself.  O(N^2) beats across the fleet - the stated
- * limit of the mesh (DESIGN 12hx); S304 is the scale step.
- *
- * Thread-safe: the cluster thread, the beat watchdog and the resolver
- * all touch it; one mutex, held for copies only.
- */
+/* clmesh.h - unicast discovery: control frames go to the seeds (re-resolved by a thread of their
+ * own) plus every recently known address, minus self.  Any thread; one mutex, held for copies. */
 #ifndef PC_CLMESH_H
 #define PC_CLMESH_H
 
@@ -34,16 +12,12 @@
 #define CLMESH_MAX_KNOWN   1024
 #define CLMESH_RESOLVE_MS  5000
 #define CLMESH_KNOWN_MS    (10 * 60 * 1000)
-/* CH-14: an address heard only from a JOIN_REQ, a hint or a beacon not
- * yet confirmed is kept this long; one an admitted node's ALIVE, map or
- * beacon - or the master's map or ASSIGN - names is kept CLMESH_KNOWN_MS.
- * A joiner re-announces every second, so a real one never lapses; a
- * replayed JOIN_REQ no longer buys ten minutes of beats */
+/* an address heard only from a JOIN_REQ, a hint or an unconfirmed beacon is kept this long: a
+ * real joiner re-announces every second, a replayed JOIN_REQ must not buy CLMESH_KNOWN_MS */
 #define CLMESH_TRIAL_MS    (30 * 1000)
 
-/* parse `seeds` (comma/space separated host[:port]; a missing port is
- * @default_port, the cluster port) and start the resolver thread.
- * -1 on a malformed list (logged). */
+/* parse `seeds` (comma/space separated host[:port], the port defaulting to @default_port) and
+ * start the resolver thread; -1 on a malformed list (logged) */
 int clmesh_start(const char *seeds, int default_port);
 /* ask the resolver to run now (a join retry) - never blocks */
 void clmesh_resolve_soon(void);

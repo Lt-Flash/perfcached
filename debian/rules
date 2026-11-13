@@ -1,34 +1,15 @@
 #!/usr/bin/make -f
-# perfcached — Debian packaging (S64).
-#
-# The tree already installs FHS-correctly, so dh_auto_install just calls
-# it.  ONE thing is then undone deliberately: the Makefile puts the unit
-# in /etc/systemd/system, which is right for `make install` on a host
-# and wrong for a package - policy wants /usr/lib/systemd/system, and
-# dh_installsystemd places it there from debian/perfcached.service.
-#
-# The alternative - teaching the Makefile a "packaging mode" - puts
-# Debian policy inside a portable build system, where the next distro's
-# rules would fight it.
-#
-# The sysusers file is NOT removed: dh_installsysusers is not in the
-# compat-13 sequence, and the Makefile already installs it to the
-# policy-correct /usr/lib/sysusers.d/perfcached.conf.  debian/postinst
-# runs systemd-sysusers so the account exists at install time rather
-# than at next boot - the unit is User=perfcached and would otherwise
-# fail with a message pointing at systemd instead of at the cause.
-#
-# PC_BUILD_REV: the build happens without .git, so the Makefile's
-# `git rev-parse` yields "unknown" and a released binary cannot say what
-# it is.  Default it to the Debian version, which IS traceable; a driver
-# that knows the git revision can export PC_BUILD_REV and win.
+# perfcached Debian packaging: dh_auto_install runs the tree's own FHS install; the units come from
+# debian/ (policy's /usr/lib/systemd/system), not the Makefile's /etc/systemd/system.
+
+# the build has no .git, so the revision defaults to the Debian version (traceable); a driver that
+# knows the git revision exports PC_BUILD_REV
 PC_BUILD_REV ?= $(shell dpkg-parsechangelog -SVersion 2>/dev/null || echo unknown)
 export PC_BUILD_REV
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
-# S352 (0.5.9): the packages send alert mail - curl's SMTP client, for
-# every make below (the Makefile's PC_MAIL ?= none yields to it); libcurl
-# reaches the binary packages' Depends through ${shlibs:Depends}
+# the packages send alert mail through curl's SMTP client (the Makefile's PC_MAIL ?= none yields to
+# this); libcurl reaches Depends through ${shlibs:Depends}
 export PC_MAIL = libcurl
 
 %:
@@ -37,23 +18,16 @@ export PC_MAIL = libcurl
 override_dh_auto_build:
 	dh_auto_build -- PC_BUILD_REV=$(PC_BUILD_REV) PC_DASH=yes perfcached perfcli perfdump perfload perfcached-dashboard libperfd.a libperfd.so
 
-# Two binary packages from one tree: perfcached (the clustered edition,
-# built by dh_auto_build and tested by dh_auto_test) is installed first;
-# then the tree is cleaned and built again as the standalone edition for
-# perfcached-standalone.  The edition is a compile-time choice (cluster
-# code linked or not, -DPC_EDITION_STANDALONE), and make tracks neither,
-# so the clean between the two is what keeps a clustered object out of
-# the standalone binary.  The standalone build goes through dh_auto_build
-# too, so it gets the same hardening flags.
+# two binary packages from one tree: the clustered edition first, then a clean and a standalone
+# build (-DPC_EDITION_STANDALONE) - make tracks neither, so the clean keeps cluster objects out
 override_dh_auto_install:
 	$(MAKE) install DESTDIR=$(CURDIR)/debian/perfcached PREFIX=/usr \
 		PC_BUILD_REV=$(PC_BUILD_REV) PC_DASH=yes
-	# PD-9: the daemon reads this to know it is a package install
+	# the daemon reads this to know it is a package install
 	mkdir -p debian/perfcached/usr/share/perfcached
 	echo package > debian/perfcached/usr/share/perfcached/INSTALL-MODE
-	# 12no (0.6.6): the dashboard is its own package - the Makefile put
-	# it into the clustered tree; its unit comes from debian/ like the
-	# daemon's (dh_installsystemd, disabled)
+	# the dashboard is its own package - the Makefile put it into the clustered tree; its unit comes
+	# from debian/ like the daemon's (dh_installsystemd, disabled)
 	mkdir -p debian/perfcached-dashboard/usr/bin \
 		debian/perfcached-dashboard/etc/perfcached \
 		debian/perfcached-dashboard/usr/lib/sysusers.d
@@ -73,17 +47,8 @@ override_dh_auto_install:
 		PC_BUILD_REV=$(PC_BUILD_REV)
 	mkdir -p debian/perfcached-standalone/usr/share/perfcached
 	echo package > debian/perfcached-standalone/usr/share/perfcached/INSTALL-MODE
-	# The units come from debian/ (dh_installsystemd), not from the
-	# Makefile's /etc/systemd/system.  Each is a copy of contrib/'s with
-	# the package's prefix: the binary it starts must be one the package
-	# installs - 0.4.0's first debs shipped /usr/local/bin and never
-	# started.
-	# S370 (0.5.8): the client library is its own packages.  Taken from
-	# the clustered install (the library is not edition-specific): the
-	# .so.N and .so.VERSION into libperfd0; the header, the archive, the
-	# development link and the .pc into libperfd-dev.  Neither daemon
-	# package carries any of it any more (libperfd-dev Replaces/Breaks
-	# the older ones that did).
+	# each unit is contrib/'s with the package's prefix (it must start a binary the package installs);
+	# the client library goes to libperfd0 (.so.N) and libperfd-dev (header, archive, link, .pc)
 	mkdir -p debian/libperfd0/usr/lib debian/libperfd-dev/usr/lib \
 		debian/libperfd-dev/usr/include
 	mv debian/perfcached/usr/lib/libperfd.so.* debian/libperfd0/usr/lib/
@@ -94,10 +59,8 @@ override_dh_auto_install:
 	rm -rf debian/perfcached-standalone/usr/lib/libperfd.* \
 		debian/perfcached-standalone/usr/lib/pkgconfig \
 		debian/perfcached-standalone/usr/include
-	# UP5: the upgrade helper drives the /opt prefix layout of the release
-	# tarballs (a link switched between prefixes); a package is upgraded by
-	# the package manager, so neither package carries the helper, its units
-	# or its example settings.
+	# the upgrade helper drives the release tarballs' /opt prefix layout; a package is upgraded by the
+	# package manager, so neither package carries the helper, its units or its example settings
 	for p in perfcached perfcached-standalone; do \
 		rm -f $(CURDIR)/debian/$$p/usr/sbin/perfcached-upgrade \
 			$(CURDIR)/debian/$$p/etc/systemd/system/perfcached-upgrade.path \
@@ -114,7 +77,7 @@ override_dh_auto_install:
 			{ echo "$$u starts $$bin, which $$p does not install" >&2; exit 1; }; \
 	done
 
-# S370: the library's shlibs - a program built against libperfd0 depends on
+# the library's shlibs - a program built against libperfd0 depends on
 # at least the version that built it
 override_dh_makeshlibs:
 	dh_makeshlibs -plibperfd0 -V 'libperfd0 (>= 0.5.9~)'
@@ -122,19 +85,15 @@ override_dh_makeshlibs:
 # perfcached-standalone's unit is perfcached.service too: the same name
 # for the same daemon, whichever edition is installed
 override_dh_installsystemd:
-	# PD-10 (DESIGN 12nr): a clustered cache is restarted members first,
-	# the master last, with a gate between - never by three `apt upgrade`
-	# runs at once.  The daemon packages leave the running build in place;
-	# the postinst says so.  The dashboard is stateless and keeps the
-	# automatic restart.
-	dh_installsystemd -pperfcached --no-restart-after-upgrade
-	dh_installsystemd -pperfcached-standalone --name=perfcached --no-restart-after-upgrade
-	# 12no: shipped disabled - one enabled node shows the whole fleet
-	dh_installsystemd -pperfcached-dashboard --no-enable --no-start
+	# a fleet restarts members first and the master last, never by apt:
+	# an upgrade leaves the running daemon (and dashboard) as it is
+	dh_installsystemd -pperfcached --no-stop-on-upgrade
+	dh_installsystemd -pperfcached-standalone --name=perfcached --no-stop-on-upgrade
+	# shipped disabled: one enabled node shows the whole fleet
+	dh_installsystemd -pperfcached-dashboard --no-enable --no-start --no-stop-on-upgrade
 
-# The suite starts real daemons, binds ports and wants privileges no
-# buildd grants.  Gate the build on the smoke tests instead - the same
-# three matrix.sh trusts, including the canary that MUST fail.
+# the suite starts real daemons and wants privileges no buildd grants: gate on the smoke tests
+# matrix.sh trusts instead, including the canary that MUST fail
 override_dh_auto_test:
 	$(MAKE) selftest selftest_broken noisetest
 	./noisetest

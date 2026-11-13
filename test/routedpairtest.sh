@@ -1,16 +1,6 @@
 #!/bin/sh
-# routedpairtest.sh - S211: the delete behind a routed jset takes the
-# same road as the jset.
-#
-# A three-node eager fleet and the routing client (routedpairtest.c):
-# with per-key routing on, a jset went to the key's owner over its own
-# link while the jdel behind it went over the primary link, where the
-# owner's push had not landed yet - the delete removed nothing and the
-# document then arrived on every member.  The C program proves the pair
-# on every member through per-node handles; this driver only brings the
-# fleet up and counts.  Before the fix it fails the two routed legs and
-# passes the routing-off pair and the positive control.
-# Usage: test/routedpairtest.sh [./perfcached] [./routedpairtest]
+# routedpairtest.sh - the delete behind a routed jset takes the same road as the jset, so it cannot
+# overtake the owner's push (routedpairtest.c proves the pair; this brings up the fleet).
 set -u
 BIN=${1:-./perfcached}
 RT=${2:-./routedpairtest}
@@ -57,10 +47,8 @@ start() {
 peers_up() { printf '%s\n' '{"method":"stats"}' | timeout 30 ./perfcli -h 127.0.53.$1 -p 1806$1 -a $SEC -q 2>/dev/null | head -1 | python3 -c 'import json,sys
 try: print((json.load(sys.stdin).get("cluster") or {}).get("peers_up", -1))
 except Exception: print(-1)'; }
-# READY, not only peered: a node that joined holding nothing reports
-# recovering for its first ~2 s (the bootstrap check), and a probe sent then is
-# told "node is not READY (recovering)" - GitLab 110112 deltombtest, GitHub
-# 38000859316 routedpairtest: both read as the fleet misbehaving
+# READY, not only peered: a node that joined holding nothing reports recovering for its first
+# ~2 s, and a probe sent then is told "node is not READY (recovering)"
 upready() { printf '%s\n' '{"method":"stats"}' | timeout 30 ./perfcli -h 127.0.53.$1 -p 1806$1 -a $SEC -q 2>/dev/null | head -1 | python3 -c 'import json,sys
 try: r = json.load(sys.stdin); print("%s:%s" % ((r.get("cluster") or {}).get("peers_up", -1), r.get("state")))
 except Exception: print(-1)'; }
@@ -98,9 +86,8 @@ pass=$((pass + N_OK)); fail=$((fail + N_BAD))
 # a client that died before its summary is a failure, not a clean count
 grep -q "^routedpairtest: " "$D/rt.out" || { bad "the client did not finish (exit $RTRC): $(tail -2 "$D/rt.out" | tr '\n' ' ')"; }
 
-# on a failure, what the three nodes' cluster planes did - the probes' "not
-# READY (recovering)" (GitLab 110102, GitHub 38000859316) is a node that
-# rejoined holding nothing, and only the node logs say why it rejoined
+# on a failure, what the three nodes' cluster planes did: a "not READY (recovering)" probe is a
+# node that rejoined holding nothing, and only the node logs say why
 if [ $fail -gt 0 ]; then
 	for i in 1 2 3; do
 		echo "  --- n$i: cluster / state lines"

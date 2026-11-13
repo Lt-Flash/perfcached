@@ -1,6 +1,4 @@
-/*
- * clorder.c - S461: the set and delete apply paths of a replicated key.
- */
+/* clorder.c - the set and delete apply paths of a replicated key. */
 #include "clorder.h"
 
 void (*clorder_test_hook)(int side, const str *k);
@@ -16,7 +14,8 @@ int clorder_set(pcache_htable_t *ht, const str *k, const str *v,
 		return CLORDER_REFUSED;
 	if (clorder_test_hook)
 		clorder_test_hook(CLORDER_SET, k);
-	rc = pcache_ht_store_ver(ht, k, v, exp, fl, ver);
+	rc = ((fl & PCACHE_F_PASSIVE) ? pcache_ht_store_peer : pcache_ht_store_ver)(ht, k, v,
+		exp, fl, ver);            /* an eager replica: ties broken */
 	if (rc)
 		return rc;
 	/* a delete planted after the check removed nothing yet */

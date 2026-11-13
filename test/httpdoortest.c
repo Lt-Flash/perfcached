@@ -1,30 +1,5 @@
-/* httpdoortest.c - the metrics door (httpdoor.c; the 0.7.2 split, wave 1):
- * proto.c's reply staging captured, the clock faked, the trees and the
- * exposition stubbed; the JSON renderer and the address helpers are the
- * real ones.
- *
- *   A  the head: incomplete is "read more", no head in 8 KB drops the
- *      connection, a bare-LF head is read, the bytes consumed are the
- *      head's (from an offset too)
- *   B  methods: anything but GET is 405 - POST since 0.7.0 with its Allow
- *      line; a path of 256 bytes is 414; a query string is ignored
- *   C  the token: none sent is 401 with the browser's Basic challenge;
- *      Bearer right, wrong and the wrong length; the header name in any
- *      case; Basic with the token as the password (any user), and wrong
- *   D  the routes: / is 410 with where the page went, /health, /members,
- *      /clients, /stats (the tree as JSON), /metrics (the exposition's
- *      content type), anything else 404; every answer has a correct
- *      Content-Length, the three hardening headers and Connection: close,
- *      and marks the connection to close
- *   E  the cache (0.6.2): /stats and /metrics built once per http_cache_ms
- *      for a remote peer, the copy served between; a stats reset drops
- *      the copies; a loopback peer and a cache of 0 always get a fresh
- *      build
- *   F  the rate (0.6.2): a bucket of twice http_rate per IPv4 address or
- *      IPv6 /64, refilled by the clock; another address has its own; an
- *      IPv4 client and its ::ffff: form share one; loopback and rate 0
- *      are never limited; the refusals counted, logged once in 10 s
- */
+/* httpdoortest.c - the metrics door (httpdoor.c): proto.c's reply staging captured, the clock
+ * faked, trees and exposition stubbed; the JSON renderer and address helpers are real. */
 #include <arpa/inet.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -61,6 +36,8 @@ int out_append(struct pc_conn *c, const char *p, size_t n)
 long long deny_now(void) { return fake_ms; }
 unsigned int compat_ticks(void) { return 1; }
 const char *pc_http_token(void) { return token; }
+int pc_auth_needs_tls(void) { return 0; }
+int pc_conn_secure(const void *conn) { (void)conn; return 1; }
 int pc_http_rate(void) { return rate; }
 int pc_http_cache_ms(void) { return cache_ms; }
 int compat_log_level = L_NOTICE;
@@ -197,7 +174,7 @@ int main(void)
 	const char *b;
 	int rc, i, n;
 
-	/* A */
+	/* A: the head - incomplete reads more, none in 8 KB drops, bare LF read, bytes consumed */
 	rc = send_at("GET /health HTTP/1.0\r\nHost: x\r\n", 0, 0);
 	CHK(rc == 0 && cap_len == 0, "A: a head without its blank line - read more");
 	{
@@ -212,7 +189,7 @@ int main(void)
 	rc = send_at("GET /health HTTP/1.0\r\n\r\nGET /x", 7, 0);
 	CHK(rc == 24 && starts("HTTP/1.0 200 OK\r\n"), "A: from an offset - the head's 24 bytes, not what follows");
 
-	/* B */
+	/* B: methods - anything but GET is 405 with Allow; a 256-byte path 414; a query ignored */
 	send_at("PUT /stats HTTP/1.0\r\n\r\n", 0, 0);
 	b = body(&bl);
 	CHK(starts("HTTP/1.0 405 Method Not Allowed\r\n") && well_formed() && b &&
@@ -230,7 +207,7 @@ int main(void)
 	GET("/health?probe=1&x=2");
 	CHK(starts("HTTP/1.0 200 OK\r\n"), "B: a query string is ignored");
 
-	/* C */
+	/* C: the token - none is 401 with a Basic challenge; Bearer and Basic, right and wrong */
 	token = "s3cret";
 	GET("/health");
 	CHK(starts("HTTP/1.0 401 Unauthorized\r\n") &&
@@ -252,7 +229,7 @@ int main(void)
 	CHK(starts("HTTP/1.0 401 "), "C: Basic with the wrong password - 401");
 	token = NULL;
 
-	/* D */
+	/* D: the routes, each with Content-Length, the hardening headers and Connection: close */
 	GET("/");
 	CHK(starts("HTTP/1.0 410 Gone\r\n") && has("perfcached-dashboard") && well_formed(),
 		"D: / - 410, the page is the dashboard's");
@@ -283,7 +260,7 @@ int main(void)
 		has("try /stats, /members, /clients, /metrics or /health\n"),
 		"D: anything else - 404, naming the five routes");
 
-	/* E */
+	/* E: the cache - /stats and /metrics built once per http_cache_ms for a remote peer */
 	cache_ms = 60000;
 	stats_builds = 0;
 	GET("/stats");
@@ -307,7 +284,7 @@ int main(void)
 	GET("/stats");
 	CHK(stats_builds == 5, "E: http_cache_ms = 0 - every request built");
 
-	/* F */
+	/* F: the rate - a bucket per IPv4 address or IPv6 /64; loopback and rate 0 never limited */
 	{
 		pc_addr a = v4("10.0.0.1"), m = v6("::ffff:10.0.0.1"), o = v4("10.0.0.2"),
 			l = v4("127.0.0.1"), s1 = v6("2001:db8:1:2::10"), s2 = v6("2001:db8:1:2::20"),

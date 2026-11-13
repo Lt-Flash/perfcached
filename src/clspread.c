@@ -1,14 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clspread.c - spread's decisions (M17, wave 4).  See clspread.h.
- *
- * Moved from cluster.c at e6c1232: the settled predicate, the settle
- * hold, the reclaim verdict, the set fingerprint and the replicas-short
- * reading.  The walks, the probes, the deletes and the words stay with
- * the orchestrator.  Nothing here reads `C` - what cluster.c read from
- * it arrives as arguments - and nothing logs (rule 4).
- */
+/* Spread's decisions (see clspread.h).  Nothing here reads `C` or logs. */
 #include <stddef.h>
 
 #include "clspread.h"
@@ -19,16 +11,8 @@
 #include "fnv1a.h"
 #include "pc_slot.h"
 
-/*
- * Settled, and anchored on REPAIR COMPLETION rather than a timer.
- *
- * The failure this must exclude is dropping a copy before the real
- * holder has it.  "Membership has been quiet for T seconds" only
- * correlates with that; "every live peer's repair cycle has walked
- * clean, and none is armed" establishes it, and the sweep already
- * maintains exactly those flags.  The grace being quiet is kept as a
- * second gate, not the primary one.
- */
+/* Anchored on repair completion, not a timer: every live peer's cycle walked clean and
+ * none armed is what proves the real holder already has the copy. */
 int clspread_settled(int k, int in_grace, const struct pc_clmap *m,
 		int self_id, const struct clpeers *pt, int c, long long now)
 {
@@ -38,26 +22,8 @@ int clspread_settled(int k, int in_grace, const struct pc_clmap *m,
 		return 0;
 	if (in_grace)
 		return 0;              /* a membership change is still recent */
-	/*
-	 * RECLAIM REQUIRES THE SHARED MAP, and this is the rule the whole
-	 * pass turns on: ADDING a copy may act on a local opinion, because
-	 * being wrong costs a surplus; REMOVING one may not, because being
-	 * wrong costs the record.
-	 *
-	 * pc_spread_in_set falls back to HRW over what THIS node can see
-	 * when the map is short or absent.  That is right for repair - two
-	 * nodes with different views simply both send.  It is wrong here:
-	 * a node whose view is still converging computes a different set
-	 * from the senders' and deletes what they just gave it.  Measured
-	 * on the CI runner, which is slower than this machine and so
-	 * converges later: a RETURNING node went 64 -> 25 records, and the
-	 * fleet to 207 where it owed 240.  Three local runs had passed.
-	 *
-	 * The master's map is the one view every node adopts, so sets
-	 * derived from it agree by construction.  No map that covers the
-	 * fleet, no reclaim - the surplus simply waits, which is the safe
-	 * direction.
-	 */
+	/* Reclaim needs the SHARED map: a still-converging local view computes another
+	 * set and deletes what the senders just gave.  No covering map, no reclaim. */
 	{
 		int seen = 1, j;
 
@@ -66,26 +32,18 @@ int clspread_settled(int k, int in_grace, const struct pc_clmap *m,
 				seen++;
 		if (!m || (int)m->nnodes < seen)
 			return 0;
-		/*
-		 * AND THE MAP MUST LIST US.  pc_clplace_in_set() answers 0
-		 * both for "not in the top K" and for "not in this map at
-		 * all", and for a DELETE those are opposite meanings: the
-		 * first says the record is not ours, the second says the map
-		 * cannot tell us anything about ourselves.  A node that has
-		 * just REJOINED can hold an id the published map predates -
-		 * placement mixes addresses, but this lookup is by id - and
-		 * it then reads every record it holds as somebody else's.
-		 * Measured: a returning node went 64 -> 25 and the fleet to
-		 * 207 of 240 owed.
-		 */
+		/* The map must list us: a rejoined node's id can postdate it, and
+		 * in_set's 0 would then read every record it holds as another's. */
 		if (!pc_clplace_has(m, (uint16_t)self_id))
 			return 0;
 	}
 	for (i = 0; i < pt->n_peers; i++) {
 		const struct peer *pr = &pt->peers[i];
 
-		if (!clpeers_live(pr, now))
-			continue;
+		if (__atomic_load_n(&pr->missed, __ATOMIC_RELAXED))
+			return 0;      /* owed writes it was skipped for: the copies kept for it stay */
+		if (!clpeers_usable(pr, now))
+			continue;      /* a CONNECTING one is placed nowhere yet */
 		if (pr->nstate == PC_NST_RECOVERING)
 			return 0;      /* it is still pulling its own state */
 		if (pr->setrepair[c] || pr->backfill[c])
@@ -97,25 +55,8 @@ int clspread_settled(int k, int in_grace, const struct pc_clmap *m,
 }
 
 
-/*
- * SETTLED IS NOT ENOUGH ON ITS OWN, and the measurement that proved it:
- * a returning node ended with 25 of the ~58 records placement gives it
- * and the fleet sat at 207 where it owed 240 - UNDER-replicated, which
- * is the direction that loses data.
- *
- * The predicate is per-node and instantaneous.  The moment it first
- * goes true, this node's own repair cycles are clean, but another
- * holder may not have finished sending to the returning node, and two
- * nodes whose views of the set differ by one beat can each drop a copy
- * believing the other holds it.  Liveness of the set is not POSSESSION
- * by the set, and nothing cheap can prove possession per record.
- *
- * So settle must HOLD, not merely occur: the predicate has to be true
- * on this many consecutive ticks before anything is dropped, and any
- * false reading resets the count to zero.  Reclaiming late costs a
- * little memory and a stale-read window that was already there;
- * reclaiming early costs records.
- */
+/* Settled must HOLD, not merely occur: the predicate is per-node and instantaneous, and
+ * another holder may still be sending to a returning node. */
 int clspread_hold(unsigned int *settled_for, unsigned int *cursor,
 		int settled)
 {
@@ -129,12 +70,6 @@ int clspread_hold(unsigned int *settled_for, unsigned int *cursor,
 	return 1;
 }
 
-/*
- * The reclaim walk's verdict on one record this node holds: 1 = ask a
- * holder whether our copy may go (S146), 0 = keep it.  Kept: a key the
- * walk's buffer cannot carry, a key this node is a holder of, and a key
- * whose K-set is not wholly live (a degraded fleet keeps its surplus).
- */
 int clspread_reclaim_candidate(const char *key, int klen, int k)
 {
 	unsigned slot;
@@ -149,11 +84,6 @@ int clspread_reclaim_candidate(const char *key, int klen, int k)
 	return 1;
 }
 
-/*
- * S127: a fingerprint of WHO IS IN THE SET - the slot-holding peers - so
- * a set change arms the repair (spread_note_set_change) and nothing else
- * does.
- */
 unsigned long long clspread_set_fp(const struct clpeers *pt, long long now)
 {
 	unsigned long long fp = 0;
@@ -161,15 +91,8 @@ unsigned long long clspread_set_fp(const struct clpeers *pt, long long now)
 
 	for (i = 0; i < pt->n_peers; i++)
 		if (clpeers_holds_slots(&pt->peers[i], now))
-			/* HASH EXACTLY WHAT PLACEMENT USES: the advertise
-			 * address and the cluster port, which is the pair
-			 * pc_hrw_mix() takes - never the runtime node id.
-			 * The id is precisely what peer_gone() zeroes, so
-			 * hashing it changed the fingerprint the moment a
-			 * peer was purged and armed the repair INSIDE the
-			 * grace that the purge was supposed to be covered
-			 * by.  A fingerprint for "who is in the set" must
-			 * move only when the SET moves. */
+			/* the pair pc_hrw_mix() takes; never the id, which peer_gone()
+			 * zeroes and would so arm the repair inside the purge's grace */
 			fp ^= fnv1a64_u64(FNV1A64_BASIS,
 				(unsigned long long)
 				pt->peers[i].addr.in4.sin_addr.s_addr << 16 |
@@ -178,21 +101,8 @@ unsigned long long clspread_set_fp(const struct clpeers *pt, long long now)
 	return fp;
 }
 
-/*
- * S157: WARN WHEN `replicas` EXCEEDS THE LIVE MEMBERS.
- *
- * Validation cannot check it - membership is automatic and P is unknown
- * at -C time - so it is a runtime condition on the 1 Hz tick: K against
- * self plus the live peers, once READY and outside the shard grace (a
- * membership change is "not yet", never a shortfall).  A reading has to
- * hold for a few ticks before it is believed, so a flapping peer does
- * not turn this into a log writer; one WARNING on the way in, one
- * NOTICE on the way out, and the figure on /stats, /metrics and the
- * page.  The founding case is the loud one: a single node with
- * replicas = 2 warns a few seconds after it founds the fleet, which is
- * what a reader of the configurations page needs to hear.  Not a
- * refusal - a fleet below K is degraded, not wrong.
- */
+/* Warn, never refuse: membership is automatic so -C cannot check it, and a fleet below K
+ * is degraded, not wrong.  The hold keeps a flapping peer from writing the log. */
 int clspread_short_step(struct clspread_short *s, int k, int ready,
 		int in_grace, int live)
 {

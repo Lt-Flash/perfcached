@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clunk.c - unknown commands: the bounded table, its frame and the fleet
- * fold (S165).  See clunk.h.  No lock, no clock, no log: the caller owns
- * the table and says what time it is.
- */
+/* clunk.c - unknown commands: the bounded table, its frame and the fleet fold (see clunk.h); no
+ * lock, clock or log - the caller owns the table and says what time it is */
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,9 +36,8 @@ size_t clunk_name(char *out, int upper, const char *cmd, size_t clen,
 	return at;
 }
 
-/* copy a NUL-terminated string that is already ours (an address, a
- * client name) with the same printable rule, so nothing unprintable
- * reaches a log line or the page through the side fields either */
+/* copy a string that is already ours (an address, a client name) under the same printable rule,
+ * so nothing unprintable reaches a log line or the page through the side fields */
 static void put_str(char *out, size_t cap, const char *s)
 {
 	size_t i = 0;
@@ -89,9 +85,8 @@ int clunk_note(struct clunk_table *t, int dialect, const char *name,
 			t->other++;
 			return -1;
 		}
-		/* filled BEFORE it is counted in: a worker's table is folded
-		 * by other threads while its owner writes it (obs.h's racy-read
-		 * rule), and a reader must never meet a half-built row */
+		/* filled BEFORE it is counted in: other threads fold a worker's table while its owner writes
+		 * it (obs.h's racy-read rule), and a reader must never meet a half-built row */
 		r = &t->rows[t->n];
 		memset(r, 0, sizeof *r);
 		r->dialect = (unsigned char)dialect;
@@ -239,9 +234,8 @@ int clunk_parse(const unsigned char *b, size_t n, unsigned *node,
 		    !pc_r8(&r, &cl) || cl > CLUNK_CLIENT - 1 ||
 		    !pc_rraw(&r, x->client, (size_t)cl))
 			return -1;
-		/* a peer is not trusted to have sanitised: the page and the
-		 * journal get printable ASCII whatever arrived (the name's one
-		 * space, between command and subcommand, is printable) */
+		/* a peer is not trusted to have sanitised: the page and the journal get printable ASCII
+		 * whatever arrived */
 		x->name[nl] = 0;
 		put_str(x->name, sizeof x->name, x->name);
 		x->nlen = (unsigned char)strlen(x->name);   /* an embedded NUL ends it */

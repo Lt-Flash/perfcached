@@ -1,18 +1,6 @@
 #!/bin/sh
-# jdeltest.sh - S201: a native-door jdel at the ROOT removes the key.
-#
-# Found 2026-09-20 gating cachedb_perfd for the staging RGSs: their
-# de-registration is `JSON.DEL <key>`, and on the native door the record
-# survived - every root jdel answered a "bad path" error and left the key,
-# on a fresh document, an edited one, an implicit path and a plain value
-# alike - while the RESP door's JSON.DEL removed it.  The native door
-# sent a root delete through pc_jp_del, which cannot delete the root;
-# the RESP door had special-cased `$` into a key removal all along.
-#
-# Both doors on one daemon, so the two are compared in one run.  The
-# native side goes through pcnative (CMD frames, S317): a document param
-# travels as its JSON text, and jget answers the fragment's JSON text.
-# Usage: test/jdeltest.sh [./perfcached]
+# jdeltest.sh - a native-door jdel at the root removes the key, as the RESP door's JSON.DEL does, on
+# every document shape; both doors on one daemon.  Usage: test/jdeltest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -63,7 +51,7 @@ def req(method, params):
     return r["result"] if "result" in r else {"error": r.get("error")}
 def exists(k):
     # the exists verb, not get: under redis_types = strict a get of a
-    # document is WRONGTYPE (S280) and would read as "absent"
+    # document is WRONGTYPE and would read as "absent"
     return req("exists", {"col": "0", "key": k}).get("exists") is True
 
 r = socket.create_connection(("127.0.0.1", 17924), 8); r.settimeout(10)
@@ -78,7 +66,7 @@ def resp(*a):
 
 doc = {"status": "Registered", "ua": "Probe 1.0"}
 
-# A: fresh root document -> jdel $ (the brief's case A)
+# A: fresh root document -> jdel $
 req("jset", {"col": "0", "key": "pa", "path": "$", "val": doc})
 x = req("jdel", {"col": "0", "key": "pa", "path": "$"})
 (ok if x == {"deleted": True} else bad)("root jdel on a fresh document answers deleted:true (%r)" % x)
@@ -104,9 +92,8 @@ x = req("jdel", {"col": "0", "key": "pc", "path": "$"})
 (ok if x == {"deleted": True} and not exists("pc") else bad)(
     "root jdel on a key with a TTL removes it (%r)" % x)
 
-# S280: a plain value is a STRING, and a JSON verb refuses it - Redis 8's
-# JSON.DEL on a string is "Existing key has wrong Redis type" and the key
-# survives (probed 2026-09-30); DEL is what removes a string
+# a plain value is a STRING and a JSON verb refuses it, as Redis 8's JSON.DEL does
+# ("Existing key has wrong Redis type"); DEL is what removes a string
 req("set", {"col": "0", "key": "pp", "value": "hello"})
 x = req("jdel", {"col": "0", "key": "pp", "path": "$"})
 (ok if "Existing key has wrong Redis type" in json.dumps(x.get("error")) and exists("pp") else bad)(
@@ -120,7 +107,7 @@ x = req("jdel", {"col": "0", "key": "nope", "path": "$"})
 req("jset", {"col": "0", "key": "ps", "path": "$", "val": doc})
 x = req("jdel", {"col": "0", "key": "ps", "path": "$.ua"})
 g = req("jget", {"col": "0", "key": "ps"})
-# jget's value is the fragment's JSON text (S317)
+# jget's value is the fragment's JSON text
 try: gv = json.loads(g.get("value")) if isinstance(g.get("value"), str) else None
 except ValueError: gv = None
 if not isinstance(gv, dict): gv = None

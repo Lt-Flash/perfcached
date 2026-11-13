@@ -1,17 +1,5 @@
-/* histtest.c - S183: a percentile must estimate the VALUE, not name a
- * power of two above it.
- *
- * The histogram was one bucket per octave and a percentile answered
- * with that bucket's upper bound, so /stats and the status page showed
- * 16, 32, 64, 128, 512 us and nothing else.  The operator's words: "if
- * the value is 262 us then obviously it would be less than 512 but more
- * than 256" - which is not a measurement, it is arithmetic the reader
- * could do without us.
- *
- * Eight buckets per octave and interpolation inside the bucket: this
- * feeds known distributions through the real recorder and holds the
- * answers to an error bound.
- */
+/* histtest.c - a percentile estimates the value, not the power of two above it: eight buckets an
+ * octave, interpolated, fed known distributions through the real recorder within an error bound. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,9 +10,8 @@ int pc_obs_init(int nworkers, long long slowlog_usec);
 void pc_obs_cmd(const char *name, size_t nlen, unsigned long long usec);
 int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap);
 
-/* the percentiles are only reachable the way the page reads them: out
- * of the JSON the HTTP door renders from the stats tree (S317).  That
- * is the point - this asserts what a reader sees. */
+/* percentiles are read the way the page reads them, out of the JSON the HTTP door renders from
+ * the stats tree: this asserts what a reader sees */
 static unsigned long long field(const char *name, const char *key)
 {
 	static char buf[1 << 20];
@@ -52,9 +39,7 @@ static unsigned long long field(const char *name, const char *key)
 	return v;
 }
 
-/* obs.c reaches for the worker id; a histogram test has one worker.
- * (The unknown-command table it also reaches for is linked in as the
- * real src/clunk.o - obs.h now carries its prototypes.) */
+/* obs.c reaches for the worker id; a histogram test has one worker */
 int pc_worker_id(void) { return 0; }
 
 static int fails;
@@ -91,7 +76,7 @@ int main(void)
 		return 2;
 	}
 
-	/* 1. every call the same 262 us - the operator's own example */
+	/* 1. every call the same 262 us */
 	for (i = 0; i < 10000; i++)
 		pc_obs_cmd("flat", 4, 262);
 	s = row("flat");
@@ -111,16 +96,13 @@ int main(void)
 			p50, err_pct(p50, 262));
 		CHK(err_pct(p99, 262) <= 12.5,
 			"p99 reads %llu (%.1f%% off)", p99, err_pct(p99, 262));
-		/* the complaint in one assertion: 262 us must not report as
-		 * 512, and 256 and 512 are the only powers of two it could
-		 * have collapsed to */
+		/* 262 us must not report as 512 or 256, the powers of two it could collapse to */
 		CHK(p50 != 512 && p50 != 256,
 			"and it is not a power of two (%llu)", p50);
 	}
 
-	/* 2. a spread: 200..299 us, ten calls each.  The median is 249-250
-	 * and p99 is ~298 - both must land inside the bucket width, and
-	 * NEITHER may be a power of two, which is the whole complaint. */
+	/* 2. a spread: 200..299 us, ten calls each; median ~249 and p99 ~298 land inside the bucket
+	 * width, and neither may be a power of two */
 	for (i = 200; i < 300; i++) {
 		int j;
 
@@ -145,9 +127,8 @@ int main(void)
 		CHK(p50 < p99, "and p50 < p99, which one bucket per octave could not show");
 	}
 
-	/* 3. the fast path: a 2 us call must read 2 us, not "<= 2" from a
-	 * bucket that also holds 1 - below PC_OBS_SUB every value has its
-	 * own slot precisely so a GET is not rounded */
+	/* 3. the fast path: below PC_OBS_SUB each value has its own slot, so a 2 us GET reads 2 us,
+	 * not "<= 2" from a bucket that also holds 1 */
 	for (i = 0; i < 1000; i++)
 		pc_obs_cmd("fast", 4, 2);
 	{
@@ -156,12 +137,8 @@ int main(void)
 		CHK(p50 == 2, "a 2 us call reports p50 = %llu us, exactly", p50);
 	}
 
-	/* 4. S259: a call faster than a microsecond is recorded as 0 us, and
-	 * a percentile of such calls read 0 - rc51 GitHub cmdstatstest, 40
-	 * JSON gets in 26 us on a fast runner, "p50=0.000".  A measured call
-	 * took AT MOST 1 us, not none: Redis 7 reports 0.001 ms there (its
-	 * histogram's floor), so the shape its readers expect is >= 1 us -
-	 * and the max beside it must not sit below its own percentiles. */
+	/* 4. a sub-microsecond call took at most 1 us, not none: it reads >= 1 us (Redis's 0.001 ms
+	 * floor), and the max beside it never sits below its own percentiles */
 	for (i = 0; i < 1000; i++)
 		pc_obs_cmd("sub", 3, 0);
 	{
@@ -175,10 +152,8 @@ int main(void)
 		CHK(mx == 1, "and max_us %llu, not below its percentiles", mx);
 	}
 
-	/* S194: the five-minute window rides beside the totals.  No roll
-	 * has happened in this test - a roll is a minute of wall clock -
-	 * so the window IS everything, which is the honest answer for a
-	 * row younger than one roll and is what the merge must report. */
+	/* the five-minute window rides beside the totals; no roll happens here (a roll is a
+	 * minute of wall clock), so the window must report everything */
 	{
 		unsigned long long c = field("flat", "calls");
 		unsigned long long wc = field("flat", "win_calls");

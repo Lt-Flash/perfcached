@@ -1,23 +1,5 @@
-/* noiseboundtest.c - RV-2: the transport refuses at its OWN boundaries.
- *
- * cs_encrypt() had no `ptlen <= PC_NOISE_MAXPT` guard and returned
- * (int)clen; cs_decrypt() had no ceiling either; and the 64-bit nonce
- * counter had no policy for its last value.  Nothing reaches any of
- * them today - every caller chunks to PC_NOISE_MAXPT and the datagram
- * plane is frame-bounded - which is exactly why the boundary belonged
- * to the callers and not to the transport: the next caller inherits a
- * promise nobody wrote down.
- *
- * Asserted here, on the public transport calls:
- *  - a record of exactly PC_NOISE_MAXPT encrypts, decrypts and round-
- *    trips; one byte more is refused and the nonce does NOT advance;
- *  - a ciphertext over PC_NOISE_MAXMSG is refused before the AEAD sees
- *    it, and the nonce does not advance;
- *  - the nonce 2^64-1 is never used (Noise, section 5.1: reserved): the
- *    last usable one is 2^64-2, after which both directions refuse for
- *    good - the connection ends and a reconnect re-keys;
- *  - the no-key copy-through obeys the same ceiling.
- * Milliseconds. */
+/* noiseboundtest.c - the transport refuses at its own bounds: past MAXPT or MAXMSG without moving
+ * the nonce, and for good at nonce 2^64-1 (Noise 5.1, reserved); the no-key copy-through too. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

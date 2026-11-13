@@ -1,20 +1,6 @@
 #!/bin/sh
-# legdraintest.sh - S172, S175, now OC (DESIGN 12oc): records a burst puts
-# past their buckets' slots - the overflow leg once, the buckets' chains now -
-# come back to their buckets as the table widens.
-#
-# Measured on the test fleet 2026-09-20: loading 62,000 keys at 86,000/s
-# into a 4,096-bucket collection left 39,390 records (62%) in the leg
-# PERMANENTLY.  Table growth runs on the 1 Hz maintenance thread in
-# bounded chunks, so a sub-second bulk load outruns it completely.  Since
-# OC a split lays a bucket's chain into both halves, so the width alone
-# brings them back; S175's signal (records in chains past leg_stuck_pct)
-# still widens past grow_at_pct.
-#
-# The test reproduces exactly that: a deliberately small table, a burst
-# far faster than growth, then the property - the chains empty and every
-# record is still readable, with its value intact.
-# Usage: test/legdraintest.sh [./perfcached]
+# legdraintest.sh - records a burst puts past their buckets' slots (into the chains) come back to
+# their buckets as the table widens: a small table, a load faster than growth, every value intact.
 set -u
 
 BIN=${1:-./perfcached}
@@ -97,14 +83,8 @@ print("  ..   loaded %d in %.2f s (%.0f/s); table %s buckets, leg %s" %
       (N, dt, N/dt, c.get("buckets"), leg0))
 (ok if leg0 > 1000 else bad)("the burst outran growth and filled the chains (%d records)" % leg0)
 
-# Growth runs on the maintenance tick; give it the deadline and stop when
-# the chains are near empty.  At the default 75% target with 6 slots a
-# bucket, Poisson(4.5) leaves ~30% of buckets full and their surplus in
-# chains; S175 makes that the signal - more than leg_stuck_pct of the
-# entries chained widens the table past grow_at_pct, down to
-# grow_floor_pct (50).  The splitter runs on a TIME slice (S131), so this
-# is also an assertion about speed: the leg took 2 s to drain on the
-# fleet with S176; fifteen is the deadline.
+# growth runs on the maintenance tick: past leg_stuck_pct of entries chained, the table
+# widens down to grow_floor_pct; the splitter is time-sliced, so the deadline bounds speed
 DEADLINE = 15
 end = time.time() + DEADLINE
 while time.time() < end:
@@ -115,14 +95,8 @@ while time.time() < end:
 settle = time.time() - (end - DEADLINE)
 c = col()
 leg1 = c.get("overflow", 0)
-# 5% of the entries.  The 75% geometry leaves ~7% by the arithmetic and
-# 8.5% measured; the 50% floor measures 3.9%, not the 1.7% a uniform
-# Poisson(3) implies, because linear hashing splits buckets IN ORDER -
-# between two power-of-two levels the table holds split buckets at half
-# the load of the unsplit ones, and the fuller half is where the leg
-# comes from.  The uniform figure only arrives at a doubling.
-# OC-3: a chained bucket keeps 5 at home (slot 5 is the link), so between
-# doublings the unsplit half (Poisson 4.9) leaves ~6% chained - 8% is the bound.
+# under 8% of the entries chained: a chained bucket keeps 5 at home (slot 5 is the link),
+# and between doublings the unsplit half (Poisson 4.9) leaves ~6% chained
 (ok if leg1 * 100 < 8 * N else bad)(
     "the chains fell to near nothing: %d -> %d records, %.1f%% of the keyspace "
     "(%s buckets, %s splits asked for by the chains)"

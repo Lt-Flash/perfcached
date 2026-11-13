@@ -1,20 +1,6 @@
 #!/bin/sh
-# cmdstatstest.sh - S159: the native door counts into the same command
-# rows and the same slow log as the RESP door, under its wire's name
-# (cmd:get for a CMD request - S317, through test/pcnative.py - and
-# bin:get for a fixed-layout verb; S189 uses a COLON, since a Redis
-# command name may contain a dot; RESP keeps its bare Redis name), and
-# the rows are reachable off the RESP door: /stats carries `commands`
-# and `slowlog`, /metrics the per-command counters and a log2 latency
-# histogram, INFO latencystats the p50/p99/p99.9 bounds in Redis 7's
-# shape.  Counts are asserted EXACTLY: the drivers are raw sockets (the
-# CMD ones framed by pcnative), so nothing injects hidden commands.
-#
-# Daemon A logs every command (slowlog_usec = 0); daemon B's threshold
-# is ten seconds, so it must count and never log.
-# Fail-first: 0.4.0-rc1 has no cmd:* row, no `commands` on /stats and
-# no latencystats section.
-# Usage: test/cmdstatstest.sh [./perfcached]
+# cmdstatstest.sh - the native door counts into the RESP door's command rows and slow log under its
+# wire's name (cmd:get, bin:get), on /stats, /metrics and INFO latencystats, counted exactly.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -190,9 +176,8 @@ check(all(sum(c.get("hist", [])) == c.get("calls") for c in cmds.values()) and l
       "/stats commands: bucket sums equal calls on every row (%d rows)" % len(cmds))
 check(1 <= jg.get("p50_us", 0) <= jg.get("p99_us", 0) <= jg.get("p999_us", 0),
       "/stats commands: p50_us<=p99_us<=p999_us, all >=1 (%s/%s/%s)" % (jg.get("p50_us"), jg.get("p99_us"), jg.get("p999_us")))
-# S183: eight buckets per octave and interpolation inside the bucket, so
-# a percentile estimates the VALUE.  It must never exceed the exact max,
-# which is the thing the histogram cannot overstate.
+# eight buckets per octave, interpolated, so a percentile estimates the value;
+# it must never exceed the exact max
 check(jg.get("max_us", 0) > 0 and jg.get("p999_us", 0) <= jg.get("max_us", 0),
       "/stats commands: an exact max_us, and no percentile above it (%s <= %s)"
       % (jg.get("p999_us"), jg.get("max_us")))
@@ -215,10 +200,8 @@ check((mval(r'perfcached_command_usec_total\{cmd="cmd:get"\}') or 0) == jg.get("
       "/metrics command_usec_total{cmd:get} equals the /stats usec")
 bk = re.findall(r'perfcached_command_latency_seconds_bucket\{cmd="cmd:get",le="([^"]+)"\} (\d+)\n', mt)
 les = [b[0] for b in bk]; cums = [int(b[1]) for b in bk]
-# S359: one bound per octave, not the daemon's eight (S183's 129 rows per
-# command were 90% of /metrics): 3 us, then each octave's last microsecond
-# 7 us .. 262.143 ms (2^n - 1), and +Inf - 18 rows, every bound an edge of
-# the fine histogram, rising.
+# /metrics has one bound per octave, not the daemon's eight: 3 us, then 2^n - 1 us from
+# 7 us to 262.143 ms, then +Inf - 18 rising rows, each an edge of the fine histogram
 want = ["0.000003"] + ["%.6f" % ((2 ** n - 1) / 1e6) for n in range(3, 19)] + ["+Inf"]
 check(les == want,
       "/metrics histogram: one bound per octave, 3 us .. 262.143 ms and +Inf (%d rows, first %s, last %s)"
@@ -241,6 +224,7 @@ stb = stats(18763)
 check(stb.get("slowlog") == [] and {c.get("name"): c.get("calls") for c in stb.get("commands", [])}.get("cmd:get") == 5,
       "threshold 10 s: /stats slowlog empty, commands still counted")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"

@@ -1,21 +1,5 @@
-/*
- * clboottest.c - the S83 bootstrap decision (M4).
- *
- * A node that joins holding nothing must pull a full walk before it
- * serves, and every case here is a way that could go wrong quietly:
- *   - giving up after the wrong number of rounds, so a fleet that would
- *     have served the walk is abandoned (or never abandoned)
- *   - a re-pick that finds nobody reporting READY on the next tick
- *     instead of waiting the beat the code says it waits - which is what
- *     boot_tick actually did, the extension being a dead store
- *   - pending and round_failed read from different instants, which
- *     boot_tick allowed by taking the lock twice in a row
- *
- * The clock is injected and the handoff lock is supplied by the caller,
- * so none of this needs a fleet, a socket or a bulk thread.
- *
- * Build: cc -o clboottest test/clboottest.c src/clboot.o -lpthread
- */
+/* clboottest.c - the bootstrap decision of a node that joins holding nothing: rounds, re-picks,
+ * the deadline and the handoff, on an injected clock and a caller-supplied lock. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -101,9 +85,8 @@ int main(void)
 		"C4 at the deadline it gives up and relies on the push backfill");
 	chk(B.deadline_ms == 0, "C4 clearing the deadline behind it");
 
-	/* C5 is the dead store boot_tick had: the branch says "wait a beat
-	 * more" and then the next branch zeroed the deadline, so the node
-	 * gave up on the following tick instead. */
+	/* a failed round with nobody to re-pick waits a beat more: the deadline
+	 * is extended, never zeroed by the next branch */
 	memset(&B, 0, sizeof B);
 	clboot_arm(&B, now);
 	chk(clboot_after_pick(&B, now, 1, 0) == CLBOOT_WAIT,
@@ -135,8 +118,6 @@ int main(void)
 	chk(clboot_take_round_failed(&B, &MX) == 0,
 		"D5 exactly once - it is read and cleared");
 
-	/* D6: pending and round_failed in ONE acquisition, which boot_tick
-	 * did not do - it took the lock twice in a row for these two. */
 	memset(&B, 0, sizeof B);
 	clboot_handoff(&B, &MX, addr, id, 1);
 	clboot_pull_failed(&B, &MX);

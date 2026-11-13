@@ -1,20 +1,6 @@
 #!/bin/sh
-# lamporttest.sh — a version that works without a synced clock.
-#
-# Nothing in the cluster could say which of two copies of a key was
-# newer.  A wall-clock stamp would answer it only if every node's clock
-# agreed, and this design refuses that dependency on purpose: the pull
-# path ships TTL as REMAINING seconds and the receiver rebases it, so two
-# nodes never have to agree on the time.
-#
-# A Lamport counter needs no clock.  Asserted here:
-#  - it advances on writes, not on time passing;
-#  - it CONVERGES across the fleet via the heartbeat, so a node that
-#    never wrote anything still knows roughly where the cluster is;
-#  - a node restarted from nothing LEARNS the fleet value instead of
-#    starting at 0 - otherwise every restart would claim to be oldest and
-#    its writes would lose to stale copies for ever.
-# usage: test/lamporttest.sh [./perfcached]
+# lamporttest.sh - a Lamport version needs no synced clock: it advances on writes, not time, converges
+# across the fleet by heartbeat, and a node restarted from nothing learns it instead of starting at 0.
 set -u
 
 BIN=${1:-./perfcached}
@@ -23,10 +9,8 @@ SEC=lm-client-secret
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a reused pid
+# never hits a stranger; the name pattern is only a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -75,10 +59,18 @@ except Exception: print("ERR")'; }
 put() { ./perfcli -h 127.0.51.$1 -p 1797$1 -a $SEC \
 	-j "{\"method\":\"set\",\"params\":{\"col\":\"c\",\"key\":\"$2\",\"value\":\"v\"}}" \
 	>/dev/null 2>&1; }
+st() { ./perfcli -h 127.0.51.$1 -p 1797$1 -a $SEC -q -j '{"method":"stats"}' 2>/dev/null \
+	| python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+formed() { # every node ready and seeing the other two, up to 30 s: a joiner is CONNECTING until its links answer
+	i=0
+	while [ $i -lt 300 ] && { [ "$(st 1)" != "ready 2" ] || [ "$(st 2)" != "ready 2" ] || [ "$(st 3)" != "ready 2" ]; }; do
+		sleep 0.1; i=$((i+1))
+	done
+}
 
 mk 1; mk 2; mk 3
 start 1 a && start 2 a && start 3 a || { echo "fleet did not start"; exit 1; }
-sleep 6
+formed
 
 # it advances with WRITES, not with time
 A0=$(lam 1)
@@ -107,7 +99,7 @@ echo "  ..   after 50 writes on node1: n1=$A2 n2=$B n3=$C"
 # a node restarted from nothing must LEARN the fleet value, not restart at 0
 pkill -9 -f "[p]erfcached -f $D/n3.conf"; sleep 8
 start 3 b || bad "node3 did not restart"
-sleep 6
+formed
 C2=$(lam 3)
 echo "  ..   node3 after a from-scratch restart: $C2"
 [ "$C2" != "ERR" ] && [ "$C2" -ge "$A2" ] \

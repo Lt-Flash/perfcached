@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * logrl.c - a limit on log lines the network can drive (CH-17; logrl.h).
- */
+/* logrl.c - a limit on log lines the network can drive (see logrl.h) */
 #include <pthread.h>
 #include <string.h>
 #include <time.h>

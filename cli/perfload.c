@@ -1,37 +1,5 @@
-/*
- * perfload - S113: a parallel loader over the client door.
- *
- * Reads a perfdump file set (doc/perfdump-format.md) and streams it back
- * through N pipelined connections with the `restore` batch verb: every
- * record with ITS version and ITS absolute expiry, installed through the
- * daemon's write path (WAL, the eager push), so a fleet of any size or
- * mode takes it as if a client had written it - only with the history
- * the dump held.
- *
- * Routing is the library's (S35 perfd_owner_of): a shard fleet's records
- * go straight to their owners; an eager or plain fleet takes the files
- * spread across its members.  The daemon never forwards a restore (the
- * forward frame carries no version): a record it does not own comes back
- * NAMED in the reply, with the node that owns or holds it, and the loader
- * re-sends it there once.
- *
- * Policy `newer` is the store's own rule (a copy older than, or as old
- * as, the one held loses), so a re-run over a finished load stores
- * nothing and counts everything as older; that is what makes a resume
- * safe.  A chunk file is marked done in DIR/perfload.done once its last
- * batch is acknowledged; the next run skips it.
- *
- * `--via-set` is the comparator and the fail-first control: the same
- * records through plain pipelined `set`, which re-bases the TTL and
- * assigns fresh versions - the two things a loader must NOT do.
- *
- * S317: a batch is built as the request TREE (perfd_append_tree) and
- * its reply read as a tree (perfd_next_reply_tree): keys and values are
- * bulks, byte-exact, never through the JSON edge whose rendering is
- * lossy for bytes that are not UTF-8.  Each sent batch keeps its
- * encoded records (offset, length) so a misrouted one is re-added to
- * another batch as it was encoded.
- */
+/* perfload - a parallel loader over the client door: a perfdump file set goes back through N
+ * pipelined connections with the `restore` batch verb, each record with ITS version and expiry */
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -48,21 +16,25 @@
 #include "../src/json.h"
 #include "../src/ptree.h"
 #include "../src/pcaddr.h"
+#include "../src/core/pcache_arena.h"
 
-#define VERSION     "0.1"
+#define VERSION     "0.2"
 #define MAXTOK      (1 << 17)
-#define RECMAX      (1 << 16)          /* PCACHE_CELL_MAX: the largest key or value */
+#define RECMAX      PCACHE_CELL_MAX    /* the store's largest record: key + value never exceed it */
 #define MAXMEM      64
 #define MAXMAP      64
-/* the batch is sent once its tree reaches this; the record that tipped
- * it is already in, so a batch runs over by at most one record (two
- * RECMAX cells and ~70 bytes of framing), and 880 KB + 128 KB stays
- * under the daemon's 1 MB frame payload (PC_MAX_REQ) - there is no
- * base64 inflation to leave room for any more */
-#define BATCH_BYTES (880u << 10)
+/* a batch is sent once its tree reaches this, so it runs over by one record at most:
+ * that record and 8 KB of framing still fit the daemon's 1 MB frame (PC_MAX_REQ) */
+#define BATCH_BYTES ((1u << 20) - RECMAX - (8u << 10))
 #define BATCH_MAX   4096
 #define DEPTH_MAX   64
 #define SETTLE_MS   60000
+/* perfdump-format 2 (doc/perfdump-format.md): the type byte indexes the `t` restore
+ * takes, absent for 0 (a string) - the same table perfdump writes with */
+#define PCD_FORMAT  2
+#define PCD_MAGIC   "PCD2"
+static const char *const pcd_types[] = { NULL, "json", "rl", "hash", "lock" };
+#define PCD_NTYPES  ((int)(sizeof pcd_types / sizeof pcd_types[0]))
 
 struct file {
 	char name[256], col[64];
@@ -73,7 +45,7 @@ struct file {
 
 struct opts {
 	const char *dir, *host, *secret, *cols, *map, *policy;
-	const char *enable;            /* S129: [secrets] enable */
+	const char *enable;            /* [secrets] enable */
 	int port, threads, batch, depth, rate, dry, verify, restart, settle,
 	    via_set, route, verbose;
 };
@@ -99,9 +71,8 @@ struct shared {
 	int failed;
 };
 
-/* one appended request, kept until its reply is read: the misrouted
- * records are cut out of it (each record's encoded item, by offset and
- * length inside the batch tree) and re-sent.  tree NULL = a `set`. */
+/* one appended request, kept until its reply is read: misrouted records are cut out of it
+ * (by offset and length in the batch tree) and re-sent; tree NULL = a `set` */
 struct sent {
 	unsigned char *tree;
 	size_t *roff, *rlen;
@@ -228,6 +199,17 @@ static int manifest_read(struct shared *sh)
 		free(toks);
 		return -1;
 	}
+	i = pc_json_get(buf, toks, ntok, 0, "format_version");
+	if (i < 0 || toks[i].type != PC_J_PRIM || atoi(buf + toks[i].start) != PCD_FORMAT) {
+		fprintf(stderr, "perfload: %s is perfdump format %.*s; perfload " VERSION " loads format %d "
+			"only (format 1 dropped the hash, rate-limit and lock types): dump the source "
+			"again with perfdump " VERSION "\n", sh->o->dir,
+			i >= 0 ? toks[i].end - toks[i].start : 1, i >= 0 ? buf + toks[i].start : "?",
+			PCD_FORMAT);
+		free(buf);
+		free(toks);
+		return -1;
+	}
 	sh->files = calloc((size_t)cap, sizeof *sh->files);
 	tf = pc_json_get(buf, toks, ntok, 0, "files");
 	for (i = tf + 1; tf >= 0 && i < ntok; i++) {
@@ -275,8 +257,8 @@ static int manifest_read(struct shared *sh)
 	return 0;
 }
 
-/* DIR/perfload.done: one line per chunk file whose last batch was
- * acknowledged - "<file> <records> <target> <policy>" */
+/* DIR/perfload.done, one line per chunk whose last batch was acknowledged: "<file> <records>
+ * <target> <policy>"; under policy `newer` a re-run stores nothing, so a resume is safe */
 static void done_read(struct shared *sh)
 {
 	char path[512], line[512];
@@ -372,7 +354,7 @@ static int reader_open(struct reader *r, struct shared *sh, struct file *f)
 	    spawn_rd_open(&r->sp, path, f->zstd > 0) != 0)
 		return -1;
 	r->pf = r->sp.f;
-	if (fread(h, 1, 4, r->pf) != 4 || memcmp(h, "PCD1", 4) != 0) {
+	if (fread(h, 1, 4, r->pf) != 4 || memcmp(h, PCD_MAGIC, 4) != 0) {
 		spawn_rd_close(&r->sp);
 		r->pf = NULL;
 		return -1;
@@ -381,10 +363,10 @@ static int reader_open(struct reader *r, struct shared *sh, struct file *f)
 	return 0;
 }
 
-/* next record into @key/@val (RECMAX each); 1 = a record, 0 = the
- * trailer (r->trailer set), -1 = a framing error */
+/* next record into @key (RECMAX + 1, NUL-terminated) and @val (RECMAX);
+ * 1 = a record, 0 = the trailer (r->trailer set), -1 = a framing error */
 static int reader_next(struct reader *r, char *key, uint32_t *kl, char *val, uint32_t *vl,
-		unsigned long long *exp, unsigned long long *ver, unsigned char *fl)
+		unsigned long long *exp, unsigned long long *ver, unsigned char *type)
 {
 	unsigned char h[25];
 
@@ -407,11 +389,12 @@ static int reader_next(struct reader *r, char *key, uint32_t *kl, char *val, uin
 	*vl = get32(h + 4);
 	*exp = get64(h + 8);
 	*ver = get64(h + 16);
-	*fl = h[24];                       /* S280: bit 0 = a JSON document */
-	if (*kl > RECMAX || *vl > RECMAX)
+	*type = h[24];
+	if (*kl > RECMAX || *vl > RECMAX - *kl || *type >= PCD_NTYPES)
 		return -1;
 	if (fread(key, 1, *kl, r->pf) != *kl || fread(val, 1, *vl, r->pf) != *vl)
 		return -1;
+	key[*kl] = 0;
 	r->crc = crc32_upd(r->crc, h, 25);
 	r->crc = crc32_upd(r->crc, key, *kl);
 	r->crc = crc32_upd(r->crc, val, *vl);
@@ -441,15 +424,14 @@ static perfd_t *dial(struct shared *sh, const char *host, int port, int learn)
 	secrets[1] = NULL;
 	if (sh->o->secret)
 		po.secrets = secrets;
-	po.encrypt = sh->o->enable != NULL;      /* S468: enable needs Noise */
+	po.encrypt = sh->o->enable != NULL;      /* enable needs Noise */
 	p = perfd_connect(host, port, &po);
 	if (!p) {
 		fprintf(stderr, "perfload: %s:%d: %s\n", host, port, perfd_error(NULL));
 		return p;
 	}
-	/* S129: `restore` is privileged, and this tool fans out across N
-	 * connections - the bit is PER CONNECTION, so every one of them has
-	 * to raise it, including any opened later for a retry. */
+	/* `restore` is privileged and the bit is PER CONNECTION: every one raises it,
+	 * including any opened later for a retry */
 	if (sh->o->enable) {
 		char params[512];
 		char *res;
@@ -497,22 +479,17 @@ static int handle_by_node(struct shared *sh, int node)
 	return -1;
 }
 
-/* which handle takes @key: the owner when the library routes it, else
- * this thread's member, else the --to address */
-static struct handle *pick(struct job *j, const char *col, const char *key, uint32_t kl)
+/* which handle takes @key (NUL-terminated): the owner when the library
+ * routes it, else this thread's member, else the --to address */
+static struct handle *pick(struct job *j, const char *col, const char *key)
 {
 	struct shared *sh = j->sh;
 	int idx = -1;
 
 	if (sh->nmem == 0)
 		return &j->hs[0];
-	if (j->disc && sh->o->route) {
-		char kz[RECMAX + 1];
-
-		memcpy(kz, key, kl);
-		kz[kl] = 0;
-		idx = perfd_owner_of(j->disc, col, kz);
-	}
+	if (j->disc && sh->o->route)
+		idx = perfd_owner_of(j->disc, col, key);
 	if (idx < 0 || idx >= j->nh)
 		idx = sh->o->route ? j->idx % j->nh : 0;
 	return &j->hs[idx];
@@ -596,13 +573,12 @@ static void batch_send(struct job *j, struct handle *h)
 		drain(j, h);
 }
 
-/* one record into @h's batch; @raw is a ready-made record item (a
- * re-route), else the fields are encoded here: {k, v, exp, ver, t?} with
- * the key and the value as bulks, exact */
+/* one record into @h's batch: @raw is a ready-made item (a re-route), else {k, v, exp, ver,
+ * t?} is encoded here, key and value as bulks - never the JSON edge, lossy for non-UTF-8 */
 static void batch_add(struct job *j, struct handle *h, const unsigned char *raw,
 		size_t rawlen, const char *key, uint32_t kl, const char *val,
 		uint32_t vl, unsigned long long exp, unsigned long long ver,
-		unsigned char fl, int rerouted)
+		unsigned char type, int rerouted)
 {
 	size_t at;
 
@@ -621,9 +597,9 @@ static void batch_add(struct job *j, struct handle *h, const unsigned char *raw,
 		pc_tw_i64(&h->w, (long long)exp);
 		pc_tw_key(&h->w, "ver");
 		pc_tw_i64(&h->w, (long long)ver);
-		if (fl & 0x01) {               /* S280 */
+		if (type) {
 			pc_tw_key(&h->w, "t");
-			pc_tw_str(&h->w, "json");
+			pc_tw_str(&h->w, pcd_types[type]);
 		}
 		pc_tw_end(&h->w);
 	}
@@ -699,8 +675,8 @@ static long long tv_num(const struct pc_tv *v, int map, const char *key)
 	return pc_tv_get_int(v, map, key, &n) == 0 ? n : 0;
 }
 
-/* read every reply @h has outstanding, tally it, re-send what came back
- * misrouted to the node the daemon named */
+/* read @h's outstanding replies and tally them; the daemon never forwards a restore (no version
+ * in the forward frame), so a misrouted record comes back named and is re-sent to that node */
 static void drain(struct job *j, struct handle *h)
 {
 	struct shared *sh = j->sh;
@@ -834,17 +810,17 @@ static void *verifier(void *arg)
 	struct job *j = arg;
 	struct shared *sh = j->sh;
 	struct file *f;
-	char *key = malloc(RECMAX), *val = malloc(RECMAX);
+	char *key = malloc(RECMAX + 1), *val = malloc(RECMAX);
 
 	while ((f = take(sh)) != NULL) {
 		struct reader r;
 		uint32_t kl, vl;
 		unsigned long long exp, ver;
-		unsigned char fl;
+		unsigned char type;
 		int rc = -1;
 
 		if (reader_open(&r, sh, f) == 0) {
-			while ((rc = reader_next(&r, key, &kl, val, &vl, &exp, &ver, &fl)) == 1)
+			while ((rc = reader_next(&r, key, &kl, val, &vl, &exp, &ver, &type)) == 1)
 				;
 			reader_close(&r);
 		}
@@ -866,7 +842,7 @@ static void *loader(void *arg)
 	struct shared *sh = j->sh;
 	struct opts *o = sh->o;
 	struct file *f;
-	char *key = malloc(RECMAX), *val = malloc(RECMAX);
+	char *key = malloc(RECMAX + 1), *val = malloc(RECMAX);
 	char colbuf[64];
 	int i;
 
@@ -887,7 +863,7 @@ static void *loader(void *arg)
 		struct reader r;
 		uint32_t kl, vl;
 		unsigned long long exp, ver;
-		unsigned char fl = 0;
+		unsigned char type = 0;
 		int rc = 0;
 
 		snprintf(colbuf, sizeof colbuf, "%s", map_col(sh, f->col));
@@ -897,18 +873,18 @@ static void *loader(void *arg)
 			j->failed = 1;
 			break;
 		}
-		while (!j->failed && (rc = reader_next(&r, key, &kl, val, &vl, &exp, &ver, &fl)) == 1) {
+		while (!j->failed && (rc = reader_next(&r, key, &kl, val, &vl, &exp, &ver, &type)) == 1) {
 			struct handle *h;
 
 			j->records++;
 			j->bytes += kl + vl;
 			if (o->dry)
 				continue;
-			h = o->via_set ? &j->hs[j->idx % j->nh] : pick(j, colbuf, key, kl);
+			h = o->via_set ? &j->hs[j->idx % j->nh] : pick(j, colbuf, key);
 			if (o->via_set)
 				set_add(j, h, key, kl, val, vl, exp);
 			else
-				batch_add(j, h, NULL, 0, key, kl, val, vl, exp, ver, fl, 0);
+				batch_add(j, h, NULL, 0, key, kl, val, vl, exp, ver, type, 0);
 			if (o->rate > 0) {
 				unsigned long long per = (unsigned long long)o->rate / (unsigned long long)o->threads + 1, due, now;
 
@@ -1081,6 +1057,7 @@ static void usage(FILE *f)
 	fprintf(f, "perfload " VERSION " - load a perfdump file set into a perfcached node or fleet\n"
 		"usage: perfload DIR --to HOST:PORT [options]\n"
 		"  -a SECRET            client secret (default: $PERFCLI_AUTH; none = plaintext)\n"
+		"  --enable SECRET      [secrets] enable - restore needs a privileged connection\n"
 		"  --threads N          loader connections (default 4)\n"
 		"  --batch K            records per restore call (default 256, max 4096)\n"
 		"  --depth D            restore calls in flight per connection (default 8, max 64)\n"
@@ -1094,7 +1071,8 @@ static void usage(FILE *f)
 		"  --no-settle          do not wait for the members' entry counts to stand still\n"
 		"  --no-route           send everything to --to; the daemon names what belongs elsewhere\n"
 		"  --via-set            the comparator: plain pipelined set (TTL re-based, fresh versions)\n"
-		"  -v                   verbose\n");
+		"  -v                   verbose\n"
+		"  -V                   version\n");
 }
 
 int main(int argc, char **argv)
@@ -1150,7 +1128,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	if (pc_hostport_split(o.host, hostbuf, sizeof hostbuf, &o.port) != 0) {
-		/* IP6-1: HOST:PORT or [V6]:PORT, the port a whole number */
+		/* HOST:PORT or [V6]:PORT, the port a whole number */
 		fprintf(stderr, "perfload: --to needs HOST:PORT (or [IPV6]:PORT)\n");
 		return 2;
 	}

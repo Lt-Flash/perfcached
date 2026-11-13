@@ -1,18 +1,6 @@
 #!/bin/sh
-# eagerdoubttest.sh - S464: the doubt follows its source.
-#
-# Three eager nodes, past their own 30 s start windows (S305 keeps those).
-#  1  node 3 is killed -9 and comes back COLD (its WAL wiped): it
-#     bootstraps from the fleet and holds nothing new, so node 1 doubts
-#     nobody - its misses stay final and no pull goes out, none is served;
-#  2  node 3 authors keys, is killed -9 and comes back RECOVERED (its WAL
-#     replayed): node 1 doubts node 3 alone - a miss asks node 3, and node
-#     2 serves none of them.
-# Both restarts fall inside PEER_UP_MS (10 s), so the peer never looked gone.
-# Fail-first: before S464 every peer's return reopened 30 s of every miss
-# broadcast to every peer - arm 1 sends pulls and both peers serve them,
-# arm 2 has node 2 serving; S464 as first built missed arm 2's return.
-# Usage: test/eagerdoubttest.sh [./perfcached] [./perfcli]
+# eagerdoubttest.sh - the doubt follows its source: a peer back cold leaves misses final, one back
+# recovered from its WAL is the only peer a miss asks.  Usage: test/eagerdoubttest.sh [./perfcached] [./perfcli]
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}

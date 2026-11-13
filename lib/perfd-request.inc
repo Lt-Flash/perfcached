@@ -3,19 +3,12 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-request.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds the wire, outbound: the JSON edge (params text <-> trees, S317) and the
- * request encoders (enqueue_cmd, enqueue_bin).
- */
-/* ---- the JSON edge (S317) ---------------------------------------------- */
+/* perfd-request.inc - part of perfd.c, #included in order (one translation unit, never compiled
+ * alone): the JSON edge (params text <-> trees) and the request encoders. */
+/* ---- the JSON edge ----------------------------------------------------- */
 
-/* params JSON text -> a request tree in a heap writer the caller frees.
- * NULL/empty JSON = no parameters (w left empty).  A value under a
- * DOC_KEYS key is kept as its JSON text in one bulk. */
+/* params JSON text -> a request tree in a heap writer the caller frees; NULL/empty = none.
+ * A value under a DOC_KEYS key is kept as its JSON text in one bulk. */
 static int json_to_tree(perfd_t *p, const char *json, struct pc_tw *w)
 {
 	const char *why = "malformed";
@@ -31,9 +24,8 @@ static int json_to_tree(perfd_t *p, const char *json, struct pc_tw *w)
 	return 0;
 }
 
-/* a reply tree -> malloc'd NUL-terminated JSON text (*lenout = its length
- * without the terminator).  Bytes that are not UTF-8 render as U+FFFD -
- * lossy by design; a byte-exact caller takes the tree form. */
+/* a reply tree -> malloc'd NUL-terminated JSON (*lenout without the NUL).  Non-UTF-8 bytes
+ * render as U+FFFD, lossy by design; a byte-exact caller takes the tree form. */
 static char *tree_to_json(perfd_t *p, const unsigned char *tree, size_t n,
 		size_t *lenout)
 {
@@ -58,9 +50,8 @@ static char *tree_to_json(perfd_t *p, const unsigned char *tree, size_t n,
 	return fit ? fit : buf;
 }
 
-/* a reply tree indexed for reading; -1 with p->err when it is not a map */
-/* S284: give the node array back to the handle for the next parse
- * (pc_tv_parse keeps and grows it) - in place of pc_tv_free */
+/* give the node array back to the handle for the next parse (pc_tv_parse
+ * keeps and grows it) - in place of pc_tv_free */
 static void tv_put(perfd_t *p, struct pc_tv *v)
 {
 	if (!p->tvn || p->tvcap < v->cap) {
@@ -74,11 +65,12 @@ static void tv_put(perfd_t *p, struct pc_tv *v)
 	v->nn = v->cap = 0;
 }
 
+/* a reply tree indexed for reading; -1 with p->err when it is not a map */
 static int tv_root(perfd_t *p, struct pc_tv *v, const unsigned char *tree,
 		size_t n, const char *what)
 {
 	memset(v, 0, sizeof *v);
-	/* S284: parse into the handle's node array; tv_put returns it */
+	/* parse into the handle's node array; tv_put returns it */
 	v->n = p->tvn;
 	v->cap = p->tvcap;
 	p->tvn = NULL;
@@ -126,7 +118,7 @@ static int push_id(perfd_t *p, unsigned long long id)
 	return 0;
 }
 
-/* S317: frame + queue one CMD request: [BV_CMD][mlen u8][method] then
+/* frame + queue one CMD request: [BV_CMD][mlen u8][method] then
  * the parameters as ONE tree item (@tree, @tlen bytes), or none. */
 static int enqueue_cmd(perfd_t *p, const char *method,
 		const unsigned char *tree, size_t tlen)
@@ -168,9 +160,8 @@ static int enqueue_cmd(perfd_t *p, const char *method,
 	memcpy(at, method, mlen);
 	if (tlen)
 		memcpy(at + mlen, tree, tlen);
-	/* the in-order FIFO belongs to the blocking collector; an async
-	 * handle correlates by callback instead, and would otherwise grow
-	 * this array for the life of the connection */
+	/* the in-order FIFO is the blocking collector's; an async handle correlates by callback
+	 * and would otherwise grow this array for the life of the connection */
 	if (!p->async && push_id(p, p->next_id) != 0)
 		return -1;
 	p->qlen += need;
@@ -220,7 +211,7 @@ static int enqueue_bin(perfd_t *p, int verb, const char *col,
 	at[0] = BIN_MAGIC;
 	at[1] = BIN_VER;
 	at[2] = BIN_REQ;
-	at[3] = p->want_hh ? BIN_F_HINT : 0;   /* S295 */
+	at[3] = p->want_hh ? BIN_F_HINT : 0;
 	wle32(at + 4, (unsigned int)plen);
 	wle64(at + 8, ++p->next_id);
 	at += BIN_HDR;

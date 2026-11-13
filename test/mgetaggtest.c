@@ -1,30 +1,5 @@
-/* mgetaggtest.c - G8 (DESIGN 12nh): one mget waiting on several remote
- * lookups (mgetfan.c), the cluster and the store stubbed and the clock
- * faked.
- *
- *   A  an mget answered from the node alone: the native tree's shape (a
- *      hit's value and ttl, a miss), and the RESP array
- *   B  lookups: the last answer hands the mget back, not before; a found
- *      value copied with its ttl, the pull's own buffer not kept; one that
- *      timed out is unanswered - the tree says so per key, RESP answers
- *      -TRYAGAIN with the count, never values beside nils; the counters
- *   C  a found document under redis_types = strict answers as absent
- *   D  shard: an owner's miss is absent, the negative cache untouched;
- *      inside the reshard grace everyone is asked once, the retry's pull
- *      capped at the mget's deadline; with no time left nobody is asked
- *      and the key is unanswered
- *   E  proxy: a miss where the locator pointed - the locator forgotten,
- *      everyone asked; store: a miss is absent and remembered (negative
- *      cache)
- *   F  the map: two of this worker's requests on one pending slot (one
- *      expired, its successor) each find their key; an answer nobody
- *      waits on is not taken; a freed mget's waiting pulls are cancelled
- *      and their answers not taken; a closed connection drops its mgets
- *      only
- *   G  the guard: the 1,001st lookup refused (the cap), and a lookup that
- *      would leave less than a quarter of the pending table free (busy)
- *   H  the counters from the last stats reset, and from the start
- */
+/* mgetaggtest.c - one mget waiting on several remote lookups (mgetfan.c), with the cluster and the
+ * store stubbed and the clock faked. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,7 +146,7 @@ int main(void)
 	const char *why;
 	int taken, i;
 
-	/* A */
+	/* A: an mget answered by the node alone - the native tree's shape and the RESP array */
 	m = pc_mget_new("c", 1, 3);
 	pc_mget_hit(m, 0, dupz("v0"), 2, now_ticks + 10);
 	pc_mget_absent(m, 1);
@@ -185,7 +160,7 @@ int main(void)
 		"A: the RESP array");
 	pc_mget_free(m);
 
-	/* B */
+	/* B: lookups - the last answer hands the mget back; a timed-out key is -TRYAGAIN */
 	m = pc_mget_new("c", 1, 4);
 	pc_mget_hit(m, 0, dupz("here"), 4, 0);
 	r1 = wait_key(m, 1, "k1");
@@ -217,7 +192,7 @@ int main(void)
 	CHK(f == 1 && u == 1 && r == 0, "B: counted - 1 fanned out, 1 unanswered");
 	pc_mget_free(m);
 
-	/* C */
+	/* C: a found document under redis_types = strict answers as absent */
 	strict = 1;
 	m = pc_mget_new("c", 1, 1);
 	r1 = wait_key(m, 0, "doc");
@@ -226,9 +201,34 @@ int main(void)
 	CHK(done == m && !strcmp(resp(m), "*1\r\n$-1\r\n"),
 		"C: a document under strict: nil (%s)", jbuf);
 	pc_mget_free(m);
+
+	/* I */
+	m = pc_mget_new("c", 1, 4);
+	pc_mget_set_count(m);
+	pc_mget_hit(m, 0, NULL, 0, 0);
+	pc_mget_absent(m, 1);
+	r1 = wait_key(m, 2, "doc");
+	r2 = wait_key(m, 3, "gone");
+	pc_mget_attach(m, &conn_a, PC_MGET_DOOR_RESP, NULL);
+	done = answer(r1, "{}", 0, PCACHE_F_JSON, &taken);
+	CHK(taken && !done, "I: EXISTS of four, a document found elsewhere");
+	done = answer(r2, NULL, 0, 0, &taken);
+	CHK(done == m && !strcmp(resp(m), ":2\r\n"),
+		"I: the number found, the document under strict among them (%s)", jbuf);
+	pc_mget_free(m);
+	m = pc_mget_new("c", 1, 2);
+	pc_mget_set_count(m);
+	pc_mget_hit(m, 0, NULL, 0, 0);
+	r1 = wait_key(m, 1, "slow");
+	pc_mget_attach(m, &conn_a, PC_MGET_DOOR_RESP, NULL);
+	done = answer(r1, NULL, 1, 0, &taken);
+	CHK(done == m && !strcmp(resp(m),
+		"-TRYAGAIN exists: 1 key(s) not answered\r\n"),
+		"I: a key not answered: -TRYAGAIN, never counted absent (%s)", jbuf);
+	pc_mget_free(m);
 	strict = 0;
 
-	/* D */
+	/* D: shard - an owner's miss is absent; inside the reshard grace everyone is asked once */
 	shard = 1;
 	m = pc_mget_new("c", 1, 2);
 	r1 = wait_key(m, 0, "s1");
@@ -260,7 +260,7 @@ int main(void)
 	pc_mget_free(m);
 	shard = grace = 0;
 
-	/* E */
+	/* E: proxy - a miss forgets the locator and asks everyone; store - a miss is remembered */
 	proxy = 1;
 	m = pc_mget_new("c", 1, 2);
 	targets[next_req & 0xffff] = 7;        /* r1 went where the locator said */
@@ -281,7 +281,7 @@ int main(void)
 	pc_mget_free(m);
 	proxy = 0;
 
-	/* F */
+	/* F: the pending map - a slot reused, stray answers not taken, frees and closes cancel */
 	m = pc_mget_new("c", 1, 2);
 	r1 = PEND_TAG | (5u << 16) | 9;        /* slot 9, an old generation */
 	r2 = PEND_TAG | (6u << 16) | 9;        /* slot 9 again */
@@ -308,7 +308,7 @@ int main(void)
 	done = answer(r1, "late", 0, 0, &taken);
 	CHK(!taken, "F: and the late answer is not taken");
 
-	/* G */
+	/* G: the guard - the 1,001st lookup refused, and one leaving under a quarter of it free */
 	m = pc_mget_new("c", 1, PC_MGET_MAX_REMOTE + 1);
 	pend_cap = 8192;
 	pend_free = 8192;
@@ -333,7 +333,7 @@ int main(void)
 		"G: a quarter free exactly: it waits");
 	pc_mget_free(m);
 
-	/* H */
+	/* H: the counters from the last stats reset, and from the start */
 	pc_mget_count_refused();
 	pc_mget_stats(1, &f, &u, &r);
 	CHK(r == 1, "H: a refusal counted");

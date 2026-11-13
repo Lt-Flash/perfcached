@@ -1,24 +1,6 @@
 #!/bin/sh
-# udpblocktest.sh - S36 step e2: UDP blocked on a path, TCP open, is NOT
-# a dead node (memberlist's TCP fallback probe).
-#
-# A cloud security group, a Kubernetes NetworkPolicy or a stale UDP
-# conntrack entry can drop a peer's UDP while its TCP gets through; to
-# beats-on-UDP that looked exactly like a dead node.  Now, before a
-# silent peer is purged (or a master declared dead) the node asks TCP:
-# an answer means "UDP is blocked here" - an ERROR, every frame to it by
-# the lane, and a request that it send everything back by TCP too.
-# The rig: three namespaces on a bridge; once the fleet has formed, node
-# 3's namespace drops every incoming UDP datagram:
-#   1  lane on: node 3 logs the UDP block, purges neither peer, nobody
-#      elects; the others are asked for TCP; after the switch the fleet
-#      is three and eager writes cross both ways
-#      S329: then the block is lifted, and within lane_retry_s (2 s here)
-#      every forced lane goes back to UDP - 0.4.6 never released one
-#   2  the control, lane off: node 3 loses its peers - proof the rig
-#      blocks UDP, so arm 1's pass is the fallback
-# Needs root, ip netns and iptables; SKIPs loudly without them.
-# Usage: test/udpblocktest.sh [./perfcached]
+# udpblocktest.sh - UDP blocked on a path while TCP answers is NOT a dead node: the lane carries every
+# frame by TCP until UDP returns; lane off is the control.  Needs root, netns and iptables, else SKIPs.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=$(readlink -f "${1:-./perfcached}")
@@ -134,7 +116,7 @@ setv 1 a1 from1; setv 3 a3 from3
 wait_for 5 'getv 3 a1 | grep -q from1 && getv 1 a3 | grep -q from3' \
 	&& ok "eager writes cross both ways (node 1 -> 3 by TCP, 3 -> 1)" \
 	|| bad "writes did not cross: node 3 sees $(getv 3 a1), node 1 sees $(getv 1 a3)"
-# S329: the block lifted, the lanes forced for it must come back to UDP
+# the block lifted, the lanes forced for it must come back to UDP
 fz() { st "$1" 'r["cluster"]["lane"]["forced"]'; }
 F0="$(fz 1)$(fz 2)$(fz 3)"
 unblock3

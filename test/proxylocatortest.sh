@@ -1,22 +1,6 @@
 #!/bin/sh
-# proxylocatortest.sh - S321: a proxy node's locator can be stale, and a
-# miss on the node it names is not the fleet's answer.
-#
-# Proxy keeps one copy per key; a node that read a key through a peer
-# remembers the holder (the locator) and asks it directly next time.  A
-# key deleted on its holder and written again through another node left
-# that entry pointing at a node without it, and 0.4.6 answered the miss
-# there as final: GET said absent, DEL and EXPIRE said "nothing there",
-# for a key the fleet held (DESIGN 12im).  Now the steered miss forgets
-# the entry and asks the fleet once.  A three-node proxy fleet, each
-# node on its own loopback address, the RESP door:
-#   1  GET, 2  DEL, 3  EXPIRE through node 1 after the key moved from
-#      node 2 to node 3 - right answers, and the effect lands on node 3
-#   4  a key absent everywhere still reads absent through a stale entry
-# Each move waits out the 2 s tombstone a delete leaves (a separate,
-# designed behaviour: a delete wins for tombstone_ms).
-# Fail-first: 0.4.6 answers nil, 0 and 0 to legs 1-3.
-# Usage: test/proxylocatortest.sh [./perfcached]
+# proxylocatortest.sh - a proxy node's locator can be stale: a miss on the node it names forgets the entry
+# and asks the fleet once, so GET, DEL and EXPIRE reach the real holder (each move outwaits the tombstone).
 set -u
 BIN=${1:-./perfcached}
 pass=0; fail=0

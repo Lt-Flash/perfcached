@@ -1,18 +1,6 @@
 #!/bin/sh
-# httpidletest.sh - S46's idle HTTP timeout on a quiet worker.  A metrics
-# connection that never sends its request is closed after `http_timeout`
-# seconds - but the worker only sweeps when it wakes, and it chose how
-# long to wait from a count taken BEFORE that turn's accepts.  A new idle
-# HTTP connection on an otherwise quiet worker was therefore never
-# counted, the worker waited with no timeout, and nothing closed it.
-#   - one worker, so every connection shares its wait
-#   - an idle native connection opened first (native doors are never
-#     swept; it must survive, and opening it later would wake the worker)
-#   - a finished HTTP request first, as the positive control
-#   - then an HTTP connection that sends nothing: closed by the daemon
-#     within ~4 s of a 2 s timeout
-# Fail-first: the build before the live count keeps it open.
-# Usage: test/httpidletest.sh [./perfcached]
+# httpidletest.sh - an idle HTTP connection on a quiet worker is closed after http_timeout: the
+# worker's wait must count connections accepted in the same turn.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pchttpidle.XXXXXX); P1=
@@ -74,6 +62,7 @@ dt = time.time() - t0
 check(gone and dt <= 4.0, "an HTTP connection that sends nothing is closed within 4 s of a 2 s timeout on a quiet worker (%s after %.1f s)" % ("closed" if gone else "still open", dt))
 check(not select.select([native], [], [], 0)[0], "the idle native connection is not swept")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

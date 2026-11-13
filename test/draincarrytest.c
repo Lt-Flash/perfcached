@@ -1,14 +1,5 @@
-/*
- * draincarrytest.c - S459: while a resize drains, the new table answers for
- * the records the old one still holds.  A read that misses the new table
- * reads the old one; a write to a key only the old one holds (an add, a TTL
- * bump, a store) carries the record over first; a delete - old table first,
- * then the new one, as the store does it - is never undone by a carry; an
- * expired record is not carried; with the link cleared the old table is
- * not consulted.  Last, a delete and a carry of the same 20,000 keys race
- * on two threads: no key may survive in the new table.  G (OM2-9): a write
- * drops the drained copy, which never answers after the new record expires.
- */
+/* draincarrytest.c - while a resize drains, the new table answers for records the old one still
+ * holds: a miss reads the old one, a write carries the record first, a delete is never undone. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>

@@ -1,40 +1,32 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * metrics.c — S46: the OpenMetrics exposition.  See metrics.h for why
- * the names in here are a contract rather than a convenience.
- *
- * Everything is read from the same accessors the stats verb uses, with
- * the same tolerance for torn counters: an exposition is a trend, not
- * a transaction, and taking locks to serialise a scrape would put a
- * scraper in the path of the data plane - the exact failure this
- * project exists to avoid.
- */
+/* metrics.c - the OpenMetrics exposition (the names are a contract: see metrics.h).  Read without
+ * locks like the stats verb: a scrape is a trend, and must never stall the data plane. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
 #include "daemon.h"
-#include "obs.h"                        /* S159: the command rows */
+#include "obs.h"                        /* the command rows */
 #include "metrics.h"
 #include "version.h"
 #include "store.h"
 #include "wal.h"
-#include "rdb.h"                        /* S215: snapshots that did not publish */
+#include "rdb.h"                        /* snapshots that did not publish */
 #include "cluster.h"
-#include "clretain.h"                       /* S238 */
-#include "proto.h"                      /* S161: the client-limit counters */
-#include "memguard.h"                   /* S366 */
-#include "pubsub.h"                     /* PS1: pub/sub figures */
-#include "mail.h"                       /* S352 */
+#include "clretain.h"
+#include "proto.h"                      /* the client-limit counters */
+#include "memguard.h"
+#include "pubsub.h"                     /* pub/sub figures */
+#include "mail.h"
 #include "alerts.h"
-#include "hostlink.h"                  /* S465 */
+#include "hostlink.h"
 #include "iostat.h"
-#include "uring.h"                     /* 0.6.0 step 1 */
+#include "uring.h"
 #include "core/pcache_arena.h"
 #include "core/pcache_htable.h"
-#include "mgetfan.h"                    /* G8 */
+#include "mgetfan.h"
 
 static time_t started;
 
@@ -65,20 +57,7 @@ static void emit(struct out *o, const char *fmt, ...)
 	if (o->len >= o->cap)
 		return;
 	va_start(ap, fmt);
-	/*
-	 * The newer clang-analyzer on the Ubuntu CI reports this as
-	 * "vsnprintf is called with an uninitialized va_list argument".
-	 * It is not: its own path trace goes line 47 -> this line and
-	 * never visits the va_start directly above, so the checker simply
-	 * does not model va_start as initialising `ap` - there is no note
-	 * claiming the va_start was conditionally skipped, because there
-	 * is no such path.  The early return above happens BEFORE the
-	 * va_start, so every path that reaches here has run it.
-	 *
-	 * Suppressed at the site rather than by disabling the check, so a
-	 * future va_list that really is uninitialised still gets caught -
-	 * this is the only va_list in the tree.
-	 */
+	/* the analyzer does not model va_start as initialising `ap`: a false positive */
 	/* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
 	n = vsnprintf(o->b + o->len, o->cap - o->len, fmt, ap);
 	va_end(ap);
@@ -91,7 +70,7 @@ static void emit(struct out *o, const char *fmt, ...)
 }
 
 /* a label value must not carry a quote or a backslash into the
- * exposition - a collection name is operator-chosen, not ours */
+ * exposition - a collection name is the user's, not ours */
 static void label_escape(const char *in, char *out, size_t cap)
 {
 	size_t i = 0;
@@ -125,21 +104,17 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"perfcached_uptime_seconds %ld\n",
 		started ? (long)(time(NULL) - started) : 0L);
 
-	/* S381: the divisor for the process CPU a dashboard draws - the CPUs
+	/* the divisor for the process CPU a dashboard draws - the CPUs
 	 * this process may use (affinity, capped by a cgroup quota) */
 	emit(&o, "# HELP perfcached_process_cpus CPUs this process may use (affinity, capped by a cgroup cpu.max quota)\n"
 		"# TYPE perfcached_process_cpus gauge\n"
 		"perfcached_process_cpus %.2f\n", pc_process_cpus());
 
-	/* S229: the node's lifecycle state, which /metrics never carried -
-	 * FAILED, STALLED and now HEALING were visible on the page and in
-	 * /stats only.  The Prometheus enum shape: one series per state,
-	 * 1 for the current one, so a panel can draw a state timeline and an
-	 * alert can match state="failed". */
+	/* the Prometheus enum shape: one series per state, 1 for the current one */
 	{
 		static const int sts[] = { PC_NST_STARTING, PC_NST_RECOVERING,
 			PC_NST_READY, PC_NST_DRAINING, PC_NST_FAILED,
-			PC_NST_STALLED, PC_NST_HEALING };
+			PC_NST_STALLED, PC_NST_HEALING, PC_NST_CONNECTING };
 		int cur = pc_node_state(), k;
 
 		emit(&o, "# HELP perfcached_node_state the node's lifecycle "
@@ -150,7 +125,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 				pc_node_state_name(sts[k]), sts[k] == cur);
 	}
 
-	/* S123: connections open right now, per door and dialect - gauges,
+	/* connections open right now, per door and dialect - gauges,
 	 * untouched by a counter reset */
 	emit(&o, "# HELP perfcached_connections_open connections open now, by door and dialect\n"
 		"# TYPE perfcached_connections_open gauge\n"
@@ -159,7 +134,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"perfcached_connections_open{door=\"native\",dialect=\"resp\"} %u\n",
 		PC_RESP_READ(pc_resp_open), PC_RESP_READ(pc_nat_bin_open),
 		PC_RESP_READ(pc_nat_resp_open));
-	emit(&o, "# HELP perfcached_clients_open client connections open across the data doors (S161)\n"
+	emit(&o, "# HELP perfcached_clients_open client connections open across the data doors\n"
 		"# TYPE perfcached_clients_open gauge\n"
 		"perfcached_clients_open %u\n"
 		"# HELP perfcached_max_clients the client limit in force\n"
@@ -171,7 +146,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		PC_RESP_READ(pc_clients_open), pc_max_clients,
 		__atomic_load_n(&pc_clients_refused, __ATOMIC_RELAXED));
 	{
-		struct pc_memguard_stats mg;   /* S366 */
+		struct pc_memguard_stats mg;
 
 		pc_memguard_stats(&mg);
 		emit(&o, "# HELP perfcached_memory_limit_bytes the memory this node may use (the tightest of MemTotal and its cgroups' limits)\n"
@@ -199,7 +174,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			mg.idle_released, mg.trims);
 	}
 	{
-		struct pc_pubsub_stats ps;   /* PS1/PS3 */
+		struct pc_pubsub_stats ps;
 
 		pc_pubsub_stats(&ps);
 		emit(&o, "# HELP perfcached_pubsub_subscribers subscriptions held by connections on this node\n"
@@ -247,7 +222,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			"# HELP perfcached_pubsub_alloc_failed_total deliveries not made because an allocation failed on this node\n"
 			"# TYPE perfcached_pubsub_alloc_failed_total counter\n"
 			"perfcached_pubsub_alloc_failed_total %llu\n"
-			"# HELP perfcached_pubsub_keyspace_events_total keyspace notifications emitted on this node (PS8)\n"
+			"# HELP perfcached_pubsub_keyspace_events_total keyspace notifications emitted on this node\n"
 			"# TYPE perfcached_pubsub_keyspace_events_total counter\n"
 			"perfcached_pubsub_keyspace_events_total %llu\n",
 			ps.subscribers, ps.channels, ps.patterns, ps.published,
@@ -255,7 +230,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			ps.relay_lost, ps.relay_dropped, ps.queue_dropped, ps.publish_paused, ps.queue_bytes, ps.relay_duplicates, ps.alloc_failed, ps.keyspace);
 	}
 	{
-		/* PS11: the dedicated relay plane */
+		/* the dedicated relay plane */
 		int rport, rthreads, rdirect;
 		unsigned long long sd, sc, rx;
 
@@ -276,7 +251,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			rthreads, rdirect, sd, sc, rx);
 	}
 	{
-		/* PS12: relaying only what a peer wants */
+		/* relaying only what a peer wants */
 		struct pc_psint_figures fi;
 
 		pc_cluster_pubsub_interest_figures(&fi);
@@ -302,7 +277,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			fi.resyncs_received);
 	}
 	{
-		/* PS5: pushes over UDP */
+		/* pushes over UDP */
 		struct pc_udp_figures uf;
 
 		pc_conn_udp_figures(&uf);
@@ -329,15 +304,12 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			uf.pruned_no_ack, uf.pruned_no_progress);
 	}
 	{
-		/* S159: the command rows by name - RESP under its Redis name,
-		 * the native door as cmd:<method> and bin:<verb> - and the log2
-		 * latency histogram behind them, in seconds as Prometheus wants
-		 * it: le = 3 us, 7 us, 15 us, ... 262.143 ms, +Inf (S359) */
+		/* per-command rows and their latency histogram, in seconds as Prometheus wants it */
 		struct pc_obs_cmdsum cs[128];
 		int nc = pc_obs_cmd_merge(cs, 128), ci, k;
 		char esc[64];
 
-		emit(&o, "# HELP perfcached_command_calls_total commands executed, by name: RESP under its Redis name, the native door as cmd:<method> and bin:<verb> (S159)\n"
+		emit(&o, "# HELP perfcached_command_calls_total commands executed, by name: RESP under its Redis name, the native door as cmd:<method> and bin:<verb>\n"
 			"# TYPE perfcached_command_calls_total counter\n");
 		for (ci = 0; ci < nc; ci++) {
 			label_escape(cs[ci].name, esc, sizeof esc);
@@ -351,13 +323,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			emit(&o, "perfcached_command_usec_total{cmd=\"%s\"} %llu\n",
 				esc, cs[ci].usec);
 		}
-		/* S359: one bucket per octave, not every fine bucket.  The daemon
-		 * keeps eight per octave (S183) for its own percentiles; written
-		 * out whole that was 129 series per command - 90% of this page,
-		 * scraped every 15 s.  Each bound below is an edge of the fine
-		 * histogram (an octave's last bucket, 2^n - 1 us, plus 3 us at the
-		 * fast end), so the cumulative counts are exact and any le this
-		 * emits was emitted before. */
+		/* one bucket per octave, not all the fine ones (129 series a command): each bound is an
+		 * edge of the fine histogram (2^n - 1 us, plus 3 us), so the cumulative counts stay exact */
 		emit(&o, "# HELP perfcached_command_latency_seconds per-command latency, one bucket per octave from 3 us up\n"
 			"# TYPE perfcached_command_latency_seconds histogram\n");
 		for (ci = 0; ci < nc; ci++) {
@@ -380,14 +347,12 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		}
 	}
 	{
-		/* S165: what this node answered as unknown or unsupported, by
-		 * dialect.  No per-name label: names are the client's to choose
-		 * and unbounded - /stats carries them, fleet-wide.  Per node, as
-		 * every counter here: Prometheus does the summing. */
+		/* no per-name label: names are the client's to choose and unbounded (/stats carries
+		 * them); per node, as every counter here - Prometheus does the summing */
 		unsigned long long ut[CLUNK_DIALECTS], up;
 
 		pc_obs_unknown_totals_raw(ut, &up);
-		emit(&o, "# HELP perfcached_commands_unknown_total commands this node answered as unknown or unsupported, by dialect (S165)\n"
+		emit(&o, "# HELP perfcached_commands_unknown_total commands this node answered as unknown or unsupported, by dialect\n"
 			"# TYPE perfcached_commands_unknown_total counter\n"
 			"perfcached_commands_unknown_total{dialect=\"resp\"} %llu\n"
 			"perfcached_commands_unknown_total{dialect=\"binary\"} %llu\n"
@@ -397,7 +362,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			ut[CLUNK_RESP], ut[CLUNK_BIN], up);
 	}
 
-	/* ---- memory: the S47 pressure surface ---------------------- */
+	/* ---- memory: the pressure surface ---------------------- */
 	pcache_arena_pressure(&pr);
 	held = pcache_arena_held_bytes();
 	mx = pcache_arena_max_bytes;
@@ -413,7 +378,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"perfcached_arena_live_bytes %llu\n",
 		(unsigned long long)pcache_arena_live_bytes());
 	emit(&o, "# HELP perfcached_arena_regions_free_bytes a retired index's "
-		"slots, kept for the next index - not room for records (S445)\n"
+		"slots, kept for the next index - not room for records\n"
 		"# TYPE perfcached_arena_regions_free_bytes gauge\n"
 		"perfcached_arena_regions_free_bytes %lu\n",
 		pr.regions_free_warm_bytes + pr.regions_free_cold_bytes);
@@ -423,7 +388,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 	emit(&o, "# HELP perfcached_arena_warm_free_bytes free slots kept resident\n"
 		"# TYPE perfcached_arena_warm_free_bytes gauge\n"
 		"perfcached_arena_warm_free_bytes %lu\n", pr.warm_free_bytes);
-	/* S150 C: the region zone's free set and how the carve is served */
+	/* the region zone's free set and how the carve is served */
 	emit(&o, "# HELP perfcached_arena_regions_free_warm_bytes retired index slots kept resident (inside warm_free)\n"
 		"# TYPE perfcached_arena_regions_free_warm_bytes gauge\n"
 		"perfcached_arena_regions_free_warm_bytes %lu\n", pr.regions_free_warm_bytes);
@@ -460,16 +425,16 @@ size_t pc_metrics_render(char *buf, size_t cap)
 	emit(&o, "# HELP perfcached_arena_commits_ahead_total 2 MB groups committed ahead of the chunk frontier by the reclaim tick\n"
 		"# TYPE perfcached_arena_commits_ahead_total counter\n"
 		"perfcached_arena_commits_ahead_total %lu\n", pr.commits_ahead);
-	emit(&o, "# HELP perfcached_arena_commits_inline_total 2 MB groups a carve had to commit itself - the write path populating with a client waiting (S166)\n"
+	emit(&o, "# HELP perfcached_arena_commits_inline_total 2 MB groups a carve had to commit itself - the write path populating with a client waiting\n"
 		"# TYPE perfcached_arena_commits_inline_total counter\n"
 		"perfcached_arena_commits_inline_total %lu\n", pr.commits_inline);
-	emit(&o, "# HELP perfcached_arena_commits_index_total 2 MB groups committed by a region carve - a table split on the maintenance thread, or a collection created (S168)\n"
+	emit(&o, "# HELP perfcached_arena_commits_index_total 2 MB groups committed by a region carve - a table split on the maintenance thread, or a collection created\n"
 		"# TYPE perfcached_arena_commits_index_total counter\n"
 		"perfcached_arena_commits_index_total %lu\n", pr.commits_index);
 	emit(&o, "# HELP perfcached_arena_locked_bytes bytes of the arena locked in RAM (mlock); 0 = the arena is swappable\n"
 		"# TYPE perfcached_arena_locked_bytes gauge\n"
 		"perfcached_arena_locked_bytes %lu\n", pr.locked_bytes);
-	emit(&o, "# HELP perfcached_arena_pin_lost 1 = a group could not be locked after a pinned start: the arena is partly swappable (S167)\n"
+	emit(&o, "# HELP perfcached_arena_pin_lost 1 = a group could not be locked after a pinned start: the arena is partly swappable\n"
 		"# TYPE perfcached_arena_pin_lost gauge\n"
 		"perfcached_arena_pin_lost %u\n", pr.pin_lost);
 	emit(&o, "# HELP perfcached_hugetlb_pool_empty_total punched groups not re-committed, pool empty\n"
@@ -482,7 +447,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_writes_refused_inplace_total counter\n"
 		"perfcached_writes_refused_inplace_total %lu\n",
 		__atomic_load_n(&pcache_nomem_inplace, __ATOMIC_RELAXED));
-	emit(&o, "# HELP perfcached_stale_dropped_total older copies dropped because a newer one could not land at the ceiling - reads pull instead of serving them (S244)\n"
+	emit(&o, "# HELP perfcached_stale_dropped_total older copies dropped because a newer one could not land at the ceiling - reads pull instead of serving them\n"
 		"# TYPE perfcached_stale_dropped_total counter\n"
 		"perfcached_stale_dropped_total %lu\n",
 		__atomic_load_n(&pcache_nomem_dropped, __ATOMIC_RELAXED));
@@ -512,7 +477,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 	n = pc_store_count();
 	for (i = 0; i < n; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		pcache_ht_totals_t t;
 		char esc[128];
 
@@ -521,11 +486,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "perfcached_collection_entries{collection=\"%s\"} %lu\n",
 			esc, t.entries);
 	}
-	/* S131: the overflow leg, and what the walk across it costs.  A
-	 * table at its target load factor keeps the leg near empty; one
-	 * that has stopped growing puts everything there, and the walk
-	 * blocks every other maintenance duty for its whole duration.
-	 * Alert on the leg, not on entries. */
+	/* the overflow leg: near empty at the target load factor, everything once growth stops, and
+	 * its walk blocks every other maintenance duty - alert on the leg, not on entries */
 	emit(&o, "# HELP perfcached_collection_overflow records in the overflow leg rather than in a bucket's slots\n"
 		"# TYPE perfcached_collection_overflow gauge\n");
 	for (i = 0; i < n; i++) {
@@ -537,10 +499,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "perfcached_collection_overflow{collection=\"%s\"} %u\n",
 			esc, pcache_ht_overflow(pc_store_ht(i)));
 	}
-	/* S239: the sizing mode as an info-style gauge (1 on the mode it is
-	 * in), and the size AUTO would resize it to - 0 when it would leave
-	 * it.  Alert on a WARN collection whose target is non-zero, and on
-	 * any overflow while the mode is not auto (growth is blocked). */
+	/* alert on a WARN collection whose target is non-zero, and on any overflow while the mode is
+	 * not auto (growth is blocked) */
 	emit(&o, "# HELP perfcached_collection_autoscale_mode how the table is sized: auto grows and shrinks it, warn only reports, off leaves it\n"
 		"# TYPE perfcached_collection_autoscale_mode gauge\n");
 	for (i = 0; i < n; i++) {
@@ -576,12 +536,12 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "perfcached_collection_held_walk_seconds{collection=\"%s\"} %.6f\n",
 			esc, pc_store_held_walk_us(i) / 1000000.0);
 	}
-	/* S120: the budget's parts per collection */
+	/* the budget's parts per collection */
 	emit(&o, "# HELP perfcached_collection_index_bytes index regions carved for the collection's table (creation and growth), never freed\n"
 		"# TYPE perfcached_collection_index_bytes gauge\n");
 	for (i = 0; i < n; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		char esc[128];
 
 		label_escape(pc_store_name(i), esc, sizeof esc);
@@ -592,7 +552,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_collection_record_bytes gauge\n");
 	for (i = 0; i < n; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		char esc[128];
 
 		label_escape(pc_store_name(i), esc, sizeof esc);
@@ -603,7 +563,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_collection_held_bytes gauge\n");
 	for (i = 0; i < n; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		unsigned int age = 0;
 		unsigned long long hb = pc_store_held(i, &age);
 		char esc[128];
@@ -618,7 +578,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_collection_hits_total counter\n");
 	for (i = 0; i < n; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		pcache_ht_totals_t t;
 		char esc[128];
 
@@ -631,7 +591,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_collection_misses_total counter\n");
 	for (i = 0; i < n; i++) {
 		if (!pc_store_live(i))
-			continue;   /* S69: a dropped collection */
+			continue;   /* a dropped collection */
 		pcache_ht_totals_t t;
 		char esc[128];
 
@@ -640,9 +600,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "perfcached_collection_misses_total{collection=\"%s\"} %lu\n",
 			esc, t.misses);
 	}
-	/* S151: the client-only view.  The totals above count every origin -
-	 * a peer serving a pull and recovery probing its replay both land
-	 * there - so a hit rate built from them is "anyone", not "clients". */
+	/* the client-only view: the totals above also count peers serving pulls and recovery probes,
+	 * so a hit rate from them means "anyone", not "clients" */
 	emit(&o, "# HELP perfcached_collection_client_hits_total read hits from client workers only\n"
 		"# TYPE perfcached_collection_client_hits_total counter\n");
 	for (i = 0; i < n; i++) {
@@ -672,9 +631,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 
 	/* ---- durability -------------------------------------------- */
 	pc_wal_get_stats(&ws);
-	/* S145: staged (acked, still in a producer ring) and unsynced (in the
-	 * file, not yet fdatasync'd) are different losses - the first goes on
-	 * kill -9 and can be DROPPED, the second goes only with the power. */
+	/* staged (acked, still in a producer ring) is lost on kill -9 and can be DROPPED; unsynced
+	 * (in the file, not yet fdatasync'd) only with the power */
 	emit(&o, "# HELP perfcached_wal_staged_records acknowledged writes not yet in the log file (lost on kill -9)\n"
 		"# TYPE perfcached_wal_staged_records gauge\n"
 		"perfcached_wal_staged_records %llu\n",
@@ -683,10 +641,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_wal_unsynced_records gauge\n"
 		"perfcached_wal_unsynced_records %llu\n",
 		ws.pending_hi > ws.synced_seq ? ws.pending_hi - ws.synced_seq : 0ULL);
-	/* S224: whether snapshots can keep up with the WAL - alert when
-	 * full_in_seconds (when measured, >= 0) falls below twice
-	 * perfcached_rdb_last_duration_seconds, emitted with the rdb block
-	 * below.  The README writes the rule out. */
+	/* alert when full_in_seconds (when >= 0) falls below twice
+	 * perfcached_rdb_last_duration_seconds; the README writes the rule out */
 	emit(&o, "# HELP perfcached_wal_fill_mb_per_second how fast the WAL "
 		"ring is filling (smoothed, decays while idle)\n"
 		"# TYPE perfcached_wal_fill_mb_per_second gauge\n"
@@ -695,7 +651,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"segments last at the current fill rate (-1 = not measured)\n"
 		"# TYPE perfcached_wal_full_in_seconds gauge\n"
 		"perfcached_wal_full_in_seconds %.1f\n", ws.full_in_s);
-	/* RV-13: the whole ring's fill time - below the last snapshot's
+	/* the whole ring's fill time - below the last snapshot's
 	 * duration no trigger can keep a snapshot ahead of the WAL */
 	emit(&o, "# HELP perfcached_wal_ring_fill_seconds how long the WHOLE "
 		"WAL ring takes to fill at the current rate (-1 = not measured); "
@@ -703,7 +659,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_wal_ring_fill_seconds gauge\n"
 		"perfcached_wal_ring_fill_seconds %.1f\n", ws.ring_fill_s);
 	if (ws.segments > 0) {
-		/* S437: the ring's shape and its use */
+		/* the ring's shape and its use */
 		emit(&o, "# HELP perfcached_wal_segments segment files in the WAL ring\n"
 			"# TYPE perfcached_wal_segments gauge\n"
 			"perfcached_wal_segments %d\n"
@@ -726,7 +682,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 	emit(&o, "# HELP perfcached_wal_appended_total records written to the WAL\n"
 		"# TYPE perfcached_wal_appended_total counter\n"
 		"perfcached_wal_appended_total %llu\n", ws.appended);
-	/* the S58 metric: a ring-full drop is a record the barrier can
+	/* a ring-full drop is a record the barrier can
 	 * never cover, so it belongs on a dashboard, not only in a log */
 	emit(&o, "# HELP perfcached_wal_dropped_total records dropped, ring full\n"
 		"# TYPE perfcached_wal_dropped_total counter\n"
@@ -737,9 +693,6 @@ size_t pc_metrics_render(char *buf, size_t cap)
 	emit(&o, "# HELP perfcached_wal_synced_seq newest fsynced sequence\n"
 		"# TYPE perfcached_wal_synced_seq gauge\n"
 		"perfcached_wal_synced_seq %llu\n", ws.synced_seq);
-	/* S215: 1 = the device refused a WAL write or sync and the node
-	 * failed itself over it; the watermark above has stopped for good */
-	/* S229: heals - a lost record made durable again by a snapshot */
 	emit(&o, "# HELP perfcached_wal_heals_total times the node healed "
 		"lost WAL records with a snapshot and returned to service\n"
 		"# TYPE perfcached_wal_heals_total counter\n"
@@ -753,7 +706,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		"# TYPE perfcached_wal_last_heal_seconds gauge\n"
 		"perfcached_wal_last_heal_seconds %.3f\n",
 		(double)ws.last_heal_ms / 1000);
-	/* S306: routine healing - an alert compares heals_recent with the
+	/* routine healing - an alert compares heals_recent with the
 	 * threshold, or reads heal_routine directly */
 	emit(&o, "# HELP perfcached_wal_heals_recent heals in the last %d "
 		"seconds\n"
@@ -784,10 +737,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 				"# TYPE perfcached_rdb_save_errors_total counter\n"
 				"perfcached_rdb_save_errors_total %llu\n",
 				rs.save_errors);
-			/* RV-12: the other side of S224's alert, and the
-			 * figures that say snapshots have stopped.  S224
-			 * documented a rule against a duration that only
-			 * /stats carried. */
+			/* the duration the full_in_seconds alert compares with, and the figures that say
+			 * snapshots have stopped */
 			emit(&o, "# HELP perfcached_rdb_saves_total snapshots "
 				"completed and published by this process\n"
 				"# TYPE perfcached_rdb_saves_total counter\n"
@@ -817,7 +768,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		struct pc_cl_stats cs;
 
 		pc_cluster_get_stats(&cs);
-		{                                       /* S296 */
+		{
 			struct pc_rebalance rbs;
 
 			pc_cluster_rebalance(&rbs);
@@ -829,7 +780,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 				"perfcached_rebalance_moved_records_total %llu\n",
 				rbs.moved_records);
 		}
-		{                                              /* S36d */
+		{
 			char fid[16 * 37], fad[16][24];
 			long long fago[16];
 			unsigned long long ffr[16];
@@ -847,7 +798,6 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "# HELP perfcached_cluster_map_valid the map is usable\n"
 			"# TYPE perfcached_cluster_map_valid gauge\n"
 			"perfcached_cluster_map_valid %d\n", cs.map_valid);
-		/* S216 */
 		emit(&o, "# HELP perfcached_cluster_thread_stalled the cluster "
 			"thread has made no progress for apply_stall_ms (the "
 			"node reports STALLED)\n"
@@ -863,15 +813,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			"# TYPE perfcached_cluster_thread_stall_max_ms gauge\n"
 			"perfcached_cluster_thread_stall_max_ms %llu\n",
 			cs.apply_stall_ms_max);
-		/* S223: 1 when this node's reconcile was skipped because no
-		 * live peer was up while it was down - the fleet came back
-		 * together, so nothing was deleted.  The expected state on
-		 * EVERY node after a whole-fleet outage, and never after an
-		 * ordinary rejoin. */
-		/* RV-15: the negative cache is direct-mapped - a set onto a
-		 * slot holding a live entry for another key displaces it, and
-		 * a displaced TOMBSTONE no longer guards its key against a
-		 * copy of the deleted record still crossing on the wire */
+		/* the negative cache is direct-mapped: a displaced TOMBSTONE no longer guards its key
+		 * against a copy of the deleted record still crossing on the wire */
 		emit(&o, "# HELP perfcached_cluster_neg_displaced_total live "
 			"negative-cache entries overwritten by another key\n"
 			"# TYPE perfcached_cluster_neg_displaced_total counter\n"
@@ -884,9 +827,6 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			"perfcached_cluster_tomb_displaced_total %llu\n",
 			cs.tomb_displaced);
 		{
-			/* G8: an mget across owners - the ones that waited on
-			 * remote lookups, those that ended with a key not
-			 * answered in time, those refused (cap, pending table) */
 			unsigned long long mf, mu, mr;
 
 			pc_mget_stats(0, &mf, &mu, &mr);
@@ -912,16 +852,15 @@ size_t pc_metrics_render(char *buf, size_t cap)
 
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			clretain_get_stats(&rt, (unsigned int)ts.tv_sec);
-			/* S443: deletes AND expiries (an eager collection's
-			 * reaped keys, S392) - and the expiries apart */
+			/* deletes AND expiries (an eager collection's reaped keys), and the expiries apart */
 			emit(&o, "# HELP perfcached_cluster_tombstones_retained deletes "
 				"and expiries remembered past the crossing window, so a "
 				"partition healing inside tombstone_retain_s cannot undo "
-				"them (S238)\n"
+				"them\n"
 				"# TYPE perfcached_cluster_tombstones_retained gauge\n"
 				"perfcached_cluster_tombstones_retained %llu\n"
 				"# HELP perfcached_cluster_tombstones_retained_expiries of "
-				"them, keys an eager collection expired (S443)\n"
+				"them, keys an eager collection expired\n"
 				"# TYPE perfcached_cluster_tombstones_retained_expiries gauge\n"
 				"perfcached_cluster_tombstones_retained_expiries %llu\n"
 				"# HELP perfcached_cluster_tombstones_retained_bytes what "
@@ -935,7 +874,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 				"# TYPE perfcached_cluster_tombstones_dropped_early_total counter\n"
 				"perfcached_cluster_tombstones_dropped_early_total %llu\n"
 				"# HELP perfcached_cluster_tombstones_dropped_early_expiries_total "
-				"of them, expiries (S443)\n"
+				"of them, expiries\n"
 				"# TYPE perfcached_cluster_tombstones_dropped_early_expiries_total counter\n"
 				"perfcached_cluster_tombstones_dropped_early_expiries_total %llu\n"
 				"# HELP perfcached_cluster_tombstones_replayed_total deletes "
@@ -945,13 +884,14 @@ size_t pc_metrics_render(char *buf, size_t cap)
 				rt.entries, rt.expiries, rt.bytes, rt.dropped_early,
 				rt.dropped_early_expiries, pc_cluster_tomb_catchup_sent());
 		}
+		/* expected on EVERY node after a whole-fleet outage (nothing was deleted), never after an
+		 * ordinary rejoin */
 		emit(&o, "# HELP perfcached_cluster_reconcile_skipped the "
 			"reconcile was skipped: no peer was up while this node "
 			"was down\n"
 			"# TYPE perfcached_cluster_reconcile_skipped gauge\n"
 			"perfcached_cluster_reconcile_skipped %d\n",
 			cs.reconcile_skipped ? 1 : 0);
-		/* S274 */
 		emit(&o, "# HELP perfcached_cluster_restart_safe 1 when a restart "
 			"of this node now would find a reconcile witness (a peer up "
 			"long enough to have seen the outage)\n"
@@ -962,26 +902,19 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			"# TYPE perfcached_cluster_restart_witnesses gauge\n"
 			"perfcached_cluster_restart_witnesses %d\n",
 			cs.restart_safe ? 1 : 0, cs.restart_witnesses);
-		/* S221: a peer speaking another cluster wire epoch is refused
-		 * at the door.  Non-zero during a rolling upgrade is expected
-		 * and ends when the last old node is cut; non-zero after it
-		 * means a node was missed, and it is not in the fleet. */
+		/* non-zero epoch_refused is expected during a rolling upgrade; after it, a node was missed
+		 * and is not in the fleet */
 		emit(&o, "# HELP perfcached_cluster_wire_epoch the cluster wire "
 			"contract this build speaks\n"
 			"# TYPE perfcached_cluster_wire_epoch gauge\n"
-			"perfcached_cluster_wire_epoch %d\n", pc_cluster_epoch());   /* 12nu: the one spoken */
+			"perfcached_cluster_wire_epoch %d\n", pc_cluster_epoch());
 		emit(&o, "# HELP perfcached_cluster_epoch_refused_total peer "
 			"datagrams refused for speaking another wire epoch\n"
 			"# TYPE perfcached_cluster_epoch_refused_total counter\n"
 			"perfcached_cluster_epoch_refused_total %llu\n",
 			cs.epoch_refused);
-		/* S125: replica lag.  A node falling behind on inbound copies
-		 * looks healthy from every other angle - it heartbeats, it
-		 * serves clients fast, it stays a member - so these are the
-		 * figures to alert on.  applied_total is a counter; the rest
-		 * are the daemon's own 1 Hz readings, published as gauges
-		 * rather than recomputed by the scraper, because the useful
-		 * rate is the one measured against the real elapsed tick. */
+		/* replica lag: a node falling behind looks healthy from every other angle, so alert here;
+		 * the per-second gauges are the daemon's 1 Hz readings, against the real elapsed tick */
 		emit(&o, "# HELP perfcached_cluster_rx_applied_total replica records applied\n"
 			"# TYPE perfcached_cluster_rx_applied_total counter\n"
 			"perfcached_cluster_rx_applied_total %llu\n", cs.rx_applied);
@@ -991,7 +924,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "# HELP perfcached_cluster_rx_older_per_second replica copies refused as older per second\n"
 			"# TYPE perfcached_cluster_rx_older_per_second gauge\n"
 			"perfcached_cluster_rx_older_per_second %u\n", cs.rx_older_ps);
-		/* S212: the sweep and reconcile clocks - the numbers that say
+		/* the sweep and reconcile clocks - the numbers that say
 		 * when the full-keyspace walks have become a cost */
 		emit(&o, "# HELP perfcached_cluster_repl_sweep_ms wall time of the last completed eager repair cycle\n"
 			"# TYPE perfcached_cluster_repl_sweep_ms gauge\n"
@@ -1011,7 +944,6 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "# HELP perfcached_cluster_reconcile_pending reconcile probes issued and not yet answered\n"
 			"# TYPE perfcached_cluster_reconcile_pending gauge\n"
 			"perfcached_cluster_reconcile_pending %llu\n", cs.reconcile_pending);
-		/* S392, S393, S395 */
 		emit(&o, "# HELP perfcached_cluster_reconcile_open 1 while this node's post-restart reconcile pass is open\n"
 			"# TYPE perfcached_cluster_reconcile_open gauge\n"
 			"perfcached_cluster_reconcile_open %d\n", cs.reconcile_open);
@@ -1039,7 +971,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 		emit(&o, "# HELP perfcached_cluster_reconcile_eta_seconds seconds left in the walk at its current rate, -1 when not known\n"
 			"# TYPE perfcached_cluster_reconcile_eta_seconds gauge\n"
 			"perfcached_cluster_reconcile_eta_seconds %lld\n", cs.reconcile_eta_s);
-		emit(&o, "# HELP perfcached_cluster_replicas_short replicas minus live members, 0 when met (S157)\n"
+		emit(&o, "# HELP perfcached_cluster_replicas_short replicas minus live members, 0 when met\n"
 			"# TYPE perfcached_cluster_replicas_short gauge\n"
 			"perfcached_cluster_replicas_short %d\n", pc_cluster_replicas_short());
 		emit(&o, "# HELP perfcached_cluster_rx_drops_total datagrams the receive buffers could not hold\n"
@@ -1056,7 +988,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			"perfcached_cluster_rx_rcvbuf_bytes %u\n", cs.rx_rcvbuf);
 	}
 
-	/* S465: the link under the node's address, over the last minute */
+	/* the link under the node's address, over the last minute */
 	{
 		struct hostlink hl;
 		char dev[160];
@@ -1077,7 +1009,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 					"perfcached_link_speed_mbps{device=\"%s\"} %d\n", dev, hl.speed_mbps);
 		}
 	}
-	/* S352: the alerts raised now, by level - a dashboard alerts on
+	/* the alerts raised now, by level - a dashboard alerts on
 	 * these without reading the mail - and what the mailer did */
 	{
 		struct pc_mail_stats ms;
@@ -1110,15 +1042,14 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			rin, rout, rdrop);
 	}
 
-	/* 0.6.0 step 1 (DESIGN 12li): system calls against the work they
-	 * moved - datagrams per syscall is 1.0 until S364 */
+	/* system calls against the work they moved */
 	{
 		static const char *const plane[PC_UDP_N] = { "cluster", "relay" };
 		struct pc_iostat io;
 		int u;
 
 		pc_iostat_get(&io, 0);
-		emit(&o, "# HELP perfcached_io_backend_info the workers' I/O backend: configured, running, buffers (S361)\n"
+		emit(&o, "# HELP perfcached_io_backend_info the workers' I/O backend: configured, running, buffers\n"
 			"# TYPE perfcached_io_backend_info gauge\n"
 			"perfcached_io_backend_info{configured=\"%s\",active=\"%s\",buffers=\"%s\"} 1\n",
 			pc_io_backend_name(pc_io_backend.configured),
@@ -1140,7 +1071,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			"perfcached_io_syscalls_total{call=\"read\"} %llu\n"
 			"perfcached_io_syscalls_total{call=\"write\"} %llu\n",
 			io.reads, io.writes);
-		emit(&o, "# HELP perfcached_io_uring_enters_total an io_uring worker's io_uring_enter() calls (S361)\n"
+		emit(&o, "# HELP perfcached_io_uring_enters_total an io_uring worker's io_uring_enter() calls\n"
 			"# TYPE perfcached_io_uring_enters_total counter\n"
 			"perfcached_io_uring_enters_total %llu\n"
 			"# HELP perfcached_io_uring_completions_total completions those workers reaped\n"
@@ -1153,7 +1084,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 			"# TYPE perfcached_io_uring_sends_total counter\n"
 			"perfcached_io_uring_sends_total %llu\n",
 			io.ur_enters, io.ur_cqes, io.ur_recvs, io.ur_sends);
-		{                                   /* S372 */
+		{
 			struct pc_out_pause_stats op;
 
 			pc_conn_out_pause_stats(&op);
@@ -1168,10 +1099,8 @@ size_t pc_metrics_render(char *buf, size_t cap)
 				"perfcached_clients_output_stall_kills_total %llu\n",
 				op.paused_now, op.pauses, op.stall_kills);
 		}
-		/* S361: per worker, whichever backend it runs - which worker
-		 * carries the load, and the instrument a test uses to see
-		 * where a connection landed (write() is no longer the only
-		 * way out, so /proc's per-thread syscw cannot say) */
+		/* per worker, whichever backend: which worker carries the load, and where a test sees a
+		 * connection land (write() is not the only way out, so /proc's syscw cannot say) */
 		emit(&o, "# HELP perfcached_io_worker_ops_total a worker's client I/O: in = read() calls or receive completions, out = write() calls or sends, wait = epoll waits or io_uring_enter() calls\n"
 			"# TYPE perfcached_io_worker_ops_total counter\n");
 		for (u = 0; u < pc_io_backend.workers; u++) {
@@ -1184,7 +1113,7 @@ size_t pc_metrics_render(char *buf, size_t cap)
 				u, ws.reads + ws.ur_recvs, u, ws.writes + ws.ur_sends,
 				u, ws.ep_waits + ws.ur_enters);
 		}
-		/* S379: a worker's time outside its wait; rate() over it is the
+		/* a worker's time outside its wait; rate() over it is the
 		 * busy share the page and the epoll-busy alert read */
 		emit(&o, "# HELP perfcached_io_worker_busy_seconds_total a worker's time outside its wait (epoll_wait or io_uring_enter - which also submits the sends)\n"
 			"# TYPE perfcached_io_worker_busy_seconds_total counter\n");

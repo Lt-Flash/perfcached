@@ -1,26 +1,6 @@
 #!/bin/sh
-# reconcileholdtest.sh - S394 (DESIGN 12nd): the restart reconcile asks by
-# hold-check - a batch of keys per datagram, answered held or absent with the
-# version, never a value - when every live member answers one, and by pull
-# (as before) while a member does not.
-#
-# Three eager nodes with a WAL, 200 keys written through node 1.  The pass is
-# the subject, so the fast path is off (reconcile_fast = no: it would end the
-# pass from a witness's replay) and it walks.
-#   1. node 3 stopped once a restart of it is witnessed, 50 keys deleted
-#      meanwhile, node 3 started: its walk asks by hold-check - every key it
-#      probes (reconcile_holdchecks = reconcile_probed, none by pull; the
-#      slots that match the witness's digests are not probed at all, S261,
-#      so at least the 50) - drops exactly the 50 (reconciled 50) and keeps
-#      the other 150; its peers count the keys they answered
-#      (holdchecks_served)
-#   2. node 2 restarted with PERFCACHED_TEST_NO_HOLDQ (it announces no
-#      HOLDQ and drops hold-checks, as a build before 0.7.2): node 3 stopped,
-#      30 more deleted, node 3 started - its walk asks by pull (no new
-#      hold-check), and still drops exactly the 30
-# The standalone edition refuses [cluster]: SKIPPED, loudly.
-# Fail-first: a build before S394 has no reconcile_holdchecks - 1 fails.
-# Usage: test/reconcileholdtest.sh [./perfcached]
+# reconcileholdtest.sh - the restart reconcile asks by hold-check (a batch of keys per datagram, held or
+# absent with the version) when every live member answers one, and by pull while one does not.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -60,13 +40,10 @@ advertise = 127.0.31.$1
 mode = eager
 # the open pass is the subject: walk, never the fast path
 reconcile_fast = no
-# ... and the walk alone: with the marks (12ny, 0.7.3) a restarted member
-# also asks the origin for the tail of its deletes, and the ones that come
-# back that way are applied as deletes, not counted as reconciled - the
-# exact 50 below read 47 (v0.7.3-rc1, GitLab 111842)
+# ... and the walk alone: with the marks a restarted member also asks the origin for
+# its deletes' tail, applied as deletes and not counted as reconciled
 tombstone_acks = no
-# ... nor the S238 catch-up: a replay ahead of the walk leaves it nothing to
-# count (rc13 GitLab: reconciled 0, node 3 holding 150)
+# ... nor the catch-up: a replay ahead of the walk leaves it nothing to count
 tombstone_retain_s = 0
 collections = 0
 [collection 0]
@@ -157,7 +134,7 @@ else
 	bad "1. node 3's pass: reconciled $(st 3 'c.get("reconciled")') (want 50), open $(st 3 'c.get("reconcile_open")'), holds $(ents 3), resyncs $(st 3 'c.get("resyncs")'), skipped $(st 3 'c.get("reconcile_skipped")'), replayed by 1/2 $(st 1 'c.get("tombstones_retained", {}).get("replayed")')/$(st 2 'c.get("tombstones_retained", {}).get("replayed")')"
 fi
 
-# ---- 2. a member that does not answer them: the pull, as before -----------
+# ---- 2. a member that does not answer them: the pull ----------------------
 stop1 2
 start 2 2 PERFCACHED_TEST_NO_HOLDQ=1 || exit 1
 ready3

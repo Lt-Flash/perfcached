@@ -1,28 +1,6 @@
 #!/bin/sh
-# upinvflighttest.sh - S424 (0.7.1; AR13 on 245-247, 2026-10-20): a fetch
-# overtaken by an invalidation of its key.  One fake (test/fakeupstream.py),
-# read-through with tracking as PROD's prod-redis has it: a fetch's reads are
-# tracked and their invalidations arrive on another connection.  The fake's
-# reply_delay_ms takes the value at once and answers 400 ms later - a reply in
-# flight.  Per key: a cold GET starts the fetch (it reads "old"); 150 ms in,
-# the key becomes "new" upstream and the invalidation is pushed; the fetch's
-# reply lands after it.  Before S424 the node kept that "old" copy - nothing
-# invalidates it again (245: the previous value served 500 ms and more after
-# a write).
-#  A. ten keys: every read from 0.6 s to 2 s after the change answers "new"
-#  B. the race happened: inflight_invalidated and inflight_refetches count it
-#     (a pass that never raced would prove nothing)
-#  C. no write reached the upstream
-#  D. S433: a key that keeps changing while its fetches are in flight - every
-#     150 ms for 1.8 s, each fetch's reply 400 ms late - overtakes all four
-#     rounds, and the last copy is kept for its waiters (inflight_kept).  It
-#     holds the value from before the last change, and no invalidation is
-#     left to reach it: kept whole it answered that value until the key
-#     changed again.  Capped as an untracked fill (upstream_negative_ms), a
-#     read 6 s after the last change answers the last value.
-# Fail-first: on the build before S424 A reads "old" (B's counters are absent);
-# on the build before S433 D reads the kept, older value.
-# Usage: test/upinvflighttest.sh [./perfcached]
+# upinvflighttest.sh - a read-through fetch overtaken by an invalidation of its key is refetched, and
+# a copy kept for waiters is capped as an untracked fill.  Usage: test/upinvflighttest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -150,9 +128,8 @@ t = threading.Thread(target=lambda: first.__setitem__("v", get(key)))
 t.start()
 n = 0
 t0 = time.time()
-# a change every 150 ms overtakes each 400 ms reply, until the third refetch
-# (the fourth and last round) has started; then ONE change while that round
-# is in flight - after its read, before its reply - and none after it
+# a change every 150 ms overtakes each 400 ms reply until the last round has started;
+# then ONE change while that round is in flight, and none after it
 while refetches() - r0 < 3 and time.time() - t0 < 10:
     time.sleep(0.15); n += 1; change("c%d" % n)
 time.sleep(0.15); n += 1; change("c%d" % n)

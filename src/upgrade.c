@@ -1,18 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * upgrade.c - UP6n/UP5 (DESIGN 12nf): who may vouch for a build to install.
- *
- * A release artifact (the tarball) carries a detached ed25519 signature
- * over its bytes - what `openssl pkeyutl -sign -rawin` makes with the
- * release key on the build host.  It verifies against the release key
- * built in here, or one of [upgrade] trusted_keys.  Anything else is
- * refused; an unsigned artifact too, unless [upgrade] allow_unsigned.
- *
- * `perfcached -K <file>` runs the same check offline.  The root helper
- * (perfcached-upgrade) asks the INSTALLED binary, so an artifact never
- * vouches for itself.
- */
+/* upgrade.c - stage, verify and switch to a release build (the contract is upgrade.h's) */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -37,7 +25,7 @@
 #define PC_BUILD_REV "unknown"
 #endif
 
-/* ---- UP5: the node file ------------------------------------------------ */
+/* ---- the node file ----------------------------------------------------- */
 
 static struct {
 	char dir[512];                 /* <state_dir>/upgrade, "" = off */
@@ -98,7 +86,7 @@ int pc_upg_node_init(const char *state_dir)
 	return 0;
 }
 
-static uint32_t FACT;                   /* UPS: the cached fact */
+static uint32_t FACT;                   /* the cached fact */
 static void fact_tick(void);
 static void switch_asked_tick(void);
 /* clmsg.h's UPGSW_* (cluster.c pins them equal) */
@@ -114,8 +102,8 @@ void pc_upg_node_tick(void)
 	static unsigned int n;
 	int st;
 
-	switch_asked_tick();                    /* UPS: a member's ask - answered
-	                                         * even here with none (refused) */
+	switch_asked_tick();                    /* a member's ask - answered even
+	                                         * with no state directory (refused) */
 	if (!N.dir[0])
 		return;
 	if (n++ % 5 == 0)
@@ -125,12 +113,11 @@ void pc_upg_node_tick(void)
 		node_write(st);
 }
 
-/* ---- UP6n: staging ----------------------------------------------------- */
+/* ---- staging ----------------------------------------------------------- */
 
 static pthread_mutex_t SL = PTHREAD_MUTEX_INITIALIZER;
-/* the relay notes and the switch/ask queues have their own: the cluster
- * thread takes it every beat, and must never wait behind SL - SL is held
- * while a whole build is read and verified.  Order: SL, then QL */
+/* the relay notes' and the switch/ask queues' own lock: the cluster thread takes it every beat and
+ * must never wait behind SL, held while a whole build is read and verified.  Order: SL, then QL */
 static pthread_mutex_t QL = PTHREAD_MUTEX_INITIALIZER;
 static struct pc_upgrade_conf UC;          /* set once at start */
 static struct {
@@ -265,10 +252,8 @@ static int staged_list(struct sent *e, int max)  /* under SL */
 		e[n].sha[64] = 0;
 		e[n].size = (long long)st.st_size;
 		e[n].at = st.st_mtime;
-		/* 0.6.5 rc5: ordered at the file system's resolution - two builds
-		 * staged within one second (a fast runner stages a 2 MB build in
-		 * well under one) were told apart arbitrarily, and the prune
-		 * could drop the newer of them */
+		/* ordered at the file system's resolution: two builds staged within one second would be
+		 * told apart arbitrarily, and the prune could drop the newer */
 		e[n].at_ns = (long long)st.st_mtim.tv_sec * 1000000000LL +
 			st.st_mtim.tv_nsec;
 		n++;
@@ -312,14 +297,8 @@ static int hexsha(const char *h, unsigned char out[32])
 		bl == 32 ? 0 : -1;
 }
 
-/* PD-9 (DESIGN 12nr): how this daemon was installed.  A package is upgraded
- * by the package manager - its helper is deliberately not in the packages -
- * so a build staged on a package host would never be switched to; the
- * verb refuses it instead.  [daemon] install_mode overrides the detection:
- * the binary under /opt/perfcached-* is a prefix install (the release
- * tarballs, the self-upgrade's layout); the packages write
- * /usr/share/perfcached/INSTALL-MODE; anything else is "local" (a
- * `make install`). */
+/* detected: a binary under /opt/perfcached-* is a prefix install, the packages write INSTALL-MODE,
+ * else local; packages ship no helper, so a build staged there could never be switched to */
 static int inst_cfg;                       /* PC_INSTALL_* from the config */
 static const char *inst_names[] = { "auto", "package", "prefix", "local" };
 
@@ -379,7 +358,7 @@ int pc_upg_stage_begin(long long size, const char *sha_hex,
 		*err = "this node has no state directory - nowhere to stage";
 		return -1;
 	}
-	if (!strcmp(pc_upg_install_mode(), "package")) {      /* PD-9 */
+	if (!strcmp(pc_upg_install_mode(), "package")) {
 		*err = "this node is a package install - upgrade it with the "
 			"package manager (apt, apk), not with upgrade_stage";
 		return -1;
@@ -640,7 +619,7 @@ static void meta_get(const char *sha, const char *key, char *out, size_t ol)
 static void switch_tree(struct pc_tw *out);
 static void asks_tree(struct pc_tw *out);
 
-static void revert_tree(struct pc_tw *out);   /* UP7b, below */
+static void revert_tree(struct pc_tw *out);
 
 void pc_upg_status_tree(struct pc_tw *out)
 {
@@ -651,7 +630,7 @@ void pc_upg_status_tree(struct pc_tw *out)
 	pthread_mutex_lock(&SL);
 	n = staged_list(e, 16);
 	pc_tw_map(out);
-	pc_tw_key(out, "install_mode");            /* PD-9 */
+	pc_tw_key(out, "install_mode");
 	pc_tw_str(out, pc_upg_install_mode());
 	pc_tw_key(out, "staged");
 	pc_tw_arr(out);
@@ -717,8 +696,8 @@ void pc_upg_status_tree(struct pc_tw *out)
 	}
 	pthread_mutex_unlock(&QL);
 	pc_tw_end(out);
-	switch_tree(out);                       /* UPS */
-	revert_tree(out);                       /* UP7b */
+	switch_tree(out);
+	revert_tree(out);
 	pthread_mutex_lock(&QL);
 	asks_tree(out);
 	pthread_mutex_unlock(&QL);
@@ -755,7 +734,7 @@ int pc_upg_relay_staged(const char *sha_hex, int *older)
 	return n;
 }
 
-/* ---- UPS: the switch ------------------------------------------------------ */
+/* ---- the switch ------------------------------------------------------------ */
 
 const char *pc_upg_helper_state(void)
 {
@@ -884,9 +863,8 @@ int pc_upg_switch(const char *sha_hex, int force, char *id, size_t idl,
 	return 0;
 }
 
-/* UP7b: the prefix this process runs from, when it is a prefix install
- * (/opt/perfcached-<version>/bin/perfcached -> /opt/perfcached-<version>),
- * else "" */
+/* the prefix this process runs from when it is a prefix install
+ * (/opt/perfcached-<version>/bin/perfcached -> /opt/perfcached-<version>), else "" */
 static void live_prefix(char *out, size_t cap)
 {
 	char exe[512], *s;
@@ -909,9 +887,8 @@ static void live_prefix(char *out, size_t cap)
 	snprintf(out, cap, "%s", exe);
 }
 
-/* UP7b: the helper's newest result with status=ok - the switch it made
- * last, from which prefix to which.  0 found (from/to/at filled), -1 none;
- * the results directory is root's, its files 644. */
+/* the helper's newest status=ok result - its last switch, from which prefix to which: 0 found
+ * (from/to/at filled), -1 none; the results directory is root's, its files 644 */
 static int last_ok_result(char *from, size_t fl, char *to, size_t tl,
 		long long *at)
 {
@@ -957,9 +934,8 @@ static int last_ok_result(char *from, size_t fl, char *to, size_t tl,
 	return 0;
 }
 
-/* UP7b: live_prefix, previous (the helper's last switch) and switching
- * (a request the helper has taken and not answered yet) - what a roll
- * driver that re-reads the fleet needs to tell the states apart */
+/* live_prefix, previous (the helper's last switch) and switching (taken by the helper, not yet
+ * answered) - what a roll driver re-reading the fleet needs to tell the states apart */
 static void revert_tree(struct pc_tw *out)
 {
 	char lp[512], from[200], to[200], p[800], rid[40] = "", rat[40] = "";
@@ -1164,7 +1140,7 @@ static void switch_tree(struct pc_tw *out)
 	pc_tw_end(out);
 }
 
-/* ---- UPS: the fact ---------------------------------------------------------- */
+/* ---- the fact ---------------------------------------------------------------- */
 
 uint32_t pc_upg_fact(void)
 {
@@ -1236,7 +1212,7 @@ static void fact_tick(void)
 	__atomic_store_n(&FACT, f | st << 4 | pre << 16, __ATOMIC_RELAXED);
 }
 
-/* ---- UPS: M_UPG_SWITCH / M_UPG_ACK - the queues ------------------------------ */
+/* ---- M_UPG_SWITCH / M_UPG_ACK - the queues ----------------------------------- */
 
 static struct {
 	int state;                     /* 0 free, 1 asked, 2 answered */

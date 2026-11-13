@@ -1,13 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clpush.c - the per-thread write-path push groups (M5).  See clpush.h.
- *
- * The bodies came out of pc_repl_push(), wgroup_send() and
- * repl_flush_mine() unchanged.  What differs: the groups are reached
- * through a pointer, the clock is passed in, the wire geometry arrives
- * at init, and the send is a callback so no datagram is sealed here.
- */
+/* clpush.c - the per-thread write-path push groups; see clpush.h.  The send is a
+ * callback, so no datagram is sealed here. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,7 +61,7 @@ static int addr_same(const pc_addr *a, const pc_addr *b)
 	return pc_addr_eq(a, b);
 }
 
-/* S253: note a non-holder key in the group it is travelling in.  A
+/* note a non-holder key in the group it is travelling in.  A
  * failed grow leaves it un-noted, which keeps the copy. */
 static void nh_note(struct wgroup *g, const char *col, size_t collen,
 		const char *key, size_t klen, unsigned long long ver)
@@ -115,13 +109,8 @@ static void append(struct clpush *p, int tidx, int i,
 	}
 	g = &gs[i];
 	if (!g->q) {
-		/* hdr + flush_bytes + this record.  The old comment here
-		 * claimed nothing larger was reachable because "the
-		 * pre-append guard keeps qlen + n inside cap" - but cap is
-		 * the WIRE's gather ceiling, not what was allocated, and the
-		 * guard does not run at all when the group is empty.  A small
-		 * first record followed by a larger one overran this block.
-		 * The size is recorded now and grown below when it has to be. */
+		/* hdr + flush_bytes + this record: cap is the wire's gather ceiling, not
+		 * the allocation, so a later, larger record is grown below */
 		g->qcap = p->hdr + p->flush_bytes + n;
 		g->q = malloc(g->qcap);
 		if (!g->q) {
@@ -132,9 +121,8 @@ static void append(struct clpush *p, int tidx, int i,
 		g->qcount = 0;
 	}
 	if (g->qcount && !addr_same(&g->to, to)) {
-		/* the slot changed hands: what was gathered for the old peer
-		 * is dropped - it is gone, and the sweep owes the newcomer
-		 * everything anyway */
+		/* the slot changed hands: what was gathered for the old peer is
+		 * dropped - the sweep owes the newcomer everything anyway */
 		g->qlen = p->hdr;
 		g->qcount = 0;
 		g->nhlen = 0;          /* never sent: those copies stay */
@@ -190,10 +178,8 @@ void clpush_append_nh(struct clpush *p, int tidx, int i,
 		klen, ver);
 }
 
-/* ---- S253: the ack table ------------------------------------------------
- * Workers park, the cluster thread takes and expires; a slot's state is
- * the only thing they share, moved by CAS so a worker never waits on the
- * cluster thread and a slot is never read half-filled. */
+/* ---- the ack table: workers park, the cluster thread takes and expires.  A slot's
+ * state moves by CAS: a worker never waits and a slot is never read half-filled. */
 static struct clpush_ack *acks_of(struct clpush *p)
 {
 	struct clpush_ack *a = __atomic_load_n(&p->acks, __ATOMIC_ACQUIRE);

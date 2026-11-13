@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * uring.c - S361 (0.6.0): the io_uring layer and its startup check
- * (uring.h).  Raw system calls throughout; the numbers and layouts are
- * the kernel's published ABI, the same on every architecture we build.
- */
+/* uring.c - the io_uring layer and its startup check (uring.h): raw system calls; the numbers and
+ * layouts are the kernel's published ABI, the same on every architecture we build. */
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -166,9 +163,8 @@ static void setup_failed(int e, char *err, size_t errsz)
 int pc_ur_init(struct pc_ur *r, unsigned entries, unsigned cq_entries,
 		char *err, size_t errsz)
 {
-	/* best first: the flags that let a single-thread ring skip the
-	 * kernel's cross-task signalling; each step drops what an older
-	 * kernel rejects with EINVAL */
+	/* best first: flags that let a single-thread ring skip cross-task signalling; each step
+	 * drops what an older kernel rejects with EINVAL */
 	static const unsigned ladder[] = {
 		UR_SETUP_SUBMIT_ALL | UR_SETUP_COOP_TASKRUN |
 			UR_SETUP_SINGLE_ISSUER | UR_SETUP_DEFER_TASKRUN,
@@ -354,11 +350,8 @@ int pc_ur_submit(struct pc_ur *r, int wait, int timeout_ms)
 	unsigned flags = UR_ENTER_GETEVENTS;  /* runs deferred task work too */
 	int rc;
 
-	/* 0.6.0.1: a waiter with requests pending is counted as in iowait,
-	 * and a worker always has some - every connection's multishot
-	 * receive - so an idle node read ~97% PSI io pressure and high
-	 * iowait on 245-247 (10-12).  It waits for the network, not a disk;
-	 * a kernel that can be told so (6.15+) is. */
+	/* a waiter with requests pending counts as iowait, and every connection's multishot receive
+	 * is one (an idle node read ~97% io pressure); 6.15+ is told it waits on the network */
 	if (wait && (r->features & UR_FEAT_NO_IOWAIT))
 		flags |= UR_ENTER_NO_IOWAIT;
 
@@ -432,10 +425,8 @@ int pc_ur_bufs_init(struct pc_ur *r, uint16_t bgid, unsigned nbufs,
 		snprintf(err, errsz, "provided buffers: out of memory");
 		return -1;
 	}
-	/* resident from the start: one store a page, through volatile - a
-	 * memset(0) right after malloc() is folded into calloc(), which on
-	 * fresh pages touches nothing (seen on 224: the pool became resident
-	 * later, as traffic cycled through the ring) */
+	/* resident from the start: one store a page through volatile - a memset(0) after malloc()
+	 * folds into calloc(), which touches nothing on fresh pages */
 	{
 		volatile char *b = r->bufs;
 		size_t i, len = (size_t)nbufs * size;
@@ -727,9 +718,8 @@ void pc_uring_check(struct pc_uring_verdict *v)
 	v->setup_flags = r.setup_flags;
 	v->counts_iowait = !(r.features & UR_FEAT_NO_IOWAIT);
 out:
-	/* a receive still armed could land in the buffers after the ring's
-	 * teardown, which is asynchronous: on that path they are left be
-	 * (32 KB, once, on a host that is falling back anyway) */
+	/* a receive still armed could land in the buffers after the asynchronous ring teardown: on
+	 * that path they are left be (32 KB, once, on a host falling back anyway) */
 	if (armed)
 		r.bufs = NULL;
 	if (cfd >= 0)

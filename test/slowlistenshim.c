@@ -1,8 +1,5 @@
-/* slowlistenshim.c - LD_PRELOAD for test/readytest.sh: listen(2) called from
- * any thread but the process's main one sleeps PC_SLOWLISTEN_MS first.  The
- * workers open their own listeners, so this widens the window between the
- * daemon's "perfcached ready" line and the doors actually accepting - a
- * window a loaded CI runner opened by itself (v0.5.6, waltest under ASan). */
+/* slowlistenshim.c - LD_PRELOAD for test/readytest.sh: listen(2) from any thread but the main one
+ * sleeps PC_SLOWLISTEN_MS, widening the gap between "perfcached ready" and the doors accepting. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdlib.h>

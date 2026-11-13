@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clreplay.c - CH-1: a sealed cluster frame is taken once.  See clreplay.h.
- */
+/* clreplay.c - a sealed cluster frame is taken once.  See clreplay.h. */
 #include <stdlib.h>
 #include <string.h>
 
 #include "clreplay.h"
+#include "cluster.h"                    /* pc_cluster_replay_counts */
 
 struct win {
 	int lock;
@@ -22,7 +21,7 @@ struct sender {
 };
 
 static struct sender tab[CLREPLAY_SENDERS];
-static int tab_lock;
+static int tab_lock, nwins;
 static unsigned long long cnt[CLREPLAY_NCOUNT];
 
 static void spin(int *l)
@@ -110,13 +109,16 @@ static int counted(int rc)
 	return rc;
 }
 
-int clreplay_admit(const struct clwire_id *id, long long now)
+int clreplay_admit(const struct clwire_id *id, uint32_t from_ip, long long now)
 {
-	struct sender *s = sender_of(id->ip, id->port);
+	struct sender *s;
 	struct win *w, *fresh;
 	uint64_t cur;
 	int rc, lower = 0;
 
+	if (id->ip != from_ip)             /* it speaks for its own host only */
+		return counted(CLREPLAY_HOST);
+	s = sender_of(id->ip, id->port);
 	if (!s || id->stream >= CLREPLAY_STREAMS)
 		return counted(CLREPLAY_FULL);
 	cur = __atomic_load_n(&s->incarn, __ATOMIC_ACQUIRE);
@@ -131,15 +133,23 @@ int clreplay_admit(const struct clwire_id *id, long long now)
 		        &cur, id->incarn, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			;
 	if (!(w = __atomic_load_n(&s->w[id->stream], __ATOMIC_ACQUIRE))) {
-		if (!(fresh = calloc(1, sizeof *fresh)))
+		if (__atomic_add_fetch(&nwins, 1, __ATOMIC_RELAXED) > CLREPLAY_WINS) {
+			__atomic_sub_fetch(&nwins, 1, __ATOMIC_RELAXED);
+			return counted(CLREPLAY_FULL);     /* the window budget */
+		}
+		if (!(fresh = calloc(1, sizeof *fresh))) {
+			__atomic_sub_fetch(&nwins, 1, __ATOMIC_RELAXED);
 			return counted(CLREPLAY_FULL);
+		}
 		fresh->incarn = id->incarn;
 		w = NULL;
 		if (__atomic_compare_exchange_n(&s->w[id->stream], &w, fresh, 0,
 		        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			w = fresh;
-		else
-			free(fresh);
+		else {
+			free(fresh);           /* another thread's went in */
+			__atomic_sub_fetch(&nwins, 1, __ATOMIC_RELAXED);
+		}
 	}
 	spin(&w->lock);
 	if (id->incarn != w->incarn) {
@@ -157,6 +167,21 @@ int clreplay_admit(const struct clwire_id *id, long long now)
 	    now - __atomic_load_n(&s->seen_ms, __ATOMIC_RELAXED) >= 1000)
 		__atomic_store_n(&s->seen_ms, now, __ATOMIC_RELAXED);
 	return rc == CLREPLAY_OK ? rc : counted(rc);
+}
+
+/* cluster.h's view of the counts */
+void pc_cluster_replay_counts(unsigned long long *dup, unsigned long long *old,
+		unsigned long long *incarn, unsigned long long *full,
+		unsigned long long *host)
+{
+	unsigned long long c[CLREPLAY_NCOUNT];
+
+	clreplay_counts(c);
+	*dup = c[CLREPLAY_DUP];
+	*old = c[CLREPLAY_OLD];
+	*incarn = c[CLREPLAY_INCARN];
+	*full = c[CLREPLAY_FULL];
+	*host = c[CLREPLAY_HOST];
 }
 
 void clreplay_counts(unsigned long long out[CLREPLAY_NCOUNT])

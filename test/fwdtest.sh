@@ -1,19 +1,6 @@
 #!/bin/sh
-# fwdtest.sh — the forwarded-write plane under a DEEP PIPELINE.
-# 100k x 256B sets stream through a non-holder ingress with 400 in
-# flight; placement forwards them to the holder.  The regression this
-# encodes (found live): park-table exhaustion answered every verb with
-# the PULL-miss shape - a SET got {"found":false} while the already-
-# sent forward STORED at the holder anyway (client told failure, write
-# landed).  Asserted here:
-#  - every reply to a set carries "stored" - no foreign shapes ever;
-#  - TRUTH CONSERVATION: fleet entries == the stored:true count exactly
-#    (every confirmed write is really there, every refusal really
-#    absent - the old bug stored 100% while confirming 93%);
-#  - refusals are RARE (<=1%): the datagram plane may drop a burst
-#    (that is the v1 contract - an honest stored:false is retryable),
-#    but systemic refusal means the plane is broken.
-# Usage: test/fwdtest.sh [./perfcached]
+# fwdtest.sh - forwarded writes under a deep pipeline: every reply carries "stored", the fleet holds exactly the
+# confirmed writes, refusals stay under 1%, forwards are durable.  Usage: test/fwdtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -48,18 +35,8 @@ fsync = everysec
 segment_mb = 64
 segments = 4
 ring_kb = ${FWD_RING_KB:-8192}
-                 # the crash-durability check needs the whole forward
-                 # burst IN the WAL: an overflowed ring drops sequenced
-                 # records (counted, by design) and the sync barrier
-                 # then honestly syncs the survivors - on a starved
-                 # 2-vCPU CI box that read as data loss.
-                 #
-                 # FWD_RING_KB exists to REPRODUCE that: S58's mechanism
-                 # was read from the code and never demonstrated, and a
-                 # test that only ever runs with a ring big enough
-                 # proves the hardening, not the mechanism.  Set it
-                 # small (1024) under 'taskset -c 0,1' and the drop
-                 # assertion below should fire.
+                 # the crash-durability check needs the whole forward burst in the WAL: an overflowed ring
+                 # drops records; FWD_RING_KB=1024 under 'taskset -c 0,1' shows the drop check firing
 [cluster]
 multicast = 239.255.77.35:17135
 advertise = 127.0.0.3$1
@@ -75,12 +52,8 @@ node 2 17042 64
 P1=$!
 "$BIN" -f "$D/n2.conf" > "$D/n2.log" 2>&1 &
 P2=$!
-# v0.5.6.1 GitLab check [repl3]: the first connect was REFUSED.  This
-# wait could never succeed: the nodes run at log_level = warn and
-# "perfcached ready" is a NOTICE, so it burned its 10 s every time and the
-# suite went on blind - on a busy runner, to a door not yet listening.
-# Wait for the doors themselves, longer, and if they never open say so
-# with the logs.
+# wait for the doors themselves, not "perfcached ready": the nodes log at warn and that line is a
+# notice
 RDY=300; [ -n "$SANRT" ] && RDY=900
 up() { python3 -c "import socket,sys; socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=1).close()" "$1" 2>/dev/null; }
 i=0
@@ -93,16 +66,18 @@ if ! up 17041 || ! up 17042; then
 	for n in 1 2; do echo "--- node $n log (alive: $(eval kill -0 \$P$n 2>/dev/null && echo yes || echo NO))"; tail -15 "$D/n$n.log"; done
 	exit 1
 fi
-sleep 3.5   # membership
+# a joiner is CONNECTING until its links answer: wait for both ready and seeing each other
+st() { python3 -c 'import json,pcnative,socket,sys
+g = pcnative.wrap(socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5))
+g.write(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"stats\"}\n"); g.flush()
+r = json.loads(g.readline())["result"]; print(r.get("state"), r["cluster"].get("peers_up"))' "$1" 2>/dev/null; }
+i=0
+while [ $i -lt $RDY ] && { [ "$(st 17041)" != "ready 1" ] || [ "$(st 17042)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
-# truth conservation is judged on the FLEET once the moves are done: the
-# S296 rebalancer starts shedding the holder's records to the ingress as
-# soon as the burst lands, and a record in flight is on neither node.
-# v0.5.6 GitLab check-asan repl3: A=6396 + B=84516 = 90912 two seconds
-# after the drain, "a write lied" - and the same run's fleet held all
-# 100,000 a minute later.  A write that really lied leaves the fleet
-# short for good: poll until the fleet count equals the confirmed stores,
-# up to the settle budget below, and fail only if it never does.
+# conservation is judged on the fleet once moves are done: the rebalancer sheds the holder's
+# records at once and a record in flight is on neither node, so poll up to the settle budget
 FIRST_SETTLE=60; [ -n "$SANRT" ] && FIRST_SETTLE=180
 python3 - "$FIRST_SETTLE" <<'EOF'
 import json, pcnative, socket, sys, time
@@ -170,20 +145,8 @@ case $? in
 	*) bad "loader failed" ;;
 esac
 
-# ---- forwarded writes are DURABLE at the holder -------------------------
-# (the ring-count bug: the peer thread silently dropped every WAL
-#  record for forwarded stores - rings were sized workers+3 while the
-#  peer thread is slot workers+4)
-# The holder is NOT static after the burst: the S296 rebalancer sheds
-# records to the less-utilised peer a few MB per tick while it sits
-# above the fleet mean (every forward lands here first; the ingress ends
-# up holding 7-37% of the keys by migration).  10-04, GitLab check-asan:
-# the holder read 92,539 at the loader, 92,255 at the barrier and 91,515
-# after the restart while the fleet still held all 100,000 - moves in
-# flight, misread as crash loss.  So: wait for the rebalancer to settle
-# before the barrier, and judge durability on the FLEET after the
-# restart; the holder's own count is reported, and a move that lands in
-# the window between the barrier and the kill is named, not failed.
+# ---- forwarded writes are durable at the holder.  The rebalancer moves records while the holder
+# sits above the fleet mean: let it settle before the barrier, judge on the fleet after the restart.
 SETTLE=60; [ -n "$SANRT" ] && SETTLE=180
 B0=$(python3 - "$SETTLE" <<'EOF'
 import json, pcnative, socket, sys, time
@@ -204,9 +167,8 @@ EOF
 )
 set -- $B0; B0=$1; WDROP=$2; RBSTATE=$3; RBMOVED=$4
 [ "$RBSTATE" = settled ] || echo "    note: the rebalancer did not settle within $SETTLE s (state $RBSTATE, moved $RBMOVED) - the holder may still be shedding"
-# the equality below asserts crash-durability of every SEQUENCED write;
-# a ring drop is a sequenced write the barrier can never cover, so it
-# must be its own loud failure, not a misattributed "lost in crash"
+# crash-durability covers every sequenced write; a ring drop is one the barrier can never cover,
+# so it fails loudly on its own
 [ "$WDROP" = "0" ] && ok || bad "wal ring dropped $WDROP records pre-barrier (ring too small for this host)"
 kill -9 $P2 2>/dev/null; P2=
 sleep 0.5

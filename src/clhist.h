@@ -1,39 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clhist.h — the identity history (control plane, step 3b).
- *
- * Part of what the master syncs to the backup, and the piece that is
- * easy to leave out.  It answers one question: HAVE WE SEEN THIS NODE
- * BEFORE?  That is what separates STARTING (a genuinely new node) from
- * RECOVERING (one that is coming back), and it is not a judgement the
- * node itself can make - a node whose state directory was wiped, or one
- * running an ephemeral identity, sincerely believes it is new.
- *
- * A backup promoted without this would call every returning node new,
- * which is why it belongs in the synced payload rather than being
- * rebuilt from whatever the new master happens to remember.
- *
- * IT IS BOUNDED, AND FORGETTING IS SAFE.  A cluster can see an unbounded
- * number of identities over its life - every container restart with no
- * volume mints a fresh one - so this cannot grow without limit.  When
- * full, the least recently seen entry is dropped.
- *
- * The cost of forgetting is WORK, not correctness: a returning node whose
- * identity was evicted is called STARTING, so peers may backfill it when
- * they did not need to.  Its data is not at risk, because a receiver
- * refuses a copy that is not newer than the one it holds - the version
- * comparison is what makes this bound affordable.  Without that, evicting
- * an identity could mean clobbering a rejoiner's newer data, and the
- * history would have to be exact.
- */
+/* clhist.h - the identity history the master syncs to the backup: HAVE WE SEEN THIS NODE BEFORE
+ * (RECOVERING, not STARTING) - a node with a wiped state directory sincerely believes it is new */
 #ifndef PC_CLHIST_H
 #define PC_CLHIST_H
 
 #include <stdint.h>
 
-/* 1024 x 24 bytes = 24KB, and it rides the sync payload rather than a
- * datagram, so the bound is about memory and churn rather than MTU. */
+/* 24KB in the sync payload; when full the least recently seen goes - a forgotten node is called
+ * STARTING and costs a needless backfill, never data (receivers refuse copies that are not newer) */
 #define PC_CLHIST_MAX   1024
 #define PC_CLHIST_ENTSZ 24
 
@@ -52,9 +27,7 @@ struct pc_clhist {
 
 void pc_clhist_init(struct pc_clhist *h);
 
-/* Record or refresh an identity.  Returns 1 if it was already known
- * (the node is RECOVERING), 0 if this is the first sight of it (it is
- * STARTING).  Evicts the least recently seen entry when full. */
+/* record or refresh an identity: 1 already known (RECOVERING), 0 first sight (STARTING) */
 int pc_clhist_note(struct pc_clhist *h, const unsigned char ident[16],
 		uint16_t node_id);
 

@@ -1,37 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * memguard.c - S366: the memory a node may still use, and what it lets its
- * clients take.  The why is in memguard.h; DESIGN 12ks has the numbers.
- *
- * Sources, re-read every second (a cgroup's limit can be changed live):
- *   /proc/meminfo     MemTotal, MemAvailable - the machine's, or under lxcfs
- *                     the container's (245-247: the 1 GB cap lives on a
- *                     parent cgroup the container cannot see, so this is the
- *                     only place it shows)
- *   cgroup v2         memory.max / memory.current / memory.stat inactive_file
- *                     on every level of /proc/self/cgroup's path that has them
- *   cgroup v1         memory.limit_in_bytes / memory.usage_in_bytes /
- *                     memory.stat total_inactive_file, the same walk
- * A cgroup's headroom is limit - usage + its inactive file pages (what
- * reclaim takes first without hurting anyone); the node's available memory
- * is the smallest of MemAvailable and every headroom, its limit the
- * smallest of MemTotal and every limit.
- *
- * A hugetlb pool (ST1, DESIGN 12kw) is allocated at boot and never counted in
- * MemAvailable: under a meminfo limit it is taken off MemTotal - the heap
- * can never have it - and an arena on MAP_HUGETLB commits from that pool,
- * not from the memory this guard watches.  Its uncommitted part is a claim
- * on ordinary memory only beyond the pool's free pages, and only when
- * vm.nr_overcommit_hugepages lets the kernel make surplus pages.  A cgroup
- * limit needs no correction: hugetlb pages are not charged to it.
- *
- * Test hooks (logged when used): PERFCACHED_TEST_MEMINFO=<file> stands in
- * for /proc/meminfo, PERFCACHED_TEST_PROC_CGROUP=<file> for
- * /proc/self/cgroup and PERFCACHED_TEST_CGROUP_ROOT=<dir> for /sys/fs/cgroup;
- * PERFCACHED_TEST_ARENA="<hugetlb|thp> <reserved MB> <committed MB>
- * [<overcommit pages>]" stands in for the arena's tier and figures.
- */
+/* memguard.c - the memory a node may still use and what its clients may take: the smallest
+ * of MemAvailable and every cgroup level's headroom, re-read every second (memguard.h). */
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -54,9 +24,8 @@
 #define MG_LEVELS     16
 #define MG_V1_NOLIMIT (1ull << 60)    /* v1 says "unlimited" with ~2^63 */
 #define MG_MARGIN     (32ull << 20)   /* on top of the measured process base */
-/* the heap give-back: trim once this much connection memory was freed since
- * the last trim, when less than MG_TRIM_QUIET was freed over the last
- * MG_QUIET_S seconds (the burst is over), at most every MG_TRIM_GAP_S */
+/* the heap give-back: trim once MG_TRIM_AFTER of connection memory was freed since the last
+ * trim and under MG_TRIM_QUIET in the last MG_QUIET_S s, at most every MG_TRIM_GAP_S */
 #define MG_TRIM_AFTER (32ull << 20)
 #define MG_TRIM_QUIET (4ull << 20)
 #define MG_QUIET_S    5
@@ -75,11 +44,11 @@ static struct {
 	pthread_mutex_t mx;                /* the sampled figures, for stats */
 	char source[96];
 	unsigned long long limit, avail, floor, hyst, reserve;
-	unsigned long long cg_use, cg_inact;  /* S406: the binding cgroup's (0: meminfo binds) */
-	unsigned long long pool, pool_free;  /* ST1: the hugetlb pool, bytes */
+	unsigned long long cg_use, cg_inact;  /* the binding cgroup's (0: meminfo binds) */
+	unsigned long long pool, pool_free;  /* the hugetlb pool, bytes */
 	long long room;
 
-	/* ST1: PERFCACHED_TEST_ARENA - the arena's tier and figures */
+	/* PERFCACHED_TEST_ARENA: the arena's tier and figures */
 	int t_set, t_huge;
 	unsigned long long t_reserved, t_committed;
 	long t_overcommit;
@@ -270,7 +239,7 @@ static void sample(unsigned long long *limit, unsigned long long *avail,
 		if (mt > 0) {
 			*limit = (unsigned long long)mt << 10;
 			if (G.pool && G.pool < *limit)
-				*limit -= G.pool;          /* ST1: never the heap's */
+				*limit -= G.pool;          /* never the heap's */
 			*avail = (unsigned long long)(ma > 0 ? ma : 0) << 10;
 			snprintf(src, srclen, G.pool ? "meminfo, less the hugetlb pool"
 				: "meminfo");
@@ -297,6 +266,7 @@ static void sample(unsigned long long *limit, unsigned long long *avail,
 			if (inact < 0 && G.cgv == 1)   /* v1 without hierarchy */
 				inact = field(b, "inactive_file");
 		}
+		/* headroom: limit - usage + the inactive file pages reclaim takes first */
 		head = lim > use ? lim - use : 0;
 		if (inact > 0)
 			head += (unsigned long long)inact;
@@ -366,9 +336,8 @@ static unsigned long long arena_reserve(unsigned long long *ceiling, int *huge)
 	unc = res > com ? res - com : 0;
 	if (!h)
 		return unc;
-	/* ST1: a hugetlb arena commits from the pool, already outside
-	 * MemAvailable; only surplus pages beyond its free part, which the
-	 * kernel makes from ordinary memory, are a claim on it */
+	/* a hugetlb arena commits from the pool, already outside MemAvailable; only surplus
+	 * pages beyond its free part, which the kernel makes from ordinary memory, claim on it */
 	if (oc == 0 || unc <= G.pool_free)   /* -1 = unknown: it may */
 		return 0;
 	return unc - G.pool_free;
@@ -385,8 +354,7 @@ static unsigned long long rss_bytes(void)
 	return res * (unsigned long long)sysconf(_SC_PAGESIZE);
 }
 
-/* sample, then the budget; the caller is the maintenance thread (or init) */
-/* S406: the limit and, under a cgroup, its usage and inactive file pages */
+/* the limit and, under a cgroup, its usage and inactive file pages */
 static void figures(char *b, size_t n)
 {
 	pthread_mutex_lock(&G.mx);
@@ -398,6 +366,7 @@ static void figures(char *b, size_t n)
 	pthread_mutex_unlock(&G.mx);
 }
 
+/* sample, then the budget; the caller is the maintenance thread (or init) */
 static void resample(int at_init)
 {
 	unsigned long long lim, av, fl, hy, rs, cu, ci;
@@ -481,10 +450,8 @@ long pc_memguard_init(const struct pc_config *cfg)
 #endif
 	discover();
 	resample(1);
-	/* the process base, MEASURED: what is resident beyond the arena's
-	 * committed part now that the WAL rings, the stage buffer and the
-	 * tables exist - plus a margin for the per-worker scratch that faults
-	 * in at first use */
+	/* the process base, MEASURED: resident beyond the arena's committed part once the WAL
+	 * rings, stage buffer and tables exist, plus a margin for scratch faulted in later */
 	{
 		unsigned long long r, c;
 		long oc;

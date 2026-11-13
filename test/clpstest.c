@@ -1,26 +1,5 @@
-/*
- * clpstest.c - the pub/sub relay plane with nothing of cluster.c linked
- * (M16, wave 4).
- *
- * Until this, the plane's only checks were daemons: relaytest,
- * relayinteresttest and the PS11 port tests, each a fleet on one host.
- * The failure that cost the most was a restarted node answered as a
- * stale slot, which then FILTERED relays it had never been told about -
- * a subscription made in that window was never delivered, 6 runs in 9 on
- * two CPUs, and nothing below a fleet could see it.
- *
- * This links the REAL clps.o, clsend.o, clpeers.o, clwire.o, psindex.o
- * and quiesce.o; the transmit is captured (clsend's hook) and every
- * datagram is opened and parsed back.  Only cluster.c's accessors and
- * pubsub.c's callbacks are stand-ins.  What it pins, per peer: who gets
- * a relay and on which sequence space (everything / filtered / broadcast
- * until current), what the interest handlers accept and from whom, and
- * what the relay port's probe step reports.  Nothing binds a socket: the
- * probes are checked up to the decision, and a peer is never direct
- * while a relay is sent.
- *
- * Build: see the Makefile's clpstest target.
- */
+/* clpstest.c - the pub/sub relay plane on the real clps, clsend, clpeers, clwire, psindex and quiesce
+ * objects, every datagram captured and parsed: who gets a relay on which sequence space, and why. */
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -58,7 +37,7 @@ struct clpeers *cl_peers(void) { return &PT; }
 int cl_enabled(void) { return enabled; }
 int cl_node_id(void) { return 42; }
 long long cl_now_ms(void) { return now; }
-/* S461: clrp.o's one call into cluster.c - a relay-port group's apply */
+/* clrp.o's one call into cluster.c - a relay-port group's apply */
 void cl_repl_apply_group(const unsigned char *pt, size_t n, const pc_addr *from)
 { (void)pt; (void)n; (void)from; }
 pc_addr cl_self_addr(void)
@@ -312,8 +291,8 @@ int main(void)
 	relay("rx");
 	i5 = to(5);
 	{
-		/* this node's own frame, as if member 5 had sent it - the
-		 * lanes are made only for a live member's id (CH-20) */
+		/* this node's own frame, as if member 5 had sent it - lanes are made
+		 * only for a live member's id */
 		static unsigned char fr[MAX_DGRAM];
 		size_t fn = out[i5].n;
 
@@ -328,8 +307,8 @@ int main(void)
 		chk(delivered == 1 && dups == 1, "receive the same sequence again: a duplicate, not delivered twice");
 		clps_handle_publish(fr, fn - 1);
 		chk(delivered == 1, "receive a frame one byte short: dropped");
-		/* CH-20: an id no live member holds gets no lanes - delivered,
-		 * unaccounted, so its repeat is not seen as one */
+		/* an id no live member holds gets no lanes - delivered, unaccounted, so
+		 * its repeat is not seen as one */
 		fr[1] = 999 >> 8;
 		fr[2] = 999 & 0xff;
 		delivered = dups = 0;
@@ -531,7 +510,7 @@ int main(void)
 	chk(clps_rx_open(0, 2, &why, &err) == 0 && why == CLPS_RX_OFF, "rx_open, no port: 0, nothing to say");
 	chk(clps_rx_port() == 0, "no relay port bound: 0 advertised");
 
-	/* ---- S461: the lane spread, on a loopback group of four ------------- */
+	/* ---- the lane spread, on a loopback group of four ------------------- */
 	{
 		struct sockaddr_in a;
 		socklen_t al = sizeof a;

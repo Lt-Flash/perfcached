@@ -1,15 +1,5 @@
-/*
- * scancost.c — what one pcache_ht_scan() call costs, in-process.
- *
- * enumbench measured the per-SCAN-call gap over the wire (x1.2-1.6 vs
- * redis at matched density), but the wire and redis-cli put a ~50us
- * floor under every number.  This strips both: fill a table, sweep it
- * with the real cursor calls, report us/call and ns/key.  Run it
- * before AND after touching the scan path, same command, or the
- * "improvement" is a guess (S40).
- *
- * Build: make scancost   Run: ./scancost [nkeys] [val] [log2]
- */
+/* scancost.c - one pcache_ht_scan() call's cost in-process, without the wire's ~50us floor;
+ * run it before AND after touching the scan path.  ./scancost [nkeys] [val] [log2] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

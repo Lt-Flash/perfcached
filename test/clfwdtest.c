@@ -1,11 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- *
- * clfwdtest.c - the proxy write plane's wire frames (M11 slice 1).
- *
- * Both frames were built at one end of cluster.c and decoded at the
- * other, so nothing checked that the two agreed.  These round-trip
- * them.
- */
+ * clfwdtest.c - the proxy write plane's wire frames: build and parse round-trip, golden bytes. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,19 +14,8 @@ static void chk(int cond, const char *what)
 	printf("FAIL: %s\n", what);
 }
 
-/* ---- GOLDEN WIRE VECTORS ------------------------------------------
- *
- * Captured from clfwd.c as it stood BEFORE the cursor rewrite, by
- * running the builders and dumping their output.  The rest of this file
- * round-trips build against parse, which proves the two agree with each
- * other - and would go on passing if every offset in the file shifted
- * by one, because both halves would shift together.  These bytes are
- * what a peer on an older build actually puts on the wire, so they are
- * the only thing here that can catch that.
- *
- * If one of these fails, the frame layout MOVED.  That is a fleet-wide
- * incompatibility, not a test to update.
- */
+/* ---- golden wire vectors: what an older peer puts on the wire, which a round trip cannot catch.
+ * A failure means the frame layout MOVED - a fleet-wide incompatibility, not a test to update. */
 /* GENERATED from the pre-cursor clfwd.c - do not hand-edit */
 static const struct golden { const char *nm; size_t n;
 	unsigned char b[128]; } GOLDEN[] = {
@@ -44,14 +27,14 @@ static const struct golden { const char *nm; size_t n;
 	{ "FWD_ACK", 14, {
 		0x12, 0x67, 0x45, 0x23, 0x01, 0x01, 0x16, 0xe9, 0x4f, 0xb3, 0xfd, 0xff,
 		0xff, 0xff } },
-	/* CH-16: eight LE bytes of the loser's version after the key, as the
-	 * tombstone's (S209) - grown deliberately; an older receiver ignores it */
+	/* eight LE bytes of the loser's version after the key, as the tombstone's - grown
+	 * deliberately; an older receiver ignores it */
 	{ "DEMOTE", 29, {
 		0x14, 0x01, 0x10, 0x08, 0x07, 0x00, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f,
 		0x6e, 0x73, 0x61, 0x62, 0x63, 0x2d, 0x31, 0x32, 0x33,
 		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01 } },
-	/* S209: eight LE bytes of the delete's version after the key -
-	 * the golden grew deliberately; an older receiver ignores the tail */
+	/* eight LE bytes of the delete's version after the key - grown deliberately; an older
+	 * receiver ignores the tail */
 	{ "TOMBSTONE", 27, {
 		0x16, 0x08, 0x07, 0x00, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x73,
 		0x61, 0x62, 0x63, 0x2d, 0x31, 0x32, 0x33,
@@ -176,10 +159,7 @@ int main(void)
 	chk(clfwd_ack_parse(buf, CLFWD_ACK_LEN - 1, &ar) == 0,
 		"E4 a short ack is refused");
 
-	/* ---- F. DEMOTE and TOMBSTONE (slice 3) ---------------------------
-	 * Near-identical frames: the demote carries the winning node id and
-	 * the tombstone does not.  Both were built at one end of cluster.c
-	 * and decoded at the other. */
+	/* ---- F. DEMOTE and TOMBSTONE: near-identical, the demote carries the winning node id ---- */
 	{
 		struct clfwd_key kw, kr;
 		unsigned int winner = 0;
@@ -188,8 +168,7 @@ int main(void)
 		kw.col = "orders"; kw.collen = 6;
 		kw.key = "cust:7";  kw.klen = 6;
 
-		/* F1. demote round trip - the key tail plus the loser's
-		 * version (CH-16) */
+		/* F1. demote round trip - the key tail plus the loser's version */
 		{
 			uint64_t dv = 0;
 
@@ -213,8 +192,7 @@ int main(void)
 				"F1 a partial version tail reads as unversioned");
 		}
 
-		/* F2. tombstone round trip - the key tail plus the delete's
-		 * version (S209) */
+		/* F2. tombstone round trip - the key tail plus the delete's version */
 		{
 			uint64_t tv = 0;
 
@@ -236,9 +214,8 @@ int main(void)
 			chk(clfwd_tomb_parse(buf, len - 3, &kr, &tv) == 1 && tv == 0,
 				"F2 a partial version tail reads as unversioned");
 		}
-		/* F2b. S446: a replayed expiry - one flags byte after the
-		 * version, only when set; an older receiver's parse reads the
-		 * same key and version and ignores it */
+		/* F2b. a replayed expiry: one flags byte after the version, only when set; an older
+		 * receiver's parse reads the same key and version and ignores it */
 		{
 			uint64_t tv = 0;
 			unsigned int tf = 9;
@@ -257,10 +234,8 @@ int main(void)
 			    clfwd_tomb_parse_f(buf, len, &kr, &tv, &tf) == 1 && tf == 0,
 				"F2b no flag: the frame of before, and flags 0 - a delete");
 		}
-		/* F2c. 12ny AT-2: a delete numbered at its origin - 20 bytes
-		 * after the flags byte, behind their own flag; every older
-		 * parse reads the same key and version, the S446 one the same
-		 * expiry bit; cut short, it is unnumbered */
+		/* F2c. a delete numbered at its origin: 20 bytes after the flags byte, behind
+		 * their own flag; older parses read key, version, expiry bit; cut short, none */
 		{
 			struct clfwd_tomb_num nw = { 0x1122334455667788ULL, 0xa1b2c3d4u, 4242424242ULL }, nr;
 			uint64_t tv = 0;
@@ -349,10 +324,7 @@ int main(void)
 		chk(kr.collen == 0 && kr.klen == 6, "F6 and the key still lands");
 	}
 
-	/* ---- G. the JSON forward pair (slice 4) --------------------------
-	 * The widest frame here: operation, path, flags, ttl and a 64-bit
-	 * `by`, then four variable parts.  `by` and `newval` used to be a
-	 * raw memcpy of the host's bytes; they pack explicitly now. */
+	/* ---- G. the JSON forward pair: `by` and `newval` pack explicitly, not a host memcpy ---- */
 	{
 		struct clfwd_json jw, jr;
 		struct clfwd_jack aw2, ar2;
@@ -393,12 +365,8 @@ int main(void)
 		chk(clfwd_json_parse(buf, CLFWD_JSON_HDR + 10, &jr) == 0,
 			"G4 declared parts do not fit");
 
-		/* G4b. a length that fits WITHOUT the path but not WITH it.
-		 * The earlier truncation cases were refused by the other
-		 * terms whatever plen did, so dropping plen from the fit
-		 * check went unnoticed.  col 6 + key 3 + val 7 = 16 fits in
-		 * 18; adding path 5 needs 21 and does not.
-		 * (mutation: omit j->plen from the fit check) */
+		/* G4b. col 6 + key 3 + val 7 = 16 fits in 18, path 5 makes 21: catches plen
+		 * dropped from the fit check, which the other truncation cases miss */
 		len = clfwd_json_build(buf, 0x60, &jw);
 		chk(clfwd_json_parse(buf, CLFWD_JSON_HDR + 18, &jr) == 0,
 			"G4b a frame whose PATH does not fit is refused");
@@ -428,10 +396,8 @@ int main(void)
 			"G6 and reports none");
 		chk(ar2.st == 7, "G6 with the failure status intact");
 
-		/* G6b. an ack whose declared fragment runs past the datagram.
-		 * G7 only covers one shorter than the HEADER, which the
-		 * header check catches whatever the fit check does.
-		 * (mutation: remove the ack fit check) */
+		/* G6b. an ack whose declared fragment runs past the datagram: catches a missing
+		 * fit check, which G7 (shorter than the header) does not */
 		aw2.st = 0; aw2.fraglen = 5; aw2.frag = "frag!";
 		len = clfwd_jack_build(buf, 0x61, &aw2);
 		chk(clfwd_jack_parse(buf, CLFWD_JACK_HDR + 2, &ar2) == 0,

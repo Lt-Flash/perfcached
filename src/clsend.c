@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clsend.c - the cluster plane's send path (M14).  See clsend.h.
- */
+/* clsend.c - the cluster plane's send path; see clsend.h. */
 #include <sys/socket.h>
 
 #include "clsend.h"
@@ -11,10 +9,10 @@
 #include "iostat.h"
 
 static int send_fd = -1;
-static const uint8_t *send_psk, *accept_psk;   /* CH-7: accept_psk opens only */
+static const uint8_t *send_psk, *accept_psk;   /* accept_psk opens only */
 static clsend_xmit_fn send_xmit;
-static clsend_lane_fn lane_fn;                 /* S36 step b */
-static clsend_forced_fn lane_forced;           /* S36 e2 */
+static clsend_lane_fn lane_fn;
+static clsend_forced_fn lane_forced;
 static size_t lane_min;
 
 void clsend_set_lane(clsend_lane_fn lane, size_t min, clsend_forced_fn forced)
@@ -40,7 +38,6 @@ static long xmit_sendto(int fd, const void *buf, size_t n,
 	return (long)sendto(fd, buf, n, 0, &to->sa, pc_addr_len(to));
 }
 
-/* 0.6.0 step 1: one sendto per datagram today - the count S364 moves */
 static long udp_xmit(const void *buf, size_t n, const pc_addr *to)
 {
 	long r = send_xmit(send_fd, buf, n, to);

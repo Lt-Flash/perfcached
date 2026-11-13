@@ -1,13 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respout.c - the RESP door's reply writers: an error (its code word), a
- * simple string, an integer, a bulk, the null bulk, an array's header, and
- * the two readers every command shares (a command word compared without
- * case, a whole decimal integer).  Pure, into a pc_jw; any thread.  Moved
- * from verbs.c unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md);
- * test/respouttest.c.
- */
+/* respout.c - the RESP door's reply writers and the two readers every command shares
+ * (a command word compared without case, a whole decimal integer).  Pure; any thread. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,11 +15,8 @@ void resp_err(struct pc_jw *w, const char *msg)
 	pc_jw_lit(w, "\r\n");
 }
 
-/* RESP carries the error CODE in the first word and clients dispatch on
- * it: a retryable condition must answer -TRYAGAIN, not -ERR.  resp_err()
- * hardcodes ERR, so backpressure needs its own emitter - otherwise every
- * client sees a generic error and none of them retries, which is the whole
- * point of saying "busy" instead of "forward failed".  S38. */
+/* Clients dispatch on the error CODE word: a retryable condition must answer
+ * -TRYAGAIN, not -ERR, or no client retries. */
 void resp_err_code(struct pc_jw *w, const char *code, const char *msg)
 {
 	pc_jw_lit(w, "-");
@@ -35,7 +26,7 @@ void resp_err_code(struct pc_jw *w, const char *code, const char *msg)
 	pc_jw_lit(w, "\r\n");
 }
 
-/* S280: an error line in Redis's own words, code and all - its WRONGTYPE,
+/* an error line in Redis's own words, code and all - its WRONGTYPE,
  * and RedisJSON's wrong-type error, which has no code word */
 void resp_err_line(struct pc_jw *w, const char *line)
 {

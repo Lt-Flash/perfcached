@@ -1,24 +1,6 @@
 #!/bin/sh
-# winstatstest.sh - S351: /stats carries, beside every counter the status page
-# shows, its window over the last five minutes (win_<field>), kept by the
-# daemon.
-#
-# The page reads as a five-minute dashboard and was one only for the
-# commands table: the rest were lifetime totals under a "last 5 min"
-# heading (PROD 2026-10-08: "All these numbers don't look like 5 min ones").
-# wintest.c pins the window arithmetic on an injected clock; this pins the
-# wiring, on two eager members:
-#  - every win_ field the page reads is in /stats (a missing one would show
-#    a dash forever);
-#  - on a daemon younger than five minutes a window is its whole count -
-#    50 stores, 20 hits, 1 miss;
-#  - reset stats: the window counts from the reset, not across it;
-#  - the FLEET windows are null while a member has no minute of baseline
-#    (never a few seconds passed off as five minutes), and a figure once
-#    it has one;
-#  - since.win_s says how far back the windows reach.
-# ~75 s: the fleet case needs a minute of baseline.
-# Usage: test/winstatstest.sh [./perfcached] [./perfcli]
+# winstatstest.sh - /stats carries a five-minute window (win_<field>) beside every counter the page shows:
+# whole counts on a young daemon, restarted by a reset, and fleet windows null until a minute of baseline.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -142,9 +124,8 @@ fl = c.get("fleet") or {}
 (ok if fl.get("members") == 2 and fl.get("win_stores", "x") is None else bad)(
     "a fleet window with a member seen for seconds is null, not a guess (members %s, win_stores %r)"
     % (fl.get("members"), fl.get("win_stores", "absent")))
-# 4. reset stats: the window counts from the reset
-# S407 part 3: the daemon's HTTP door takes no POST; the page's reset is the
-# native verb reset_stats {"fleet": true}, sent here as the dashboard sends it
+# 4. reset stats: the window counts from the reset; the reset is the native verb
+# reset_stats {"fleet": true}, sent as the dashboard sends it
 import socket, pcnative
 _nf = pcnative.wrap(socket.create_connection(("127.0.0.1", 17951), 5))
 pcnative.call(_nf, "reset_stats", fleet=True)

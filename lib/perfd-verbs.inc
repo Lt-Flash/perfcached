@@ -3,14 +3,8 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-verbs.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds the typed verbs: strings and counters, conditional sets (S279, S297),
- * hashes (S313), rate limits (S314) and the JSON path verbs.
- */
+/* The typed verbs, #included by perfd.c (one translation unit, statics stay file-local):
+ * strings, counters, conditional sets, hashes, rate limits, JSON paths, admin verbs. */
 /* ---- request helpers --------------------------------------------------- */
 
 /* open a params map holding col and key; the caller adds its own
@@ -70,12 +64,8 @@ int perfd_set_cond(perfd_t *p, const char *col, const char *key,
 	return ok;
 }
 
-/* ---- S313: hashes ---------------------------------------------------------
- * Every call sends one H command (verb 18, the fixed layout) and reads
- * the daemon's reply TREE as the payload: 'i' i64 | 'b' u32 len, bytes
- * | 'n' | 'a' u32 count, items | 'o' | 'e' u32 len, the error line -
- * the S313 subset of src/ptree.h, read here by a cursor rather than an
- * index because every reply is a flat item or one array. */
+/* ---- hashes: one H command each; the reply tree is 'i' i64 | 'b' u32 len, bytes |
+ * 'n' | 'a' u32 count, items | 'o' | 'e' u32 len, the error line (src/ptree.h) */
 struct hrt {
 	const unsigned char *b;
 	size_t n, o;
@@ -155,7 +145,7 @@ static int hcall(perfd_t *p, const char *col, const char *key,
 
 		for (i = 0; i < nargs; i++)
 			need += 4 + argl[i];
-		/* S284: the handle's request scratch, grown once */
+		/* the handle's request scratch, grown once */
 		if (grow_buf(p, &p->wsc, &p->wscap, need) != 0)
 			return -1;
 		enc = p->wsc;
@@ -189,8 +179,8 @@ static int hcall(perfd_t *p, const char *col, const char *key,
 			l = sizeof msg - 1;
 		memcpy(msg, *tree + 5, l);
 		msg[l] = 0;
-		*tree = NULL;                  /* borrowed (S284) */
-		/* a server's own words, never a format (it used to be one) */
+		*tree = NULL;                  /* borrowed */
+		/* a server's own words, never a format */
 		return errk(p, server_kind(msg), "%s", msg);
 	}
 	return 0;
@@ -314,9 +304,8 @@ int perfd_hget(perfd_t *p, const char *col, const char *key,
 	return rc;
 }
 
-/* S353: a _buf call's copy - straight from the reply the handle lends into
- * the caller's buffer.  Too small: the buffer is left untouched and *vlen
- * says how much is needed (-2); the caller retries with a bigger one. */
+/* a _buf call's copy from the lent reply; too small: the buffer is left untouched
+ * and *vlen says how much is needed (-2) */
 static int buf_out(const void *src, size_t n, void *buf, size_t cap,
 		size_t *vlen)
 {
@@ -556,12 +545,8 @@ int perfd_sub(perfd_t *p, const char *col, const char *key, long long by,
 	return counter(p, BV_SUB, col, key, by, 0, newval);
 }
 
-/* mget {col, keys: [..]} -> {values: [{found, value?, ttl?,
- * unanswered?}..]}: the values are bulks, copied exact.  G8: a key whose
- * owner did not answer in time comes back {found: false, unanswered:
- * true}.  @status NULL (perfd_mget): such a key fails the whole call, as
- * a short answer does - a miss it is not.  Else (perfd_mget_ex) each
- * key's PERFD_MGET_* */
+/* values are bulks, copied exact.  An unanswered key (owner too slow) fails the whole
+ * call with @status NULL - it is not a miss; else it is PERFD_MGET_UNANSWERED */
 static int mget_call(perfd_t *p, const char *col, const char *const *keys,
 		int nkeys, void **values, size_t *vlens, int *status)
 {
@@ -654,9 +639,8 @@ int perfd_mget_ex(perfd_t *p, const char *col, const char *const *keys,
 	return mget_call(p, col, keys, nkeys, values, vlens, status);
 }
 
-/* keys {col, match?, limit?} -> {keys: [b..], ..}; the keys come back as
- * bytes, and a C string is what this API promises, so a NUL inside a key
- * ends it there (as it always did) */
+/* keys come back as bytes and this API promises C strings, so a NUL inside
+ * a key ends it there */
 int perfd_keys(perfd_t *p, const char *col, const char *match, int limit,
 		char ***keys_out)
 {
@@ -747,7 +731,7 @@ static int tw_whole(perfd_t *p, struct pc_tw *w)
 	return errk(p, PERFD_E_ARG, "request too large");
 }
 
-/* S297: compare-and-set / compare-and-delete (setifeq, setifne, delifeq,
+/* compare-and-set / compare-and-delete (setifeq, setifne, delifeq,
  * delifne).  1 applied, 0 not, -1 error. */
 static int cmp_call(perfd_t *p, const char *method, const char *flag,
 		const char *col, const char *key, const void *val, size_t vlen,
@@ -829,7 +813,7 @@ int perfd_jget(perfd_t *p, const char *col, const char *key,
 		
 		return 0;
 	}
-	/* the fragment is one bulk of its JSON text (D3); tv_bulk_dup
+	/* the fragment is one bulk of its JSON text; tv_bulk_dup
 	 * terminates it, which is the C string this API promises */
 	rc = tv_bulk_dup(&v, pc_tv_get(&v, 0, "value"), (void **)frag_out, &fl);
 	tv_put(p, &v);
@@ -864,7 +848,7 @@ int perfd_jget_buf(perfd_t *p, const char *col, const char *key,
 		tv_put(p, &v);
 		return 0;
 	}
-	/* the fragment's JSON text, one bulk (D3) - copied as it stands,
+	/* the fragment's JSON text, one bulk - copied as it stands,
 	 * without the terminator perfd_jget adds */
 	k = pc_tv_get(&v, 0, "value");
 	if (k < 0 || k >= v.nn || v.n[k].type != 'b') {
@@ -888,7 +872,7 @@ int perfd_jset(perfd_t *p, const char *col, const char *key,
 		return -1;
 	tw_ckp(&w, col, key, path);
 	pc_tw_key(&w, "val");
-	pc_tw_str(&w, json_val);           /* the document: its text, one bulk (D3) */
+	pc_tw_str(&w, json_val);           /* the document: its text, one bulk */
 	if (ttl > 0) {
 		pc_tw_key(&w, "ttl");
 		pc_tw_i64(&w, ttl);
@@ -956,10 +940,8 @@ int perfd_jincr(perfd_t *p, const char *col, const char *key,
 	return 0;
 }
 
-/* ---- the admin verbs (0.6.6, DESIGN 12no) ---------------------------------
- * Thin: the params as JSON text, the reply as JSON text - perfd_command's
- * edge.  The collection name and the secret are escaped (a name is
- * limited by the daemon, but a secret is any bytes). */
+/* ---- the admin verbs: params and reply as JSON text (perfd_command's edge) ----
+ * The collection name and the secret are escaped: a secret is any bytes. */
 static char *admin_call(perfd_t *p, const char *method, const char *col,
 		const char *flag, const char *secret)
 {
@@ -994,9 +976,8 @@ static char *admin_call(perfd_t *p, const char *method, const char *col,
 	return perfd_command(p, method, any ? buf : NULL);
 }
 
-/* 0.7.0 (S420): the handle's name, sent once per connection it uses - a
- * refusal (an older daemon without the verb) is not reported: the name is
- * a courtesy, not a capability */
+/* the handle's name, once per connection; an older daemon's refusal is not
+ * reported: the name is a courtesy, not a capability */
 static void name_replay(perfd_t *p)
 {
 	char buf[256];
@@ -1041,24 +1022,18 @@ char *perfd_clients(perfd_t *p, int cap)
 
 int perfd_enable(perfd_t *p, const char *secret)
 {
-	char *r, *keep;
+	char *r;
 
 	if (!p || !secret)
 		return errk(p, PERFD_E_PROTOCOL, "enable: no secret");
-	if (!p->encrypted && p->nsec)                              /* S468 */
+	if (!p->encrypted && p->nsec)
 		return errk(p, PERFD_E_STATE, "enable: this connection is "
 			"authenticated but not encrypted, and the enable secret never "
 			"crosses in the clear - connect with perfd_opts.encrypt = 1");
-	r = admin_call(p, "enable", NULL, NULL, secret);
+	r = admin_call(p, "enable", NULL, NULL, secret);   /* kept by perfd_command_tree */
 	if (!r)
 		return -1;
 	free(r);
-	keep = strdup(secret);
-	if (keep) {
-		free(p->enable_sec);
-		p->enable_sec = keep;
-	}
-	p->enable_due = 0;
 	return 0;
 }
 
@@ -1074,10 +1049,8 @@ char *perfd_updrain(perfd_t *p, const char *col, int what)
 		what == PERFD_SWEEP_STOP ? "stop" : NULL, NULL);
 }
 
-/* 0.7.0 (S408 part 2): the operations verbs.  ops_call builds {"col":…,
- * <ikey>:N, <skey>:"…", <bkey>:true} from what is given - the four shapes
- * these verbs take - and sends it; a verb with nothing to say sends no
- * params. */
+/* the operations verbs: {"col":…, <ikey>:N, <skey>:"…", <bkey>:true} from what is
+ * given; a verb with nothing to say sends no params */
 static char *ops_call(perfd_t *p, const char *method, const char *col,
 		const char *ikey, long long ival, const char *skey, const char *sval,
 		const char *bkey)
@@ -1149,7 +1122,7 @@ char *perfd_rename(perfd_t *p, const char *col, const char *to)
 	return ops_call(p, "rename", col, NULL, 0, "to", to ? to : "", NULL);
 }
 
-/* S432: the RESP door's DB-index map at runtime (0.7.1) */
+/* the RESP door's DB-index map at runtime */
 char *perfd_map(perfd_t *p, int index, const char *col)
 {
 	return ops_call(p, "map", NULL, "index", index, "col", col ? col : "",
@@ -1213,7 +1186,7 @@ char *perfd_upgrade_switch(perfd_t *p, const char *sha256, int force)
 		force ? "force" : NULL);
 }
 
-char *perfd_cluster_epoch_commit(perfd_t *p, int epoch)       /* 12nu */
+char *perfd_cluster_epoch_commit(perfd_t *p, int epoch)
 {
 	return ops_call(p, "cluster_epoch_commit", NULL, "epoch", epoch, NULL, NULL,
 		NULL);
@@ -1225,9 +1198,8 @@ char *perfd_fleetstop(perfd_t *p, int timeout_ms)
 		timeout_ms, NULL, NULL, NULL);
 }
 
-/* 0.7.0 (S411 part 1): the staging of a release artifact - perfcli's
- * upgrade-stage loop, in the library so the upgrade leader and the
- * dashboard stage builds the same way. */
+/* staging a release artifact: in the library so perfcli, the upgrade leader and
+ * the dashboard stage builds the same way */
 static int json_str_field(const char *res, const char *key, char *out,
 		size_t cap)
 {

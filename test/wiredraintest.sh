@@ -1,29 +1,6 @@
 #!/bin/sh
-# wiredraintest.sh - a connection's output limit is on its BACKLOG, not
-# on its traffic.
-#
-# The wire buffer is reset only when it drains completely, and the limit
-# (PC_MAX_OUTQ + 1/16) was checked against everything appended since that
-# reset - bytes already in the socket included.  A reader that keeps up
-# but never quite empties the buffer was closed after 8.5 MB of TRAFFIC,
-# as a "write error" no counter records: GitHub rc46 check-standalone,
-# pushbatchtest's burst arm, one subscriber cut at 1,931 of 4,000 4 KB
-# frames with dropped 0 and slow kills 0.
-#
-# pushbatchtest caught it by luck - a fast reader drains between flushes.
-# Here the reader is FLOW-CONTROLLED to lag the publisher by 5-6 MB:
-# more than loopback's socket buffers hold, so the server always has
-# something pending, and less than the 8 MB slow-consumer cap, so a
-# close is never the legitimate one.  20 MB crosses the old limit twice
-# over, however fast or slow the host.
-#   - every frame arrives, in order, and the connection is not closed
-#   - no slow kill, nothing dropped (the lag stayed under the cap)
-#   - the backlog was really the SERVER's: /clients shows the subscriber
-#     pending >= 512 KB (a lag the sockets absorb proves nothing - the
-#     first cut of this test passed on the unfixed build for exactly
-#     that reason: 5-6 MB fit in loopback's buffers)
-# Fail-first: the build before the fix cuts the subscriber at ~8.5 MB.
-# Usage: test/wiredraintest.sh [./perfcached]
+# wiredraintest.sh - a connection's output limit is on its backlog, not its traffic: a subscriber
+# held 5-6 MB behind (server pending >= 512 KB) gets all 20 MB in order.  Usage: test/wiredraintest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcwiredrain.XXXXXX); P1=
@@ -68,9 +45,8 @@ LAG_LO, LAG_HI = 5 << 20, 6 << 20
 hdr = b"*3\r\n$7\r\nmessage\r\n$2\r\nst\r\n$%d\r\n" % PL
 fl = len(hdr) + PL + 2
 
-# a small receive window, so the lag cannot hide in the client's socket:
-# what the server's send buffer cannot hold (tcp_wmem max, 4 MB here)
-# stays in its OWN wire buffer - the backlog under test
+# a small receive window, so the lag cannot hide in the client's socket: what the
+# server's send buffer cannot hold stays in its OWN wire buffer, the backlog under test
 sub = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sub.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 << 10)
 sub.connect(("127.0.0.1", 17582))
@@ -181,6 +157,7 @@ check(state["waits_at_lag"] > 0 and state["pend_max"] >= (512 << 10),
 check(replies.count(b"\r\n") == state["sent"] and all(l == b":1" for l in replies.split(b"\r\n")[:state["sent"]]),
       "every PUBLISH answered 1 receiver (%d of %d)" % (replies.count(b"\r\n"), state["sent"]))
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$D/w.res"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$D/w.res"
 [ -s "$D/w.res" ] || bad "the python driver produced nothing"
 [ -s "$D/w.py.err" ] && { bad "the python driver raised:"; tail -3 "$D/w.py.err"; }

@@ -1,15 +1,5 @@
-/*
- * slottest.c — src/pc_slot.h, the key -> slot function placement rests on.
- *
- * Checked here rather than through a live cluster because everything
- * else about placement is downstream of this: if the slot is wrong the
- * owner is wrong, and a cluster test would report that as "the nodes
- * disagree" without ever pointing here.
- *
- * The reference values are Redis's own.  They are hard-coded rather
- * than recomputed, because a test that recomputes the value the same
- * way the code does proves only that the code is self-consistent.
- */
+/* slottest.c - pc_slot.h's key -> slot function, the root of placement, against Redis's own values
+ * hard-coded (a recomputed reference proves only self-consistency). */
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -34,12 +24,8 @@ static void eq(const char *what, unsigned got, unsigned want)
 	}
 }
 
-/* The tables are compile-time constants, so the typo they could hide
- * has to be caught HERE.  All 2048 entries are re-derived - T[0] from
- * the polynomial bitwise, T[k] from T[k-1] - and compared.  This is the
- * check that used to run on every call, moved to build time.  A single
- * wrong digit would still look like a hash and still spread keys, and
- * would disagree with every Redis client for one byte value in 256. */
+/* the tables are compile-time constants, so all 2048 entries are re-derived from the polynomial
+ * and compared: one wrong digit still spreads keys but disagrees with every Redis client */
 static void t_table(void)
 {
 	unsigned k, n, j, wrong = 0, fk = 0, fn = 0;
@@ -78,11 +64,8 @@ static void t_table(void)
 	}
 }
 
-/* Slicing must equal the plain byte-at-a-time form for EVERY length,
- * not just the aligned ones: the 8-byte step and the tail loop are
- * different code, and a key of 25 bytes uses both.  Lengths 0..64 plus
- * pseudo-random content, compared against an independent
- * implementation written here. */
+/* slicing equals the byte-at-a-time form for EVERY length 0..64 (the 8-byte step and the tail
+ * loop are different code), against an independent implementation written here */
 static void t_slice(void)
 {
 	unsigned char buf[80];
@@ -127,7 +110,7 @@ static void t_crc(void)
 	eq("crc16(\"\")", pc_crc16("", 0), 0);
 }
 
-/* Redis's own slots.  Verified against redis-cli CLUSTER KEYSLOT. */
+/* Redis's own slots, as redis-cli CLUSTER KEYSLOT gives them */
 static void t_vectors(void)
 {
 	struct { const char *k; unsigned s; } v[] = {
@@ -145,9 +128,8 @@ static void t_vectors(void)
 	}
 }
 
-/* the hash-tag rule, including the edges Redis specifies but that are
- * easy to get subtly wrong - each one is a key someone deliberately
- * grouped, so disagreeing here breaks exactly the intent */
+/* the hash-tag rule's edges: each is a key someone deliberately grouped, so disagreeing here
+ * breaks exactly the intent */
 static void t_tags(void)
 {
 	unsigned a = pc_key_slot("{42}", 4);
@@ -175,18 +157,8 @@ static void t_tags(void)
 		bad("key hashing stopped at an embedded NUL");
 }
 
-/* The table is built lazily and workers are THREADS, so this checks
- * that concurrent first-use is correct.
- *
- * Be clear about what it does NOT prove.  The reason pc_slot.h gives
- * the table per-thread storage is a weak-memory hazard: one thread
- * seeing `built` set before the table's stores are visible.  x86 does
- * not reorder store-store, so a SHARED table passes this test here -
- * verified by putting one back, 5 runs, 18/18 each time.  Only a
- * weakly-ordered target (ARM) could fail it.  The per-thread table
- * removes the hazard by construction; this test guards the ordinary
- * correctness of lazy init, and the ARM case rests on the argument in
- * pc_slot.h, not on this assertion passing. */
+/* concurrent first use of the lazily built table; x86 passes even a shared table, so the
+ * weak-memory case rests on pc_slot.h's per-thread storage, not on this test */
 #define NTHREAD 8
 #define NITER   20000
 static void *hammer(void *arg)
@@ -239,17 +211,8 @@ static void t_threads(void)
 }
 
 
-/* pc_hrw_mix(): the rendezvous weight, and the second half of the
- * placement contract.  These values were captured from the THREE
- * byte-identical copies that lived in cluster.c, lib/perfd.c and
- * clplace.c BEFORE they were collapsed into pc_mix.h, so they prove the
- * collapse changed nothing.  (Exception: the 198.51.100.224 row's
- * address was swapped to a documentation address after the collapse and
- * its value re-derived from pc_mix.h; the other four rows still carry
- * the pre-collapse capture.)  They are also the guard against anyone
- * "improving" the mix later: a better hash here would move every key in
- * every deployment, silently, because both sides would change together
- * and agree perfectly on the new answer. */
+/* pc_hrw_mix(), the rendezvous weight: captured values that guard the mix against "improvement" -
+ * a different hash would move every key in every deployment, both sides agreeing on it */
 static void t_mix(void)
 {
 	struct { uint64_t kh; const char *ip; uint16_t port; uint64_t want; } v[] = {

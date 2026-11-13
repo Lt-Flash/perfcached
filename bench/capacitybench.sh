@@ -1,41 +1,9 @@
 #!/bin/sh
-# capacitybench.sh — S39, the capacity arm nobody has run.
-#
-# Every other benchmark in this repo measures a working set of a few MB
-# against a 512 MB node - under 1% of ONE arena.  In that regime store
-# and proxy keep everything local and shard is forced to spread for
-# nothing, so shard measures slowest and the tables read as "shard is
-# the slow mode".  That is an artefact of the workload: shard's whole
-# purpose is capacity beyond one node, and no benchmark has ever entered
-# the regime where that matters.
-#
-# This arm does.  Three nodes at ARENA MB each, and a working set that
-# EXCEEDS one arena while fitting the fleet.
-#
-# THROUGHPUT IS NOT THE HEADLINE - HIT RATE IS.  A mode that has quietly
-# stopped holding half the keyspace answers its misses FASTER than a
-# mode that holds everything, so a throughput number taken while a mode
-# is missing is not comparable to one taken while another is hitting.
-# Every read row here carries the hit rate beside it.
-#
-# There is NO EVICTION.  pcache_htable.c returns "arena full - write
-# dropped" and the client is told `cache full`; live records are never
-# evicted to make room (reclaim only returns drained chunks to the OS).
-# So store and eager do not degrade gracefully - they stop accepting
-# writes, and the keys that never landed miss forever.  That also rules
-# out redis-benchmark as the fill client: it aborts on the first -ERR,
-# which would give the filling modes LESS fill effort than the others
-# and silently rig the comparison.  natbench counts errors and carries
-# on, so every mode gets the same wall-clock effort.
-#
-# Usage:
-#   bench/capacitybench.sh
-#   KEYSPACE=200000 bench/capacitybench.sh     # a bigger working set
-#   MODEARMS="store shard" bench/capacitybench.sh
+# capacitybench.sh - each mode with a working set past one arena but inside the fleet: HIT RATE is the
+# headline (no eviction: a full node refuses writes); natbench fills because it carries on past -ERR.
 set -u
 
-# RUNTIME=docker|podman|nerdctl, else autodetect - a docker-only host
-# used to die with "podman: not found" (same fix as enumbench)
+# RUNTIME=docker|podman|nerdctl, else autodetect
 RT=${RUNTIME:-}
 if [ -n "$RT" ]; then
 	command -v "$RT" >/dev/null 2>&1 || {
@@ -54,18 +22,8 @@ SECRET=cap-client-secret
 MODEARMS=${MODEARMS:-"store eager proxy shard"}
 ARENA=${ARENA:-128}                    # PER NODE; the fleet is 3x this
 VAL=${VAL:-1024}
-# Sized from measurement, not from the value size: a 1024-byte value
-# costs ~2212 bytes of arena_used (1536 live, and the allocator asks
-# ~1.44x that again).  One 128 MB node therefore holds ~60,000 of them
-# and the fleet ~182,000.  The default sits at ~2x one arena and ~2/3 of
-# the fleet: comfortably past what one node can hold, comfortably inside
-# what three can.  The run re-derives the real figure and prints it, so
-# a wrong guess here is visible rather than assumed.
-# 0 = CALIBRATE: fill one node until it refuses and size the working set
-# from what it actually held.  A hardcoded number was wrong the moment
-# arena_mb became a real bound (b1e71f1), and it would be wrong again the
-# next time the record overhead moves.  The arm needs a working set that
-# exceeds ONE node and fits THREE; only the daemon can say where that is.
+# 0 = calibrate: fill one node until it refuses and size the working set from what it held (only the
+# daemon knows its record overhead); the arm needs a working set past ONE node and inside THREE.
 KEYSPACE=${KEYSPACE:-0}
 # multiple of one node's measured capacity to aim the working set at:
 # past one arena, comfortably inside three.
@@ -158,22 +116,12 @@ CFG
 	return 0
 }
 
-# spares=0, i.e. a NON-ROUTING client, and this is the whole arm.
-# libperfd routes by key when it has standbys (S35), so with routing on
-# the CLIENT does the distributing and every mode spreads across the
-# fleet - the first run of this harness reported store holding 115,000
-# keys over three nodes, which is exactly what store is supposed not to
-# do.  Pinning to one node is what makes the DAEMON's placement the
-# thing being measured.
-#
-# ROUTE=1 gives the contrast run: the recommended production setup,
-# where a cluster-aware client removes the forward hop.  Do not compare
-# a routed number with a pinned one - they are different experiments.
+# spares=0, a NON-ROUTING client pinned to one node, so the DAEMON's placement is measured; ROUTE=1
+# is the routed contrast run, a different experiment not to be compared with it
 ROUTE=${ROUTE:-0}
 SPARES=$([ "$ROUTE" = 1 ] && echo -1 || echo 0)
 nat() { # nat <getpct> <secs> -> raw natbench output
-	# trailing positionals: kv=1 (the data verbs on their fixed-layout
-	# frames, the only wire since S317), latrate=0, spares
+	# trailing positionals: kv=1 (the data verbs on their fixed-layout frames), latrate=0, spares
 	$RT exec cap-cli natbench "$(n_ip 1)" 6479 "$SECRET" 0 \
 		"$CONNS" "$THREADS" "$DEPTH" "$2" "$KEYSPACE" "$VAL" "$1" 1 0 \
 		"$SPARES" 2>&1
@@ -265,18 +213,13 @@ for M in $MODEARMS; do
 		e=$(echo "$st" | field entries); u=$(echo "$st" | field arena_used)
 		held=$((held + ${e:-0})); used=$((used + ${u:-0}))
 		[ "${e:-0}" -gt 0 ] && usedheld=$((usedheld + ${u:-0}))
-		# per-node, because the SUM hides the distribution and the
-		# distribution is the entire question: "the fleet holds it"
-		# and "one node holds it" sum identically.
+		# per-node: "the fleet holds it" and "one node holds it" sum identically
 		per="$per n$i=${e:-0}/$(( ${u:-0} / 1048576 ))MB"
 		[ "${e:-0}" -gt "${maxnode:-0}" ] && maxnode=${e:-0}
 	done
 	say "  per node:$per"
-	# per-record cost from the nodes that actually HOLD something.  The
-	# fleet total includes the baseline arena of every idle node, so
-	# dividing it by keys_held charged store for two nodes holding
-	# nothing and reported 4,387 B/record against shard's 2,979 - a
-	# difference that was entirely the denominator.
+	# per-record cost from the nodes that actually hold something: the fleet total includes every idle
+	# node's baseline arena
 	bpr=$([ "${held:-0}" -gt 0 ] && echo $((usedheld / held)) || echo 0)
 
 	say "  reading for ${READ_SECS}s"
@@ -292,11 +235,8 @@ for M in $MODEARMS; do
 		"$held" "$maxnode" "$KEYSPACE" "$hpct" \
 		"$((used / 1048576))" "${ferr:-?}" "${rops:-0}" "$bpr" \
 		>> "$D/results.tsv"
-	# entries_sum is a SUM over nodes, so a replicating mode counts each
-	# key once per copy: eager read 72% of the keyspace by that measure
-	# while its hit rate said 50.1%, the same as store.  HIT RATE is the
-	# capacity number; the sum is a distinct-key count only for modes
-	# that put a key on exactly one node.
+	# entries_sum counts a replicated key once per copy, so HIT RATE is the capacity number; the sum is a
+	# distinct-key count only for modes that put a key on one node
 	say "  entries_sum $held (most on one node: $maxnode) of $KEYSPACE,"
 	say "  fleet $((used / 1048576)) MB, fill errors ${ferr:-?},"
 	say "  read ${rops:-0}/s at ${hp}% HIT RATE  <- the capacity number"

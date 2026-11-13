@@ -1,27 +1,11 @@
 #!/bin/sh
-# asynctest.sh — libperfd's event-loop surface (S32) under a real loop.
-#
-# Starts a daemon, runs the libevent consumer against it, and RESTARTS
-# the daemon partway through, because obligation 3 is about reconnect:
-# the consumer must re-establish - Noise handshake included - from
-# inside its loop, without a blocking call and without losing track of
-# the requests that were in flight when the node went away.
-#
-# Skipped, loudly, if libevent headers are absent: the point of using
-# libevent rather than a hand-rolled poll() is that it is what S31's
-# consumer actually runs, and a substitute would not prove the same thing.
-#
-# usage: test/asynctest.sh [./perfcached] [./asynctest]
+# asynctest.sh - libperfd's event-loop surface under libevent: the daemon is restarted mid-load and the
+# consumer must reconnect (Noise included) from inside its loop without losing in-flight requests.
 set -u
 
 BIN=${1:-./perfcached}
 AT=${2:-./asynctest}
-# A directory of THIS RUN's own.  It used to be a fixed
-# /var/tmp/pcasync, and the script does `rm -rf "$D"` - so two
-# concurrent runs deleted each other's state mid-test.  CI runs
-# concurrent=2 with netns-run.sh, which isolates the suites' fixed PORTS
-# but not the filesystem; that is exactly how clitest's shared history
-# file turned the v0.3.7-rc3 tag red.
+# a directory of THIS RUN's own: the script removes it, and concurrent CI runs share the filesystem
 D=$(mktemp -d /var/tmp/pcasync.XXXXXX)
 SECRET=at-client-secret
 P1=
@@ -30,12 +14,8 @@ P1=
 SKIPPED, and a skip is not a pass"; exit 0; }
 
 rm -rf "$D"; mkdir -p "$D"
-# the bracket in the pattern stops pkill/pgrep matching the shell that
-# runs them - they read their own command line too
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line; the name
+# pattern is a fallback, its bracket keeping pkill from matching the shell running it
 PIDS=""
 trap '[ -n "$P1" ] && kill -9 $P1 2>/dev/null; for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" \
      2>/dev/null; rm -rf "$D"' EXIT
@@ -79,9 +59,8 @@ start() {
 
 start || exit 1
 
-# The consumer kills the daemon itself mid-load (that is the point of
-# obligation 3); this brings it back so the reconnect has something to
-# reconnect TO.  Backgrounded with a delay, not double-backgrounded.
+# the consumer kills the daemon itself mid-load; this brings it back so the reconnect has something
+# to reconnect TO
 (
 	i=0
 	while [ $i -lt 200 ]; do

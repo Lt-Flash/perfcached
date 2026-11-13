@@ -1,27 +1,6 @@
 #!/bin/sh
-# reloadtest.sh - 12nw (0.7.1): a configuration reload.  SIGHUP, `perfcached
-# -f <conf> -H <pid>` (what the units' ExecReload runs) and the privileged
-# `reload` verb read the file again; when every key that changed is one a
-# running daemon can take - resp_allow, http_allow, the http / resp /
-# enable / client secrets, log_level, slowlog_usec - it is applied, and
-# when ANY other key changed the reload is refused whole, naming the keys,
-# and nothing changes.  Cases:
-#   A. nothing changed: -H answers so, exit 0
-#   B. the http token, the RESP password and the enable secret, one reload:
-#      the old ones refused after it, the new ones taken
-#   C. resp_allow narrowed past this address: the RESP door refuses it;
-#      widened again: taken
-#   D. the client secret: a new perfcli handshake needs the new one
-#   E. slowlog_usec 10 s -> 0: the next command is in the slow log
-#   F. a key that cannot reload ([daemon] workers) beside one that can (the
-#      token): refused, exit 1, the message names [daemon] workers, and the
-#      token did NOT change
-#   G. a file that does not load: refused, exit 1, the daemon untouched
-#   H. kill -HUP: the daemon lives (before 0.7.1 it died) and reloads
-#   I. the verb: refused without privilege, applied with it; stats.reload
-#      counts applied and refused
-# Fail-first: before 0.7.1 there is no -H and SIGHUP ends the daemon.
-# Usage: test/reloadtest.sh [./perfcached] [./perfcli]
+# reloadtest.sh - SIGHUP, -H <pid> and the reload verb apply a changed config when every changed key can reload,
+# else refuse it whole, naming the keys.  Usage: test/reloadtest.sh [./perfcached] [./perfcli]
 set -u
 BIN=${1:-./perfcached}; CLI=${2:-./perfcli}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

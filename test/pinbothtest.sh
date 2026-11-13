@@ -1,30 +1,6 @@
 #!/bin/sh
-# pinbothtest.sh - S265: the arena and the WAL buffers are locked in RAM
-# together or not at all.
-#
-# The arena is mlock'd when RLIMIT_MEMLOCK allows (pin = auto) or must be
-# (pin = require); the WAL's rings and the pump's stage buffer never were.
-# A node could therefore report itself resident while its write path
-# stalled on a swapped-out ring page.  Now, when the arena is locked, the
-# WAL buffers are locked with it; if they cannot be, `pin = auto` unlocks
-# the arena as well and warns, and `pin = require` refuses to start.
-#
-# Ground truth is the kernel's VmLck.  16 MB arena, 2 workers (8 rings of
-# 1 MB rings; S266 sizes them by role - 2 workers of 1 MB, 6 small of
-# 512 KB, + the 4 MB stage and its 4 MB write buffer = 13 MB of WAL
-# buffers), the soft RLIMIT_MEMLOCK
-# set per case (no privilege needed below the hard limit):
-#   A. 60 MB, auto:    both locked - VmLck >= the arena's locked bytes +
-#                      wal.buffer_bytes (read from /stats), buffers_locked
-#   B. 20 MB, auto:    the arena fits, the WAL does not - NEITHER locked
-#                      (VmLck 0) and the node says why
-#   C. 20 MB, require: refuses to start, naming both
-#   D. <=8 MB, auto:   the arena cannot lock - neither locked, as before
-# A-C need a hard limit of 20-60 MB and are SKIPPED, loudly, below it
-# (default containers and CI runners); D runs under any limit.
-# Fail-first: the build before S265 locks only the arena in A and B
-# (VmLck 16 MB) and starts in C.
-# Usage: test/pinbothtest.sh [./perfcached]
+# pinbothtest.sh - the arena and the WAL buffers are locked in RAM together or not at all (pin = auto
+# unlocks both and warns, pin = require refuses), judged by the kernel's VmLck.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcpin.XXXXXX)
@@ -38,8 +14,7 @@ skp()  { skip=$((skip+1)); echo "  SKIP $1"; }
 for p in 18701 18702; do
 	ss -ltn 2>/dev/null | grep -q ":$p[[:space:]]" && { echo "pinbothtest: port $p busy" >&2; exit 1; }
 done
-# AddressSanitizer intercepts mlock and ignores it (the call succeeds, no
-# page is locked: VmLck 0 while the daemon reads both as locked) - there is
+# AddressSanitizer intercepts mlock and ignores it (VmLck 0 while the daemon reads both as locked):
 # nothing to test in such a build
 if grep -qa "__asan_init" "$BIN" 2>/dev/null; then
 	echo "pinbothtest: SKIPPED - an ASan build: the sanitizer ignores mlock, so VmLck cannot answer"
@@ -47,9 +22,7 @@ if grep -qa "__asan_init" "$BIN" 2>/dev/null; then
 fi
 HARD=$(ulimit -H -l)
 [ "$HARD" = unlimited ] && HARD=1048576
-# CAP_IPC_LOCK (bit 14) ignores RLIMIT_MEMLOCK altogether - root on a
-# bare host has it, root in a default container and an unprivileged
-# runner do not.  With it, the daemon is started without it.
+# CAP_IPC_LOCK (bit 14) ignores RLIMIT_MEMLOCK altogether, so with it the daemon is started without it
 CAPEFF=$(awk '/^CapEff:/ { print $2 }' /proc/self/status)
 DROP=
 if [ $(( 0x$CAPEFF >> 14 & 1 )) = 1 ]; then

@@ -1,30 +1,11 @@
 #!/bin/sh
-# readygatetest.sh — C7: a node that is not READY refuses DATA verbs and
-# still answers OBSERVABILITY ones.
-#
-# WHY THE GATE EXISTS.  A node replaying its WAL can still hold a key
-# that was DELETED while it was down (that is B4's resurrection bug, and
-# reconcile is what settles it).  Until it settles, serving does not
-# answer LATE - it answers WRONGLY, which is the one failure a cache
-# must not let a client mistake for a fact.
-#
-# THE WINDOW.  A clustered node that recovered data enters RECOVERING at
-# daemon.c:699 and leaves it when it founds, JOIN_WAIT_MS (2 s) later.
-# Workers are spawned before that, so the window is reachable by a
-# client.  The test polls through it.
-#
-# IF THE WINDOW IS MISSED the test says so and FAILS rather than
-# passing: "no refusal seen" is indistinguishable from "gate absent"
-# unless we also prove we were actually inside the window, so the run
-# asserts it observed state=recovering too.
-#
-# usage: test/readygatetest.sh [./perfcached] [./perfcli]
+# readygatetest.sh - a node that is not READY refuses DATA verbs (RESP: -LOADING) and still answers
+# observability ones; the run must prove it observed the RECOVERING window, or it fails.
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
-# per-run by default; the override stays so a human can keep the tree.
-# A fixed default collides under CI's concurrent=2 - see clitest and
-# v0.3.7-rc3.
+# per-run by default (a fixed default collides under concurrent CI jobs); the override lets a human
+# keep the tree
 D=${READYGATE_DIR:-$(mktemp -d /var/tmp/readygate.XXXXXX)}
 PORT=${PORT:-17841}
 RPORT=${RPORT:-17843}
@@ -33,13 +14,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
 
-# The per-run tree is removed on the way out - a WAL is provisioned in
-# it, 65 MB a run, and for a week nothing took it away: 43 runs of this
-# suite and as many of its sibling left 5.4 GB in /var/tmp on the CI
-# runner, the disk filled, and v0.4.0-rc24's check and check-asan went
-# red in statedirtest (a default-sized WAL could not be provisioned)
-# over code that was green everywhere else.  A tree the caller named
-# (READYGATE_DIR) is the caller's to keep.
+# the per-run tree (a 65 MB provisioned WAL each run) is removed on exit; a tree the caller named
+# (READYGATE_DIR) is the caller's to keep
 [ -n "${READYGATE_DIR:-}" ] || trap 'rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM
 rm -rf "$D"; mkdir -p "$D/wal"
@@ -47,10 +23,8 @@ REV=$("$BIN" -V 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')
 { [ -z "$REV" ] || [ "$REV" = unknown ]; } && \
 	{ echo "readygatetest: build cannot name itself"; exit 2; }
 
-# resp_collections maps RESP db 0 onto the collection this test fills.
-# Without it DBSIZE answers "no such collection" both inside the
-# RECOVERING window and after READY, so the DBSIZE probe below cannot
-# tell a gated node from a serving one and proves nothing.
+# resp_collections maps RESP db 0 onto the filled collection; without it DBSIZE answers "no such
+# collection" gated or not, and the probe proves nothing
 cat > "$D/n1.conf" <<CFG
 [daemon]
 workers = 2
@@ -77,14 +51,10 @@ save = off
 buckets_log2 = 12
 CFG
 
-# stderr is NOT discarded: perfcli writes an error RESPONSE there, and a
-# refusal is exactly what this test is looking for.  Swallowing it made
-# the gate's reply read as an empty string and the whole run vacuous.
+# stderr is kept: perfcli writes an error RESPONSE there, and a refusal is what this test looks for
 j() { "$CLI" -h 127.0.0.1 -p "$PORT" -j "$1" 2>&1; }
-# S138: what a RESP client is TOLD while the node is not READY.  The gate
-# sits in front of command dispatch, so any data command reaches it, and
-# the first word is the point: clients dispatch on the error CODE, and
-# -LOADING is the one a real Redis sends while it reads its dataset.
+# what a RESP client is TOLD while the node is not READY: clients dispatch on the error CODE, and
+# -LOADING is what a real Redis sends while it reads its dataset
 resp1() { # resp1 <inline command> - the first line of the RESP reply
 	python3 -c 'import socket, sys
 try:
@@ -150,11 +120,8 @@ while [ $k -lt 120 ]; do
 	"-LOADING "*)    SAW_RESP_LOADING=1;;
 	"-ERR LOADING"*) SAW_RESP_ERR="$R";;
 	esac
-	# S140: DBSIZE and FLUSHDB resolve no collection of their own, but
-	# that does not make them connection-plane commands - one reports
-	# the keyspace and the other would destroy it, so both belong
-	# BEHIND this gate exactly like GET.  Probed here, adjacent to the
-	# GET probe, so all three samples fall in the same window.
+	# DBSIZE and FLUSHDB resolve no collection but report or destroy the keyspace, so they sit behind the
+	# gate like GET; probed beside GET so all three samples fall in the same window
 	DB=$(resp1 "DBSIZE")
 	case "$DB" in
 	"-LOADING "*) SAW_DB_LOADING=1;;
@@ -178,8 +145,7 @@ else bad "a data verb was SERVED while the node was not READY"; fi
 # observability must survive the gate: this is when you need it most
 if [ "$SAW_STATS" = 1 ]; then ok; else bad "stats was gated too"; fi
 if [ "$SAW_MEMBERS" = 1 ]; then ok; else bad "members was gated too"; fi
-# S138: a RESP client dispatches on the error CODE, so the condition has
-# to BE the code.  Buried inside a generic -ERR it is just a failure.
+# the condition must BE the code, not buried in a generic -ERR
 if [ "$SAW_RESP_LOADING" = 1 ]; then ok
 elif [ -n "$SAW_RESP_ERR" ]; then
 	bad "RESP refused with '$SAW_RESP_ERR' - the code must be LOADING, not ERR"
@@ -207,8 +173,7 @@ case "$R" in
 "-LOADING "*) bad "RESP still says LOADING after the node is READY ($R)";;
 *) ok;;
 esac
-# the same two controls: each probe must be able to answer WITHOUT the
-# code, or seeing -LOADING above proves nothing about the gate.
+# the same control for DBSIZE and FLUSHDB: each must answer once READY
 DB=$(resp1 "DBSIZE")
 case "$DB" in
 :*) ok;;

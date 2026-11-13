@@ -1,30 +1,6 @@
 #!/bin/sh
-# hashfwdtest.sh - S319: a forwarded hash READ is rendered on the asking
-# node, over the record the owner sends - so its reply is no longer bound
-# by the forward ack (58,000 bytes) that a reply TREE had to fit.
-#
-#   1  a shard fleet of three: a hash whose HGETALL reply is larger than
-#      a forward ack reads the same through the owner and through both
-#      forwarders, on RESP and on the native door; the small reads, the
-#      absent key, WRONGTYPE and the arity errors read the same through
-#      a forwarder as on the owner; writes still forward; the ceiling on
-#      a command's ARGUMENTS is one number wherever it runs - an HMGET
-#      over 58,000 bytes of arguments is refused on the owner too, by
-#      name; fwd_reply_too_big stays 0 and nothing is logged
-#   2  the gate: beside a member that neither advertises the read plane
-#      nor asks on it (a variant of this tree, built as hashtest's part 4
-#      does, or the older daemon given as $2) every node asks the old
-#      way - a small
-#      read through the old member works, the big HGETALL through a
-#      forwarder answers "holder rejected", and the OWNER now counts it
-#      and logs why; replace that member with this build and the big read
-#      works through every node: the rolling restart
-# Fail-first: on 0.4.5.2 the big HGETALL through a forwarder is
-# "-ERR holder rejected", nothing counts it, nothing logs it, the
-# argument ceiling is "command too large to forward" on a forwarder only,
-# and an HMGET of 400 absent fields through a forwarder is "bad reply"
-# (the RESP sink sized its buffer at twice the tree; a nil is 1 -> 5).
-# Usage: test/hashfwdtest.sh [./perfcached] [older-perfcached-for-part-2]
+# hashfwdtest.sh - a forwarded hash READ is rendered on the asking node over the record the owner
+# sends, so its reply is not bound by the forward ack; older members are asked the old way.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -86,16 +62,8 @@ start() {
 	echo "  node $1 did not start: $(tail -2 "$D/n$1.log" | tr '\n' ' ')"; return 1
 }
 stopn() { [ -f "$D/n$1.pid" ] && { p=$(cat "$D/n$1.pid"); kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; rm -f "$D/n$1.pid"; }; }
-# py <mode> <n> <args...>: one RESP connection to node n
-#   cmd  <args...>   one command; an array reply prints as [a,b,...], an
-#                    error as -LINE, a nil as nil
-#   count <args...>  one command; prints the array's length or the error
-#   load <key> <nf>  HSETs nf 16+16-byte fields (f%015d -> v%015d) in
-#                    chunks of 250 pairs; prints the sum of the replies
-#   hgetall <key> <nf>  HGETALL, checked field by field; prints "ok <n>"
-#   hmget <key> <nfields> <namelen>  HMGET with that many names of that
-#                    length (existing names when namelen is 16); prints
-#                    the array's length or the error
+# py <mode> <n> <args...>: one RESP connection to node n - cmd (array as [a,b], -ERR, nil),
+# count, load <key> <nf> (16+16-byte fields), hgetall <key> <nf>, hmget <key> <n> <namelen>
 py() { m=$1; n=$2; shift 2; python3 - "$m" "1838$n" "$@" <<'PY'
 import socket, sys
 mode, port = sys.argv[1], int(sys.argv[2])
@@ -190,9 +158,20 @@ fleet() {
 	done
 	return 1
 }
-# owned_by <n> <prefix>: prints a key the shard map gives node n - the
-# first probe key whose SET through node n was NOT forwarded (fwd_sent
-# unchanged); the probe is deleted again
+formed() { # every listed node ready and seeing the others (a CONNECTING joiner is listed already), up to 30 s
+	i=0; while [ $i -lt 300 ]; do
+		good=1
+		for x in "$@"; do
+			fs=$(curl -s "http://127.0.0.1:1836$x/stats" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null)
+			[ "$fs" = "ready $(($# - 1))" ] || good=0
+		done
+		[ $good = 1 ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
+# owned_by <n> <prefix>: a key the shard map gives node n - the first probe whose SET through
+# node n was not forwarded (fwd_sent unchanged); the probe is deleted again
 owned_by() {
 	k=1; while [ $k -le 60 ]; do
 		key="$2$k"
@@ -215,7 +194,7 @@ echo "part 1: a shard fleet of three, a hash whose HGETALL is larger than a forw
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the shard fleet did not form"; echo "hashfwdtest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+formed 1 2 3
 big=$(owned_by 1 big) || { bad "no key of 60 is owned by node 1"; echo "hashfwdtest: $pass passed, $fail failed"; exit 1; }
 set -- $(others 1); f1=$1; f2=$2
 echo "  key $big is owned by node 1; nodes $f1 and $f2 forward"
@@ -263,7 +242,7 @@ if [ -z "$OLD" ]; then
 	mkdir -p "$D/t"
 	tar -cf - --exclude=./.git --exclude='*.o' --exclude='*.a' . 2>/dev/null |
 		(cd "$D/t" && tar -xf -) || { bad "cannot copy the tree"; exit 1; }
-	# neither advertises the plane nor asks on it - what 0.4.5.2 does
+	# neither advertises the plane nor asks on it - what an older daemon does
 	sed -i 's/CLMEMB_FEAT_TYPES2 | CLMEMB_FEAT_HREAD/CLMEMB_FEAT_TYPES2/' "$D/t/src/cluster.c"
 	sed -i 's/pc_cluster_fleet_has(PC_FEAT_HREAD, NULL)/0/' "$D/t/src/verbs.c"
 	grep -q 'CLMEMB_FEAT_HREAD;' "$D/t/src/cluster.c" && { bad "the variant still advertises CLMEMB_FEAT_HREAD"; exit 1; }
@@ -279,7 +258,7 @@ if [ -n "$OLD" ] && [ -x "$OLD" ]; then
 	for n in 1 2 3; do rm -rf "$D/s$n"; conf $n; done
 	start 1 "$BIN" && start 2 "$BIN" && start 3 "$OLD" || exit 1
 	fleet 1 2 3 || { bad "the mixed fleet did not form"; echo "hashfwdtest: $pass passed, $fail failed"; exit 1; }
-	sleep 2
+	formed 1 2 3
 	bo=$(owned_by 1 gate) || { bad "no key of 60 is owned by node 1"; echo "hashfwdtest: $pass passed, $fail failed"; exit 1; }
 	echo "  key $bo is owned by node 1 (this build)"
 	eq "2. HSET $NF fields through node 3" "$(py load 3 "$bo" $NF)" $NF
@@ -296,7 +275,7 @@ if [ -n "$OLD" ] && [ -x "$OLD" ]; then
 	stopn 3
 	start 3 "$BIN" || exit 1
 	fleet 1 2 3 || { bad "2. the fleet did not re-form after the restart"; echo "hashfwdtest: $pass passed, $fail failed"; exit 1; }
-	sleep 2
+	formed 1 2 3
 	eq "2. after the restart: HGETALL through node 2" "$(py hgetall 2 "$bo" $NF)" "ok $((NF * 2))"
 	eq "2. after the restart: HGETALL through node 3" "$(py hgetall 3 "$bo" $NF)" "ok $((NF * 2))"
 	eq "2. and the owner" "$(py hgetall 1 "$bo" $NF)" "ok $((NF * 2))"

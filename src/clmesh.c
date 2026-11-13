@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clmesh.c - S36: the unicast target set.  See clmesh.h.
- */
+/* clmesh.c - the unicast target set.  See clmesh.h. */
 #include <errno.h>
 #include <netdb.h>
 #include <pthread.h>
@@ -28,10 +26,10 @@ struct known {
 	pc_addr a;
 	long long seen_ms;
 	long long hint_ms;             /* last told to a master */
-	int confirmed;                 /* CH-14: kept CLMESH_KNOWN_MS, not the trial */
+	int confirmed;                 /* kept CLMESH_KNOWN_MS, not the trial */
 };
 
-/* CH-14: how long @k is kept after it was last heard */
+/* how long @k is kept after it was last heard */
 static long long life(const struct known *k)
 {
 	return k->confirmed ? CLMESH_KNOWN_MS : CLMESH_TRIAL_MS;
@@ -73,7 +71,7 @@ static int parse_seeds(const char *list, int default_port)
 		memcpy(tok, p, n);
 		tok[n] = 0;
 		p += n;
-		/* IP6-1: the one host:port parser (pcaddr.c); the port is
+		/* the one host:port parser (pcaddr.c); the port is
 		 * optional here - without one, the cluster port */
 		if (strchr(tok, ':')) {
 			if (pc_hostport_split(tok, host, sizeof host, &port) != 0) {

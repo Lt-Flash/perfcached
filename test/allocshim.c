@@ -1,20 +1,5 @@
-/* allocshim.c - S283: an LD_PRELOAD shim that COUNTS heap allocations, so
- * a test can assert that a request path allocates nothing per request.
- *
- * PC_ALLOC_COUNT names a file; the shim maps its first page shared and
- * adds one to the 64-bit counter at offset 0 on every malloc, calloc and
- * realloc (frees are not counted: an allocation is the cost).  The test
- * reads the file whenever it likes - no signal, no polling, nothing in
- * the daemon changes.
- *
- * glibc only: the calls are forwarded to glibc's own __libc_malloc and
- * friends, because dlsym(RTLD_NEXT) needs a feature-test macro and itself
- * allocates.  On another libc the shim interposes nothing and the counter
- * stays 0 - the test's positive control (the daemon allocates at startup)
- * then reports that the shim is not in effect, rather than a green run.
- * The same holds under a sanitizer, whose runtime comes first in the
- * preload list and answers malloc itself.
- */
+/* allocshim.c - LD_PRELOAD shim counting malloc/calloc/realloc into the 64-bit word at offset 0 of
+ * the file PC_ALLOC_COUNT names.  glibc only: on another libc or a sanitizer the count stays 0. */
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>

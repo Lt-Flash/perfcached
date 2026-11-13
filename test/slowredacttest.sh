@@ -1,23 +1,6 @@
 #!/bin/sh
-# slowredacttest.sh - a credential never reaches the slow log.
-#
-# The slow ring keeps a command's first arguments, and three things read
-# it: SLOWLOG GET, /stats ("slowlog") and the page's slow log card, whose
-# hover shows the whole command line.  An AUTH slower than the threshold
-# - a SET on the 245-247 fleet took 10.1 ms in the first burst after a
-# restart, and AUTH runs in the same bursts - stored the RESP password in
-# all three.  The ring now stores "(redacted)" for every argument of AUTH
-# and for the two after an AUTH inside HELLO.
-#
-# slowlog_usec = 0 logs every command, so each case below is certainly
-# IN the ring; the suite then asserts both halves, because an absent
-# password proves nothing if the entry was never written:
-#   - the AUTH and HELLO entries exist, with "(redacted)" where the
-#     secrets were and the argument count unchanged;
-#   - the secrets appear nowhere in SLOWLOG GET's raw reply, in /stats,
-#     or in the daemon's log;
-#   - an ordinary command's arguments are still recorded as sent.
-# Usage: test/slowredacttest.sh [./perfcached]
+# slowredacttest.sh - a credential never reaches the slow log: AUTH and HELLO entries exist with
+# "(redacted)", no secret in SLOWLOG GET, /stats or the log.  Usage: test/slowredacttest.sh [./perfcached]
 set -u
 
 BIN=${1:-./perfcached}

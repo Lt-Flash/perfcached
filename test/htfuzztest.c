@@ -1,40 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * htfuzztest.c - TM-1 (DESIGN 12ob): a shadow-model fuzzer for the table
- * and the arena under it.
- *
- * A seeded sequence of operations - store, remove, fetch, probe, touch,
- * getver, a counter add - against a table small enough that the buckets'
- * chains (OC) carry much of the keyspace, with the maintenance thread's
- * work interleaved: a split, the evacuator (S190), the
- * reclaim tick, and now and then a burst that fills one size class over
- * several chunks and a mass removal that leaves chunks sparse (one class
- * in one chunk - the allocator's current one - never turns sparse, so
- * without the burst the evacuator has nothing to move).  Every result is
- * checked against a plain model that knows nothing of the insides: a
- * key's generation and length, or a counter's integer.  The maintenance
- * steps also run from the read hook - inside a lock-free read's version
- * window, after its chain scan, the moment another thread can run them -
- * so the race classes of 2026-10-22 are in reach without threads.
- *
- * Checked:
- *  - each operation's answer: a value byte-exact, present when the model
- *    has it and absent when it does not, a counter's new value;
- *  - every so many steps, a sweep: every key read back, the whole table
- *    walked for keys the model does not hold, and (a debug build) the
- *    arena ledger's census;
- *  - every so many steps, a quiet phase: the reclaim tick and the
- *    evacuator, over and over with nothing else running, settle - and
- *    move no record more than once (S190's ping-pong moved a class's
- *    last survivors for ever);
- *  - that the evacuator moved records at all in each seed, and some of
- *    them inside a read's window over the three - a run that never
- *    reached S190's path is a failure, not a pass.
- * A failure says the seed, the step and the last 32 operations, and
- * stops; HTFUZZ_SEED and HTFUZZ_OPS replay it.  The default run is three
- * seeds of 40,000 steps.
- */
+/* htfuzztest.c - a seeded shadow-model fuzzer for the table and arena, maintenance run inside reads'
+ * windows; HTFUZZ_SEED and HTFUZZ_OPS replay a failure, which prints the last 32 operations. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -300,7 +267,7 @@ static void sweep(void)
 		fail("the walk handed over %lu records, the model holds %lu",
 			walk_n, live());
 	{
-		const char *why = pcache_ht_chain_check(ht);   /* OC-11 */
+		const char *why = pcache_ht_chain_check(ht);
 
 		if (why)
 			fail("the chains' shape: %s", why);
@@ -315,8 +282,7 @@ static void sweep(void)
 #endif
 }
 
-/* S190: with nothing else running, the evacuator settles, and moves no
- * record more than once */
+/* with nothing else running, the evacuator settles, and moves no record more than once */
 static void quiet(void)
 {
 	unsigned int r, m, still = 0;

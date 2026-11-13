@@ -1,23 +1,6 @@
 #!/bin/sh
-# snapdraintest.sh - S453: a snapshot taken while a resize swaps and drains
-# holds every record.
-#
-# THE BUG.  The snapshot takes its WAL marker when its walk starts and walks
-# the collection's live table only.  A resize that swaps during that walk
-# leaves the walk on the old table, and the drain's end empties it - every
-# record the walk had not reached yet is in neither the snapshot nor (below
-# the marker) the WAL replay: a restart loses it, acknowledged.  A snapshot
-# that starts while a swapped resize still drains misses what the drain has
-# not carried.  walordertest's round 8 lost one key this way (1 of 160,000).
-#
-# A fresh node per arm, 30,000 records of ~330 bytes, the snapshot writer
-# held to 1 MB/s (a walk of ~10 s); a resize starts 0.3 s into the walk:
-#   1. grow 2^13 -> 2^15, then kill -9 and restart: all 30,000 back, each right;
-#   2. shrink 2^15 -> 2^13 the same way.
-# Each arm also reads the premise: the walk still ran when the resize was
-# asked for.  Fail-first (GitLab 112549, without the fix): the snapshots held
-# 8,398 and 7,302 records, and 21,603 and 22,698 were gone after the restart.
-# Usage: test/snapdraintest.sh [./perfcached] [./perfcli]
+# snapdraintest.sh - a snapshot taken while a resize swaps and drains holds every record: a grow
+# and a shrink started mid-walk, then kill -9, and every acknowledged record is back.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

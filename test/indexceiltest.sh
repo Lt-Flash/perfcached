@@ -1,23 +1,6 @@
 #!/bin/sh
-# indexceiltest.sh - S128: a collection's index is carved UNDER the arena
-# ceiling, and one range means one range.
-#
-# The arena's ceiling is enforced on the chunk carve - that is what makes
-# `arena full - write dropped` reach a client - but the REGION carve, the
-# index structures a table is built from, fell through to shm_malloc with
-# no test at all.  So records were bounded and the tables holding them
-# were not: one `create {buckets_log2: 24}` on a 2 GB node left the arena
-# holding 2.6 GB, 21% past a bound that is supposed to be hard.
-#
-# A node with a 64 MB arena is asked for indexes it cannot afford, at
-# `create`, at `resize` and in its own config file at startup, and must
-# refuse each one while HOLDING NO MORE THAN ITS CEILING.  Each refusal is
-# paired with a size that fits, so a blanket refusal cannot pass.
-#
-# Fail-first on the pre-S128 build: the 2^20 create SUCCEEDS and held goes
-# to ~200 MB against a 64 MB max, the 2^20 resize likewise, the 2^22
-# startup collection starts, and `buckets_log2 = 1` is accepted by the
-# config while the verbs refuse it.
+# indexceiltest.sh - a collection's index is carved UNDER the arena ceiling: an unaffordable index is
+# refused at create, resize and startup while held stays under the ceiling; a fitting size still works.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -44,7 +27,7 @@ arena_mb = $MAXMB
 [secrets]
 client = $SEC
 cluster = idx-cluster-secret
-# S129: this suite resizes, which is privileged
+# this suite resizes, which is privileged
 enable = idx-enable-secret
 [listen]
 plaintext = loopback
@@ -78,8 +61,8 @@ def call(m, **p):
     if p: r["params"] = p
     f.write((json.dumps(r) + "\n").encode()); f.flush()
     return json.loads(f.readline())
-# S129: create/resize are privileged, and this helper dials once per
-# invocation - raise it on THIS link before anything else.
+# create/resize are privileged and this helper dials once per invocation:
+# enable on this link before anything else
 call("enable", secret="idx-enable-secret")
 def say(r):
     if "error" in r:
@@ -181,8 +164,7 @@ done
 
 kill "$P" 2>/dev/null; wait "$P" 2>/dev/null; P=""
 
-# 6. the same range in the config file.  This parsed 1..24 while the verbs
-#    took 4..24: the same value legal in one place and refused in the other.
+# 6. the same range in the config file as at the verbs
 cfgbad=0
 for b in 1 3 25; do
 	conf "$D/bad$b.conf" ""
@@ -203,8 +185,7 @@ sed -i "s/^buckets_log2 = 12/buckets_log2 = 4/" "$D/ok4.conf"
 #    refuses to START rather than silently exceeding what it was sized for
 conf "$D/huge.conf" "[collection big]
 buckets_log2 = 22"
-# the pre-S128 daemon STARTS here and runs forever, so this is bounded and
-# "still alive at the bound" is the failure, not a slow refusal
+# bounded: a daemon that starts here runs forever, so "still alive at the bound" is the failure
 timeout 20 "$BIN" -f "$D/huge.conf" > "$D/huge.log" 2>&1
 rc=$?
 if [ $rc -eq 124 ]; then

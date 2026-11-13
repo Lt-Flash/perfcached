@@ -3,23 +3,18 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * pc_noise.c — Noise_NNpsk0_25519_ChaChaPoly_SHA256 over libsodium.
- * See pc_noise.h.  Follows the Noise spec rev 34: the 'e' token with a
- * PSK does MixHash then MixKey; the psk token does MixKeyAndHash;
- * Split's first CipherState is the initiator->responder direction.
- */
+/* pc_noise.c - Noise_NNpsk0_25519_ChaChaPoly_SHA256 over libsodium, per the Noise spec rev 34
+ * (with a PSK: 'e' does MixHash then MixKey, psk does MixKeyAndHash). */
 #include <string.h>
 #include <sodium.h>
 
 /* angle brackets: the -I order picks the logger - the daemon's src/compat
- * (-Isrc), libperfd's MIT lib/shim/compat (-Ilib/shim first, S371) */
+ * (-Isrc), libperfd's MIT lib/shim/compat (-Ilib/shim first) */
 #include <compat/dprint.h>
 #include "pc_noise.h"
 
-/* NOISE_NAME, not NAME: consumer build systems (OpenSIPS modules) pass
- * -DNAME=<module.so> on every compile line, and the collision was a
- * redefinition warning away from being a corrupted handshake label. */
+/* NOISE_NAME, not NAME: some consumers' module builds pass -DNAME=<module.so> on every
+ * compile line, which would corrupt the handshake label */
 #define NOISE_NAME "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 
 /* ---- HKDF (RFC 5869 over HMAC-SHA256), Noise variant ------------------- */
@@ -73,33 +68,9 @@ static void nonce12(uint64_t n, uint8_t out[12])
 	out[11] = (uint8_t)(n >> 56);
 }
 
-/* RV-2: THE TRANSPORT'S BOUNDARIES ARE ITS OWN.
- *
- * Every caller chunks to PC_NOISE_MAXPT and the datagram plane is
- * frame-bounded, so nothing reached these - which is exactly how the
- * boundary came to belong to the callers rather than to the transport.
- * One byte over encrypted to 65,536 bytes, more than the 16-bit record
- * length can carry, and the oversize record decrypted.  Both refuse
- * here now, and a refusal never moves the nonce.
- *
- * THE NONCE.  A 64-bit counter, and Noise reserves its last value
- * (section 5.1): 2^64-1 is never used, so 2^64-2 is the last record a
- * key protects.  After that both directions refuse for good - the
- * connection is over and a reconnect re-keys.  The counter used to WRAP
- * to 0, which under ChaCha20-Poly1305 is nonce reuse under one key.
- * Unreachable (2^64 records at a million a second is 584,000 years),
- * and written down rather than left to arithmetic.
- *
- * THE PSK stays Argon2id at the INTERACTIVE limits, deliberately.  It
- * is NOT derived per connection: the daemon derives each secret once at
- * startup and libperfd caches it per process.  And the salt is
- * deterministic (a shared secret cannot carry a random one), so the PSK
- * is a pure function of the secret and these limits - raising them is a
- * flag day for every deployed daemon, client and peer, not a tuning
- * knob.  What an attacker with a captured handshake pays per guess is
- * the INTERACTIVE cost; the control that matters is the secret's
- * entropy, which the config already warns about under 8 characters. */
-#define PC_NOISE_NONCE_LAST (UINT64_MAX - 1)   /* 2^64-1 is reserved */
+/* the transport owns its bounds, not its callers: an oversize record or a spent nonce space
+ * refuses here, never moving the nonce; a spent key stays refused (a reconnect re-keys) */
+#define PC_NOISE_NONCE_LAST (UINT64_MAX - 1)   /* 2^64-1 is reserved (Noise 5.1) */
 
 /* EncryptWithAd; out holds ptlen+16.  No key -> copy through (Noise).
  * -1: a record over PC_NOISE_MAXPT, or the nonce space is spent. */
@@ -201,7 +172,7 @@ static int sym_encrypt_and_hash(struct pc_symstate *ss, const uint8_t *pt,
 	int clen = cs_encrypt(&ss->cs, ss->h, 32, pt, ptlen, out);
 
 	if (clen < 0)
-		return -1;                 /* RV-2: never hash a length of -1 */
+		return -1;                 /* never hash a length of -1 */
 	sym_mix_hash(ss, out, (size_t)clen);
 	return clen;
 }
@@ -248,7 +219,7 @@ static void read_e(struct pc_handshake *hs, const uint8_t *in)
 	sym_mix_key(&hs->ss, hs->re, 32);
 }
 
-/* ---- PSK derivation ---------------------------------------------------- */
+/* ---- PSK derivation: once per secret at startup, cached per process ---- */
 
 int pc_psk_derive(const char *password, size_t plen, int principal,
 		uint8_t psk[32])
@@ -259,8 +230,8 @@ int pc_psk_derive(const char *password, size_t plen, int principal,
 	const char *lbl = label[principal == PC_PRIN_CLUSTER ? 1 : 0];
 	static const char pfx[] = "perfcached-psk-salt-v1:";
 
-	/* deterministic per-principal salt (a shared secret cannot use a
-	 * random salt): salt = SHA256("perfcached-psk-salt-v1:"+label)[:16] */
+	/* deterministic salt (a shared secret cannot carry a random one): raising the limits
+	 * below is a flag day for every daemon, client and peer, not a tuning knob */
 	crypto_hash_sha256_init(&st);
 	crypto_hash_sha256_update(&st, (const uint8_t *)pfx, sizeof pfx - 1);
 	crypto_hash_sha256_update(&st, (const uint8_t *)lbl, strlen(lbl));
@@ -320,7 +291,7 @@ int pc_hs_write_msg2(struct pc_handshake *hs, const uint8_t *payload,
 	sodium_memzero(dh, sizeof dh);
 	cl = sym_encrypt_and_hash(&hs->ss, payload, paylen, out + 32);
 	if (cl < 0)
-		return -1;                     /* RV-2: a payload over the ceiling */
+		return -1;                     /* a payload over the ceiling */
 	*outlen = 32 + (size_t)cl;
 	/* responder: recv = c1 (initiator->responder), send = c2 */
 	sym_split(&hs->ss, recv, send);
@@ -348,7 +319,7 @@ int pc_hs_write_msg1(struct pc_handshake *hs, const uint8_t psk[32],
 	write_e(hs, out);
 	cl = sym_encrypt_and_hash(&hs->ss, payload, paylen, out + 32);
 	if (cl < 0)
-		return -1;                     /* RV-2: a payload over the ceiling */
+		return -1;                     /* a payload over the ceiling */
 	*outlen = 32 + (size_t)cl;
 	return 0;
 }
@@ -404,8 +375,7 @@ static int hexeq(const uint8_t *got, const char *hex)
 
 int pc_noise_selftest(void)
 {
-	/* RFC 5869 Test Case 1: PRK = HMAC-SHA256(salt, IKM); our HKDF's
-	 * internal temp_key IS that PRK, and T(1) is our first output. */
+	/* RFC 5869 Test Case 1: PRK = HMAC-SHA256(salt, IKM), our HKDF's internal temp_key */
 	uint8_t ikm[22], salt[13], o1[32], o2[32];
 	uint8_t psk_a[32], psk_b[32];
 	struct pc_handshake ini, res;
@@ -419,10 +389,7 @@ int pc_noise_selftest(void)
 	memset(ikm, 0x0b, sizeof ikm);
 	for (i = 0; i < 13; i++)
 		salt[i] = (uint8_t)i;
-	/* temp_key = HMAC(salt, ikm) = RFC5869 TC1 PRK; expose via o1 by
-	 * running one HMAC directly (hkdf hides temp_key, so check T(1)
-	 * against an independent computation is done in python; here we
-	 * verify the extract PRK, the crypto that matters most) */
+	/* hkdf() hides temp_key, so one HMAC is checked against the TC1 PRK */
 	{
 		uint8_t prk[32];
 

@@ -11,10 +11,10 @@
 #include "store.h"
 #include "fnv1a.h"
 #include "events.h"
-#include "pubsub.h"                    /* PS8 */
+#include "pubsub.h"
 
 unsigned int pc_ev_any;
-unsigned int pc_ev_notify_any;                 /* PS8 */
+unsigned int pc_ev_notify_any;
 static unsigned int nmask[PC_MAX_COLLECTIONS], def_nmask;
 
 static unsigned int def_mask;
@@ -50,7 +50,7 @@ void pc_ev_set_default(unsigned int mask, int rate_per_s, int hash_keys)
 	def_hash = hash_keys;
 }
 
-/* PS8: the keyspace notification, both channel shapes, local-only */
+/* the keyspace notification, both channel shapes, local-only */
 static void notify(int slot, const char *event, const str *key)
 {
 	char chan[64 + 256 + 4096];
@@ -185,7 +185,7 @@ void pc_ev_miss(pcache_htable_t *ht, const str *key, int expired)
 	char kb[80];
 	int s;
 
-	if ((s = nslot_for(ht, PC_EV_MISS)) >= 0)         /* PS8 */
+	if ((s = nslot_for(ht, PC_EV_MISS)) >= 0)
 		notify(s, "keymiss", key);
 	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
 		return;
@@ -202,7 +202,7 @@ void pc_ev_store(pcache_htable_t *ht, const str *key, unsigned int bytes,
 	char kb[80];
 	int s;
 
-	if ((s = nslot_for(ht, PC_EV_STORE)) >= 0)        /* PS8 */
+	if ((s = nslot_for(ht, PC_EV_STORE)) >= 0)
 		notify(s, "set", key);
 	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
 		return;
@@ -218,7 +218,7 @@ void pc_ev_remove(pcache_htable_t *ht, const str *key)
 	char kb[80];
 	int s;
 
-	if ((s = nslot_for(ht, PC_EV_REMOVE)) >= 0)       /* PS8 */
+	if ((s = nslot_for(ht, PC_EV_REMOVE)) >= 0)
 		notify(s, "del", key);
 	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
 		return;
@@ -234,7 +234,7 @@ void pc_ev_expired(int slot, const str *key)
 
 	if (__atomic_load_n(&pc_ev_notify_any, __ATOMIC_ACQUIRE) &&
 	    slot >= 0 && slot < PC_MAX_COLLECTIONS && (nmask[slot] & PC_EV_EXPIRED))
-		notify(slot, "expired", key);                /* PS8 */
+		notify(slot, "expired", key);
 	if (!__atomic_load_n(&pc_ev_any, __ATOMIC_ACQUIRE))
 		return;
 	if (slot < 0 || slot >= PC_MAX_COLLECTIONS ||

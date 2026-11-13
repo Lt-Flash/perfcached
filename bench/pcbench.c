@@ -1,35 +1,5 @@
-/*
- * pcbench — dual-protocol cache bench client (task S10).
- *
- * ONE client, two wire protocols, so perfcached and Redis are measured
- * through the same code path:
- *   -P perf   perfcached's CMD frames: get/set as a method name plus a
- *             params TREE (src/ptree.h), the way every non-data method
- *             travels since S317 - measures the tree codec's cost
- *   -P bin    perfcached's data verbs on their fixed-layout frames
- *             (src/proto.h) - what libperfd's typed verbs and the
- *             OpenSIPS driver ride; measures the wire alone
- *   -P resp   Redis RESP
- *
- * Each thread owns one connection and drives a fixed pipeline depth.
- * Depth 1 records per-op RTT into a 1us-granularity histogram
- * (p50/p99/p999); deeper pipelines measure throughput (batch RTTs are
- * not per-op latency and are not reported as such).  A fill phase
- * populates the keyspace before any timed GET arm; the first -w seconds
- * of each run are discarded (cold caches are not regressions, they are
- * warm-ups).  Replies are counted AND checked: a frame flagged as an
- * error or a RESP -ERR counts as an error, and any error fails the run
- * loudly - a bench that cannot fail is not a bench.
- *
- * usage: pcbench -h host -p port -P perf|resp [-C col] [-c conns]
- *        [-d depth] [-n keys] [-v valsize] [-T secs] [-w warmup]
- *        [-M getpct] [-F] (fill only) [-N] (skip the pre-GET fill: the
- *        keyspace is known-filled - REQUIRED for reads through a
- *        proxy-mode NON-HOLDER, where a refill through an ingress with
- *        an empty locator would place duplicate copies)
- *        [-q] (machine-readable line only) [-K prefix] (keys are
- *        <prefix>%08u, default "k"; at most 100 characters)
- */
+/* pcbench - cache bench client: -P perf (CMD frames, a params tree), bin (fixed-layout data verbs)
+ * or resp (Redis), one code path for both servers; any error reply fails the run */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,10 +18,11 @@
 static const char *o_host = "127.0.0.1", *o_proto = "perf", *o_col = "b";
 static int o_port = 6379, o_conns = 4, o_depth = 1, o_keys = 100000;
 static int o_val = 64, o_secs = 10, o_warm = 2, o_getpct = 100;
+/* -N skips the pre-GET fill: required to read through a proxy-mode non-holder, where
+ * a refill through an ingress with an empty locator would place duplicate copies */
 static int o_fill_only = 0, o_quiet = 0, o_nofill = 0;
 /* -K: keys are <prefix>%08u instead of k%08u, so the timed GETs can land
- * on a keyspace another tool loaded in a real application's shape (the
- * keys/scan bench: svc:auth:access_token:jwt_ + a 40-character token) */
+ * on a keyspace another tool loaded in a real application's shape */
 static const char *o_kpfx = "k";
 
 static volatile int t_stop;
@@ -147,10 +118,8 @@ static int build_req(char *dst, int get, unsigned int key, const char *val)
 	int kl = snprintf(kb, sizeof kb, "%s%08u", o_kpfx, key);
 
 	if (is_perf) {
-		/* a CMD frame (src/proto.h): the 16-byte header, then
-		 * [verb 19][mlen][method] and the params as one tree map
-		 * {col, key[, value]} - 'm' [pairs u32] then (bulk key, bulk)
-		 * pairs, little-endian throughout */
+		/* a CMD frame: the 16-byte header, [verb 19][mlen][method], then the
+		 * params as one tree map {col, key[, value]} of bulk pairs (src/ptree.h) */
 		unsigned char *d = (unsigned char *)dst, *q;
 		size_t cn = strlen(o_col);
 		unsigned int tree = 5 + (5 + 3) + (5 + (unsigned int)cn) +
@@ -221,11 +190,8 @@ static int build_req(char *dst, int get, unsigned int key, const char *val)
 
 /* ---- reply counting ---------------------------------------------------- */
 
-/* frames (both -P perf and -P bin): [magic ver type flags][plen u32]
- * [id u64][payload].  type 2 = response (flags bit0 = error), type 3 =
- * notification (skipped, not counted - replies must pair with
- * requests).  Returns replies counted; *used = bytes consumed; *errs
- * incremented per error reply. */
+/* frames: [magic ver type flags][plen u32][id u64][payload]; type 2 = response (flags bit0 =
+ * error), type 3 = notification, not counted.  Returns replies counted, *used = bytes consumed */
 static int count_bin(const char *buf, size_t n, size_t *used,
 		unsigned long long *errs)
 {

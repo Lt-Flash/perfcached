@@ -1,21 +1,6 @@
 #!/bin/sh
-# clustertest.sh — M4 verification: a two-node store-mode cluster on
-# AUTOMATIC membership (no node ids, no peer lists - only the group):
-#  - formation: two cold-started nodes elect exactly ONE master, get
-#    DISTINCT auto-assigned node ids, and see each other up;
-#  - pull-on-miss: a key set on A is served to a client of B (source
-#    cluster), then B holds it locally (a second get is a local hit);
-#  - negative cache: a genuine miss on both nodes is asked ONCE, then
-#    the negative cache answers without new pull traffic;
-#  - tombstone: a delete on A removes it from B and plants the tombstone
-#    so a racing pull cannot resurrect it;
-#  - remaining TTL survives the pull;
-#  - quarantine (S19): a datagram sealed with the WRONG cluster secret
-#    is counted as bad_auth and dropped - the node keeps serving, never
-#    self-terminates;
-#  - failover: killing the MASTER promotes the survivor within ~5s and
-#    it keeps serving - the automatic-membership core.
-# Usage: test/clustertest.sh [./perfcached]
+# clustertest.sh - a two-node store cluster on automatic membership: one master, distinct ids,
+# pull-on-miss, negative cache, tombstones, TTL, wrong-secret quarantine and master failover.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -88,7 +73,12 @@ cfield() { call $1 '{"method":"stats"}' \
 	| python3 -c "import json,sys; print(json.load(sys.stdin)[\"cluster\"][\"$2\"])"; }
 
 # ---- formation: one master, distinct auto ids, mutual visibility -------
-sleep 3.5   # join window + election + first keepalives
+# a joiner is CONNECTING until its links answer: wait for both ready and seeing each other
+st() { call $1 '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 17001)" != "ready 1" ] || [ "$(st 17002)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 RA=$(cfield 17001 role); RB=$(cfield 17002 role)
 NA=$(cfield 17001 node); NB=$(cfield 17002 node)
 echo "formation: A id=$NA role=$RA, B id=$NB role=$RB"
@@ -130,14 +120,11 @@ R=$(call 17002 '{"method":"get","params":{"col":"th","key":"shared"}}')
 echo "B after A-delete: $R"
 echo "$R" | grep -q '"found": false' && ok || bad "tombstone did not remove: $R"
 
-# both nodes still serving, no crash
 call 17001 '{"method":"ping"}' | grep -q pong && ok || bad "A died"
 call 17002 '{"method":"ping"}' | grep -q pong && ok || bad "B died"
 
-# quarantine: a wrong-secret datagram to A's unicast port must be dropped.
-# The header (magic, version) is clear text before the AEAD: the forgery
-# carries this build's version, since UP1 counts any OTHER version as a
-# build this one cannot talk to (wire_ver_refused), not as bad auth.
+# quarantine: a wrong-secret datagram to A's unicast port must be dropped.  The forgery carries
+# this build's version: any OTHER version counts as wire_ver_refused, not as bad auth.
 CLVER=$(sed -n 's/^#define PC_CL_VER[[:space:]]*\([0-9][0-9]*\).*/\1/p' src/cluster.h)
 [ -n "$CLVER" ] || { bad "PC_CL_VER not found in src/cluster.h"; exit 1; }
 CLVER=$CLVER python3 - <<'EOF'
@@ -148,7 +135,7 @@ pkt = bytes([0xA1, ver]) + os.urandom(198)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 for _ in range(20):
     s.sendto(pkt, ("127.0.0.21", 17131))
-# and ten with a version this build does not speak: UP1's counter, not bad_auth
+# and ten with a version this build does not speak: wire_ver_refused, not bad_auth
 pkt = bytes([0xA1, (ver + 1) & 0xff]) + os.urandom(198)
 for _ in range(10):
     s.sendto(pkt, ("127.0.0.21", 17131))

@@ -1,32 +1,6 @@
 #!/bin/sh
-# pubsubpressuretest.sh - a publisher that outruns a worker's queue is
-# paused, not silently dropped.  A publish for subscribers on another
-# worker is queued there; past the queue's cap it was dropped and counted,
-# while PUBLISH had already answered every receiver - on the 223 rig 32
-# closed-loop publishers lost 66% of 1 KB messages that way.  A door's
-# publish that leaves a queue at half its cap now pauses the publishing
-# connection - its input waits and the kernel's flow control holds the
-# client - until the queue is below a quarter.
-#   - four workers, `pubsub_queue_mb = 1`, rpsbench flat out: 32
-#     publishers of 1 KB into one subscriber, 16 into four
-#   - nothing lost, no gaps or reorders, no subscriber closed, every
-#     PUBLISH's receiver count honoured, nothing dropped at the queue,
-#     and the pause counted
-#   - a paused publisher does not stall its worker: PINGs on other
-#     connections keep answering through the overload
-# Fail-first: the build without the pause lost 1,592,493 and 2,513,316
-# messages in the two cells, every one of them answered as delivered.
-#
-# A subscriber the machine starves is a different event: its output
-# reaches the cap and the daemon closes it as a slow subscriber - the
-# designed answer (Redis's own), counted in pubsub.slow_kills.  GitHub,
-# d0d6f73: one subscriber got 576 messages, then EOF, and 8.8 M publishes
-# after it reached nobody.  A run with a slow kill is NOT JUDGED on loss
-# and is run again (three tries); queue drops - what this suite exists
-# for - fail every run, killed or not.  PRESSURE_STARVE_SUB=1 pins the
-# subscriber thread to a busy core at idle priority: the positive control
-# that every try then reads as a slow kill and the cell fails, by name.
-# Usage: test/pubsubpressuretest.sh [./perfcached] [./rpsbench]
+# pubsubpressuretest.sh - a publisher that outruns another worker's queue is paused, not dropped, and
+# does not stall its worker.  A slow-subscriber kill voids a try (PRESSURE_STARVE_SUB=1 is its control).
 set -u
 BIN=${1:-./perfcached}
 RPS=${2:-./rpsbench}
@@ -133,6 +107,7 @@ for name, args in (("32 publishers, 1 KB, 1 subscriber", "-S 1 -s 1 -P 32 -t 2 -
         if cell(name, args.split()):
             break
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; I\ *) echo "  ..   ${l#I }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

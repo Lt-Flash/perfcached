@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * winctr.c - S351: five-minute windows of cumulative counters.  See
- * winctr.h.  One table of keys, each with a snapshot a minute in
- * PC_WIN_SLOTS slots; a mutex around it - /stats is built a few times a
- * second at most, never on a hot path.
- */
+/* winctr.c - five-minute windows of cumulative counters (see winctr.h): a snapshot a minute per key,
+ * under a mutex - /stats is built a few times a second at most, never on a hot path */
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,13 +85,8 @@ long long pc_win_delta_at(const char *key, unsigned long long cur,
 		return -1;
 	}
 	e->seen = now;
-	/* a counter that went backwards was restarted (reset stats, a peer
-	 * that came back): its snapshots belong to the run before.  It
-	 * started again from 0 somewhere in the last window, so its baseline
-	 * is EXACTLY 0 - kept as this minute's snapshot and flagged, so the
-	 * windows that follow count everything since the restart (not just
-	 * what came after the first read of it) and need no minute of
-	 * history first */
+	/* a counter that went backwards was restarted (a stats reset, a peer back): it began again from 0
+	 * inside the window, so 0 is its EXACT baseline - kept as this minute's snapshot, and flagged */
 	for (s = 0; s < PC_WIN_SLOTS; s++)
 		if (e->has[s] && cur < e->v[s]) {
 			memset(e->has, 0, sizeof e->has);

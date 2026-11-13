@@ -1,28 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * jsonpath.h — the JSON path verbs' engine (task S26, the decided v1.1).
- *
- * Documents stay OPAQUE BLOBS in the store; every operation here is
- * parse-on-demand over the in-house tokenizer, splicing the document
- * text - no tree storage, nothing in WAL/replication changes shape.
- *
- * Path subset: $ (root), .name, [index] - e.g. $.a.b[2].c.  No filters,
- * no recursive descent, no wildcard.  Rules (pinned in the design):
- * root $ replaces the whole (validated) document; setting a NEW leaf
- * under an existing object creates it; a missing INTERMEDIATE parent is
- * an error (no deep-create); array indexes must exist (append is
- * jarrappend's job, later); type conflicts error.
- *
- * All functions splice into @out (cap PC_JP_MAX) and return the new
- * document length, or a negative PC_JP_E_* code.
- */
+/* jsonpath.h - JSON path verbs over opaque document blobs, parsed on demand and
+ * spliced into @out; each returns the new length or a negative PC_JP_E_* */
 #ifndef PC_JSONPATH_H
 #define PC_JSONPATH_H
 
 #include <stddef.h>
 
-#define PC_JP_MAX        65536         /* documents live in cells */
+/* paths: $ .name [index] only; a missing intermediate parent is an error and
+ * an array index must exist */
+#define PC_JP_MAX       65536         /* documents live in cells */
 #define PC_JP_E_DOC      (-1)          /* the stored value is not JSON */
 #define PC_JP_E_PATH     (-2)          /* bad path syntax */
 #define PC_JP_E_MISSING  (-3)          /* intermediate parent absent */
@@ -37,13 +24,11 @@
  * false or null - with nothing else around it?  1 yes, 0 no. */
 int pc_jp_valid_value(const char *val, size_t vlen);
 
-/* extract: copy the fragment at @path into @out */
 int pc_jp_get(const char *doc, size_t dlen, const char *path, size_t plen,
 		char *out, size_t cap);
 
-/* set: splice @val (itself validated JSON) at @path.  nx: only when the
- * leaf is absent; xx: only when present.  mkpath: missing INTERMEDIATE
- * name steps are created as nested objects (index steps never are). */
+/* splice validated JSON @val at @path; nx: leaf absent only, xx: present only;
+ * mkpath creates missing intermediate name steps as objects (never index steps) */
 int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 		const char *val, size_t vlen, int nx, int xx, int mkpath,
 		char *out, size_t cap);
@@ -58,8 +43,8 @@ int pc_jp_append(const char *doc, size_t dlen, const char *path,
 int pc_jp_del(const char *doc, size_t dlen, const char *path, size_t plen,
 		char *out, size_t cap);
 
-/* increment the number at @path by @by; *result carries the new value.
- * Integer-only in v1 (the store's counters are integers too). */
+/* increment the number at @path by @by; *result carries the new value;
+ * integer-only, as the store's counters are */
 int pc_jp_incr(const char *doc, size_t dlen, const char *path, size_t plen,
 		long long by, long long *result, char *out, size_t cap);
 

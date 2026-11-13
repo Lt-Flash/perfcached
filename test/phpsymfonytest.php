@@ -70,5 +70,12 @@ $edge = str_repeat('e', 262052 - 200);
 $c2->get('edge', fn() => $edge);
 ok($c2->get('edge', fn() => 'miss') === $edge, 'a value just under the limit is stored');
 $c2->clear(); $other->clear();
+// S498: a namespace holding a glob character clears its own keys only
+$star = new PerfcachedAdapter($pc, 'c', 'ns*', 600);
+$near = new PerfcachedAdapter($pc, 'c', 'nsx', 600);
+$star->get('k', fn() => 'mine'); $near->get('k', fn() => 'theirs');
+ok($star->clear() === true && !$star->hasItem('k') && $near->get('k', fn() => 'lost') === 'theirs',
+    "clear() on namespace 'ns*' leaves 'nsx''s keys");
+$near->clear();
 echo "phpsymfonytest: " . ($n - $fails) . " passed, $fails failed\n";
 exit($fails ? 1 : 0);

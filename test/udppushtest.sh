@@ -1,23 +1,6 @@
 #!/bin/sh
-# udppushtest.sh - PS5: pub/sub pushes over UDP, from the daemon's side,
-# with the datagrams opened here (libsodium through ctypes).
-#   - pubsub_udp answers a stream and a key, and a probe arrives from the
-#     door's own address and port, sealed with that key
-#   - nothing but probes goes over UDP until the probe's cookie comes back;
-#     a wrong cookie is refused
-#   - then deliveries (message and pmessage) arrive as sealed datagrams in
-#     sequence and not over TCP; one too large for a datagram stays on TCP
-#   - an ack beyond what was sent is refused
-#   - the destination is the connection's own peer, whatever the client says
-#   - a client that stops acking, and one whose acks stop moving while
-#     datagrams go out, lose every subscription and are told why
-#   - an unconfirmed stream expires; port 0 stops a stream; a door with
-#     pubsub_udp = no refuses
-# Fail-first: the PS12 build has no pubsub_udp method.
-# Then libperfd's side, through udppushcli: the same deliveries at the
-# notify hook, blocking and async handles, gaps, a stranger's datagram,
-# the timer acks, and a handle pruned for silence.
-# Usage: test/udppushtest.sh [./perfcached] [./udppushcli]
+# udppushtest.sh - pub/sub pushes over UDP: the daemon's probe, cookie, sealed in-sequence datagrams,
+# acks and expiry (opened here via libsodium/ctypes), then libperfd's side through udppushcli.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -246,6 +229,7 @@ while time.time() - t6 < 4.5:
 check(len(seen) == 3 and [x[1] for x in seen] == [1, 2, 3] and 0.7 <= seen[1][0] <= 2.2 and seen[2][0] <= 3.5,
       "on an idle daemon an unconfirmed stream still gets its 3 probes, about a second apart (%s)" % seen)
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -5 "$D/py.err"; }

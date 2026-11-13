@@ -1,29 +1,6 @@
 #!/bin/sh
-# upgradeloadtest.sh - UP7c (DESIGN 12ns; 12ne's UP10, its first form): the
-# roll under load, with the three assertions of 12ne.
-#   - a three-member loopback fleet; 2,000 keys pre-filled and replicated,
-#     500 more written and then deleted (replicated too);
-#   - rollload (libperfd, 4 threads, spares) reads the pre-filled keys and
-#     writes 2,000 others for as long as the roll takes;
-#   - perfcli upgrade rolls every node with the switch hook (this binary
-#     restarted - the install is the one step CI cannot do);
-#   - no error: the load saw no error, no miss and no wrong value - the
-#     restarts were failovers inside the library;
-#   - no lost key: every pre-filled key and every key the load wrote reads
-#     back with its value on EVERY node;
-#   - no resurrection: every deleted key is absent on every node.
-# The previous minor's release artifact (UP10's full form) comes when a
-# release lives in the package registry; the epoch bump, the standalone
-# node and the bad signature stay on UP10's list.
-#
-# MODE=shard runs the same roll on a shard fleet (one owner per key, the
-# WAL on every node so a restart brings its share back): there the owner's
-# share is away while it restarts, by design (README's table), so the
-# load's errors are counted and bounded, not zero; a miss or a wrong value
-# is still a defect (an existing key must never read as absent), and
-# after the roll every key must be there, with its value, through every
-# node, and every deleted key absent - no lost key, no resurrection.
-# Usage: [MODE=eager|shard] test/upgradeloadtest.sh [./perfcached] [./perfcli] [./rollload]
+# upgradeloadtest.sh - perfcli upgrade rolls the fleet under load: no error (shard: bounded), no lost key, no
+# resurrection.  Usage: [MODE=eager|shard] test/upgradeloadtest.sh [./perfcached] [./perfcli] [./rollload]
 set -u
 BIN=${1:-./perfcached}; CLI=${2:-./perfcli}; LOAD=${3:-./rollload}
 MODE=${MODE:-eager}
@@ -35,9 +12,8 @@ case "$LOAD" in /*) ;; *) LOAD=$(pwd)/$LOAD;; esac
 T=$(cd "$(dirname "$0")" && pwd); PYTHONPATH=$T${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH   # pcnative
 D=$(mktemp -d /var/tmp/pcrollload.XXXXXX)
 LP=
-# the daemons are waited for, not only killed: the shard variant starts on the
-# same ports the moment the eager one exits (v0.7.0-rc3, GitLab 110995 roll:
-# "port 17711 already bound" - the killed nodes were still going away)
+# the daemons are waited for, not only killed: the shard variant starts on the same ports the
+# moment the eager one exits
 trap 'kill $LP 2>/dev/null; PS=$(cat "$D"/pid* 2>/dev/null); for p in $PS; do kill -9 $p 2>/dev/null; done
 	for p in $PS; do i=0; while [ $i -lt 50 ] && kill -0 $p 2>/dev/null; do sleep 0.1; i=$((i+1)); done; done
 	[ -n "${KEEP:-}" ] && echo "kept $D" || rm -rf "$D"' EXIT
@@ -115,13 +91,8 @@ EOF2
 chmod 755 "$D/hook.sh"
 node 1; node 2; node 3
 start 1; start 2; start 3
-# the nodes join and pull a bootstrap before they are READY (a replicated
-# collection): the first write came 3.5 s after the log said ready and was
-# refused "not READY (recovering)" on 225 (2026-10-16) - wait for the state
-# ... and for its PEERS: a node READY before it has seen a live peer owns every
-# slot (HRW over nobody) and stores a shard write locally; the fill then sat on
-# node 1 and the deletes, forwarded to the owners a second later, found nothing
-# (deleted 166 of 500, 225 2026-10-16)
+# wait for READY (the nodes pull a bootstrap first) and for a live peer: a node alone owns every
+# slot and would store a shard write locally
 rdy() {
 	i=0; while [ $i -lt 150 ] && pyn "$1" peek | grep -q 'not READY'; do sleep 0.2; i=$((i+1)); done
 	i=0; while [ $i -lt 150 ] && [ "$(python3 -c 'import json,sys,urllib.request
@@ -138,9 +109,8 @@ def call(m, **kw):
     if "error" in r: raise SystemExit("ERR %s %s" % (m, r["error"]))
     return r["result"]
 if what == "fill":
-    # a forwarded set that timed out answers {stored: false} without an error
-    # (the native door's FWD_SET) - checked, so a placement fault fails here
-    # with the key, not 2,500 slot timeouts later
+    # a forwarded set that timed out answers {stored: false} without an error: checked,
+    # so a placement fault fails here with the key
     for k in range(2000):
         if not call("set", col="0", key="roll:p:%d" % k, value="p%d" % k).get("stored"): raise SystemExit("set roll:p:%d not stored" % k)
     for k in range(500):
@@ -176,8 +146,7 @@ r=$(pyn 1 del); case "$r" in "deleted 500") ok "500 keys deleted on node 1";; *)
 i=0; while [ $i -lt 100 ] && [ "$(pyn 3 peek)" != "p1999=p1999 d499=None" ]; do sleep 0.2; i=$((i+1)); done
 [ "$(pyn 3 peek)" = "p1999=p1999 d499=None" ] && ok "the deletes reached node 3" || bad "node 3 after the deletes: $(pyn 3 peek)"
 
-# "-": the loopback door is plaintext (plaintext = loopback does no crypto), so the
-# library connects without a secret, as perfcli does here
+# "-": the loopback door is plaintext, so the library connects without a secret, as perfcli does
 "$LOAD" 127.0.0.81 17711 - 0 4 2000 600 "$D/load.out" > "$D/load.log" 2>&1 &
 LP=$!
 sleep 2
@@ -197,11 +166,8 @@ miss=$(echo "$summary" | sed 's/.*misses=\([0-9]*\).*/\1/'); wr=$(echo "$summary
 if [ "$MODE" = eager ]; then
 	[ "$lrc" = 0 ] && [ "$errs" = 0 ] && [ "$miss" = 0 ] && [ "$wr" = 0 ] && ok "NO ERROR: errors 0, misses 0, wrong values 0 (failovers $fo)" || bad "the load saw errors $errs, misses $miss, wrong $wr: $(grep 'last error' "$D/load.out" | head -2 | tr '\n' '|')"
 else
-	# shard: the owner's share is away while it restarts - errors are expected and bounded (under 5% of
-	# the requests across three restarts); a miss or a wrong value is a defect all the same
-	# shard keeps ONE copy: while an owner restarts its share reads as absent
-	# (a pull to a node that is down times out) - misses are the restart windows'
-	# and bounded, wrong values never
+	# shard keeps one copy: while an owner restarts its share reads absent, so misses are bounded and
+	# wrong values never
 	[ "$wr" = 0 ] && [ "$miss" -lt $((ops * 2 / 5)) ] && ok "shard: wrong values 0, misses $miss (the owners' shares while they restarted; errors $errs, failovers $fo)" || bad "shard: misses $miss, wrong $wr: $(grep 'last error' "$D/load.out" | head -2 | tr '\n' '|')"
 	[ "$errs" -lt $((ops / 20)) ] 2>/dev/null && ok "shard: the errors ($errs) stayed under 5% of $ops requests" || bad "shard: errors $errs of $ops requests - more than the restart windows explain: $(grep 'last error' "$D/load.out" | head -2 | tr '\n' '|')"
 fi

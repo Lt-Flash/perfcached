@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Yury Kirsanov - see lib/LICENSE */
-/*
- * perfd-log.c - S370: where libperfd's few log lines go (perfd.h,
- * perfd_set_log).  A consumer with a logger of its own hands it here; with
- * none, errors and worse go to stderr, as before the hook existed.
- */
+/* perfd-log.c - where libperfd's log lines go (perfd_set_log); with no logger
+ * set, errors and worse go to stderr. */
 #include <stdarg.h>
 #include <stdio.h>
 

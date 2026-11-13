@@ -1,17 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
-# mitboundtest.sh - S371: libperfd's MIT boundary is what the COMPILER
-# reads to build it, checked on every push.  It replaces synctest.sh: the
-# vendoring export it guarded is gone (consumers link the installed
-# library), and the boundary now lives where the library is built.
-#  1. every file the library's objects are compiled from - PERFD_SRCS and
-#     every header they reach, resolved by the compiler with the library's
-#     own flags (make print-libperfd) - carries an MIT SPDX line;
-#  2. the archive holds exactly PERFD_SRCS' objects (the daemon's GPL
-#     compat.o rode in it before 0.5.0);
-#  3. a doctored tree whose perfd.c includes a GPL header, and one whose
-#     header is relabelled GPL, are both caught - the check can fail.
-# Usage: test/mitboundtest.sh <libperfd.a>
+# mitboundtest.sh - libperfd's MIT boundary as the compiler reads it: every file the library is
+# built from carries an MIT SPDX line, the archive holds only PERFD_SRCS, and a doctored tree fails.
 set -u
 AR=${1:?usage: mitboundtest.sh <libperfd.a>}
 CC=${CC:-cc}

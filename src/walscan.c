@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * walscan.c - the WAL's reader: the segments in generation order, each
- * record's length, checksum and type checked, handed to a callback;
- * replay at start (S15), the suites, and perfcached -W's dump.  Moved
- * from wal.c unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* walscan.c - the WAL's reader: segments in generation order, each record's length, checksum and
+ * type checked, handed to a callback (replay at start, the suites, perfcached -W's dump). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +11,7 @@
 #include "wal.h"
 #include "walfmt.h"
 
-/* ---- scan (tests, -W, S15 replay) -------------------------------------- */
+/* ---- scan (tests, -W, replay) ------------------------------------------ */
 
 struct seg_meta {
 	int idx;
@@ -97,11 +93,8 @@ long pc_wal_scan(const char *dir, pc_wal_scan_cb cb, void *ctx,
 				break;
 			}
 			if (!PC_WAL_T_KNOWN(buf[4])) {
-				/* UP3: its framing is sound (length, CRC), its type
-				 * is a newer build's - and its header may be laid out
-				 * as this build cannot know.  Handed on unparsed, so
-				 * the replay can refuse it, instead of calling the log
-				 * torn here and dropping every record after it */
+				/* a newer build's type (framing sound): handed on unparsed for the
+				 * replay to refuse, not called torn and the rest dropped */
 				count++;
 				if (cb && cb(buf[4], "", 0, "", 0, "", 0, 0, 0, 0, 0,
 				        ctx) < 0) {
@@ -117,12 +110,11 @@ long pc_wal_scan(const char *dir, pc_wal_scan_cb cb, void *ctx,
 				int type = p[0], collen = p[1], klen = r16(p + 2);
 				uint32_t vlen = r32(p + 4);
 				uint64_t exp = r64(p + 8), seq = r64(p + 16);
-				/* type 4 carries the version between seq and
-				 * the strings; every older type does not, and
-				 * still replays (numbered 0) */
+				/* type 4 carries the version between seq and the strings; older
+				 * types do not, and still replay (numbered 0) */
 				unsigned int hdr = PC_WAL_HDRLEN(type);
 				uint64_t ver = hdr >= 32u ? r64(p + 24) : 0;
-				/* S280: an upsert's type */
+				/* an upsert's type */
 				unsigned char flags = hdr == 33u ? p[32] : 0;
 				const char *col = (const char *)p + hdr;
 				const char *key = col + collen;
@@ -154,7 +146,7 @@ struct dump_ctx {
 	long n;
 	unsigned long long last_seq;
 	int order_ok;
-	long unknown;                  /* UP3: a newer build's records */
+	long unknown;                  /* a newer build's records */
 };
 
 static int dump_cb(int type, const char *col, int collen, const char *key,
@@ -169,7 +161,7 @@ static int dump_cb(int type, const char *col, int collen, const char *key,
 
 	(void)val;
 	if (!PC_WAL_T_KNOWN(type)) {
-		/* UP3: not parsed - its header is a newer build's, its seq
+		/* not parsed - its header is a newer build's, its seq
 		 * unknown, so it neither orders nor breaks the order */
 		printf("type=%d unknown: a newer build's record, not parsed\n",
 			type);
@@ -180,23 +172,22 @@ static int dump_cb(int type, const char *col, int collen, const char *key,
 		d->order_ok = 0;
 	d->last_seq = seq;
 	d->n++;
-	/* ver= is printed only where the record actually carries one, so a
-	 * pre-A1 log reads as silent about versions rather than as full of
-	 * records versioned zero */
+	/* ver= only where the record carries one, so an older log reads as silent about versions
+	 * rather than as full of records versioned zero */
 	printf("seq=%llu %s %.*s/%.*s vlen=%d exp=%llu", seq,
 		tn[type >= 1 && type <= PC_WAL_T_DEL_N ? type : 0], collen, col, klen, key,
 		vlen, exp);
 	if (PC_WAL_T_HASVER(type))
 		printf(" ver=%llu", ver);
 	if (flags & PCACHE_F_JSON)
-		printf(" type=json");                  /* S280 */
+		printf(" type=json");
 	else if (flags & PCACHE_F_RL)
-		printf(" type=ratelimit");             /* S314 */
+		printf(" type=ratelimit");
 	else if (flags & PCACHE_F_HASH)
-		printf(" type=hash");                  /* S313 */
+		printf(" type=hash");
 	else if (type == PC_WAL_T_DEL && vlen == PC_WAL_DEL_VERLEN)
-		printf(" ver=%llu", (unsigned long long)r64((const unsigned char *)val));  /* S240 */
-	else if (type == PC_WAL_T_DEL_N && vlen == PC_WAL_DELN_VLEN) {   /* AT-3b */
+		printf(" ver=%llu", (unsigned long long)r64((const unsigned char *)val));
+	else if (type == PC_WAL_T_DEL_N && vlen == PC_WAL_DELN_VLEN) {
 		const unsigned char *u = (const unsigned char *)val;
 
 		printf(" ver=%llu origin=%016llx incarn=%u num=%llu",

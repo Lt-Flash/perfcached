@@ -1,8 +1,6 @@
 #!/bin/sh
-# workerbaltest.sh - S460: libperfd moves its connections off a crowded daemon
-# worker (see workerbaltest.c for the claims).  One standalone node, 8 workers,
-# the encrypted door on loopback.
-# Usage: test/workerbaltest.sh [./perfcached] [./workerbaltest]
+# workerbaltest.sh - libperfd moves its connections off a crowded daemon worker (workerbaltest.c
+# holds the claims): one standalone node, 8 workers, the encrypted door on loopback.
 set -u
 BIN=${1:-./perfcached}
 WB=${2:-./workerbaltest}

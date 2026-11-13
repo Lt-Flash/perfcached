@@ -1,14 +1,5 @@
-/*
- * clfleettest.c - one collection's figures for the whole fleet (S164),
- * the rules without the peer table (M15, wave 4).
- *
- * Until this, the only thing that checked these rules was fleetcolstest's
- * three daemons, and only for eager.  The failure the rules exist for was
- * a page reading 6,129 entries on a fleet holding 2,043 - a sum where a
- * max belonged - and the spread and store bases had no check at all.
- *
- * Build: cc -o clfleettest test/clfleettest.c src/clfleet.o
- */
+/* clfleettest.c - one collection's fleet-wide figures per mode, without the peer table: the
+ * fullest member where copies would be summed, the sum where each key has one copy. */
 #include <stdio.h>
 #include <string.h>
 

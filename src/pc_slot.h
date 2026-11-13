@@ -3,52 +3,8 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * pc_slot.h — the key -> slot function, shared by the daemon and by
- * libperfd, header-only so the two CANNOT drift.
- *
- * This is Redis's hash slot, exactly: CRC16-CCITT (polynomial 0x1021,
- * zero seed, no reflection, no final xor) over the key, modulo 16384,
- * with Redis's hash-tag rule.  It has to be bit-identical to what a
- * Redis client computes, or the client routes to a node we do not think
- * owns the key and every request pays a forward - which is the whole
- * thing S44 exists to remove.
- *
- * Computed SLICE-BY-8: eight bytes per step, as eight independent table
- * lookups XORed together.  The obvious byte-at-a-time loop carries a
- * serial dependency - every step needs the previous CRC - which costs
- * more than the arithmetic does.  Slicing breaks the chain so the CPU
- * issues the lookups in parallel, and the result is BIT-IDENTICAL:
- * same polynomial, same value, verified against the byte-at-a-time
- * form on the CCITT check value and 200k random buffers.  Measured on a
- * 25-byte key it is ~15ns against ~57ns, which also makes it faster
- * than the FNV-1a placement used before S44 (~21ns) - the interop
- * contract costs nothing after all.  Tails shorter than 8 bytes fall
- * back to the plain loop.
- *
- * The tables are compile-time constants in .rodata, 4KB total.  They
- * were built at runtime from the polynomial until 2026-08-31, to rule
- * out the typo a constant table hides so well - a single wrong digit
- * would still look like a hash, still spread keys, and quietly
- * disagree with every Redis client for one byte value in 256.  That
- * risk is now caught by test/slottest.c, which re-derives all 2048
- * entries and compares, so the check happens once at build time rather
- * than on every call.  Never hand-edit an entry: change the generator
- * and let the test confirm it.
- *
- * Constant tables are also strictly SAFER than the lazily built ones
- * they replace.  That version needed per-thread storage, because a
- * shared table can be seen half-built by another thread on a
- * weakly-ordered CPU - a wrong slot, intermittently, with nothing
- * logged.  Initialised by the compiler, there is no build to race with.
- *
- * Bytes are read one at a time rather than as a word, so there is no
- * alignment or endianness dependency: the same bytes give the same slot
- * on every target.
- *
- * PLACEMENT DEPENDS ON THIS.  Two nodes that disagree about a key's
- * slot disagree about its owner, and the key lives in two places.
- */
+/* pc_slot.h - Redis's hash slot (CRC16-CCITT mod 16384, hash tags), header-only
+ * so daemon and libperfd cannot drift: it must match every client bit for bit */
 #ifndef PC_SLOT_H
 #define PC_SLOT_H
 
@@ -59,7 +15,7 @@
 #define PC_SLOTS 16384
 
 /* T[0] is the CCITT table; T[k][n] = (T[k-1][n] << 8) ^ T[0][T[k-1][n] >> 8].
- * All 2048 entries are re-derived and checked by slottest. */
+ * slottest re-derives all 2048 entries: never hand-edit one */
 static const uint16_t pc_crc16_tab[8][256] = {
 	{
 		0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
@@ -335,6 +291,7 @@ static const uint16_t pc_crc16_tab[8][256] = {
 	},
 };
 
+/* slice-by-8, bytes read singly: no alignment or endianness dependency */
 static inline uint16_t pc_crc16(const char *buf, size_t len)
 {
 	const unsigned char *p = (const unsigned char *)buf;
@@ -354,19 +311,13 @@ static inline uint16_t pc_crc16(const char *buf, size_t len)
 	return crc;
 }
 
-/* Redis's hash tag: if the key holds "{...}" with a NON-EMPTY body, the
- * slot comes from the body alone, so an application can force related
- * keys onto one node.  An empty "{}" or an unclosed "{" falls back to
- * the whole key - matching Redis, including the edge cases, because a
- * client that disagrees with us here routes wrongly for exactly the
- * keys someone deliberately grouped. */
+/* Redis's hash tag: "{...}" with a NON-EMPTY body slots by the body alone; "{}"
+ * or an unclosed "{" use the whole key, matching Redis's edge cases exactly */
 static inline uint16_t pc_key_slot(const char *key, size_t len)
 {
 	const char *o, *c;
 
-	/* memchr, not a hand-rolled loop: it vectorises and the loop
-	 * cannot, and this runs once per request on the routing path -
-	 * measured 21ns against 4.7ns for a 25-byte key. */
+	/* memchr vectorises where a hand loop cannot; this runs once per request */
 	o = (const char *)memchr(key, '{', len);
 	if (!o)
 		return (uint16_t)(pc_crc16(key, len) % PC_SLOTS);

@@ -1,15 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * reload.h - a configuration reload (DESIGN 12nw): SIGHUP, `systemctl
- * reload` (ExecReload runs `perfcached -f <conf> -H $MAINPID`) or the
- * privileged `reload` verb.  The file is read again and compared key by
- * key with the one the daemon runs; when every key that changed is one a
- * running daemon can take - the doors' allow-lists, the secrets, the log
- * level, the slow-log threshold - they are applied, and when ANY other key
- * changed (the cluster mode, a listener, a collection, the memory...) the
- * reload is refused whole, naming those keys, and nothing changes.
- */
+/* reload.h - a configuration reload (SIGHUP, systemctl reload, the `reload` verb): keys a running
+ * daemon can take are applied; when any other key changed, the reload is refused whole. */
 #ifndef PC_RELOAD_H
 #define PC_RELOAD_H
 
@@ -25,10 +17,11 @@
 #define PC_RL_CLIENT        0x020u
 #define PC_RL_LOGLEVEL      0x040u
 #define PC_RL_SLOWLOG       0x080u
+#define PC_RL_TLS           0x100u     /* the TLS doors' certificate and key */
+#define PC_RL_AUTH_TLS      0x200u     /* auth_needs_tls */
 
-/* the daemon, before the threads: the file it runs and what was read from
- * it (taken over; freed at exit), and where the outcome file goes
- * ($RUNTIME_DIRECTORY, else state_dir, else none) */
+/* the daemon, before the threads: the file it runs and its keymap (taken over; freed at exit);
+ * the outcome file goes to $RUNTIME_DIRECTORY, else state_dir, else none */
 void pc_reload_init(const char *path, struct pc_keymap *boot,
 		const char *state_dir);
 /* async-signal-safe: SIGHUP's handler */

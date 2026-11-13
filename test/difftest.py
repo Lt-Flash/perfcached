@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""difftest.py - S317's gate: the 0.4.5 daemon (binary protocol only)
+"""difftest.py - the gate: the 0.4.5 daemon (binary protocol only)
 answers every native method the same as the last daemon with the JSON-RPC
 door (p044) did - compared as DECODED VALUES, not as bytes, after the
-shape changes DESIGN 12if documents are normalised away:
+shape changes listed here are normalised away:
 
   - values and keys are bytes on the tree: the reference's "enc":"b64"
     sibling, "k_enc", and {"b64":..,"enc":"b64"} key objects decode to
@@ -12,47 +12,48 @@ shape changes DESIGN 12if documents are normalised away:
   - hcmd answers the command's reply item itself (no {"reply":..} wrapper,
     no "tree" hex twin)
   - stats loses native.json; members' clients lose "json"
-  - stats gains process.allocator (S282, 0.5.0 - after the p044 reference):
+  - stats gains process.allocator (0.5.0 - after the p044 reference):
     dropped on the new side, and only that key, so anything else new
     under process still differs
   - each collection in stats gains autoscale_floor_log2, and autoscale
     gains the floor mode, so its refusal of an unknown mode lists it
-    (S328, 0.5.1): that key and that one message, nothing else
+    (0.5.1): that key and that one message, nothing else
   - every counter in stats gains its five-minute window beside it, a
-    win_ key (S351, 0.5.6.2): the shape compare lets the new side ADD
+    win_ key (0.5.6.2): the shape compare lets the new side ADD
     win_ keys - one the reference has (the commands table's) must still
-    be there; members gains the fleet block (S341, 0.5.6.2): that key
-  - stats.since gains next_reset, the scheduled stats reset (S358,
-    0.5.6.4): that key, and only under since
+    be there; members gains the fleet block (0.5.6.2): that key
+  - stats.since gains next_reset, the scheduled stats reset
+    (0.5.6.4): that key, and only under since
   - stats.clients gains max_basis, memory (the memory guard) and buffers
-    (idle connections' buffers, the heap trim) (S366, 0.5.6.5), and
-    handshakes (the per-turn cap, ST5, 0.5.7): those four keys, and only
+    (idle connections' buffers, the heap trim) (0.5.6.5), and
+    handshakes (the per-turn cap, 0.5.7): those four keys, and only
     under clients
-  - stats.process gains build, the build flavor (S357, 0.5.9), and stats
-    gains mail and alerts, the alert mailer (S352, 0.5.9), io (0.6.0),
+  - stats.process gains build, the build flavor (0.5.9), and stats
+    gains mail and alerts, the alert mailer (0.5.9), io (0.6.0),
     http, the HTTP door's rate and cache (0.6.2), and reload, the config
-    reloads (12nw, 0.7.1): those keys, there
-  - each collection in stats gains hot_keys, the sampled hot keys (S397,
-    0.7.1): dropped on the new side, that key only; and durable (G5,
-    0.7.2), autoscale_set and autoscale_gen (S436, 0.7.2): those keys
-  - the autoscale verb stamps its mode with a Lamport tick (S436, 0.7.2),
+    reloads (0.7.1): those keys, there
+  - each collection in stats gains hot_keys, the sampled hot keys
+    (0.7.1): dropped on the new side, that key only; and durable
+    (0.7.2), autoscale_set and autoscale_gen (0.7.2), keeps and
+    copies (0.7.5): those keys
+  - the autoscale verb stamps its mode with a Lamport tick (0.7.2),
     one more tick than the reference, so every version stamped after it
     is one higher: the corpus asks it after the requests that read a
     version (exists answered ver 5 for 4 where it stood before)
   - stats.memory gains arena_free_tables and arena_regions_raised, a
     dropped index's slots kept for the next index and the frontier's rises
-    over them (S445, 0.7.2): those keys, there
+    over them (0.7.2): those keys, there
   - stats.resp gains enable_lockouts and enable_refused, the per-source
-    lockout on wrong enable secrets (S417, 0.6.6), and map and
-    map_overrides, the DB-index map as it holds (S432, 0.7.1): those keys,
+    lockout on wrong enable secrets (0.6.6), and map and
+    map_overrides, the DB-index map as it holds (0.7.1): those keys,
     there
   - stats.cluster gains the reconcile's fast path, budget and progress
-    (S392, S393, S395, 0.6.4): reconcile_fast*, reconcile_budget,
+    (0.6.4): reconcile_fast*, reconcile_budget,
     reconcile_open, reconcile_walked, reconcile_walk_total,
     reconcile_rate, reconcile_eta_s - those keys, only under cluster
   - stats.native gains plain (the plaintext hello's counts) and
-    native.binary records, the sealed records opened (S468, 0.7.4), and a
-    member gains link_pct, its network link's use (S465, 0.7.4): those
+    native.binary records, the sealed records opened (0.7.4), and a
+    member gains link_pct, its network link's use (0.7.4): those
     keys, there
   - replies whose VALUES are the node's own state (stats, members,
     collections, probe, pubsub_udp) compare by SHAPE: same keys, same
@@ -193,7 +194,7 @@ class New:
                 m = "mode is auto, warn or off"
             return {"__error__": m}
         res = r.get("result")
-        # D3: jget's value is one bulk of the fragment's JSON text where
+        # jget's value is one bulk of the fragment's JSON text where
         # the reference embedded the value itself - parse it to compare
         if method == "jget" and isinstance(res, dict) and isinstance(res.get("value"), str):
             res = dict(res)
@@ -229,6 +230,8 @@ def _canon_new(v):
                     c.pop("durable", None)                # stats, G5 (0.7.2)
                     c.pop("autoscale_set", None)          # stats, S436 (0.7.2)
                     c.pop("autoscale_gen", None)
+                    c.pop("keeps", None)                  # stats, OM2-4 (0.7.5)
+                    c.pop("copies", None)
         return out
     if isinstance(v, list):
         return [_canon_new(x) for x in v]
@@ -433,9 +436,8 @@ CORPUS = [
     ("probe", {"secs": 1}),
     ("fleetstop", None),
     ("reset_stats", None),
-    # S436 (0.7.2): the autoscale verb stamps the mode with a Lamport tick,
-    # so it moves the clock every later write is stamped from - asked here,
-    # after every request that reads a version, so those still compare
+    # the autoscale verb stamps the mode with a Lamport tick, moving the clock later writes are stamped
+    # from - so it is asked after every request that reads a version
     ("autoscale", {"col": C, "mode": "warn"}),
     ("autoscale", {"col": C, "mode": "bogus"}),
     ("rename", {"col": C, "to": "dt_renamed"}),

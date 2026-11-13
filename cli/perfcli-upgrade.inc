@@ -1,23 +1,5 @@
-/* perfcli-upgrade.inc - UP7a (DESIGN 12ns): the roll driver.
- *
- *   perfcli -E <enable> -h <seed> upgrade plan <tarball> version=<v>
- *           [switch_cmd=<program>] [journal=<file>] [ready_s=<n>] [gate_s=<n>]
- *   perfcli ... upgrade start | resume | status | abort | rollback [journal=<file>]
- *
- * A stateless program with a journal: the roll's truth is the fleet, read
- * before every transition (which build each node runs, whether it is
- * ready, whether its peers kept their records); the journal says what was
- * intended and what happened.  Per node: staged -> switching -> up ->
- * ready -> gated.  At most one node past staged at a time; a node is never
- * skipped; the order (members by id, the backup, the master last) is
- * recomputed before each node; the driver stops at the first gate that
- * fails, reverts THAT node and prints the rollback command.
- *
- * switch_cmd replaces the upgrade_switch / upgrade_revert verbs with a
- * program (the CI roll's hook, 12ns "testability without root"):
- *   <program> switch <addr> <port> <node> <artifact> <sha256>
- *   <program> revert <addr> <port> <node>
- */
+/* perfcli-upgrade.inc - the roll driver (#included by perfcli.c), stateless but for its journal;
+ * switch_cmd=<program> runs `<program> switch|revert <addr> <port> <node> <artifact> <sha256>` */
 #include <stdarg.h>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -31,15 +13,15 @@ struct unode {
 	char ver[32], rev[32], state[24], role[16];
 	long long pid, entries;
 	int peers_up, safe, reach;
-	int ecommit, emin, emax;           /* 12nu: the epoch it speaks, its range */
+	int ecommit, emin, emax;           /* the epoch it speaks, its range */
 };
 
 struct uplan {
 	char artifact[512], sha[65], version[48], switch_cmd[512], journal[512];
 	char seed[128];
 	int ready_s, gate_s;
-	int fleet_epoch;                   /* 12nu: committed when the plan was made (0 unknown) */
-	int epoch;                         /* 12nu: `commit epoch=<n>` */
+	int fleet_epoch;                   /* committed when the plan was made (0 unknown) */
+	int epoch;                         /* `commit epoch=<n>` */
 };
 
 static int ujournal_line(const struct uplan *pl, const char *fmt, ...)
@@ -70,9 +52,8 @@ static long long jnumv(const char *res, const char *key)
 	return s ? strtoll(s + strlen(pat), NULL, 10) : -1;
 }
 
-/* the value of @key among the TOP-LEVEL keys of the JSON object that
- * starts at @obj ('{'): nested objects, arrays and strings are skipped, so
- * cluster.lane.peers_up is not taken for cluster.peers_up.  NULL: absent. */
+/* the value of @key among the TOP-LEVEL keys of the object at @obj ('{'), so
+ * cluster.lane.peers_up is not taken for cluster.peers_up; NULL: absent */
 static const char *jtop(const char *obj, const char *key)
 {
 	char pat[64];
@@ -117,13 +98,8 @@ static const char *jobj(const char *res, const char *key)   /* "key":{ ... */
 	return *p == '{' ? p : NULL;
 }
 
-/* the records a node holds: the top-level "entries" of each object in its
- * stats' "collections" array, summed - the same measure before and after a
- * peer's restart, so a fall says records went missing.  Every "entries" in
- * the text used to be summed, and that mixed in the fleet's total, the
- * node's total, the negative cache's and the shard map's: in shard mode a
- * peer "lost" 6039 -> 4999 across a restart while every key read back
- * (upgradeloadtest, 225, 2026-10-16) - its negative cache had emptied. */
+/* the records a node holds: the top-level "entries" of each object in its stats' "collections",
+ * summed - not every "entries" in the text, which mixes in the fleet's and the negative cache's */
 static long long jentries_sum(const char *res)
 {
 	const char *p = res ? strstr(res, "\"collections\":[") : NULL;
@@ -184,9 +160,8 @@ static int unode_read(struct unode *n)
 		return -1;
 	}
 	{
-		/* the cluster's own figures live in its block: a first-match scan of
-		 * the whole text found an upstream's "role":"replica" and another
-		 * block's "peers_up":0 (225, 2026-10-16: the ready gate never passed) */
+		/* the cluster's own figures live in its block: a first-match scan of the whole
+		 * text finds an upstream's "role" or another block's "peers_up" */
 		const char *cl = jobj(r, "cluster"), *v, *rs;
 
 		jfield(r, "version", n->ver, sizeof n->ver);
@@ -208,7 +183,7 @@ static int unode_read(struct unode *n)
 				rs++;
 			v = rs && *rs == '{' ? jtop(rs, "safe") : NULL;
 			n->safe = v && !strncmp(v, "true", 4);
-			/* 12nu: cluster.epoch {committed, min, max} - 0 on a build before 0.7.1 */
+			/* cluster.epoch {committed, min, max} - 0 on a build without epochs */
 			rs = jtop(cl, "epoch");
 			while (rs && *rs == ' ')
 				rs++;
@@ -407,7 +382,7 @@ static int uopts(struct uplan *pl, int argc, char **argv)
 			pl->ready_s = atoi(a + 8);
 		else if (!strncmp(a, "gate_s=", 7))
 			pl->gate_s = atoi(a + 7);
-		else if (!strncmp(a, "epoch=", 6))             /* 12nu */
+		else if (!strncmp(a, "epoch=", 6))
 			pl->epoch = atoi(a + 6);
 		else {
 			fprintf(stderr, "upgrade: unknown word '%s'\n", a);
@@ -435,10 +410,8 @@ static int ufile_sha256(const char *path, char *hex, size_t cap)
 	return 0;
 }
 
-/* UP12b (12nv): what the candidate says about itself - share/perfcached/RELEASE
- * inside the tarball, written by `make install` from the tree's constants.
- * tar runs directly (no shell): one pass lists the members, the second
- * extracts the one file to a pipe.  Both GNU tar and busybox take -t/-x/-O/-z. */
+/* the candidate's share/perfcached/RELEASE from the tarball, tar run directly (no shell): one
+ * pass lists the members, the second extracts the file; GNU tar and busybox take -t/-x/-O/-z */
 struct urel {
 	int found;
 	char version[48], revision[48], edition[24];
@@ -647,14 +620,28 @@ static int uwait_up(const struct uplan *pl, struct unode *u, long long old_pid, 
 	return -2;
 }
 
+/* the seed (HOST:PORT in the journal) as the options perfcli dials it with */
+static const char *useed_opts(const struct uplan *pl, char *buf, size_t cap)
+{
+	const char *c = strrchr(pl->seed, ':');
+
+	if (c)
+		snprintf(buf, cap, "-h %.*s -p %s", (int)(c - pl->seed), pl->seed, c + 1);
+	else
+		snprintf(buf, cap, "-h %s", pl->seed);
+	return buf;
+}
+
 static void uprint_rollback(const struct uplan *pl, const struct unode *u)
 {
+	char so[288];
+
 	printf("rollback this node:  perfcli -h %s -p %d -E <enable> upgrade-revert\n",
 		u->addr, u->port);
-	printf("rollback the roll:   perfcli -h %s -E <enable> upgrade rollback journal=%s\n",
-		pl->seed, pl->journal);
-	printf("continue:            perfcli -h %s -E <enable> upgrade resume journal=%s\n",
-		pl->seed, pl->journal);
+	printf("rollback the roll:   perfcli %s -E <enable> upgrade rollback journal=%s\n",
+		useed_opts(pl, so, sizeof so), pl->journal);
+	printf("continue:            perfcli %s -E <enable> upgrade resume journal=%s\n",
+		useed_opts(pl, so, sizeof so), pl->journal);
 }
 
 /* revert one node (the hook, or the daemon's upgrade_revert) and wait for the
@@ -750,9 +737,7 @@ static int uroll(struct uplan *pl, int resume)
 		}
 		memcpy(before, ns, sizeof ns);
 		/* u points into ns, which every fleet re-read below overwrites in
-		 * member order: the node being rolled is copied out first (225,
-		 * 2026-10-16: the gated line named another node and the same node
-		 * was switched again and again) */
+		 * member order: the node being rolled is copied out first */
 		cur = *u;
 		u = &cur;
 		old_pid = u->pid;
@@ -786,7 +771,7 @@ static int uroll(struct uplan *pl, int resume)
 		if (rc != 0) {
 			ujournal_line(pl, "node=%d addr=%s:%d event=failed reason=%s", u->node,
 				u->addr, u->port, rc == -1 ? "not-up-in-time" : "not-ready-in-time");
-			/* 12ns case 2/3: revert THAT node, verify the old build, stop */
+			/* revert THAT node, verify the old build, stop */
 			if (urevert_node(pl, u, peers) == 0)
 				ujournal_line(pl, "stop reason=node-%d-reverted - the nodes already "
 					"rolled stay on %s", u->node, pl->version);
@@ -814,7 +799,7 @@ static int uroll(struct uplan *pl, int resume)
 				} else if (b->entries >= 50 && a->entries < b->entries * 9 / 10) {
 					lost = 1;
 					ujournal_line(pl, "node=%d peer=%d entries %lld -> %lld across the "
-						"restart (S405's shape)", u->node, b->node, b->entries,
+						"restart", u->node, b->node, b->entries,
 						a->entries);
 				}
 			}
@@ -853,10 +838,8 @@ static int urollback(struct uplan *pl)
 		ujournal_line(pl, "stop reason=no-fleet");
 		return 1;
 	}
-	/* 12nu rule 6: a fleet committed above the plan's epoch cannot take
-	 * the old build back (it has no codec for the new epoch) - the commit
-	 * must be undone first, which the master allows while every member
-	 * still speaks the old epoch */
+	/* a fleet committed above the plan's epoch cannot take the old build back (no codec for
+	 * it): the commit is undone first, allowed while every member speaks the old epoch */
 	for (i = 0; i < n; i++)
 		if (ns[i].reach && pl->fleet_epoch && ns[i].ecommit > pl->fleet_epoch) {
 			ujournal_line(pl, "stop reason=epoch-committed fleet=%d plan=%d",
@@ -934,7 +917,7 @@ static int upgrade_cmd(int argc, char **argv)
 	snprintf(pl.seed, sizeof pl.seed, "%s:%s", g_dial_host ? g_dial_host : "127.0.0.1",
 		g_dial_port ? g_dial_port : "6479");
 	if (!strcmp(sub, "plan")) {
-		char dir[520];
+		char dir[520], so[288];
 		struct urel rl;
 
 		if (argc < 2 || uopts(&pl, argc - 2, argv + 2) != 0 || !pl.version[0]) {
@@ -956,9 +939,8 @@ static int upgrade_cmd(int argc, char **argv)
 				mkdir(dir, 0700);
 			}
 		}
-		/* 12nu: the epoch the fleet speaks and each member's range - a roll
-		 * keeps the fleet on its committed epoch; the commit is its own
-		 * step after the roll (upgrade commit) */
+		/* the epoch the fleet speaks and each member's range: a roll keeps the fleet on its
+		 * committed epoch; the commit is its own step after the roll (upgrade commit) */
 		{
 			struct unode ns[UP_MAX_NODES];
 			int n = ufleet_read(ns, UP_MAX_NODES), i;
@@ -979,9 +961,8 @@ static int upgrade_cmd(int argc, char **argv)
 				printf("the fleet speaks wire epoch %d; the roll keeps it there - "
 					"`upgrade commit epoch=<n>` raises it once every member speaks <n>\n",
 					pl.fleet_epoch);
-			/* UP12b, 12nu rule 3: the candidate's own range, read from the
-			 * tarball before anything is staged - a build that cannot speak
-			 * the committed epoch would be refused by its first peer */
+			/* the candidate's own range, read before anything is staged: a build
+			 * without the committed epoch would be refused by its first peer */
 			ufile_release(pl.artifact, &rl);
 			if (!rl.found)
 				printf("the candidate says nothing about its wire epochs (a tarball "
@@ -1023,8 +1004,8 @@ static int upgrade_cmd(int argc, char **argv)
 		}
 		printf("planned: %s (%s) -> every member of %s; journal %s\n", pl.version,
 			pl.sha, pl.seed, pl.journal);
-		printf("next: perfcli -h %s -E <enable> upgrade start journal=%s\n", pl.seed,
-			pl.journal);
+		printf("next: perfcli %s -E <enable> upgrade start journal=%s\n",
+			useed_opts(&pl, so, sizeof so), pl.journal);
 		return 0;
 	}
 	if (uopts(&pl, argc > 0 ? argc - 1 : 0, argv + 1) != 0)
@@ -1046,7 +1027,7 @@ static int upgrade_cmd(int argc, char **argv)
 		return 0;
 	}
 	if (!strcmp(sub, "commit")) {
-		/* 12nu: the fleet's wire epoch, raised on the master once every
+		/* the fleet's wire epoch, raised on the master once every
 		 * member speaks it - its own step after a roll has soaked */
 		struct unode ns[UP_MAX_NODES];
 		int n, i, epoch = pl.epoch, master = -1;

@@ -1,33 +1,6 @@
 #!/bin/sh
-# tombacktest.sh - 12ny AT-3b: every member counts, durably, which of each
-# origin's numbered deletes it holds (clack.h, ackstate.h).
-#
-# A peer's delete never reached this node's WAL (an eager replica persists
-# only what it authored), so "confirmed once the WAL has synced it" had no
-# record to wait for.  Now a numbered delete - this node's own or a peer's -
-# is logged as PC_WAL_T_DEL_N with its numbering, counted, and confirmed
-# once the WAL has synced it; a snapshot carries the marks in `acks` beside
-# it, and a restart rebuilds them from that file and the replay.  Three
-# eager nodes; node 2 takes snapshots (a clean stop writes one), nodes 1 and
-# 3 run on the WAL alone:
-#   1. 60 deletes through node 1: node 1 confirms 60 in its own space,
-#      nodes 2 and 3 confirm 60 in node 1's
-#   2. node 3 killed (-9): its WAL holds 60 numbered deletes, 1..60, of
-#      node 1's space; restarted, the replay counts them back - confirmed 60
-#   3. node 2 stopped cleanly: its snapshot leaves `acks`; restarted, the
-#      file restores the space - confirmed 60
-#   4. 20 more: both restarted members count on past what they rebuilt (80)
-#   5. node 1 restarted: a new incarnation is a new space - 5 deletes in it,
-#      the old one kept at 80, on node 2 and on node 1 itself
-#   6. AT-4: the keepalives carry the marks - node 2 holds what nodes 1 and 3
-#      announce of both spaces, and every node's gate is open
-#   7. AT-10: node 3 restarted as a build without the marks
-#      (PERFCACHED_TEST_NO_ACKS): node 1's gate closes and names it, its
-#      marks are cleared - an origin forgets nothing by marks
-#   8. node 3 back as itself: the gate opens, it announces what it rebuilt
-# FAIL-FIRST: before AT-3b /stats has no cluster.acks and the WAL no del-n;
-# before AT-4 no node holds another's marks.
-# Usage: test/tombacktest.sh [./perfcached]
+# tombacktest.sh - every member counts, durably, which of each origin's numbered deletes it holds:
+# rebuilt from the WAL and the snapshot's `acks`, carried by keepalives; a member without them shuts the gate.
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -90,6 +63,15 @@ a = pcnative.call(f, "stats")["result"]["cluster"].get("acks")
 print(eval(sys.argv[2]))
 PY
 }
+kp() { # kp <i>: keeps/copies of collection c on node i (OM2-4)
+	python3 - "$1" <<'PY' 2>/dev/null
+import socket, sys, pcnative
+i = int(sys.argv[1])
+f = pcnative.wrap(socket.create_connection(("127.0.147.%d" % i, 19410 + i), 10))
+c = pcnative.call(f, "stats", col="c")["result"]["collections"][0]
+print("%s/%s" % (c.get("keeps"), c.get("copies")))
+PY
+}
 ops() { # ops <verb> <from> <to>: through node 1, one call each
 	python3 - "$1" "$2" "$3" <<'PY'
 import socket, sys, pcnative
@@ -106,7 +88,7 @@ space() {
 	ak "$1" "next((m['$4'] for m in a['marks'] if m['origin'] == '$2' and m['incarn'] == $3), -1)"
 }
 peers1() { # peers1: up to 15 s for node 1 to hold both peers - a delete sent
-	# while one is still being admitted is a hole nothing fills before AT-6
+	# while one is still being admitted is a hole nothing fills yet
 	k=0; while [ $k -lt 75 ]; do
 		[ "$(python3 - <<'PY' 2>/dev/null
 import socket, pcnative
@@ -197,8 +179,14 @@ k=0; while [ $k -lt 50 ] && { [ "$(rep 2 "$O1" "$I1" 80)" != 2 ] || [ "$(rep 2 "
 G=$(for i in 1 2 3; do ak $i 'a["fleet"]["confirming"]'; done | tr '\n' ' ')
 [ "$G" = "True True True " ] && ok "6. AT-10: every member announces its marks - the gate is open on all three" ||
 	bad "6. the gate on nodes 1/2/3: $G"
+K=$(kp 1)
+[ "$K" = "fleet-delete-safe/all" ] &&
+	grep -q "collection 'c' keeps: fleet-delete-safe once every member acknowledges deletes - a restart replays its WAL (fsync everysec); copies: every node's (eager)" "$D/n1.log" &&
+	ok "6. OM2-4: node 1's c keeps $K, and its start said so" ||
+	bad "6. OM2-4: node 1's c keeps $K (want fleet-delete-safe/all); the start: $(grep 'keeps:' "$D/n1.log" | tail -1)"
 
-# 7. node 3 as a build without the marks
+# 7. node 3 as a build without the marks (PERFCACHED_TEST_NO_ACKS): node 1's gate closes and names
+# it, and its collection turns recoverable/all from fleet-delete-safe/all
 N3=$(python3 - <<'PY' 2>/dev/null
 import socket, pcnative
 f = pcnative.wrap(socket.create_connection(("127.0.147.3", 19413), 10))
@@ -215,6 +203,9 @@ H=$(ak 1 "sum(1 for m in a['fleet']['marks'] if m['member'] == '$M3')")
 [ "$(ak 1 'a["fleet"]["confirming"]')" = False ] && [ "$W" = "[$N3]" ] && [ "$H" = 0 ] &&
 	ok "7. AT-10: node 3 announces no marks - node 1's gate closes and names it ($W), its marks cleared" ||
 	bad "7. node 3 without marks: node 1 confirming $(ak 1 'a["fleet"]["confirming"]'), waiting_for $W (node 3 is $N3), node 3's marks held $H"
+K=$(kp 1)
+[ "$K" = "recoverable/all" ] && ok "7. OM2-4: node 1's c keeps $K while node 3 confirms nothing" ||
+	bad "7. OM2-4: node 1's c keeps $K (want recoverable/all)"
 
 # 8. node 3 as itself again
 kill -TERM $P3; wait $P3 2>/dev/null

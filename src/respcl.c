@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respcl.c - the RESP door's CLUSTER commands: the topology a stock Redis
- * client routes by (S44), the slot map serialised once per membership
- * snapshot (S75), and CLUSTER itself.  Moved from verbs.c unchanged (the
- * 0.7.2 split, wave 1 - doc/MODULARITY.md); it reaches verbs.c through
- * verbsint.h.
- */
+/* respcl.c - the RESP door's CLUSTER commands: the topology a stock Redis client routes by and the
+ * slot map serialised once per membership snapshot; reaches verbs.c through verbsint.h */
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -20,30 +15,11 @@
 #include "respout.h"
 #include "verbsint.h"
 
-/* ---- CLUSTER: the topology a stock Redis client routes by (S44) ------
- * Placement runs rendezvous over the SLOT, so ownership is derivable
- * here and a Redis client in any language can route without an extra
- * hop.  What this is NOT is Redis Cluster: there are no MOVED
- * redirects, and none are needed - a request landing on the wrong node
- * is FORWARDED, so a client with a stale map stays correct and merely
- * pays the hop it would have paid anyway.  That is why CLUSTER INFO
- * reports state ok whenever the fleet is up: there is no slot that
- * nobody can answer for.
- *
- * The slot space here is FRAGMENTED.  Rendezvous decides each slot
- * independently, so runs of a single owner average ~1.5 slots and a
- * three-node fleet yields ~11k ranges where Redis would have 3.  It is
- * truthful and clients cope (they expand any reply into a 16384-entry
- * table), but it makes CLUSTER SLOTS a large reply - measured and
- * discussed under S44 in doc/DESIGN.md.  CLUSTER SHARDS is ~6x smaller
- * for the same information because it does not repeat the node block
- * per range; prefer it where the client supports it.
- */
+/* ---- CLUSTER: not Redis Cluster - no MOVED; a request on the wrong node is FORWARDED, so a client
+ * with a stale map pays a hop.  Rendezvous decides each slot alone: ~11k ranges on three nodes. ---- */
 
-/* a 40-hex node name, the only shape Redis clients accept.  Built from
- * the PERSISTED identity when the peer has one, so a name survives a
- * restart the way a Redis node name does; a peer whose build predates
- * identities falls back to its node number, stable while it holds it. */
+/* a 40-hex node name, the only shape Redis clients accept: from the PERSISTED identity so it
+ * survives a restart, else the node number (a peer older than identities) */
 static void resp_cl_id(char *out, const struct pc_member *m)
 {
 	static const char hx[] = "0123456789abcdef";
@@ -64,12 +40,8 @@ static void resp_cl_id(char *out, const struct pc_member *m)
 	}
 }
 
-/* the port the CLUSTER family advertises for a member: its RESP door.
- * A Redis client routed at client_port would be dialling the native
- * door, which off-box speaks only Noise - the client cannot even say
- * hello.  Falls back to client_port for a peer whose build predates the
- * gossiped field, which is exactly the old (broken off-box, workable
- * on-box) behaviour rather than a made-up number. */
+/* the port CLUSTER advertises: the RESP door (the native door off-box speaks only Noise);
+ * client_port for a peer too old to gossip it */
 static int resp_cl_port(const struct pc_member *m)
 {
 	return m->resp_port ? m->resp_port : m->client_port;
@@ -89,9 +61,8 @@ static void resp_cl_node(struct pc_jw *w, const struct pc_member *m)
 	resp_bulk(w, id, 40);
 }
 
-/* index of the member owning @slot, or -1.  pc_shard_owner_slot()
- * answers 0 for "this node", which is a node NUMBER everywhere else,
- * so the self case is resolved through the member list, not assumed. */
+/* index of the member owning @slot, or -1; pc_shard_owner_slot() answers 0 for "this node", a
+ * node NUMBER elsewhere, so self is resolved through the member list */
 static int resp_cl_owner(const struct pc_member *mem, int nm, unsigned slot)
 {
 	int want = pc_shard_owner_slot(slot), i;
@@ -103,10 +74,8 @@ static int resp_cl_owner(const struct pc_member *mem, int nm, unsigned slot)
 	return -1;
 }
 
-/* fill @ownv with the owning member INDEX for every slot (0xFF: none).
- * Computed once per reply: both CLUSTER SLOTS and CLUSTER SHARDS walk
- * the same array, so the two replies cannot disagree, and neither pays
- * for 16384 rendezvous rounds twice. */
+/* the owning member INDEX for every slot (0xFF: none), once per reply: SLOTS and SHARDS walk the
+ * same array, so they cannot disagree */
 static void resp_cl_ownmap(const struct pc_member *mem, int nm,
 		unsigned char *ownv)
 {
@@ -134,23 +103,13 @@ static int resp_cl_runs(const unsigned char *ownv, int who)
 	return n;
 }
 
-/* ---- S75: the serialised slot map, cached per membership snapshot ----
- * CLUSTER SLOTS is a pure function of who the members are: building it
- * walks 16384 rendezvous rounds and writes ~750KB on a three-node fleet
- * (rendezvous scatters ownership, so ~11000 ranges).  Once S74 tells
- * clients the truth they all fetch it, on connect and on every topology
- * refresh, so the build is paid once per membership change instead of
- * once per client.  The client's own parsing cost is untouched - that is
- * the placement question (option 1 in the filing), measured, not
- * guessed at, before it is reopened.  Workers are threads: the copy out
- * happens under the lock. */
+/* ---- the serialised slot map, cached per membership snapshot: a build is 16384 rendezvous rounds
+ * and ~750KB, and every client fetches it; workers are threads, so the copy out is locked ---- */
 static pthread_mutex_t clmap_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { unsigned long long key; char *buf; size_t len; } clmap_cache[2];
 
-/* FNV-1a over everything the reply depends on: the members, their
- * doors, their state, in snapshot order (self first - the reply differs
- * per node, so does the cache).  Placement reads the same peer table, so
- * a change that moves a slot changes this key. */
+/* FNV-1a over everything the reply depends on - members, doors, state, in snapshot order (self
+ * first, so it differs per node); placement reads the same table, so a moved slot changes it */
 static unsigned long long resp_clmap_key(const struct pc_member *mem,
 		int nm, int shards)
 {
@@ -210,7 +169,7 @@ int rh_cluster(struct resp_ctx *c)
 	size_t subl = c->nargs >= 2 ? c->argl[1] : 0;
 
 	/* KEYSLOT is answerable with no cluster at all, and is how
-	 * an operator checks our slot maths against real Redis. */
+	 * our slot maths is checked against real Redis. */
 	if (resp_is(sub, subl, "KEYSLOT")) {
 		if (c->nargs != 3) {
 			resp_err(c->out, "wrong number of arguments for "
@@ -236,14 +195,13 @@ int rh_cluster(struct resp_ctx *c)
 	}
 	if (resp_is(sub, subl, "INFO")) {
 		struct pc_jw b;
-		int on = resp_cluster_on();   /* S74: one truth, INFO reads it too */
+		int on = resp_cluster_on();   /* one truth, INFO reads it too */
 
 		pc_jw_init(&b, c->scratch, c->scratch_cap);
 		pc_jw_lit(&b, "cluster_enabled:");
 		pc_jw_i64(&b, on);
-		/* ok whenever the fleet is up: every slot has an
-		 * owner, and a miss is forwarded rather than
-		 * refused, so there is no "slot not served" state */
+		/* ok whenever the fleet is up: every slot has an owner and
+		 * a miss is forwarded, so no slot goes unserved */
 		pc_jw_lit(&b, "\r\ncluster_state:");
 		pc_jw_lit(&b, on ? "ok" : "fail");
 		pc_jw_lit(&b, "\r\ncluster_slots_assigned:");
@@ -272,33 +230,14 @@ int rh_cluster(struct resp_ctx *c)
 	}
 
 	if (resp_is(sub, subl, "NODES")) {
-		/* The LEGACY text topology, and still the one the
-		 * widest tooling reads: captured on the wire,
-		 * redis-benchmark --cluster opens with exactly
-		 * "CLUSTER NODES" (never INFO first), and Lettuce
-		 * parses this format too.  Implemented S49, because
-		 * without it the ecosystem's own load driver cannot
-		 * route here and S44's payoff cannot even be measured.
-		 *
-		 * One line per node:
-		 *   <id> <ip:port@cport> <flags> <master> <ping-sent>
-		 *   <pong-recv> <config-epoch> <link-state> <slots...>
-		 * There is no cluster bus, so cport repeats the client
-		 * port - parsers split on the @ and use what precedes
-		 * it.  No replicas exist, so flags are master (plus
-		 * myself on the answering node) and the master field
-		 * is "-". */
+		/* the LEGACY text topology redis-benchmark --cluster opens with: no cluster bus, so cport
+		 * repeats the port; no replicas, so flags are master (myself) and the master field "-" */
 		struct pc_jw tw;
 		unsigned char *ownv;
 		int i, s;
 
-		/* tw is a STACK local: pc_jw_init_heap() refuses a
-		 * writer whose len is nonzero (its stranded-bytes
-		 * guard), and uninitialised stack read as exactly
-		 * that.  Found by the map test: NODES answered "out
-		 * of memory" on any worker whose stack was dirty
-		 * from earlier requests, and worked on a virgin
-		 * daemon - which is why every smoke test passed. */
+		/* tw is a STACK local: pc_jw_init_heap() refuses a writer
+		 * whose len is nonzero, and dirty stack reads as exactly that */
 		memset(&tw, 0, sizeof tw);
 		ownv = malloc(PC_SLOTS);
 		if (!ownv) {
@@ -367,20 +306,16 @@ int rh_cluster(struct resp_ctx *c)
 		unsigned char *ownv;
 		int i, s, nr;
 
-		/* S75: serve the last build while the membership
+		/* serve the last build while the membership
 		 * snapshot's key still matches */
 		if (resp_clmap_cached(is_shards, key, c->out)) {
 			PC_RESP_BUMP(pc_resp_slots_hits);
 			return 0;
 		}
-		/* tw is a STACK local: pc_jw_init_heap() refuses a
-		 * writer whose len is nonzero, and dirty stack reads
-		 * as exactly that (see CLUSTER NODES) */
+		/* a STACK local, as in CLUSTER NODES */
 		memset(&tw, 0, sizeof tw);
-		/* 16KB, allocated per call rather than kept in a
-		 * static: workers are THREADS, and a shared scratch
-		 * buffer here would corrupt one reply with another's
-		 * walk under any concurrency at all. */
+		/* per call, not a static: workers are THREADS, and a shared
+		 * buffer would mix one reply into another's walk */
 		ownv = malloc(PC_SLOTS);
 		if (!ownv) {
 			resp_err(c->out, "out of memory building the "
@@ -389,14 +324,8 @@ int rh_cluster(struct resp_ctx *c)
 		}
 		resp_cl_ownmap(mem, nm, ownv);
 		nr = resp_cl_runs(ownv, -1);
-		/* SLOTS is the one reply whose size a request does
-		 * not bound: it enumerates the slot space, and
-		 * rendezvous scatters ownership, so a 4-node fleet
-		 * already exceeds the fixed per-worker scratch.  A
-		 * heap buffer sized for the ranges about to be
-		 * written - ~101 bytes each at the widest (5-digit
-		 * slots, a 15-char address, a 40-char name) - so the
-		 * common case never reallocs. */
+		/* SLOTS is the one reply a request does not bound (a 4-node fleet outgrows the worker
+		 * scratch): heap, ~101 bytes a range at the widest, so the common case never reallocs */
 		if (pc_jw_init_heap(&tw, (size_t)nr * 104 +
 		        (size_t)nm * 256 + 64) != 0) {
 			free(ownv);
@@ -421,10 +350,8 @@ int rh_cluster(struct resp_ctx *c)
 				resp_cl_node(&tw, &mem[ownv[s]]);
 			}
 		} else {
-			/* SHARDS groups the same ranges by owner,
-			 * writing the node block once instead of once
-			 * per range - the difference between a ~130KB
-			 * and a ~770KB reply on a three-node fleet. */
+			/* SHARDS writes the node block once per owner, not per
+			 * range: ~130KB instead of ~770KB on a three-node fleet */
 			resp_arr(&tw, nm);
 			for (i = 0; i < nm; i++) {
 				char id[40], ip[INET_ADDRSTRLEN];
@@ -461,9 +388,8 @@ int rh_cluster(struct resp_ctx *c)
 				resp_bulk(&tw, ip, strlen(ip));
 				resp_bulk(&tw, "endpoint", 8);
 				resp_bulk(&tw, ip, strlen(ip));
-				/* every node owns its slots outright -
-				 * there are no replicas of a shard here -
-				 * so the only honest role is master */
+				/* every node owns its slots outright - no replicas of a
+				 * shard - so the only honest role is master */
 				resp_bulk(&tw, "role", 4);
 				resp_bulk(&tw, "master", 6);
 				resp_bulk(&tw, "replication-offset", 18);
@@ -490,12 +416,12 @@ int rh_cluster(struct resp_ctx *c)
 	if (resp_is(sub, subl, "COUNTKEYSINSLOT")) {
 		/* the count is not tracked per slot, and answering
 		 * a made-up number would be worse than refusing */
-		unk_sub(c);                    /* S165: refused on purpose, still a gap */
+		unk_sub(c);                    /* refused on purpose, still a gap */
 		resp_err(c->out, "unsupported CLUSTER subcommand "
 			"(keys are not counted per slot)");
 		return 0;
 	}
-	unk_sub(c);                            /* S165 */
+	unk_sub(c);
 	resp_err(c->out, "unsupported CLUSTER subcommand");
 	return 0;
 }

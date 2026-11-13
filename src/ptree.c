@@ -3,9 +3,7 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * ptree.c - the native door's value codec (task S317).  See ptree.h.
- */
+/* ptree.c - the native door's value codec.  See ptree.h. */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -699,9 +697,8 @@ static int skip_tok(const struct pc_jtok *t, int ntok, int i)
 	return j;
 }
 
-/* a string token as a 'b' item, unescaped straight into the writer's
- * buffer (the escaped span is never shorter than the bytes); @is_key
- * counts it as a map key */
+/* a string token as a 'b' item, unescaped straight into the writer's buffer
+ * (the escaped span is never shorter); @is_key counts it as a map key */
 static int put_str(struct pc_tw *w, const char *json, const struct pc_jtok *k,
 		int is_key, const char **err)
 {

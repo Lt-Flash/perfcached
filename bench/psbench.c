@@ -1,40 +1,5 @@
-/*
- * psbench - the pub/sub fan-out bench (PS7).
- *
- * Why this exists.  natbench measures request/response: one reply per
- * request, so the client's read side is bounded by what it asked for.
- * Fan-out inverts that - one publish becomes N deliveries - so the
- * load generator is the first thing to saturate, and a bench that does
- * not say so reports the CLIENT's ceiling as the server's.  This one
- * therefore reports its own CPU, counts what every subscriber received
- * separately from what was published, and refuses to call anything a
- * loss unless it can name the expectation it fell short of.
- *
- * Two modes, so the publisher and the subscribers can sit on different
- * hosts (and off the servers' hosts):
- *
- *   psbench sub <host> <port> <secret|-> <channel> <conns> <threads> <secs> [pattern 0|1]
- *   psbench pub <host> <port> <secret|-> <channel> <conns> <threads> <secs> <valsize> [rate/s]
- *
- * Both drive libperfd's async surface: one epoll per thread over that
- * thread's handles, no blocking call on a path that must keep reading.
- * The publishes go through perfd_submit's JSON edge (params text in,
- * the reply rendered back - that conversion is part of what this
- * client pays; the payload is spliced into the params unescaped, so it
- * must not contain a quote); deliveries reach the notify hook rendered
- * from the NOTIFY tree.  A subscriber submits one subscribe and then
- * only reads; a publisher keeps <depth> publishes in flight per
- * connection, or paces to <rate> when one is given.
- *
- * What it prints, and what each number means:
- *   published/s      publishes the servers ACCEPTED (replies counted)
- *   receivers/publish  the local receiver count the node answered with
- *   delivered/s      messages the subscribers actually read
- *   expected/s       published/s * subscribers-on-this-driver
- *   shortfall        expected - delivered, as a percentage
- *   client CPU       this process's own CPU: over ~1 core per thread
- *                    means the figure above is the DRIVER's ceiling
- */
+/* psbench - pub/sub fan-out bench, `sub` and `pub` modes for separate hosts; it reports its own
+ * CPU, since one publish is N deliveries and the client saturates first.  Payload: no quotes. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -185,19 +150,16 @@ static void *run(void *arg)
 					params, sub_done, c);
 				c->subscribed = -1;      /* submitted */
 			} else if (g_pub) {
-				/* 16 in flight whether or not a rate is set: at
-				 * depth 1 a paced publisher is capped at
-				 * connections / RTT, below the rates it is asked
-				 * for, and would report its own ceiling */
+				/* 16 in flight even when paced: at depth 1 a paced publisher
+				 * caps at connections / RTT and reports its own ceiling */
 				int depth = 16;
 
 				while (c->inflight < depth) {
 					if (g_rate) {
 						double now = now_s();
 
-						/* the handshake ran before the first
-						 * publish; do not burst to catch up for
-						 * it - 50 ms of backlog at most */
+						/* no burst to catch up for the handshake:
+						 * 50 ms of backlog at most */
 						if (next < now - 0.05)
 							next = now - 0.05;
 						if (now < next)
@@ -315,10 +277,8 @@ int main(int argc, char **argv)
 	getrusage(RUSAGE_SELF, &ru);
 	cpu = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 +
 		(double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
-	/* the ACTIVE window - first to last event.  A subscriber that waits
-	 * for the publisher, or outlives it, is idle for part of its run, and
-	 * dividing its CPU by the whole run hid a pegged driver behind a
-	 * comfortable average. */
+	/* the ACTIVE window, first to last event: dividing CPU by the whole run hid a
+	 * pegged driver that waits for or outlives the publisher */
 	act = last > first ? last - first : el;
 	if (act < 0.1)
 		act = el;

@@ -1,9 +1,5 @@
-/*
- * psudptest.c - the life of a UDP push stream (PS5), driven through
- * src/psudp.h exactly as a worker's sweep runs it: probes, expiry, and
- * the two prunes - an ACK that stopped arriving, and one that stopped
- * moving while datagrams kept going out.
- */
+/* psudptest.c - a UDP push stream's life driven through psudp.h as a worker's sweep runs it: probes,
+ * expiry, and the prunes of an ACK that stopped arriving or stopped moving while datagrams went out. */
 #include <stdio.h>
 #include <string.h>
 

@@ -1,20 +1,6 @@
 #!/bin/sh
-# resplistener.sh — the dedicated RESP listener (task S33): a plaintext
-# door for LAN Redis clients that is NARROWER than the native one.
-# Asserted:
-#  - a non-loopback RESP listener REFUSES TO START without resp_allow
-#    (the dialect has no handshake, so the allow-list is the door);
-#  - with one, it starts and serves RESP off-box;
-#  - DIALECT PINNING: native binary frames are refused on the RESP
-#    listener - so the native verb surface, admin verbs included, is
-#    unreachable from it - while the native listener is unchanged (its
-#    requests go through test/pcnative.py);
-#  - the allow-list actually rejects a peer outside the CIDR;
-#  - AUTH: NOAUTH before, WRONGPASS on a bad password, OK on the right
-#    one, PING gated too (Redis requirepass behaviour);
-#  - resp_collections scopes which collections a RESP client can see;
-#  - MANY CLIENTS AT ONCE: 200 concurrent connections all serve.
-# Usage: test/resplistener.sh [./perfcached]
+# resplistener.sh - the dedicated RESP listener: no non-loopback start without resp_allow, no native frames,
+# allow-list and AUTH enforced, 200 clients served.  Usage: test/resplistener.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -27,8 +13,7 @@ pass=0 fail=0
 ok()  { pass=$((pass+1)); }
 bad() { fail=$((fail+1)); echo "FAIL: $1"; }
 
-# the host's own LAN address - the listener must be non-loopback for the
-# allow-list rules to apply at all
+# the host's LAN address: the allow-list rules apply only to a non-loopback listener
 LANIP=$(ip -4 -o addr show scope global 2>/dev/null \
 	| awk '{print $4}' | cut -d/ -f1 | head -1)
 [ -n "$LANIP" ] || { echo "no global IPv4 address: skipping"; exit 0; }
@@ -231,7 +216,7 @@ case "$(printf '%s\n' "$OUT" | sed -n 2p)" in
 esac
 stop
 
-# ---- 7. MANY CLIENTS AT ONCE (the point of the task) -----------------
+# ---- 7. many clients at once ------------------------------------------
 mkconf "$D/many.conf" "resp = $LANIP:17102
 resp_allow = $LANNET"
 start "$D/many.conf" || { echo "many cfg did not start"; cat "$D/log"; exit 1; }

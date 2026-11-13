@@ -1,21 +1,6 @@
 #!/bin/sh
-# psnotifytest.sh - the native door's notification is built once per
-# message, and once per message under each pattern, and every subscriber
-# still gets its own.  The body was rebuilt for every subscriber - 45% of
-# the door's CPU delivering to 64 of them - although it depends only on
-# the message and the pattern it matched.  Now the first native
-# subscriber a worker meets builds it and the rest reuse it; this pins
-# what reuse must not change.
-#   - one worker, so every subscriber shares one delivery loop
-#   - on channel t: three native subscribers - two through test/pcnative.py's
-#     line idiom and one reading raw frames, so the NOTIFY type is seen
-#   - on patterns t* and * (line) and t* (raw): each must name ITS
-#     pattern, so a body shared across patterns shows as the wrong one
-#   - payloads: plain, one with quotes and control characters, and binary
-#     (bytes on the wire, read back through surrogateescape, no enc
-#     sibling); then a channel only the patterns match
-#   - RESP subscribers on the same worker still get RESP frames
-# Usage: test/psnotifytest.sh [./perfcached]
+# psnotifytest.sh - the native door's notification is built once per message and pattern, and every
+# native and RESP subscriber still gets its own, naming its pattern.  Usage: test/psnotifytest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -161,6 +146,7 @@ for name, sub in (("line 1", t1), ("line 2", t2)):
 b1.s.settimeout(0.3)
 check(b1.note() is None, "raw on t gets nothing for tx")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

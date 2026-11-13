@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clbulk.c - the bulk plane's framing and batch handoff (M7).  See
- * clbulk.h.  The bodies came out of bulk_io(), bulk_send_stream(),
- * bulk_recv_exact() and run_migration()'s handoff unchanged; what
- * differs is that the queue is reached through a pointer and the
- * "channel busy" case is REPORTED rather than logged here.
- */
+/* clbulk.c - the bulk plane's framing and batch handoff (see clbulk.h); the queue is reached through
+ * a pointer and "channel busy" is REPORTED, not logged here */
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>

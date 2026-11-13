@@ -1,34 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * perfcli — the command-line client (the redis-cli analogue).
- *
- * All communication rides libperfd (lib/perfd.[ch]) - the one client
- * transport, per the 08-26 decree: connection, Noise channel, framing,
- * id-matched replies and error surfacing are the library's; the CLI
- * owns only words -> params, display, and the line editor
- * (cli/lineedit.c, history persisted 0600 in ~/.perfcli_history).
- * Zero dependencies beyond libsodium (which libperfd needs anyway).
- *
- * Modes:
- *   perfcli [opts] <command words...>      one-shot, exit code honest
- *   perfcli [opts] -j '{"method":..,"params":..}'  one raw request
- *   perfcli [opts]                         REPL on a tty, pipe otherwise
- *
- * S317: the wire is binary; JSON is this tool's INPUT SYNTAX and its
- * display.  A word command becomes a params JSON object here, libperfd
- * encodes it to the request tree (a jset/jarrappend `val` travels as
- * one bulk of its JSON text) and renders the reply tree back as JSON
- * for printing.  -j takes the same {"method","params"} object; an id
- * or jsonrpc member in it is ignored.
- *
- * Options: -h host (127.0.0.1)  -p port (6479)  -u /unix.sock
- *          -a secret  -A (prompt, no echo)  [PERFCLI_AUTH env]
- *          -q quiet (result to stdout only, no prompt/banner)
- *
- * Word commands mirror the verb set 1:1; values with spaces take double
- * quotes with backslash escapes.  jset's value argument is RAW JSON.
- */
+/* perfcli - the command-line client (the redis-cli analogue): libperfd is the transport, perfcli
+ * owns words -> params, display and the line editor; JSON is only its input syntax and display */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -122,18 +95,12 @@ static void pretty_print(const char *s, size_t n)
 
 /* ---- request building -------------------------------------------------- */
 
-/*
- * S72: what we dialled with, so a session that outlived its server can
- * be redialled instead of prompting into a corpse.
- */
+/* what we dialled with, so a session that outlived its server can be redialled */
 static const char *g_dial_host, *g_dial_port, *g_dial_unix;
 static perfd_opts *g_dial_opts;
 
-/* Redial once after the connection died.  libperfd deliberately does
- * not reconnect by itself - that is the caller's call - and for an
- * interactive session the caller is us: redis-cli redials on the next
- * command and says so, and anything else leaves a prompt attached to a
- * dead handle.  Returns 1 if a fresh connection is in place. */
+/* redial once after the connection died: libperfd never reconnects by itself, and an
+ * interactive session must not stay attached to a dead handle; 1 = a fresh connection */
 static int redial(void)
 {
 	perfd_t *n;
@@ -153,12 +120,8 @@ static int redial(void)
 	return 1;
 }
 
-/* one round trip via libperfd; prints the result (or the error).
- * Returns 0 on a result, 1 on an error / transport failure. */
-/* S129: the privilege secret this session started with, kept so a
- * REDIAL can raise privilege again.  Without it a reconnect mid-session
- * silently drops the bit and the next DDL is refused with a message
- * about privilege the operator believes they already hold. */
+/* the privilege secret this session started with, so a redial raises privilege again
+ * rather than the next DDL being refused */
 static const char *g_enable_secret;
 
 static int raise_privilege(void)
@@ -181,13 +144,8 @@ static int raise_privilege(void)
 	return ok ? 0 : -1;
 }
 
-/* S233: the verbs a redial must NOT send again.  A connection that
- * failed after the request went out cannot say whether it ran, and these
- * are not safe twice: a second fleetstop is a second stop (seen at F4 of
- * the RV-5 fault run - the reply outwaited the I/O timeout, perfcli
- * redialled and stopped the fleet again), a second create/drop/rename/
- * resize/restore/map/unmap acts on whatever the first one left.  The privileged set
- * of verbs.c, less enable/disable, which only set this session's bit. */
+/* verbs a redial must NOT send again: a request lost with its connection may have run, and
+ * these are not safe twice (the privileged verbs, less enable/disable) */
 static int unsafe_twice(const char *m)
 {
 	static const char *const once[] = { "fleetstop", "create", "drop",
@@ -200,15 +158,12 @@ static int unsafe_twice(const char *m)
 	return 0;
 }
 
-/* S317: a jget answers the document fragment as BYTES of JSON text, and
- * the library'"'"'s JSON edge renders bytes as a string - so the fragment
- * arrives escaped, "value":"{\"a\":1}".  For a reader of perfcli'"'"'s output
- * the document is JSON: put it back raw, as the JSON door used to send it.
- * Only the "value" member moves; anything else is copied as rendered. */
+/* a jget's fragment arrives as JSON text rendered as an escaped string: put it back raw for
+ * the reader - only the "value" member moves, the rest is copied as rendered */
 static char *splice_document(char *res)
 {
 	size_t n = strlen(res);
-	int maxt = (int)(n / 2) + 8, ntok, tv, i;
+	int maxt = (int)(n / 2) + 8, ntok, tv, i, child = 0;
 	struct pc_jtok *t = malloc(sizeof *t * (size_t)maxt);
 	char *doc, *out;
 	struct pc_jw w;
@@ -239,7 +194,9 @@ static char *splice_document(char *res)
 		int tk = i, tval = i + 1;
 
 		if (t[tk].parent != 0)
-			continue;              /* inside a member'"'"'s subtree */
+			continue;              /* inside a member's subtree */
+		if (child++ & 1)
+			continue;              /* a value: the members alternate key, value */
 		if (w.len > 1)
 			pc_jw_lit(&w, ",");
 		pc_jw_raw(&w, res + t[tk].start - 1, (size_t)(t[tk].end - t[tk].start) + 2);
@@ -295,9 +252,8 @@ static int do_command(const char *method, const char *params_json)
 	return 0;
 }
 
-/* a raw {"method":..,"params":..} request (-j / a '{' line): pull the
- * method and the params text out and ride the library like every other
- * command - the library frames and numbers it */
+/* a raw {"method":..,"params":..} request (-j / a '{' line): the method and params text ride
+ * the library like any other command */
 static int raw_command(const char *json)
 {
 	static struct pc_jtok toks[4096];
@@ -386,12 +342,8 @@ static void jw_kv_ll(struct pc_jw *w, const char *k, long long v)
 	pc_jw_i64(w, v);
 }
 
-/* a string field's value in a flat JSON reply ({"id":"..."}), or "" */
-
-/* UP6n: upgrade-stage <tarball> <version> - the tarball and, beside it,
- * <tarball>.sig (64 raw bytes, or 128 hex characters) to this node's
- * upgrade/staged/, in order, 192 KB at a time.  The node verifies the
- * whole file at the end; this only says how far it got.  Needs -E. */
+/* upgrade-stage: the tarball and <tarball>.sig go to the node's upgrade/staged/ 192 KB at a
+ * time; the node verifies the whole file, this only reports progress */
 static void stage_progress(void *ctx, size_t done, size_t total)
 {
 	(void)ctx;
@@ -453,11 +405,8 @@ static void staged_versions(const char *res, char *out, size_t cap)
 	}
 }
 
-/* UP8 (12ne), the first piece: fleet-status - this node and every member
- * it knows, each dialled, as the upgrade leader will see them: version,
- * the state this handle sees, the install mode (PD-9) and the builds
- * staged there.  Unprivileged.  Needs a handle that learned the fleet
- * (the default; -u on a unix socket learns too). */
+/* fleet-status: this node and every member it knows, each dialled as the upgrade leader sees
+ * it; unprivileged, needs a handle that learned the fleet (the default; -u learns too) */
 static int fleet_status_cmd(void)
 {
 	int n = perfd_member_count(g_p), i, bad = 0;
@@ -515,7 +464,7 @@ static int fleet_status_cmd(void)
 	return bad ? 1 : 0;
 }
 
-#include "perfcli-upgrade.inc"          /* UP7a: perfcli upgrade - the roll driver */
+#include "perfcli-upgrade.inc"          /* perfcli upgrade - the roll driver */
 
 static int upgrade_stage_cmd(int argc, char **argv)
 {
@@ -527,9 +476,8 @@ static int upgrade_stage_cmd(int argc, char **argv)
 		fprintf(stderr, "usage: upgrade-stage <tarball> <version>\n");
 		return 2;
 	}
-	/* S411: the staging is libperfd's (perfd_upgrade_stage_file); what is
-	 * perfcli's is the warning about an unsigned artifact, said before
-	 * the bytes go */
+	/* the staging is libperfd's (perfd_upgrade_stage_file); perfcli warns about an
+	 * unsigned artifact before the bytes go */
 	snprintf(sp, sizeof sp, "%s.sig", argv[1]);
 	if (access(sp, R_OK) != 0)
 		fprintf(stderr, "perfcli: no %s - sending it UNSIGNED (the node "
@@ -561,15 +509,14 @@ static int local_cmd(int argc, char **argv)
 	return 1;
 }
 
-/* build the PARAMS object ("{...}") for a word command; the method is
- * argv[0] and rides perfd_command.  Returns the params length, 0 for a
- * command with no params, -1 on usage error, -2 handled locally. */
-/* S123: the command word as typed, the method as the daemon spells it */
+/* the command word as typed, the method as the daemon spells it */
 static const char *canon(const char *m)
 {
 	return strcmp(m, "reset-stats") ? m : "reset_stats";
 }
 
+/* the PARAMS object ("{...}") for a word command, the method being argv[0]: its length,
+ * 0 for no params, -1 on a usage error, -2 handled locally */
 static int build(char *out, size_t cap, int argc, char **argv)
 {
 	struct pc_jw w;
@@ -588,28 +535,28 @@ static int build(char *out, size_t cap, int argc, char **argv)
 	    !strcmp(m, "collections") || !strcmp(m, "reset_stats") ||
 	    !strcmp(m, "reset-stats") || !strcmp(m, "mailtest") ||
 	    !strcmp(m, "upgrade_status") || !strcmp(m, "reload") ||
-	    !strcmp(m, "maps") ||              /* S432 */
-	    !strcmp(m, "master_auto")) {       /* CH-9 */
+	    !strcmp(m, "maps") ||
+	    !strcmp(m, "master_auto")) {
 		return 0;                      /* no params */
-	} else if (!strcmp(m, "updrain") ||    /* S331: needs privilege */
-	    !strcmp(m, "upfill")) {            /* AR4 */
+	} else if (!strcmp(m, "updrain") ||    /* needs privilege */
+	    !strcmp(m, "upfill")) {
 		NEED(1);
 		P_OPEN();
 		if (argc > 2 && !strcmp(argv[2], "stop"))
 			pc_jw_lit(&w, ",\"stop\":true");
 		else if (argc > 2 && !strcmp(m, "upfill") &&
-		    !strcmp(argv[2], "check"))     /* S400 */
+		    !strcmp(argv[2], "check"))
 			pc_jw_lit(&w, ",\"check\":true");
 		pc_jw_lit(&w, "}");
-	} else if (!strcmp(m, "fleetstop")) {  /* S222: needs privilege */
+	} else if (!strcmp(m, "fleetstop")) {  /* needs privilege */
 		if (argc < 2)
 			return 0;
-		/* S233: how long to wait for the peers, ms (the daemon
+		/* how long to wait for the peers, ms (the daemon
 		 * clamps it to 1-120 s) */
 		pc_jw_lit(&w, "{\"timeout_ms\":");
 		pc_jw_i64(&w, atoll(argv[1]));
 		pc_jw_lit(&w, "}");
-	} else if (!strcmp(m, "master_prefer")) {   /* CH-9 */
+	} else if (!strcmp(m, "master_prefer")) {
 		NEED(1);
 		pc_jw_lit(&w, "{\"node\":");
 		pc_jw_i64(&w, atoll(argv[1]));
@@ -621,7 +568,7 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		pc_jw_i64(&w, atoll(argv[1]));
 		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "create")) {
-		/* S69: create <col> [buckets_log2] */
+		/* create <col> [buckets_log2] */
 		NEED(1);
 		pc_jw_lit(&w, "{\"col\":");
 		pc_jw_str(&w, argv[1], strlen(argv[1]));
@@ -631,7 +578,7 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		}
 		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "drop")) {
-		/* S69: drop <col> [force] */
+		/* drop <col> [force] */
 		NEED(1);
 		pc_jw_lit(&w, "{\"col\":");
 		pc_jw_str(&w, argv[1], strlen(argv[1]));
@@ -640,7 +587,7 @@ static int build(char *out, size_t cap, int argc, char **argv)
 			pc_jw_lit(&w, ",\"force\":true");
 		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "rename")) {
-		/* S69: rename <col> <to> */
+		/* rename <col> <to> */
 		NEED(2);
 		pc_jw_lit(&w, "{\"col\":");
 		pc_jw_str(&w, argv[1], strlen(argv[1]));
@@ -648,9 +595,8 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		pc_jw_str(&w, argv[2], strlen(argv[2]));
 		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "map") || !strcmp(m, "unmap")) {
-		/* S432: map <index> <col> / unmap <index> - the index a whole
-		 * decimal, so `map prod-redis 0` (the words swapped) is refused
-		 * here rather than sent as index 0 */
+		/* map <index> <col> / unmap <index>: the index a whole decimal, so swapped
+		 * words (`map mycol 0`) are refused here rather than sent as index 0 */
 		const char *d;
 
 		NEED(!strcmp(m, "map") ? 2 : 1);
@@ -666,7 +612,7 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		}
 		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "autoscale")) {
-		/* S239: autoscale <col> <auto|floor|warn|off> */
+		/* autoscale <col> <auto|floor|warn|off> */
 		NEED(2);
 		pc_jw_lit(&w, "{\"col\":");
 		pc_jw_str(&w, argv[1], strlen(argv[1]));
@@ -674,14 +620,14 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		pc_jw_str(&w, argv[2], strlen(argv[2]));
 		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "resize")) {
-		/* S69: resize <col> <buckets_log2> */
+		/* resize <col> <buckets_log2> */
 		NEED(2);
 		pc_jw_lit(&w, "{\"col\":");
 		pc_jw_str(&w, argv[1], strlen(argv[1]));
 		pc_jw_lit(&w, ",\"buckets_log2\":");
 		pc_jw_i64(&w, atoll(argv[2]));
 		pc_jw_lit(&w, "}");
-	} else if (!strcmp(m, "name")) {                 /* S420 */
+	} else if (!strcmp(m, "name")) {
 		NEED(1);
 		pc_jw_lit(&w, "{\"name\":");
 		pc_jw_str(&w, argv[1], strlen(argv[1]));
@@ -718,12 +664,8 @@ static int build(char *out, size_t cap, int argc, char **argv)
 			jw_kv_ll(&w, "ttl", atoll(argv[4]));
 		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "keys")) {
-		/* S88: the collection is a glob and may be absent - "keys" and
-		 * "keys *" list every collection, grouped; the daemon bounds it.
-		 * There is no cursor here on purpose - `scan` is the cursored
-		 * walk.  The limit is PER COLLECTION, so every matched
-		 * collection appears; ones that hit the cap are named in the
-		 * reply's truncated_collections. */
+		/* the collection is a glob, absent = every collection, grouped; no cursor on
+		 * purpose (`scan` is the cursored walk); the limit is PER COLLECTION */
 		if (argc < 2) {
 			pc_jw_lit(&w, "{\"col\":\"*\"}");
 		} else {
@@ -802,6 +744,7 @@ static int build(char *out, size_t cap, int argc, char **argv)
 	} else if (!strcmp(m, "help")) {
 		printf("commands:\n"
 		  "  ping | stats [col] | save | sync | load | reset-stats\n"
+		  "  name <name> - this connection's name on the node (clients)\n"
 		  "  create <col> [buckets_log2] | drop <col> [force]\n"
 		  "  resize <col> <buckets_log2> | rename <col> <to>\n"
 	  "  map <index> <col> | unmap <index> | maps - the RESP door's DB\n"
@@ -831,15 +774,17 @@ static int build(char *out, size_t cap, int argc, char **argv)
 	  "  upgrade_status - the builds staged here, an upload in progress\n"
 	  "  upgrade plan <tarball> version=<v> [switch_cmd=<prog>] [journal=<f>]\n"
 	  "      [ready_s=<n>] [gate_s=<n>]; then upgrade start|resume|status|\n"
-	  "      abort|rollback [journal=<f>] - the roll driver (DESIGN 12ns):\n"
+	  "      abort|rollback [journal=<f>] - the roll driver, one-shot only:\n"
 	  "      stages the build on every member, then one node at a time,\n"
 	  "      members first and the master last, with the gates between;\n"
-	  "      stops at the first failure and reverts that node; needs -E\n"
+	  "      stops at the first failure and reverts that node;\n"
+	  "      start/resume/rollback need -E\n"
 	  "  upgrade commit epoch=<n> - the fleet's wire epoch, raised on the\n"
-	  "      master once every member speaks <n> (12nu); needs -E\n"
+	  "      master once every member speaks <n>; needs -E\n"
 	  "  upgrade-revert [force] - the helper switches this node back to the\n"
 	  "      prefix it kept before its last switch (upgrade_status.previous);\n"
-	  "      needs -E; force skips the running-build and helper checks\n"
+	  "      needs -E, one-shot only; force skips the running-build and\n"
+	  "      helper checks\n"
 	  "  fleet-status - this node and every member, each dialled: version,\n"
 	  "      state, install mode (package/prefix/local), the builds staged\n"
 	  "  mailtest - send one test mail through this node's [mail] and\n"
@@ -887,10 +832,7 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		fprintf(stderr, "perfcli: request too large\n");
 		return -1;
 	}
-	out[w.len] = 0;                    /* perfd_command takes a C string
-	                                    * - an unterminated params once
-	                                    * dragged the PREVIOUS command's
-	                                    * tail into the request */
+	out[w.len] = 0;                    /* perfd_command takes a C string */
 	return (int)w.len;
 
 usage:
@@ -921,13 +863,14 @@ static char *prompt_secret(void)
 	return buf[0] ? buf : NULL;
 }
 
-/* ---- S71: usage, and a default target that is not a guess ------------- */
+/* ---- usage, and a default target that is not a guess ------------------ */
 
 static void usage(FILE *f)
 {
 	fprintf(f,
-		"usage: perfcli [-h host] [-p port] [-u /unix.sock] [-a secret | -A]\n"
-		"               [-q] [-P] [-j '{\"method\":..,\"params\":..}' | <command words...>]\n"
+		"usage: perfcli [-h host] [-p port] [-u /unix.sock] [-a secret | -A] [-N name]\n"
+		"               [-E secret | -e] [--encrypt] [-q] [-P]\n"
+		"               [-j '{\"method\":..,\"params\":..}' | <command words...>]\n"
 		"  -h host    daemon address (default: the local daemon's config, else 127.0.0.1)\n"
 		"  -p port    daemon port (default 6479)\n"
 		"  -u path    unix socket instead of tcp\n"
@@ -945,22 +888,20 @@ static void usage(FILE *f)
 		"  -j json    send one raw {\"method\":..,\"params\":..} request\n"
 		"  -V         version\n"
 		"options go BEFORE the command; after it they are the command's arguments.\n"
-		"environment: PERFCLI_AUTH (secret), PERFCLI_ENCRYPT (--encrypt), PERFCACHED_CONF (config to read the\n"
-		"target and secret from; also tried: /etc/perfcached/perfcached.conf,\n"
+		"environment: PERFCLI_AUTH (secret), PERFCLI_ENABLE (-E), PERFCLI_ENCRYPT\n"
+		"(--encrypt), PERFCACHED_CONF (config to read the target and secret from;\n"
+		"also tried: /etc/perfcached/perfcached.conf,\n"
 		"/opt/perfcached/etc/perfcached.conf, /etc/perfcached.conf)\n");
 }
 
-/* With no target given, a deployed daemon is usually right here and bound
- * to the host's own address, not loopback - so bare `perfcli` on the very
- * node running perfcached could not connect.  The config it runs from
- * says where it listens and what the client secret is; read it. */
+/* with no target, the daemon here usually binds the host's own address, not loopback: the
+ * config it runs from says where it listens and what the client secret is */
 static char cf_host[256], cf_port[16], cf_secret[256], cf_path[512];
 
 static int local_defaults(const char **host, const char **port,
 		const char **secret)
 {
-	/* S339: /etc/perfcached.conf too - where a release tarball's install
-	 * (PROD) keeps it; perfcli found none there and dialled in the clear */
+	/* /etc/perfcached.conf too - where a release tarball's install keeps it */
 	static const char *cands[] = { NULL, "/etc/perfcached/perfcached.conf",
 		"/opt/perfcached/etc/perfcached.conf", "/etc/perfcached.conf" };
 	char line[1024], sect[64] = "";
@@ -1000,14 +941,21 @@ static int local_defaults(const char **host, const char **port,
 		while (*v == ' ' || *v == '\t')
 			v++;
 		v[strcspn(v, "\r\n")] = 0;
+		if (*v == '"' && (e = strrchr(v + 1, '"')) != NULL) {
+			*e = 0;                /* as the daemon reads it: quotes keep a '#' */
+			v++;
+		} else {
+			v[strcspn(v, "#")] = 0;
+			for (e = v + strlen(v); e > v && (e[-1] == ' ' || e[-1] == '\t'); )
+				*--e = 0;
+		}
 		if (!strcmp(sect, "listen") && !strcmp(s, "tcp") && !cf_host[0]) {
 			char h[256];
 			int pn;
 
 			if (pc_hostport_split(v, h, sizeof h, &pn) != 0)
-				continue;               /* IP6-1: the one parser */
-			/* a wildcard bind is reachable on loopback (IP6-2:
-			 * [::] on ::1) */
+				continue;
+			/* a wildcard bind is reachable on loopback ([::] on ::1) */
 			snprintf(cf_host, sizeof cf_host, "%s",
 				!strcmp(h, "0.0.0.0") ? "127.0.0.1" :
 				!strcmp(h, "::") ? "::1" : h);
@@ -1031,7 +979,7 @@ int main(int argc, char **argv)
 {
 	const char *host = "127.0.0.1", *port = "6479", *unixp = NULL;
 	const char *secret = getenv("PERFCLI_AUTH"), *rawjson = NULL;
-	const char *conn_name = NULL;          /* S420: -N */
+	const char *conn_name = NULL;          /* -N */
 	const char *enable_secret = NULL;
 	int prompt_enable = 0, encrypt = getenv("PERFCLI_ENCRYPT") != NULL;
 	char req[REQ_CAP];
@@ -1041,9 +989,8 @@ int main(int argc, char **argv)
 		const char *a = argv[i];
 		int last = i + 1 >= argc;
 
-		/* S71: -h has been the HOST flag since day one, and it is also
-		 * the first thing anyone types for help - so -h with nothing
-		 * after it, or with another option after it, IS help */
+		/* -h is the HOST flag and also the first thing anyone types for help: -h with
+		 * nothing after it, or with another option after it, IS help */
 		if (!strcmp(a, "--help") || !strcmp(a, "-?") ||
 		    (!strcmp(a, "-h") && (last || argv[i + 1][0] == '-'))) {
 			usage(stdout);
@@ -1061,13 +1008,10 @@ int main(int argc, char **argv)
 		} else if (!strcmp(a, "-a"))
 			secret = argv[++i];
 		else if (!strcmp(a, "-N"))
-			conn_name = argv[++i];           /* S420 */
+			conn_name = argv[++i];
 		else if (!strcmp(a, "-E")) {
-			/* S129: raise privilege on THIS connection right after
-			 * the handshake.  It has to happen on the same link -
-			 * the bit dies with the connection, so a separate
-			 * `perfcli enable ...` invocation cannot help a
-			 * one-shot `perfcli resize ...`. */
+			/* raise privilege on THIS connection after the handshake: the bit dies
+			 * with it, so a separate `perfcli enable` cannot help a one-shot */
 			if (last) {
 				fprintf(stderr, "perfcli: -E needs a value "
 					"(try --help)\n");
@@ -1077,7 +1021,7 @@ int main(int argc, char **argv)
 		} else if (!strcmp(a, "-e"))
 			prompt_enable = 1;
 		else if (!strcmp(a, "--encrypt"))
-			encrypt = 1;                     /* S468 */
+			encrypt = 1;
 		else if (!strcmp(a, "-A"))
 			prompt_auth = 1;
 		else if (!strcmp(a, "-j"))
@@ -1091,16 +1035,13 @@ int main(int argc, char **argv)
 				perfd_version());
 			return 0;
 		} else if (a[0] == '-' && a[1]) {
-			/* S71: a typo used to be ignored and the client dialled
-			 * anyway - a wrong invocation behaved like a right one */
 			fprintf(stderr, "perfcli: unknown option '%s' (try --help)\n", a);
 			return 2;
 		} else
 			break;
 	}
-	/* S71: options after the command are the command's ARGUMENTS -
-	 * `stats -a secret` set no secret and was dropped unauthenticated,
-	 * answering "connection closed".  Say what happened to the word. */
+	/* options after the command are the command's ARGUMENTS (`stats -a secret` sets
+	 * no secret): say what happened to the word */
 	{
 		int k;
 
@@ -1124,10 +1065,8 @@ int main(int argc, char **argv)
 		secret = prompt_secret();
 	if (prompt_enable)
 		enable_secret = prompt_secret();
-	/* S129: the privilege secret is NOT the app password.  Env is
-	 * PERFCLI_ENABLE, deliberately distinct from PERFCLI_AUTH - an
-	 * operator whose shell exports the application's client secret
-	 * must not thereby hold DDL privilege. */
+	/* the privilege secret is NOT the app password: PERFCLI_ENABLE, distinct from
+	 * PERFCLI_AUTH, so a shell exporting the client secret holds no DDL privilege */
 	if (!enable_secret)
 		enable_secret = getenv("PERFCLI_ENABLE");
 	{
@@ -1138,28 +1077,22 @@ int main(int argc, char **argv)
 
 		secrets[0] = secret; secrets[1] = NULL;
 		o.io_timeout_ms = 30000;
-		/* S233: a fleet stop answers only once its peers have gone,
-		 * up to its timeout_ms (30 s by default, 120 s at most) - so a
-		 * 30 s read timeout expired just before the answer whenever a
-		 * peer did not go.  One-shot only: an interactive session
-		 * keeps the short timeout, and unsafe_twice() stops it from
-		 * sending the stop again. */
+		/* a fleet stop answers once its peers have gone, up to its timeout_ms (120 s at
+		 * most); one-shot only - unsafe_twice() keeps a session from resending it */
 		if (i < argc && !strcmp(argv[i], "fleetstop"))
 			o.io_timeout_ms = 125000;
-		/* S352: a mail test answers once the SMTP server has, up to
+		/* a mail test answers once the SMTP server has, up to
 		 * [mail] timeout_s (300 s at most) plus 5 */
 		if (i < argc && !strcmp(argv[i], "mailtest"))
 			o.io_timeout_ms = 310000;
-		/* 12nw: a reload of client secrets runs an Argon2id derivation each */
+		/* a reload of client secrets runs an Argon2id derivation each */
 		if (i < argc && !strcmp(argv[i], "reload"))
 			o.io_timeout_ms = 60000;
 		if (secret)
 			o.secrets = secrets;
-		/* S468: the enable secret never rides a plaintext connection */
+		/* the enable secret never rides a plaintext connection */
 		o.encrypt = encrypt || enable_secret;
-		/* S420: the connection's name on the node - perfcli@<host>
-		 * unless -N says otherwise; it is what the node's enable, sweep
-		 * and reset log lines carry */
+		/* the connection's name in the node's enable, sweep and reset log lines */
 		if (!conn_name) {
 			static char nm[128];
 			char hn[96] = "host";
@@ -1171,9 +1104,11 @@ int main(int argc, char **argv)
 			conn_name = nm;
 		}
 		o.name = conn_name;
+		/* -h/-p or -u name a node - a call goes there, and its answer is the answer */
+		o.pin = 1;
 		g_dial_host = host; g_dial_port = port; g_dial_unix = unixp;
 		g_dial_opts = &o;
-		/* S457: an abort is a file beside the journal - no connection, so
+		/* an abort is a file beside the journal - no connection, so
 		 * it still works while the seed is the node being switched */
 		if (i + 1 < argc && !strcmp(argv[i], "upgrade") &&
 		        !strcmp(argv[i + 1], "abort"))
@@ -1181,8 +1116,8 @@ int main(int argc, char **argv)
 		g_p = unixp ? perfd_connect_unix(unixp, &o)
 		            : perfd_connect(host, atoi(port), &o);
 		if (!g_p) {
-			/* S71: name what was tried - "Connection refused" alone
-			 * sent an operator to the wrong subnet for an hour */
+			/* name what was tried: "Connection refused" alone
+			 * does not say where */
 			if (unixp)
 				fprintf(stderr, "perfcli: %s (%s)\n", perfd_error(NULL),
 					unixp);
@@ -1204,12 +1139,10 @@ int main(int argc, char **argv)
 					"loopback): drop -a\n");
 			return 2;
 		}
-		g_encrypted = !secret ? 0 : o.encrypt ? 1 : 2;   /* S468 */
+		g_encrypted = !secret ? 0 : o.encrypt ? 1 : 2;
 	}
-	/* S71: prove the session before announcing it.  With no secret on an
-	 * encrypted door the TCP connect succeeds and the daemon drops the
-	 * connection at the first request: the banner used to say the session
-	 * was up and the first command answered "connection closed". */
+	/* prove the session before announcing it: with no secret on an encrypted door the
+	 * connect succeeds and the daemon drops the connection at the first request */
 	if (perfd_ping(g_p) != 0) {
 		if (!secret)
 			fprintf(stderr, "perfcli: the daemon closed the connection on "
@@ -1239,13 +1172,13 @@ int main(int argc, char **argv)
 	if (rawjson)
 		return raw_command(rawjson) ? 1 : 0;
 
-	if (i < argc && !strcmp(argv[i], "upgrade-stage"))      /* UP6n */
+	if (i < argc && !strcmp(argv[i], "upgrade-stage"))
 		return upgrade_stage_cmd(argc - i, argv + i);
-	if (i < argc && !strcmp(argv[i], "fleet-status"))       /* UP8 */
+	if (i < argc && !strcmp(argv[i], "fleet-status"))
 		return fleet_status_cmd();
-	if (i < argc && !strcmp(argv[i], "upgrade"))           /* UP7a: the roll driver */
+	if (i < argc && !strcmp(argv[i], "upgrade"))           /* the roll driver */
 		return upgrade_cmd(argc - i - 1, argv + i + 1);
-	if (i < argc && !strcmp(argv[i], "upgrade-revert")) {    /* UP7b */
+	if (i < argc && !strcmp(argv[i], "upgrade-revert")) {
 		int force = i + 1 < argc && !strcmp(argv[i + 1], "force");
 		char *r = perfd_upgrade_revert(g_p, force);
 
@@ -1267,9 +1200,8 @@ int main(int argc, char **argv)
 		return do_command(canon(argv[i]), n ? req : NULL) ? 1 : 0;
 	}
 
-	/* REPL / pipe: one command per line.  On a tty the in-house line
-	 * editor supplies arrows + persisted history; pipes read plain
-	 * lines and never touch the terminal. */
+	/* REPL / pipe: one command per line; a tty gets the line editor and history,
+	 * a pipe reads plain lines and never touches the terminal */
 	{
 		static char pline[REQ_CAP];
 		char histpath[512];
@@ -1313,15 +1245,15 @@ int main(int argc, char **argv)
 			while (*s == ' ' || *s == '\t')
 				s++;
 			if (!strcmp(s, "exit") || !strcmp(s, "quit"))
-				break;                 /* S88: the way out everyone types */
+				break;                 /* the way out everyone types */
 			if (*s == '{') {           /* raw JSON passthrough */
 				rc |= raw_command(s);
 			} else if (*s && *s != '#') {
 				wc = split_words(s, wv, 512);
 				if (wc > 0 && !strcmp(wv[0], "fleet-status")) {
-					rc |= fleet_status_cmd();          /* UP8 */
+					rc |= fleet_status_cmd();
 				} else if (wc > 0 && !strcmp(wv[0], "upgrade-stage")) {
-					rc |= upgrade_stage_cmd(wc, wv);   /* UP6n */
+					rc |= upgrade_stage_cmd(wc, wv);
 				} else if (wc > 0 && !local_cmd(wc, wv)) {
 					n = build(req, sizeof req, wc, wv);
 					if (n >= 0)

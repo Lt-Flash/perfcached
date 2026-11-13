@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* Shim for OpenSIPS ipc.h — exactly one consumer: the arena's hoard
- * flush broadcast.  Runs inline on the caller until the daemon registers
- * a real all-threads broadcaster (compat_set_broadcast, task S6). */
+/* Shim for the vendored core's ipc.h, used only by the arena's hoard flush broadcast; runs
+ * inline on the caller until the daemon registers an all-threads one (compat_set_broadcast). */
 #ifndef PC_COMPAT_IPC_H
 #define PC_COMPAT_IPC_H
 

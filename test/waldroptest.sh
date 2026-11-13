@@ -1,36 +1,6 @@
 #!/bin/sh
-# waldroptest.sh — fsync = always must not silently lose acknowledged writes.
-#
-# THE BUG (measured 2026-08-29, build 40f907f): fsync = always makes the
-# pump call fdatasync once per drained batch.  On ms-class storage that
-# window is long enough for the per-writer ring to fill, and a full ring
-# DROPS the record - `r->dropped++; /* NEVER block a worker */`.  The
-# client is told the write succeeded, the record never reaches the WAL,
-# and it is gone after a restart.  Six trials lost 30-2601 of 20000,
-# while fsync = no and fsync = everysec lost nothing in six trials each -
-# the most durable setting was the only lossy one.
-#
-# The fix has three independent parts and this test covers all three:
-#   1. the probe derives the ring depth fsync=always needs on THIS device
-#   2. the daemon applies it unless the operator pinned ring_kb
-#   3. a drop is shouted, not merely counted
-#
-# WHICH ARMS ACTUALLY CATCH A REGRESSION.  Arm 1 (defaults must not drop)
-# is an end-to-end sanity check and NOT a reliable detector: proven
-# fail-first against 40f907f, it PASSED there - the stock 1 MB ring is a
-# coin flip on this device (six trials dropped 30-2601, and some dropped
-# nothing).  The load-bearing arms are 2 (the depth was derived and
-# applied) and 3 (a forced drop is shouted); both failed against 40f907f,
-# arm 3 with 14220 of 20000 acknowledged writes lost in silence.  If this
-# test ever needs tightening, tighten those two - do not try to make
-# arm 1 deterministic by piling on load.
-#
-# S456 (v0.7.3-rc14, GitHub: 1814 of 20000 dropped on an NVMe the probe
-# called fast): under fsync = always a full ring now WAITS for the pump.
-# Arm 5 is its deterministic check - the shim slows every WAL write, so
-# the ring fills on any runner, and before S456 that fill dropped.
-#
-# usage: test/waldroptest.sh [./perfcached] [./pcbench] [./perfcli] [./syncfailshim.so]
+# waldroptest.sh - the WAL ring under slow fsync must not silently lose acknowledged writes: the probe
+# sizes it, ring_kb wins, the receipt owns its gaps, and a full ring waits under always and everysec.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -42,9 +12,8 @@ case "$SHIM" in /*) ;; *) SHIM="$PWD/$SHIM";; esac
 # a dynamic sanitizer runtime comes first in the preload list (healtest)
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 PRELOAD="${SANRT:+$SANRT }$SHIM"
-# per-run by default; the override stays so a human can keep the tree.
-# A fixed default collides under CI's concurrent=2 - see clitest and
-# v0.3.7-rc3.
+# per-run by default (a fixed default collides under concurrent CI jobs); the override lets a human
+# keep the tree
 D=${WALDROP_DIR:-$(mktemp -d /var/tmp/waldrop.XXXXXX)}
 KEYS=${KEYS:-20000}
 PORT=${PORT:-17831}
@@ -52,13 +21,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
 
-# The per-run tree is removed on the way out - a WAL is provisioned in
-# it, 65 MB a run, and for a week nothing took it away: 43 runs of this
-# suite and as many of its sibling left 5.4 GB in /var/tmp on the CI
-# runner, the disk filled, and v0.4.0-rc24's check and check-asan went
-# red in statedirtest (a default-sized WAL could not be provisioned)
-# over code that was green everywhere else.  A tree the caller named
-# (WALDROP_DIR) is the caller's to keep.
+# the per-run tree (a 65 MB provisioned WAL each run) is removed on exit; a tree the caller named
+# (WALDROP_DIR) is the caller's to keep
 [ -n "${WALDROP_DIR:-}" ] || trap 'rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM
 rm -rf "$D"; mkdir -p "$D/wal"
@@ -115,8 +79,8 @@ run() { # run <probe> <extra> -> echoes "appended dropped entries"
 
 echo "=== waldroptest ($REV, $KEYS keys) ==="
 
-# 1. THE REGRESSION ITSELF.  With the probe allowed to run, fsync=always
-#    must lose nothing - whatever this device's fsync latency is.
+# 1. with the probe allowed to run, fsync=always loses nothing - a sanity check, not a reliable
+#    detector (the stock ring is a coin flip here): tighten the later arms, not this one
 set -- $(run auto "")
 echo "  probed:      appended=$1 dropped=$2 entries=$3"
 if [ "$3" = "$KEYS" ]; then ok; else bad "fill did not accept $KEYS (entries=$3)"; fi
@@ -141,16 +105,13 @@ else
 	fi
 fi
 
-# 3. AN EXPLICIT ring_kb STILL WINS - the operator is not overridden.
+# 3. AN EXPLICIT ring_kb STILL WINS - the configured value is not overridden.
 set -- $(run auto "ring_kb = 64")
 if grep -q "ring .* -> .* KB per writer" "$D/n1.log"; then
 	bad "an explicit ring_kb = 64 was overridden by the probe"
 else ok; fi
-#    and with a ring that small on slow storage the drop must be SHOUTED,
-#    not merely counted.  (If this device is fast enough not to drop even
-#    at 64 KB, there is nothing to shout about and the arm is skipped.)
-#    Since S456 fsync = always waits instead, so this is n/a; healtest
-#    shouts under everysec.
+#    and with a ring that small a drop would be SHOUTED, but fsync = always now waits instead, so
+#    this is n/a (healtest shouts under everysec)
 echo "  pinned:      appended=$1 dropped=$2 entries=$3"
 if [ "$2" -gt 0 ] 2>/dev/null; then
 	if grep -q "DROPPED .* acknowledged write" "$D/n1.log"; then
@@ -162,13 +123,8 @@ else
 	ok; echo "  shouted:    n/a (nothing dropped even at ring_kb = 64)"
 fi
 
-# 4. S58: THE BARRIER'S RECEIPT MUST OWN ITS GAPS.  A ring-full drop
-#    discards a record that already holds a sequence number, so
-#    synced_seq still reaches last_seq and {"synced":true,"seq":N}
-#    names records the WAL never carried (measured: 20000 writes,
-#    seq 20000, 1223 dropped, 18777 replayed after kill -9).  The
-#    reply carries the drop count so a caller can tell a full barrier
-#    from a partial one.
+# 4. THE BARRIER'S RECEIPT MUST OWN ITS GAPS: a ring-full drop discards a record that already holds
+#    a sequence number, so the reply carries the drop count to tell a full barrier from a partial one
 rm -rf "$D/wal"; mkdir -p "$D/wal"
 mkcfg auto ""
 "$BIN" -f "$D/n1.conf" > "$D/n4.log" 2>&1 &
@@ -202,10 +158,8 @@ else
 	     tell a full barrier from one covering survivors only"
 fi
 
-# 5. S456: UNDER fsync = always A FULL RING WAITS FOR THE PUMP.  The shim
-#    delays every WAL segment write 100 ms, so the 1 MB ring fills during
-#    the fill wherever this runs; nothing may be dropped, all of it must
-#    reach the WAL, and the waits must be counted (the ring did fill).
+# 5. UNDER fsync = always A FULL RING WAITS FOR THE PUMP: the shim delays every WAL write 100 ms;
+#    nothing may drop, all must reach the WAL, and the waits must be counted
 rm -rf "$D/wal"; mkdir -p "$D/wal"; : > "$D/ctl"; : > "$D/shim.log"
 mkcfg no "ring_kb = 1024"
 PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD" \
@@ -236,11 +190,8 @@ grep -q walslow "$D/shim.log" && ok || bad "5. the shim never slowed a WAL write
 	|| bad "5. fsync = always on a slowed device: appended $1, dropped $2, entries $3 of $KEYS (want all, none dropped)"
 [ "$4" -gt 0 ] 2>/dev/null && ok || bad "5. waits+pauses $4: no writer ever waited (want > 0 - the ring must have filled)"
 
-# 6. S466: UNDER fsync = everysec A FULL RING NO LONGER DROPS EITHER.  The
-#    same slowed device as 5; before S466 everysec dropped and healed here
-#    (19,988 of 20,000 records dropped on 207, ring_kb 16).  Now the writer
-#    waits: its connection is held (writer_pauses), or its write waits in
-#    the ring (ring_waits) - one or the other must have happened.
+# 6. UNDER fsync = everysec A FULL RING DOES NOT DROP EITHER: on the same slowed device the writer
+#    waits, its connection held (writer_pauses) or its write in the ring (ring_waits)
 rm -rf "$D/wal"; mkdir -p "$D/wal"; : > "$D/ctl"; : > "$D/shim.log"
 FSYNC=everysec mkcfg no "ring_kb = 64"
 PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD" \

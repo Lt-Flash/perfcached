@@ -1,31 +1,6 @@
 #!/bin/sh
-# splitkeeptest.sh - S131: the table keeps up with a write burst.
-#
-# The splitter's budget was a flat 128 splits per maintenance tick, once a
-# second, whatever the deficit.  A burst therefore outran it and it never
-# caught up at any useful speed: 600,000 records left a table at load
-# factor 102 needing about nineteen minutes of ticking to reach its target
-# of 4, and everything that would not fit six to a bucket went to the
-# overflow leg - which is one chain per hash bucket under a single lock,
-# and which NEVER drains back into the table.  The budget is now bounded
-# by TIME rather than by a count, so the table grows with the arrivals.
-#
-# The deficit has to be large to tell the two apart: at 41,000 records the
-# old budget reaches load factor 9.4 against the new one's 5.5, which is
-# not a gate.  At 300,000 the old one cannot converge at all.
-#
-# What is asserted is that the table CATCHES UP, not what it looks like at
-# the instant the fill ends.  A snapshot is a function of how fast the
-# client can push relative to the maintenance tick, and that is a property
-# of the machine: the first version of this suite asserted the leg was
-# under half the table, which held on two runners at 37-39% and failed on a
-# faster one at 50.4% - by 0.4% - and failed badly under a sanitizer on a
-# 2-vCPU box at 83%.  The catch-up is not machine-dependent in the same
-# way: the fixed splitter converges in seconds, the old one needs about
-# nineteen minutes, so a 90 s bound separates them by two orders of
-# magnitude.
-#
-# Fail-first on the pre-S131 binary: it never converges inside the bound.
+# splitkeeptest.sh - the splitter's time-bounded budget keeps the table up with a write burst: after
+# 300,000 records it converges on its target load factor within 90 s (a flat budget needs ~19 min).
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -103,11 +78,8 @@ echo "  ..   $ENT entries in $BKT buckets, leg $LEG, fill ${EL}s (${RATE} set/s)
 [ "$ENT" -ge $((N - N / 100)) ] \
 	&& ok "the burst was stored ($ENT of $N)" \
 	|| bad "only $ENT of $N stored"
-# THE property: the table converges on its target load factor once the
-# burst is over.  The old flat budget of 128 splits a tick needs about
-# nineteen minutes from this deficit and so never gets here; the
-# time-sliced one takes seconds.  Reported with the time it took, so a
-# regression that merely slows it down is visible rather than silent.
+# THE property: the table converges on its target load factor once the burst is over; the time it
+# took is reported, so a regression that merely slows it is visible
 WAITED=-1
 i=0
 while [ $i -lt 90 ]; do
@@ -120,9 +92,8 @@ LF10=$(( ENT * 10 / BKT ))
 [ "$WAITED" -ge 0 ] \
 	&& ok "the table caught up in ${WAITED}s: load factor $((LF10/10)).$((LF10%10)) in $BKT buckets, target 4" \
 	|| bad "S131: load factor $((LF10/10)).$((LF10%10)) in $BKT buckets after 90s - the splitter never caught up"
-# the leg is REPORTED, not asserted: how much lands there during the burst
-# is a function of how fast this machine's client outruns the tick, and it
-# never drains afterwards (S134), so it is information, not a property
+# the leg is REPORTED, not asserted: how much lands there depends on how fast this machine's client
+# outruns the tick, and it never drains afterwards
 echo "  ..   $LEG of $ENT records went to the overflow leg during the burst"
 # the maintenance thread is still answering while all this happens: the
 # walk's own cost is published, and a walk that never completed is 0

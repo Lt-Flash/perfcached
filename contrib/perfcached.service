@@ -1,4 +1,4 @@
-# perfcached.service — systemd unit (task S24).
+# perfcached.service — systemd unit.
 #
 # Install:
 #   cp contrib/perfcached.service /etc/systemd/system/
@@ -26,7 +26,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/perfcached -f /etc/perfcached/perfcached.conf
-# 12nw (0.7.1): `systemctl reload perfcached` reads the file again and applies
+# `systemctl reload perfcached` reads the file again and applies
 # what a running daemon can take - the allow-lists, the secrets, log_level,
 # slowlog_usec - or fails, naming every other key that changed, with nothing
 # applied.  -H checks the file first, signals the daemon and waits for its
@@ -58,7 +58,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 # /var/lib/perfcached, created and owned for us - point [wal] dir there
 StateDirectory=perfcached
 StateDirectoryMode=0700
-# S326: the node's identity is derived from the VM's DMI uuid, which is
+# the node's identity is derived from the VM's DMI uuid, which is
 # 0400 root - this daemon is not root.  A root ("+") step copies it into
 # the service's RuntimeDirectory (/run/perfcached), where the daemon
 # reads it as $RUNTIME_DIRECTORY/dmi-product-uuid.  A machine without DMI (an LXC)

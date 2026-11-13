@@ -1,19 +1,6 @@
 #!/bin/sh
-# pullordertest.sh - a replica read in its start window answers each read
-# with that read's reply, while member pushes arrive between them.
-#
-# applythreadstest saw a read on the replica go "backwards" in 3 of about 8
-# CI runs.  It was never data: S462 pushes a member's state as a NOTIFY
-# frame to every native connection, the push arrived between a request and
-# its reply, and the suite's client took it for the reply - every later
-# read then got the reply of the read before (request 2802 answered with
-# 2801's value, 2801 with the id-less push; GitLab 112538, 12 of 12 rounds).
-# Each round is a fresh fleet of two (io_uring and epoll in turn,
-# apply_threads 1 and 4) written through A while a reader on B reads at
-# full speed, every request with its own id: a reply whose id is not its
-# request's, or a value of another key or older than one already read,
-# fails the round.
-# Usage: test/pullordertest.sh [./perfcached] [rounds]
+# pullordertest.sh - a replica read in its start window answers each read with that read's reply
+# while member pushes (NOTIFY frames) arrive between them.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -165,10 +152,10 @@ while [ $r -le "$ROUNDS" ]; do
 		[ -n "$first" ] || first="round $r (apply_threads $at, $io): $(val BACK); A's ver $(val A_VER); B $(val B_STATS)"
 	fi
 	[ -n "$(val READS)" ] || { bad "round $r: the driver failed: $(tail -2 "$D/out")"; seen=1; break; }
-	# a zero proves nothing: 12 rounds read 0 times when two founders had not merged
+	# a zero proves nothing: a fleet whose two founders never merged reads 0 times
 	[ "$(val FORMED)" = True ] && [ "$(val READS)" -gt 100 ] 2>/dev/null \
 		|| { bad "round $r: the fleet formed $(val FORMED), B read $(val READS) values - nothing measured"; seen=1; break; }
-	# the premise (HG_MALLOC's lesson): a replica out of arena measures memory, not order
+	# the premise: a replica out of arena measures memory, not order
 	[ "$(val NOMEM)" = 0 ] || { bad "round $r: B refused copies for want of arena ($(val B_STATS)) - this run measured memory"; seen=1; break; }
 	r=$((r + 1))
 done

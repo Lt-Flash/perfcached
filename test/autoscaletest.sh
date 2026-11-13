@@ -1,40 +1,6 @@
 #!/bin/sh
-# autoscaletest.sh - S239: a collection's autoscale mode - auto, warn, off.
-#
-# On 245-247 an operator's `resize 9 17` was shrunk back to 2^12 58 s
-# later by S150's auto-shrink, and nothing could say "leave this one".
-# The operator's design, after Ceph's pg_autoscale_mode: AUTO grows and
-# shrinks by key count (today's behaviour, the default); WARN changes
-# nothing and says what auto would do; OFF changes nothing and says
-# nothing.  Under WARN and OFF growth is blocked too - keys past the
-# slots go to the overflow leg, which the page shows red.
-#
-# One node, shrink_cooloff_s = 2, six collections:
-#   a, w, o  - made at 2^17 holding 200 keys (a shrink case): only a
-#              (auto) shrinks; w logs what auto would do, once; o is
-#              silent.  All three publish the target.
-#   ga,gw,go - made at 2^12 holding 30,000 keys (past 75% of the slots):
-#              only ga grows; gw and go keep 4,096 buckets and put the
-#              rest in the leg; gw logs a grow recommendation.
-# Then /stats and /metrics carry the mode and the target; the verb
-# (privileged) sets a mode - o to auto shrinks it - and the verb's mode
-# survives a restart over the config's; and a bad value is refused.
-# FAIL-FIRST: the build before S239 does not know the key and will not
-# start with this config.
-#
-# S328, FLOOR - auto that never shrinks below the operator's size (the
-# PROD AU fleet's collection 0, made at 2^15, was shrunk to 2^12 a
-# minute after its first start):
-#   f   - made at 2^17 holding 200 keys: stays 2^17 where a shrank;
-#   gf  - made at 2^12 holding 30,000 keys: grows, as ga does;
-#   ff  - floor 2^13, grown past 2^14 by 80,000 keys, then all but 200
-#         deleted: shrinks back to 2^13 exactly - not 2^12, where auto
-#         would put it - and says it stopped at its floor;
-#   rf  - made at 2^12, an explicit resize to 2^14 while empty: the
-#         resize is the new floor, so it stays 2^14;
-# and /stats publishes the floor.  FAIL-FIRST: a build before S328
-# refuses "autoscale = floor" and does not start with this config.
-# Usage: test/autoscaletest.sh [./perfcached] [./perfcli]
+# autoscaletest.sh - a collection's autoscale mode: auto grows and shrinks, warn and off change
+# nothing (warn says what auto would do), floor never shrinks below its size; verb, stats, restart.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -57,7 +23,7 @@ workers = 2
 log_level = notice
 state_dir = $D/state
 shrink_cooloff_s = 2
-# S328: rf's explicit resize is DDL
+# rf's explicit resize is DDL
 allow_create = yes
 [memory]
 arena_mb = 128
@@ -170,9 +136,8 @@ NO=$(grep -c "collection 'o' (autoscale" "$D/n.log")
 	|| bad "growth: ga $(w "$GA" 1), gw $(w "$GW" 1)/$(w "$GW" 2) leg, go $(w "$GO" 1)/$(w "$GO" 2) leg"
 grep -q "collection 'gw' (autoscale = warn).*growth blocked.*auto would grow it to 2^" "$D/n.log" \
 	&& ok "and warn recommended the growth it blocked" || bad "gw: no grow recommendation in the log"
-# the operator: "in off mode collection should also turn red when there's
-# too many keys" - off says nothing in the log, but publishes the target
-# the page turns red on (auto would grow it: target above its size)
+# off says nothing in the log, but publishes the target the page turns red on
+# (auto would grow it: target above its size)
 [ "$(w "$GO" 4)" -gt 12 ] 2>/dev/null && ! grep -q "collection 'go' (autoscale" "$D/n.log" \
 	&& ok "off published its grow target (2^$(w "$GO" 4) over 4,096 buckets: the page's red) and logged nothing" \
 	|| bad "go: target '$(w "$GO" 4)' (want > 12) or it logged"
@@ -181,7 +146,7 @@ echo "$M" | grep -q 'perfcached_collection_autoscale_mode{collection="w",mode="w
 	&& echo "$M" | grep -q 'perfcached_collection_autoscale_target_buckets{collection="w"} 4096' \
 	&& ok "/metrics: the mode gauge and the target (4096) for w" || bad "/metrics lacks the autoscale series"
 
-# S328: FLOOR
+# FLOOR
 F=$(col f); GF=$(col gf); RF=$(col rf)
 echo "   f: $F | gf: $GF | rf: $RF | ff grew to $FFG"
 [ "$(w "$F" 1)" = 131072 ] && [ "$(w "$F" 3)" = floor ] \

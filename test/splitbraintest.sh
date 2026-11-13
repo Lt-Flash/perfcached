@@ -1,24 +1,6 @@
 #!/bin/sh
-# splitbraintest.sh — S42b: a write on BOTH SIDES of a partition.
-#
-# The case that would hurt most, and the one nothing pinned until now.
-# DESIGN.md §6.4 states the contract per mode:
-#
-#   proxy - writes serialise at the holder, but the simultaneous-birth
-#           race (two ingresses, both probes confirm absent) DOES fork;
-#           the demoter then heals it deterministically, lower node-id
-#           wins, the loser becomes a stub.  A partition is precisely
-#           how that race is arranged on demand - so this asserts the
-#           HEALING, which had never been exercised.
-#   store - "two writers on two nodes diverge permanently".  Divergence
-#           is the documented behaviour, not a bug, so this asserts it
-#           holds: a silent change to convergence would be just as much
-#           a contract break as a silent change the other way.
-#
-# Assertions are on what a CLIENT CAN READ afterwards, never on log
-# lines (feedback-prove-the-path-can-execute).
-#
-# Usage: test/splitbraintest.sh [runtime]
+# splitbraintest.sh - a write on both sides of a partition: proxy mode forks and must heal (lower
+# node id wins), store mode must stay diverged; asserted on what a client reads, never on logs.
 set -u
 
 RT=${1:-${RUNTIME:-}}       # the argument, else $RUNTIME (CI), else nerdctl or docker
@@ -95,12 +77,8 @@ if [ "$PA" = from-majority ] && [ "$PC" = from-isolated ]; then
 else
 	ok "one side refused - no fork to heal (n1=$PA n3=$PC)"
 fi
-# S442: node 2 reads it while node 3 is cut off, so node 2 remembers node 1
-# as the holder.  A remembered holder is asked alone, so after the heal no
-# lookup through node 2 could collect both copies, and the demoter never
-# fired (GitHub 39959849797: node 2 answered from-majority through all 30
-# rounds).  Done on purpose here, so the heal below is tested against it
-# every run rather than by the luck of when node 2 first looks.
+# node 2 reads it while node 3 is cut off, so it remembers node 1 as the holder and asks it alone;
+# done on purpose, so the heal below is tested against a remembered holder every run
 P2=$(get_k 2 px "$PK")
 echo "       node 2 during the split: $P2 (it now remembers node 1 as the holder)"
 
@@ -117,14 +95,7 @@ else
 	bad "membership did not reconverge (n1=$(peers 1) n3=$(peers 3))"
 fi
 # ---- 5. THE ASSERTION: proxy must converge, and it heals LAZILY -----
-# The demoter is NOT a timer.  It fires when a broadcast probe collects
-# a SECOND positive answer (cluster.c, "TWO holders: deterministic
-# demotion"), so a fork survives until something LOOKS UP the key in a
-# way that probes.  Sleeping and reading once therefore tests nothing
-# in particular - and worse, the reads are themselves the repair, so a
-# naive check can trigger the heal it then reports as absent.
-#
-# So: drive the detector on purpose and give it a bounded budget.
+# the demoter fires only when a probe collects a second holder, so drive lookups on a bounded budget
 CONV=0
 i=0
 while [ $i -lt 30 ]; do
@@ -140,9 +111,8 @@ if [ $CONV = 1 ]; then
 else
 	bad "PROXY STILL FORKED after 30 lookup rounds: n1=$F1 n2=$F2 n3=$F3 -
 	     one key answers differently depending on which node is asked"
-	# what each node saw: the race (a broadcast that drew two different
-	# versions), the demote sent, applied - or kept (CH-16: the loser held
-	# something newer than the race saw)
+	# what each node saw: the race (a broadcast that drew two versions), the demote sent, applied -
+	# or kept (the loser held something newer than the race saw)
 	for n in 1 2 3; do
 		D=$($RT exec pcnode$n perfcli -q -j '{"method":"stats"}' 2>/dev/null | python3 -c '
 import json, sys

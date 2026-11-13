@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
-# noise_interop.py — an INDEPENDENT Noise_NNpsk0_25519_ChaChaPoly_SHA256
-# initiator, written from the Noise spec against the `cryptography`
-# library (not perfcached's C).  If it interoperates with the daemon's
-# responder, both implementations are spec-correct.  The PSK is passed in
-# hex (obtained from `noisetest psk ...`, i.e. the same libsodium the
-# daemon derives with) so Argon2id need not be reproduced here.
-#
-# Inside the transport the daemon speaks its binary protocol (S317: the
-# JSON-RPC text dialect is gone), so the requests are CMD frames built by
-# test/pcnative.py's frame() and the replies trees read by its decode();
-# the transport itself - records, chunking, reassembly - stays this file's.
-#
-# argv: <host> <port> <key_id> <psk_hex> [mode]
-#   mode: ok (default) | wrongpsk | tamper
-# exit 0 = the expected outcome happened.
+# noise_interop.py - an independent Noise_NNpsk0_25519_ChaChaPoly_SHA256 initiator (`cryptography`,
+# from the spec) against the daemon.  argv: <host> <port> <key_id> <psk_hex> [ok|wrongpsk|tamper]
 import socket, struct, sys, os
 import pcnative                                   # test/pcnative.py, beside this file
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -23,12 +10,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
 NAME = b"Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 
-# This initiator is written against a modern `cryptography`.  Where the
-# host's is too old to drive the handshake at all - 222 carries 2.8, from
-# 2019, and `public_bytes_raw()` arrived in 41 - the suite cannot test
-# anything and says so: exit 77, which the wrapper turns into a loud SKIP.
-# Probing the FEATURE rather than the version number keeps this honest as
-# the library moves.  The daemon side is unaffected either way.
+# a `cryptography` too old to drive the handshake (public_bytes_raw() arrived in 41) cannot test
+# anything: exit 77, which the wrapper turns into a loud SKIP; the feature is probed, not the version
 def _library_can_drive():
     try:
         X25519PrivateKey.generate().public_key().public_bytes_raw()
@@ -47,11 +30,8 @@ if not _library_can_drive():
 
 
 def sha256(d):
-    # cryptography dropped the mandatory `backend` argument in 3.1 and
-    # 2.x still requires it, and the hosts this runs on span both (222
-    # carries 2.8).  Try the modern signature, fall back to the old one -
-    # a helper that cannot construct a hash fails the whole interop suite
-    # for a reason that has nothing to do with the handshake it tests.
+    # cryptography 2.x requires the `backend` argument that 3.1 dropped: try the modern signature,
+    # fall back to the old one
     try:
         h = hashes.Hash(hashes.SHA256())
     except TypeError:

@@ -1,18 +1,6 @@
 #!/bin/sh
-# summarize.sh — turn a respbench/containerbench results.tsv into the
-# comparison table a reader actually wants: every arm against the redis
-# reference at the SAME clients and pipeline depth.
-#
-# Kept separate and shared by both harnesses so the ratio arithmetic
-# exists once.  Both write the same columns, so both can use it, and a
-# results file from either can be re-summarised later without re-running
-# anything:
-#
-#   bench/summarize.sh /var/tmp/respbench/results.tsv
-#
-# Ratios are ARM / REDIS at the same cell.  For latency the ratio is
-# inverted and labelled "tighter", because lower is better there and
-# printing x0.22 for a 4.6x improvement reads as a regression.
+# summarize.sh - every arm of a respbench/containerbench results.tsv against redis at the same cell;
+# latency ratios inverted and labelled "tighter".  Usage: bench/summarize.sh /var/tmp/respbench/results.tsv
 set -u
 F=${1:-/var/tmp/respbench/results.tsv}
 [ -r "$F" ] || { echo "summarize: cannot read $F" >&2; exit 1; }
@@ -45,11 +33,8 @@ awk -F'\t' '
 			split(cell, c, "\t")
 			# a cell with no redis row cannot be compared
 			if (!((cell SUBSEP "redis") in set)) continue
-			# nor is there anything to show when redis is the ONLY
-			# arm measured so far - which is the normal state while
-			# a run is in flight, since redis goes first.  Printing
-			# a headed, empty table for every cell buries the rows
-			# that do exist.
+			# nor when redis is the only arm measured so far (redis runs first): an
+			# empty table per cell would bury the rows that exist
 			ncmp = 0
 			for (j = 1; j <= na; j++) {
 				a2 = armorder[j]
@@ -68,12 +53,8 @@ awk -F'\t' '
 				arm = armorder[j]
 				if (arm == "redis") continue
 				if (!((cell SUBSEP arm) in set) && !((cell SUBSEP arm) in get)) continue
-				# A GET-only arm has no SET p99, so fall back to its GET
-				# p99 rather than printing "-".  The cold arms are
-				# GET-only BY DESIGN and their latency is the point of
-				# them: proxy-cold at 10.6 ms against shard-cold at
-				# 1.2 ms is the headline, and a summary that blanks it
-				# is worse than no summary.
+				# a GET-only arm (the cold arms) has no SET p99: show its GET p99, not a
+				# blank - their latency is the point of them
 				p99v = sp99[cell, arm]; p99r = rsp
 				if (p99v == "") { p99v = gp99[cell, arm]; p99r = rgp }
 				printf "    %-22s %12s %8s %12s %8s %10s %9s\n", \

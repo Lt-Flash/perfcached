@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * cfgcore.c - the config sections of the daemon itself: [daemon], [memory],
- * [secrets], [listen] and [wal] - one function a section, each answering a
- * key it knows or CFG_KV_UNKNOWN.  Moved from config.c's handle_kv, each
- * case body unchanged but for its indent and its last break (the 0.7.2
- * split, wave 1 - doc/MODULARITY.md).
- */
+/* cfgcore.c - the config sections of the daemon itself: [daemon], [memory], [secrets], [listen]
+ * and [wal]; one function a section, answering a key it knows or CFG_KV_UNKNOWN. */
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,12 +26,8 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 	int lv;
 
 	if (!strcasecmp(key, "allow_create")) {
-		/* S69: whether a CLIENT may create and drop
-		 * collections here.  It gates ORIGINATION only, not
-		 * what this node accepts from the fleet: a create is
-		 * propagated to every member whatever its own
-		 * setting, so the collection set stays uniform and
-		 * turning this on does not need a fleet restart. */
+		/* gates a client's ORIGINATION only: a create from the fleet reaches every member whatever
+		 * its setting, so the set stays uniform and turning this on needs no fleet restart */
 		if (!strcasecmp(val, "yes") || !strcasecmp(val, "on"))
 			cfg->allow_create = 1;
 		else if (!strcasecmp(val, "no") || !strcasecmp(val, "off"))
@@ -54,7 +45,7 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "notify_events")) {        /* PS8 */
+	if (!strcasecmp(key, "notify_events")) {
 		if (pc_ev_parse(val, &cfg->notify_events) != 0) {
 			PERR(ps, "notify_events: miss|expired|store|remove|all|none, comma-separated\n");
 			return -1;
@@ -73,37 +64,37 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 		else { PERR(ps, "log_events_hash: yes|no\n"); return -1; }
 		return 0;
 	}
-	if (!strcasecmp(key, "grow_at_pct"))                /* S150 */
+	if (!strcasecmp(key, "grow_at_pct"))
 		return parse_int(ps, val, 10, 100, &cfg->grow_at_pct);
-	if (!strcasecmp(key, "autoscale")) {                /* S239 */
+	if (!strcasecmp(key, "autoscale")) {
 		if ((cfg->autoscale = pc_autoscale_parse(val)) < 0) {
 			PERR(ps, "autoscale: auto|floor|warn|off\n");
 			return -1;
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "redis_types")) {              /* S280 */
+	if (!strcasecmp(key, "redis_types")) {
 		if ((cfg->redis_types = pc_types_parse(val)) < 0) {
 			PERR(ps, "redis_types: strict|loose\n");
 			return -1;
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "shrink_at_pct"))              /* S150 D */
+	if (!strcasecmp(key, "shrink_at_pct"))
 		return parse_int(ps, val, 0, 99, &cfg->shrink_at_pct);
-	if (!strcasecmp(key, "grow_floor_pct"))            /* S175 */
+	if (!strcasecmp(key, "grow_floor_pct"))
 		return parse_int(ps, val, 0, 100, &cfg->grow_floor_pct);
-	if (!strcasecmp(key, "leg_stuck_pct"))             /* S175 */
+	if (!strcasecmp(key, "leg_stuck_pct"))
 		return parse_int(ps, val, 0, 100, &cfg->leg_stuck_pct);
-	if (!strcasecmp(key, "prefetch_min_keys"))          /* S232 */
+	if (!strcasecmp(key, "prefetch_min_keys"))
 		return parse_int(ps, val, 0, 100000000, &cfg->prefetch_min_keys);
-	if (!strcasecmp(key, "shrink_cooloff_s"))           /* S150 D */
+	if (!strcasecmp(key, "shrink_cooloff_s"))
 		return parse_int(ps, val, 0, 86400, &cfg->shrink_cooloff_s);
 	if (!strcasecmp(key, "workers"))
 		return parse_int(ps, val, 1, 512, &cfg->workers);
-	if (!strcasecmp(key, "busy_poll_us"))           /* S363 */
+	if (!strcasecmp(key, "busy_poll_us"))
 		return parse_int(ps, val, 0, 100000, &cfg->busy_poll_us);
-	if (!strcasecmp(key, "link_monitor")) {         /* S465 */
+	if (!strcasecmp(key, "link_monitor")) {
 		if (!*val || strlen(val) > 15 || strpbrk(val, "/ \t")) {
 			PERR(ps, "link_monitor: auto | off | <device>, not '%s'\n", val);
 			return -1;
@@ -112,9 +103,9 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 			strcasecmp(val, "auto") ? val : "");
 		return 0;
 	}
-	if (!strcasecmp(key, "link_speed_mbps"))        /* S465 */
+	if (!strcasecmp(key, "link_speed_mbps"))
 		return parse_int(ps, val, 0, 10000000, &cfg->link_speed_mbps);
-	if (!strcasecmp(key, "busy_poll_prefer")) {     /* S363 */
+	if (!strcasecmp(key, "busy_poll_prefer")) {
 		if (!strcasecmp(val, "yes") || !strcasecmp(val, "on"))
 			cfg->busy_poll_prefer = 1;
 		else if (!strcasecmp(val, "no") || !strcasecmp(val, "off"))
@@ -125,9 +116,9 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "output_stall_s"))         /* S372 */
+	if (!strcasecmp(key, "output_stall_s"))
 		return parse_int(ps, val, 1, 3600, &cfg->output_stall_s);
-	if (!strcasecmp(key, "io")) {                    /* S361 */
+	if (!strcasecmp(key, "io")) {
 		if (!strcasecmp(val, "io_uring"))
 			cfg->io_backend = PC_IO_URING;
 		else if (!strcasecmp(val, "epoll"))
@@ -139,14 +130,14 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 		cfg->io_explicit = 1;
 		return 0;
 	}
-	if (!strcasecmp(key, "address_wait_s"))           /* S294 */
+	if (!strcasecmp(key, "address_wait_s"))
 		return parse_int(ps, val, 0, 600, &cfg->address_wait_s);
-	if (!strcasecmp(key, "keys_turn_us"))             /* S292 */
+	if (!strcasecmp(key, "keys_turn_us"))
 		return parse_int(ps, val, 0, 100000, &cfg->keys_turn_us);
 	if (!strcasecmp(key, "slowlog_usec"))
 		return parse_int(ps, val, 0, 60000000,
 			&cfg->slowlog_usec);
-	if (!strcasecmp(key, "stats_reset")) {           /* S358 */
+	if (!strcasecmp(key, "stats_reset")) {
 		if (stats_reset_parse(val, &cfg->stats_reset_days)) {
 			PERR(ps, "stats_reset must be off or 1d .. 7d, "
 				"not '%s'\n", val);
@@ -154,7 +145,7 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "stats_reset_at")) {        /* S358 */
+	if (!strcasecmp(key, "stats_reset_at")) {
 		if (hhmm_parse(val, &cfg->stats_reset_at_s)) {
 			PERR(ps, "stats_reset_at must be HH:MM (local "
 				"time), not '%s'\n", val);
@@ -164,13 +155,13 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 	}
 	if (!strcasecmp(key, "pubsub_queue_mb"))
 		return parse_int(ps, val, 0, 65536, &cfg->pubsub_queue_mb);
-	if (!strcasecmp(key, "max_clients"))      /* S161 */
+	if (!strcasecmp(key, "max_clients"))
 		return parse_int(ps, val, 0, 1000000, &cfg->max_clients);
-	if (!strcasecmp(key, "enable_lockout_after"))   /* S417 */
+	if (!strcasecmp(key, "enable_lockout_after"))
 		return parse_int(ps, val, 0, 1000000, &cfg->enable_lockout_after);
 	if (!strcasecmp(key, "enable_lockout_s"))
 		return parse_int(ps, val, 1, 86400, &cfg->enable_lockout_s);
-	if (!strcasecmp(key, "install_mode")) {       /* PD-9 */
+	if (!strcasecmp(key, "install_mode")) {
 		if (!strcasecmp(val, "auto")) cfg->install_mode = PC_INSTALL_AUTO;
 		else if (!strcasecmp(val, "package")) cfg->install_mode = PC_INSTALL_PACKAGE;
 		else if (!strcasecmp(val, "prefix")) cfg->install_mode = PC_INSTALL_PREFIX;
@@ -181,7 +172,7 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "memory_floor")) {   /* S366 */
+	if (!strcasecmp(key, "memory_floor")) {
 		char *e;
 		long n;
 
@@ -291,18 +282,19 @@ int cfg_kv_memory(struct pstate *ps, char *key, char *val)
 		return parse_int(ps, val, 0, 86400, &cfg->reclaim_quiet_s);
 	if (!strcasecmp(key, "reclaim_cooloff_s"))
 		return parse_int(ps, val, 0, 86400, &cfg->reclaim_cooloff_s);
-	if (!strcasecmp(key, "pin")) {              /* S167 */
-		if (!strcasecmp(val, "auto"))
-			cfg->pin_require = 0;
-		else if (!strcasecmp(val, "require"))
+	if (!strcasecmp(key, "pin")) {
+		cfg->pin_require = cfg->pin_off = 0;
+		if (!strcasecmp(val, "require"))
 			cfg->pin_require = 1;
-		else {
-			PERR(ps, "pin: auto|require\n");
+		else if (!strcasecmp(val, "no"))
+			cfg->pin_off = 1;
+		else if (strcasecmp(val, "auto")) {
+			PERR(ps, "pin: auto|require|no\n");
 			return -1;
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "huge_pages")) {       /* S167 */
+	if (!strcasecmp(key, "huge_pages")) {
 		if (!strcasecmp(val, "auto"))
 			cfg->huge_pages_off = 0;
 		else if (!strcasecmp(val, "off"))
@@ -338,7 +330,7 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 		return 0;
 	}
 	if (!strcasecmp(key, "enable")) {
-		/* S129: refused empty - an empty privilege secret
+		/* refused empty - an empty privilege secret
 		 * would authorise every caller that sent nothing */
 		if (!*val) {
 			PERR(ps, "the enable secret is empty\n");
@@ -360,7 +352,7 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 		cfg->cluster_secret = strdup(val);
 		return 0;
 	}
-	if (!strcasecmp(key, "cluster_accept")) {         /* CH-7: a rotation's other secret */
+	if (!strcasecmp(key, "cluster_accept")) {         /* a rotation's other secret */
 		if (cfg->cluster_accept_secret) {
 			PERR(ps, "duplicate cluster_accept secret\n");
 			return -1;
@@ -369,11 +361,8 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 		return 0;
 	}
 	if (!strcasecmp(key, "http")) {
-		/* S37: a shared token for the HTTP door.  A SECOND
-		 * layer, never the first: it rides plaintext, so
-		 * anyone who can see the traffic can replay it.  It
-		 * exists so one mis-scoped firewall rule does not
-		 * immediately hand over the fleet's topology. */
+		/* a second layer, never the first: it rides plaintext and can be replayed - it only
+		 * keeps one mis-scoped firewall rule from handing over the fleet's topology */
 		if (cfg->http_token) {
 			PERR(ps, "duplicate http token\n");
 			return -1;
@@ -382,11 +371,8 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 		return 0;
 	}
 	if (!strcasecmp(key, "resp")) {
-		/* the Redis AUTH password for RESP listeners - a plain
-		 * shared secret compared in constant time, NOT an
-		 * Argon2id PSK: stock Redis clients can only send a
-		 * password, so this is the strongest in-band control
-		 * the dialect allows */
+		/* a plain shared secret compared in constant time, not an Argon2id PSK: stock Redis
+		 * clients can only send a password */
 		if (cfg->resp_password) {
 			PERR(ps, "duplicate resp secret\n");
 			return -1;
@@ -394,13 +380,13 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 		cfg->resp_password = strdup(val);
 		return 0;
 	}
-	if (!strcasecmp(key, "upstream")) {             /* S383 */
+	if (!strcasecmp(key, "upstream")) {
 		PERR(ps, "[secrets] upstream moved in 0.6.1: write "
 			"upstream_password = <it> in each read-through "
 			"[collection] - each may front its own Redis\n");
 		return -1;
 	}
-	if (!strcasecmp(key, "mail")) {                 /* S352 */
+	if (!strcasecmp(key, "mail")) {
 		if (cfg->mail.pass) {
 			PERR(ps, "duplicate mail secret\n");
 			return -1;
@@ -428,7 +414,7 @@ static int yesno(struct pstate *ps, const char *key, const char *val, int *out)
 	return 0;
 }
 
-/* S468: "<addr> [encrypt=yes|no]" - the suffix overrides [listen] encrypt */
+/* "<addr> [encrypt=yes|no]" - the suffix overrides [listen] encrypt */
 static int add_native_listener(struct pstate *ps, enum pc_listen_type type,
 		char *val)
 {
@@ -453,6 +439,29 @@ static int add_native_listener(struct pstate *ps, enum pc_listen_type type,
 	return 0;
 }
 
+/* "<addr:port> [tls]" - a RESP or HTTP door, over TLS when it says so */
+static int add_door_listener(struct pstate *ps, char *val, int kind)
+{
+	char *sp = strpbrk(val, " \t"), *opt;
+	int tls = 0;
+
+	if (sp) {
+		*sp = 0;
+		for (opt = sp + 1; *opt == ' ' || *opt == '\t'; opt++)
+			;
+		if (strcasecmp(opt, "tls")) {
+			PERR(ps, "a %s listener takes one option, tls (got '%s')\n",
+				kind == 1 ? "resp" : "http", opt);
+			return -1;
+		}
+		tls = 1;
+	}
+	if (add_listener_ex(ps, PC_LISTEN_TCP, val, kind))
+		return -1;
+	ps->cfg->listen[ps->cfg->n_listen - 1].tls = tls;
+	return 0;
+}
+
 /* [listen] */
 int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 {
@@ -461,18 +470,38 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 	if (!strcasecmp(key, "tcp") || !strcasecmp(key, "unix"))
 		return add_native_listener(ps, !strcasecmp(key, "tcp") ?
 			PC_LISTEN_TCP : PC_LISTEN_UNIX, val);
-	if (!strcasecmp(key, "encrypt"))           /* S468 */
+	if (!strcasecmp(key, "encrypt"))
 		return yesno(ps, key, val, &cfg->listen_encrypt);
 	if (!strcasecmp(key, "resp"))
-		return add_listener_ex(ps, PC_LISTEN_TCP, val, 1);
+		return add_door_listener(ps, val, 1);
 	if (!strcasecmp(key, "http"))
-		return add_listener_ex(ps, PC_LISTEN_TCP, val, 2);
+		return add_door_listener(ps, val, 2);
+	if (!strcasecmp(key, "tls_cert") || !strcasecmp(key, "tls_key")) {
+		char **dst = key[4] == 'c' ? &cfg->tls_cert : &cfg->tls_key;
+
+		if (*dst || !*val) {
+			PERR(ps, "%s: %s\n", key, *dst ? "given twice" : "empty");
+			return -1;
+		}
+		*dst = strdup(val);
+		return 0;
+	}
+	if (!strcasecmp(key, "auth_needs_tls"))
+		return yesno(ps, key, val, &cfg->auth_needs_tls);
+	if (!strcasecmp(key, "tls_min")) {
+		if (strcmp(val, "1.2") && strcmp(val, "1.3")) {
+			PERR(ps, "tls_min: 1.2 or 1.3\n");
+			return -1;
+		}
+		cfg->tls_min13 = !strcmp(val, "1.3");
+		return 0;
+	}
 	if (!strcasecmp(key, "http_timeout"))
 		return parse_int(ps, val, 0, 3600,
 			&cfg->http_timeout_s);
-	if (!strcasecmp(key, "http_rate"))         /* 0.6.2 */
+	if (!strcasecmp(key, "http_rate"))
 		return parse_int(ps, val, 0, 100000, &cfg->http_rate);
-	if (!strcasecmp(key, "http_cache_ms"))     /* 0.6.2 */
+	if (!strcasecmp(key, "http_cache_ms"))
 		return parse_int(ps, val, 0, 60000, &cfg->http_cache_ms);
 	if (!strcasecmp(key, "http_allow")) {
 		char *tok, *save = NULL, *dup = strdup(val);
@@ -509,9 +538,9 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 		cfg->resp_collections = strdup(val);
 		return 0;
 	}
-	if (!strcasecmp(key, "keepalive_s"))       /* PS2 */
+	if (!strcasecmp(key, "keepalive_s"))
 		return parse_int(ps, val, 0, 86400, &cfg->keepalive_s);
-	if (!strcasecmp(key, "pubsub_udp")) {      /* PS5 */
+	if (!strcasecmp(key, "pubsub_udp")) {
 		if (!strcasecmp(val, "yes") || !strcasecmp(val, "on"))
 			cfg->pubsub_udp = 1;
 		else if (!strcasecmp(val, "no") || !strcasecmp(val, "off"))
@@ -523,14 +552,8 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 		return 0;
 	}
 	if (!strcasecmp(key, "resp_redirect")) {
-		/* RV-10: what a RESP door does with a key this node does
-		 * not own under shard or spread.  forward - answer it,
-		 * paying the hop (today; right for a plain client).
-		 * moved - a genuine -MOVED and no forward, for a
-		 * cluster-aware client, which refreshes its slot table
-		 * from exactly that and from nothing else.  Per daemon,
-		 * not per request: the daemon cannot tell the two
-		 * kinds of client apart. */
+		/* a key this node does not own: forward answers it (for a plain client), moved sends -MOVED
+		 * (a cluster-aware client refreshes from it); per daemon, as clients cannot be told apart */
 		if (!strcasecmp(val, "forward"))
 			cfg->resp_redirect = 0;
 		else if (!strcasecmp(val, "moved"))
@@ -600,15 +623,15 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 	if (!strcasecmp(key, "segment_mb"))
 		return parse_int(ps, val, 0, 1024, &cfg->wal_segment_mb);
 	if (!strcasecmp(key, "segments") ||
-	    !strcasecmp(key, "segments_min"))          /* S466 step 2 */
+	    !strcasecmp(key, "segments_min"))
 		return parse_int(ps, val, 2, 64, &cfg->wal_segments);
-	if (!strcasecmp(key, "segments_max"))          /* S466 step 2 */
+	if (!strcasecmp(key, "segments_max"))
 		return parse_int(ps, val, 2, 256, &cfg->wal_segments_max);
 	if (!strcasecmp(key, "ring_kb")) {
 		cfg->wal_ring_kb_set = 1;
 		return parse_int(ps, val, 4, 16384, &cfg->wal_ring_kb);
 	}
-	if (!strcasecmp(key, "on_full")) {            /* S466 */
+	if (!strcasecmp(key, "on_full")) {
 		if (!strcasecmp(val, "wait"))
 			cfg->wal_on_full = 0;
 		else if (!strcasecmp(val, "heal"))
@@ -619,7 +642,7 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 		}
 		return 0;
 	}
-	if (!strcasecmp(key, "unknown_records")) {    /* UP3 */
+	if (!strcasecmp(key, "unknown_records")) {
 		if (!strcasecmp(val, "refuse"))
 			cfg->wal_unknown_skip = 0;
 		else if (!strcasecmp(val, "skip"))
@@ -645,7 +668,7 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 
 			if (sscanf(tok, "%d %lld", &secs, &ch) == 2 &&
 			        secs == 0 && ch >= 1) {
-				/* S224: Redis's manual invites this, so say
+				/* Redis's manual invites this, so say
 				 * why it is refused rather than just "bad" */
 				free(dup);
 				PERR(ps, "save: seconds must be at least 1 - a "

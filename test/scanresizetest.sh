@@ -1,28 +1,6 @@
 #!/bin/sh
-# scanresizetest.sh - S257: a SCAN that spans a resize returns every key.
-#
-# The scan cursor was a bucket index into whichever table was live, on the
-# premise that tables only grow in place (3.4).  Since S69 a resize is a
-# migration and a swap: after a SHRINK a cursor past the new table's size
-# walked nothing and reported the scan complete; after a GROW it indexed
-# buckets holding other keys.  Found by the spread census: a node's walk
-# outlasted its auto-shrink and counted 294k of its 641k keys.  (A GROW
-# turned out safe for the old cursor - see the fail-first note below.)
-# One node, collection 0 (the RESP door's) at 2^16 buckets, autoscale off,
-# 20,000 keys:
-#   1. shrink - the native door's `scan`, 256 buckets a page, paused after
-#      40 pages (10,240 buckets: past the 8,192 the table shrinks to); resize
-#      to 2^13 (20,000 keys refuse anything smaller) and wait until it has
-#      swapped AND drained; finish the scan;
-#   2. grow - the RESP door's SCAN, COUNT 64, paused after 8 pages; resize
-#      back to 2^16, wait; finish;
-#   each: every one of the 20,000 keys returned at least once.
-# Fail-first: rc50 ends the shrink scan early - 3,271 of 20,000 keys, the
-# scan reported complete.  The grow arm passes on rc50 too: the bucket index
-# is the hash's low bits, so a key's bucket after a grow keeps its old low
-# bits and an ascending cursor still meets every key it has not seen - it
-# stays as the guard for the new cursor, not as a fail-first.
-# Usage: test/scanresizetest.sh [./perfcached]
+# scanresizetest.sh - a SCAN that spans a resize returns every key: a cursor paused across a shrink
+# and across a grow, on the native and the RESP doors, still meets all 20,000.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -133,6 +111,7 @@ while cur:
 check(ok and "result" in rz, "grow: paused at %d keys after 8 SCAN pages, resized to 65,536 buckets" % mid)
 check(KEYS <= seen, "grow: SCAN returned %d of the 20,000 keys (every one at least once)" % len(KEYS & seen))
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$D/res"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$D/res"
 [ -s "$D/res" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

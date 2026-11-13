@@ -1,19 +1,6 @@
 #!/bin/sh
-# rejointest.sh — what a node that REJOINS with a WAL is owed, and what
-# it must not be given.
-#
-# A node with a WAL comes back holding an unknown subset of the keyspace,
-# and the fleet cannot see which keys or how many.  Two things must hold
-# before any reconciliation protocol is designed on top, and both are
-# about data the node itself is wrong or right about:
-#
-#   1. A value it AUTHORED and logged but never replicated is NEWER than
-#      the fleet's copy.  Recovery must keep it - no peer may push an
-#      older copy over it.
-#   2. A key DELETED while it was down must not come back.  Its WAL still
-#      has the record; the tombstone happened where it could not see it.
-#
-# usage: test/rejointest.sh [./perfcached]
+# rejointest.sh - a node rejoining with a WAL keeps a value it authored but never replicated, and a
+# key deleted while it was down does not come back.  usage: test/rejointest.sh [./perfcached]
 set -u
 
 BIN=${1:-./perfcached}
@@ -81,7 +68,12 @@ getv() { call "$1" "{\"method\":\"get\",\"params\":{\"col\":\"c\",\"key\":\"$2\"
 
 for i in 1 2 3; do mk $i; done
 for i in 1 2 3; do start $i a; done
-sleep 5
+# a joiner is CONNECTING until its links answer: up to 30 s for every node ready, seeing the others
+st() { call $1 '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1)" != "ready 2" ] || [ "$(st 2)" != "ready 2" ] || [ "$(st 3)" != "ready 2" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
 # ---- 1: a value authored and logged but never replicated ---------------
 call 1 '{"method":"set","params":{"col":"c","key":"k1","value":"V1"}}' >/dev/null
@@ -93,8 +85,8 @@ done
 echo "$(getv 2 k1)" | grep -q V1 && ok "peers hold V1 before the kill" \
 	|| bad "peers never got V1"
 
-# author V2 and pull the plug before the sweep can push it.  fsync=always
-# so the log has it; the sweep tick is ~10s so it cannot have run.
+# author V2 and pull the plug before the sweep can push it: fsync=always so the log has it, and the
+# ~10 s sweep cannot have run
 call 1 '{"method":"set","params":{"col":"c","key":"k1","value":"V2"}}' >/dev/null
 sleep 1
 kill -9 $P1 2>/dev/null; P1=
@@ -104,7 +96,7 @@ echo "$R" | grep -q V1 && ok "peers still hold the OLD V1 (V2 never replicated)"
 
 sleep 8
 start 1 b
-# the first ANSWER counts: GitLab 112703 read nothing at all just after ready
+# the first answer counts: just after ready a read may return nothing
 i=0; while [ $i -lt 100 ]; do R=$(getv 1 k1); [ -n "$R" ] && break; sleep 0.2; i=$((i+1)); done
 echo "  ..   node1 straight after recovery (after $i empty reads): $R"
 echo "$R" | grep -q V2 && ok "recovery restored the newer V2" \
@@ -114,8 +106,7 @@ R=$(getv 1 k1)
 echo "  ..   node1 after the fleet settled: $R"
 echo "$R" | grep -q V2 && ok "OBLIGATION 1: peers did not overwrite the newer value" \
 	|| bad "OBLIGATION 1: a peer's older copy overwrote the recovered V2: $R"
-# ...and prove WHY, rather than trusting a race: a node that came back
-# holding data must be refused a blind backfill, and say so.
+# ...and prove why: a node that came back holding data is refused a blind backfill, and says so
 if grep -q "NOT backfilling" "$D"/n2.a.log "$D"/n3.a.log 2>/dev/null; then
 	ok "the gate fired: a peer refused to backfill a node holding data"
 else

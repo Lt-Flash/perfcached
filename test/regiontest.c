@@ -1,20 +1,5 @@
-/* S150 C: a retired table's slots come back.  Retire a table and its
- * regions join the arena's free set: the next table of any size takes
- * them before the frontier moves (regions_bytes and held stay FLAT
- * across up/down cycles), and past the cool-off the give-back punches
- * whole quiet groups of them out above a keep of one group - and the
- * process RSS says so, not a counter.  A punched group comes back on
- * the next take and the table built on it works.
- *
- * S445: a retired index that borders the zone's frontier is not kept for
- * the next index - the frontier rises over it and it is the records' room
- * again.  So every case above runs with a small table carved BELOW the
- * one retired (`pin`): what it frees is not at the frontier, and goes to
- * the free set as S150 C has it.  Then (7-9) the pin goes too: the
- * frontier rises over it and over the free slots above it, `held` loses
- * them at once, and the next ticks punch them as tail - the process RSS
- * says so.  FAIL-FIRST: v0.7.2-rc3 raised them and never punched them
- * (RSS 10052 -> 10052 KB); before S445 cases 1-6 held without the pin. */
+/* regiontest.c - a retired table's index regions join the arena's free set and are taken before the
+ * frontier moves; past the cool-off quiet groups are punched, as the process RSS shows. */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -68,9 +53,8 @@ int main(void)
 	S12 = pcache_htable_index_bytes(12) / slot;
 	G = 8;                              /* slots a punch group */
 
-	/* 0. settle: the reservation's never-carved tail is punched once
-	 * (S119) by the same tick - get that out of the way, so the RSS
-	 * figures below move for the region zone alone */
+	/* 0. settle: the reservation's never-carved tail is punched by the same tick; get that out
+	 * of the way, so the RSS figures below move for the region zone alone */
 	for (t = 0; t < 12; t++)
 		pcache_arena_reclaim_tick();
 	rss0 = rss_bytes();
@@ -174,7 +158,7 @@ int main(void)
 		"store and fetch on the rebuilt table");
 	pkg_free(out.s);
 
-	/* 7. S445: b retired while the pin borders the frontier - kept */
+	/* 7. b retired while the pin borders the frontier - kept */
 	pcache_arena_pressure(&pr);
 	raised0 = pr.regions_raised;
 	pcache_htable_retire(b);

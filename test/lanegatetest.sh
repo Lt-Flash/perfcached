@@ -1,16 +1,6 @@
 #!/bin/sh
-# lanegatetest.sh - CH-14: the frame lane's asks (LANE_FORCE, LANE_PROBE)
-# are taken only from an address the node knows.  A peer whose UDP to us
-# failed may be heard over the lane before its first ALIVE, so the gate is
-# a slot at the address (or the master), not admission; udpblocktest is
-# the flow that needs it.  Here: a two-node unicast fleet with a lane, and
-# frames sealed with the fleet's secret from 127.0.141.9 (clinject).
-#   1  from that unknown address: a LANE_FORCE forces nothing and a
-#      LANE_PROBE draws no answer - both counted in sender_refused
-#   2  the same address made known (an ALIVE from it, a free id): its
-#      LANE_PROBE is answered and its LANE_FORCE forces the lane - the
-#      gate tells a known sender from a stranger
-# Usage: test/lanegatetest.sh [./perfcached] [./clinject]
+# lanegatetest.sh - the frame lane's asks (LANE_FORCE, LANE_PROBE) are taken only from an address the
+# node knows (a slot or the master), not from a stranger sealed with the fleet's secret.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -78,7 +68,8 @@ conf 1; conf 2
 start 1; sleep 2; start 2
 wait_for 30 '[ "$(st 1 "r[\"cluster\"][\"peers_up\"]")$(st 2 "r[\"cluster\"][\"peers_up\"]")" = 11 ] && [ "$(st 1 "r[\"state\"]")" = ready ]' \
 	|| bad "the fleet did not form: peers $(st 1 'r["cluster"]["peers_up"]')/$(st 2 'r["cluster"]["peers_up"]')"
-CID=$(st 1 'r["cluster"]["cluster_id"]')
+# the id, asked until it comes: a /stats read that timed out gave "?", and clinject its usage
+k=0; CID=; while [ $k -lt 20 ] && ! echo "$CID" | grep -qE '^[0-9a-f]{8}-[0-9a-f-]{27}$'; do CID=$(st 1 'r["cluster"]["cluster_id"]'); k=$((k+1)); [ $k -gt 1 ] && sleep 0.5; done
 
 echo "--- 1: a stranger's asks"
 R0=$(refused); F0=$(forced)
@@ -99,7 +90,7 @@ O=$(inj alive 77)
 sleep 0.5                     # the ALIVE handled: a slot at 127.0.141.9
 O2=$(inj raw 27)
 echo "$O2" | grep -q '^reply 40 ' \
-	&& ok "an ALIVE from it (node 77), then its LANE_PROBE - answered (LANE_PROBE_R)" \
+	&& ok "an ALIVE from it (node 77, $(echo "$O" | grep -c '^reply ') frames back in its second), then its LANE_PROBE - answered (LANE_PROBE_R)" \
 	|| bad "the known sender's LANE_PROBE: $O2 (alive: $O)"
 F1=$(forced)
 O3=$(inj raw 24)

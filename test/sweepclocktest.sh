@@ -1,32 +1,6 @@
 #!/bin/sh
-# sweepclocktest.sh - S212 step 1: the two full-keyspace walks carry a
-# clock, and the clock reads what the walk cost.
-#
-# The eager repair sweep walks the whole table every cycle (sending only
-# what the watermark says is owed), and the post-restart reconcile probes
-# every key this node replayed, 64 a second.  Both are cheap at today's
-# keyspace and O(N) in it, and nothing said what either cost.  Now
-# `stats.cluster` (and /metrics, and the replication card) carry:
-#   repl_sweep_ms / _scanned / _sent / _cycles - the last COMPLETED
-#       repair cycle (one peer, one collection, cursor 0 to 0);
-#   reconcile_ms / reconcile_pending - the last completed reconcile pass,
-#       first probe to last, and probes issued but not yet answered.
-#
-#  sweep     - A alone holds 1100 x 4 KB (4.4 MB, more than one 4 MB
-#              sweep slice); B starts cold, so A's backfill walk to it
-#              takes TWO slices, one per 10 s tick: the completed cycle
-#              reads >= 9 s, >= 1100 scanned, >= 1100 sent, 1+ cycles.
-#              (A sweep that sends nothing finishes in one slice and
-#              reads ~0 ms, which is the truth about it.)
-#  reconcile - A restarts with its WAL: it replays the 1100 keys and
-#              probes every one of them at 64/s (a slice cut mid-bucket
-#              re-probes that bucket, so "probed" is issues, >= 1100);
-#              the completed pass reads ~17 s with 0 pending - the pending
-#              gauge itself is pinned in clpendtest, because on loopback
-#              a probe is answered within the sampling interval.
-# Fail-first: a daemon before S212 has no such keys - every read is
-# "absent".
-# Usage: test/sweepclocktest.sh [./perfcached]
+# sweepclocktest.sh - the repair sweep and the post-restart reconcile carry a clock (repl_sweep_*,
+# reconcile_ms/_pending) that reads what the last completed walk cost.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -57,13 +31,11 @@ multicast = 239.255.77.251:17451
 advertise = 127.0.73.$1
 pull_timeout_ms = 400
 mode = eager
-# S393: this suite times the walk at the pace before 0.6.4 - 64 a second
+# this suite times the walk at 64 a second
 reconcile_rate_max = 64
 collections = c
-# S260: this suite times the repair WALK.  With the digest gate on, the
-# fresh peer's first cycle finds B already holding all 1,100 records (its
-# pull brought them) and walks nothing - the gate's job, and why the clock
-# it reads would never tick.  sweepgatetest covers the gate.
+# the digest gate off: with it, the fresh peer's first cycle finds B holding every
+# record and walks nothing, so the clock never ticks (sweepgatetest covers the gate)
 sweep_digests = no
 [collection c]
 buckets_log2 = 12
@@ -134,8 +106,8 @@ EOF
 val() { sed -n "s/^$2=//p" "$D/$1.out" | head -1; }
 num() { case "${1:-}" in ''|*[!0-9]*) echo -1;; *) echo "$1";; esac; }
 
-# both with a WAL: a WAL-less node's interchange digest differs from a
-# WAL-bearing one's (S73b) and the two refuse each other
+# both with a WAL: a WAL-less node's interchange digest differs from a WAL-bearing one's
+# and the two refuse each other
 mkdir -p "$D/wal1" "$D/wal2"
 conf 1 "$D/wal1"; conf 2 "$D/wal2"
 start 1 || { bad "A did not start"; echo "sweepclocktest: $pass passed, $fail failed"; exit 1; }
@@ -155,15 +127,8 @@ MS=$(num "$(val sweep MS)"); SC=$(num "$(val sweep SCANNED)"); SE=$(num "$(val s
 	|| bad "repl_sweep_ms = $(val sweep MS) (want ~10000: two 10 s-spaced slices)"
 
 echo "--- the reconcile's clock: A restarts with its WAL and probes every key it replayed"
-# S223: the reconcile now runs only with a WITNESS - a peer that was up at
-# least 30 s (three sweep periods) before this node went down - because
-# only that peer saw what was deleted meanwhile.  B joined just before the
-# sweep phase, so wait until it is old enough - 46 s, because
-# this node's death is estimated from its alive stamp, touched every ten
-# beats, so it can read up to 10 s EARLY (the safe direction) and the
-# effective grace seen from here is up to 40 s; otherwise A would rightly
-# skip the pass (a fleet that has only just formed has no witness) and
-# this suite would be measuring a pass that is correctly not run.
+# the reconcile runs only with a witness up 30 s before this node died, and the death is read from
+# an alive stamp up to 10 s early: wait 46 s, or A rightly skips the pass
 i=0
 while [ $i -lt 60 ]; do
 	up=$(python3 "$DRV" uptime 2 2>/dev/null | sed -n 's/^UP=//p')
@@ -179,7 +144,7 @@ RMS=$(num "$(val rec RMS)"); PK=$(num "$(val rec PEAK_PENDING)")
 [ "$(num "$(val rec PROBED)")" -ge $N ] && [ "$(val rec PENDING)" = 0 ] && [ "$(val rec A_ENTRIES)" = $N ] \
 	&& ok "the reconcile pass probed all $N replayed keys ($(val rec PROBED) issues); pending is 0 once every answer is in (peak seen $PK), $(val rec DROPPED) dropped, A still holds $N" \
 	|| bad "reconcile: probed $(val rec PROBED), pending $(val rec PENDING) (peak $(val rec PEAK_PENDING)), dropped $(val rec DROPPED), A holds $(val rec A_ENTRIES)"
-# S471: a probe that timed out walks the pass again, and the clock reads every walk
+# a probe that timed out walks the pass again, and the clock reads every walk
 W=$(( $(num "$(val rec ROUNDS)") + 1 ))
 [ "$RMS" -ge 12000 ] && [ "$RMS" -le $((30000 * W)) ] \
 	&& ok "and it took $RMS ms over $W walk(s) - $N keys at 64 a second, the O(N) the filing named" \

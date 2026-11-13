@@ -1,24 +1,5 @@
-/* clretaintest.c - S238: the retained-tombstone table (clretain.c).
- *
- *   A  get: a noted tombstone answers with the highest version noted, and
- *      nothing after retain_s
- *   B  each: replays exactly the entries planted in (since, upto]
- *   C  the cap: past `max`, the OLDEST goes; one evicted before retain_s
- *      is counted as dropped early, one past it is not
- *   D  expire: drops what is older than retain_s, keeps the rest
- *   F  12ny AT-5: numbered deletes - forgotten through a mark, in their
- *      space's arrival order (a late lower one waits for the head), a
- *      newer delete taking an entry over (numbered or not), two spaces
- *      apart, the replay walk carrying the numbering, how far each space
- *      was forgotten and when, the expiry hold
- *   G  12ny AT-8: what this table no longer holds, for a member back from
- *      an absence - per space, the highest seq forgotten by the marks or
- *      dropped unconfirmed (the time rule, the cap); and whether anything
- *      unnumbered noted since a time is gone
- *   E  memory at the default cap (250,000 x a realistic key): the bytes
- *      the table reports, and what the process actually grew by (RSS) -
- *      the figure the README quotes
- * Milliseconds, and a quarter-million allocations. */
+/* clretaintest.c - the retained-tombstone table (clretain.c): get, replay by range, the cap,
+ * expiry, numbered deletes, what a returning member has lost, memory at the default cap. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,9 +33,9 @@ static void count_cb(const char *col, size_t cn, const char *key, size_t kn,
 
 	(void)col; (void)cn; (void)key; (void)kn; (void)oid; (void)incarn;
 	a->n++;
-	a->x += expiry != 0;               /* S446: the kind, for the replay */
+	a->x += expiry != 0;               /* the kind, for the replay */
 	a->vsum += ver;
-	a->num += seq != 0;                /* AT-5: the numbering, for the replay */
+	a->num += seq != 0;                /* the numbering, for the replay */
 	a->seqsum += seq;
 }
 
@@ -72,7 +53,7 @@ static unsigned int shard_of(const char *col, const char *key)
 	return h % 64u;
 }
 
-/* AT-5 (c): counts the kept expiries a replay walk hands out */
+/* counts the kept expiries a replay walk hands out */
 static void kind_cb(const char *col, size_t cn, const char *key, size_t kn,
 		uint64_t ver, int expiry, uint64_t oid, uint32_t incarn,
 		uint64_t seq, void *ctx)
@@ -150,9 +131,8 @@ int main(void)
 		st.entries, st.dropped_early);
 	CHK(clretain_get("c", 1, "c01999", 6, 3020) == 2000 && clretain_get("c", 1, "c00000", 6, 3020) == 0,
 		"C: the newest survives, the oldest went first");
-	/* S392: a witness vouches only after the newest delete the cap lost -
-	 * past retain_s's floor (2920), at the planting second of the newest
-	 * entry evicted early (the table holds ~640 of 100 a second: ~3013) */
+	/* a witness vouches only after the newest delete the cap lost: past retain_s's floor
+	 * (2920), at the planting second of the newest entry evicted early (~3013) */
 	{
 		unsigned int cs = clretain_complete_since(3020);
 
@@ -160,10 +140,8 @@ int main(void)
 			"C: complete-since moved to the newest early drop (%u, floor 2920)", cs);
 	}
 
-	/* C2: S443 - expiries counted apart from deletes.  Five of each on a
-	 * fresh table; a delete noted for an expired key turns it into a
-	 * delete; then expiries past the cap - their early drops are
-	 * expiries, and a delete evicted early is not */
+	/* C2: expiries counted apart from deletes; a delete noted for an expired key makes it a
+	 * delete, and past the cap an early drop is an expiry, never a delete */
 	{
 		struct clretain_stats s0, s1;
 		char kk[16];
@@ -194,10 +172,8 @@ int main(void)
 			clretain_note_expiry("c", 1, k, strlen(k), (uint64_t)i + 20, 4002 + (unsigned)i / 100, 0);
 		}
 		clretain_get_stats(&s1, 4022);
-		/* the seeded ten are now 6 deletes (d0..d4, and x0) and 4
-		 * expiries; whichever of the deletes the cap pushed out are the
-		 * only early drops that are not expiries - since S444, none: an
-		 * expiry never pushes out a delete (C3) */
+		/* the seeded ten are now 6 deletes (d0..d4, x0) and 4 expiries, and no delete is an
+		 * early drop: an expiry never pushes one out (C3) */
 		{
 			unsigned long long dr = s1.dropped_early - s0.dropped_early,
 				dx = s1.dropped_early_expiries - s0.dropped_early_expiries,
@@ -211,9 +187,8 @@ int main(void)
 		}
 	}
 
-	/* C3: S444 - an expiry never pushes out a delete.  100 deletes, then
-	 * 2,000 expiries past the cap: every delete is still held, and every
-	 * early drop is an expiry */
+	/* C3: an expiry never pushes out a delete - 100 deletes, then 2,000 expiries past the
+	 * cap: every delete still held, every early drop an expiry */
 	{
 		struct clretain_stats s0, s1;
 		int held = 0;
@@ -262,7 +237,7 @@ int main(void)
 			s1.entries, s1.expiries);
 	}
 
-	/* ---- F: AT-5 */
+	/* ---- F: numbered deletes, forgotten through a mark in each space's arrival order */
 	{
 		struct acc af;
 		struct fg f;
@@ -338,7 +313,7 @@ int main(void)
 		clretain_note_expiry("c", 1, "x1", 2, 1, 7000, 0);
 		clretain_note_expiry("c", 1, "x2", 2, 2, 7008, 0);
 		clretain_note("c", 1, "d1", 2, 3, 7000);
-		clretain_note_expiry("c", 1, "xk", 2, 4, 7000, 1);   /* (c): shortened */
+		clretain_note_expiry("c", 1, "xk", 2, 4, 7000, 1);   /* kept: TTL shortened */
 		clretain_expire_expiries(7010, 10);
 		clretain_get_stats(&st, 7010);
 		CHK(st.entries == 3 && st.expiries == 2 && st.forgotten_expiries == 1 &&
@@ -372,7 +347,7 @@ int main(void)
 		"D: S392 - nothing lost: complete since retain_s's floor (%u, want 4000)",
 		clretain_complete_since(4100));
 
-	/* ---- G: AT-8 */
+	/* ---- G: what the table no longer holds, for a member back from an absence */
 	{
 		struct gn g;
 		char ks[11][16];
@@ -437,10 +412,8 @@ int main(void)
 #endif
 #endif
 #ifdef UNDER_ASAN
-	/* ASan's redzones and its quarantine of the entries C evicted make
-	 * the process's growth no measure of the table (v0.7.2-rc4, GitHub
-	 * check-asan core1: 40.8 MB for the table's 20.7) - the bound is the
-	 * release build's, where the figure is the one the GUIDE quotes */
+	/* ASan's redzones and its quarantine of the entries C evicted make the process's growth
+	 * no measure of the table: the RSS bound is the release build's */
 	CHK(st.entries == 250000, "E: 250,000 held (the RSS bound is the release build's, not ASan's)");
 #else
 	CHK(st.entries == 250000 && (r1 - r0) / 1024 < 40,

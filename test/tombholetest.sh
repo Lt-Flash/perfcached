@@ -1,25 +1,6 @@
 #!/bin/sh
-# tombholetest.sh - 12ny AT-6 (AT-12 d): a lost delete datagram is a hole the
-# member asks for, and nothing past it is forgotten until it is filled.
-#
-# A delete goes to each member as one unicast datagram.  One lost - a full
-# socket, a dropped packet - was lost for good when the member never went
-# silent: the catch-up replay is for a peer back from a SILENCE, and the
-# repair sweep re-sends records, not deletes, so the member kept the key.
-# With numbering, the member sees the hole: its mark stops below it (so no
-# origin forgets past it) and it asks for [from, to] (M_GAP_REQ); the
-# origin re-sends what it holds as numbered tombstones.
-# Three eager nodes; node 3 runs under netcutshim, and for 400 ms it hears
-# nothing from node 1 while node 1 deletes 20 keys a second:
-#   1. the cut was delivered (the shim consumed node 1's datagrams)
-#   2. node 3 asked for the hole and node 1 re-sent what it held
-#   3. node 3 confirms every delete node 1 numbered - its mark passed the
-#      hole - and node 1 forgot them all
-#   4. node 3 holds none of the deleted keys
-# FAIL-FIRST: before AT-6 the hole stays - node 3's mark stops below it,
-# node 1 keeps every delete from the hole on, and node 3 keeps the keys
-# whose deletes it lost.
-# Usage: test/tombholetest.sh [./perfcached] [./netcutshim.so]
+# tombholetest.sh - a lost delete datagram is a hole the member asks for (M_GAP_REQ), and nothing
+# past it is forgotten until the origin re-sends it as numbered tombstones.
 set -u
 BIN=${1:-./perfcached}
 SHIM=${2:-./netcutshim.so}
@@ -107,7 +88,7 @@ print(i)
 PY
 DP=$!
 sleep 4
-echo "cut 127.0.149.1" > "$D/cut3"
+echo "cut 127.0.149.1 rst" > "$D/cut3"
 sleep 0.4
 : > "$D/cut3"
 wait $DP; DP=

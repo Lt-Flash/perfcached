@@ -1,15 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * jsonpath.c — the JSON path engine (task S26).  See jsonpath.h.
- *
- * Everything is span splicing over the S7 tokenizer: parse the document,
- * walk the path to a leaf (or its would-be parent), then rebuild the
- * text as prefix + fragment + suffix.  Token spans need one adjustment:
- * for strings, start/end EXCLUDE the quotes, so the syntactic extent is
- * start-1 .. end+1; containers and primitives already span their whole
- * text.
- */
+/* jsonpath.c - the JSON path engine: span splicing over the tokenizer (prefix + fragment +
+ * suffix); string token spans EXCLUDE their quotes, so their extent is start-1 .. end+1. */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -88,9 +80,8 @@ static int ext_end(const struct pc_jtok *t)
 	return t->type == PC_J_STR ? t->end + 1 : t->end;
 }
 
-/* the walk result: leaf >= 0 when the full path resolved; otherwise
- * parent/-holds the last container reached (valid only when rc says
- * NOLEAF - the final step's parent exists but the member does not). */
+/* the walk result: leaf >= 0 when the full path resolved; on NOLEAF (the final step's parent
+ * exists, the member does not) parent/last hold the last container reached */
 struct jp_walk {
 	int leaf;                  /* token idx of the value, or -1 */
 	int parent;                /* the final step's container token */
@@ -152,9 +143,8 @@ static int jp_member(const char *doc, const struct pc_jtok *t, int ntok,
 	return PC_JP_E_NOLEAF;
 }
 
-/* walk all steps.  On success w->leaf is the value token.  On a missing
- * FINAL step returns PC_JP_E_NOLEAF with w->parent/w->last valid (so
- * jset can create); a missing INTERMEDIATE step is PC_JP_E_MISSING. */
+/* walk all steps: w->leaf is the value token; a missing FINAL step is PC_JP_E_NOLEAF with
+ * w->parent/w->last valid (so jset can create), a missing INTERMEDIATE one PC_JP_E_MISSING */
 static int jp_walk(const char *doc, const struct pc_jtok *t, int ntok,
 		const struct jp_step *st, int ns, struct jp_walk *w)
 {
@@ -175,15 +165,8 @@ static int jp_walk(const char *doc, const struct pc_jtok *t, int ntok,
 	return 0;
 }
 
-/*
- * tokenize into this thread's token array, sized to the document and
- * grown to the largest one the thread has seen - never freed (S283: a
- * malloc per call was one of the per-request allocations DESIGN 12hd
- * found; test/jsonalloctest.sh counts them).  One tokenized document per
- * thread at a time: every caller here is done with the tokens before it
- * tokenizes again (pc_jp_set validates the value, then tokenizes the
- * document).
- */
+/* tokenize into this thread's token array, grown to the largest document seen and never
+ * freed (no malloc per call); one tokenized document per thread at a time */
 static int jp_tokenize(const char *doc, size_t dlen, struct pc_jtok **tp)
 {
 	static __thread struct pc_jtok *scratch;
@@ -368,9 +351,8 @@ int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 		return jp_splice(doc, dlen, a, b, val, vlen, out, cap);
 	}
 	if (rc == PC_JP_E_MISSING && mkpath) {
-		/* walk manually to the deepest EXISTING container, then
-		 * synthesize "rest1":{"rest2":{...VAL}} inside it - name
-		 * steps only, and the container must be an object */
+		/* walk to the deepest EXISTING container (an object), then synthesize
+		 * "rest1":{"rest2":{...VAL}} inside it - name steps only */
 		int cur = 0, si, at, nonempty, n2;
 		char ins[JP_NAME_MAX * 2 + 8];
 		size_t need, k;

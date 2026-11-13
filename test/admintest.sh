@@ -1,7 +1,6 @@
 #!/bin/sh
-# admintest.sh — the admin verbs: save (existing), sync (WAL barrier),
-# load (additive snapshot import - the live value always wins).
-# Usage: test/admintest.sh [./perfcached]
+# admintest.sh - the admin verbs: save, sync (WAL barrier), load (additive snapshot import, the live
+# value always wins), probe.  Usage: test/admintest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 

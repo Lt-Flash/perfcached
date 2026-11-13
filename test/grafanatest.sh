@@ -1,17 +1,6 @@
 #!/bin/sh
-# grafanatest.sh — the three observability surfaces the Grafana Redis
-# datasource renders its panels from (S53): INFO (summary fields +
-# commandstats), CLIENT LIST, SLOWLOG.
-#
-# The formats here are not ours to design - the plugin parses Redis's
-# exact shapes, so every assertion below checks the SHAPE as well as
-# the value: cmdstat_<name>:calls=N,usec=N,usec_per_call=F, CLIENT
-# LIST as space-separated k=v lines, SLOWLOG entries as 6-field arrays
-# (id, unix-time, usec, argv-array, addr, name).
-#
-# Counts are asserted EXACTLY where possible: the driver is a raw RESP
-# client, so nothing injects hidden commands the way redis-cli does.
-# Usage: test/grafanatest.sh [./perfcached]
+# grafanatest.sh - INFO (with commandstats), CLIENT LIST and SLOWLOG in Redis's exact shapes, which
+# the Grafana Redis datasource parses; counts are exact, as a raw RESP client injects no commands.
 set -u
 
 BIN=${1:-./perfcached}
@@ -247,11 +236,8 @@ def parse():
     if t == b"*": return [parse() for _ in range(int(body))]
 for i in range(30):
     s.sendall(cmd([b"SET", b"k%d" % i, b"v"])); parse()
-# The property is the threshold: nothing FASTER than the default 10 ms is
-# logged.  Asserting an empty log made it a timing test - under ASan on a
-# busy runner a SET straight after start took >10 ms once (v0.5.6.3
-# check-asan core), and was rightly logged.  A threshold that is wrong
-# (or not applied) still logs these SETs at a few us, and fails here.
+# the property is the threshold: nothing faster than the default 10 ms is logged (a slow
+# SET under ASan rightly is); a wrong or unapplied threshold logs these and fails
 s.sendall(cmd([b"SLOWLOG", b"GET", b"128"])); ents = parse()
 fast = [e[2] for e in ents if e[2] < 10000]
 print("  %s   default threshold logs nothing faster than 10 ms (%d logged, %d under 10 ms%s)"

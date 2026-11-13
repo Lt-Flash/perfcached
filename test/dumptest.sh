@@ -1,12 +1,6 @@
 #!/bin/sh
-# dumptest.sh - S112 part 1: the `dump` verb.  A three-node eager fleet is
-# filled with records carrying TTLs (some none) and overwritten once so
-# versions differ; a chunked walk of `dump` from a node that took NONE of
-# the writes must yield every live record exactly once, with the value,
-# the TTL and the version the door reports for it, over several chunks
-# and with a slot range that splits the keyspace into two halves whose
-# union is the whole.  Fail-first: a daemon without `dump` answers
-# method-not-found and every assertion here fails.
+# dumptest.sh - a chunked `dump` walk from a node that took none of the writes yields every live record
+# of an eager fleet exactly once, with the door's value, TTL and version; slot ranges split it cleanly.
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 TOOL=${2:-./perfdump}
@@ -50,14 +44,8 @@ start() { # start <id>
 	done
 	echo "node $1 did not start"; cat "$D/n$1.log"; exit 1
 }
-# drive <port> <op> [args]: ops print one line
-#   fill <n>            -> writes n records: key dk<i>, value v<i> + "x"*(i%50), ttl 300 on even i, none on odd;
-#                          then overwrites every 10th with value "w<i>" (a second version); prints "sets=<n>"
-#   dump <count> [lo hi] -> walks dump in chunks of <count> buckets (optional slot range) and prints
-#                           "chunks=<c> records=<r> dup=<d>" then one line per record "key value ttl ver"
-#   get <key>           -> "value ttl" from get (ttl -1 = none), or MISSING
-#   entries             -> entries of dc
-#   buckets             -> buckets of dc
+# drive <port> <op> [args], one line out: fill <n> (dk<i>, TTL on even i, every 10th overwritten), dump
+# <count> [lo hi] (chunks/records/dup, then "key value ttl ver" lines), get <key>, entries, buckets
 drive() {
 	python3 - "$@" <<'PYEOF'
 import json, pcnative, socket, sys, os, time
@@ -88,12 +76,8 @@ if op == "fill":
 elif op == "dump":
     count = int(sys.argv[3]); lo = int(sys.argv[4]) if len(sys.argv) > 4 else None; hi = int(sys.argv[5]) if len(sys.argv) > 5 else None
     cursor = 0; chunks = 0; seen = {}; dup = 0; out = []; maxn = 0; table = None; restarts = 0
-    # each record once only while the table is QUIET: a linear-hash split
-    # during the walk moves half a bucket ahead of the cursor, which then
-    # sees it again - the documented at-least-once.  A member still
-    # growing from the push did exactly that on rc32's check-asan (114
-    # repeats).  Wait for the bucket count to stand still for 1.5 s with
-    # no resize running; a swap during the walk is caught by `table`.
+    # each record once only while the table is QUIET (a split moves records ahead of the
+    # cursor): wait for the bucket count to stand still 1.5 s with no resize running
     last = None; still = 0
     for _ in range(120):
         st = call("stats")
@@ -154,12 +138,8 @@ i=0; while [ $i -lt 100 ]; do grep -q "recovering -> ready" "$D/n1.log" && grep 
 R=$(drive 17641 fill 2000)
 [ "$R" = "sets=2000" ] && ok "2000 records written at node 1, 200 of them twice" || bad "fill: $R"
 await_entries 17643 2000 30 && ok "node 3 holds all 2000 by the push" || bad "node 3 holds $(drive 17643 entries), want 2000"
-# 2000 records in 256 buckets is load factor 7.8: the maintenance thread
-# splits 128 buckets a second until it is under four, and a split moves
-# half a bucket's records AHEAD of a walk's cursor, where it sees them
-# again - the cursor's at-least-once contract under a resize, the same
-# one a tool must document.  Every assertion below wants a quiet table,
-# so wait until the bucket count has stood still for two seconds.
+# 2000 records in 256 buckets make the maintenance thread split, and a split moves records ahead of a
+# walk's cursor (at-least-once under a resize): wait until the bucket count stands still for 2 s
 B0=$(drive 17643 buckets); i=0
 while [ $i -lt 40 ]; do sleep 0.5; B1=$(drive 17643 buckets); [ "$B1" = "$B0" ] && i=$((i+1)) || i=0; B0=$B1; [ $i -ge 4 ] && break; done
 echo "  ..   table settled at $B0 buckets"
@@ -197,11 +177,8 @@ NL=$(head -1 "$D/lo.out" | sed -n 's/.*records=\([0-9]*\).*/\1/p'); NH=$(head -1
 OV=$(cat "$D/lo.out" "$D/hi.out" | tail -n +2 | awk '$1 ~ /^dk/{print $1}' | sort | uniq -d | wc -l)
 [ "$OV" = 0 ] && ok "no key in both halves" || bad "$OV keys in both slot halves"
 
-# 5. the overflow leg is chunked, not drained in one reply: 2000 records in
-#    256 buckets of 6 slots put hundreds in the leg; with 16-bucket chunks
-#    the walk budgets the leg itself (S121: 16 buckets' worth of records
-#    per call, whole chains, so at most one chain over) and still yields
-#    every record exactly once
+# 5. the overflow leg is chunked, not drained in one reply: with 16-bucket chunks the walk budgets
+#    the leg itself (whole chains, at most one over) and still yields every record exactly once
 drive 17643 dump 16 > "$D/small.out"; HS=$(head -1 "$D/small.out")
 NS=$(echo "$HS" | sed -n 's/.*records=\([0-9]*\).*/\1/p'); DS=$(echo "$HS" | sed -n 's/.*dup=\([0-9]*\).*/\1/p'); CS=$(echo "$HS" | sed -n 's/chunks=\([0-9]*\).*/\1/p')
 [ "$NS" = 2000 ] && [ "$DS" = 0 ] && ok "16-bucket chunks: every record once again ($CS chunks)" || bad "16-bucket chunks: $HS"
@@ -209,19 +186,16 @@ NS=$(echo "$HS" | sed -n 's/.*records=\([0-9]*\).*/\1/p'); DS=$(echo "$HS" | sed
 MX=$(echo "$HS" | sed -n 's/.*maxchunk=\([0-9]*\).*/\1/p')
 [ "${MX:-999}" -le 104 ] && ok "no chunk exceeded its budget: largest $MX records (16 buckets x 6 slots, plus at most one chain of the leg)" || bad "a chunk carried $MX records: the budget did not hold (S121)"
 
-# 6. a count covering the whole table is never a cut: S281 walks the leg
-#    FIRST, and the call that finishes it goes on through the buckets with
-#    its budget, so the whole table is one chunk (it was two - the buckets,
-#    then the leg on the next call)
+# 6. a count covering the whole table is never a cut: the leg is walked FIRST and the call that
+#    finishes it goes on through the buckets, so the whole table is one chunk
 drive 17643 dump 16384 > "$D/big.out"; R=$(head -1 "$D/big.out")
 case "$R" in
 	chunks=1\ records=2000\ dup=0*) ok "a whole-table count is one chunk, the leg then the buckets ($R)";;
 	ERROR*halve*) ok "an oversized chunk is refused whole with the halving hint";;
 	*) bad "whole-table count: $R";;
 esac
-# 7. the tool: three connections on bucket ranges dump the collection to a
-#    directory; every record once with its value, ttl and version equal to
-#    the verb's; the manifest verifies; then the same through zstd
+# 7. the tool: three connections on bucket ranges dump to a directory, every record once and equal
+#    to the verb's; the manifest verifies; then the same through zstd
 if [ -x "$TOOL" ]; then
 	T=$("$TOOL" --from 127.0.0.1:17643 --collections dc --threads 3 --count 16 --zstd 0 --out "$D/dump" 2>&1 | tail -1)
 	case "$T" in
@@ -246,20 +220,20 @@ seen = {}; bad = 0; now = time.time() * 1000
 for f in sorted(os.listdir(d)):
     if not f.endswith(".pcd"): continue
     b = open(os.path.join(d, f), "rb").read()
-    assert b[:4] == b"PCD1", f
+    assert b[:4] == b"PCD2", f
     off = 4
     while True:
         kl = struct.unpack_from("<I", b, off)[0]
         if kl == 0xFFFFFFFF:
             n = struct.unpack_from("<Q", b, off + 4)[0]; break
-        vl, exp, ver, flags = struct.unpack_from("<IQQB", b, off + 4)
+        vl, exp, ver, rtype = struct.unpack_from("<IQQB", b, off + 4)
         off += 25
         k = b[off:off + kl].decode(); v = b[off + kl:off + kl + vl].decode(); off += kl + vl
         if k in seen: bad += 1
         seen[k] = 1
         w = want.get(k)
         if not w: bad += 1; continue
-        if w[0] != v or w[2] != ver: bad += 1
+        if w[0] != v or w[2] != ver or rtype != 0: bad += 1
         if w[1] < 0 and exp != 0: bad += 1
         if w[1] >= 0 and not (now + (w[1] - 20) * 1000 <= exp <= now + (w[1] + 5) * 1000): bad += 1
 print("records=%d bad=%d" % (len(seen), bad))
@@ -267,10 +241,10 @@ PYEOF
 )
 	[ "$RB" = "records=2000 bad=0" ] && ok "the chunk files hold every record once, values, versions and absolute expiries agreeing with the verb" \
 		|| bad "chunk files: $RB"
-	# S344: a manifest's file names reach no shell - a quote runs nothing, a path is refused
+	# a manifest's file names reach no shell - a quote runs nothing, a path is refused
 	mkdir -p "$D/evil"
 	cat > "$D/evil/manifest.json" <<'EOF'
-{"source":"x","files":[{"file":"a'; touch s344-ran; echo '","collection":"c","records":0,"crc32":0,"complete":true},{"file":"../outside","collection":"c","records":0,"crc32":0,"complete":true}]}
+{"format":"perfdump-format","format_version":2,"source":"x","files":[{"file":"a'; touch s344-ran; echo '","collection":"c","records":0,"crc32":0,"complete":true},{"file":"../outside","collection":"c","records":0,"crc32":0,"complete":true}]}
 EOF
 	TOOLA=$(readlink -f "$TOOL")
 	(cd "$D/evil" && "$TOOLA" --inspect "$D/evil" > "$D/evil.out" 2>&1)

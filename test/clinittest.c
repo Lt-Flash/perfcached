@@ -1,12 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- *
- * clinittest.c - the node identity file format (M13 slice 1).
- *
- * The doc's test note for M13 asks for "digest golden values; each
- * refusal path".  Both are here: fnv1a64 against fixed vectors, and one
- * case per named refusal - which is only possible because each refusal
- * has its own message rather than a shared -1.
- */
+ * clinittest.c - the node identity file: fnv1a64 golden values, every refusal path by its own
+ * message, the config digest and the proposed node id. */
 #include <stdio.h>
 #include <string.h>
 
@@ -39,9 +33,6 @@ int main(void)
 		id[i] = (unsigned char)(i * 17);
 
 	/* A. fnv1a64 GOLDEN VALUES - the published FNV-1a 64 vectors */
-	/* the PUBLISHED FNV-1a 64 vectors.  They failed before 2026-09-13
-	 * because the offset basis was one digit short; that is fixed, so
-	 * these now pin it to the real algorithm. */
 	chk(clinit_fnv1a64((const unsigned char *)"", 0) == 14695981039346656037ULL,
 		"A1 fnv1a64(\"\") is the offset basis");
 	chk(clinit_fnv1a64((const unsigned char *)"a", 1) == 0xaf63dc4c8601ec8cULL,
@@ -63,10 +54,8 @@ int main(void)
 	chk(strlen(hex) == 32, "B1 32 hex digits");
 	chk(!strcmp(hex, "00112233445566778899aabbccddeeff"), "B2 the right ones");
 
-	/* B2b. NIBBLE ORDER.  Every byte above is 0x00, 0x11, 0x22 ... -
-	 * palindromic, so swapping the nibbles produces identical output
-	 * and the check above cannot see it.  Use bytes whose halves
-	 * differ.  (mutation: swap the two hx[] lookups) */
+	/* B2b. nibble order: the bytes above are palindromic (0x00, 0x11 ...) and hide a nibble
+	 * swap, so use bytes whose halves differ */
 	{
 		unsigned char asym[16];
 		char ah[33];
@@ -114,10 +103,8 @@ int main(void)
 		why, sizeof why);
 	chk_why(rc, why, "first line", "E2 a wrong first line");
 
-	/* E2b. A file of the RIGHT LENGTH whose header text is wrong.  The
-	 * case above is short enough that the length check refuses it
-	 * first, so removing the header comparison went unnoticed.
-	 * (mutation: drop the memcmp against CLINIT_IDENT_HEADER) */
+	/* E2b. the right length with a wrong header: the case above is refused by its length
+	 * first, so it cannot see the header check */
 	{
 		char b3[256];
 		size_t l3 = clinit_ident_render(b3, sizeof b3, id);
@@ -186,12 +173,8 @@ int main(void)
 	if (i >= (int)len)
 		chk(1, "F1 every truncation of the file is refused");
 
-	/* ---- G. the config digest (slice 2) ------------------------------
-	 * The number two nodes compare to decide whether they may federate.
-	 * A digest that drifts refuses every join, so these golden values
-	 * were computed from an INDEPENDENT reimplementation of the fold,
-	 * not read out of this code - otherwise they would pin whatever it
-	 * happens to do rather than what it must do. */
+	/* ---- G. the config digest, which two nodes compare before they federate -----------
+	 * golden values from an independent reimplementation of the fold, not from this code */
 	{
 		struct clinit_digest_in in;
 		const char *ab[2] = { "a", "b" };
@@ -210,9 +193,8 @@ int main(void)
 		d1 = clinit_config_digest(&in);
 		chk(d1 == 0x5f025e56d9975374ULL, "G2 with two collections");
 
-		/* G3. ORDER INDEPENDENCE - the property the sort exists for.
-		 * Two nodes listing their collections differently must still
-		 * federate. */
+		/* G3. order independence, what the sort exists for: two nodes listing their
+		 * collections differently must still federate */
 		in.names = ba;
 		d2 = clinit_config_digest(&in);
 		chk(d2 == d1, "G3 the same set in the other order digests the same");
@@ -240,10 +222,8 @@ int main(void)
 		chk(clinit_config_digest(&in) != d0,
 			"G5 dropping a collection changes it");
 
-		/* S127: K decides WHICH nodes hold a key, so two members
-		 * running different K place the same record differently and
-		 * each reads the other as missing it.  It must move the
-		 * digest, and each K must be distinct from every other. */
+		/* K decides which nodes hold a key, so members running different K each read the
+		 * other as missing records: K must move the digest, each value distinctly */
 		in.route_algo = "hrw-slot16k-v1"; in.n_names = 1;
 		in.replicas = 2;
 		chk(clinit_config_digest(&in) != d0,
@@ -258,8 +238,8 @@ int main(void)
 		}
 		in.replicas = 0;
 
-		/* G6. a fleet with no WAL keeps the digest it had before the
-		 * flag existed - what makes a rolling upgrade safe (S73b) */
+		/* G6. a fleet with no WAL keeps the digest it had before the flag existed, which
+		 * makes a rolling upgrade safe */
 		in.n_names = 1; in.wal = 0;
 		chk(clinit_config_digest(&in) == d0,
 			"G6 wal=0 folds nothing, so the pre-flag digest is unchanged");
@@ -284,10 +264,8 @@ int main(void)
 		}
 	}
 
-	/* ---- H. the proposed node id (slice 3) ---------------------------
-	 * Derived from the identity so a node suggests the same id every
-	 * start.  The master arbitrates, so a collision is resolved rather
-	 * than fatal - but the range must hold and it must be stable. */
+	/* ---- H. the proposed node id, derived from the identity so it is stable --------
+	 * across starts; the master arbitrates a collision, but the range must hold */
 	{
 		unsigned char a[16], b[16];
 		int idA, idB, j;

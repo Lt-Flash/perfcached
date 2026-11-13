@@ -1,13 +1,6 @@
 #!/bin/sh
-# movedhinttest.sh - RV-10: a forwarded reply tells a routing client it is
-# behind (see movedhinttest.c for the claim and the stale map it builds).
-#
-# The driver: a two-node SHARD fleet, the routing client connects and
-# names its cue, a third node joins - a third of the keyspace changes
-# owner under a client that will not hear about it - and the client's
-# verdicts are counted.  Against a daemon without the hint the handle
-# keeps two members for the whole run.
-# Usage: test/movedhinttest.sh [./perfcached] [./movedhinttest]
+# movedhinttest.sh - a forwarded reply tells a routing client its map is behind when a third node joins
+# under it (the claim is in movedhinttest.c).  Usage: test/movedhinttest.sh [./perfcached] [./movedhinttest]
 set -u
 BIN=${1:-./perfcached}
 MH=${2:-./movedhinttest}

@@ -1,17 +1,6 @@
 #!/bin/sh
-# meshtrialtest.sh - CH-14: in unicast mode an address heard only from a
-# JOIN_REQ or a hint is kept CLMESH_TRIAL_MS (30 s), not ten minutes - a
-# joiner re-announces every second and never lapses, while one replayed
-# JOIN_REQ had bought ten minutes of every control frame at its address.
-# A two-node unicast fleet; a JOIN_REQ from 127.0.144.9 (clinject) to the
-# member, and then a listener on that address counting what arrives.
-#   1  the fleet beats at the address it was told of: frames arrive in the
-#      first seconds (node 2's beats, and the master's after node 2's hint)
-#   2  nothing arrives from 70 s on: node 2 dropped it at 30 s, and the
-#      master, last hinted then, 30 s after that
-# The joining flows the trial must not break are foundtest's and
-# unicasttest's (joiners that know each other only through hints).
-# Usage: test/meshtrialtest.sh [./perfcached] [./clinject]
+# meshtrialtest.sh - in unicast mode an address heard only from a JOIN_REQ or a hint is kept CLMESH_TRIAL_MS
+# (30 s), so a replayed JOIN_REQ buys no lasting traffic.  Usage: test/meshtrialtest.sh [./perfcached] [./clinject]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -71,9 +60,8 @@ wait_for() { # wait_for <secs> <shell condition>
 up() { st "$1" 'r["cluster"]["peers_up"]'; }
 
 conf 1; conf 2
-# node 1 founds alone first: which of two nodes started 2 s apart founds is
-# a race (node 2 won it under ASan on GitHub), and the JOIN_REQ goes to the
-# member
+# node 1 founds alone first: which of two nodes started 2 s apart founds is a race, and the
+# JOIN_REQ goes to the member
 start 1
 wait_for 30 '[ "$(st 1 "r[\"cluster\"][\"role\"]")" = master ]' || bad "node 1 did not found the fleet"
 start 2

@@ -1,30 +1,5 @@
-/*
- * clworktest.c - the worker entry points, with nothing of cluster.c
- * linked (M9b, wave 4).
- *
- * M9's bullet named no test, and M9 noted why: its entry points needed
- * a populated peer table and live arena state.  With the send path a
- * module (M14) and the pending table one (M2), they need neither - this
- * links the REAL clwork.o, clpend.o and clsend.o, captures what would
- * have been sent, opens it, and parses it.  Only the accessors are
- * stand-ins: the table they hand out is a real struct clpeers.
- *
- * What it pins is what a client sees when this goes wrong: a forward
- * that parks a slot and sends nothing hangs until the deadline; one that
- * sends and parks nothing loses the answer; a failed send that keeps its
- * slot leaks the table a slot at a time; a pull that reaches a dead
- * peer waits on an answer that cannot come.
- *
- * The write-path push (M9b's second half) links the real clpush.o and
- * clmig.o too, so what reaches a peer is a real group, opened and parsed
- * back.  Its failures are quieter than the forward's: a record pushed to
- * a peer that is not a holder is extra apply work on every node, and a
- * record NOT pushed to one is a copy the fleet believes it has - and
- * under spread the return value decides whether this node keeps the
- * record at all.
- *
- * Build: see the Makefile's clworktest target.
- */
+/* clworktest.c - the worker entry points over the real clwork, clpend, clsend, clpush and clmig,
+ * only cluster.c's accessors stubbed: what is sent is captured, opened and parsed back. */
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -69,18 +44,18 @@ static unsigned long long repl_pushed, repl_groups, not_held, skipped_big;
 
 struct clpush *cl_push(void) { return &PW; }
 int pc_cluster_replicas(void) { return K; }
-/* 12nt: clwork asks upstream.c how long a through key's pull or forward
- * may wait (the owner fetches first); no upstream here */
+/* clwork asks upstream.c how long a through key's pull or forward may wait (the owner
+ * fetches first); no upstream here */
 int pc_upstream_pull_extra_ms(const char *col, size_t collen) { (void)col; (void)collen; return 0; }
 int pc_worker_id(void) { return 0; }
-/* S461: clrp.o's one call into cluster.c - a relay-port group's apply */
+/* clrp.o's one call into cluster.c - a relay-port group's apply */
 void cl_repl_apply_group(const unsigned char *pt, size_t n, const pc_addr *from)
 { (void)pt; (void)n; (void)from; }
 unsigned int compat_ticks(void) { return ticks; }
 void cl_px_repl_pushed(unsigned long long n) { repl_pushed += n; }
 void cl_px_repl_groups(void) { repl_groups++; }
 void cl_px_spread_not_held(void) { not_held++; }
-static unsigned long long ack_parked, ack_kept;          /* S253 */
+static unsigned long long ack_parked, ack_kept;
 void cl_px_spread_ack(unsigned int parked, unsigned int kept)
 {
 	ack_parked += parked;
@@ -396,9 +371,7 @@ int main(void)
 	}
 
 	/* ---- spread: the K holders, and the keep decision ------------------ *
-	 * This node READY, peer 9 past its slot grace: the candidates are
-	 * exactly 42, 5 and 7, all live, so with K = 2 every key has two
-	 * holders and what this node keeps plus what it sends is always 2. */
+	 * candidates 42, 5 and 7 (9 past its grace): with K = 2, kept plus sent is always 2 */
 	K = 2;
 	nst = PC_NST_READY;
 	PT.peers[2].last_seen_ms = NOW - PEER_UP_MS - PEER_SLOT_GRACE_MS - 1;
@@ -445,9 +418,8 @@ int main(void)
 		}
 		chk(bad == 0, "spread, 64 keys: kept here + sent is K for every one");
 
-		/* peer 9 quiet but inside its grace: still a candidate, so a key
-		 * it holds has one live holder fewer to send to - and the push
-		 * sends to LIVE holders only, never to the one that is quiet */
+		/* peer 9 quiet but inside its grace: still a candidate, but the push sends to LIVE
+		 * holders only, so a key it holds has one holder fewer to send to */
 		PT.peers[2].last_seen_ms = NOW - PEER_UP_MS - 1;
 		for (i = 0, bad = 0, in = 0; i < 64; i++) {
 			unsigned want = 0;

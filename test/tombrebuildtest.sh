@@ -1,31 +1,6 @@
 #!/bin/sh
-# tombrebuildtest.sh - 12ny AT-8 (AT-12 g): a member away longer than the
-# fleet keeps deletes for it is rebuilt, not waited for - and keeps what it
-# wrote while it was away.
-#
-# The deletes a member missed are kept for it while it is counted and up to
-# tombstone_retain_s; past that nobody holds them, and a replay or a gap
-# request has nothing to give back.  A restart was already told (S392's
-# fast path refuses and it walks).  A member back WITHOUT a restart - a
-# partition healed - took the replay of what was left and kept the keys
-# whose deletes were gone, and pushed them back to the fleet.  Now the
-# nodes that no longer hold what it missed say so (M_REBUILD) and it
-# reconciles every record written before its absence; its writes since are
-# not in question.  Three eager nodes, tombstone_retain_s 20; node 3 under
-# netcutshim is cut from both peers, multicast too, for 35 s:
-#   1. during the cut node 1 deletes 200 of 300 keys, and node 3 takes 50
-#      writes of its own (as far as it accepts them alone)
-#   2. healed: node 1 or 2 asked node 3 to rebuild, node 3 took it, and
-#      the asker saw it taken (one pass, or two when the askers' views of
-#      when the absence began fall in different seconds)
-#   3. node 3 holds none of the 200 deleted keys and all 100 that live
-#   4. node 3 still holds every write it accepted during the cut - stored
-#      after the absence began, so not in question
-#   5. nodes 1 and 2 hold none of the 200 either: nothing node 3 kept came
-#      back to them on the heal
-# FAIL-FIRST: before AT-8 nobody asks - node 3 keeps the deleted keys whose
-# deletes the time rule dropped while it was away.
-# Usage: test/tombrebuildtest.sh [./perfcached] [./netcutshim.so]
+# tombrebuildtest.sh - a member away longer than tombstone_retain_s (partitioned, not restarted) is told
+# to rebuild: it drops the keys whose deletes it missed and keeps what it wrote while away.
 set -u
 BIN=${1:-./perfcached}
 SHIM=${2:-./netcutshim.so}
@@ -121,10 +96,8 @@ print(sum(1 for i in range(a, b) if (pcnative.call(f, "get", col="c", key="%s:%d
 PY
 }
 k=0; while [ $k -lt 75 ] && { [ "$(st 1 'c.get("peers_up")')" != 2 ] || [ "$(st 1 'c["acks"]["fleet"]["confirming"]')" != True ]; }; do sleep 0.2; k=$((k+1)); done
-# a write node 1 takes before any is counted on: v0.7.3-rc4 (GitHub core2)
-# found node 3 holding none of the 300 below, the helper's count thrown
-# away - and tombjointest's node 1 had taken none of its writes, the fleet
-# formed by every figure it read.  The first refusal is said either way
+# a write node 1 takes before any is counted on (a fleet formed by every figure can still refuse
+# writes); the first refusal is said either way
 probe() { # a write node 1 takes: "ok", or what refused it
 	python3 - <<'PY' 2>&1
 import socket, pcnative
@@ -140,11 +113,8 @@ k=0; P0=; while [ $k -lt 75 ]; do
 done
 [ -n "$P0" ] && echo "  ..   node 1 refused a write after the fleet formed: $P0; took one after $k polls"
 [ "$P1" = ok ] || bad "node 1 takes no write after 15 s: $P1"
-# the rebuild's drops need a WITNESS - a peer up, and complete, 30 s
-# (WITNESS_GRACE_MS: three sweeps) before node 3's absence began; nodes 1
-# and 2 booted ~10 s before the cut in v0.7.3-rc5 (both CIs), so every drop
-# was deferred and node 3 kept all 200 deleted keys.  The cut comes 32 s
-# after the starts (S455: a rebuild with no witness drops nothing)
+# the rebuild's drops need a WITNESS, a peer up and complete WITNESS_GRACE_MS (30 s) before node 3's
+# absence began - without one it drops nothing - so the cut comes 32 s after the starts
 w=$((32 - $(date +%s) + T0 - 3)); [ $w -gt 0 ] && sleep $w
 W=$(ops 1 set r 0 300)
 [ "$W" = 300 ] || bad "node 1 took $W of the 300 writes"
@@ -153,7 +123,7 @@ sleep 3
 
 # 1. the cut - the r: keys were stored on node 3 3 s before it, its own w:
 # keys 3 s after: a second either side of the boundary is rounding
-echo "cut 127.0.151.1 127.0.151.2 mcast" > "$D/cut3"
+echo "cut 127.0.151.1 127.0.151.2 mcast rst" > "$D/cut3"
 sleep 3
 D1=$(ops 1 del r 0 200)
 W3=$(ops 3 set w 0 50)

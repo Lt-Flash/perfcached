@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * dirlock.c - S290: one daemon per state / WAL directory.  See dirlock.h.
- */
+/* dirlock.c - one daemon per state / WAL directory: an fcntl() lock (F_GETLK names
+ * the holder, unlike flock) on a file inside it, dropped by the kernel at exit. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -47,12 +46,8 @@ int pc_dir_lock(const char *dir, const char *what, int create)
 			"to start\n", what, dir, path, strerror(errno));
 		return -1;
 	}
-	/* A predecessor that is still DYING holds the lock for a moment: a
-	 * kill -9 is delivered asynchronously, a clean stop takes as long
-	 * as its last snapshot, and a restart that starts the next process
-	 * at once would otherwise be refused by its own past.  So wait up to
-	 * DIRLOCK_WAIT_MS for the holder to let go, saying so once; a
-	 * holder that is alive and staying is refused after the wait. */
+	/* a DYING predecessor (kill -9 is asynchronous, a clean stop finishes its
+	 * snapshot) holds it a moment: wait DIRLOCK_WAIT_MS before refusing */
 	{
 		int waited = 0, said = 0;
 
@@ -110,8 +105,7 @@ int pc_dir_lock(const char *dir, const char *what, int create)
 	if (ftruncate(fd, 0) == 0 && write(fd, pid, (size_t)n) != n)
 		LM_WARN("%s %s: could not write the pid into %s\n", what, dir,
 			path);
-	/* held for the life of the process: the fd is deliberately never
-	 * closed - closing ANY descriptor of the file would drop an fcntl
-	 * lock, which is why nothing else in the daemon opens this file */
+	/* the fd is never closed: closing ANY descriptor of the file drops an
+	 * fcntl lock, which is why nothing else in the daemon opens it */
 	return 0;
 }

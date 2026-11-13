@@ -1,37 +1,6 @@
 #!/bin/sh
-# healtest.sh - S229: a node that loses WAL records heals itself.
-#
-# A ring drop or a segment overrun loses an acknowledged write from the
-# LOG - not from memory: every write stores to the table first and
-# enqueues to the WAL after.  So a snapshot that starts after the last
-# loss makes every acknowledged write durable again.  Before S229 the node
-# went FAILED and stayed there until restarted, and the dropped writes
-# were gone after that restart.  Now it goes HEALING - writes refused,
-# reads served, out of client selection, still in the map - takes an
-# unthrottled snapshot, and returns to READY by itself when one that began
-# after the last loss is published.
-#
-# One node, a 16 KB producer ring, 1 KB fill values, snapshots otherwise off:
-#   1. a paced fill of 40,000 keys lands with nothing dropped;
-#   2. a pipelined burst of 20,000 x 4 KB on 4 connections, with the WAL's
-#      device made SLOW for its duration (syncfailshim "walslow": each
-#      append succeeds after 100 ms), overflows the rings - records are
-#      DROPPED on any runner.  A burst that merely raced the pump dropped
-#      nothing under ASan on GitLab (rc36): the loss has to be forced;
-#   3. the node is seen HEALING, refusing a write with the heal's own
-#      message while serving a read, and returns to READY by itself, one
-#      heal counted, the log saying both - and waits until wal.unhealed
-#      (losses no heal has covered yet) is 0, not just for READY;
-#   4. it takes writes again, and /metrics shows the state and the heal;
-#   5. THE POINT: kill -9 and restart - every write the node acknowledged
-#      is there with its value, the dropped ones included.
-# FAIL-FIRST: on a build before S229 the node goes FAILED and stays there,
-# and after the restart the dropped writes are missing.
-# Not covered here, and why: with a [wal] dir the snapshot writer always
-# exists, so "no snapshot directory to heal from" cannot be configured;
-# and a heal whose snapshot the device refuses cannot be isolated -
-# syncfailshim fails the WAL's own syncs first (FAILED, as S215 wants).
-# Usage: test/healtest.sh [./perfcached] [./syncfailshim.so]
+# healtest.sh - a node that loses WAL records (forced ring drops) heals itself: HEALING, an unthrottled
+# snapshot, READY again, and every acknowledged write survives a kill -9 and restart.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -42,9 +11,8 @@ case "$SHIM" in /*) ;; *) SHIM="$PWD/$SHIM";; esac
 # preload list; the shim goes last (as in syncfailtest)
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 PRELOAD="${SANRT:+$SANRT }$SHIM"
-# the WAL on tmpfs where there is one: on a disk whose write-back holds
-# ~35 MB/s even a paced 1 KB fill overflows a 64 KB ring (S226), and the
-# fill must land clean so the heal is the burst's
+# the WAL on tmpfs where there is one: a slow disk overflows the ring even on the paced fill, which
+# must land clean so the heal is the burst's
 BASE=/var/tmp; [ -d /dev/shm ] && [ -w /dev/shm ] && BASE=/dev/shm
 D=$(mktemp -d $BASE/pcheal.XXXXXX)
 PID=
@@ -80,7 +48,7 @@ segment_mb = 16
 segments = 16
 ring_kb = 16
 save = off
-# S466: the default waits rather than lose a record; this test is about the heal
+# the default waits rather than lose a record; this test is about the heal
 on_full = heal
 CONF
 chmod 600 "$D/n.conf"
@@ -111,11 +79,8 @@ def call(s, f, m, **p):
 def out(k, v): print("%s=%s" % (k, v)); sys.stdout.flush()
 val = lambda i: ("v%d:" % i) + "x" * 990
 acked = {}
-# 1. the fill, bounded by the pump: a write is acknowledged at the ring,
-# so pacing by round trips bounds nothing - 2 in flight still dropped 34
-# under ASan on a busy runner (rc38), the pump slower than the client.  A
-# sync barrier every 8 records (~8 KB, half the 16 KB ring) drains it
-# before the next 8 go in, however slow the pump.
+# 1. the fill, bounded by the pump (a write is acked at the ring): a sync barrier every
+# 8 records (~8 KB, half the 16 KB ring) drains it however slow the pump
 s, f = conn()
 for b in range(0, 40000, 2):
     reqs = "".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": "set",
@@ -140,11 +105,8 @@ def watch():
             if (g.get("result") or {}).get("value") == val(1): reads_ok[0] += 1
         time.sleep(0.02)
 wt = threading.Thread(target=watch); wt.start()
-# 2. the burst: 4 connections at once (both workers' rings), 5,000 each,
-# 4 KB values (four fill a 16 KB ring), pipelined - each with a
-# writer and a reader on its socket, so the replies never back up into a
-# deadlock.  On tmpfs a 1 KB burst from one connection dropped only one
-# run in three: the pump kept up.
+# 2. the burst: 4 connections (both workers' rings), 5,000 x 4 KB each, pipelined with
+# a writer and a reader per socket so the replies never back up into a deadlock
 big = lambda i: ("b%d:" % i) + "y" * 3990
 def burst(lo, n, res):
     bs, bf = conn(); rep = []
@@ -165,13 +127,8 @@ for lo, rep in res.items():
     for i, r in zip(range(lo, lo + 5000), rep):
         if (r.get("result") or {}).get("stored"): acked["k%06d" % i] = big(i); burst_ok += 1
 out("BURST_ACKED", burst_ok)
-# 3. wait for the heal to finish - ALL of it.  READY is not enough: a
-# loss is counted when a worker drops the record, the heal starts on the
-# WAL thread's next pass, and under walslow that pass can be seconds away.
-# A first heal that ended before the burst did left READY showing while
-# the burst's last drops waited for a second heal (rc64 GitLab: the write
-# in step 4 refused, heals 2).  wal.unhealed is the losses no heal has
-# covered yet; 0 means done.
+# 3. wait for the heal to finish - ALL of it: READY can show between two heals;
+# wal.unhealed counts the losses no heal has covered yet, 0 means done
 t0 = time.time(); st = {}; early = 0
 while time.time() - t0 < 60:
     st = call(s, f, "stats")["result"]
@@ -190,8 +147,8 @@ out("REFUSAL_MSG", (refusals[0] if refusals else "")[:60]); out("READS_WHILE_HEA
 r = call(s, f, "set", col="c", key="after", value="yes"); ok_after = bool((r.get("result") or {}).get("stored"))
 if ok_after: acked["after"] = "yes"
 out("WRITE_AFTER", ok_after)
-# before the kill -9 below: an ack is at the producer ring, and kill -9
-# takes what the WAL thread has not drained (rdbkilltest lost 1 that way)
+# before the kill -9 below: an ack is at the producer ring, and kill -9 takes what
+# the WAL thread has not drained
 call(s, f, "sync")
 m = urllib.request.urlopen("http://127.0.0.1:%d/metrics" % hport, timeout=5).read().decode()
 out("M_READY", 'perfcached_node_state{state="ready"} 1' in m)

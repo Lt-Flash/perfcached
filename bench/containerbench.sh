@@ -1,82 +1,18 @@
 #!/bin/sh
-# containerbench.sh — the RESP comparison, assembled from nothing.
-#
-# Builds its own perfcached image, pulls its own Redis, creates its own
-# network, runs both phases, writes one TSV, tears everything down.  The
-# host needs a container runtime and nothing else: no compiler, no
-# libsodium, no redis-server, no perfcached binary.  That is the point -
-# bench/respbench.sh measures the same thing but wants a built tree and
-# a Redis on the host, which is a lot to ask of someone evaluating this
-# for the first time.
-#
-#   PHASE 1  redis container  vs  ONE standalone perfcached container
-#   PHASE 2  redis container  vs  a 3-node perfcached cluster, one arm
-#            per mode: store, eager, proxy, shard
-#
-# THE CLIENT IS redis-benchmark, RUN IN ITS OWN CONTAINER, on the same
-# bridge as both servers.  Redis's own tool, unmodified, speaking native
-# RESP to redis-server and to perfcached's RESP door alike - so neither
-# server is favoured by client placement, and the client cannot tell
-# which it reached.  Running it on the host instead would give whichever
-# server shares the host's network namespace an unearned advantage.
-#
-# Usage:
-#   bench/containerbench.sh                 # everything, both dialects (resp bin)
-#   REPS=1 bench/containerbench.sh          # smoke run, ~2 h; REPS=3 ~5.5 h
-#   (about 244 cells of up to 4M requests each: the 8-minute smoke run
-#   this line once promised predates n_for sizing the cells.  Both
-#   timings predate S136 stretching every fast cell to CELL_MIN_S, and
-#   have not been re-taken since)
-#   CELL_MIN_S=0 bench/containerbench.sh    # the pre-S136 sizing, to
-#                                           # compare with rows it made
-#   PHASES=1 bench/containerbench.sh        # standalone comparison only
-#   MODEARMS="store shard" bench/containerbench.sh   # of: store eager proxy shard spread
-#   DIALECTS=resp bench/containerbench.sh   # RESP only, the old behaviour
-#   DIALECTS=bin bench/containerbench.sh    # the native door only
-#   RUNTIME=podman bench/containerbench.sh  # default: nerdctl, else podman
-#   NETEM="delay 5ms rate 10mbit" bench/containerbench.sh
-#                                           # shape the bench traffic
-#
-# Results: /var/tmp/containerbench/results.tsv, same COLUMNS as
-# respbench.sh - but do not read the two as one table.  Everything here
-# crosses a bridge veth and sits under a container's limits, where
-# respbench runs on host loopback; the arms inside THIS file are
-# comparable to each other, which is what it is for.  Comparing a
-# container number to a host number measures the container.
+# containerbench.sh - Redis vs perfcached over RESP and the native door, built and run in containers
+# (needs only a runtime).  Rows cross a bridge veth: compare arms here, not with respbench's host rows.
 set -u
 
-# Pick a runtime that can actually BUILD, not merely one that is
-# installed.  nerdctl answers `info` happily and then fails every build
-# because buildkitd is not running - so "installed" and "usable" and
-# "can do the job" are three different questions, and only the last one
-# matters here.  Probed with a real one-line image rather than a flag.
+# pick a runtime that can actually BUILD (nerdctl answers `info`, then fails every build without
+# buildkitd), probed with a real one-line image
 RT=${RUNTIME:-}
-# THE PROBE MUST RUN A BUILD STEP.  Two versions of this were wrong
-# before this one:
-#   `FROM scratch` alone     - valid for podman, REJECTED by Docker, so
-#                              the probe failed on itself and blamed the
-#                              runtime.
-#   `FROM scratch` + LABEL   - builds under both, but starts NO
-#                              container, so it passed on a host where
-#                              AppArmor blocked every RUN step and the
-#                              real build died at `RUN apk add`.
-# A probe that does not exercise the path being probed is worse than no
-# probe: it converts "this will fail" into "this will fail later, with a
-# more confusing message".  So it now runs an actual step, using the
-# same base image the real build uses - the pull is shared, not extra.
+# the probe runs a real RUN step on the real build's base image: a probe without one passed on a
+# host where AppArmor blocked every RUN step
 PROBE_ERR=""
 BUILD_ENV=""
 
-# do_build <runtime> <-f file> <args...> - one place that knows how to
-# invoke a build, so the probe and the real build cannot diverge.
-#
-# Docker gets BUILDKIT FIRST.  The legacy builder starts each RUN step
-# under the docker-default AppArmor profile, and on a host where that
-# profile will not load ("Unable to replace docker-default. Profile
-# doesn't conform to protocol") every RUN dies with exit 185 - dockerd
-# healthy, images pullable, builds impossible.  BuildKit executes steps
-# through its own path and is unaffected.  Legacy is kept as the
-# fallback for daemons too old for DOCKER_BUILDKIT=1.
+# do_build <runtime> <-f file> <args...> - shared by the probe and the real build.  Docker tries
+# BuildKit first: legacy RUN steps die (exit 185) where the docker-default AppArmor profile won't load.
 do_build() {
 	dbrt=$1; shift
 	if [ "$dbrt" = docker ]; then
@@ -184,14 +120,8 @@ fi
 
 D=${CONTAINERBENCH_DIR:-/var/tmp/containerbench}
 NET=${NET:-pcbenchnet}
-# MTU: default to whatever the host's DEFAULT-ROUTE interface uses, not
-# the runtime's 1500.  A container bridge is 1500 unless told otherwise,
-# and read throughput tracks MTU directly - a pipelined batch of 200 B
-# GET responses is one segment at 65536, two at 9000, nine at 1500.
-# Measured on one host: GET 502,673/s at 1500, 793,905 at 9000, and
-# 1,639,869 on loopback, while SET barely moved.  A host whose NIC runs
-# 9000 and whose bench ran at 1500 was measuring a network it does not
-# have, and reporting its cache as slower than it is.
+# MTU defaults to the default-route interface's, not the runtime's 1500: read throughput tracks MTU,
+# so a 9000-byte host benched at 1500 measures a network it does not have.
 host_mtu() {
 	hi=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
 	[ -n "$hi" ] && ip link show "$hi" 2>/dev/null |
@@ -201,84 +131,29 @@ MTU=${MTU:-$(host_mtu)}
 case "${MTU:-}" in ''|*[!0-9]*) MTU=1500 ;; esac
 SUBNET=${SUBNET:-10.98.0.0/24}
 IMG=${IMG:-perfcached:bench}
-# Debian-based (glibc), never a musl tag.  Two reasons, and the second
-# is the one that bit: it is the reference server, so it should share a
-# base with the image under test; and cb-drive runs redis-benchmark FROM
-# THIS IMAGE, so a musl tag means the resp arms are driven by a
-# musl-built client while the native arms are not.  See the musl
-# allocator note above - that is not a difference anyone wants inside a
-# comparison.  +29 MB (119 -> 148).
+# Debian (glibc), never a musl tag: cb-drive runs redis-benchmark from this image, so a musl tag
+# would drive the resp arms with a musl-built client.
 REDIS_IMG=${REDIS_IMG:-docker.io/library/redis:8}
 CLIENTS=${CLIENTS:-"1 4 16 50 200 500 1000"}
 PIPES=${PIPES:-"1 8 16 64"}
 
-# PIPE_CLIENTS: the client count for the PIPELINED cells.  The depth-1
-# sweep walks $CLIENTS; the pipeline sweep holds clients fixed and walks
-# depth, so each table varies one axis at a time.
-#
-# That fixed count used to be a hardcoded 50, which SILENTLY IGNORED
-# CLIENTS: asking for CLIENTS=500 PIPES=64 measured 50 clients at depth
-# 64.  The column said 50, so it was not hidden - but it was not what
-# was asked for either.
-#
-# Now: if CLIENTS names exactly one value that is plainly the
-# concurrency you meant, so use it.  Otherwise 50, which keeps the
-# default matrix and the figures quoted in the README.
+# PIPE_CLIENTS: the client count of the pipelined cells, which walk depth at fixed clients: CLIENTS
+# when it names exactly one value, else 50.
 PIPE_CLIENTS=${PIPE_CLIENTS:-$(set -- $CLIENTS; [ $# -eq 1 ] && echo "$1" || echo 50)}
 REPS=${REPS:-3}
 N=${N:-100000}
 KEYSPACE=${KEYSPACE:-20000}
 VAL=${VAL:-200}
-# 128, not 512: phase 2 runs THREE nodes at once, and on a host with a
-# RESERVED hugepage pool (nr_hugepages, as any HG_MALLOC/OpenSIPS box
-# has) they come out of that pool rather than THP.  3 x 512 MB wants
-# 1.5 GB of hugepages; node 1 takes its share and node 2 exits right
-# after "probed tier = MAP_HUGETLB" with nothing left.  bench/
-# containers-up.sh has used 128 for the same reason.
+# 128, not 512: phase 2 runs three nodes, and on a host with a reserved hugepage pool 3 x 512 MB
+# leaves node 2 nothing after its "probed tier = MAP_HUGETLB".
 ARENA=${ARENA:-128}
-# WORKERS: one epoll thread each.  Half the cores, because THE CLIENT
-# SHARES THIS BOX - redis-benchmark is a real CPU consumer, and so are
-# the daemon's own maintenance, WAL and RDB threads.  Giving the workers
-# every core starves the client and the measurement stops being about
-# the server.
-#
-# Measured on a 4-vCPU host, 50 clients, pipeline 64, redis stable to
-# within 1.9% across the three runs:
-#
-#   workers   SET/s       GET/s       SET p99   GET p99
-#   1         1,111,467   1,020,735   3.911ms   3.783ms
-#   2         1,449,739   1,042,000   2.623ms   5.847ms
-#   4         1,408,901     735,529   1.439ms  10.887ms
-#
-# The second worker is worth +30% on SET.  The fourth buys nothing and
-# costs 28% of GET throughput while tripling its tail - GET replies
-# carry the values, so the client needs a core to parse them and at
-# workers=cores there is none left.  cores/2 was the best of the three,
-# and it was also the old default's worst case.
-#
-# The README figures were taken with 4 workers; set WORKERS=4 to
-# reproduce them on a >=8-core host.
+# WORKERS: half the cores, because the client shares this box (at workers = cores GET fell 28% and
+# its p99 tripled).  WORKERS=4 reproduces the README figures on a >=8-core host.
 NCPU=$(nproc 2>/dev/null || echo 2)
 WORKERS=${WORKERS:-$([ "$NCPU" -ge 2 ] && echo $((NCPU / 2)) || echo 1)}
 
-# CPUSET_SRV / CPUSET_CLI: put the servers and the client on separate
-# CPUs.  Two different confounds hide in an unpinned run on a
-# multi-socket box, and pinning both sides apart removes them together:
-#
-#   - the client competes with the workers for cores, so "more workers"
-#     and "less client" move at the same time (measured: at workers =
-#     cores on a 4-vCPU host, GET fell to x0.72 and its p99 tripled);
-#   - the arena is allocated and first-touched at startup, so it lands
-#     on ONE NUMA node.  A worker scheduled on the far socket pays
-#     remote memory for every bucket it reads, which looks exactly like
-#     "adding workers stopped helping".
-#
-# On a 2-socket host with node0 = 0-3 and node1 = 4-7:
-#
-#   CPUSET_SRV=0-3 MEMS_SRV=0 CPUSET_CLI=4-7 bench/containerbench.sh
-#
-# gives the servers four cores with all their memory local and hands the
-# client the other socket, so neither effect is in the number.
+# CPUSET_SRV/CPUSET_CLI (+ MEMS_SRV): pin servers and client apart so neither core contention nor a
+# far-socket arena is in the number, e.g. CPUSET_SRV=0-3 MEMS_SRV=0 CPUSET_CLI=4-7.
 CPUSET_SRV=${CPUSET_SRV:-}
 CPUSET_CLI=${CPUSET_CLI:-}
 MEMS_SRV=${MEMS_SRV:-}
@@ -291,57 +166,16 @@ PHASES=${PHASES:-"1 2"}
 MODEARMS=${MODEARMS:-"store eager proxy shard spread"}
 SECRET=cb-client-secret
 
-# Dialects to drive each perfcached arm with.  redis-benchmark speaks
-# only RESP, so the redis reference arm is always resp regardless of
-# this - the native rows are compared against that same reference.
-#
-#   resp - the RESP door, driven by redis-benchmark (Redis's own build
-#          of Redis's own tool: nothing of ours in the client path)
-#   bin  - the native door: the binary protocol (16-byte header
-#          frames), the data verbs on their fixed-layout frames, driven
-#          by natbench through libperfd's perfd_submit_kv
-#
-# The daemon speaks one native wire since S317 (the newline-JSON dialect
-# is gone, and the json arm with it).  bin goes through libperfd, which
-# is the library a real client links, so those rows are what an
-# application can actually get - pcbench's numbers are not, it counts
-# frames in place and never materialises a value.  natbench can also
-# send get/set as CMD trees (its kv=0 path); that measures the tree
-# codec on top of the wire and is not an arm here.
-#
-#   DIALECTS=bin bench/containerbench.sh
+# DIALECTS: resp = the RESP door via redis-benchmark; bin = the native door via natbench through
+# libperfd's perfd_submit_kv.  The redis reference arm is always resp.
 DIALECTS=${DIALECTS:-"resp bin"}
 NAT_PORT=6479                          # the native listener; RESP is 6380
 NAT_SECS=${NAT_SECS:-5}                # natbench runs for a DURATION
-# Latency sampling: 1 = time every request, as redis-benchmark does, so
-# the two clients carry the same instrument.  natbench measures that at
-# ~25% of its own CPU at depth 256; raise this to trade percentiles for
-# throughput, but then the resp and native rows are no longer paying the
-# same cost and the comparison is not like-for-like.
+# 1 = time every request, as redis-benchmark does; raising it buys natbench throughput, but the
+# resp and native rows then no longer pay the same cost
 NAT_LAT=${NAT_LAT:-1}
-# redis-benchmark takes a REQUEST COUNT and natbench takes a DURATION,
-# so at high pipelining the two clients were not running for comparable
-# times: N=100000 at pipeline 16 finishes in about a QUARTER SECOND
-# while the native arm ran a full NAT_SECS.  The tell in a results file
-# is a redis row of exactly 100000/0.251 = 398,406 and 100000/0.502 =
-# 199,203 - timer-quantised values from a sub-second run, and in one
-# such run redis's GET went DOWN when given more threads, which is not
-# a regression, it is a measurement that never reached steady state.
-#
-# Scale the count with the pipeline depth so every cell runs for roughly
-# the same wall time.  N stays the pipeline-1 count, which is what it
-# always meant.
-# Scale the request count with BOTH knobs that raise throughput, or the
-# cell finishes before it means anything.  Depth alone was not enough:
-# at pipeline 1 the count stayed at N and 16-plus clients ran it in
-# ~0.75s, which quantises on redis-benchmark's 250 ms stop tick (S136,
-# below; this comment once blamed its millisecond timer) - the
-# tell was 133,156 (= 100000/0.751) appearing IDENTICALLY across four
-# different cells and two different arms.
-#
-# The client factor saturates because throughput does: measured 15,865/s
-# at one client and ~133,000/s from sixteen clients upward, so past that
-# more connections buy queueing, not rate.
+# scale redis-benchmark's request count with depth and clients so every cell runs a comparable wall
+# time (natbench runs for a duration); the client factor saturates where throughput does
 n_for() { # n_for <pipeline> <clients>
 	if [ "$2" -le 4 ]; then nf_f=1
 	elif [ "$2" -le 16 ]; then nf_f=3
@@ -353,32 +187,8 @@ n_for() { # n_for <pipeline> <clients>
 }
 N_MAX=${N_MAX:-4000000}
 
-# S136: with --threads, redis-benchmark does not stop when its last
-# reply lands.  clientDone() calls aeStop() only when it runs
-# single-threaded; a threaded run is stopped by showThroughput(), a
-# timer that fires every 250 ms (SHOW_THROUGHPUT_INTERVAL), and the
-# elapsed time it divides by is read after that.  Every threaded pass
-# is therefore rounded UP to the next quarter second.  A 4M-request
-# cell that perfcached answers in ~1.3 s can only print 4M / 1.25, 1.5,
-# 1.75, 2.0, 2.25 or 2.5 s = 3.20M, 2.67M, 2.29M, 2.00M, 1.78M or 1.60M,
-# each up to one step - 11-25% - under the real rate, while Redis's
-# 4-7 s cells were off by 4-6% at most.  The tell is N / rps landing a
-# few ms past a multiple of 250 ms: 130 of the 152 RESP figures of the
-# 09-04 run did, against 8% by chance (natbench figures, and respbench,
-# which runs unthreaded, sit at chance).  The 0.251 / 0.502 / 0.751 s
-# values n_for's comment above describes were this same tick; making
-# the cells longer shrank the step, it did not remove it.
-#
-# So a cell is sized by what it measures, not by a guess from its knobs:
-# its first pass runs at n_for's count as a pilot, and if the faster of
-# its SET and GET passes finished inside CELL_MIN_S, the count is scaled
-# until it cannot - one tick is then at most 250 ms / CELL_MIN_S of the
-# figure, 2.5% at the default.  The pilot's own rate is rounded down by
-# up to a tick, so it is sized from the fastest rate that pilot could
-# have meant, with 10% on top.  A pilot that already ran long enough is
-# kept as rep 1.  Every rep is checked against the floor after it runs,
-# and $D/cells.tsv records each cell's request count and pass times.
-# CELL_MIN_S=0 restores n_for's sizing.
+# threaded redis-benchmark stops on a 250 ms tick, rounding each pass UP to a quarter second, so a
+# pilot pass sizes each cell to run >= CELL_MIN_S (one tick <= 2.5%); 0 restores n_for's sizing
 CELL_MIN_S=${CELL_MIN_S:-10}           # whole seconds
 CELL_TICK_MS=250                       # redis-benchmark's SHOW_THROUGHPUT_INTERVAL
 CELL_N_MAX=${CELL_N_MAX:-200000000}
@@ -417,46 +227,19 @@ cell_rec() { # cell_rec <arm> <clients> <pipeline> <requests> <set rps|""> <get 
 		>> "$D/cells.tsv"
 }
 
-# Container base.  GLIBC, and there is no second option: musl's
-# allocator serialises libperfd's per-reply malloc (measured on the
-# since-removed JSON dialect), so a musl-built client peaks at TWO
-# threads and then goes BACKWARDS - 217,391 ops/s at 1 thread, 42,104
-# at 8, where the same test on the glibc image climbs 339,555 ->
-# 905,550.  A 21.5x gap at 8 threads that has nothing to do with the
-# dialect, the wire or the daemon, and it silently made every
-# containerised native figure this harness printed back then a
-# measurement of the allocator.  The musl Containerfile was deleted
-# rather than left as a knob someone could reach for.
+# glibc only: musl's allocator serialises libperfd's per-reply malloc, so a musl client peaked at
+# two threads and the native figures measured the allocator
 CONTAINERFILE=${CONTAINERFILE:-bench/Containerfile.debian}
-# Extra lines for every node's [cluster] block.  Exists so a run can
-# provoke a specific refusal on purpose - e.g. max_pending = 64 to make
-# the parked table overflow - which is how the error-capture path gets
-# tested against a real failure instead of a hypothetical one.
+# extra lines for every node's [cluster] block, e.g. max_pending = 64 to provoke a refusal and test
+# the error-capture path on a real failure
 CLUSTER_EXTRA=${CLUSTER_EXTRA:-}
 
-# Per-key ROUTING for the native arms (S35), on by default because it is
-# the configuration a cluster-aware deployment actually runs, and until
-# e0a0a83 it was unreachable from the async API - so every shard number
-# this harness ever printed was a client that could not route, paying a
-# forward on nearly every key.  Measured on a 3-node fleet, shard went
-# 222,528 -> 2,561,332 ops/s with forwards falling to zero.
-#
-# What it does NOT do is make the native arms comparable to the resp
-# one.  A routed client spreads its connections over the whole fleet;
-# redis-benchmark speaks only to node 1 and cannot route at all.  Those
-# are different experiments - read the bin rows across modes, and
-# redis-vs-resp, and do not read resp-vs-native.
-#
-# ROUTE=0 reproduces the pre-e0a0a83 numbers.
+# ROUTE=1: the native arms route per key, as a cluster-aware deployment does; redis-benchmark cannot,
+# so compare bin rows across modes and redis with resp, never resp with native.
 ROUTE=${ROUTE:-1}
 
-# Every list knob is WHITESPACE-separated, and a comma is the obvious
-# typo.  Accept it - the intent is unambiguous - and then VALIDATE, so
-# an unknown value cannot pass silently.  `DIALECTS=bin,resp` used to
-# reach point() as one token, match neither bin nor resp, and fall
-# through to the resp default: the run measured the RESP door and
-# labelled the arm "perfcached-solo-bin,resp".  A wrong number wearing
-# the right name is the worst outcome a harness can produce.
+# list knobs are whitespace-separated; a comma is accepted, then every value is validated so a typo
+# cannot measure the default arm under the wrong label
 list_norm() { printf '%s' "$1" | tr ',' ' '; }
 CLIENTS=$(list_norm "$CLIENTS")
 PIPES=$(list_norm "$PIPES")
@@ -490,17 +273,8 @@ for p_ in $PHASES; do
 	   exit 2 ;;
 	esac
 done
-# Client threads, and it must be the SAME budget for both clients or the
-# arms are not comparable.  redis-benchmark is SINGLE-threaded unless
-# told otherwise, while natbench takes a thread count - so a run that
-# passed one and not the other gave the native arms N client threads and
-# the resp arms one, and the native-vs-redis ratio carried the
-# difference.  The tell was that the redis arm and the perfcached RESP
-# arm tracked each other closely (42,680 vs 39,872 SET/s at 50 clients)
-# while the native arms sat 4x higher on the same host.
-#
-# Both drivers now take this, capped at the client count (neither client
-# can use more threads than it has connections).
+# client threads: the same budget for both drivers (redis-benchmark is single-threaded unless told),
+# capped at the client count
 CLI_THREADS=${CLI_THREADS:-$([ "$NCPU" -ge 2 ] && echo $((NCPU / 2)) || echo 1)}
 NAT_THREADS=${NAT_THREADS:-}
 
@@ -513,61 +287,18 @@ RESP_PORT=6380
 say() { echo "$@" >&2; }
 have_phase() { case " $PHASES " in *" $1 "*) return 0;; esac; return 1; }
 
-# NET_KEEP=1: use an EXISTING network and do not remove it.  Without
-# this there is no way to shape the bench traffic, because the script
-# creates its bridge at start and deletes it at exit - so a qdisc
-# attached beforehand goes with it, and one attached to docker0 shapes
-# an interface that is not in the path at all.  A 10mbit netem on
-# docker0 left a run reporting 909,382 GET/s of 200-byte values, which
-# is ~180 MB/s down a 1.25 MB/s link: the tell that it was shaping
-# nothing.
-#
-#   docker network create --subnet 10.98.0.0/24 pcbenchnet
-#   BR=br-$(docker network inspect pcbenchnet -f "{{.Id}}" | cut -c1-12)
-#   tc qdisc add dev $BR root netem delay 5ms rate 10mbit
-#   NET_KEEP=1 bench/containerbench.sh
-#   tc qdisc del dev $BR root
+# NET_KEEP=1: use an EXISTING network and do not remove it at exit
 NET_KEEP=${NET_KEEP:-0}
 
-# NETEM="delay 5ms rate 10mbit" - shape the bench traffic.
-#
-# This has to be applied to each container's HOST-SIDE VETH, and that is
-# not obvious: container-to-container traffic is forwarded between veth
-# ports by the bridge and NEVER passes the bridge device's root qdisc,
-# so `tc qdisc add dev br-xxxx` shapes nothing.  Neither does docker0,
-# which is not even in the path.  Both were tried: a "10mbit" limit left
-# a run reporting 862,345 GET/s of 200-byte values - about 172 MB/s down
-# a 1.25 MB/s link - and nothing in the output said the shaping was
-# inert.
-#
-# The veths only exist while a container runs, so the script attaches
-# the qdisc itself after each start.
-#
-# SEMANTICS: this is a root qdisc on the HOST side of a veth, so it
-# shapes ONE DIRECTION - packets on their way INTO that container.  A
-# path is symmetric only when both of its endpoints are shaped, which
-# is why the client now lives in a persistent, named, shaped container
-# (drive_up) instead of an ephemeral `run --rm` that has no veth to
-# attach anything to.  While the client was unshaped its replies came
-# home at full speed, so "delay 5ms" produced 5ms of ROUND TRIP rather
-# than 10, every single-hop arm landed on the same throughput, and the
-# run read as a dead heat between servers when it was only ever
-# measuring the pipe.  shape_selftest() measures the round trip and
-# says so out loud if it comes back at 1x.
-#
-# So: `delay` is PER DIRECTION and the RTT is twice it; `rate` is per
-# direction as well, i.e. full duplex.
+# NETEM: a root qdisc on each container's host-side veth (the bridge device's shapes nothing), so it
+# shapes traffic INTO that container: delay and rate are per direction, the RTT twice the delay.
 NETEM=${NETEM:-}
 
 host_veth() { # host_veth <container> -> the veth on THIS side of it
 	hv_pid=$($RT inspect -f '{{.State.Pid}}' "$1" 2>/dev/null)
 	[ -n "$hv_pid" ] || return 1
-	# `ip link`, NOT /sys/class/net/eth0/iflink.  SYSFS DOES NOT FOLLOW
-	# THE NETWORK NAMESPACE: it reflects the netns that mounted it, so
-	# reading it under `nsenter -n` returns the HOST's interfaces and
-	# the peer lookup silently matches nothing.  ip(8) uses netlink,
-	# which does respect the namespace.  The container side prints as
-	# `eth0@if12`, and 12 is the host-side index.
+	# `ip link`, not /sys/class/net/eth0/iflink: sysfs reflects the netns that mounted it, not
+	# nsenter's.  The container side prints `eth0@if12`; 12 is the host-side index.
 	hv_peer=$(nsenter -t "$hv_pid" -n ip -o link show eth0 2>/dev/null |
 		sed -n 's/.*eth0@if\([0-9]*\).*/\1/p' | head -1)
 	[ -n "$hv_peer" ] || return 1
@@ -580,10 +311,7 @@ shape() { # shape <container> - netem on the path INTO this container
 	sh_if=$(host_veth "$1") || {
 		say "  NETEM: could not find the veth for $1 - NOT shaped"
 		SHAPE_FAIL=1; return 0; }
-	# `replace`, not `add`: under NET_KEEP=1 a veth can come back with a
-	# qdisc still on it, and `add` then fails EEXIST - which the old code
-	# swallowed into "tc failed", printing a failure while the link was
-	# in fact shaped.
+	# `replace`, not `add`: under NET_KEEP=1 a veth can come back still shaped, and `add` fails EEXIST
 	if ! tc qdisc replace dev "$sh_if" root netem $NETEM 2>/dev/null; then
 		say "  NETEM: tc failed on $sh_if - NOT shaped (need tc, and"
 		say "  CAP_NET_ADMIN on the host)"
@@ -598,10 +326,8 @@ shape() { # shape <container> - netem on the path INTO this container
 	fi
 }
 
-# The client has to be shaped like everything else, or the whole reply
-# direction is free.  That needs a container which exists BEFORE any
-# traffic starts and keeps one veth across every measurement, so the
-# client is started once and each measurement is an exec into it.
+# the client lives in one persistent container, shaped like the servers, and each measurement is an
+# exec into it: an unshaped client gets the whole reply direction free
 drive_up() {
 	$RT inspect -f '{{.State.Running}}' cb-drive 2>/dev/null | grep -q true || {
 		$RT rm -f cb-drive >/dev/null 2>&1
@@ -611,23 +337,15 @@ drive_up() {
 			say "  could not start the client container cb-drive"
 			return 1; }
 	}
-	# unconditionally, even for a container that was already up: one left
-	# behind by a killed run carries THAT run's qdisc, or none, and an
-	# unshaped client is precisely the bug this function exists to fix.
-	# shape() uses `tc qdisc replace`, so re-shaping is free.
+	# re-shaped even when already up: a container left by a killed run carries that run's qdisc, or none
 	shape cb-drive
 	pin_check cb-drive "$CPUSET_CLI"
 }
 
 bench_cli() { $RT exec cb-drive redis-benchmark "$@"; }
 
-# The native dialect needs OUR image (natbench links libperfd), and the
-# redis image obviously does not carry it - so the native arms get their
-# own persistent client container.  It is shaped and pinned by exactly
-# the same calls as cb-drive: a native arm driven from an UNSHAPED
-# client while the resp arm is shaped would compare two different
-# networks and read as a dialect result, which is the same class of bug
-# as shaping one direction only.
+# the native arms need our image (natbench links libperfd), so they get their own client container,
+# shaped and pinned by the same calls as cb-drive
 drive_nat_up() {
 	$RT inspect -f '{{.State.Running}}' cb-driven 2>/dev/null | grep -q true || {
 		$RT rm -f cb-driven >/dev/null 2>&1
@@ -655,13 +373,8 @@ nat_threads() { # nat_threads <conns> - NAT_THREADS overrides, else shared
 	echo "$nt"
 }
 
-# nat_run <host> <conns> <depth> <getpct> -> "rps p50 p99"
-# Fails (exit 1) on no result, on a run that reported errors, and on the
-# zero-hit case - a GET pass that read an empty keyspace would otherwise
-# report a splendid rps for returning nothing.
-# natbench's 12th positional is kv: 1 = the data verbs on their
-# fixed-layout frames (perfd_submit_kv), which is the bin arm; 0 would
-# send get/set as CMD trees through the JSON edge and is not driven here.
+# nat_run <host> <conns> <depth> <getpct> -> "rps p50 p99"; fails on no result, errors or zero hits.
+# natbench's 12th positional kv=1 drives the data verbs on their fixed-layout frames (the bin arm).
 nat_run() {
 	pt_files
 	nat_cli "$1" "$NAT_PORT" "$SECRET" 0 "$2" "$(nat_threads "$2")" \
@@ -687,9 +400,8 @@ nat_run() {
 		}' "$PT_OUT"
 }
 
-# Two passes per point - getpct 0 then 100 - so the SET and GET columns
-# mean what they mean for redis-benchmark, and the GET pass runs second,
-# reading keys the SET pass just wrote.
+# two passes per point, getpct 0 then 100, so SET/GET mean what they do for redis-benchmark and the
+# GET pass reads the keys the SET pass wrote
 point_nat() { # point_nat <host> <clients> <depth>
 	pn_s=$(nat_run "$1" "$2" "$3" 0)   || return 1
 	pn_g=$(nat_run "$1" "$2" "$3" 100) || return 1
@@ -703,9 +415,7 @@ point_nat_get() { # point_nat_get <host> <clients> <depth>
 	nat_run "$1" "$2" "$3" 100
 }
 
-# Read the pinning back.  `--opt mtu=` was silently ignored by docker
-# earlier in this harness's life and nothing said so; an unverified knob
-# is worse than no knob, because the run still prints a number.
+# read the pinning back: an unverified knob still prints a number
 pin_check() { # pin_check <container> <expected-cpus>
 	[ -n "$2" ] || return 0
 	pc_got=$($RT inspect -f '{{.HostConfig.CpusetCpus}}' "$1" 2>/dev/null)
@@ -717,10 +427,8 @@ pin_check() { # pin_check <container> <expected-cpus>
 	fi
 }
 
-# Prove the shaping bites in BOTH directions.  A one-way netem is not a
-# visible failure - it silently halves the round trip - so measure it:
-# with `delay Dms` at each end a PING must come back at ~2D, and
-# anything near 1D means the reply path is still free.
+# prove the shaping bites both ways: with `delay Dms` at each end a PING must come back at ~2D;
+# near 1D means the reply path is still free
 shape_selftest() { # shape_selftest <host> <port>
 	[ -n "$NETEM" ] || return 0
 	sd_d=$(printf '%s' "$NETEM" | sed -n 's/.*delay[ ]*\([0-9.]*\)ms.*/\1/p')
@@ -758,9 +466,8 @@ do_build "$RT" --platform linux/amd64 -f "$CONTAINERFILE" \
 	say "  RUNTIME=<name> $0"
 	exit 1; }
 
-# The image must be able to name the binary inside it, for the same
-# reason every other harness here refuses an unstamped build: a results
-# file that cannot say what produced it is not a measurement.
+# the image must name the binary inside it: a results file that cannot say what produced it is
+# not a measurement
 BINREV=$($RT run --rm --entrypoint perfcached "$IMG" -V 2>/dev/null |
 	sed -n 's/.*(\(.*\)).*/\1/p')
 case "${BINREV:-unknown}" in
@@ -769,13 +476,8 @@ esac
 say "    image built: perfcached $BINREV"
 
 cleanup
-# The MTU option is NOT spelled the same everywhere.  podman and
-# nerdctl take `--opt mtu=`; docker wants the bridge driver's own key,
-# `com.docker.network.driver.mtu`, and SILENTLY IGNORES the short form -
-# it creates the network at 1500 and reports success.  That is exactly
-# why the check below reads the MTU back from a container instead of
-# trusting the exit status: a host whose NIC runs 9000 was benchmarking
-# reads across 1500 and had no way to tell.
+# docker wants com.docker.network.driver.mtu and silently ignores `--opt mtu=` (podman, nerdctl),
+# which is why the MTU is read back from a container below
 case "$RT" in
 docker) MTUOPT="com.docker.network.driver.mtu=$MTU" ;;
 *)      MTUOPT="mtu=$MTU" ;;
@@ -791,11 +493,7 @@ fi
 $RT network create --subnet "$SUBNET" --opt "$MTUOPT" "$NET" >/dev/null 2>&1 ||
 	$RT network create --subnet "$SUBNET" "$NET" >/dev/null 2>&1 || {
 	say "containerbench: could not create network $NET"; exit 1; }
-# sysfs, not `ip link`: iproute2 is NOT installed in debian-slim, while
-# the busybox image this harness used to run did provide it - so moving
-# REDIS_IMG to the Debian build silently turned this into an empty
-# string and printed `mtu=?` into the provenance line.  /sys/class/net
-# exists in every image.
+# sysfs, not `ip link`: iproute2 is not in debian-slim
 ACT_MTU=$($RT run --rm --network "$NET" --entrypoint sh \
 	"$REDIS_IMG" -c 'cat /sys/class/net/eth0/mtu' 2>/dev/null |
 	tr -dc '0-9')
@@ -820,14 +518,7 @@ printf 'arm\tclients\tpipeline\tset_rps\tget_rps\tset_p50ms\tget_p50ms\tset_p99m
 printf 'arm\tclients\tpipeline\trequests\tset_ms\tget_ms\n' > "$D/cells.tsv"
 
 # ---- the driver -----------------------------------------------------
-# redis-benchmark ships in the redis image, so the client is Redis's own
-# build of Redis's own tool - nothing of ours is in the measurement path.
-# Live ratio against the redis reference.  The redis arm always runs
-# first, so by the time any other arm prints a line its comparison is
-# already known - and a progress line with a bare number is close to
-# useless while a run takes an hour.  The reference is kept in a file
-# because POSIX sh has no associative arrays and the alternative is
-# re-parsing the TSV per row.
+# ratio against the redis reference, which always runs first; kept in a file (POSIX sh has no arrays)
 ref_put() { # ref_put <clients> <pipeline> <set> <get>
 	printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >> "$D/ref.txt"
 }
@@ -845,11 +536,7 @@ ref_note() { # ref_note <clients> <pipeline> <set> <get> -> " (x.. / x..)"
 }
 
 # ---- tabular progress -------------------------------------------------
-# One aligned table per arm instead of a stream of sentences: a run
-# prints ~80 measurement lines and comparing them by eye across a
-# scrolling terminal is not reading, it is squinting.  The header
-# reprints whenever the arm changes, so a line always has a column
-# heading above it no matter where you scroll in.
+# one aligned table per arm; the header reprints whenever the arm changes
 TROW_ARM=""
 trow() { # trow <arm> <clients> <pipe> <set> <get> <sp99> <gp99>
 	if [ "$1" != "$TROW_ARM" ]; then
@@ -870,14 +557,8 @@ trow() { # trow <arm> <clients> <pipe> <set> <get> <sp99> <gp99>
 		"$2" "$3" "${4:--}" "${5:--}" "${6:--}" "${7:--}" "$rn" >&2
 }
 
-# $DIALECT selects the client and the wire; the row/median/REPS logic
-# above it is shared, so a native row is built exactly like a resp one.
-# Why the last point produced nothing.  The client's stderr used to go
-# to /dev/null, so a failed cell reported "no result" and NOTHING else -
-# and there are now four distinct reasons a cluster request is refused
-# (TRYAGAIN, forward failed, holder rejected, holder timed out) which
-# that discarded byte was the only thing distinguishing.  A run that
-# says a cell died without saying why costs another whole run.
+# the client's stderr is kept: it alone tells apart the ways a cluster request is refused
+# (TRYAGAIN, forward failed, holder rejected, holder timed out)
 PT_OUT=""; PT_ERR=""
 pt_files() {                           # $D exists only after setup
 	PT_OUT="$D/point.out"; PT_ERR="$D/point.err"
@@ -916,18 +597,8 @@ med() { tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+)?$' | sort -g | awk '
 	{v[NR]=$1} END { if (NR==0) { print 0; exit }
 		print (NR%2) ? v[(NR+1)/2] : (v[NR/2]+v[NR/2+1])/2 }'; }
 
-# ROUTED RESP - a cluster-aware Redis client, modelled directly.
-# redis-benchmark cannot route: --cluster randomises the HASH TAG per
-# request, so its GET phase asks for keys its SET phase never wrote and
-# measures the miss path.  So: one redis-benchmark per node, pinned to
-# that node, with an explicit command whose key carries a hash tag THAT
-# NODE OWNS by the door's own CLUSTER NODES map - every request lands on
-# its owner exactly as a routing client would send it, and the GETs read
-# what the SETs wrote.  Rates are summed (the fleet's aggregate, which is
-# what a routed client sees); p50/p99 are the worst of the three, because
-# a client is as slow as the node it is waiting on.  Under `spread` the
-# map names one owner per slot; whether that owner is a holder is what
-# the arm measures.
+# routed RESP: one redis-benchmark per node, each key's hash tag owned by that node per CLUSTER NODES
+# (--cluster misses its own keys); rates are summed, p50/p99 the worst of the three.
 RTAGS=""; RVAL=""
 cb_cli() { $RT run --rm --network "$NET" --entrypoint redis-cli "$REDIS_IMG" \
 	-h "$(n_ip 1)" -p "$RESP_PORT" "$@" 2>/dev/null; }
@@ -1031,10 +702,8 @@ row() { # row <arm> <host> <port> <clients> <pipeline>
 		"$(echo $s9 | med)" "$(echo $g9 | med)"
 }
 
-# GET-only, for the cold-entry arms.  Reads only, and not as a
-# shortcut: a SET through a cold node in PROXY mode would place the key
-# THERE (the self-preference band), warming the very node whose coldness
-# is the measurement.
+# GET-only, for the cold-entry arms: a SET through a cold proxy-mode node would place the key there
+# and warm the node whose coldness is measured
 point_get() { # point_get <host> <port> <clients> <pipeline> [requests]
 	pt_files
 	case ${DIALECT:-resp} in
@@ -1059,9 +728,8 @@ row_get() { # row_get <arm> <host> <port> <clients> <pipeline>
 	gn=$(n_for "$gpl" "$gc"); gsz=""; gwarm=""
 	[ "${DIALECT:-resp}" = resp ] || gsz=nat
 	while [ $gk -le "$REPS" ]; do
-		# rep 1 arrives cold; every read after it must be put back,
-		# or the median is a warm number wearing a cold label - and a
-		# pilot (CELL_MIN_S) reads through the node like any rep
+		# rep 1 arrives cold; every later read (a CELL_MIN_S pilot too) must be re-cooled, or the
+		# median is a warm number wearing a cold label
 		if [ -n "$gwarm" ] && [ -n "$RECOOL" ]; then
 			$RECOOL || break
 		fi
@@ -1095,15 +763,8 @@ row_get() { # row_get <arm> <host> <port> <clients> <pipeline>
 	trow "$ga" "$gc" "$gpl" "" "$mg" "" "$(echo $g9_ | med)"
 }
 
-# <dialect> optional: drive ONE dialect.  The cold arm needs that,
-# because a cold read warms the node it read through - the second
-# dialect through the same node would not be cold and would look
-# faster for a reason that has nothing to do with the wire.
-# Put node 2 back to genuinely empty.  rm+start_node, NOT `restart`: a
-# restarted container comes back on a NEW veth, so the netem qdisc
-# shape() put on the old one is gone and this arm would run unshaped
-# while the others did not.  start_node re-shapes, re-pins and waits for
-# the port.  Called once per COLD REP - see RECOOL in row_get.
+# recool_node2 empties node 2 with rm + start_node, not `restart`: a restarted container comes back
+# on a new veth without the netem qdisc.  Called once per cold rep.
 RECOOL=""                              # set only while a cold arm runs
 RECOOL_MODE=""
 recool_node2() {
@@ -1147,9 +808,8 @@ drive_get() { # drive_get <arm> <host> <port> [dialect]
 	DIALECT=resp
 }
 
-# One pass per dialect, each its own arm.  The redis arm is forced to
-# resp: redis-benchmark is the only client that speaks to it, and an
-# arm named "redis-bin" would be a lie about what was measured.
+# one pass per dialect, each its own arm; the redis arm is always resp, redis-benchmark being the
+# only client that speaks to it
 arm_dialects() { # arm_dialects <arm>
 	[ "$1" = redis ] && { echo resp; return 0; }
 	echo "$DIALECTS"
@@ -1206,10 +866,8 @@ cluster = cb-cluster-secret
 [listen]
 tcp = 0.0.0.0:6479
 resp = 0.0.0.0:$RESP_PORT
-# S33: the RESP dialect has no handshake, so a non-loopback listener is
-# REFUSED without an allow-list - the daemon will not start otherwise,
-# which is how this harness found out.  Scoped to the bench subnet: the
-# containers are the only things that can reach it.
+# a non-loopback RESP listener needs an allow-list (RESP has no handshake);
+# scoped to the bench subnet, which only the containers reach
 resp_allow = $SUBNET
 EOF
 	if [ -n "$2" ]; then
@@ -1231,22 +889,14 @@ EOF
 }
 
 start_node() { # start_node <name> <ip> <conf>
-	# --ulimit memlock=-1: containers default to a memlock limit far
-	# below the arena, so mlock() fails and the arena runs UNPINNED
-	# (swappable) - a property of the container, not of the daemon, and
-	# one that would quietly show up as "perfcached is slower in
-	# containers".  Observed here before it was raised.
+	# --ulimit memlock=-1: the container default is far below the arena, so mlock() fails and the
+	# arena runs unpinned
 	$RT run -d --name "$1" --network "$NET" --ip "$2" $PIN_SRV \
 		--ulimit memlock=-1 \
 		-v "$3:/etc/perfcached.conf:ro" "$IMG" >/dev/null 2>&1 || return 1
 	shape "$1"
 	pin_check "$1" "$CPUSET_SRV"
-	# ASK THE SERVICE, do not read the logs.  A detached container here
-	# runs perfectly and `podman logs` returns nothing at all - the
-	# daemon is healthy and the log line the old check waited for never
-	# arrives, so it timed out on a working node.  Whether logs are
-	# captured depends on the runtime's log driver; whether the port
-	# answers is the thing actually being waited for.
+	# ask the service, not the logs: a detached container may capture no logs at all
 	k=0
 	while [ $k -lt 60 ]; do
 		if $RT run --rm --network "$NET" --entrypoint redis-cli \
@@ -1259,11 +909,7 @@ start_node() { # start_node <name> <ip> <conf>
 		[ "$st" = exited ] && break
 		sleep 1; k=$((k + 1))
 	done
-	# print what the daemon actually said.  A container that refuses to
-	# start says WHY on stderr and then exits, so the useful output is
-	# in the logs of a stopped container - fetch them before anything
-	# removes it, and show the config too, since every failure so far
-	# has been the config rather than the image.
+	# show what the daemon said (from the stopped container's logs) and its config, the usual culprit
 	say "  $1 did not become ready (status: $($RT inspect -f '{{.State.Status}}' "$1" 2>/dev/null))."
 	say "  Daemon output (may be empty - some runtimes capture nothing"
 	say "  from a detached container; run it in the foreground to see):"
@@ -1281,16 +927,8 @@ start_node() { # start_node <name> <ip> <conf>
 	return 1
 }
 
-# S137: a node that answers PING can still refuse every data verb.  An
-# eager member that joins holding nothing is RECOVERING until its
-# bootstrap pull completes (S83) and answers -LOADING until then, while
-# start_node's PING and the membership poll both pass.  On 2026-09-11 the
-# first eager cell lost two of its three reps that way.  So before an arm
-# is driven, each node is asked for its OWN lifecycle state: the stats
-# verb reports it first, clustered or not (B1), and it is the state the
-# refusal is decided by (serving_denied).  The test suite waits on the
-# "node state .* -> ready" log line instead; a detached container may
-# capture no logs at all, which is why start_node asks the service too.
+# a node that answers PING can still refuse data verbs (an eager member RECOVERING until its bootstrap
+# pull completes), so each node's own lifecycle state is awaited before an arm is driven
 READY_WAIT_S=${READY_WAIT_S:-60}
 node_state() { # node_state <ip> - the node's own lifecycle state, from stats
 	$RT run --rm --network "$NET" --entrypoint perfcli "$IMG" \
@@ -1376,15 +1014,14 @@ replicas = 2" ;;             # S127: K=2 of the three - through a plain
 				say "  the bridge may not carry multicast - skipping mode=$M"
 			elif say "  membership formed in ${k}s ($peers nodes)" &&
 			     ! await_ready "$(n_ip 1)" "$(n_ip 2)" "$(n_ip 3)"; then
-				# S137: a member can be in the map and still RECOVERING
+				# a member can be in the map and still RECOVERING
 				say "  skipping mode=$M rather than driving a node"
 				say "  that refuses every data verb (-LOADING)"
 			else
 				FLEET_UP=$(date +%s)
 				drive "perfcached-$M" "$(n_ip 1)" "$RESP_PORT"
-				# the same fleet through a cluster-aware Redis
-				# client, for the modes that have an owner to
-				# compute (ROUTED=0 skips it)
+				# the same fleet through a cluster-aware Redis client, for the modes
+				# with an owner to compute (ROUTED=0 skips it)
 				case $M in
 				shard|spread)
 					if [ "${ROUTED:-1}" = 1 ] && routed_tags; then
@@ -1392,22 +1029,8 @@ replicas = 2" ;;             # S127: K=2 of the three - through a plain
 					fi ;;
 				esac
 
-				# COLD ENTRY.  Driving every mode through node 1
-				# compares a mode at a 100% local hit rate against
-				# one at 33%, which measures the PLACEMENT and not
-				# the mode: proxy keeps every key on the node that
-				# received it, shard cannot.  Read through a node
-				# holding nothing and shard wins 2.1x with an 8.7x
-				# tighter tail, because it COMPUTES the owner and
-				# unicasts while proxy consults a locator and
-				# broadcasts when that misses.
-				#
-				# Wait out SHARD_GRACE_S first: for 30s after a
-				# membership change a shard miss does not answer
-				# authoritatively, it retries once as a BROADCAST.
-				# Measured inside that window shard looks slower
-				# than proxy; measured after it, faster.  Two
-				# ad-hoc runs disagreed for exactly this reason.
+				# cold entry: read through a node holding nothing, so the arm measures
+				# the mode, not placement; after SHARD_GRACE_S, inside which misses broadcast
 				up=$(( $(date +%s) - FLEET_UP ))
 				if [ "$up" -lt 32 ]; then
 					say "  (waiting $((32 - up))s for the reshard grace)"
@@ -1418,32 +1041,8 @@ replicas = 2" ;;             # S127: K=2 of the three - through a plain
 					--threads "$(cli_threads 20)" \
 					-r "$KEYSPACE" \
 					-d "$VAL" --csv >/dev/null 2>&1
-				# One dialect per pass, and node 2 is RESTARTED
-				# between them: the first pass pulls keys onto
-				# it, so a second dialect reading the same node
-				# would be reading a warm one.  natbench and
-				# redis-benchmark share the key format
-				# (key:%012u), so both dialects read the
-				# keys the fill above wrote.
-				# EVERY cold rep must be cold.  Re-cooling once
-				# per dialect leaves rep 1 cold and reps 2..N
-				# reading the node rep 1 just warmed, so the
-				# median REPS reports is a warm number wearing
-				# a cold label - store-cold matched store warm
-				# to seven digits before this.
-				# The cold arm is a NON-ROUTING concept and must
-				# not be run routed.  It empties node 2 and reads,
-				# which is exactly what a RESP client meets: it
-				# lands on a node that does not hold the key and
-				# the daemon has to fetch it.  A ROUTED client
-				# never lands on the wrong node - it reads from
-				# each key's owner - so emptying node 2 does not
-				# make reads cold, it DELETES a third of the
-				# keyspace.  At 1-4 connections every one can sit
-				# on the emptied member and the arm reports ZERO
-				# HITS; at 16+ the misses hide inside a ~2/3 hit
-				# rate, which is worse, because then it looks
-				# like a number.
+				# every cold rep re-cools node 2 (RECOOL).  Never routed: a routed client
+				# reads each key's owner, so emptying node 2 deletes a third of the keys.
 				COLD_SAVED_ROUTE=$ROUTE
 				ROUTE=0
 				RECOOL_MODE=$M
@@ -1459,12 +1058,8 @@ replicas = 2" ;;             # S127: K=2 of the three - through a plain
 				done
 				RECOOL=""
 				ROUTE=$COLD_SAVED_ROUTE
-				# a cold rep only reads COLD keys until it has
-				# walked the keyspace once; after that it is
-				# reading what it just pulled.  With N well
-				# above KEYSPACE most of even a genuinely cold
-				# rep is warm, so this column measures the
-				# warm-up TRANSIENT, not the cold cost.
+				# with N well above KEYSPACE a cold rep mostly reads what it just pulled:
+				# this column measures the warm-up transient, not the cold cost
 				say "  (cold arm: each rep re-reads the ${KEYSPACE}-key"
 				say "  keyspace several times over, so only the first"
 				say "  pass is cold - this column is a warm-up"
@@ -1473,9 +1068,7 @@ replicas = 2" ;;             # S127: K=2 of the three - through a plain
 			fi
 		fi
 		$RT rm -f cb-n1 cb-n2 cb-n3 >/dev/null 2>&1
-	# huge pages are not returned the instant a container dies, so the
-	# next mode can find the pool still held and fail for a reason that
-	# has nothing to do with it.  Wait for them back.
+	# huge pages are not returned the instant a container dies; wait for them back before the next mode
 	sleep 3
 	done
 fi

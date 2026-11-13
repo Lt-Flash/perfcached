@@ -3,15 +3,8 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-io.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds the wire, inbound: raw socket IO, the little-endian field helpers, reply
- * framing (take_msg) and the blocking collector that hands a call its reply
- * (collect_head, the S284 borrowed reply buffer).
- */
+/* perfd-io.inc - part of perfd.c's one translation unit, not compiled alone: raw socket IO, the LE
+ * helpers, reply framing (take_msg) and the blocking collector (collect_head) */
 /* ---- raw IO ------------------------------------------------------------ */
 
 static int io_all(perfd_t *p, int wr, void *buf, size_t n)
@@ -36,7 +29,7 @@ static int io_all(perfd_t *p, int wr, void *buf, size_t n)
 	return 0;
 }
 
-/* S369: the transport scratch, made at the first encrypted transfer */
+/* the transport scratch, made at the first encrypted transfer */
 static uint8_t *xbuf(perfd_t *p)
 {
 	if (!p->xbuf && !(p->xbuf = malloc(PERFD_XBUF))) {
@@ -76,12 +69,8 @@ static int send_bytes(perfd_t *p, const char *b, size_t n)
 
 static int rbuf_reserve(perfd_t *p, size_t more)
 {
-	/* Drop the consumed prefix in ONE move, rather than shifting the
-	 * whole remainder down after every message the way take_msg used
-	 * to.  That was O(bytes remaining) per reply, so a read carrying
-	 * a deep pipeline cost O(n^2): at depth 256 the client spent 61%
-	 * of its CPU in memmove and throughput went BACKWARDS - 5.4M ops/s
-	 * at depth 64 down to 3.1M at 256. */
+	/* drop the consumed prefix in ONE move: shifting the remainder after every message was O(n^2)
+	 * on a deep pipeline (61% of the CPU in memmove at depth 256) */
 	if (p->roff) {
 		if (p->rlen > p->roff)
 			memmove(p->rbuf, p->rbuf + p->roff, p->rlen - p->roff);
@@ -124,7 +113,7 @@ static int fill(perfd_t *p)
 		return 0;
 	}
 	{
-		uint8_t hdr[2], *ct = xbuf(p);   /* S369: not 64 KB of stack */
+		uint8_t hdr[2], *ct = xbuf(p);   /* not 64 KB of stack */
 		size_t cl;
 		int pl;
 
@@ -198,13 +187,8 @@ static unsigned long long rle64(const char *b)
 
 /* ---- reply parsing ----------------------------------------------------- */
 
-/* S317: the hook's text.  A NOTIFY frame carries a tree; the application
- * asked for JSON (perfd_notify_cb), so the tree is rendered here - and a
- * UDP delivery (udp_deliver) builds the same tree and comes through the
- * same function, so the two hook texts cannot differ by a byte.  The
- * buffer is reused: a byte renders to six characters at most (\u00XX),
- * and a container adds less than its own encoded size, so 6n + 32 is a
- * bound and the writer never overflows. */
+/* the hook's text: a NOTIFY tree rendered as JSON, the UDP path included, so the two texts cannot
+ * differ; a byte renders to at most six characters, so 6n + 32 bounds the reused buffer */
 static void notify_hook(perfd_t *p, const unsigned char *tree, size_t n)
 {
 	struct pc_jw w;
@@ -226,23 +210,8 @@ static void notify_hook(perfd_t *p, const unsigned char *tree, size_t n)
 	p->ncb(w.buf, w.len, p->nctx);
 }
 
-/* Extract ONE message from p->rbuf WITHOUT touching the socket.  Every
- * message is a frame (S317: the text dialect is gone, so a first byte
- * that is not the magic is a corrupt stream, not another dialect).  The
- * payload comes back as a pointer INTO rbuf (S284), valid until the next
- * fill(): collect_head copies it to the handle's reply buffer, park_msg
- * and the event-loop drain to a malloc'd copy.  Keeping it socket-free is what lets the
- * blocking collector and the event-loop drain (S32) share a single wire
- * implementation instead of growing a second one.
- *   1 = message extracted; got, result, rlen and ebuf are set
- *   2 = a notification was consumed; nothing extracted, call again
- *   0 = incomplete, need more bytes in rbuf
- *  -1 = fatal, connection poisoned
- * A 1 with a NULL result means the daemon answered an error frame for
- * that id, and ebuf holds its message.  RV-10: a reply flagged
- * BIN_F_MOVED carries the stamp of the map the daemon routed by after
- * the tree - [term u32][seq u32] - noted here in hint_*, acted on after
- * the call (hint_check); the stamp is cut off *rlen. */
+/* ONE frame from rbuf, socket untouched (blocking and event-loop paths share it): 1 = got (NULL
+ * result: an error frame, in ebuf), 2 = a notification consumed, 0 = incomplete, -1 = fatal */
 static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 		size_t *rlen, char *ebuf, size_t ecap)
 {
@@ -280,7 +249,7 @@ static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 	type = (unsigned char)rb[2];
 	*got = rle64(rb + 8);
 	if (type == BIN_NOTIFY) {
-		/* membership is acted on here (S107), then the hook sees it */
+		/* membership is acted on here, then the hook sees it */
 		notify_internal(p, (const unsigned char *)rb + BIN_HDR, plen);
 		notify_hook(p, (const unsigned char *)rb + BIN_HDR, plen);
 	} else if (type != BIN_RSP) {
@@ -295,9 +264,8 @@ static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 		if (cap) {
 			memcpy(ebuf, rb + BIN_HDR, el);
 			ebuf[el] = 0;
-			/* this library sends no verb a 0.4.5 daemon lacks, so
-			 * "unknown verb" can only mean an OLDER daemon: say so,
-			 * instead of a bare refusal on the first request */
+			/* this library sends no verb a 0.4.5 daemon lacks, so "unknown
+			 * verb" means an OLDER daemon: say so */
 			if (plen == 12 && !memcmp(rb + BIN_HDR, "unknown verb", 12))
 				snprintf(ebuf, ecap, "the daemon does not speak this "
 					"library's wire (perfcached < "
@@ -308,7 +276,7 @@ static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 	} else {
 		size_t body = plen;
 
-		/* S295: the holder hint is the LAST trailer */
+		/* the holder hint is the LAST trailer */
 		if ((rb[3] & BIN_F_HINT) && body >= 8) {
 			body -= 8;
 			p->hh_node = (int)rle32(rb + BIN_HDR + body);
@@ -321,7 +289,7 @@ static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 			p->hint_seq = rle32(rb + BIN_HDR + body + 4);
 			p->hint_seen = 1;
 		}
-		/* S284: into rbuf, not a copy - valid until the next fill();
+		/* into rbuf, not a copy - valid until the next fill();
 		 * every caller copies it before reading the socket again */
 		*result = rb + BIN_HDR;
 		*rlen = body;
@@ -330,7 +298,7 @@ static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 	return type == BIN_NOTIFY ? 2 : 1;
 }
 
-/* S284: a malloc'd copy of a reply (out of order, or asked for owned) */
+/* a malloc'd copy of a reply (out of order, or asked for owned) */
 static char *dup_reply(perfd_t *p, const char *r, size_t n)
 {
 	char *c = malloc(n ? n : 1);
@@ -344,13 +312,11 @@ static char *dup_reply(perfd_t *p, const char *r, size_t n)
 	return c;
 }
 
-/* S284: a request writer over the handle's request scratch, sized to
- * @need - an upper bound the caller computes - instead of a heap writer
- * per call.  A bound that turns out short makes the writer "over", which
- * tw_whole reports as an error, never a short request. */
+/* a request writer over the handle's scratch, sized to the caller's upper bound @need; a short
+ * bound makes the writer "over", which tw_whole reports as an error, never a short request */
 static int tw_scratch(perfd_t *p, struct pc_tw *w, size_t need);
 
-/* S284: grow-once - to the largest reply this handle has seen */
+/* grow-once - to the largest reply this handle has seen */
 static int grow_buf(perfd_t *p, void *bufp, size_t *capp, size_t need)
 {
 	void **b = bufp;
@@ -402,7 +368,7 @@ static int park_msg(perfd_t *p, unsigned long long got, char *result,
 		p->poisoned = 1;
 		return errk(p, PERFD_E_NOMEM, "out of memory");
 	}
-	/* result points into rbuf (take_msg): keep a copy (S284) */
+	/* result points into rbuf (take_msg): keep a copy */
 	e->result = NULL;
 	if (result && !(e->result = dup_reply(p, result, rlen))) {
 		free(e);
@@ -416,11 +382,8 @@ static int park_msg(perfd_t *p, unsigned long long got, char *result,
 	return 0;
 }
 
-/* read replies until the FIFO head's arrives, parking the ones that
- * overtake it.  0 = *out is the payload (*outlen bytes: a reply tree, or
- * a data verb's fixed layout), BORROWED from the handle's reply buffer
- * until its next collect (S284) - malloc'd for the caller only when
- * p->own_reply; -1 with p->err set (error frame / transport). */
+/* read replies until the FIFO head's arrives, parking those that overtake it: 0 = *out (*outlen
+ * bytes) BORROWED until the next collect, malloc'd only with own_reply; -1 with p->err set */
 static int collect_head(perfd_t *p, char **out, size_t *outlen)
 {
 	unsigned long long want;

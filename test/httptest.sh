@@ -1,29 +1,14 @@
 #!/bin/sh
-# httptest.sh — S46: a stable, machine-readable metrics surface.
-#
-# The task's own words: the JSON stats shape "has moved twice this
-# week", so STABLE is the operative word.  These checks exist to make
-# a rename break a test rather than an operator's dashboard: every
-# name asserted below is part of the contract from here on.
-#
-#   1. the endpoint answers OpenMetrics text on GET /metrics
-#   2. the contract names are all present, with HELP/TYPE
-#   3. the numbers track reality (entries follow writes)
-#   4. /health is a liveness probe an orchestrator can use
-#   5. an unknown path is a clean 404, not a hang or a crash
-#   6. an off-box metrics listener without an allow-list is REFUSED
-#      at config time - it is plaintext and unauthenticated, so the
-#      network is its only protection (the RESP listener's rule)
-# Usage: test/httptest.sh [./perfcached]
+# httptest.sh - the HTTP surface: every metric name asserted here is a contract (a rename must break
+# this test, not a dashboard), plus /health, 404s, the page's rules, the token and the refusals.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
 BIN=${1:-./perfcached}
 SEC=met-client-secret
 D=$(mktemp -d /var/tmp/pcmet.XXXXXX)
-# daemons die by the pids this script started, never by a pattern: a pattern
-# assumes the binary's name, and a fail-first run against a renamed daemon
-# outlived the old trap and held the suite's ports against the next runs
+# daemons die by the pids this script started, never by a pattern: a pattern assumes the binary's
+# name, and a renamed daemon outlived the trap and held the suite's ports
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -148,16 +133,11 @@ echo "$R" | grep -q "^# HELP perfcached_arena_held_bytes" \
 # ---- 3. the numbers track reality -------------------------------------
 fill 50 >/dev/null
 sleep 1
-# S115: the page's trend cards carry axes - Y labels beside the plot, time
-# ticks under it, a peak marker and a pointer readout.  The served script
-# must contain the renderers and the listener; a build before S115 has none.
-# S407 part 3: the page's bytes come from pagedump (the daemon serves no page)
+# the trend cards' axes, peak marker and pointer readout; the page's bytes come from pagedump
+# (the daemon serves no page)
 PG=$("${PAGEDUMP:-./pagedump}")
-# S206: the stylesheet is well-formed - no rule opens inside another.
-# The .mark and .cmp rules once sat between the two source lines of the
-# .brand rule, inside its open brace; Chrome let the anchor through and
-# dropped the compass, which rendered black and unsized.  A rule that
-# opens at depth 1 is the whole defect, so that is what is checked.
+# the stylesheet is well-formed: no rule opens inside another (one that did made Chrome drop the
+# compass)
 CSSOK=$(printf '%s' "$PG" | python3 -c '
 import re,sys
 h=sys.stdin.read(); m=re.search(r"<style>(.*?)</style>",h,re.S); css=m.group(1) if m else ""
@@ -180,15 +160,14 @@ print("ok" if ok else "nested=%s open=%d"%(nested,len(stack)))
 [ "$CSSOK" = ok ] && ok "the stylesheet is well-formed: no rule opens inside another, .mark and .cmp present" \
 	|| bad "the stylesheet has a rule opening inside another ($CSSOK)"
 
-# S210: a member in trouble BLINKS - a steps() timing under a second on
-# both alarm rules, in hot tokens that exist in both themes; the gone
-# card does not blink; reduced motion holds the bright ring.
+# a member in trouble BLINKS (a steps() timing under 1 s on both alarm rules, tokens in both themes);
+# the gone card does not; reduced motion holds the bright ring
 S210=$(printf '%s' "$PG" | python3 -c '
 import re,sys
 h=sys.stdin.read(); m=re.search(r"<style>(.*?)</style>",h,re.S); css=m.group(1) if m else ""
 css=re.sub(r"/\*.*?\*/","",css,flags=re.S)
 def rule(sel):
-    # the selector alone or in a group (S388: ".node.failed,.node.nowit{")
+    # the selector alone or in a group (".node.failed,.node.nowit{")
     m=re.search(r"(?:^|[}\s,])"+re.escape(sel)+r"(?:\s*,[^{}]*)?\{([^}]*)\}",css); return m.group(1) if m else ""
 def anim(sel):
     m=re.search(r"animation:\s*(\w+)\s+([\d.]+)(m?s)\s+steps\(",rule(sel)); return (m.group(1), float(m.group(2))*(1 if m.group(3)=="s" else .001)) if m else (None,None)
@@ -204,7 +183,7 @@ print("ok" if fa[0] and aa[0] and fa[1]<1 and aa[1]<=1 and fa[1]<aa[1] and hot a
 [ "$S210" = ok ] && ok "S210: failed and attn blink with a steps() timing under a second (failed the faster), in hot tokens declared for both themes; gone does not; reduced motion holds the bright ring" \
 	|| bad "S210: $S210"
 
-# S208: the header aligns on centre and both marks share one declared size.
+# the header aligns on centre and both marks share one declared size.
 S208=$(printf '%s' "$PG" | python3 -c '
 import re,sys
 h=sys.stdin.read(); m=re.search(r"<style>(.*?)</style>",h,re.S); css=m.group(1) if m else ""
@@ -222,10 +201,8 @@ print("ok" if "align-items:center" in hdr and "baseline" not in hdr and same and
 [ "$S208" = ok ] && ok "S208/S227: the header aligns on centre, both marks share --markpx (60-72 px since S227), the controls are one group on a row of its own under the brand (it jumped rows when the identity filled in), the option no longer says (this node)" \
 	|| bad "S208: $S208"
 
-# S227: the marks' INK is centred in their boxes (both drawings sit one
-# unit low in a 0 0 32 32 box: the anchor's ink spans y 3..31, the
-# compass ring is centred at y 17), and the wordmark's line box is trimmed
-# to its cap height so centring meets the capitals' middle
+# the marks' ink is centred in their boxes (both drawings sit one unit low in 0 0 32 32), and the
+# wordmark's line box is trimmed to its cap height
 S227=$(printf '%s' "$PG" | python3 -c '
 import re,sys
 h=sys.stdin.read()
@@ -238,9 +215,7 @@ print("ok" if okv and okt else "mark=%s compass=%s brand-trim=%s"%(mark and mark
 ')
 [ "$S227" = ok ] && ok "S227: both header marks draw their ink centred (viewBox 0 1 32 32) and the wordmark is trimmed to cap height" \
 	|| bad "S227: $S227"
-# S236: the compass's ring and arrows are the anchor's ink, and the header
-# ring is drawn at the anchor's stroke width (the operator: they were
-# grey and heavier, the anchor white)
+# the compass's ring and arrows use the anchor's ink, and the header ring the anchor's stroke width
 S236=$(printf '%s' "$PG" | python3 -c '
 import re,sys
 h=sys.stdin.read()
@@ -256,24 +231,16 @@ print("ok" if ok else "anchor=%s ring=%s arrows=%s ring-width=%s anchor-widths=%
 ')
 [ "$S236" = ok ] && ok "S236: the compass ring and arrows use the anchor's ink, and the header ring its stroke width" \
 	|| bad "S236: $S236"
-# S243: a counter that went BACKWARDS (a restart, reset_stats) restarts
-# its window instead of being differenced against another run's samples
-# ("pushed on write -2 418 242" until F5).  Behaviour checked by running
-# the page's own push()/wv() in node: 100,200,300,50,80 gave
-# 100,100,200,-50,-20 before and 100,100,200,50,30 after; CI has no JS
-# runtime, so here the rule itself is asserted in the served page.
+# a counter that went BACKWARDS (a restart, reset_stats) restarts its window instead of being
+# differenced against another run's samples; CI has no JS runtime, so the rule is asserted in the page
 printf '%s' "$PG" | python3 -c '
 import re,sys
 h=sys.stdin.read(); m=re.search(r"function wv\(k,v\)\{(.*?)return a&&a\.length>1\?v-a\[0\]:v;\}",h,re.S)
 sys.exit(0 if m and "v<a[a.length-1])H[k]=[]" in m.group(1) else 1)' \
 	&& ok "S243: a windowed counter that goes backwards (a restart) restarts its window - no negative figures" \
 	|| bad "S243: wv() differences a restarted counter against the previous run's samples"
-# S239: each collection row carries its autoscale chip - red when the mode
-# blocks growth (warn, off - not auto, not S328's floor, which grow) and
-# keys are in the leg, amber when WARN says auto would
-# shrink it - and the leg cell goes red on the same condition.  Rendering
-# checked in node (auto -> plain, warn 2^17 target 12 -> amber "warn ->
-# 2^12", off with a leg -> red); here the rules are asserted present.
+# each collection row's autoscale chip: red when the mode blocks growth (warn, off) and keys are in
+# the leg, amber when WARN says auto would shrink it; the leg cell goes red on the same condition
 printf '%s' "$PG" | python3 -c '
 import re,sys
 h=sys.stdin.read()
@@ -285,9 +252,8 @@ sys.exit(0 if ok else 1)' \
 	&& ok "S239: each collection shows its autoscale mode - amber when warn would shrink it, red when growth is blocked and it has too many keys (past the grow line, or in the leg)" \
 	|| bad "S239: the collections card lacks the autoscale chip or its amber/red rules"
 
-# S202: the page carries the anchor as its favicon - contrib/brand/
-# favicon.svg inlined as a data URI, so no second route and no second
-# request.  Decoded, it must be that SVG, not a stale or truncated copy.
+# the favicon is contrib/brand/favicon.svg inlined as a data URI (no second request); decoded, it
+# must be that SVG, not a stale or truncated copy
 FAV=$(printf '%s' "$PG" | grep -oE '<link rel=icon type="image/svg\+xml" href="data:image/svg\+xml;base64,[A-Za-z0-9+/=]+"' | head -1 | sed -E 's/.*base64,([A-Za-z0-9+\/=]+)".*/\1/')
 if [ -n "$FAV" ] && printf '%s' "$FAV" | base64 -d 2>/dev/null | grep -q "perfcached favicon - the anchor"; then
 	ok "the page carries the anchor favicon as an inline SVG data URI"
@@ -300,57 +266,38 @@ for m in "function ylab(" "function xlab(" "class=yl" "class=xl" "class=pk" '"mo
 done
 [ -z "$missing" ] && ok "the page carries the S115 axis renderers and the pointer readout" \
 	|| bad "the page lacks:$missing (S115)"
-# S130: the rolling window is FIVE MINUTES, not an hour.  HMAX and POLL are
-# the only two constants behind it - the header text, the axis labels and
-# the tick branch all quote them - so asserting the constant is asserting
-# the window.  A build before S130 says HMAX=1200, an hour of samples drawn
-# three to a pixel.  The window must also stay under xlab()'s 900 s branch,
-# which is what draws the minute ticks at all.
+# the rolling window is five minutes: HMAX and POLL are its only constants, and it must stay under
+# xlab()'s 900 s branch, which draws the minute ticks
 echo "$PG" | grep -qF "HMAX=100," \
 	&& ok "the page keeps 5 minutes of history (HMAX=100 at POLL=3000)" \
 	|| bad "S130: the page's history window is not 100 samples: $(echo "$PG" | sed -n 's/.*\(HMAX=[0-9]*\).*/\1/p' | head -1)"
 echo "$PG" | grep -qF "if(span<900)" \
 	&& ok "and the window is inside the branch that draws minute ticks" \
 	|| bad "S130: the minute-tick branch is gone"
-# S163: a fleet cell (fv()) stacks the fleet total over this node's share
-# with the same .hv/.hl pair the hit-rate cell uses, but it sits in a bare
-# td.  A stacking rule scoped to .hit alone never reaches it, and the two
-# figures render inline as one number ("6,1292,043 here").
+# a fleet cell (fv()) stacks total over this node's share in a bare td, so the stacking rule must not
+# be scoped to .hit alone, or the two figures render inline as one number
 echo "$PG" | grep -qE 'td \.hv\{display:flex;flex-direction:column' \
 	&& echo "$PG" | grep -qE 'td \.hl\{font-size:11px' \
 	&& ok "the fleet cells stack the total over this node's share" \
 	|| bad "S163: the .hv/.hl stacking rule does not reach a plain td"
-# the cluster plane's cards are ordered by height after every redraw, so a
-# grid row holds cards of one size (a build before this writes them in a
-# fixed order and one long card leaves its row's neighbours half empty)
+# the cluster plane's cards are ordered by height after every redraw, so a grid row holds cards
+# of one size
 echo "$PG" | grep -qF "function sizePlane(" && echo "$PG" | grep -qF "sizePlane();trend();}" \
 	&& ok "the plane's cards are sorted by their height" \
 	|| bad "the plane's cards are not sorted by height"
-# S214: ... ONCE.  Re-deciding the order on every poll moved a cell each
-# time its height crossed a step; planeOrder keeps it until a cell comes
-# or goes or the plane changes width (pagejstest drives the function)
+# the order is decided once: planeOrder keeps it until a cell comes or goes or the plane changes
+# width, so a cell does not move each time its height crosses a step
 echo "$PG" | grep -qF "function planeOrder(keys,hs,w)" && echo "$PG" | grep -qF "o=planeOrder(keys,hs,p.clientWidth);" \
 	&& ok "the order of the cells is decided once and kept" \
 	|| bad "the plane is re-sorted on every redraw - cells will move as their heights drift"
-# the slow log card clips a long row (a key has nowhere to wrap, and the
-# time was pushed off the card).  The slowest calls are NOT a card: in a
-# 184px grid column the figures took the width and the command name was
-# squeezed to nothing, so they are a table of their own under
-# collections, where the name is a column that cannot collapse.
-# 0.6.2: the slow log is a section of its own, folded like the commands
-# table; a long command is cut at its cell, whole in the hover, and the
-# time keeps its column
+# the slow log is a section of its own: a long command is cut at its cell (whole in the hover), and
+# the time keeps its column
 echo "$PG" | grep -qF "td.sx,th.sx{width:60%;max-width:0;overflow:hidden;text-overflow:ellipsis" \
 	&& echo "$PG" | grep -qF "<th class=sx>command</th><th class=n>took</th>" && echo "$PG" | grep -qF "<td class=sx title=\"'+t+'\">'+t+" \
 	&& ok "a slow log command is cut at its cell instead of pushing the time off the table" \
 	|| bad "a slow log command can push its time off the table"
-# S214: the plane is re-ordered by height on every redraw, so a card whose
-# row count follows the traffic changed rank and jumped about the page.
-# The cards that vary are padded to a fixed height (0.6.2: the unknown
-# commands, 8 rows - the commands and slow log cards became sections), and
-# memory + backpressure share one stacked cell.  pagejstest RENDERS these,
-# but its engine is only on the dev host; this is the check that runs
-# everywhere.
+# cards whose row count follows the traffic are padded to a fixed height so they keep their rank;
+# memory + backpressure share one stacked cell
 echo "$PG" | grep -qF "function card(t,rows,cls,min)" \
 	&& echo "$PG" | grep -qF "while(rows.length<8)rows.push(" \
 	&& ok "the cards whose rows follow the traffic are padded to a fixed height" \
@@ -383,24 +330,20 @@ echo "$PG" | grep -qF "function entc(x,FG,LB,cpe)" && echo "$PG" | grep -qF "Red
 	&& echo "$PG" | grep -qF "drawFleetTab(d.members,d.distinct)" && ! echo "$PG" | grep -qF "for(j=0;j<cols.length;j++)h+='<th" \
 	&& ok "12nx: the fleet table describes the nodes (records, Redis copies); each collection opens its members; records and copies apart; the sketch estimate read" \
 	|| bad "12nx: the fleet table still has a column per collection, or no per-member rows"
-# 12nx: the merged estimate stands for the fleet only when every reporting
-# member sent its sketch; a roll over an older daemon (no sketch verb) shows
-# store mode's lower bound instead of a partial union that can count low
+# the merged estimate stands for the fleet only when every reporting member sent its sketch; else
+# store mode's lower bound, not a partial union that can count low
 echo "$PG" | grep -qF "d.members===d.of?d:null" && echo "$PG" | grep -qF "var d=LB?dfull(x.name):null" \
 	&& echo "$PG" | grep -qF "forEach(function(n){var d=dfull(n);" \
 	&& ok "12nx: the estimate only from every reporting member's sketch (both the entries cell and the fleet row)" \
 	|| bad "12nx: a partial union of sketches is shown as the fleet's distinct keys"
-# dfull is called by drawFleetTab (top level) as well as entc (inside the
-# collections' scope): defined beside entc it was invisible to the fleet
-# table, which threw 'dfull is not defined' on every redraw (10-19, 245)
+# dfull is called by drawFleetTab (top level) as well as entc, so it must not be defined inside
+# the collections' scope
 echo "$PG" | grep -qF "d.members===d.of?d:null;}
 function drawFleetTab(ms,dist){" \
 	&& ok "12nx: dfull is defined at the top level, beside drawFleetTab" \
 	|| bad "12nx: dfull is not beside drawFleetTab - the fleet table may not see it"
-# numbers are grouped the SI way (a narrow no-break space, from five
-# digits) and never by the browser's locale: toLocaleString wrote 10134
-# as "10,134", which reads as ten point something - and as "10.134" in a
-# German browser.  A microsecond is written with the micro sign.
+# numbers are grouped the SI way (a narrow no-break space, from five digits), never by the browser's
+# locale, where 10134 reads as "10,134" or "10.134"; a microsecond uses the micro sign
 echo "$PG" | grep -qF "function nf(" && ! echo "$PG" | grep -qF "Number(v).toLocaleString()" \
 	&& echo "$PG" | grep -qF "'\\u202f'" && echo "$PG" | grep -qF "' \\u03bcs'" \
 	&& ! echo "$PG" | grep -qE "[)'] us['\" ]|' us \\\\u00b7" \
@@ -432,10 +375,7 @@ case "$N" in *" 404"*) ok "an unknown path is a clean 404";;
 	*) bad "unknown path answered: $(echo "$N" | head -1)";; esac
 
 # ---- 6. a half-open request must not hold the slot for ever ----------
-# The slowloris shape: connect, send a partial head, never finish.
-# http_timeout is 2s in this fixture, so the daemon must close it;
-# without the sweep the read below blocks until the client's own
-# timeout and the connection leaks in the meantime.
+# slowloris: a partial head, never finished; http_timeout = 2s here, so the daemon must close it
 SLOW=$(python3 - <<'PYEOF2'
 import socket, time
 try:
@@ -458,7 +398,7 @@ case "$SLOW" in
 	*) bad "half-open probe: $SLOW";;
 esac
 
-# ---- 7. S37, then S407 part 3 (0.7.0): the page left the daemon ------
+# ---- 7. the page left the daemon -------------------------------------
 P=$(http /)
 case "$P" in
 	"HTTP/1.0 410"*) ok "GET / answers 410 Gone (the page is the dashboard's)";;
@@ -473,11 +413,11 @@ PG=$("${PAGEDUMP:-./pagedump}")
 echo "$PG" | grep -qiE "src=[\"']?https?://|href=[\"']?https?://" \
 	&& bad "the page references an external asset" \
 	|| ok "the page has no external assets"
-# S91: the page renders the WAL and RDB detail, not just "on"
+# the page renders the WAL and RDB detail, not just "on"
 for f in "durability \\u00b7 wal" "durability \\u00b7 rdb" "DROPPED (acked, unlogged)" "probe underestimated" "last snapshot" "ago \\u2192 now" "histhint" "POLL=3000" "height:80px" "class=sg" "members up" "AT CEILING"; do
 	echo "$PG" | grep -qF "$f" && ok "the page carries: $f" || bad "S91: the page lacks: $f"
 done
-# S89: /stats names the doors, this one included
+# /stats names the doors, this one included
 S=$(http /stats | sed -n '/^{/,$p' | python3 -c '
 import json,sys
 d=json.load(sys.stdin); ls=d.get("listeners",[])
@@ -550,8 +490,8 @@ case "$(tok /members s3cr3t-token)" in
 	*200*) ok "the right token is accepted";;
 	*) bad "the right token was refused: $(tok /members s3cr3t-token)";;
 esac
-# 0.6.2: the page in a browser - the 401 asks for the browser's login,
-# which carries the token as its password (any user name)
+# the page in a browser: the 401 asks for the browser's login, which carries the token as its
+# password (any user name)
 H401=$(python3 -c 'import socket; s=socket.create_connection(("127.0.65.3",19653),timeout=5); s.sendall(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n"); b=b""
 while True:
     x=s.recv(65536)
@@ -586,10 +526,8 @@ mk 2 "http = 10.9.9.9:19652"
 	&& bad "an off-box http listener without http_allow started" \
 	|| ok "an off-box http listener needs http_allow"
 
-# ---- 10. a refused client is TOLD it is refused (S66) ------------------
-# A listener whose allow-list excludes the loopback source.  The client
-# must get a 403 whose body names http_allow - not an empty response,
-# which a browser cannot tell from a dead daemon.
+# ---- 10. a refused client is TOLD it is refused ----------------------
+# a 403 whose body names http_allow, not an empty response a browser cannot tell from a dead daemon
 http_port() { # http_port <port> <path>
 	python3 - "$1" "$2" <<'PYHTTP'
 import socket, sys
@@ -622,11 +560,8 @@ case "$R" in
 *"Content-Length: 46"*) ok "the 403 carries its length";;
 *) bad "the 403 has no or a wrong Content-Length: $(echo "$R" | /bin/grep -i length)";;
 esac
-# 0.6.2: refusing must never WAIT on the refused peer.  The 403 is sent
-# on a worker; draining the peer's request used to poll() it for up to
-# 200 ms there, so connections that send nothing - from an address the
-# allow-list refuses - stalled every client of that worker, 200 ms each
-# (15 of them: a worker answered 20 PINGs in 3 s instead of 300).
+# refusing must never WAIT on the refused peer: the 403 is sent on a worker, so draining a silent
+# refused peer's request stalled every client of that worker
 R=$(python3 - <<'PYDENY'
 import socket, time
 idle = [socket.create_connection(("127.0.65.1", 19654), timeout=5) for i in range(12)]
@@ -653,8 +588,8 @@ case "$R" in
 *) bad "after the silent peers, a refused client got: $(echo "$R" | head -2 | tr '\n' ' ')";;
 esac
 
-# 0.6.2: http_rate and http_cache_ms.  Loopback is exempt from both
-# unless PERFCACHED_HTTP_LIMIT_LOOPBACK is set - set here, for this node.
+# http_rate and http_cache_ms; loopback is exempt from both unless PERFCACHED_HTTP_LIMIT_LOOPBACK
+# is set - set here, for this node.
 mk 5 "http = 127.0.65.5:19656
 http_rate = 3
 http_cache_ms = 1000"

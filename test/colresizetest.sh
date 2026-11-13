@@ -1,26 +1,6 @@
 #!/bin/sh
-# colresizetest.sh — an online resize must reach the fleet AS A RESIZE.
-#
-# THE BUG THIS EXISTS FOR.  pc_cluster_col_announce() took an int named
-# `drop` and folded it: `op = drop ? CLCOL_OP_DROP : CLCOL_OP_SET`.
-# Every caller already passed a CLCOL_OP_* value, so create (0) and drop
-# (1) came out right by coincidence - and RESIZE (3), being merely
-# truthy, was broadcast to the fleet AS A DROP.  Every peer deleted the
-# collection, and the originator lost it too as the drops converged
-# back.  The call returned {"resizing":true} and the daemon logged a
-# resize; nothing said anything had been dropped.
-#
-# Found on the live fleet 245-247 on 2026-09-15 against an EMPTY
-# collection.  With records in it that was fleet-wide data loss.
-#
-# WHY A SUITE OF ITS OWN, and not coltest's fleet section: coltest runs
-# its pair in `mode = store`, and store mode does NOT reproduce this -
-# verified, the buggy binary passes there.  It needs an EAGER pair with
-# the collection DECLARED in both configs, which is the shape the live
-# fleet has.  A test that cannot fail on the unfixed build proves
-# nothing, so this one was checked against it first.
-#
-# usage: test/colresizetest.sh [./perfcached] [./perfcli]
+# colresizetest.sh - an online resize reaches the fleet AS A RESIZE, not a drop: an EAGER pair with the
+# collection declared in both configs (store mode does not reproduce the bug).
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -77,7 +57,13 @@ while [ $i -lt 200 ]; do
 	sleep 0.1; i=$((i + 1))
 done
 [ $i -lt 200 ] || { echo "  fleet did not start"; exit 1; }
-sleep 5
+# a joiner is CONNECTING until its links answer: up to 30 s for both ready and seeing each other
+st() { "$CLI" -q -h 127.0.0.1 -p "$1" -j '{"method":"stats"}' 2>/dev/null \
+	| python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 17981)" != "ready 1" ] || [ "$(st 17982)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i + 1))
+done
 
 # buckets of collection $2 on port $1, or "gone"
 bkt() { "$CLI" -q -h 127.0.0.1 -p "$1" collections 2>/dev/null | python3 -c "
@@ -98,20 +84,14 @@ else:
 	|| { bad "premise: n1=$(bkt 17981 th) n2=$(bkt 17982 th), want 65536 each"; \
 	     echo "colresizetest: $pass passed, $fail failed"; exit 1; }
 
-# a handful of writes first, or the assertion below has nothing to
-# preserve and cannot fail - a counter that was 0 before and 0 after
-# says nothing about whether it was carried
+# a handful of writes first, or the assertion below has nothing to preserve and cannot fail
 for K in a b c d e f g h; do
 	"$CLI" -q -h 127.0.0.1 -p 17981 set th pre-$K v 300 >/dev/null 2>&1
 	"$CLI" -q -h 127.0.0.1 -p 17981 get th pre-$K >/dev/null 2>&1
 done
 
-# S184: a resize builds a NEW table, and the new table's counters used
-# to start at zero - so a collection's lifetime figures reset every time
-# it grew or shrank.  Seen live: 62,000 keys expired, the collection
-# shrank a minute later, and the page then reported `expired` as 0 for
-# the event that had just happened.  Record what the collection has
-# stored BEFORE the resize; it must still be there afterwards.
+# a resize builds a NEW table, whose counters must carry the collection's lifetime figures: record
+# what it stored BEFORE the resize
 ST_BEFORE=$("$CLI" -q -h 127.0.0.1 -p 17981 stats th 2>/dev/null \
 	| python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
@@ -138,14 +118,8 @@ N2=$(bkt 17982 th)
 [ "$N2" = 4096 ] \
 	&& ok "and the peer is at the new size (4096, after $(echo "$i" | awk '{printf "%.1f", $1/2}')s)" \
 	|| bad "peer buckets: $N2, want 4096"
-# The ORIGINATOR needs its own wait, and this assertion did not have one.
-# The peer adopts the announced size the moment the announce lands, while
-# the originator moves its records incrementally - pc_store_resize_tick()
-# copies a budget at a time off the maintenance thread - so peer-finishes-
-# first is a legitimate ordering, not a fault.  On an idle box the
-# originator wins anyway (measured: 0.0s against the peer's 1.5s), which
-# is why this passed everywhere until a loaded CI runner inverted it:
-# GitHub read the originator at 65536 while the peer was already at 4096.
+# the originator needs its own wait: the peer adopts the announced size at once, while the originator
+# moves its records incrementally, so the peer finishing first is legitimate
 j=0
 while [ $j -lt 60 ]; do
 	[ "$(bkt 17981 th)" = 4096 ] && break

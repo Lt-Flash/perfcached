@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Yury Kirsanov - see LICENSE */
-/*
- * perfcached.c - the PHP client over libperfd: one class, Perfcached, on the
- * native door.  Values are bytes both ways; keys, collections and fields are
- * C strings to libperfd, so a NUL in one is a ValueError here.
- */
+/* perfcached.c - the PHP client over libperfd: one class, Perfcached, on the native door.
+ * Values are bytes both ways; keys, collections and fields are C strings (a NUL: ValueError). */
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -25,10 +22,11 @@
 #define PC_MAX_SECRETS 8
 #define PC_MAX_SEEDS   16
 #define PC_SEED_FIRST_MS 500
+#define PC_CONNECT_DEFAULT_MS 5000     /* libperfd's connect_timeout_ms when 0 */
 /* a whole record fits: PCACHE_CELL_MAX, so a read takes one round trip */
 #define PC_READ_BUF    262144
 
-/* PE-2: the handle and what it takes to dial again.  A pooled one outlives its
+/* the handle and what it takes to dial again.  A pooled one outlives its
  * request: one per worker and (seeds, port, options), kept in pc_pool */
 typedef struct {
 	perfd_t *p;
@@ -143,39 +141,53 @@ static void pc_throw(const perfd_t *p)
 	zend_throw_exception(ce, msg && *msg ? msg : "perfcached: unknown error", kind);
 }
 
-/* the first seed by pid, so a pool's workers start apart; the next when one does
- * not answer.  A wrong secret or option is wrong on all of them: it stops the walk */
-static int pc_walk_seeds(pc_conn *c)
+/* the first seed by pid, so a pool's workers start apart; the next when one does not answer.
+ * A wrong secret or option is wrong on all: it stops the walk.  @until (ms, 0 none) is shared. */
+static int pc_walk_seeds(pc_conn *c, zend_long until)
 {
-	int i, first = (int)(c->pid % c->nseeds), kind;
+	int i, first = (int)(c->pid % c->nseeds), kind, ct = c->o.connect_timeout_ms, r = 0;
 
 	for (i = 0; i < c->nseeds; i++) {
+		if (until) {
+			zend_long left = until - pc_now_ms();
+
+			if (left <= 0)
+				break;
+			c->o.connect_timeout_ms = (int)left;
+		}
 		c->p = perfd_connect(c->seeds[(first + i) % c->nseeds], c->port, &c->o);
-		if (c->p)
-			return 1;
+		if (c->p) {
+			r = 1;
+			break;
+		}
 		pc_st.seeds_failed++;
 		kind = perfd_error_kind(NULL);
-		if (kind == PERFD_E_AUTH || kind == PERFD_E_ARG)
-			return 1;
+		if (kind == PERFD_E_AUTH || kind == PERFD_E_ARG) {
+			r = 1;
+			break;
+		}
 	}
-	return 0;
+	c->o.connect_timeout_ms = ct;
+	return r;
 }
 
 /* a seed that takes the connection and says nothing costs a short wait while another
- * may answer; only when none did is the whole timeout worth waiting */
+ * may answer; only when none did is the whole timeout worth waiting - once */
 static void pc_dial_seeds(pc_conn *c)
 {
 	int ct = c->o.connect_timeout_ms;
 
 	if (c->nseeds > 1 && (ct <= 0 || ct > PC_SEED_FIRST_MS)) {
 		c->o.connect_timeout_ms = PC_SEED_FIRST_MS;
-		if (pc_walk_seeds(c)) {
+		if (pc_walk_seeds(c, 0)) {
 			c->o.connect_timeout_ms = ct;
 			return;
 		}
 		c->o.connect_timeout_ms = ct;
+		(void)pc_walk_seeds(c, pc_now_ms() + (ct > 0 ? ct : PC_CONNECT_DEFAULT_MS));
+		return;
 	}
-	(void)pc_walk_seeds(c);
+	(void)pc_walk_seeds(c, 0);
 }
 
 static int pc_dial(pc_conn *c)
@@ -268,11 +280,17 @@ static int pc_secrets(zval *z, pc_conn *c)
 	int n = 0;
 
 	if (Z_TYPE_P(z) == IS_STRING) {
+		if (strlen(Z_STRVAL_P(z)) != Z_STRLEN_P(z)) {      /* not cut at a NUL */
+			zend_value_error("a secret must hold no NUL");
+			return -1;
+		}
 		c->secrets[n++] = pestrdup(Z_STRVAL_P(z), 1);
 	} else if (Z_TYPE_P(z) == IS_ARRAY) {
 		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(z), v) {
-			if (Z_TYPE_P(v) != IS_STRING || n >= PC_MAX_SECRETS) {
-				zend_value_error("secrets must be at most %d strings", PC_MAX_SECRETS);
+			if (Z_TYPE_P(v) != IS_STRING || n >= PC_MAX_SECRETS ||
+			    strlen(Z_STRVAL_P(v)) != Z_STRLEN_P(v)) {
+				zend_value_error("secrets must be at most %d strings, with no NUL",
+					PC_MAX_SECRETS);
 				return -1;
 			}
 			c->secrets[n++] = pestrdup(Z_STRVAL_P(v), 1);
@@ -1158,8 +1176,8 @@ static void pc_prepare(void)
 		zend_error(E_WARNING, "perfcached: cannot read %s: %s", path, strerror(errno));
 		return;
 	}
-	if (fstat(fileno(f), &st) == 0 && (st.st_mode & 007))
-		zend_error(E_WARNING, "perfcached: %s can be read by anyone", path);
+	if (fstat(fileno(f), &st) == 0 && (st.st_mode & 077))         /* its owner alone */
+		zend_error(E_WARNING, "perfcached: %s can be read by others than its owner", path);
 	while (n < PC_MAX_SECRETS && fgets(line, sizeof line, f)) {
 		line[strcspn(line, "\r\n")] = 0;
 		if (*line)

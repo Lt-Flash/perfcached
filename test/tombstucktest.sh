@@ -1,25 +1,6 @@
 #!/bin/sh
-# tombstucktest.sh - 12ny AT-11: a member whose watermark stands still while
-# the others confirm is SEEN - in /members, in /stats, in an alert.
-#
-# Before: deletes kept for a member that confirmed nothing were visible only
-# by their symptom, once the cap bit (cluster.tombstones).  Now /members
-# lists each member's mark of each origin, how far behind the head and how
-# long still; /stats cluster.acks.held_by says which member each space's
-# deletes wait for and which one is stuck; cluster.acks_stuck raises.
-# Three eager nodes; node 3 announces its first marks for ever
-# (PERFCACHED_TEST_FREEZE_MARKS) while it applies as usual; a mark still
-# for 3 s counts (PERFCACHED_TEST_ACKS_STUCK_MS):
-#   1. deletes through node 1 for 15 s: node 1's /members has node 2 near
-#      the head and node 3 far behind it, still
-#   2. node 1's held_by names node 3, waiting and stuck, and node 1 keeps
-#      every delete since (tombstones_retained.numbered)
-#   3. node 1 raises cluster.acks_stuck, naming node 3
-#   4. node 3 restarted without the flag: nothing is stuck any more, and
-#      node 1 forgets what it kept
-# FAIL-FIRST: before AT-11 /members has no marks, /stats no held_by, and no
-# alert is raised.
-# Usage: test/tombstucktest.sh [./perfcached]
+# tombstucktest.sh - a member whose watermark stands still while the others confirm is SEEN: in /members,
+# in /stats cluster.acks.held_by, and as cluster.acks_stuck (node 3 freezes its marks by a test flag).
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)

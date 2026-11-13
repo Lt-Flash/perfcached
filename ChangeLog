@@ -1,3 +1,144 @@
+=========================== Release 0.7.5 ==============================
+
+2026-11-13  Yury Kirsanov
+        * [upgrade] 0.7.5 speaks cluster wire epoch 4 alone and refuses
+          a 0.7.4 node by name: from 0.7.4.x stop every node (perfcli -E
+          <enable> fleetstop), install 0.7.5 everywhere and start them
+          all - no roll.  The state is kept; the WAL and the snapshot
+          did not change.  A node-epoch file from an earlier release is
+          noted once and rewritten.  libperfd 0.7.6 routes by key
+          against 0.7.5 alone, and an older one not against 0.7.5: a
+          route_keys handle on the other side sends every request
+          through the forward hop, which refuses values over 58,000
+          bytes - move such clients with the fleet.  perfload refuses a
+          dump from an earlier perfdump (the format is version 2): take
+          it again.
+        * [lib] libperfd 0.7.6: the same soname and every symbol, plus
+          perfd_opts_init_sz().  perfd_opts_init() zeroed this library's
+          whole perfd_opts, so a program built against an older libperfd
+          that filled its own struct with it had the bytes past that
+          struct zeroed - 16 with libperfd 0.7.5 under a 0.6.x program.
+          The header now passes the caller's size (perfd_opts_init_sz),
+          and the plain function, which such programs call, touches only
+          the struct libperfd 0.6 had.  A program built before
+          perfd_opts.encrypt existed stays encrypted past the handshake,
+          as its library did.  Rebuild a program built against 0.7.5
+          that sets perfd_opts.name or worker_balance after
+          perfd_opts_init(): until then this library reads them as
+          unset.
+        * [lib] A write a FAILED or HEALING node refuses moves to
+          another member at once; it and the daemon's "forward failed"
+          are PERFD_E_REFUSED, not PERFD_E_SERVER - nothing was applied.
+          A link quiet for 100 ms is looked at before a send, so one a
+          restart closed is replaced first, and a routed perfd_add or
+          perfd_sub whose standby dies mid-request fails rather than
+          going again on the active link, where it could apply twice.
+          Handles leave a FAILED or HEALING node on the next beat.
+          perfd_opts.pin keeps a handle on the node it dialled (perfcli
+          pins), and a handle that moves raises privilege again before
+          the re-send, also after an enable sent through
+          perfd_command().
+        * [tls] TLS on the RESP and HTTP doors: resp = <addr:port> tls,
+          http = <addr:port> tls, with [listen] tls_cert, tls_key and
+          tls_min; a reload reads the pair again.  /stats tls, the
+          page's tls card and the alert tls.cert (inside 14 days of
+          expiry) watch the certificate; auth_needs_tls = yes refuses
+          AUTH and the HTTP token in the clear off loopback.  rediss://
+          upstreams, checked against upstream_tls_ca and the URL's host
+          or upstream_tls_name, with an optional client certificate
+          (upstream_tls_cert, upstream_tls_key).  OpenSSL is linked when
+          pkg-config finds it (PC_TLS=auto); perfcached -V says whether.
+        * [upstream] Discovery.  A listed master's ROLE replicas become
+          upstreams (upstream_discover = auto, the default), except
+          behind a proxy or for a write-through collection.  A Redis
+          Sentinel as the upstream is never read: the master and
+          replicas it watches are, its events are followed at once, and
+          a write-through writer follows the master it names
+          (upstream_sentinel_master, upstream_sentinel_password).  What
+          was learned is kept in state_dir for a start with the seed
+          down, the page says who named each upstream, and upstream
+          takes 32 servers.
+        * [upstream] A Redis Cluster as the upstream, from one node: the
+          slot map from CLUSTER SHARDS (SLOTS before Redis 7) every 10 s
+          and after a MOVED, each read to its slot's shard (a replica
+          after READONLY), MOVED and ASK followed, each write through to
+          its slot's master (CROSSSLOT refused), the drain sweep by
+          shard; /stats redis_cluster.
+        * [cluster] Fleets form in order.  A node that hears no master
+          founds after a settle window of 3 to 10 s, the lowest identity
+          first, and a joiner told the fleet is electing waits; two
+          that found at once still end as one fleet.  The master admits
+          joiners from a queue, one at a time (four above 16 members).
+          An admitted node is connecting - live, but holding no share,
+          standing for no election and refusing client data as not
+          READY (recovering or connecting) - until every link between it
+          and each member has answered both ways, the TCP paths in use
+          included; after 10 s the log names the missing links,
+          cluster.admission_stuck is raised and the queue moves on.  A
+          member list past max_datagram goes in parts.  A fleet started
+          all at once could stay without a master (one that yielded kept
+          beaconing) or give one node id to two nodes; neither now.
+        * [cluster] Eager: two writes of one key through two nodes at
+          one version left each replica with whichever came first, for
+          good.  Every replica now keeps the same one, and the repair
+          sweep compares values as well as versions.
+        * [table] A resize whose copy of a record found no room in the
+          arena skipped it, and the closing drain dropped the only copy
+          (0.7.3 and 0.7.4.4 too).  The resize now waits for room, the
+          old table answering, and closes only once every record moved.
+        * [cluster] Reads through a node that does not hold the key: a
+          read-only read-through collection in shard or spread answered
+          nil for keys another member owns (since 0.7.1), hash reads and
+          JSON GET could answer empty, and EXISTS, TYPE, TTL and PTTL
+          answered as if the key were absent.  All now reach the key at
+          its owner or a holder, as GET does.
+        * [upstream] A read whose fetched copy found no room in the
+          arena answered nil; it now answers the fetched value, and a
+          change to such a key is refused, naming the arena, while there
+          is still no room.  A read whose record a write's echo dropped
+          is fetched again even while its mark lingers (read_lost_spent
+          counts what is still lost).
+        * [cluster] Spread: surplus copies left after a member restarts
+          went only about 100 s after the fleet settled, then 64 a node
+          every 10 s, answering local reads meanwhile; now from 30 s
+          after, every second while any are left.  After a short
+          partition a key written through a node holding no copy could
+          stay at one copy: the first holder now keeps it as its own
+          write, on its WAL, and its sweep repairs the other holder.
+        * [cluster] After a whole-fleet restart a node could bootstrap
+          from a peer that came back empty while the records' author was
+          still replaying its log, and stay short; a bootstrap now waits
+          for a peer still loading that reports records.  A member short
+          of deletes its origin had forgotten kept those keys until
+          their TTL: the rebuild a floor asks for walked no record.
+        * [security] A cluster frame reaches the replay window only
+          after the sender checks and only from the host its header
+          names (/stats cluster.replay.host), under a budget of 4,096
+          streams; the relay port's TCP receiver grows a buffer with
+          what arrives, not to the length announced.  A RESP or HTTP
+          door off loopback with no password or token is warned about
+          at -C and at start.
+        * [stats] /stats collections[].keeps (ephemeral, recoverable,
+          fleet-delete-safe) and copies, and a start line for each.  The
+          start warns when the NIC has fewer receive queues than workers
+          or all interrupts on one CPU (alerts.host.link: rx_queues,
+          irqs, irq_cpus, tcp_retrans_s).  [memory] pin = no runs the
+          arena unlocked (GUIDE.md, "Two ways to run the memory").
+        * [tools] perfdump and perfload carry every record type (a hash
+          came back a string) and records over 64 KB; perfcli jget
+          prints valid JSON; upgrade plan prints -h HOST -p PORT;
+          perfcli reads a config's inline # notes as the daemon does;
+          the dashboard's default config is the packaged one; CLIENT
+          LIST names IPv6 clients.
+        * [php] php-perfcached 0.1.1: the seeds' second pass shares one
+          connect_timeout_ms; a secret holding a NUL is a ValueError;
+          the secrets file is warned about when its group or others have
+          any access; the Symfony adapter's clear() escapes glob
+          characters in its namespace, which could clear another's keys.
+        * [debian] An apt upgrade leaves perfcached running until you
+          restart it; it stopped the daemon and started the new build.
+          [alpine] The licence field is GPL-2.0-or-later AND MIT.
+
 ========================== Release 0.7.4.4 =============================
 
 2026-11-05  Yury Kirsanov
@@ -20,7 +161,8 @@
           The snapshot now re-reads such a bucket under its lock.
         * [page] An upstream master's tooltip said "not used (a master)"
           beside a row saying writes go there.  It meant the reads: it now
-          says "writes go here, not read (replicas only)", or "not read".
+          says "writes go here, not read (replicas only)", or "not read
+          (replicas only)" where writes go elsewhere.
         * [php] lang/php: an extension for PHP 8.3 NTS over libperfd, with
           a list of seeds and one handle a worker under PHP-FPM, a Symfony
           cache adapter, and the Debian package php8.3-perfcached.
@@ -597,7 +739,7 @@
           the WAL on, where the owner's share is away while it restarts.
 
         * [cli] perfcli upgrade plan|start|resume|status|abort|rollback:
-          the roll driver (DESIGN 12ns) - stages a build on every
+          the roll driver - stages a build on every
           member, then switches one node at a time, members first and
           the master last, with the gates between (restart-safe, a new
           pid on the version asked, ready with peers up, the peers'

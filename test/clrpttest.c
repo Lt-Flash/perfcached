@@ -1,9 +1,10 @@
-/* clrpttest.c - S469: replication groups over TCP (clrpt.c), sender and
- * receiver in one thread over loopback; cases A-E say what each checks */
+/* clrpttest.c - replication groups over TCP (clrpt.c), with sender and receiver in one thread
+ * over loopback */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -73,6 +74,9 @@ int main(void)
 	socklen_t al = sizeof at;
 	int lfd, i, sent, refused;
 
+	/* every line printed as it is said, and a hang ended in two minutes: the hung case shows */
+	setvbuf(stdout, NULL, _IONBF, 0);
+	alarm(120);
 	memset(&at, 0, sizeof at);
 	at.in4.sin_family = AF_INET;
 	at.in4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -83,7 +87,8 @@ int main(void)
 	}
 	rx = clrpt_rx_new(lfd, NULL);
 
-	/* A */
+	/* A: frames of 1 B to 60,000 B arrive whole and in order */
+	printf("  ..   case A\n");
 	for (i = 0, sent = 0; i < 100; i++) {
 		size_t n = i == 0 ? 1 : (size_t)(i * 599 % 60000) + 1;
 
@@ -96,7 +101,8 @@ int main(void)
 		"A: 100 frames of 1 B to 60,000 B - queued %d, received %d whole and in order (%d bad)",
 		sent, got, bad);
 
-	/* B */
+	/* B: a stopped reader - a send past the bound is refused (a fallback), then all drain */
+	printf("  ..   case B\n");
 	clrpt_figures(&f0);
 	clrpt_set_qmax(200000);
 	got = 0;
@@ -114,7 +120,8 @@ int main(void)
 	CHK(got == sent && bad == 0, "B: the reader drained all %d (%d received, %d bad)", sent, got, bad);
 	clrpt_set_qmax(CLRPT_QMAX);
 
-	/* C */
+	/* C: a length past the frame limit drops the connection */
+	printf("  ..   case C\n");
 	{
 		int c = socket(AF_INET, SOCK_STREAM, 0);
 		unsigned char h[4] = { 0x7f, 0xff, 0xff, 0xff };
@@ -132,7 +139,8 @@ int main(void)
 			close(c);
 	}
 
-	/* D */
+	/* D: nothing listening - the connect fails and the sends fall back */
+	printf("  ..   case D\n");
 	{
 		pc_addr none = at;
 		int r1, r2;
@@ -149,7 +157,49 @@ int main(void)
 			r1, r2);
 	}
 
-	/* E: OM2-11 - an address the gate refuses is closed at accept */
+	printf("  ..   case F\n");
+	/* F: a header naming a 60,000-byte frame commits no 60 KB: the buffer grows with what
+	 * arrives, and the frame still lands whole */
+	{
+		static unsigned char h[4 + 60000];
+		int c = socket(AF_INET, SOCK_STREAM, 0);
+		unsigned long long held = ~0ULL;
+
+		frame(h + 4, 0, 60000);
+		h[0] = 0; h[1] = 0; h[2] = 0xea; h[3] = 0x60;
+		got = bad = 0;
+		clrpt_figures(&f0);            /* the other connections' buffers stand */
+		if (c >= 0 && connect(c, &at.sa, sizeof at.in4) == 0 &&
+		    write(c, h, 104) == 104) {
+			size_t o = 104;
+			int k;
+
+			pump(rx, 1, 25);
+			clrpt_figures(&f1);
+			held = f1.rx_held - f0.rx_held;
+			/* the rest without blocking: this thread is also the reader, and a
+			 * blocking write past the socket buffers waits for it for ever */
+			fcntl(c, F_SETFL, O_NONBLOCK);
+			for (k = 0; k < 2000 && got == 0; k++) {
+				if (o < sizeof h) {
+					ssize_t w = write(c, h + o, sizeof h - o);
+
+					if (w > 0)
+						o += (size_t)w;
+				}
+				pump(rx, 1, 1);
+			}
+		}
+		CHK(held < 16384 && got == 1 && bad == 0,
+			"F: 100 bytes of a 60,000-byte frame hold %llu bytes; the rest sent, it lands whole (%d, %d bad)",
+			held, got, bad);
+		got = bad = 0;            /* E's pump waits on got */
+		if (c >= 0)
+			close(c);
+	}
+
+	printf("  ..   case E\n");
+	/* E: an address the gate refuses is closed at accept */
 	clrpt_rx_free(rx);
 	at.in4.sin_port = 0;
 	lfd = clrpt_listen(&at);

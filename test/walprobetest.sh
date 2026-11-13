@@ -1,14 +1,6 @@
 #!/bin/sh
-# walprobetest.sh — S12 verification: the probe measures with the WAL's
-# own I/O pattern and the policy pairs measurement with identity honestly
-# (a blazing tmpfs number must never read as durable).
-#
-# S63 (2026-09-03) removed the per-device cache: it was keyed by a device
-# id that a hypervisor-side storage migration does not change, so it
-# served numbers for storage that no longer existed.  These assertions
-# were inverted with it - every start must MEASURE, and the reported
-# ceiling must say it is an upper bound rather than a sustained rate.
-# Usage: test/walprobetest.sh [./perfcached]
+# walprobetest.sh - the probe measures with the WAL's own I/O pattern, never calls tmpfs durable, measures
+# on every start (no per-device cache) and reports its ceiling as an upper bound.
 set -u
 
 BIN=${1:-./perfcached}
@@ -48,9 +40,7 @@ echo "$R" | grep -q "burst ceiling" && ok || bad "no burst ceiling wording"
 echo "$R" | grep -qE "over [0-9]+ KB" && ok \
 	|| bad "the ceiling cites no measured volume: $R"
 
-# S63: no cache is written, and a second run measures again.  A cache
-# keyed by device id survives a storage migration that changes nothing
-# it can see, so it must not exist at all.
+# no cache is written, and a second run measures again: a device id survives a storage migration
 [ -e "$D/.pc-walprobe" ] && bad "a probe cache file was written" || ok
 R=$("$BIN" -P "$D")
 echo "$R" | grep -q "(cached)" && bad "second run served a cached result" || ok
@@ -72,15 +62,14 @@ plaintext = loopback
 [wal]
 dir = $2
 probe = $1
-# pinned, as in every WAL suite (1d02d7b): the policy chose 8 x 256 MB, and
-# zero-writing it took 225 past the ready wait (rc18 GitLab durability)
+# pinned, as in every WAL suite: the policy's 8 x 256 MB takes too long to zero-write
+# within the ready wait
 segment_mb = 8
 [collection th]
 buckets_log2 = 10
 EOF
 }
-# 30 s, not 6: a TERM before the daemon's handler kills it silently - rc13
-# on 224 lost both startup lines that way (the provisioning above, likely)
+# 30 s, not 6: a TERM before the daemon's handler kills it silently, losing the startup lines
 startstop() {
 	"$BIN" -f "$D/w.conf" > "$D/log" 2>&1 &
 	PID=$!

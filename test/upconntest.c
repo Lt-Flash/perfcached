@@ -1,25 +1,5 @@
-/* upconntest.c - the read-through's RESP client (upconn.c; the 0.7.2
- * split, wave 1).  An AF_UNIX socketpair stands in for the upstream - no
- * network, no port, no second process: the test writes the server's
- * replies into its end before each call and reads back what the client
- * sent.  uc_connect itself needs a listener, and is the suites'.
- *
- *   A  send_cmd: a command as a RESP array of bulks, byte for byte, binary
- *      arguments (CR, LF, NUL) carried by length
- *   B  the reply reader: a reply; a RESP3 push before it goes to on_push and
- *      the reply after it is returned; the reply's span in the buffer; a
- *      reply larger than the first buffer read whole; one larger than this
- *      thread's rv_max is -3; nothing by the deadline is -2; the server
- *      gone is -1
- *   C  role_check: ROLE master; a replica's INFO replication - link up or
- *      down, the lag (whole seconds as ms), its master's host and port; a
- *      reply naming neither is "other"; the commands it sent; leaving the
- *      usable set logged once and its return logged once
- *   D  uc_close: the connection counted down; a tracked fetch connection's
- *      copies flushed (the invalidation connection's are not); closing twice
- *      is harmless
- *   E  nap_ms sleeps at least its time by now_ms; now_us agrees with now_ms
- */
+/* upconntest.c - the read-through's RESP client (upconn.c) over an AF_UNIX socketpair standing in
+ * for the upstream: the server's replies are written before each call, what was sent read back. */
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -70,6 +50,20 @@ void on_push(struct uconn *c, struct rv *v)
 
 void flush_shadow(struct up_srv *s) { (void)s; flushes++; }
 int srv_state(const struct up_srv *s) { (void)s; return sseq[sn < 4 ? sn++ : 3]; }
+void srv_discovered(struct up_srv *m, char hosts[][64], const int *ports, int n)
+{
+	(void)m; (void)hosts; (void)ports; (void)n;
+}
+void sen_start(struct up_col *uc) { (void)uc; }
+void cl_start(struct up_col *uc) { (void)uc; }
+struct up_tls_conn *uptls_connect(struct up_tls *t, int fd, const char *name, long long dl,
+		char *why, size_t wl) { (void)t; (void)fd; (void)name; (void)dl; (void)why; (void)wl; return NULL; }
+ssize_t uptls_read(struct up_tls_conn *c, void *p, size_t n, short *ev, char *why, size_t wl)
+{ (void)c; (void)p; (void)n; (void)ev; (void)why; (void)wl; return -1; }
+ssize_t uptls_write(struct up_tls_conn *c, const void *p, size_t n, short *ev)
+{ (void)c; (void)p; (void)n; (void)ev; return -1; }
+int uptls_pending(struct up_tls_conn *c) { (void)c; return 0; }
+void uptls_close(struct up_tls_conn *c) { (void)c; }
 int pc_resolve_family(void) { return 0; }
 
 /* ---- the harness ------------------------------------------------------- */
@@ -134,6 +128,7 @@ int main(void)
 	memcpy(uc.name, "c", 2);
 	uc.nlen = 1;
 	uc.max_lag_ms = 1000;
+	uc.discover = PC_UP_DISC_NO;       /* the scripted handshake has no CLIENT INFO */
 	srv.uc = &uc;
 	memcpy(srv.addr, "10.0.0.1:6379", 14);
 	pthread_mutex_init(&srv.run_mx, NULL);
@@ -142,7 +137,7 @@ int main(void)
 	c.fd = -1;
 	open_pair();
 
-	/* A */
+	/* A: send_cmd - a RESP array of bulks, byte for byte; binary arguments carried by length */
 	{
 		static const char want[] = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\na\r\n\0b\r\n";
 		const char *av[3] = { "SET", "k", "a\r\n\0b" };
@@ -156,7 +151,7 @@ int main(void)
 			sent_len);
 	}
 
-	/* B */
+	/* B: the reply reader - pushes, spans, big replies; -3 past rv_max, -2 late, -1 gone */
 	SERVE("+OK\r\n");
 	CHK(read_reply(&c, &v, dl()) == 0 && is_ok(&v), "B: +OK read");
 	rv_free(&v);
@@ -204,7 +199,7 @@ int main(void)
 	CHK(read_reply(&c, &v, dl()) == -1, "B: the server gone is -1");
 	open_pair();
 
-	/* C */
+	/* C: role_check - ROLE master, a replica's link, lag and master, "other"; changes logged */
 	sn = 0;
 	sseq[0] = PC_UPS_SERVE; sseq[1] = PC_UPS_SERVE;
 	SERVE("*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n");
@@ -249,7 +244,7 @@ int main(void)
 		strstr(last_log, "taken back") != NULL, "C: and its return - said once");
 	(void)sent();
 
-	/* D */
+	/* D: uc_close - counted down; a tracked fetch link's copies flushed; twice is harmless */
 	srv.conns_up = 2;
 	c.tracked = 1;
 	c.inv = 0;
@@ -265,7 +260,7 @@ int main(void)
 	uc_close(&c);
 	CHK(srv.conns_up == 0 && flushes == 1, "D: the invalidation connection - no flush");
 
-	/* E */
+	/* E: nap_ms sleeps at least its time by now_ms; now_us agrees with now_ms */
 	{
 		long long t0 = now_ms(), u0 = now_us();
 

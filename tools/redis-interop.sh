@@ -1,20 +1,6 @@
 #!/bin/sh
-# redis-interop.sh - S331 read-through against a REAL Redis (DESIGN 12ix).
-#
-# The suites use test/fakeupstream.py; this runs the same paths against
-# the redis:8 image in a THROWAWAY local container (podman, or docker),
-# removed on exit - never point it at a shared Redis.  Not in CI (no image
-# pulls there); run it before a release that touches read-through:
-#
-#   tools/redis-interop.sh [./perfcached] [image]
-#
-# It connects as a read-only ACL user (the GUIDE's line, verbatim), reads
-# a string, a hash, a RedisJSON document and a list through, promotes an
-# INCR and a DEL, changes a key in Redis and waits for the invalidation,
-# runs the drain sweep (updrain) and reads the swept keys after FLUSHALL
-# on the Redis side, then proves the one-way rule two ways: MONITOR shows
-# perfcached sending only the handshake and reads, and ACL LOG shows
-# nothing refused.
+# redis-interop.sh [./perfcached] [image] - read-through against a REAL Redis in a throwaway local
+# container (never a shared one); run before a release that touches read-through.
 set -u
 BIN=$(readlink -f "${1:-./perfcached}")
 PYTHONPATH=$(cd "$(dirname "$0")/../test" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -137,9 +123,8 @@ R SET tok:t1 t1b >/dev/null
 k=0; B=""; while [ $k -lt 30 ]; do B=$(rc 'GET tok:t1'); [ "$B" = "'t1b'" ] && break; sleep 0.1; k=$((k+1)); done
 [ "$A" = "'t1a'" ] && [ "$B" = "'t1b'" ] && ok "redis changes tok:t1: the invalidation arrives, the next read has t1b ($((k * 100)) ms)" \
 	|| bad "invalidation: $A then $B (invalidations $I0 -> $(stat invalidations))"
-# ST2: EXISTS / TTL / TYPE of a document read TYPE + PTTL only - no JSON.GET
-# on the wire - and redis still tracks the key for us: deleting it, or
-# giving it an expiry, reaches the marker
+# EXISTS / TTL / TYPE of a document read TYPE + PTTL only (no JSON.GET), and redis still tracks the
+# key: deleting it, or giving it an expiry, reaches the marker
 R JSON.SET tok:pe '$' '{"p":1}' >/dev/null
 R JSON.SET tok:pe2 '$' '{"q":2}' >/dev/null
 sleep 0.2
@@ -154,9 +139,8 @@ R EXPIRE tok:pe2 100 >/dev/null
 k=0; X=""; while [ $k -lt 30 ]; do X=$(rc 'EXISTS tok:pe' 'TTL tok:pe2' | tr '\n' ' '); case "$X" in "0 "9[0-9]" "|"0 100 ") break ;; esac; sleep 0.1; k=$((k+1)); done
 case "$X" in "0 "9[0-9]" "|"0 100 ") ok "ST2: redis tracks a key read by TYPE + PTTL alone - its DEL and EXPIRE reach the marker ($X after $((k * 100)) ms)" ;;
 	*) bad "ST2 invalidation of a marker: EXISTS/TTL $X (want 0 and ~100)" ;; esac
-# ST4: an ABSENT mark is tracked too - redis tracks the key name a read
-# asked about, present or not - so a key created after a miss is read
-# well inside upstream_negative_ms
+# an ABSENT mark is tracked too (redis tracks the name a read asked about), so a key created after a
+# miss is read well inside upstream_negative_ms
 X0=$(rc 'GET tok:born')
 R SET tok:born b1 >/dev/null
 k=0; X=""; while [ $k -lt 20 ]; do X=$(rc 'GET tok:born'); [ "$X" = "'b1'" ] && break; sleep 0.05; k=$((k+1)); done

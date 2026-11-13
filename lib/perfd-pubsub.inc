@@ -3,15 +3,9 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-pubsub.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds pub/sub (PS4) and pub/sub over UDP (PS5), with the reply helpers they
- * and the typed verbs share.
- */
-/* ---- pub/sub (PS4) ------------------------------------------------------ */
+/* perfd-pubsub.inc - pub/sub over the connection and over UDP; #included by perfd.c as one
+ * translation unit (statics stay file-local), never compiled on its own. */
+/* ---- pub/sub ------------------------------------------------------------ */
 
 /* the reply map's integer @field, or -1 with p->err */
 static int reply_int(perfd_t *p, const char *what, char *res, size_t n,
@@ -106,7 +100,7 @@ int perfd_publish(perfd_t *p, const char *channel, const void *payload,
 	pc_tw_key(&w, "channel");
 	pc_tw_str(&w, channel);
 	pc_tw_key(&w, "payload");
-	pc_tw_bulk(&w, payload, plen);     /* bytes: no b64 leg (S317) */
+	pc_tw_bulk(&w, payload, plen);     /* bytes: no b64 leg */
 	pc_tw_end(&w);
 	if (pc_tw_done(&w) != 0) {
 		pc_tw_free(&w);
@@ -121,11 +115,8 @@ int perfd_publish(perfd_t *p, const char *channel, const void *payload,
 	return (int)n;
 }
 
-/* ---- pub/sub over UDP (PS5) ----------------------------------------------
- * lib/perfd_push.h has the datagram and the protocol.  The window is the
- * relay's idea (a counter is lost only when it leaves 64 behind the
- * highest seen unseen; inside the window a late one is simply accepted),
- * written again here for this library. */
+/* ---- pub/sub over UDP: lib/perfd_push.h has the datagram and the protocol; the relay's
+ * window loses a counter only once it falls 64 behind the highest seen ---- */
 #define PD_UDP_WAIT_PROBE   1          /* asked; the probe has not come */
 #define PD_UDP_CONFIRMING   2          /* async: confirm submitted */
 #define PD_UDP_ACTIVE       3
@@ -164,9 +155,8 @@ static void udp_drop(perfd_t *p, int pruned)
 	u->pruned = pruned;
 }
 
-/* a hex-text member of the reply map into @out, exactly @len bytes (the
- * stream id and the key travel as hex bulks - D8, so lib/perfd_push.h's
- * consumers see what they always saw) */
+/* a hex-text member of the reply map into @out, exactly @len bytes (the stream id and the
+ * key travel as hex bulks, as lib/perfd_push.h's consumers always saw them) */
 static int tv_hex(const struct pc_tv *v, const char *field,
 		unsigned char *out, size_t len)
 {
@@ -253,9 +243,8 @@ static int submit_tree(perfd_t *p, const char *method,
 		const unsigned char *tree, size_t tlen, perfd_reply_cb cb,
 		void *ctx, int render);
 
-/* send a request of ours: a round trip on a blocking handle, a submit on
- * an async one; the callback sees the reply tree either way.  0, or -1
- * with the error set */
+/* send a request of ours: a round trip on a blocking handle, a submit on an async one; the
+ * callback sees the reply tree either way.  0, or -1 with the error set */
 static int udp_request(perfd_t *p, const char *method,
 		const unsigned char *tree, size_t tlen, perfd_reply_cb cb)
 {
@@ -266,13 +255,8 @@ static int udp_request(perfd_t *p, const char *method,
 		return submit_tree(p, method, tree, tlen, cb, p, 0);
 	if (roundtrip(p, method, tree, tlen, &r, &n) != 0)
 		return -1;
-	/* r is BORROWED (S284) from the handle's reply buffer, but a reply
-	 * callback OWNS its result and frees it (perfd_reply_cb) - call_fire
-	 * hands the async path's malloc'd reply over the same way.  Handing
-	 * it r freed the handle's buffer, and the confirm's reply was then
-	 * copied into freed memory: musl crashed in udppushtest, glibc
-	 * aborted on "double free or corruption" (DESIGN 12iq).  One copy
-	 * per UDP stream setup or teardown - not a per-operation path. */
+	/* r is BORROWED from the handle's reply buffer, but a reply callback OWNS and frees its
+	 * result, so it gets a copy - once per stream setup or teardown, not per operation */
 	if (cb) {
 		char *c = dup_reply(p, r, n);
 
@@ -432,7 +416,7 @@ static int udp_probe_in(perfd_t *p, const unsigned char *dg, size_t n)
 		return 1;
 	if (u->state != PD_UDP_WAIT_PROBE)
 		return 0;                      /* a late probe */
-	/* the cookie goes back as hex text (D8), as it always did */
+	/* the cookie goes back as hex text, as it always did */
 	sodium_bin2hex(hex, sizeof hex, pt, PFP_COOKIE);
 	pc_tw_init(&w, params, sizeof params);
 	pc_tw_map(&w);
@@ -495,10 +479,8 @@ static void udp_deliver(perfd_t *p, const unsigned char *pt, size_t n)
 	u->since_ack++;
 	if (!p->ncb)
 		return;
-	/* the tree a delivery on the connection would have carried (D6):
-	 * {"method": "message"|"pmessage", "params": {"pattern"?, "channel",
-	 * "payload"}} - built here and rendered by the SAME function the
-	 * connection's NOTIFY goes through, so the hook cannot tell them apart */
+	/* the tree a delivery on the connection would have carried, rendered by the SAME function
+	 * as the connection's NOTIFY, so the hook cannot tell them apart */
 	need = 128 + plen + clen + dlen;
 	if (need > u->tcap) {
 		unsigned char *nt = realloc(u->tree, need);

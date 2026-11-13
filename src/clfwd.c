@@ -1,25 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- *
- * clfwd.c - the proxy write plane's wire frames.  See clfwd.h.
- *
- * No literal offsets: a cursor (clcodec.h) puts each field where the
- * previous one ended.  On the read side a single pc_rfits() per header
- * is the bounds check and the unchecked readers run inside it - measured
- * parity with hand-written offsets on parse and faster on build, where
- * per-field checking cost +3.3ns on a frame this size.
- *
- * Each builder hands its cursor the EXACT length the frame will be, the
- * same number clfwd_*_size() computes and the function returns.  Those
- * were two independent computations of one quantity with nothing making
- * them agree; now a disagreement makes the cursor refuse rather than
- * run off the buffer.
- */
+ * clfwd.c - the proxy write plane's wire frames (see clfwd.h), laid out by a cursor (clcodec.h) */
 #include <string.h>
 
 #include "clcodec.h"
 #include "clfwd.h"
 #include "clmsg.h"                    /* M_FWD_OP */
 
+/* each builder hands its cursor the EXACT length clfwd_*_size() computes, so a disagreement
+ * makes the cursor refuse rather than run off the buffer */
 size_t clfwd_op_size(unsigned int collen, unsigned int klen,
 		unsigned int vlen)
 {
@@ -140,7 +128,7 @@ size_t clfwd_demote_build(unsigned char *msg, unsigned char type,
 	pc_w8(&c, type);
 	pc_w16(&c, (uint16_t)winner);
 	key_tail_build(&c, k);
-	pc_w64(&c, ver);                   /* CH-16: after the key, see clfwd.h */
+	pc_w64(&c, ver);                   /* after the key, see clfwd.h */
 	return c.ok ? len : 0;
 }
 
@@ -178,10 +166,10 @@ size_t clfwd_tomb_build_n(unsigned char *msg, unsigned char type,
 	pc_wcur_init(&c, msg, len);
 	pc_w8(&c, type);
 	key_tail_build(&c, k);
-	pc_w64(&c, ver);                   /* S209: after the key, see clfwd.h */
+	pc_w64(&c, ver);                   /* after the key, see clfwd.h */
 	if (flags)
-		pc_w8(&c, flags & 0xffu);      /* S446: after the version */
-	if (flags & CLFWD_TOMB_F_NUMBERED) {   /* AT-2: after the flags */
+		pc_w8(&c, flags & 0xffu);      /* after the version */
+	if (flags & CLFWD_TOMB_F_NUMBERED) {   /* after the flags */
 		pc_w64(&c, num->oid);
 		pc_w32(&c, num->incarn);
 		pc_w64(&c, num->seq);
@@ -223,10 +211,10 @@ int clfwd_tomb_parse_n(const unsigned char *pt, size_t n,
 	if (n >= tail + 8)
 		*ver = pc_g64(pt + tail);        /* a versioned sender */
 	if (n >= tail + 9)
-		f = pt[tail + 8];                /* S446 */
+		f = pt[tail + 8];
 	if ((f & CLFWD_TOMB_F_NUMBERED) && n < tail + 9 + CLFWD_TOMB_NUM_LEN)
 		f &= ~CLFWD_TOMB_F_NUMBERED;     /* cut short: unnumbered */
-	if (num && (f & CLFWD_TOMB_F_NUMBERED)) {   /* AT-2 */
+	if (num && (f & CLFWD_TOMB_F_NUMBERED)) {
 		num->oid = pc_g64(pt + tail + 9);
 		num->incarn = pc_g32(pt + tail + 17);
 		num->seq = pc_g64(pt + tail + 21);

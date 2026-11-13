@@ -1,24 +1,6 @@
 #!/bin/bash
-# psnoise.sh [reps] [secs] - pub/sub on the native door through libperfd
-# (binary frames), plaintext against Noise, one host: the daemon pinned to
-# SERVER_CPUS, bench/psbench.c's subscriber and publisher processes pinned
-# to CLIENT_CPUS, loopback.
-# `plaintext = loopback` with the secret `-` is the plaintext arm;
-# `plaintext = never` with the client secret seals every connection.
-#
-#   PERFCACHED=./perfcached PSBENCH=./psbench bench/psnoise.sh 2 8
-#
-# Environment: PERFCACHED, PSBENCH [./perfcached ./psbench], SERVER_CPUS
-# [0-7], CLIENT_CPUS [8-15], WORKERS [4], OUT [/tmp/psnoise].
-#
-# psbench counts, it does not time: the rows are publishes and deliveries
-# a second, whether any subscriber got nothing, the server's CPU over the
-# middle of the publish window, and each client process's own CPU.
-# expected_deliv_s is publishes x subscribers; a shortfall against it with
-# slow_kills means the subscribers could not read what the server wrote -
-# the CLIENT's ceiling (a Noise subscriber decrypts too, and one host's
-# client cores are shared by publisher and subscriber).  Take server
-# figures only from rows without a shortfall.
+# psnoise.sh [reps] [secs] - pub/sub on the native door through libperfd, plaintext against Noise on
+# one host; a row with a delivery shortfall is the client's ceiling, not a server figure.
 set -u
 REPS=${1:-2}
 SECS=${2:-8}

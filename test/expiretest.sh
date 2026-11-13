@@ -1,37 +1,6 @@
 #!/bin/sh
-# expiretest.sh - S213: a TTL re-arm is a write and takes the write's
-# road in every mode.
-#
-# EXPIRE used to touch whatever the local table held.  A passive copy
-# was re-armed and left passive - the author's clock ran out while this
-# node's copy lived on - which is the RGS re-registration path: EXISTS
-# says yes, only EXPIRE follows, and a balancer lands it on a node at
-# random.  Measured on the fleet 2026-09-21: a device record on ONE node
-# with a fresh TTL and gone from the other two, and the JSON.DEL of its
-# de-registration landing on a node without it deleted nothing.  And a
-# key held by another node answered "absent": expire was the one
-# mutating verb without a mode branch, while set, del and add/sub all
-# forward to the owner.
-#
-# Now a re-arm on a copy ADOPTS it (the record becomes this node's, in
-# the WAL whole, pushed as authored), and a re-arm for a key held
-# elsewhere forwards: shard to the owner, proxy to the locator's holder
-# or by the probe set/add use, spread to the best-ranked holder.
-#
-# Arms, each its own fleet, each asserted on EVERY node:
-#   eager  - a re-arm via the copy-only node moves the author's clock and
-#            the third node's; the RGS sequence on the RESP dialect
-#            (JSON.SET+EXPIRE on A, EXPIRE on B once A's short clock has
-#            run out, JSON.DEL on C) leaves nothing on any node;
-#   shard  - a re-arm via a non-owner answers true and moves the owner;
-#   proxy  - a re-arm via a node that never saw the key (the probe) and
-#            via one that read it (the locator) both move the holder;
-#   spread - a re-arm via every node answers true, the K copies move and
-#            no extra copy appears;
-#   store  - a re-arm on a kept pull survives the re-arming node's
-#            restart (it is in that node's WAL now).
-# Before the fix every S213 line is red; the controls stay green.
-# Usage: test/expiretest.sh [./perfcached]
+# expiretest.sh - a TTL re-arm is a write and takes the write's road in every mode: a re-arm on a copy
+# adopts it, one for a key held elsewhere forwards; each arm asserted on every node.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -147,7 +116,8 @@ T1=$(ttl 18111 k1); T2=$(ttl 18112 k1); T3=$(ttl 18113 k1)
 [ "$R" = True ] && [ "${T1:-0}" -gt 400 ] && [ "${T2:-0}" -gt 400 ] && [ "${T3:-0}" -gt 400 ] \
 	&& ok "eager: a re-arm on the copy-only node moved the author's clock and the third node's (ttl $T1/$T2/$T3)" \
 	|| bad "eager: a re-arm on the copy-only node stayed there (updated=$R ttl author=$T1 copy=$T2 third=$T3)"
-# the RGS sequence, on the RESP dialect through three different nodes
+# a re-registration sequence (JSON.SET+EXPIRE, EXPIRE once the short clock ran out, JSON.DEL), on the
+# RESP dialect through three different nodes
 resp 18111 'JSON.SET dev $ {"status":"Reachable"}' > /dev/null
 resp 18111 'EXPIRE dev 2' > /dev/null
 sleep 0.5
@@ -174,6 +144,11 @@ stop_arm 1
 # ---- shard ---------------------------------------------------------
 for n in 1 2 3; do node 2 $n "mode = shard" ""; done
 for n in 1 2 3; do start 2 $n; done
+# each node's map holds all three before a re-arm is forwarded by it, or a re-arm right after the
+# starts answers false
+for n in 1 2 3; do
+	i=0; while [ $i -lt 100 ] && ! grep -q "3 member(s)" "$D/n2$n.log"; do sleep 0.1; i=$((i + 1)); done
+done
 sleep 1
 call 18121 '{"method":"set","params":{"col":"0","key":"k2","value":"v","ttl":60}}' > /dev/null
 sleep 0.5
@@ -225,6 +200,10 @@ stop_arm 4
 node 5 1 "mode = store" "" wal
 node 5 2 "mode = store" "" wal
 start 5 1; start 5 2
+# B pulls only from a member it knows
+for n in 1 2; do
+	i=0; while [ $i -lt 100 ] && ! grep -q "2 member(s)" "$D/n5$n.log"; do sleep 0.1; i=$((i + 1)); done
+done
 sleep 1
 call 18151 '{"method":"set","params":{"col":"0","key":"k5","value":"v","ttl":60}}' > /dev/null
 sleep 0.5

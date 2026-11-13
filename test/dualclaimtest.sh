@@ -1,24 +1,6 @@
 #!/bin/sh
-# dualclaimtest.sh — two nodes that claim the SAME term.
-#
-# clustersim reports 1296/2000 schedules ending with two masters when a
-# master dies in the same window as a split - because clterm.h's rule 3
-# is a STRICT inequality (`theirs > mine`), so two nodes promoting from
-# the same highest seen term hold the same term and neither can act on
-# the other.
-#
-# But clustersim models rule 3 ALONE.  The daemon also carries the
-# member-count/address cure in handle_master_alive, which is a total
-# order and may already resolve this.  So before anything is "fixed",
-# stage it against the daemon and find out.  A fix for a bug the product
-# does not have is worse than no fix.
-#
-# THE FAULT: kill the master AND cut the two survivors from each other
-# in the same instant.  Each survivor is then alone, sees no master, and
-# promotes from the same term the dead master held - so both claim the
-# same next one.  Heal them to each other and see what happens.
-#
-# Usage: test/dualclaimtest.sh [runtime]
+# dualclaimtest.sh - two nodes that claim the SAME term: kill the master and cut the two survivors
+# from each other at once, so both promote from the same term, then heal them.
 set -u
 
 RT=${1:-${RUNTIME:-}}       # the argument, else $RUNTIME (CI), else nerdctl or docker
@@ -50,10 +32,8 @@ except Exception: print(-1)' 2>/dev/null || echo -1; }
 mterm() { cl "$1" | python3 -c 'import json,sys
 try: print(((json.load(sys.stdin).get("cluster") or {}).get("map") or {}).get("term",-1))
 except Exception: print(-1)' 2>/dev/null || echo -1; }
-# the node's OWN term (pc_term_current): what a promotion claims, the
-# moment it claims it - the map's term follows only once the new master
-# has published (GitHub 39947040969: read at the role flip, one survivor's
-# map still said the dead master's 3 while it had claimed 4)
+# the node's OWN term (pc_term_current), the moment a promotion claims it: the map's term follows
+# only once the new master has published
 cterm() { cl "$1" | python3 -c 'import json,sys
 try: print((json.load(sys.stdin).get("cluster") or {}).get("term",-1))
 except Exception: print(-1)' 2>/dev/null || echo -1; }
@@ -74,9 +54,7 @@ done
 echo "       survivors will be pcnode$A and pcnode$B"
 
 T0=$(cterm $MN)
-# CUT FIRST, then kill: if the master dies first the survivors can still
-# see each other, elect ONE master between them, and the collision never
-# happens.  The cut has to be in place before they start looking.
+# CUT FIRST, then kill: a master dying first lets the survivors see each other and elect ONE
 part_cut pcnode$A pcnode$B
 $RT kill pcnode$MN >/dev/null 2>&1
 echo "       master killed, survivors cut from each other"

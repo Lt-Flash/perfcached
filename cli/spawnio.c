@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* spawnio.c - S344: see spawnio.h */
+/* spawnio.c - see spawnio.h */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -48,10 +48,14 @@ int spawn_rd_open(struct spawn_rd *r, const char *path, int zstd)
 	}
 	fcntl(fd[0], F_SETFD, FD_CLOEXEC);
 	fcntl(fd[1], F_SETFD, FD_CLOEXEC);
-	posix_spawn_file_actions_init(&fa);
-	posix_spawn_file_actions_adddup2(&fa, fd[1], STDOUT_FILENO);
-	rc = posix_spawnp(&r->pid, "zstd", &fa, NULL, argv, environ);
-	posix_spawn_file_actions_destroy(&fa);
+	/* without the dup zstd would write to our own stdout */
+	rc = posix_spawn_file_actions_init(&fa);
+	if (rc == 0) {
+		rc = posix_spawn_file_actions_adddup2(&fa, fd[1], STDOUT_FILENO);
+		if (rc == 0)
+			rc = posix_spawnp(&r->pid, "zstd", &fa, NULL, argv, environ);
+		posix_spawn_file_actions_destroy(&fa);
+	}
 	close(fd[1]);
 	pthread_mutex_unlock(&spawn_mx);
 	if (rc != 0 || !(r->f = fdopen(fd[0], "rb"))) {

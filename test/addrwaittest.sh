@@ -1,18 +1,6 @@
 #!/bin/sh
-# addrwaittest.sh - S294: a configured address that is not on the host
-# YET is waited for, not failed on; one that never appears still fails.
-#
-# Each case runs the daemon in its own network namespace, so the address
-# can be added after the start - the shape of an LXC whose network comes
-# up after perfcached (245, 2026-10-01: the first bind failed
-# EADDRNOTAVAIL, an ERROR, and systemd's restart picked it up 2 s later).
-#
-#   A  address added 3 s after the start -> waits, binds, ready, no ERROR
-#   B  address never added, address_wait_s = 2 -> fails after the window
-#   C  address_wait_s = 0 -> fails at once, says it did not wait
-#
-# Needs root (ip netns); SKIPs loudly without it.
-# Usage: test/addrwaittest.sh [./perfcached]
+# addrwaittest.sh - a configured address not on the host yet is waited for (address_wait_s), one that
+# never appears still fails; each case in its own netns, root or SKIP.  Usage: test/addrwaittest.sh [./perfcached]
 set -u
 BIN=$(readlink -f "${1:-./perfcached}")
 ADDR=10.250.7.1

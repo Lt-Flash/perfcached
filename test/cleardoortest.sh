@@ -1,29 +1,6 @@
 #!/bin/sh
-# cleardoortest.sh - S339: a native client with no secret is told so at
-# once, and perfcli finds a config at /etc/perfcached.conf.
-#
-# PROD 2026-10-07: `perfcli -h <its own address>` on a node sat silent for
-# ~31 s and then blamed a closed connection.  The client had no secret, so
-# it sent its first request in the clear; the binary header's first two
-# bytes (magic 0x9E, ver 1) read little-endian as a 414-byte Noise message
-# 1 - inside the handshake's bounds - and the encrypted door waited for 416
-# bytes that never came, until the CLIENT's 30 s io timeout.  It had no
-# secret because the release-tarball install keeps its config at
-# /etc/perfcached.conf, a path perfcli did not look at.
-# plaintextdoortest.sh sends the same plaintext request and counts its 3 s
-# TIMEOUT as "refused" - true, and blind to the wait.
-#
-# One daemon, `plaintext = loopback`, a native door on the host's LAN
-# address and one on loopback:
-#  - a plaintext request to the LAN door is CLOSED within a second (fails
-#    first: TIMEOUT), and the daemon says why, naming the client;
-#  - perfcli with no secret and no config fails within 5 s with the
-#    no-secret message (fails first: ~30 s);
-#  - perfcli with a config ONLY at /etc/perfcached.conf (fopenmapshim maps
-#    that path to a file here - the host's /etc is not touched) reads it
-#    and is answered with no -h/-a (fails first: it finds no config);
-#  - control: perfcli -a <secret> on the LAN door is answered.
-# Usage: test/cleardoortest.sh [./perfcached] [./perfcli] [./fopenmapshim.so]
+# cleardoortest.sh - a native client with no secret is told so at once (not left on a half-read
+# handshake until its io timeout), and perfcli finds a config at /etc/perfcached.conf.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

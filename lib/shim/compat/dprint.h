@@ -1,15 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Yury Kirsanov - see lib/LICENSE */
-/*
- * lib/shim/compat/dprint.h - S370: libperfd's own logging, for the sources it
- * shares with the daemon (src/pc_noise.c logs through LM_*).  They include
- * <compat/dprint.h> in angle brackets, so the include path decides: the
- * library's objects are built with -Ilib/shim ahead of -Isrc and get this
- * file; the daemon builds with -Isrc and gets its own.  The daemon's header
- * is GPL and is never opened for the library (S371: test/mitboundtest.sh
- * lists what the compiler reads).  Messages go to the consumer's
- * perfd_set_log() callback, or, with none, errors and worse to stderr.
- */
+/* libperfd's LM_* logging for sources shared with the daemon: -Ilib/shim ahead of
+ * -Isrc picks this over the daemon's GPL header (test/mitboundtest.sh checks). */
 #ifndef PERFD_SHIM_DPRINT_H
 #define PERFD_SHIM_DPRINT_H
 
@@ -20,6 +12,7 @@
 #define L_INFO   5
 #define L_DBG    6
 
+/* to the perfd_set_log() callback, or with none, errors and worse to stderr */
 void pdl_log(int level, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
 

@@ -1,6 +1,5 @@
 #!/bin/sh
-# libtest.sh — boots plaintext + Noise daemons and runs the libperfd C
-# suite (test/libtest.c) against them.  See the .c for coverage.
+# libtest.sh - boots plaintext and Noise daemons and runs the libperfd C suite (test/libtest.c).
 # Usage: test/libtest.sh [./perfcached] [./libtest]
 set -u
 

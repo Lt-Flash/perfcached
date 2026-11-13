@@ -1,16 +1,13 @@
 #!/bin/sh
-# asyncbin.sh — runs asyncbintest against a real daemon (S28/S32).
-# Usage: test/asyncbin.sh [./perfcached] [./asyncbintest]
+# asyncbin.sh - runs asyncbintest against a real daemon.
 set -u
 
 BIN=${1:-./perfcached}
 T=${2:-./asyncbintest}
 SEC=abin-client-secret
 D=$(mktemp -d /var/tmp/pcabin.XXXXXX)
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a
+# reused pid never hits a stranger; the name-bound pattern stays as a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on

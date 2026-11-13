@@ -1,9 +1,6 @@
 #!/bin/sh
-# phpexttest.sh - PE-1: the PHP extension end to end against live daemons, a
-# plaintext loopback door and a door that takes Noise only: test/phpexttest.php
-# drives every verb, and reads the daemon's native.plain.conns: the default stays
-# encrypted past the handshake, and encrypt => false does not.
-# Usage: test/phpexttest.sh [./perfcached] [php8.3] [lang/php/modules/perfcached.so]
+# phpexttest.sh - the PHP extension end to end (test/phpexttest.php) against a plaintext loopback door and a
+# Noise-only one; the default stays encrypted past the handshake, encrypt => false does not.
 set -u
 BIN=${1:-./perfcached}
 PHP=${2:-php8.3}
@@ -54,6 +51,13 @@ PX() { "$PHP" -n -d extension="$EXT" "$@"; }
 V=$(PX --ri perfcached 2>&1 | grep -c "perfcached => enabled")
 [ "$V" = 1 ] && ok "the extension loads in $("$PHP" -n -r 'echo PHP_VERSION, " ", PHP_ZTS ? "ZTS" : "NTS";')" \
 	|| bad "the extension did not load: $(PX --ri perfcached 2>&1 | tail -2 | tr '\n' ' ')"
+# the prepared secrets file - a warning when anyone but its owner may read it, group too
+printf 'php-test-secret\n' > "$D/sec"; chmod 640 "$D/sec"
+w1=$(PX -d perfcached.prepare_secrets_file="$D/sec" -r 'echo "x";' 2>&1); chmod 600 "$D/sec"
+w2=$(PX -d perfcached.prepare_secrets_file="$D/sec" -r 'echo "x";' 2>&1)
+case "$w1" in *"read by others than its owner"*) case "$w2" in *"read by others"*) bad "S499: a 0600 secrets file warned about: $w2";;
+	*) ok "S499: a group-readable secrets file is warned about, a 0600 one is not";; esac;;
+	*) bad "S499: a 0640 secrets file drew no warning: $(echo "$w1" | head -2 | tr '\n' ' ')";; esac
 PX "$T/phpexttest.php" 17155 17156 php-test-secret
 PF=$?
 [ $PF = 0 ] || fail=$((fail+1))

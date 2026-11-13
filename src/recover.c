@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * recover.c — startup recovery (task S15).  See recover.h.
- */
+/* Startup recovery (see recover.h). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +48,7 @@ static long recovered_n;
 
 static long recovered_wal;
 
-/* S392: the wall-clock second the loaded snapshot began, 0 = none loaded */
+/* the wall-clock second the loaded snapshot began, 0 = none loaded */
 static unsigned long long recovered_snap_wall;
 
 unsigned long long pc_recovered_snapshot_wall(void)
@@ -68,18 +66,10 @@ long pc_recovered_records(void)
 	return recovered_n;
 }
 
-/* S223: when this node's data STOPPED being current - the newest write
- * in its storage directory, wall-clock ms, 0 when nothing was found.
- * The kernel updates a file's mtime on every write(), so the newest one
- * is the last thing this node wrote before it went down.
- *
- * It errs EARLY, never late: a node that sat idle before dying reports
- * its last write rather than its death, which makes its outage look
- * longer, which finds FEWER peers that were watching throughout, which
- * makes the reconcile keep rather than delete.  That is the direction
- * the whole task exists to choose. */
+/* when this node's data stopped being current: the newest mtime in its dir, ms.  It
+ * errs EARLY (an idle node reports its last write), so the reconcile keeps. */
 static long long last_write_ms;
-static int last_write_noted;       /* S455: sampled before the dir lock */
+static int last_write_noted;       /* sampled before the dir lock */
 
 long long pc_recovered_last_write_ms(void)
 {
@@ -112,7 +102,7 @@ static void note_last_write(const char *dir)
 	closedir(d);
 }
 
-/* S455: called before S290's dir lock, which rewrites perfcached.lock here */
+/* called before the dir lock, which rewrites perfcached.lock here */
 void pc_recover_note_last_write(const char *dir)
 {
 	last_write_ms = 0;
@@ -127,7 +117,7 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 	unsigned char *data;
 	struct stat fst;
 	pcache_htable_t *ht = NULL;
-	int cache = 0;                     /* G5: ht's collection is durable = no */
+	int cache = 0;                     /* ht's collection is durable = no */
 	time_t now_wall = time(NULL);
 	size_t off = 24, n;
 	uint32_t fmt;
@@ -151,9 +141,8 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 	close(fd);
 
 	fmt = rd32(data + 4);
-	/* UP3: a format NEWER than this build reads is not corruption - it is
-	 * a downgrade, and starting from the WAL alone would lose every
-	 * replica the snapshot holds.  Said apart, and refused (pc_recover) */
+	/* a NEWER format is a downgrade, not corruption: the WAL alone would lose every
+	 * replica the snapshot holds, so pc_recover refuses */
 	if (rd32(data) == PC_RDB_MAGIC && fmt > PC_RDB_FMT) {
 		st->rdb_fmt_newer = fmt;
 		free(data);
@@ -165,7 +154,7 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 		return -1;
 	}
 	st->marker = rd64(data + 8);
-	st->rdb_wall = rd64(data + 16);    /* S392: stamped when the save began */
+	st->rdb_wall = rd64(data + 16);    /* stamped when the save began */
 
 	while (off < n - 4) {
 		unsigned char tag = data[off++];
@@ -178,7 +167,7 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 			ht = pc_store_find((const char *)data + off + 1, cl);
 			if (!ht)
 				st->rdb_skipped_nocol++;
-			/* G5: a cache collection starts empty - a snapshot taken
+			/* a cache collection starts empty - a snapshot taken
 			 * before it was made one is not loaded into it */
 			cache = ht && !pc_store_durable(ht);
 			if (cache)
@@ -190,7 +179,7 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 			/* format 1 predates the field: those records come back
 			 * unnumbered rather than being refused */
 			unsigned long long ver = fmt >= 2 ? rd64(data + off + 16) : 0;
-			/* S280: the record's type */
+			/* the record's type */
 			unsigned char fl = fmt >= 3 ? (data[off + 24] & PCACHE_F_CARRY) : 0;
 			str k, v;
 			unsigned int exp;
@@ -203,7 +192,7 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 			off += kl + vl;
 			if (!ht) {
 				if (cache)
-					st->rdb_skipped_cache++;   /* G5 */
+					st->rdb_skipped_cache++;
 				continue;              /* its collection went away */
 			}
 			exp = wall_to_ticks(wall, now_wall);
@@ -230,22 +219,8 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 
 /* ---- WAL replay -------------------------------------------------------- */
 
-/*
- * S240: REPLAY BY VERSION, NOT BY FILE ORDER.
- *
- * Each worker has its own ring and the WAL thread drains them in turn,
- * sorting only within one pass, so two workers' records for ONE key can
- * sit in the file in the opposite order to their versions (wal_late
- * counts those passes).  Applied in file order, the later of the two in
- * the FILE won: walordertest measured 10,496-18,272 of 20,000 raced keys
- * restored with an older value than they were serving at kill -9.  Since
- * S234 every record's version is stamped under the key's lock and rises
- * per key, so: an upsert or touch lands only over an OLDER version, a
- * delete removes only an older record - and remembers its version here,
- * so an older upsert later in the file cannot resurrect the key.
- * Unversioned records (pre-A1 upserts, pre-S240 deletes) replay in file
- * order as before.  The table lives for one replay.
- */
+/* Replay by VERSION, not file order: per-worker rings put one key's records out of
+ * order.  Deletes are remembered here for one replay, so an older upsert cannot revive. */
 #define TOMB_BUCKETS 65536u
 struct tomb {
 	struct tomb *next;
@@ -311,9 +286,7 @@ static void tomb_note(const char *k, int n, unsigned long long ver)
 	tombs[h] = t;
 }
 
-/* the tombstone key's buffer, grown to fit: a fixed 512 bytes skipped
- * the delete memory for any key past ~510 bytes, so an older write later
- * in the file resurrected it (the store takes keys to 64 KB) */
+/* the tombstone key's buffer, grown to fit: the store takes keys to 64 KB */
 static char *tk_buf;
 static size_t tk_cap;
 
@@ -352,7 +325,7 @@ static void tomb_free(void)
 struct replay_ctx {
 	struct pc_recover_stats *st;
 	time_t now_wall;
-	long unk_pending;       /* UP3: unknown records not yet bounded */
+	long unk_pending;       /* unknown records not yet bounded */
 };
 
 static int replay_cb(int type, const char *col, int collen, const char *key,
@@ -364,13 +337,10 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 	pcache_htable_t *ht;
 	str k, v;
 	unsigned int exp;
-	unsigned long long tv = 0;          /* S240: a touch meets this */
+	unsigned long long tv = 0;          /* a touch meets this */
 
-	/* UP3: a newer build's record, unparsed - its seq unknown too.  The
-	 * next known record bounds it: at or under the snapshot's marker,
-	 * the snapshot (a format this build reads, or rdb_load refused it)
-	 * already holds what it did.  Above, or with nothing after it, it
-	 * is a write this start would drop - pc_recover refuses */
+	/* a newer build's record, bounded by the next known one: at or under the marker
+	 * the snapshot holds what it did; above, or last in the log, pc_recover refuses */
 	if (!PC_WAL_T_KNOWN(type)) {
 		if (!c->unk_pending++ && !c->st->wal_unknown &&
 		        !c->st->wal_unknown_covered)
@@ -387,10 +357,8 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 	}
 	if (seq > c->st->last_seq)
 		c->st->last_seq = seq;
-	/* 12ny AT-3b: a numbered delete is counted wherever it lies and
-	 * whatever its collection became - its record was logged after the
-	 * delete was applied, so below the marker the snapshot holds it and
-	 * above it this replay does.  On disk: durable, nothing to wait for */
+	/* a numbered delete counts wherever it lies and whatever its collection became:
+	 * below the marker the snapshot holds it, above it this replay does */
 	if (type == PC_WAL_T_DEL_N && vlen == PC_WAL_DELN_VLEN) {
 		const unsigned char *u = (const unsigned char *)val;
 
@@ -402,13 +370,11 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 		c->st->wal_below_marker++;     /* the snapshot already holds it */
 		return 0;
 	}
-	/* S69: the collection set itself, replayed in order with the records
-	 * - a create must exist before the records written into it, and a
-	 * drop must undo a create that came earlier in the same window. */
+	/* the collection set replays in order with the records: a create precedes the
+	 * records written into it, a drop undoes an earlier create */
 	if (type == PC_WAL_T_COL_RENAME) {
-		/* the collections file names this collection as the window
-		 * STARTS, so the rename is applied here, between the records
-		 * written under each name */
+		/* the collections file names the collection as the window STARTS, so the
+		 * rename lands here, between the records written under each name */
 		if (vlen > 0 && pc_store_find(col, (size_t)collen))
 			(void)pc_store_rename(col, (size_t)collen, val,
 				(size_t)vlen, pc_lamport_now());
@@ -422,7 +388,7 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 				pc_store_note_drop(col, (size_t)collen,
 					pc_lamport_now());
 		} else if (!pc_store_find(col, (size_t)collen) && vlen == 1) {
-			if (!pc_col_name_held_ok(col, (size_t)collen)) {   /* S343 */
+			if (!pc_col_name_held_ok(col, (size_t)collen)) {
 				char pb[4 * PC_COL_NAME_MAX + 1];
 
 				LM_WARN("WAL replay: collection '%s' breaks the "
@@ -439,7 +405,7 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 		c->st->wal_skipped++;
 		return 0;
 	}
-	/* G5: a cache collection starts empty - records logged before it was
+	/* a cache collection starts empty - records logged before it was
 	 * made one are not replayed into it */
 	if (!pc_store_durable(ht)) {
 		c->st->wal_skipped_cache++;
@@ -450,7 +416,7 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 	exp = wall_to_ticks(wall, c->now_wall);
 
 	switch (type) {
-	case PC_WAL_T_UPSERT:              /* pre-A1: arrives with ver 0 */
+	case PC_WAL_T_UPSERT:              /* unversioned: arrives with ver 0 */
 	case PC_WAL_T_UPSERT_V:
 		if (exp == 1) {
 			c->st->wal_skipped++;      /* born dead: expired already */
@@ -458,7 +424,7 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 		}
 		v.s = (char *)val;
 		v.len = vlen;
-		if (ver) {                     /* S240: by version */
+		if (ver) {                     /* by version */
 			char *tk = tk_get((size_t)collen + 1 + (size_t)klen);
 			int rc;
 
@@ -467,16 +433,15 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 				c->st->wal_older++;    /* deleted by a newer record */
 				return 0;
 			}
-			/* S280: the record's type comes back with it */
+			/* the record's type comes back with it */
 			rc = pcache_ht_store_ver(ht, &k, &v, exp,
 				(unsigned char)(flags & PCACHE_F_CARRY), ver);
 			if (rc == PCACHE_E_OLDER) {
 				c->st->wal_older++;    /* a newer one already here */
 				return 0;
 			}
-			/* S244: no room for this newer record - the older copy
-			 * an earlier record (or the snapshot) left must not be
-			 * what the node restores */
+			/* no room for this newer record: the older copy left behind
+			 * must not be what the node restores */
 			if (rc == -2)
 				pcache_ht_drop_older(ht, &k, ver);
 			if (rc == 0) {
@@ -494,18 +459,18 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 			c->st->wal_applied++;
 		}
 		return 0;
-	case PC_WAL_T_DEL_N:               /* AT-3b: a DEL, numbered */
+	case PC_WAL_T_DEL_N:               /* a DEL, numbered */
 	case PC_WAL_T_DEL: {
 		char *tk = tk_get((size_t)collen + 1 + (size_t)klen);
 		unsigned long long have = 0;
 
-		if (vlen != PC_WAL_DEL_VERLEN &&    /* pre-S240: file order */
+		if (vlen != PC_WAL_DEL_VERLEN &&    /* unversioned: file order */
 		    !(type == PC_WAL_T_DEL_N && vlen == PC_WAL_DELN_VLEN)) {
 			pcache_ht_remove(ht, &k);
 			c->st->wal_applied++;
 			return 0;
 		}
-		/* S240: the version rides as the value (wal.h) */
+		/* the version rides as the value (wal.h) */
 		ver = (unsigned long long)(unsigned char)val[0] |
 			(unsigned long long)(unsigned char)val[1] << 8 |
 			(unsigned long long)(unsigned char)val[2] << 16 |
@@ -527,14 +492,11 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 		c->st->wal_applied++;
 		return 0;
 	}
-	case PC_WAL_T_TOUCH:               /* pre-A2: arrives with ver 0 */
+	case PC_WAL_T_TOUCH:               /* unversioned: arrives with ver 0 */
 	case PC_WAL_T_TOUCH_V:
 		if (exp == 1 && ver) {
-			/* re-armed into the past: a DELETE at this version, and
-			 * treated as one - it removed an unconditionally, so an
-			 * EXPIRE later in the file than a newer SET took the
-			 * newer value with it, and it is remembered, so an
-			 * older write after it cannot bring the key back */
+			/* re-armed into the past = a DELETE at this version: it honours
+			 * versions and is remembered, so an older write cannot revive it */
 			char *tk = tk_get((size_t)collen + 1 + (size_t)klen);
 			unsigned long long have = 0;
 
@@ -550,12 +512,11 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 			pcache_ht_remove(ht, &k);  /* unversioned: file order */
 		} else if (ver && pcache_ht_getver(ht, &k, &tv) == 0 &&
 		           tv >= ver) {
-			c->st->wal_older++;        /* S240: an older touch */
+			c->st->wal_older++;        /* an older touch */
 			return 0;
 		} else if (pcache_ht_touch(ht, &k, exp) == 1 && ver) {
-			/* the touch ticked a version of its own when it was
-			 * logged; put that one back, not the fresh tick the
-			 * replayed touch just made */
+			/* put back the version the touch ticked when logged,
+			 * not the fresh tick the replay just made */
 			pcache_ht_setver(ht, &k, ver);
 			if (ver > c->st->ver_high)
 				c->st->ver_high = ver;
@@ -569,7 +530,7 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 	return 0;
 }
 
-static int skip_unknown;                   /* UP3: [wal] unknown_records */
+static int skip_unknown;                   /* [wal] unknown_records */
 
 void pc_recover_set_skip_unknown(int on)
 {
@@ -580,10 +541,9 @@ void pc_recover_set_skip_unknown(int on)
 
 int pc_recover(const char *dir, struct pc_recover_stats *st)
 {
-	/* S223: BEFORE anything below opens a file for writing - the replay
-	 * and the snapshot machinery both touch this directory, and after
-	 * that the newest mtime would be "now" rather than "when I died" */
-	if (!last_write_noted)             /* S455: the daemon sampled it first */
+	/* before anything below writes in this directory, or the newest mtime
+	 * would be "now" rather than "when I died" */
+	if (!last_write_noted)             /* the daemon sampled it first */
 		note_last_write(dir);
 	struct replay_ctx ctx;
 	const char *why = "end";
@@ -610,7 +570,7 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 		st->marker = 0;
 	}
 
-	/* 12ny AT-3b: the marks that go with the snapshot just loaded, before
+	/* the marks that go with the snapshot just loaded, before
 	 * the replay counts what came after it */
 	if (st->rdb_ok) {
 		st->ack_restored = pc_ack_load(dir, st->marker);
@@ -624,8 +584,8 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 	ctx.now_wall = time(NULL);
 	ctx.unk_pending = 0;
 	pc_wal_scan(dir, replay_cb, &ctx, &why);
-	tomb_free();                       /* S240: one replay's worth */
-	st->wal_unknown += ctx.unk_pending;   /* UP3: the log's last word */
+	tomb_free();                       /* one replay's worth */
+	st->wal_unknown += ctx.unk_pending;   /* the log's last word */
 	if (st->wal_unknown_covered)
 		LM_NOTICE("recover: %ld WAL record(s) of a type this build does "
 			"not know (first: %d) lie under the snapshot's marker - the "
@@ -645,13 +605,11 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 			"build, were SKIPPED ([wal] unknown_records = skip)\n",
 			st->wal_unknown, st->wal_unknown_type);
 	}
-	/* Resume the version clock above everything that came back.  Not
-	 * observe(): that exists to refuse a peer claiming an absurd value,
-	 * and at boot - clock 0 against a fleet long past a billion writes -
-	 * it would refuse our own dataset and count it as a defect. */
+	/* resume the version clock above everything restored: restore, not observe(),
+	 * which at boot (clock 0) would refuse our own dataset as absurd */
 	recovered_n = st->rdb_records + st->wal_applied;
-	recovered_wal = st->wal_applied;              /* S352 */
-	recovered_snap_wall = st->rdb_ok ? st->rdb_wall : 0;   /* S392 */
+	recovered_wal = st->wal_applied;
+	recovered_snap_wall = st->rdb_ok ? st->rdb_wall : 0;
 	pc_lamport_restore(st->ver_high);
 	LM_NOTICE("recover: rdb %s (%ld records, %ld expired, %ld orphaned), "
 		"wal replay %ld applied / %ld below marker / %ld skipped / "
@@ -674,10 +632,8 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 	return 0;
 }
 
-/* the load verb (runtime, additive): read the current snapshot and
- * store only the records whose key is ABSENT - the live value always
- * wins.  Shares the wire format with rdb_load above but none of its
- * boot-time assumptions (the store is hot and serving). */
+/* the load verb: store only the snapshot records whose key is ABSENT (the live value
+ * wins); rdb_load's format, none of its boot-time assumptions */
 int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 		long *skipped_expired)
 {
@@ -728,7 +684,7 @@ int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 			uint32_t kl = rd32(data + off), vl = rd32(data + off + 4);
 			unsigned long long wall = rd64(data + off + 8);
 			unsigned long long ver = fmt >= 2 ? rd64(data + off + 16) : 0;
-			/* S280: the record's type */
+			/* the record's type */
 			unsigned char fl = fmt >= 3 ? (data[off + 24] & PCACHE_F_CARRY) : 0;
 			str k, v;
 			unsigned int exp;
@@ -761,9 +717,8 @@ int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 		}
 	}
 	free(data);
-	/* an imported record keeps the version it was saved with, so the
-	 * clock has to clear it too - otherwise the next local write would
-	 * be numbered below data this node just took in */
+	/* imported records keep their versions: the clock must clear them, or the
+	 * next local write is numbered below data this node just took in */
 	pc_lamport_restore(high);
 	return 0;
 }

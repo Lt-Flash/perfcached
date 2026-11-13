@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * statsreset.c - the stats reset (S123, S358): it zeroes or re-baselines
- * every running total, keeps the baselines of the cluster, proxy and WAL
- * planes the tree subtracts (since_*), and runs the reset schedule.  Owns
- * reset_mx, reset_run_mx, the three baselines and the schedule.  Moved
- * from verbs.c unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* statsreset.c - the stats reset: re-baselines every running total, keeps the cluster, proxy and
+ * WAL baselines the tree subtracts (since_*), and runs the reset schedule */
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
@@ -22,32 +17,23 @@
 #include "cluster.h"
 #include "wal.h"
 #include "obs.h"                        /* pc_obs_unknown_reset */
-#include "mgetfan.h"                    /* G8 */
+#include "mgetfan.h"
 #include "daemon.h"                     /* pc_doors_reset */
 #include "verbs.h"
 #include "statsreset.h"
 
-/* S123: the running totals start again.  The door counters are
- * re-baselined in proto.c; the cluster plane's, the proxy plane's and the
- * WAL's structs are snapshotted here and the block below reports the
- * difference; the table's own counters go through the core's
- * pcache_ht_stats_reset(); the store's size tallies are zeroed.  Live
- * gauges - entries, buckets, open connections, memory, sequence numbers,
- * roles, pending peaks - are untouched. */
+/* the running totals start again: door counters re-baseline in proto.c, the planes' structs are
+ * snapshotted here and since_* subtracts them; live gauges are untouched */
 static pthread_mutex_t reset_mx = PTHREAD_MUTEX_INITIALIZER;
-/* S358: one reset at a time.  Four callers now - the page (and through it
- * every peer), RESP's CONFIG RESETSTAT, the native verb and the schedule -
- * and pcache_ht_stats_reset() folds the current figures into its baseline:
- * two at once would fold them twice and every counter would read negative
- * (as a huge unsigned number).  Held across the whole reset; reset_mx stays
- * the short lock the readers take. */
+/* one reset at a time: pcache_ht_stats_reset() folds the current figures into its baseline, so two at
+ * once would fold twice and read negative; held across the reset, reset_mx is the readers' short lock */
 static pthread_mutex_t reset_run_mx = PTHREAD_MUTEX_INITIALIZER;
 static struct pc_cl_stats cl_base;
 static struct pc_proxy_stats px_base;
 static struct pc_wal_stats wal_base;
 static long long reset_at_s;
-static int sched_days, sched_at_s;     /* S358: 0 days = no schedule */
-static long long next_reset_s;         /* S358: under reset_mx; 0 = none */
+static int sched_days, sched_at_s;     /* 0 days = no schedule */
+static long long next_reset_s;         /* under reset_mx; 0 = none */
 
 long long pc_stats_reset_at(long long at)
 {
@@ -58,17 +44,17 @@ long long pc_stats_reset_at(long long at)
 
 	pthread_mutex_lock(&reset_run_mx);
 	pc_doors_reset();
-	pc_obs_unknown_reset();                /* S165 */
+	pc_obs_unknown_reset();
 	for (i = 0; i < n; i++)
-		if (pc_store_live(i))          /* S150 C: a retired slot holds no table */
+		if (pc_store_live(i))          /* a retired slot holds no table */
 			pcache_ht_stats_reset(pc_store_ht(i));
 	pc_store_size_reset();
-	pc_upstream_stats_reset();             /* S358: the read-through figures */
-	pc_http_cache_drop();                  /* 0.6.2: no cached /stats from before */
-	pc_mail_stats_reset();                 /* S352: the mailer's */
-	pc_iostat_reset();                     /* 0.6.0: the syscall counts */
-	pc_alerts_stats_reset();               /* S352c: the relays' */
-	pc_mget_stats_reset();                 /* G8: the mget fan-out's */
+	pc_upstream_stats_reset();             /* the read-through figures */
+	pc_http_cache_drop();                  /* no cached /stats from before */
+	pc_mail_stats_reset();
+	pc_iostat_reset();                     /* the syscall counts */
+	pc_alerts_stats_reset();               /* the relays' */
+	pc_mget_stats_reset();
 	memset(&cs, 0, sizeof cs);
 	memset(&px, 0, sizeof px);
 	memset(&ws, 0, sizeof ws);
@@ -92,9 +78,8 @@ long long pc_stats_reset(void)
 	return pc_stats_reset_at((long long)time(NULL));
 }
 
-/* S358: the page's reset - this node now, every live peer with the same
- * time (M_STATS_RESET), so the fleet's figures all count from one moment.
- * CONFIG RESETSTAT and the native verb stay this node's alone. */
+/* the page's reset: this node and every live peer at the same time (M_STATS_RESET), so the fleet
+ * counts from one moment; CONFIG RESETSTAT and the native verb stay this node's */
 long long pc_stats_reset_fleet(void)
 {
 	long long at = pc_stats_reset();
@@ -103,7 +88,7 @@ long long pc_stats_reset_fleet(void)
 	return at;
 }
 
-/* S358: days from 1970-01-01 to the civil date y-m-d (H. Hinnant) */
+/* days from 1970-01-01 to the civil date y-m-d (H. Hinnant) */
 static long long days_from_civil(long long y, unsigned int m, unsigned int d)
 {
 	long long era;
@@ -117,11 +102,8 @@ static long long days_from_civil(long long y, unsigned int m, unsigned int d)
 	return era * 146097 + (long long)doe - 719468;
 }
 
-/* S358: the first scheduled reset after @now, in LOCAL time - so every
- * node of a fleet in one timezone resets at the same moment and reports
- * the same since.reset_at.  Every @sched_days days at sched_at_s past
- * midnight; 7 days = every Monday, 2-6 days count from a Monday (day
- * number + 3, 1970-01-05 being one) so the fleet agrees on which days. */
+/* the next scheduled reset after @now in LOCAL time, so a fleet in one timezone agrees: every
+ * @sched_days days at sched_at_s; 7 = Mondays, 2-6 count from a Monday (day number + 3) */
 static long long sched_next(time_t now)
 {
 	struct tm tm, t;
@@ -175,9 +157,7 @@ void pc_stats_reset_tick(void)
 	pthread_mutex_unlock(&reset_mx);
 }
 
-/* S123/S358: when the running totals were last reset (0 = never - they
- * count from the start) and when the schedule resets them next (0 = no
- * schedule) */
+/* when the totals were last reset (0 = never) and when the schedule resets them next (0 = none) */
 void statsreset_times(long long *at, long long *next)
 {
 	pthread_mutex_lock(&reset_mx);
@@ -197,22 +177,24 @@ void since_cl(struct pc_cl_stats *s)
 	s->hb_seen -= b.hb_seen;
 	s->bad_auth -= b.bad_auth;
 	s->hb_watchdog -= b.hb_watchdog;
-	s->apply_stalls -= b.apply_stalls;      /* S216; the max is a gauge */
-	s->epoch_refused -= b.epoch_refused;    /* S221 */
-	s->epoch_commits -= b.epoch_commits;    /* 12nu */
-	s->goodbye_refused -= b.goodbye_refused;  /* CH-13 */
-	s->sender_refused -= b.sender_refused;    /* CH-12 */
-	s->id_collisions -= b.id_collisions;      /* CH-12 */
+	s->apply_stalls -= b.apply_stalls;      /* the max is a gauge */
+	s->epoch_refused -= b.epoch_refused;
+	s->epoch_commits -= b.epoch_commits;
+	s->goodbye_refused -= b.goodbye_refused;
+	s->sender_refused -= b.sender_refused;
+	s->id_collisions -= b.id_collisions;
 	s->mcast_stray -= b.mcast_stray;
 	s->joins -= b.joins;
 	s->assigns -= b.assigns;
 	s->elections -= b.elections;
 	s->demotions -= b.demotions;
+	s->members_asked -= b.members_asked;
+	s->members_sent -= b.members_sent;
 	s->pull_sent -= b.pull_sent;
 	s->pull_served -= b.pull_served;
-	s->pull_fetching -= b.pull_fetching;   /* 12nt */
+	s->pull_fetching -= b.pull_fetching;
 	s->pull_fetched -= b.pull_fetched;
-	s->fwd_through -= b.fwd_through;       /* 12nt TC-2 */
+	s->fwd_through -= b.fwd_through;
 	s->fwd_through_acked -= b.fwd_through_acked;
 	s->pull_hits -= b.pull_hits;
 	s->pull_misses -= b.pull_misses;
@@ -220,26 +202,26 @@ void since_cl(struct pc_cl_stats *s)
 	s->pend_exhausted -= b.pend_exhausted;
 	s->fwd_no_route -= b.fwd_no_route;
 	s->fwd_send_fail -= b.fwd_send_fail;
-	s->fwd_reply_too_big -= b.fwd_reply_too_big;   /* S319 */
+	s->fwd_reply_too_big -= b.fwd_reply_too_big;
 	s->tomb_sent -= b.tomb_sent;
 	s->tomb_applied -= b.tomb_applied;
 	s->neg_hits -= b.neg_hits;
-	s->neg_displaced -= b.neg_displaced;                     /* RV-15 */
+	s->neg_displaced -= b.neg_displaced;
 	s->tomb_displaced -= b.tomb_displaced;
 	s->joins_rejected -= b.joins_rejected;
 	s->reconciled -= b.reconciled;
 	s->reconcile_probed -= b.reconcile_probed;
-	s->reconcile_holdq -= b.reconcile_holdq;                 /* S394 */
+	s->reconcile_holdq -= b.reconcile_holdq;
 	s->holdq_served -= b.holdq_served;
 	s->repl_held_recovered -= b.repl_held_recovered;
 	s->pull_held_recovered -= b.pull_held_recovered;
-	s->reconcile_dig_asked -= b.reconcile_dig_asked;         /* S261 */
+	s->reconcile_dig_asked -= b.reconcile_dig_asked;
 	s->reconcile_dig_diff -= b.reconcile_dig_diff;
 	s->reconcile_dig_skipped -= b.reconcile_dig_skipped;
 	s->reconcile_dig_fallback -= b.reconcile_dig_fallback;
-	s->repl_sweep_cycles -= b.repl_sweep_cycles;   /* S212; the clocks are gauges */
+	s->repl_sweep_cycles -= b.repl_sweep_cycles;   /* the clocks are gauges */
 	s->reconcile_deferred -= b.reconcile_deferred;
-	s->reconcile_rounds -= b.reconcile_rounds;               /* S471 */
+	s->reconcile_rounds -= b.reconcile_rounds;
 	s->reconcile_unruled -= b.reconcile_unruled;
 	s->sync_sent -= b.sync_sent;
 	s->sync_rx -= b.sync_rx;
@@ -251,10 +233,8 @@ void since_cl(struct pc_cl_stats *s)
 	s->map_bad -= b.map_bad;
 	s->place_map -= b.place_map;
 	s->place_hrw -= b.place_hrw;
-	/* S125: the two receive-plane TOTALS are counters and re-baseline
-	 * with the rest.  The three per-second figures and the two queue
-	 * gauges are live readings, not running totals, so they do not -
-	 * the same rule the memory and connection gauges follow. */
+	/* the receive plane's TOTALS re-baseline; its per-second figures and queue gauges are live
+	 * readings and do not */
 	s->rx_applied -= b.rx_applied;
 	s->rx_drops -= b.rx_drops;
 }

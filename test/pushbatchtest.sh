@@ -1,38 +1,6 @@
 #!/bin/sh
-# pushbatchtest.sh - a worker writes a subscriber's pub/sub pushes once
-# per turn, not once per message.  A publish staged its frame and wrote
-# it at once, so every delivered message cost the worker a write(2):
-# measured against Redis 8 on one core, 350,064 deliveries took 467,871
-# writes and a worker's delivery ceiling was ~120k messages/s where
-# Redis did 580k.  The frames are now staged and each connection is
-# flushed once when the worker's turn ends (sooner past a high-water
-# mark, so a burst never reaches the slow-consumer cap on output the
-# socket would take), and a worker's wakes to other workers wait for the
-# end of its turn too, so the target drains a turn's messages as one
-# batch instead of waking for each.
-#   - the workers' output operations across a pipelined burst of 2000
-#     PUBLISH, against the deliveries made: /metrics
-#     perfcached_io_worker_ops_total{op="out"}, a worker's write() calls
-#     or io_uring sends (S361 - an io_uring worker makes no write(), so
-#     /proc's syscw, the counter this test first read, cannot see it)
-#   - one worker, one RESP subscriber: the publisher's own turn
-#   - two workers, four subscribers, and proof from the per-worker
-#     counters that two workers wrote: the cross-worker drain
-#   - every message arrives, in order, and PUBLISH answers the receivers
-#   - a pipelined burst past the queue's 16 MB cap, to subscribers on
-#     another worker: the queue drops nothing, a subscriber there (read by
-#     head -c, so the host's speed does not decide it) receives it all in
-#     order, one subscriber slow on purpose (a 64 KB receive buffer,
-#     nothing read for 3 s; 16 MB each is twice a connection's 8 MB cap) is
-#     closed by the cap, and every one that stopped short was a COUNTED
-#     slow kill.  A wake that waited for
-#     the end of the publisher's turn let one turn fill the cap first
-#     (9,950 of 12,000 4 KB publishes dropped; here 1,981 of 4,000); a turn wakes the target
-#     at once when it has queued a drain batch or 256 KB.
-# Fail-first: the build that flushes per push makes one write a delivery
-# (2001 and 8021 writes); staging without the deferred wakes still made
-# 1164-1795 in the cross-worker case.
-# Usage: test/pushbatchtest.sh [./perfcached]
+# pushbatchtest.sh - a worker writes a subscriber's pub/sub pushes once per turn, not per message, drops nothing
+# and cuts only a slow consumer.  Usage: test/pushbatchtest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcpushbatch.XXXXXX); P1=
@@ -54,10 +22,8 @@ client = pushbatch-client-secret
 tcp = 127.0.0.1:17561
 resp = 127.0.0.1:17562
 http = 127.0.0.1:17563
-# the probes read the workers' output counters from /metrics a fraction of a
-# second apart, and a cached build (the 1 s default) can return the same
-# figures twice - no worker wrote at all (see writers() for the other way a
-# probe misread where a subscriber sits)
+# the probes read /metrics a fraction of a second apart: a cached build (1 s default)
+# could return the same figures twice
 http_cache_ms = 0
 plaintext = loopback
 [collection 0]
@@ -132,10 +98,8 @@ def connect():
     pub.settimeout(20)
     return subs, pub
 
-# The cross-worker drain is the case the wakes matter to, and where a
-# connection lands is the kernel's choice: publish REPS messages, one at a
-# time, and see which workers wrote - the publisher's for the replies,
-# another only if a subscriber sits there - and reconnect until two did.
+# the cross-worker drain is the case under test and the kernel picks the worker: publish
+# REPS messages one at a time and reconnect until two workers wrote
 warm = b"*3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$4\r\nwarm\r\n"
 def warm_one():
     pub.sendall(b"*3\r\n$7\r\nPUBLISH\r\n$2\r\nch\r\n$4\r\nwarm\r\n")
@@ -194,12 +158,8 @@ if nsub > 1:
     fl = len(hdr) + PL + 2
     results = [(0, False)] * nsub
     errs = [None] * nsub
-    # Which subscribers sit on the worker that is NOT the publisher's: the
-    # ones the burst reaches through the cross-worker queue.  /clients does
-    # not say, so ask the threads, as the warm-up does: each subscriber also
-    # joins a channel of its own, REPS messages go there, and two workers
-    # writing (the replies, and the deliveries) means the subscriber is on
-    # the other one.
+    # which subscribers sit on the worker that is NOT the publisher's: each also joins its own
+    # channel, REPS messages go there, and two workers writing means it is on the other one
     other = [False] * nsub
     for k, sb in enumerate(subs):
         own = b"own%d" % k
@@ -219,17 +179,8 @@ if nsub > 1:
         check(pre[:len(want)] == want,
               "subscriber %d: its own channel answers %d times (%s worker; writes %s)" % (k, REPS, "the other" if other[k] else "the publisher's", last_deltas))
         sb[1] = pre[len(want):]
-    # 0.6.1: the readers no longer decide the verdict.  Whether a Python
-    # reader kept up with 16 MB was the HOST's: on GitHub's 2-core runner
-    # all three readers on the other worker fell 8 MB behind and were closed
-    # (counted, as they should be) - and no subscriber there was left to
-    # show the queue delivers the whole burst.  So the fast ones read
-    # through head -c (C speed; the order is checked on what arrived), and
-    # one is slow ON PURPOSE - a 64 KB receive buffer, nothing read for 3 s
-    # - so the output cap closes it, counted, on every host and not only on
-    # a slow one (the io_uring send-in-flight path of fc4f301 included).
-    # The daemon asks for a 1 MB send buffer (2 MB granted): ~2 MB fits in
-    # the kernel, ~14 MB backs up - past the 8 MB cap.
+    # the fast readers read through head -c (C speed), and one is slow on purpose (64 KB
+    # receive buffer, nothing read for 3 s), so the output cap closes it, counted, on any host
     import shutil, subprocess, tempfile
     ones = [k for k in range(nsub) if other[k]]
     slow_k = ones[-1] if len(ones) >= 2 else next(k for k in range(nsub) if not other[k])
@@ -287,16 +238,13 @@ if nsub > 1:
     d2 = lambda k: st2[k] - st1[k]
     whole = [results[k] == (NB, True) and errs[k] is None for k in range(nsub)]
     short = [k for k in range(nsub) if not whole[k]]
-    # The burst is 16 MB to each subscriber, twice the 8 MB a connection
-    # may have waiting: whether a Python reader keeps up is the HOST's
-    # (rc48, a 2-core runner: one reader 8 MB behind, closed, counted).
-    # What this arm exists for is the queue between the workers.
+    # the burst is 16 MB per subscriber, twice the 8 MB cap: what this arm judges is the
+    # queue between the workers, not whether a reader keeps up
     check(d2("queue_dropped") == 0,
           "a %d MB pipelined burst: the cross-worker queue dropped nothing (%d)"
           % (NB * PL >> 20, d2("queue_dropped")))
-    # A reader that stopped short must be the output cap doing its job -
-    # closed, in order up to the cut, and COUNTED.  One closed with no
-    # slow kill is rc46's silent close (see wiredraintest).
+    # a reader that stopped short must be the output cap doing its job - closed, in order
+    # up to the cut, and COUNTED (a close with no slow kill is a silent close)
     check(all(errs[k] == "EOFError" and results[k][1] for k in short) and len(short) == d2("slow_kills"),
           "every subscriber that stopped short was closed by a counted slow kill (short %s, slow kills %d, received %s, errors %s)"
           % (short, d2("slow_kills"), [r[0] for r in results], errs))
@@ -308,6 +256,7 @@ if nsub > 1:
           % (slow_k, "the other" if other[slow_k] else "the publisher's", results[slow_k][0], NB))
     shutil.rmtree(tdir, ignore_errors=True)
 PY
+	drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$D/$1.res"   # S488
 	while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$D/$1.res"
 	[ -s "$D/$1.res" ] || bad "$1: the python driver produced nothing"
 	[ -s "$D/$1.py.err" ] && { bad "$1: the python driver raised:"; tail -3 "$D/$1.py.err"; }

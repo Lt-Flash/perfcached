@@ -1,28 +1,6 @@
 #!/bin/sh
-# redis-replica-interop.sh - read-through against a REAL Redis REPLICA,
-# the way a fleet takes a keyspace over (DESIGN 12ix, 12ja).
-#
-# A throwaway redis:8 master and a replica of it, in two local containers
-# sharing one network namespace (podman, or docker), removed on exit -
-# never point this at a shared Redis.  Not in CI (no image pulls there):
-#
-#   tools/redis-replica-interop.sh [./perfcached] [image]
-#
-#   1  perfcached reads the REPLICA as the GUIDE's read-only user: tracking
-#      on, and stats name the replica's run_id as the tracking server
-#   2  writes, deletes and expiries made on the MASTER reach perfcached as
-#      invalidations FROM THE REPLICA (it applies them from the master's
-#      stream): the next read has the change
-#   3  the replica restarts: the copies are dropped, tracking comes back
-#      on the new server (a new run_id), reads are right
-#   4  a round-robin proxy over master and replica: the fetching
-#      connection reached the other server, so it is not tracked - a
-#      change made on the master is read within upstream_negative_ms
-#   5  a user without +info: no tracking at all, reads still work
-#   6  MONITOR on both servers: only the handshake and reads; ACL LOG
-#      empty on both (the replica's from its restart on: until its users
-#      are created again, perfcached's reconnects fail AUTH there), and
-#      for the user without +info exactly the refused INFO
+# redis-replica-interop.sh - read-through against a real Redis replica (throwaway local containers,
+# never a shared Redis; not in CI).  Usage: tools/redis-replica-interop.sh [./perfcached] [image]
 set -u
 BIN=$(readlink -f "${1:-./perfcached}")
 IMG=${2:-docker.io/library/redis:8}
@@ -59,8 +37,7 @@ linkup() { k=0; until RR INFO replication 2>/dev/null | grep -q "master_link_sta
 	sleep 0.2; k=$((k+1)); [ $k -gt 100 ] && return 1; done; return 0; }
 linkup || { echo "the replica never linked"; exit 1; }
 echo "redis: $(RM INFO server | grep -m1 redis_version), master + replica"
-# ACLs are not replicated: the read-only user on each server, the GUIDE's
-# line; and one without +info for case 5
+# ACLs are not replicated: the read-only user on each server, and one without +info for case 5
 for s in RM RR; do
 	$s ACL SETUSER reader on '>rpw-repl' '~*' +@read +hello +auth +select +ping +info '+client|id' '+client|tracking' >/dev/null
 	$s ACL SETUSER noinfo on '>rpw-repl' '~*' +@read +hello +auth +select +ping '+client|id' '+client|tracking' >/dev/null

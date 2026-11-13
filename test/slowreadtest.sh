@@ -1,21 +1,6 @@
 #!/bin/sh
-# slowreadtest.sh - S372: a client whose pipelined replies outrun its
-# socket is held back, not killed; one that reads nothing is closed.
-#  1. a prompt reader pipelines 60 GETs of a 250 KB value (15 MB of
-#     replies, past the 8 MB cap): it receives all 60, in order, and is
-#     not closed - its requests waited while its replies drained
-#     (clients.output.pauses moved).  Before S372 it was killed after 34.
-#     The log says "throttling client <ip:port>" once, and its disconnect
-#     line ends ", throttled N times".
-#  2. a reader that reads nothing is closed after output_stall_s (3 s
-#     here) as a slow consumer - logged so, counted in stall_kills
-#  3. while it waits, another client on the same daemon is answered
-#  4. no single reply reaches the cap: one is built in the reply scratch
-#     (PC_MAX_REQ + 4 KB), so an MGET of 40 x 250 KB (10 MB) is answered
-#     "-ERR reply too large" and the connection carries on.  After S372 the
-#     8 MB cap is met only by pub/sub pushes (pushbatchtest).
-# Runs on whichever backend the host gives (S361).
-# Usage: test/slowreadtest.sh ./perfcached
+# slowreadtest.sh - a client whose pipelined replies outrun its socket is held back, not killed; one that
+# reads nothing is closed after output_stall_s; others are still answered; no single reply reaches the cap.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

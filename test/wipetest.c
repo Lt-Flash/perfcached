@@ -1,13 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * wipetest.c — S59(a): freeing a config must WIPE the secret bytes,
- * not just free them.  Reading freed memory is UB, so the proof is a
- * test-only counter (PC_TESTHOOKS) that pc_config_wipe_secrets bumps
- * for every buffer it zeroes: parse a config carrying three secrets,
- * free it, expect exactly three wipes.  Fail-first receipt: before
- * the wipe was wired into pc_config_free this printed 0.
- */
+/* wipetest.c - freeing a config zeroes its secret bytes: a config with three secrets must count
+ * exactly three wipes on the PC_TESTHOOKS counter (reading freed memory would be UB). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,32 +1,11 @@
 #!/bin/sh
-# keysbudgettest.sh - S292: a cooperative KEYS walk steps by a TIME
-# budget per worker turn, not by a fixed bucket count.
-#
-# At 1,024 buckets a turn a walk's turn count scaled with the table's
-# size: 1,000 keys in 131,072 buckets took 128 turns, and under load each
-# turn is as long as everything else the worker serves in it - a 1-match
-# KEYS waited 64-112 ms at p99 where Redis took 10 (keyscanbench, DESIGN
-# 12hl).  Turns are counted (/stats resp.keys_walks, keys_turns), never
-# timed:
-#   1  sparse: 1,000 keys in 131,072 buckets - every walk ends in at most
-#      32 turns (about 6 at the default 250 us on 222; it was 128), and
-#      returns every key
-#   2  dense: 100,000 keys - a full walk still YIELDS (more than one
-#      turn), so the stall bound the cooperative walk exists for holds
-#   3  the same sparse walk on a daemon with keys_turn_us = 0 (the floor
-#      only - 0.4.0's walk) takes 128 turns: the budget is what does it,
-#      and this is the fail-first, run every time
-# Usage: test/keysbudgettest.sh [./perfcached]
+# keysbudgettest.sh - a cooperative KEYS walk steps by a TIME budget per worker turn, not a fixed bucket
+# count: few turns on a sparse table, still yielding on a dense one; keys_turn_us = 0 is the control.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
-# the sparse-walk ceiling is a margin over the measured ~6 turns a walk,
-# calibrated natively on 222.  A sanitizer build runs the walk 3-5x
-# slower per bucket, so a 250 us turn covers fewer buckets and the count
-# rises with the host's load (10-04, GitLab check-asan beside five other
-# ASan jobs: 55.8 a walk).  Bucket-stepping is 128 a walk (part 3 proves
-# it every run); under a sanitizer the ceiling is 96 - still far below
-# that, still the budget's doing.
+# the sparse-walk ceiling is a margin over ~6 measured turns a walk; a sanitizer build covers fewer
+# buckets per turn, so its ceiling is 96 - still far below bucket-stepping's 128
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 KB_TURN_LIMIT=32; [ -n "$SANRT" ] && KB_TURN_LIMIT=96; export KB_TURN_LIMIT
 D=$(mktemp -d /var/tmp/pckb.XXXXXX)

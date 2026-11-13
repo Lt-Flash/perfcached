@@ -1,14 +1,6 @@
 #!/bin/sh
-# walctrltest.sh - the recycling rule has to survive a restart.
-#
-# Both sides of "is this segment free" must be durable: the marker (in
-# the rdb) always was, the per-segment spans were not - they lived in a
-# calloc'd array, so after a restart every span read zero, seg_hot()
-# answered "cold" for every segment, and the rule documented in DESIGN
-# section 7 was not enforced at all.  The sequence itself restarted from
-# zero too, which is what makes it observable from outside: a log whose
-# records are numbered 1..N, then 1..M again, is not ascending.
-# Usage: test/walctrltest.sh [./perfcached]
+# walctrltest.sh - the WAL recycling rule survives a restart: the rdb marker and the per-segment spans
+# are both durable, so one log across incarnations is still one ascending sequence.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -102,7 +94,7 @@ M=$(grep "wal marker" "$D/log" | tail -1 | sed 's/.*wal marker //;s/[^0-9].*//')
 [ -n "$M" ] && [ "$M" -gt 0 ] 2>/dev/null && ok "post-recovery marker is $M" \
 	|| bad "post-recovery marker is ${M:-absent} - the replay window never shrinks"
 
-# S438: a clean stop closes the active segment's span - nothing is left open
+# a clean stop closes the active segment's span - nothing is left open
 grep -q "left open by a stop without a shutdown" "$D/log" \
 	&& bad "S438: a clean stop left a segment span open" \
 	|| ok "S438: a clean stop leaves no segment span open"
@@ -120,17 +112,8 @@ grep -q "CONTROL is torn" "$D/log" && ok "a torn CONTROL is reported" \
 	|| bad "a torn CONTROL passed unnoticed"
 stop
 
-# S438: a span left open by a stop WITHOUT a shutdown.  The active
-# segment's span is closed only by the next rotation or a clean stop; a
-# kill -9 leaves it open in CONTROL, the next start activates the slot
-# after it, and nothing closed it again: it read as holding records newer
-# than every snapshot, and one lap later its recycle was a FULL overrun
-# of records the post-recovery checkpoint covered (245, 2026-10-23).  A
-# fresh WAL: ~300 KB into the first segment, kill -9, restart (the replay
-# and its checkpoint cover all of it), then writes until the third
-# rotation recycles the killed segment, and short of a fourth (which
-# would recycle a segment written since, with no snapshot - save = off).
-# FAIL-FIRST: the build before S438 logs "wal: FULL - no free segment".
+# a span left open by a stop WITHOUT a shutdown (kill -9) must not read as holding records newer than
+# every snapshot: drive the ring until the third rotation recycles the killed segment, short of a fourth
 rm -rf "$D/wal"; mkdir -p "$D/wal"
 : > "$D/log"
 start
@@ -154,12 +137,8 @@ for p in sorted(glob.glob(sys.argv[1] + "/wal-*.seg")):
 print(max(g) if g else 0)
 PY
 }
-# driven to the killed segment's slot, not sized for one machine's speed:
-# a fixed 4,800 writes reached generation 4 and 3 on slower runners (ASan,
-# fsync = always), 5 on others.  300 a batch, under a quarter segment,
-# synced before each look, so nothing queued can reach a sixth -
-# which would recycle a segment written since the restart, never covered
-# by a snapshot (save = off): a real overrun, not this test's
+# driven to the killed segment's slot, not sized for one machine's speed: 300 a batch, synced before
+# each look, so nothing queued reaches a sixth generation (a real overrun with save = off)
 walsync() {   # the sync verb: back once everything appended is synced
 	python3 - <<'PY'
 import json, pcnative, socket
@@ -181,8 +160,8 @@ stop
 G=$(maxgen)
 [ "$G" = 5 ] && ok "S438: the ring wrapped onto the killed segment and no further (generation $G, $n batches of 300)" \
 	|| bad "S438: the ring reached generation $G after $n batches of 300, want 5"
-# S466: under on_full = wait (the default) a segment wrongly held hot is a
-# wait for a snapshot, not an overwrite - either line is the S438 bug
+# under on_full = wait (the default) a segment wrongly held hot is a wait for a snapshot, not an
+# overwrite - either line is the bug
 grep -qE "wal: FULL|wal: no free segment" "$D/log" \
 	&& bad "S438: a false overrun - $(grep -oE '(wal: FULL|wal: no free segment).*' "$D/log" | head -1 | cut -c1-160)" \
 	|| ok "S438: no overrun and no wait when the ring recycled it - its records were covered"

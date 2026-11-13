@@ -1,27 +1,5 @@
-/*
- * failovertest.c — cluster-aware libperfd (task S34).
- *
- * Proves the thing the task exists for: a client that has PRE-WARMED
- * connections survives losing the node it was using, without a
- * reconnect on the hot path.  Asserted here:
- *
- *  - the fleet is learned on connect (members, with client ports);
- *  - standbys are actually open, bounded by opts.spares;
- *  - killing the active node mid-work does NOT fail the next request:
- *    it lands on a standby, the handle reports the failover, and the
- *    active node id CHANGED;
- *  - a value written before the kill is still readable after it (the
- *    cluster's job) and the failover is FAST - well under a fresh
- *    connect+handshake, which is the entire point of pre-warming;
- *  - add/sub are NOT silently replayed across a failover: the caller
- *    gets an error naming why, because a double increment is worse
- *    than a visible failure;
- *  - policies place the handle: with round-robin over N nodes, many
- *    independent clients do not all land on the same one.
- *
- * Usage: failovertest <host> <port1> <port2> <port3> <secret>
- * The harness (failovertest.sh) owns the daemons and the killing.
- */
+/* failovertest.c - cluster-aware libperfd: a handle with pre-warmed standbys survives losing its
+ * node without a reconnect on the hot path, never replays add/sub, follows the fleet's shape. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,12 +108,8 @@ int main(int argc, char **argv)
 	sec[0] = secret;
 	sec[1] = NULL;
 
-	/* two independent runs share this binary: the default one proves
-	 * FAILOVER (the harness kills the node it names), and "route"
-	 * proves per-key routing.  They must not be mixed: with routing on
-	 * the request would simply go to a survivor and never exercise a
-	 * failover at all - which is exactly what happened when they were
-	 * one run. */
+	/* two runs share this binary: the default proves FAILOVER (the harness kills the node it
+	 * names), "route" proves routing - with routing on a request just goes to a survivor */
 	if (argc >= 7 && (!strcmp(argv[6], "route") ||
 	        !strcmp(argv[6], "noroute")))
 		goto routing;
@@ -147,8 +121,8 @@ int main(int argc, char **argv)
 	memset(&o, 0, sizeof o);
 	o.secrets = sec;
 	o.spares = -1;                 /* one per other member */
-	o.keepalive_s = 1;             /* S104: visible on the socket */
-	o.idle_ping_ms = 1500;         /* S104: fast enough to test */
+	o.keepalive_s = 1;             /* visible on the socket */
+	o.idle_ping_ms = 1500;         /* fast enough to test */
 	o.policy = PERFD_POLICY_FAILOVER;
 
 	p = perfd_connect(argv[1], ports[0], &o);
@@ -186,7 +160,7 @@ int main(int argc, char **argv)
 	else
 		bad("active node unknown");
 
-	/* ---- S70: the handle can say what it found ---- */
+	/* ---- the handle can say what it found ---- */
 	if (perfd_server_version(p)[0])
 		ok("server version learned from the member list");
 	else
@@ -211,7 +185,7 @@ int main(int argc, char **argv)
 			bad("member states: %d active, %d standby, %d other (want 1/2/0)", act, sby, oth);
 	}
 
-	/* ---- S104 layer 1: TCP keepalive is ON the link ---- */
+	/* ---- layer 1: TCP keepalive is ON the link ---- */
 	{
 		int ka = 0;
 		socklen_t kl = sizeof ka;
@@ -222,11 +196,8 @@ int main(int argc, char **argv)
 			bad("TCP keepalive not set on the link");
 	}
 
-	/* ---- S104 layer 2: idle standbys are pinged, and a dead one is
-	 * found by the ping rather than by the failover that would have
-	 * adopted it.  The harness kills a STANDBY's node on this cue; a
-	 * request on the active must not notice, and the next idle scan
-	 * must retire the corpse. ---- */
+	/* ---- layer 2: the harness kills a standby's node; the active must not notice, and the
+	 * next idle ping retires the corpse before a failover could adopt it ---- */
 	{
 		struct timespec ts = { 2, 0 };
 		int kp = 0, killed_node = 0, sby_left = 0, down = 0;
@@ -261,16 +232,8 @@ int main(int argc, char **argv)
 		if (perfd_set(p, "c", "tick3", "3", 1, 0) != 0)
 			bad("write to trigger the second idle scan: %s", perfd_error(p));
 		{
-			/* S107: the fleet purges the dead node and pushes "expelled"
-			 * within these same seconds, and the library then drops the
-			 * member entirely - so it is either marked down by the idle
-			 * ping, or already gone.  Both are right.  A member marked
-			 * down is also RE-DIALLED in the background from the next
-			 * second on, and the reason then names the latest attempt
-			 * ("re-dial: cannot connect ..."), not the ping that found
-			 * it - so the reason is reported, not matched.  That the
-			 * idle ping did the retiring is what pings_failed and the
-			 * unchanged failover count prove. */
+			/* the fleet may have expelled it: marked down or gone are both right; a
+			 * re-dial rewrites the reason, so pings_failed and failovers prove it */
 			int gone = 1;
 			char down_why[64] = "";
 
@@ -309,9 +272,8 @@ int main(int argc, char **argv)
 	else
 		bad("write before the failure: %s", perfd_error(p));
 
-	/* the harness kills the active node when it sees this line.  The
-	 * client names the PORT, which it knows from the member list -
-	 * the harness speaks no Noise and cannot ask the daemons. */
+	/* the harness kills the active node on this line; the client names the PORT, since the
+	 * harness speaks no Noise and cannot ask the daemons */
 	{
 		int kp = 0;
 
@@ -332,12 +294,8 @@ int main(int argc, char **argv)
 		nanosleep(&ts, NULL);
 	}
 
-	/* The REQUEST must survive; the DATA need not.  This is a plain
-	 * store collection, so "before" lived only on the node we just
-	 * killed - a miss here is the store model working as designed, not
-	 * a failure (eager replication is what makes data survive, and
-	 * eagertest proves that separately).  What is under test is that
-	 * the call completes at all instead of returning a dead socket. */
+	/* the REQUEST must survive, the DATA need not: a plain store collection held "before" only
+	 * on the killed node, so a miss is the store model working (eagertest covers the data) */
 	t0 = now_ms();
 	{
 		int rc = perfd_get(p, "c", "before", (void **)&val, &vlen,
@@ -399,12 +357,8 @@ int main(int argc, char **argv)
 
 	perfd_free(p);
 
-	/* ---- S35: per-key routing removes the forward hop -------------
-	 * The proof is the DAEMONS' own counters: with routing on, a
-	 * shard cluster should forward (almost) nothing, because every
-	 * write already arrives at its owner.  The harness reads
-	 * fwd_sent before and after; here we just do the work and report
-	 * what the client believed. */
+	/* ---- per-key routing removes the forward hop: the harness reads the daemons' fwd_sent
+	 * before and after; here the work is done and what the client believed reported ---- */
 routing:
 	if (argc >= 7 && (!strcmp(argv[6], "route") ||
 	        !strcmp(argv[6], "noroute"))) {
@@ -414,7 +368,7 @@ routing:
 		o.secrets = sec;
 		o.spares = -1;
 		o.policy = PERFD_POLICY_FAILOVER;
-		o.route_keys = want_route;     /* S35: opt in */
+		o.route_keys = want_route;     /* opt in */
 		p = perfd_connect(argv[1], ports[0], &o);
 		if (!p) {
 			fprintf(stderr, "route connect: %s\n",
@@ -461,17 +415,8 @@ routing:
 
 	goto done;
 
-	/* ---- S104: the whole fleet restarts under a handle, and the seed
-	 * stays down.  Every held link dies at once - the active AND the
-	 * standbys opened to the other members - so a failover that
-	 * adopted a standby blindly burned one dead link per operation
-	 * (measured: the fourth or fifth operation was the first to
-	 * succeed).  Now a standby is probed before it is adopted and a
-	 * fresh dial to any learned member follows inside the same
-	 * failover; the SECOND operation after the restart must succeed.
-	 * Then the fleet is killed outright, the handle fails, and only
-	 * the two non-seed nodes come back: the handle must re-dial
-	 * through a member it learned, not the seed it was given. ---- */
+	/* ---- the fleet restarts under a handle: a standby is probed before adoption, so the
+	 * second operation after must succeed; then only non-seed nodes return ---- */
 restart:
 	if (argc >= 7 && !strcmp(argv[6], "restart")) {
 		int seed_node = 0, op1, op2, act;
@@ -481,7 +426,7 @@ restart:
 		o.secrets = sec;
 		o.spares = -1;
 		o.policy = PERFD_POLICY_FAILOVER;
-		o.route_keys = 1;              /* the shape the operator decided */
+		o.route_keys = 1;              /* routing on, the deployed shape */
 		o.connect_timeout_ms = 2000;
 		o.io_timeout_ms = 2000;
 		p = perfd_connect(argv[1], ports[0], &o);
@@ -520,6 +465,14 @@ restart:
 			okf("a failover was performed (%llu)", perfd_failovers(p));
 		else
 			bad("no failover counted after every link died");
+		/* a standby's dial runs from the calls after it, not inside one */
+		for (op1 = 0; op1 < 100 && perfd_spare_count(p) < 1; op1++) {
+			struct timespec w = { 0, 50000000L };
+
+			if (perfd_set(p, "c", "r3", "v", 1, 0) != 0)
+				break;
+			nanosleep(&w, NULL);
+		}
 		if (perfd_set(p, "c", "r3", "v", 1, 0) == 0 &&
 		        perfd_member_count(p) == 3 && perfd_spare_count(p) >= 1)
 			okf("re-learned the fleet and re-warmed standbys after the restart (%d)",
@@ -567,11 +520,8 @@ restart:
 
 	goto done;
 
-	/* ---- S107: a member comes back on its own, and the fleet tells the
-	 * handle when its shape changes.  Three cues on the routing fleet:
-	 * BOUNCE-PORT (kill and restart that node at once - within the purge
-	 * window, so it stays a member), ADD-NODE (a fourth node joins),
-	 * EXPEL-PORT (a clean stop, so the fleet expels it at once). ---- */
+	/* ---- a member comes back on its own, and the fleet tells the handle when its shape
+	 * changes: cues BOUNCE-PORT, ADD-NODE and EXPEL-PORT on the routing fleet ---- */
 member:
 	if (argc >= 7 && !strcmp(argv[6], "member")) {
 		struct timespec ts = { 0, 0 };
@@ -612,9 +562,8 @@ member:
 			bad("fleet not held (members=%d standby port=%d)", n, bp);
 		fo0 = perfd_failovers(p);
 
-		/* 1. a member bounced within the purge window: found dead by the
-		 * idle ping or a routed request, brought back by the background
-		 * recovery - with every request succeeding meanwhile */
+		/* 1. a member bounced within the purge window: found dead by the idle ping or a
+		 * routed request, brought back by recovery, every request succeeding meanwhile */
 		/* each key's owner's client port, while all three are usable -
 		 * the bounce takes the bounced member out of the ring */
 		for (k = 0; k < 80; k++) {
@@ -633,25 +582,8 @@ member:
 			int rc, t;
 
 			snprintf(key, sizeof key, "mk%03d", k);
-			/* A key whose one owner is the member just killed is
-			 * refused by the fleet until that owner is back: the
-			 * node the handle falls back to forwards the write to
-			 * the owner's address, nothing listens there yet, and
-			 * the forward's deadline answers "not stored"
-			 * (PERFD_E_REFUSED).  That is the fleet answering
-			 * honestly, not the handle failing, and a retry lands
-			 * once the restarted node serves its address.  Before
-			 * the CH-12 data-plane gate this write was stored at
-			 * once, and only because the nodes share a host: the
-			 * forward to the dead address was delivered to the
-			 * multicast socket every node wildcard-binds on the
-			 * cluster port - the forwarding node's own (node 4
-			 * logs the refusal now: a FWD_OP from its own
-			 * address) - which stored a key it does not own and
-			 * acked it.  So: a refusal of a key the bounced member
-			 * owned is retried, 3 s at most; any other refusal,
-			 * and any other error, is a failure - the handle
-			 * failing is what this leg exists to catch. */
+			/* a key whose one owner was just killed is refused until that owner
+			 * serves again: retried 3 s at most; anything else is the handle failing */
 			for (t = 0; (rc = perfd_set(p, "c", key, "v", 1, 0)) != 0 &&
 			        perfd_error_kind(p) == PERFD_E_REFUSED &&
 			        own[k] == bp && t < 30; t++) {
@@ -662,9 +594,8 @@ member:
 				nanosleep(&ts, NULL);
 			}
 			if (rc != 0 && !fails++) {
-				/* the count alone said nothing: which write, when,
-				 * what the fleet answered, and how the handle saw
-				 * its members at that moment */
+				/* the count alone says nothing: which write, when, what the fleet
+				 * answered, and how the handle saw its members then */
 				snprintf(ferr, sizeof ferr, "%s at %d00 ms: %s", key,
 					k, perfd_error(p));
 				dump_members(p, "at the first failed write");
@@ -672,11 +603,8 @@ member:
 			ts.tv_sec = 0;
 			ts.tv_nsec = 100 * 1000 * 1000L;
 			nanosleep(&ts, NULL);
-			/* by its port, as the check below: the member comes
-			 * back under its reserved id or under a new one the
-			 * push brings, and the push can land first (GitHub,
-			 * v0.7.3-rc3: 456 -> 375 at once - never a standby
-			 * under 456, "never came back" with recovered=1) */
+			/* by its port, as the check below: the member returns under its reserved
+			 * id or a new one the push brings, and the push can land first */
 			for (i = 0; i < perfd_member_count(p); i++) {
 				int port = 0;
 
@@ -703,26 +631,8 @@ member:
 		else
 			bad("a failover happened during a standby's bounce (%llu)", perfd_failovers(p) - fo0);
 		{
-			/* The bounced node has no state directory, so it comes back
-			 * as a NEW identity at the same address - and the fleet has
-			 * TWO legitimate answers for it (S90, S108, RV-9):
-			 *   - the join lands while the dead incumbent still reads
-			 *     "up" (PEER_UP_MS): a fresh id, and the fleet must push
-			 *     the old id out and the new one in, or this handle
-			 *     routes by an id that no longer exists;
-			 *   - the join lands after the incumbent lapsed: the master
-			 *     hands the RESERVED id back, matched by address
-			 *     (clres_take, "a replacement at the same address gets
-			 *     the id back"), and the handle's entry was right all
-			 *     along.
-			 * GitLab's runner takes the first road in 200 ms; GitHub's
-			 * took the second and this step, which asserted only the
-			 * first, failed rc17 there - "still carries its old id 935
-			 * after 10 s".  What the handle must show, either way: ONE
-			 * live entry at that port, serving.  Polls with traffic
-			 * flowing: the new id exists only once the node has founded
-			 * or joined (2 s of JOIN_WAIT at the least) and the push
-			 * rides its next heartbeat. */
+			/* the bounced node returns as a new identity at the same address: a
+			 * fresh id or its reserved one; either way ONE live entry, serving */
 			int newnode = 0, live = 0, dup = 0;
 			for (k = 0; k < 100; k++) {
 				char key[32];
@@ -758,11 +668,8 @@ member:
 			}
 		}
 
-		/* 2. a node joins: the fleet tells us, and we dial it.  The
-		 * standby bounced above is usually the fleet's master, so a
-		 * re-election can still be running when node 7 asks to join,
-		 * and its JOIN waits for the new master: 15 s covers that
-		 * (measured 1.9 s when no election was pending). */
+		/* 2. a node joins: the fleet tells us and we dial it; 15 s covers a re-election
+		 * still running after the bounce above, whose JOIN waits for the new master */
 		printf("ADD-NODE\n");
 		fflush(stdout);
 		for (k = 0; k < 150 && !seen7; k++) {   /* up to 15 s */

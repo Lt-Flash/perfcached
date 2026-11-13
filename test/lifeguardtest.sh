@@ -1,20 +1,6 @@
 #!/bin/sh
-# lifeguardtest.sh - S36 step e1: a node that was itself stalled does not
-# blame its healthy peers when it wakes (Lifeguard's local health).
-#
-# A stopped process, a CPU-starved one or a paused VM wakes with its
-# peers' beats unread in its socket.  It used to purge every peer as
-# silent and elect itself - one stalled node accusing a healthy fleet.
-# Now a node whose own tick ran late holds purges and master-dead
-# decisions for as long as the stall lasted while fresh beats arrive.
-#   three nodes; node 3 SIGSTOPped for 9 s (past the 6 s purge and the
-#   8 s master-dead limits), then continued:
-#   1  node 3 says its own loop ran late (and /stats self_late moves)
-#   2  node 3 purges neither peer as silent and does not make itself
-#      master
-#   3  the fleet is three again (the others rightly saw node 3 silent)
-# Fail-first: the build before e1 has node 3 purge both peers.
-# Usage: test/lifeguardtest.sh [./perfcached]
+# lifeguardtest.sh - a node that was itself stalled does not blame its healthy peers when it wakes:
+# a late tick holds purges and master-dead decisions while fresh beats arrive (Lifeguard).
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pclg.XXXXXX)
@@ -68,7 +54,8 @@ wait_for() {
 }
 for n in 1 2 3; do conf $n; "$BIN" -f "$D/n$n.conf" > "$D/n$n.log" 2>&1 & echo $! > "$D/n$n.pid"; done
 wait_for 40 '[ "$(up 1)$(up 2)$(up 3)" = 222 ]' || { bad "the fleet did not form"; echo "lifeguardtest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+# peers_up counts a joiner still CONNECTING: node 3 stalls as a member, so all three ready first
+wait_for 30 '[ "$(st 1 "r[\"state\"]")$(st 2 "r[\"state\"]")$(st 3 "r[\"state\"]")" = readyreadyready ]'
 P3=$(cat "$D/n3.pid")
 L0=$(wc -l < "$D/n3.log")
 kill -STOP $P3; sleep 9; kill -CONT $P3

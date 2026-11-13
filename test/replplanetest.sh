@@ -1,7 +1,6 @@
 #!/bin/sh
-# replplanetest.sh - S461: eager replication on the relay port's threads; a peer without the
-# plane keeps the cluster socket; a set/delete storm converges.  Fail-first: v0.7.3.
-# Usage: test/replplanetest.sh [./perfcached]
+# replplanetest.sh - eager replication on the relay port's threads; a peer without the plane keeps
+# the cluster socket; a set/delete storm converges.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcreplplane.XXXXXX); P1= P2= P3=
@@ -100,7 +99,7 @@ def all_there(n):
 check(wait(lambda: all_there(2) and all_there(3), 15), "%d sets from 8 connections on node 1 reach node 2 and node 3" % N)
 a = {n: cl(n) for n in (1, 2, 3)}
 d = lambda n, k: a[n].get(k, 0) - b[n].get(k, 0)
-# S469: a group over max_datagram (1,232) goes to the relay port by TCP, a smaller one by UDP
+# a group over max_datagram (1,232) goes to the relay port by TCP, a smaller one by UDP
 check(d(1, "repl_plane_sent_direct") + d(1, "repl_plane_tcp_sent") > 0 and d(1, "repl_plane_sent_cluster") > 0,
       "node 1 sent node 2's groups to its relay port and node 3's to its cluster socket (%d direct, %d by TCP, %d cluster)" % (d(1, "repl_plane_sent_direct"), d(1, "repl_plane_tcp_sent"), d(1, "repl_plane_sent_cluster")))
 check(d(2, "repl_plane_rx_groups") > 0 and d(3, "repl_plane_rx_groups") == 0,
@@ -129,6 +128,7 @@ diff = [(k, t, x, y) for k, t, x, y in zip(K, truth, R(2).gets(K), R(3).gets(K))
 check(conv, "after a set/delete storm from 8 connections every key reads the same on all three nodes "
       "(%d differ, first %r; %d present on node 1)" % (len(diff), diff[:2], sum(t is not None for t in truth)))
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 # node ids are the master's to hand out: count the lines, not their numbers

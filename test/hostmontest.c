@@ -1,18 +1,5 @@
-/* hostmontest.c - S380's host monitor (hostmon.c; the 0.7.2 split, wave
- * 1): hm_apply on seconds made here, the readers against this host's
- * /proc, hm_io_init's outcomes.  No stubs - it calls only libc.
- *
- *   A  the minute's ring: no percentage until a minute is held, then CPU
- *      busy over it (steal counted busy by the reader, a share here),
- *      this process's share of every CPU, the device's busy time - capped
- *      at 100 - and memory, with the huge-page pool out of the base;
- *      PERFCACHED_ALERT_FAST's divisor shortens the window
- *   B  one second's readings from this host: /proc/stat and /proc/meminfo
- *      read, the clock the caller's, no disk read when no device is
- *      watched
- *   C  the device: none without a directory, the error for one that is
- *      not there, and for a real one either its block device or why not
- */
+/* hostmontest.c - the host monitor (hostmon.c): hm_apply on seconds made here, the readers against
+ * this host's /proc, hm_io_init's outcomes; no stubs, libc only. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +53,7 @@ int main(void)
 	char dir[64], why[400];
 	int k;
 
-	/* A */
+	/* A: the minute's ring - CPU busy, our share, device busy capped at 100, memory */
 	fresh();
 	for (k = 0; k < 60; k++)
 		second(k, 0, 300);
@@ -98,7 +85,7 @@ int main(void)
 	second(7, 10, 300);
 	CHK(HM.cpu_pct == 50 && HM.io_pct == 30, "A: the 8th - its window (60 / 10 + 1) held, said");
 
-	/* B */
+	/* B: a second's readings from /proc/stat and /proc/meminfo; no device, no disk read */
 	HM.io_ok = 0;
 	hm_read(&o, 12345);
 	CHK(o.now == 12345, "B: the reading carries the caller's clock");
@@ -108,7 +95,7 @@ int main(void)
 		"B: /proc/meminfo - read, %llu MB", o.mem_total_kb >> 10);
 	CHK(!o.io_ok, "B: no device watched - no disk read");
 
-	/* C */
+	/* C: the device - none without a directory, an error if missing, else its block device */
 	hm_io_init(NULL);
 	CHK(!HM.io_ok && !strcmp(HM.io_why, "no WAL or state directory - disk busy is not watched"),
 		"C: no directory - not watched, said");

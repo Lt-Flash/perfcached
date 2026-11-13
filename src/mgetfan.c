@@ -1,26 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * mgetfan.c - G8 (DESIGN 12nh): an mget waiting on several remote lookups
- * at once.  See mgetfan.h.
- *
- * A pull's answer finds its key through the worker's map, indexed by the
- * pending slot the request id names.  A slot can carry two of this
- * worker's requests for a moment - one that expired, its timeout still in
- * the completion queue, and the next request that took the slot - so the
- * map chains them through the keys themselves and a lookup compares the
- * whole id.
- *
- * What a single get's park does with a pull's answer, a key does here
- * too - keep a found value as that mode keeps it (pc_pull_found_keep),
- * ask everyone once after a shard owner's miss inside the reshard grace or
- * a proxy locator's miss, remember a store miss in the negative cache -
- * with two differences.  A retry may not outlive the mget's one deadline
- * (it is begun with the deadline capped, and not at all when the deadline
- * has passed), and a lookup that did not answer is unanswered, never a
- * miss: no negative cache, no "absent" for a key the fleet was not heard
- * on.
- */
+/* mgetfan.c - an mget waiting on several remote lookups at once (mgetfan.h).  A lookup that did
+ * not answer is unanswered, never a miss: no negative cache, no "absent" unheard from the fleet. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -62,6 +43,7 @@ struct pc_mget {
 	char col[256];
 	size_t collen;
 	unsigned int n, waiting, unanswered;
+	int count;                         /* pc_mget_set_count */
 	long long deadline;
 	int linked;                        /* its waiting keys are in the map */
 	struct pc_mget *next;              /* the worker's attached mgets */
@@ -94,6 +76,8 @@ static int heads_ready(void)
 	return 0;
 }
 
+/* a slot can carry an expired request (its timeout still queued) and the next one, so keys chain
+ * through themselves and a lookup compares the whole id */
 static struct mref *head_of(uint32_t req)
 {
 	return &heads[(req & PEND_SLOT_MASK) % nheads];
@@ -154,6 +138,11 @@ struct pc_mget *pc_mget_new(const char *col, size_t collen, unsigned int n)
 	return m;
 }
 
+void pc_mget_set_count(struct pc_mget *m)
+{
+	m->count = 1;
+}
+
 void pc_mget_hit(struct pc_mget *m, unsigned int i, char *val, int vlen,
 		unsigned int exp)
 {
@@ -177,12 +166,14 @@ int pc_mget_wait(struct pc_mget *m, unsigned int i, const char *key,
 	/* the guard is read after this lookup took its slot: the mget never
 	 * leaves the table below a quarter free for everything else */
 	if (m->waiting >= PC_MGET_MAX_REMOTE) {
-		*why = "mget needs more than 1000 remote lookups - split it";
+		*why = m->count ? "exists needs more than 1000 remote lookups - "
+			"split it" : "mget needs more than 1000 remote lookups - split it";
 		return PC_MGET_E_CAP;
 	}
 	if (pc_cluster_pend_free() < cap / 4) {
-		*why = "mget: the cluster's pending table is busy - retry, "
-			"or split the mget";
+		*why = m->count ? "exists: the cluster's pending table is busy - "
+			"retry, or split the keys" : "mget: the cluster's pending "
+			"table is busy - retry, or split the mget";
 		return PC_MGET_E_BUSY;
 	}
 	m->k[i].key = malloc(klen ? klen : 1);
@@ -245,14 +236,21 @@ void pc_mget_tree(const struct pc_mget *m, struct pc_tw *w)
 
 void pc_mget_resp(const struct pc_mget *m, struct pc_jw *w)
 {
-	unsigned int i;
+	unsigned int i, hits = 0;
 
 	if (m->unanswered) {
 		/* all or nothing: never values beside nils for keys it could
 		 * not reach - a nil would read as "absent" */
-		pc_jw_lit(w, "-TRYAGAIN mget: ");
+		pc_jw_lit(w, m->count ? "-TRYAGAIN exists: " :
+			"-TRYAGAIN mget: ");
 		pc_jw_i64(w, (long long)m->unanswered);
 		pc_jw_lit(w, " key(s) not answered\r\n");
+		return;
+	}
+	if (m->count) {
+		for (i = 0; i < m->n; i++)
+			hits += m->k[i].st == PC_MK_HIT;
+		resp_int(w, (long long)hits);
 		return;
 	}
 	resp_arr(w, (int)m->n);
@@ -396,7 +394,11 @@ static void settle(struct pc_mget *m, unsigned int i,
 
 	if (d->found) {
 		pc_pull_found_keep(m->col, m->collen, k->key, k->klen, d);
-		/* S280: a document answers an mget as a miss under strict */
+		if (m->count) {
+			k->st = PC_MK_HIT;
+			return;
+		}
+		/* a document answers an mget as a miss under strict */
 		if (ht && (d->newval & PCACHE_F_TYPES) &&
 		        pc_store_types_strict(ht)) {
 			k->st = PC_MK_ABSENT;
@@ -420,9 +422,8 @@ static void settle(struct pc_mget *m, unsigned int i,
 		return;
 	}
 	if (ht && pc_store_shard_enabled(ht)) {
-		/* an owner miss is authoritative - but inside the reshard
-		 * grace the data may still sit on the old owner: ask everyone
-		 * once, as a get does */
+		/* an owner miss is authoritative, but inside the reshard grace the data may still
+		 * sit on the old owner: ask everyone once, as a get does */
 		if (!k->retried && pc_shard_grace()) {
 			if (!ask_all(m, i))
 				unanswered(m, k);
@@ -432,7 +433,7 @@ static void settle(struct pc_mget *m, unsigned int i,
 		return;
 	}
 	if (ht && pc_store_proxy_enabled(ht) && k->target && !k->retried) {
-		/* S321: the locator can be stale - forget it, ask everyone */
+		/* the locator can be stale - forget it, ask everyone */
 		pc_loc_clear(m->col, m->collen, k->key, k->klen);
 		if (!ask_all(m, i))
 			unanswered(m, k);

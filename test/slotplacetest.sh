@@ -1,20 +1,6 @@
 #!/bin/sh
-# slotplacetest.sh — the daemon and libperfd must agree, key for key,
-# about which node owns a key.
-#
-# Placement moved from a key hash of ours to the Redis SLOT
-# (crc16(key) % 16384) so that a RESP client can compute it too (S44).
-# Two things now derive an owner independently: pc_shard_owner() in the
-# daemon and route_owner() in libperfd.  If they ever diverge, a key
-# lives on one node and is looked for on another - the exact failure
-# clplace.h warns about - and nothing else in the suite would catch it.
-#
-# The assertion needs no reimplementation of the hash: a ROUTED client
-# that agrees with the daemon never causes a forward, so the daemon's
-# own fwd_sent counter is the oracle.  Any disagreement, on any key,
-# shows up as a non-zero count.
-#
-# Usage: test/slotplacetest.sh [./perfcached] [./natbench] [./perfcli]
+# slotplacetest.sh - the daemon (pc_shard_owner) and libperfd (route_owner) agree key for key on the
+# owner: a routed client that agrees never causes a forward, so fwd_sent is the oracle.
 set -u
 
 BIN=${1:-./perfcached}
@@ -43,10 +29,8 @@ arena_mb = 64
 client = sl-client-secret
 cluster = sl-cluster-secret
 [listen]
-# listen ON the advertised address, not on 127.0.0.1.  A ROUTING client
-# dials each member at the address the fleet advertises, so a test where
-# the two differ has every routed connection refused - which looks like
-# "routing is broken" and is really "the address was never dialable".
+# listen ON the advertised address: a routing client dials each member at the address
+# the fleet advertises, and would be refused anywhere else
 tcp = 127.0.0.6$1:$2
 plaintext = loopback
 [cluster]
@@ -92,6 +76,14 @@ if [ "${peers:-0}" -lt 3 ]; then
 	exit 1
 fi
 ok "membership formed (3 nodes)"
+# /members lists a joiner still CONNECTING, which owns nothing yet: up to 30 s for every node ready,
+# seeing the others, on a usable map - a client routing before that disagrees with the daemon
+rdy() { "$CLI" -h 127.0.0.6$1 -p 1744$1 -j '{"method":"stats"}' 2>/dev/null | python3 -c 'import json,sys
+d=json.load(sys.stdin); c=d["cluster"]; print(d.get("state"), c.get("peers_up"), (c.get("map") or {}).get("usable"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && [ "$(rdy 1)|$(rdy 2)|$(rdy 3)" != "ready 2 True|ready 2 True|ready 2 True" ]; do
+	sleep 0.1; i=$((i+1))
+done
 
 # the daemon must advertise the algorithm the client implements, or the
 # client turns routing off and the test silently measures nothing

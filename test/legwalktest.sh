@@ -1,15 +1,6 @@
 #!/bin/sh
-# legwalktest.sh - S121: the cooperative walk budgets the overflow leg.  A
-# table of 4,096 buckets takes 30,000 records pipelined (load factor 7,
-# well past the four the maintenance thread grows at, so the leg holds
-# thousands of records for the seconds this takes); `scan` with values in
-# chunks of 64 buckets must never return more than 64 buckets' worth of
-# records plus one chain, must offer every record, and must cross the leg
-# over several chunks (cursors carrying the leg bit); `dump` on the same
-# table the same.  Fail-first: the walk before S121 handed the whole leg
-# out in the final chunk - thousands of records against a 384-record budget.
-# Since OC-3 (0.7.4) there is no leg: overflow lives in each bucket's chain,
-# walked with its bucket, so no cursor carries the leg bit any more.
+# legwalktest.sh - the cooperative walk budgets its chunks at load factor 7: scan and dump in chunks of
+# 64 buckets never return more than that plus one chain, and offer every record.
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 D=$(mktemp -d /var/tmp/pclw.XXXXXX)
@@ -67,13 +58,8 @@ def walk(verb):
         cursor = r["cursor"]
         if not r["more"]: break
     return "%s: unique=%d chunks=%d biggest=%d leg_chunks=%d dups=%d secs=%.1f" % (verb, len(seen), chunks, biggest, leg_chunks, dups, time.time() - t0)
-# The walk's at-least-once contract is REAL: the maintenance thread splits
-# buckets while the table is over its load factor, and a split moves half a
-# bucket's records ahead of a cursor, where the walk meets them again.  So
-# "every record once" is a statement about a table that is STANDING STILL,
-# and the suite waits for that before it walks - the same settle dumptest
-# does.  On a two-vCPU runner the splitter was still working when this
-# walked, and 363 honest duplicates read as a failure.
+# the walk is at-least-once (a split moves records ahead of the cursor): every record
+# once holds only for a table standing still, so wait for that first, as dumptest does
 def buckets():
     return [c for c in call("stats")["result"]["collections"] if c["name"] == "c"][0]["buckets"]
 b0, still = buckets(), 0
@@ -95,7 +81,7 @@ case "$(g fill)" in "stored=30000 buckets="[0-9]*) ok "30,000 records stored int
 for verb in scan dump; do
 	L=$(g $verb); U=$(echo "$L" | sed -n 's/.*unique=\([0-9]*\).*/\1/p'); B=$(echo "$L" | sed -n 's/.*biggest=\([0-9]*\).*/\1/p'); LC=$(echo "$L" | sed -n 's/.*leg_chunks=\([0-9]*\).*/\1/p'); DU=$(echo "$L" | sed -n 's/.*dups=\([0-9]*\).*/\1/p')
 	[ "$U" = 30000 ] && ok "$verb offered every record ($U)" || bad "$verb unique: $L"
-	# 64 buckets of 6 slots = 384 records' worth; the leg may run over by one chain (a few dozen at most here)
+	# 64 buckets of 6 slots = 384 records' worth; a chunk may run over by one chain (a few dozen at most here)
 	[ "${B:-9999}" -le 500 ] && ok "$verb: no chunk larger than the budget plus a chain (biggest $B of 384 + a chain)" || bad "$verb: a chunk of $B records - the leg came out whole: $L"
 	[ "${LC:-0}" = 0 ] && ok "$verb: no cursor with the leg bit - chains are walked with their bucket (OC-3)" || bad "$verb leg chunks: $L"
 	[ "${DU:-1}" = 0 ] && ok "$verb: no record twice while the table stood still" || bad "$verb dups: $L"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """fakeupstream.py - a scripted RESP server standing in for Redis in the
-read-through suites (S331).  No Redis on the runners, and no write may ever
+read-through suites.  No Redis on the runners, and no write may ever
 reach an upstream: this server answers the READ commands perfcached sends
 (HELLO/AUTH/SELECT/PING/INFO/TYPE/PTTL/GET/HGETALL/JSON.GET/EXISTS/CLIENT/
 SCAN) and
@@ -8,6 +8,9 @@ records ANY other command in <dir>/writes - the suites fail on a non-empty
 file.
 
   fakeupstream.py <port> <dir> [host]   (host: 127.0.0.1 by default; "::1" for IPv6)
+  FAKEUP_TLS=cert:key[:ca]  serve TLS - with a CA, the client's certificate is
+      required and checked; each handshake noted in <dir>/tls ("ok <client CN or ->" or
+      "refused <why>")
 
 <dir>/data.json  the keyspace, re-read when it changes:
     {"key": {"type": "string|hash|json|list|set|zset", "value": ...,
@@ -17,36 +20,56 @@ file.
      "delay_keys": ["k", ...] (only these are delayed; empty = all),
      "write_delay_ms": 0 (every WRITE answered this late - a slow master),
      "reply_delay_ms": 0, "reply_delay_keys": [...], "reply_delay_cmds":
-         ["GET", ...] (S424: a read takes its value at once and answers this
+         ["GET", ...] (a read takes its value at once and answers this
          late - the reply in flight; only those keys / commands),
      "down": false (refuse/close every connection),
      "resp3": true (answer HELLO 3),
      "tracking": true (answer CLIENT ID / CLIENT TRACKING),
-     "client_id_delay_ms": 0 (S431: CLIENT ID answered this late - only a
+     "client_id_delay_ms": 0 (CLIENT ID answered this late - only a
          client's invalidation connection asks it, so its tracking comes up
          that much after its fetch connections can serve),
      "inv_seq": N + "invalidate": ["k", ...]  - a NEW inv_seq pushes an
          invalidation for those keys to every REDIRECT target,
      "kill_seq": N - a NEW kill_seq closes every REDIRECT target and every
-         broadcast-tracking connection (AR1),
-     (AR1) a connection that asks CLIENT TRACKING ON BCAST [PREFIX p ...]
+         broadcast-tracking connection,
+     a connection that asks CLIENT TRACKING ON BCAST [PREFIX p ...]
          is pushed ["invalidate", [keys]] whenever this server's keyspace
          changes under its prefixes - by a write here or by a replicated
          one (data.json rewritten by the master), as a Redis replica does,
      "run_id_per_conn": true - INFO tells every connection it reached a
          DIFFERENT server (a round-robin proxy in front of several),
+     "redis_mode": "cluster" - what INFO server says the server is
+     "cluster": {"shards": [{"slots": [[lo, hi], ...], "nodes": [[host, port, "master" |
+         "replica"], ...]}, ...], "slots_only": true (CLUSTER SHARDS unknown, as before
+         Redis 7), "ask": {"key": [host, port]} (answered -ASK there), "importing":
+         ["key", ...] (served here only after ASKING), "report": [...] (what CLUSTER SHARDS
+         and SLOTS say, when it lags "shards"), "moved_empty_host": true (-MOVED <slot>
+         :<port>, Redis 7's unknown endpoint)} - a cluster node, the same
+         topology on each; a key outside this node's shard, or read on a replica without
+         READONLY, is answered -MOVED <slot> <master>; SELECT other than 0 is refused; a
+         write is routed the same way (a replica MOVEs it), and keys of two slots are CROSSSLOT
+     "perfcached_version": "0.7.5" - INFO server says it is a perfcached
+     "replicas": [["127.0.0.1", port], ...] - a master's ROLE names them
+     "laddr": "10.9.9.9:6379" - CLIENT INFO's laddr, as a server behind a proxy says
+     "sentinel": {"<name>": {"ip": h, "port": p, "replicas": [[h, p, "slave[,s_down]"], ...],
+         "sentinels": [[h, p], ...]}} - SENTINEL MASTERS, GET-MASTER-ADDR-BY-NAME,
+         REPLICAS and SENTINELS answered from it (with "redis_mode": "sentinel");
+         SUBSCRIBE taken, and a NEW "sentinel_event_seq" publishes "sentinel_event"
+         (default +switch-master) with "sentinel_event_payload" to the subscribers,
+         "sentinel_event_count" times in one write (a burst; default 1); each
+         SENTINEL <sub> and SUBSCRIBE counted
      "info_noperm": true - INFO is refused, as for a user without +info,
-     "acl": {"user": {"pw": "p", "write": true|false}, ...} - AR7: Redis ACL
+     "acl": {"user": {"pw": "p", "write": true|false}, ...} - Redis ACL
          users instead of "password": AUTH [user] pw (or HELLO 3 AUTH user pw;
          no user is "default") must name one, every command before it is
          NOAUTH, and a WRITE from a user without "write" is answered NOPERM.
          Each AUTH is noted in <dir>/auth ("user ok" / "user refused"),
          each NOPERM in <dir>/noperm,
      "role": "master" | "replica" - what ROLE and INFO replication say
-         (S382; master by default, as a lone Redis is),
+         (master by default, as a lone Redis is),
      "link": "up" | "down" - a replica's link to its master,
      "last_io_s": N - seconds since a replica last heard from its master,
-     S385 (write-through):
+     write-through:
      "accept_writes": true - a MASTER applies the writes perfcached
          forwards (SET [EX|PX|NX|XX|GET], SETEX, DEL, UNLINK, EXPIRE,
          PEXPIRE, PERSIST, INCR/INCRBY/DECRBY, APPEND, HSET, LPUSH,
@@ -55,10 +78,10 @@ file.
          replica answers READONLY),
      "replicate_to": ["dir", ...] - after a write the keyspace is copied
          there too (the replica fakes serve it),
-     "replicate_delay_ms": N or {"dir": N, ...} - S423: that copy N ms
+     "replicate_delay_ms": N or {"dir": N, ...} - that copy N ms
          after the write (a replica's lag, per replica; its tracking echoes
          the write then),
-     "push_on_write": true - S423: a write here pushes its broadcast
+     "push_on_write": true - a write here pushes its broadcast
          invalidations before the writer's reply, as Redis does (else the
          watcher's 50 ms poll sends them); "push_delay_ms": N sends them N
          ms after it - the push and the reply travel on two connections,
@@ -90,8 +113,9 @@ DIR = sys.argv[2]
 HOST = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1"   # IP6-2: "::1" listens on IPv6
 READS = {b"HELLO", b"AUTH", b"SELECT", b"PING", b"INFO", b"TYPE", b"PTTL", b"TTL",
          b"GET", b"HGETALL", b"JSON.GET", b"EXISTS", b"CLIENT", b"QUIT",
-         b"COMMAND", b"SCAN", b"ROLE", b"LRANGE"}
-# S385: COMMAND INFO's table - name: (arity, flags, first, last, step, ACL cats)
+         b"COMMAND", b"SCAN", b"ROLE", b"LRANGE", b"SENTINEL", b"SUBSCRIBE",
+         b"CLUSTER", b"READONLY", b"READWRITE", b"ASKING"}
+# COMMAND INFO's table - name: (arity, flags, first, last, step, ACL cats)
 CMDS = {
     "set": (-3, ["write", "denyoom"], 1, 1, 1, ["@write", "@string", "@slow"]),
     "get": (2, ["readonly", "fast"], 1, 1, 1, ["@read", "@string", "@fast"]),
@@ -113,12 +137,8 @@ WRITES = {b"SET", b"SETEX", b"DEL", b"UNLINK", b"EXPIRE", b"PEXPIRE", b"PERSIST"
           b"JSON.SET", b"JSON.DEL", b"MSET", b"HDEL", b"HINCRBY"}
 lock = threading.Lock()
 rep_lock = threading.Lock()          # S423: delayed copies to the replicas land in order
-# one write at a time, as Redis applies them: load, change, save here and to
-# the replicas.  Without it, concurrent writers each saved their own copy of
-# the keyspace and the replica copies landed in another order than the
-# master's - upwritethroughtest 15 (eight writers on one key) read a replica
-# one write behind the master ("Redis v47, node 'v46'": 3 of 10 ASan runs on
-# 225, 2026-10-20), and two writers to two keys could each drop the other's
+# one write at a time, as Redis applies them: load, change, save here and to the replicas;
+# concurrent writers would save their own copies and replicas land out of order
 wlock = threading.Lock()
 rep_seq = {}                         # S423: replica dir -> [last queued, last landed]
 cache = {"data": ({}, None), "ctl": ({}, None)}
@@ -129,15 +149,87 @@ bcast = {}                 # AR1: id -> [prefixes] (empty: every key)
 next_id = [100]
 
 
+def crc16(b):
+    """Redis Cluster's CRC16 (XMODEM)"""
+    crc = 0
+    for c in b:
+        crc ^= c << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1
+            crc &= 0xFFFF
+    return crc
+
+
+def key_slot(k):
+    """the key's slot, with Redis's hash tag"""
+    o = k.find(b"{")
+    if o >= 0:
+        c = k.find(b"}", o + 1)
+        if c > o + 1:
+            k = k[o + 1:c]
+    return crc16(k) % 16384
+
+
+def cl_shard_of(cl, slot):
+    for sh in cl["shards"]:
+        if any(lo <= slot <= hi for lo, hi in sh["slots"]):
+            return sh
+    return None
+
+
+def cl_reply(cl, sub):
+    """CLUSTER SHARDS or SLOTS, in RESP2 - "report" when the topology said lags the one routed"""
+    shards = cl.get("report") or cl["shards"]
+    if sub == b"SHARDS":
+        out = []
+        for sh in shards:
+            nodes = [arr([bulk(x) for x in ["id", "%040x" % n[1], "port", str(n[1]), "ip", n[0],
+                                              "endpoint", n[0], "role", n[2], "health",
+                                              n[3] if len(n) > 3 else "online"]])
+                     for n in sh["nodes"]]
+            out.append(arr([bulk("slots"), arr([b":%d\r\n" % x for lo, hi in sh["slots"]
+                                                 for x in (lo, hi)]),
+                            bulk("nodes"), arr(nodes)]))
+        return arr(out)
+    out = []
+    for sh in shards:
+        ns = sorted(sh["nodes"], key=lambda n: n[2] != "master")
+        for lo, hi in sh["slots"]:
+            out.append(arr([b":%d\r\n" % lo, b":%d\r\n" % hi] +
+                           [arr([bulk(n[0]), b":%d\r\n" % n[1], bulk("%040x" % n[1])]) for n in ns]))
+    return arr(out)
+
+
+def cl_route(cl, key, readonly, asking):
+    """None to serve here, else the error line (MOVED / ASK)"""
+    slot = key_slot(key)
+    sh = cl_shard_of(cl, slot)
+    ks = key.decode("latin-1")
+    me = [n for n in (sh or {}).get("nodes", []) if n[1] == PORT]
+    if ks in cl.get("importing", []) and asking:
+        return None
+    master = [n for n in (sh or {}).get("nodes", []) if n[2] == "master"]
+    if not sh or not master:
+        return b"-CLUSTERDOWN Hash slot not served\r\n"
+    if not me or (me[0][2] != "master" and not readonly):
+        # "moved_empty_host": Redis 7's unknown-endpoint form, ":port" - the node asked
+        host = b"" if cl.get("moved_empty_host") else master[0][0].encode()
+        return b"-MOVED %d %s:%d\r\n" % (slot, host, master[0][1])
+    if ks in cl.get("ask", {}):
+        h, p = cl["ask"][ks]
+        return b"-ASK %d %s:%d\r\n" % (slot, h.encode(), p)
+    return None
+
+
 def stamp(path):
     """what identifies a version of @path, and whether it may still change
     under that identity.  The mtime alone does not: it comes from the
     kernel's coarse clock, and 1929 of 1999 back-to-back os.replace()s on
-    the runners (224, 225, 2026-10-20) left the same one - a write landing
+    the runners left the same one - a write landing
     in the tick of the one this process last read was never seen, and a
     replica served (and never pushed for) a keyspace one write behind:
     upwritethroughtest 15 "Redis v47, node 'v46'" and 3's document without
-    its EXPIRE (0.7.1-rc1, both CIs).  So: mtime_ns, inode (os.replace
+    its EXPIRE.  So: mtime_ns, inode (os.replace
     gives every version its own) and size - and a file written in the last
     second is read again whatever it says"""
     st = os.stat(path)
@@ -163,7 +255,7 @@ def load(name):
 
 
 def alive(ent):
-    """S385: an entry still alive - ttl_ms (since this fake started, the
+    """an entry still alive - ttl_ms (since this fake started, the
     suites' data files) or exp_ms (wall clock, what a write leaves)"""
     if not ent:
         return None
@@ -190,7 +282,7 @@ def _write_json(d, body):
 
 
 def save_data(data, ctl):
-    """S385: the keyspace after a write - here, and to the replicas.  S423:
+    """the keyspace after a write - here, and to the replicas;
     "replicate_delay_ms" copies to the replicas that much later, as a real
     replica applies a write after its master (and echoes it then)"""
     body = json.dumps(data)
@@ -236,7 +328,7 @@ def cmd_info(names, ctl):
 
 
 def apply_write(cmd, ctl):
-    """S385: apply one forwarded write; the reply as Redis gives it"""
+    """apply one forwarded write; the reply as Redis gives it"""
     name = cmd[0].upper()
     if name.startswith(b"JSON.") and ctl.get("json") is False:
         return b"-ERR unknown command '%s', with args beginning with: \r\n" % cmd[0]
@@ -446,7 +538,7 @@ def push_to_targets(payload):
 
 
 def bcast_changes(last):
-    """AR1: the keys whose entry changed since @last, pushed to every BCAST
+    """the keys whose entry changed since @last, pushed to every BCAST
     connection whose prefixes cover them; returns the keyspace seen now"""
     now = load("data")
     if now is last:
@@ -471,11 +563,12 @@ def bcast_changes(last):
 
 bc_lock = threading.Lock()
 bc_state = {"last": None}
+subscribed = set()             # S479: connections in SUBSCRIBE (a sentinel's events)
 
 
 def bcast_now():
     """the broadcast pushes for what changed since the last look - from the
-    watcher's poll, or (S423 "push_on_write") from the write itself"""
+    watcher's poll, or ("push_on_write") from the write itself"""
     with bc_lock:
         if bc_state["last"] is None:
             bc_state["last"] = load("data")
@@ -483,7 +576,7 @@ def bcast_now():
 
 
 def watcher():
-    seen_inv = seen_kill = None
+    seen_inv = seen_kill = seen_ev = None
     with bc_lock:
         bc_state["last"] = load("data")
     while True:
@@ -514,6 +607,23 @@ def watcher():
                             pass
                 note("pushes", "kill")
             seen_kill = kill
+        ev = ctl.get("sentinel_event_seq")                 # S479: a sentinel's event
+        if ev is not None and ev != seen_ev:
+            if seen_ev is not None:
+                msg = arr([bulk("message"), bulk(ctl.get("sentinel_event", "+switch-master")),
+                           bulk(ctl.get("sentinel_event_payload", "mym 127.0.0.1 1 127.0.0.1 2"))])
+                msg *= int(ctl.get("sentinel_event_count", 1))
+                with lock:
+                    es = [conns.get(c) for c in subscribed]
+                for e in es:
+                    if e:
+                        try:
+                            with e[1]:
+                                e[0].sendall(msg)
+                        except OSError:
+                            pass
+                note("pushes", "sentinel event")
+            seen_ev = ev
 
 
 def serve(conn):
@@ -521,6 +631,7 @@ def serve(conn):
     authed = False
     resp3 = False
     who = None                 # AR7: the ACL user this connection is
+    readonly = asking = False  # S478
     with lock:
         cid = next_id[0]
         next_id[0] += 1
@@ -529,12 +640,14 @@ def serve(conn):
         while True:
             ctl = load("ctl")
             if ctl.get("down"):
+                note("counts", "DOWN")       # S478: a connection closed unanswered, counted
                 return
             cmd = read_cmd(f)
             if cmd is None:
                 return
             name = cmd[0].upper()
             ctl = load("ctl")
+            was_asking, asking = asking, False          # S478: ASKING is one command's
             acl = ctl.get("acl")
             if acl is not None:                      # AR7
                 u = p = None
@@ -560,6 +673,19 @@ def serve(conn):
                     note("noperm", "%s %s" % (who, name.decode("latin-1")))
                     conn.sendall(b"-NOPERM User %s has no permissions to run the '%s' "
                                  b"command\r\n" % (who.encode(), name.lower()))
+                    continue
+            if name not in READS and ctl.get("cluster") is not None and len(cmd) > 1:
+                # a write to another shard's slot is MOVED; keys of two slots, CROSSSLOT
+                ks = cmd[1:2] if name not in (b"DEL", b"UNLINK") else cmd[1:]
+                if len({key_slot(k) for k in ks}) > 1:
+                    note("counts", "CROSSSLOT " + name.decode())
+                    conn.sendall(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n")
+                    continue
+                err = cl_route(ctl["cluster"], cmd[1], False, was_asking)
+                if err:
+                    note("counts", "%s %s %s" % (err[1:err.index(b" ")].decode(), name.decode(),
+                                                 cmd[1].decode("latin-1")))
+                    conn.sendall(err)
                     continue
             if name not in READS:
                 note("writes", " ".join(c.decode("latin-1") for c in cmd))
@@ -608,6 +734,10 @@ def serve(conn):
                 if not ctl.get("tracking", True):
                     conn.sendall(b"-ERR unknown subcommand\r\n")
                     continue
+                if sub == b"INFO":                  # S479: laddr, the address it answers at
+                    conn.sendall(bulk("id=%d addr=127.0.0.1:1 laddr=%s fd=8 name= db=0\n" % (
+                        cid, ctl.get("laddr", "127.0.0.1:%d" % PORT))))
+                    continue
                 if sub == b"ID":
                     if ctl.get("client_id_delay_ms"):      # S431
                         time.sleep(ctl["client_id_delay_ms"] / 1000.0)
@@ -630,7 +760,30 @@ def serve(conn):
                 conn.sendall(b"+OK\r\n")
                 continue
             if name == b"SELECT":
+                if ctl.get("redis_mode") == "cluster" and cmd[1:2] != [b"0"]:      # S478
+                    conn.sendall(b"-ERR SELECT is not allowed in cluster mode\r\n")
+                    continue
                 conn.sendall(b"+OK\r\n")
+                continue
+            if name in (b"READONLY", b"READWRITE"):    # S478
+                readonly = name == b"READONLY"
+                note("counts", name.decode())
+                conn.sendall(b"+OK\r\n")
+                continue
+            if name == b"ASKING":
+                asking = True
+                note("counts", "ASKING")
+                conn.sendall(b"+OK\r\n")
+                continue
+            if name == b"CLUSTER" and ctl.get("cluster") is not None:
+                sub = cmd[1].upper() if len(cmd) > 1 else b""
+                note("counts", "CLUSTER " + sub.decode())
+                if sub == b"SHARDS" and ctl["cluster"].get("slots_only"):
+                    conn.sendall(b"-ERR unknown subcommand 'SHARDS'\r\n")
+                elif sub in (b"SHARDS", b"SLOTS"):
+                    conn.sendall(cl_reply(ctl["cluster"], sub))
+                else:
+                    conn.sendall(b"-ERR unknown subcommand\r\n")
                 continue
             if name == b"PING":
                 conn.sendall(b"+PONG\r\n")
@@ -655,14 +808,46 @@ def serve(conn):
                 else:
                     conn.sendall(b"*0\r\n")
                 continue
+            if name == b"SUBSCRIBE" and ctl.get("sentinel") is not None:  # S479
+                note("counts", "SUBSCRIBE")
+                with lock:
+                    subscribed.add(cid)
+                conn.sendall(b"".join(arr([bulk("subscribe"), bulk(ch), b":%d\r\n" % (i + 1)])
+                                      for i, ch in enumerate(cmd[1:])))
+                continue
+            if name == b"SENTINEL" and ctl.get("sentinel") is not None:   # S479
+                sub = cmd[1].upper() if len(cmd) > 1 else b""
+                note("counts", "SENTINEL " + sub.decode(errors="replace"))
+                ms = ctl["sentinel"]
+                nm = cmd[2].decode() if len(cmd) > 2 else ""
+                flat = lambda d: arr([bulk(str(x)) for kv in d.items() for x in kv])
+                if sub == b"MASTERS":
+                    conn.sendall(arr([flat({"name": n, "ip": m["ip"], "port": m["port"], "flags": "master"})
+                                      for n, m in ms.items()]))
+                elif nm not in ms:
+                    conn.sendall(b"-ERR No such master with that name\r\n")
+                elif sub == b"GET-MASTER-ADDR-BY-NAME":
+                    conn.sendall(arr([bulk(ms[nm]["ip"]), bulk(str(ms[nm]["port"]))]))
+                elif sub in (b"REPLICAS", b"SLAVES"):
+                    conn.sendall(arr([flat({"name": "%s:%d" % (r[0], r[1]), "ip": r[0], "port": r[1],
+                                            "flags": r[2] if len(r) > 2 else "slave"})
+                                      for r in ms[nm].get("replicas", [])]))
+                elif sub == b"SENTINELS":
+                    conn.sendall(arr([flat({"name": "s%d" % i, "ip": x[0], "port": x[1]})
+                                      for i, x in enumerate(ms[nm].get("sentinels", []))]))
+                else:
+                    conn.sendall(b"-ERR unknown sentinel subcommand\r\n")
+                continue
             if name == b"ROLE":                       # S382
                 note("counts", "ROLE")
                 if ctl.get("role") == "replica":
                     conn.sendall(arr([bulk("slave"), bulk(ctl.get("master_host", "127.0.0.1")),
                                       b":%d\r\n" % int(ctl.get("master_port", 6379)),
                                       bulk("connected"), b":1000\r\n"]))
-                else:
-                    conn.sendall(b"*3\r\n$6\r\nmaster\r\n:1000\r\n*0\r\n")
+                else:                           # S479: the replicas it names
+                    reps = ctl.get("replicas", [])
+                    conn.sendall(b"*3\r\n$6\r\nmaster\r\n:1000\r\n" + arr(
+                        [arr([bulk(h), bulk(str(p)), bulk("1000")]) for h, p in reps]))
                 continue
             if name == b"INFO" and len(cmd) > 1 and cmd[1].lower() == b"replication":
                 note("counts", "INFO replication")
@@ -684,17 +869,18 @@ def serve(conn):
                 if ctl.get("info_noperm"):
                     conn.sendall(b"-NOPERM User has no permissions to run the 'info' command\r\n")
                     continue
-                # its own name: AR7's `who` is the connection's ACL user, and
-                # reusing it here made the next command look up acl["fake-N"]
-                # - a KeyError that killed the connection (upwritethroughtest
-                # 13, its first CI run: "the connection to the master failed")
+                # its own name, not `who` (the connection's ACL user): reusing that made the next command look
+                # up acl["fake-N"] and die on a KeyError
                 srv = "fake-%d" % PORT
                 if ctl.get("run_id_per_conn"):
                     srv += "-%d" % cid
                 rid = hashlib.sha1(srv.encode()).hexdigest()
                 note("counts", "INFO " + rid[:12])
-                body = ("# Server\r\nredis_version:7.4.0\r\nredis_mode:standalone\r\n"
-                        "run_id:%s\r\ntcp_port:%d\r\n" % (rid, PORT)).encode()
+                body = ("# Server\r\nredis_version:7.4.0\r\nredis_mode:%s\r\n"
+                        "run_id:%s\r\ntcp_port:%d\r\n" % (ctl.get("redis_mode", "standalone"), rid, PORT))
+                if ctl.get("perfcached_version"):
+                    body += "perfcached_version:%s\r\n" % ctl["perfcached_version"]
+                body = body.encode()
                 if resp3:
                     conn.sendall(b"=%d\r\ntxt:%s\r\n" % (len(body) + 4, body))
                 else:
@@ -715,12 +901,22 @@ def serve(conn):
                 keys = sorted(k for k, e in data.items()
                               if fnmatch.fnmatchcase(k, pat) and
                               ("ttl_ms" not in e or e["ttl_ms"] > now))
+                cl = ctl.get("cluster")
+                if cl is not None:              # S478: a node lists its own slots' keys
+                    keys = [k for k in keys if any(n[1] == PORT for n in
+                            (cl_shard_of(cl, key_slot(k.encode("latin-1"))) or {}).get("nodes", []))]
                 part = keys[cur:cur + cnt]
                 nxt = cur + cnt if cur + cnt < len(keys) else 0
                 note("counts", "SCAN %d %s" % (cur, pat))
                 conn.sendall(arr([bulk(str(nxt)), arr([bulk(k) for k in part])]))
                 continue
             key = cmd[1].decode("latin-1") if len(cmd) > 1 else ""
+            if ctl.get("cluster") is not None and len(cmd) > 1:              # S478
+                err = cl_route(ctl["cluster"], cmd[1], readonly, was_asking)
+                if err:
+                    note("counts", "%s %s %s" % (err[1:err.index(b" ")].decode(), name.decode(), key))
+                    conn.sendall(err)
+                    continue
             note("counts", name.decode() + " " + key)
             dk = ctl.get("delay_keys") or []
             if ctl.get("delay_ms") and (not dk or key in dk):
@@ -730,9 +926,8 @@ def serve(conn):
             rc_ = ctl.get("reply_delay_cmds") or []
             if ctl.get("reply_delay_ms") and (not rk or key in rk) and \
                     (not rc_ or name.decode("latin-1").upper() in rc_):
-                # S424: the value is read NOW and the reply sent later - a
-                # reply in flight while the key changes and its invalidation
-                # is pushed on the other connection
+                # the value is read now and the reply sent later: a reply in flight while the key changes and its
+                # invalidation is pushed on the other connection
                 time.sleep(ctl["reply_delay_ms"] / 1000.0)
             ent = alive(data.get(key))
             if name == b"TYPE":
@@ -795,7 +990,35 @@ def serve(conn):
             pass
 
 
+def tls_serve(c, ctx):
+    import ssl
+    try:
+        c.settimeout(5)
+        t = ctx.wrap_socket(c, server_side=True)
+        t.settimeout(None)
+    except (ssl.SSLError, OSError) as e:
+        note("tls", "refused %s" % str(e)[:160])
+        c.close()
+        return
+    cn = "-"
+    for rdn in (t.getpeercert() or {}).get("subject", ()):
+        for k, v in rdn:
+            if k == "commonName":
+                cn = v
+    note("tls", "ok %s" % cn)
+    serve(t)
+
+
 def main():
+    ctx = None
+    if os.environ.get("FAKEUP_TLS"):
+        import ssl
+        part = os.environ["FAKEUP_TLS"].split(":")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(part[0], part[1])
+        if len(part) > 2:
+            ctx.load_verify_locations(part[2])
+            ctx.verify_mode = ssl.CERT_REQUIRED
     s = socket.socket(socket.AF_INET6 if ":" in HOST else socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))
@@ -808,7 +1031,8 @@ def main():
         if load("ctl").get("down"):
             c.close()
             continue
-        threading.Thread(target=serve, args=(c,), daemon=True).start()
+        threading.Thread(target=tls_serve if ctx else serve, args=(c, ctx) if ctx else (c,),
+                         daemon=True).start()
 
 
 main()

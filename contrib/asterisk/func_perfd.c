@@ -12,12 +12,7 @@
  */
 
 /*! \file
- *
- * \brief perfcached dialplan functions: PERFD_GET, PERFD_SET, PERFD_EXISTS
- * and PERFD_DELETE, over libperfd (the binary protocol) or RESP2.
- *
- * \ingroup functions
- */
+ * \brief PERFD_GET, PERFD_SET, PERFD_EXISTS, PERFD_DELETE over libperfd or RESP2 \ingroup functions */
 
 /*** MODULEINFO
 	<depend>perfd</depend>
@@ -47,7 +42,7 @@
 #include "asterisk/time.h"
 #include "asterisk/utils.h"
 
-#include <perfd.h>                /* libperfd, linked (perfcached S371) */
+#include <perfd.h>                /* libperfd, linked */
 #include "perfd/resp.h"
 
 /*** DOCUMENTATION
@@ -605,7 +600,7 @@ static struct pd_conf *conf_parse(struct ast_config *cfg)
 				char name[160];
 
 				server_name(&cf->servers[i], name, sizeof(name));
-				CONF_FAIL(0, "server %s is not loopback and no secret is set; the binary door is encrypted off-loopback\n", name);
+				CONF_FAIL(0, "server %s is not loopback and no secret is set; the binary door authenticates off loopback\n", name);
 			}
 		}
 	}
@@ -671,7 +666,7 @@ static int bin_open(const struct pd_conf *cf, struct pd_conn *c, char *err, size
 	char name[160];
 	int k;
 
-	perfd_opts_init(&o);            /* zeroed, with its size (libperfd 0.5) */
+	perfd_opts_init(&o);            /* zeroed, with its size */
 	o.secrets = cf->nsecrets ? (const char *const *)cf->secrets : NULL;
 	o.connect_timeout_ms = cf->connect_timeout_ms;
 	o.io_timeout_ms = cf->io_timeout_ms;
@@ -753,9 +748,8 @@ static int op_binary(const struct pd_conf *cf, struct pd_conn *c, int verb,
 	case PD_GET:
 		rc = perfd_get(c->h, col, key, &v, &n, NULL);
 		if (rc == 1) {
-			/* the caller ast_std_free()s every value, the RESP
-			 * client's too: hand it a copy of ours and give the
-			 * library's buffer back to the library */
+			/* the caller ast_std_free()s every value, the RESP client's too: hand it a
+			 * copy of ours and give the library's buffer back to the library */
 			*vout = ast_std_malloc(n + 1);
 			if (*vout) {
 				memcpy(*vout, v, n);
@@ -1005,10 +999,8 @@ static const char *verb_name(int verb)
 	}
 }
 
-/*
- * The one path every function takes.  GET: OK hands back a malloc'd value in
- * @vout (ast_std_free it).  EXISTS / DELETE: OK means 1, NOTFOUND means 0.
- */
+/* The one path every function takes.  GET: OK hands back a malloc'd value in @vout
+ * (ast_std_free it).  EXISTS / DELETE: OK means 1, NOTFOUND means 0. */
 static enum pd_status pd_do(struct ast_channel *chan, int verb, char *data,
 	const char *value, char **vout, size_t *vlout)
 {

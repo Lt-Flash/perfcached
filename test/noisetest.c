@@ -1,10 +1,5 @@
-/*
- * noisetest — S25' Noise core proof (the #4074 discipline: prove the
- * core in a standalone harness before anything depends on it).
- * Runs pc_noise_selftest(): RFC 5869 extract vector, a full NNpsk0
- * round-trip both directions, wrong-PSK rejection, tamper rejection.
- * The independent-implementation interop proof is test/noise_interop.py.
- */
+/* noisetest - the Noise core proved standalone: pc_noise_selftest() (RFC 5869 vector, NNpsk0 both
+ * ways, wrong PSK and tamper refused); test/noise_interop.py is the independent interop proof. */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -29,11 +24,8 @@ static int io_all(int fd, int wr, uint8_t *b, size_t n)
 	return 0;
 }
 
-/* one handshake as <who> with a RAW key, framed as libperfd frames it.
- * A raw key lets a test present one that no secret derives - the
- * all-zero key an underived PSK slot holds.  0 established (msg2
- * verified), 3 refused (the responder closed or its msg2 does not
- * verify), 1 the dial itself failed. */
+/* one handshake as <who> with a RAW key (one no secret derives, e.g. an all-zero PSK slot):
+ * 0 established, 3 refused, 1 the dial itself failed */
 static int dial(const char *host, const char *port, const char *who,
 		const char *keyhex)
 {
@@ -93,14 +85,8 @@ static int dial(const char *host, const char *port, const char *who,
 	return 0;
 }
 
-/* `noisetest`            -> run the selftest
- * `noisetest psk C PWD`  -> print the authoritative PSK hex for principal
- *   C (client|cluster) and password PWD, from the SAME libsodium the
- *   daemon uses.  The interop test feeds this to its independent Python
- *   initiator, so PSK derivation never has to be reproduced elsewhere.
- * `noisetest dial HOST PORT client|cluster KEYHEX|zero`
- *   -> hand-shake with a live door as that principal with that raw key;
- *   prints established or refused. */
+/* no args: the selftest; `psk C PWD`: the PSK hex the daemon's libsodium derives, for the interop
+ * test; `dial HOST PORT client|cluster KEYHEX|zero`: one handshake, established or refused */
 int main(int argc, char **argv)
 {
 	if (sodium_init() < 0) {

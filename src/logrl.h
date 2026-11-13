@@ -1,22 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * logrl.h - a limit on log lines the network can drive (CH-17).
- *
- * A refusal said per datagram or per connection is a log that whoever can
- * reach the port writes: a replayed frame, a flood from rotating sources,
- * a misconfigured neighbour.  Each such line goes through pc_logrl_ok()
- * first, with its reason and the address it is about:
- *
- *   - one line per (reason, address) per LOGRL_WINDOW_MS;
- *   - at most LOGRL_CAP lines per window across every reason and address;
- *   - what was held back is never lost silently: the next line of that
- *     reason and address that is said is preceded by one line giving the
- *     count, and the next line said after the cap gives the cap's.
- *
- * The callers' counters count every event whether or not it is said.
- * Any thread: one lock, taken only on these refusal paths.
- */
+/* logrl.h - a limit on log lines the network can drive: one per (reason, address) per window, at
+ * most LOGRL_CAP a window, the held-back count said with the next line.  Any thread, one lock. */
 #ifndef PC_LOGRL_H
 #define PC_LOGRL_H
 
@@ -26,10 +11,8 @@
 #define LOGRL_CAP       60
 #define LOGRL_SLOTS     256
 
-/* one reason per distinct line: a key is a reason and a host, and two
- * different lines about one host must not hold each other back (the
- * master's ALIVE and MASTER_ALIVE refused on the epoch are two lines -
- * epochcommittest reads the second) */
+/* one reason per distinct line: two different lines about one host must not hold each other
+ * back (the master's ALIVE and MASTER_ALIVE refused on the epoch are two lines) */
 enum pc_logrl_reason {
 	LRL_JOIN_HELD = 1,      /* a join whose identity a live member holds */
 	LRL_JOIN_CLONE,         /* a join refused as a clone */
@@ -50,18 +33,18 @@ enum pc_logrl_reason {
 	LRL_HS_AUTH,            /* a client handshake that does not verify */
 	LRL_HS_VERSION,         /* a client handshake, unknown version */
 	LRL_ID_COLLISION,       /* an id a live member elsewhere holds */
-	LRL_SENDER_GATE,        /* a frame its sender may not send (CH-12) */
+	LRL_SENDER_GATE,        /* a frame its sender may not send */
 	LRL_SENDER_ALIVE,       /* a keepalive with an id or identity refused */
 	LRL_SENDER_MRANGE,      /* a master keepalive out of range */
 	LRL_SENDER_MFOLLOW,     /* a master keepalive a member does not follow */
 	LRL_SENDER_JOIN,        /* a join whose identity is live elsewhere */
 	LRL_MCAST_STRAY,        /* another local address's unicast, on the
 	                         * multicast socket */
-	LRL_BAD_AUTH,           /* CH-4: a datagram that does not authenticate */
-	LRL_GAP_FLOOR,          /* S463: a member told to floor a numbering space */
-	LRL_EAGER_DOUBT,        /* S464: a peer back that eager misses now ask */
-	LRL_BULK_HOST,          /* CH-11: a bulk connection from no member's host */
-	LRL_REPLAY,             /* CH-1: a sealed frame taken before */
+	LRL_BAD_AUTH,           /* a datagram that does not authenticate */
+	LRL_GAP_FLOOR,          /* a member told to floor a numbering space */
+	LRL_EAGER_DOUBT,        /* a peer back that eager misses now ask */
+	LRL_BULK_HOST,          /* a bulk connection from no member's host */
+	LRL_REPLAY,             /* a sealed frame taken before */
 	LRL_REASONS
 };
 

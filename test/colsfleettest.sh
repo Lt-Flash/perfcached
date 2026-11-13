@@ -1,22 +1,6 @@
 #!/bin/sh
-# colsfleettest.sh - S163: the collection figures ride the membership
-# plane.  On a three-node store-mode fleet every member's per-collection
-# block (its OWN client hits and misses, entries, stores, removes,
-# expired, named by hash) appears in /members on every node; the fleet
-# total of client hits equals the sum of the members' own /stats
-# hits_client; a pull one node serves for a peer moves the server's
-# client figures not at all; the map's hash joins to /stats' `hash`;
-# a standalone daemon publishes no members, so the page has no fleet
-# column to show.  S164: /stats rows carry the daemon's fleet block, and
-# under store (a pulled copy is kept) its entries are the fullest member's
-# as a lower bound, not the copies summed.
-# Fail-first: v0.4.0-rc1's ALIVE carries no collection block and its
-# /stats rows carry no hash.
-# The read through node 2 once took node 3's late "joined" notification for
-# its reply (GitHub master, rc3 and rc4; 1 of 60 on two pinned CPUs), and an
-# 80 ms pull timed out on those two CPUs (2 of 60) - hence the id-matching
-# reader and pull_timeout_ms = 1000: this test counts, it does not time.
-# Usage: test/colsfleettest.sh [./perfcached]
+# colsfleettest.sh - the collection figures ride the membership plane: every member's own block in
+# /members on every node, fleet totals that add up, and a served pull moving no client figure.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -106,10 +90,8 @@ def fleet_b(port):
         for c in m.get("collections") or []:
             out[n] = c
     return out
-# a native connection also carries unsolicited NOTIFY frames (a member
-# joining pushes a membership notification to every client; pcnative renders
-# it as an id-less {"notify":"membership",...} line), so the reply is the
-# first line that answers this request's id - not the first line
+# a native connection also carries unsolicited notify lines (a member joining), so the
+# reply is the first line that answers this request's id
 def jcall(port, method, params):
     s = socket.create_connection(("127.0.0.1", port), timeout=5); f = pcnative.wrap(s)
     f.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) + "\n").encode()); f.flush()
@@ -171,6 +153,7 @@ import os, subprocess                      # S407 part 3: the page is pagedump's
 page = subprocess.check_output([os.environ.get("PAGEDUMP", "./pagedump")]).decode("utf-8", "replace")
 check("fleet figures first" in page and "function fv(" in page and "copies across" in page, "the page renders fleet figures first with this node beside")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"

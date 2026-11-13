@@ -1,14 +1,5 @@
-/* pcaddrtest.c - IP6-1 (DESIGN 12np): the address type (pcaddr.c).
- *
- *   A  IPv4 is what it was: pc_addr_v4 is the network-order s_addr the
- *      placement hash and the wire use, equality is address + port (as
- *      peer_addr_eq / addr_eq were), ntop prints the dotted quad
- *   B  IPv6: parse, equality (scope id included), loopback, ntop with
- *      brackets where a port follows, the %scope round trip
- *   C  the host:port parser: the config's forms (last colon, as it always
- *      split), [v6]:port, and what it refuses
- *   D  pc_addr_from_sa: either family in, a short length or another
- *      family refused */
+/* pcaddrtest.c - the address type (pcaddr.c): IPv4 unchanged, IPv6, the host:port parser and
+ * pc_addr_from_sa. */
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -25,7 +16,7 @@ int main(void)
 	char buf[PC_ADDR_STRLEN], host[64];
 	int port = 0;
 
-	/* A */
+	/* A: IPv4 - network-order s_addr, equality is address + port, ntop the dotted quad */
 	memset(&s4, 0, sizeof s4);
 	s4.sin_family = AF_INET;
 	s4.sin_port = htons(6480);
@@ -77,7 +68,7 @@ int main(void)
 			"A: four pc_addr_str in one call stay distinct: '%s'", line);
 	}
 
-	/* B */
+	/* B: IPv6 - parse, equality with scope id, loopback, bracketed ntop, %scope round trip */
 	CHK(pc_addr_parse("::1", 6480, &a) == 0 && pc_addr_family(&a) == AF_INET6 &&
 		pc_addr_is_loopback(&a) && pc_addr_v4(&a) == 0,
 		"B: '::1' parses, AF_INET6, loopback, no v4 value");
@@ -97,7 +88,7 @@ int main(void)
 	CHK(pc_addr_parse("10.0.0.300", 1, &a) == -1 && pc_addr_parse("host", 1, &a) == -1,
 		"B: '10.0.0.300' and a name are not numeric addresses");
 
-	/* C */
+	/* C: host:port - the config's forms (last colon), [v6]:port, and what is refused */
 	CHK(pc_hostport_split("0.0.0.0:6479", host, sizeof host, &port) == 0 &&
 		!strcmp(host, "0.0.0.0") && port == 6479,
 		"C: 0.0.0.0:6479");
@@ -123,7 +114,7 @@ int main(void)
 	CHK(pc_hostport_split("a-very-long-host-name:1", host, 8, &port) == -1,
 		"C: a host that does not fit is refused, not cut");
 
-	/* D */
+	/* D: pc_addr_from_sa - either family in, a short length or another family refused */
 	{
 		struct sockaddr_in6 s6;
 

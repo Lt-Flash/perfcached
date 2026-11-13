@@ -1,22 +1,6 @@
 #!/bin/sh
-# iostattest.sh - 0.6.0 step 1 (DESIGN 12li): the system-call instruments
-# S361-S364 are judged with.
-#  1. the workers: a burst of 400 pipelined SETs on one connection arrives
-#     in far fewer read() calls than requests, and wakes the worker far
-#     fewer times; every counter moves; /stats io and /metrics carry them
-#  1b. one request at a time (depth 1): about ONE read() a request - a
-#     short read ends the drain (0.6.0, DESIGN 12lk); before, every request
-#     cost a second, empty read() to collect EAGAIN (2.0 a request)
-#  2. the cluster plane (three eager nodes): the writer's replication goes
-#     out as UDP datagrams, ONE sendto() EACH today - datagrams per syscall
-#     exactly 1.0, the figure S364's batching is meant to raise; a member
-#     receives them, and its receive syscalls also count the empty poll
-#     that ends each drain (rx_syscalls > rx_datagrams)
-#  3. a stats reset starts /stats io again; /metrics never falls
-# The workers' figures are the ACTIVE backend's (/stats io.backend, S361):
-# epoll's read() calls and waits, or an io_uring worker's receive
-# completions and io_uring_enter() calls - with read() at 0.
-# Usage: test/iostattest.sh ./perfcached
+# iostattest.sh - the system-call instruments: worker reads and wakeups per request (pipelined and depth 1),
+# the cluster plane's datagrams per syscall, and a stats reset; the figures are the active backend's.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

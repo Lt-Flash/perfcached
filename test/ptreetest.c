@@ -1,18 +1,5 @@
-/* ptreetest.c - S317: the native door's value codec (src/ptree.c).
- *
- * The writer: every tag, nested containers whose counts are patched when
- * they close, a map counting keys not values, bytes with a NUL, a
- * rollback that restores the count and clears an overflow, a fixed
- * buffer that overflows cleanly, a heap buffer that grows, nesting past
- * PT_DEPTH refused, an unclosed container not "done".  The reader: every
- * tag back, get/at/key_at, the typed accessors ('i' and 'd' integers, a
- * non-integer 'd' refused), and a refusal of every truncation, a bad
- * tag, a map key that is not bytes, trailing bytes, a count that lies,
- * nesting past the limit.  The renderers: a known tree to its JSON and
- * its RESP, a map as an object and as a flat array, bools as true/:1,
- * an error as {"error":...} and -line, bytes that are not UTF-8 not
- * breaking the JSON.  Fail-first: the module does not exist before S317.
- */
+/* ptreetest.c - the native door's value codec (src/ptree.c): the writer, the reader and its
+ * refusals of malformed input, the JSON and RESP renderers, JSON text to a tree. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,23 +1,6 @@
 #!/bin/sh
-# cachecoltest.sh - G5 (DESIGN 12nh): a cache collection.  `[collection x]
-# durable = no` keeps the collection off the WAL and out of the snapshot,
-# and a restart starts it empty - on this node (a fleet's peers still
-# refill it the ordinary ways; one node here).  Two collections: keep
-# (durable, the default) and tmp (durable = no).
-#   A  -E (the config as read) says durable = no for tmp, and /stats says
-#      durable false for tmp, true for keep
-#   B  writes, a delete, a TTL re-arm, a snapshot and a WAL tail into both:
-#      the WAL dump holds keep's records and not one of tmp's
-#   C  a clean stop (its snapshot on the way down) and a start: keep is
-#      back whole, tmp is empty
-#   D  a kill -9 and a start: the same
-#   E  tmp durable first (records in the WAL and a snapshot), then made a
-#      cache: it starts empty, and the start says how many records of it
-#      were not loaded
-#   F  a reload that changes durable is refused by name - restart to apply
-# Fail-first: a build without G5 refuses the key at the start (A), and with the key
-# ignored tmp's records are in the WAL (B) and back after a restart (C-E).
-# Usage: test/cachecoltest.sh [./perfcached]
+# cachecoltest.sh - `durable = no` keeps a collection off the WAL and out of the snapshot, so it
+# starts empty after any restart, and a reload cannot change it.  Usage: test/cachecoltest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -122,6 +105,12 @@ start
 R=$(py 'print(" ".join("%s=%s" % (c["name"], c.get("durable")) for c in call("stats")["result"]["collections"]))')
 echo "$R" | grep -q "keep=True" && echo "$R" | grep -q "tmp=False" &&
 	ok "A. /stats: keep durable, tmp not ($R)" || bad "A. /stats: $R"
+R=$(py 'print(" ".join("%s=%s/%s" % (c["name"], c.get("keeps"), c.get("copies")) for c in call("stats")["result"]["collections"]))')
+echo "$R" | grep -q "keep=recoverable/1" && echo "$R" | grep -q "tmp=ephemeral/1" &&
+	grep -q "collection 'keep' keeps: recoverable - a restart replays its WAL (fsync everysec); copies: one" "$D/log" &&
+	grep -q "collection 'tmp' keeps: ephemeral (durable = no) - a restart starts it empty here; copies: one" "$D/log" &&
+	ok "A. what each keeps (OM2-4): $R, and the start says so" ||
+	bad "A. what each keeps (OM2-4): $R; the start: $(grep 'keeps:' "$D/log" | tr '\n' '|')"
 
 # ---- B ---------------------------------------------------------------
 R=$(py "$WRITE")

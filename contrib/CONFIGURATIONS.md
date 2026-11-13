@@ -9,13 +9,17 @@ place of the documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`,
 `203.0.113.0/24`), and validate before starting:
 
     perfcached -f /etc/perfcached/perfcached.conf -C   # parse, check, report
-    perfcached -f /etc/perfcached/perfcached.conf -E   # the effective config, secrets masked
+    perfcached -f /etc/perfcached/perfcached.conf -E   # its main settings as parsed, secrets masked
 
 Every file here passed `perfcached -C` on the build it ships with, and
 the checker refuses the things these files are careful about: a cluster
 secret equal to a client secret, a RESP listener off loopback without
-`resp_allow`, `spread` without `replicas`.  Every option, annotated,
-is in [perfcached.conf.example](perfcached.conf.example); what the
+`resp_allow`, `spread` without `replicas`.  The ones with a RESP
+password or an HTTP token on a plaintext door off loopback (02, 05,
+08, 09, 11) pass with a warning that it travels in the clear: give the
+door `tls` (GUIDE.md, "TLS on the RESP and HTTP doors") or keep it on a
+trusted segment.  The options, annotated, are in
+[perfcached.conf.example](perfcached.conf.example); what the
 sections mean is in [GUIDE.md](../GUIDE.md) under *Running it*.
 
 Two rules that every fleet example follows.  **The same file goes on
@@ -27,11 +31,11 @@ whole fleet, and a node whose file differs is refused at join, by name.
 
 | # | configuration | shows |
 |---|---|---|
-| 01 | [One node, minimal](#one-node-minimal) | In-memory only, one encrypted door, one collection.  The smallest thing that serves. |
-| 02 | [One node for Redis clients](#one-node-for-redis-clients) | The RESP door on the LAN with its three guards, the status page, a local socket for tools, and `SELECT n` mapped onto named collections. |
+| 01 | [One node, minimal](#one-node-minimal) | In-memory only, one native door, one collection.  The smallest thing that serves. |
+| 02 | [One node for Redis clients](#one-node-for-redis-clients) | The RESP door on the LAN with its three guards, the HTTP door, a local socket for tools, and `SELECT n` mapped onto named collections. |
 | 03 | [One node that survives a restart](#one-node-that-survives-a-restart) | Identity and runtime-created collections in `state_dir`, a WAL with snapshots, runtime DDL behind the `enable` secret, a sampled query log. |
 | 04 | [One node whose memory follows the load](#one-node-whose-memory-follows-the-load) | An elastic arena that grows under pressure and gives idle memory back, and an index that grows and shrinks by itself. |
-| 05 | [An eager fleet](#an-eager-fleet) | Every node holds every record.  The same file on every node; membership is automatic; the RESP door and the status page on each. |
+| 05 | [An eager fleet](#an-eager-fleet) | Every node holds every record.  The same file on every node; membership is automatic; the RESP door and the HTTP door on each. |
 | 06 | [A store fleet](#a-store-fleet) | Pull-on-miss: a node fetches what it misses from a peer and keeps the copy, so each node converges on its own working set. |
 | 07 | [A proxy fleet](#a-proxy-fleet) | The capacity plane: each key on exactly one node placed by free memory, forwarded writes, served-through reads, a rebalancer.  Fleet capacity is the sum of the arenas. |
 | 08 | [A shard fleet behind Redis clients](#a-shard-fleet-behind-redis-clients) | Deterministic ownership, and the slot map published on the RESP door so a cluster-aware Redis client sends every key to its owner. |
@@ -49,7 +53,7 @@ section appears.
 
 ## One node, minimal
 
-In-memory only, one encrypted door, one collection.  The smallest thing that serves.
+In-memory only, one native door, one collection.  The smallest thing that serves.
 
 ```ini
 # One node, in-memory only: the smallest configuration that serves.
@@ -65,7 +69,7 @@ client = CHANGE-ME-client            # what clients present (repeat the line to 
 cluster = CHANGE-ME-cluster          # optional standalone; if set, must differ from the client secret
 
 [listen]
-tcp = 0.0.0.0:6479                   # the encrypted native door: binary and RESP
+tcp = 0.0.0.0:6479                   # the native door, binary and RESP: Noise-authenticated
 
 [collection sessions]
 buckets_log2 = 16                    # index sizing only; it grows and shrinks by itself
@@ -73,10 +77,10 @@ buckets_log2 = 16                    # index sizing only; it grows and shrinks b
 
 ## One node for Redis clients
 
-The RESP door on the LAN with its three guards, the status page, a local socket for tools, and `SELECT n` mapped onto named collections.
+The RESP door on the LAN with its three guards, the HTTP door, a local socket for tools, and `SELECT n` mapped onto named collections.
 
 ```ini
-# One node for Redis clients on the LAN, with the status page and a
+# One node for Redis clients on the LAN, with the HTTP door and a
 # local socket for tools.
 [daemon]
 workers = 8
@@ -90,13 +94,14 @@ arena_mb = 2048
 client = CHANGE-ME-client
 cluster = CHANGE-ME-cluster
 resp = CHANGE-ME-redis-AUTH          # the Redis AUTH password; differs from both above
-http = CHANGE-ME-http-token          # the status page and /metrics, /stats, /members
+http = CHANGE-ME-http-token          # the HTTP door: /metrics, /stats, /members
 
 [listen]
-tcp = 0.0.0.0:6479                   # native, encrypted
+tcp = 0.0.0.0:6479                   # native, authenticated (encrypt = yes keeps it encrypted)
 unix = /run/perfcached/perfcached.sock
 plaintext = loopback                 # plaintext on 127.0.0.1 and the socket only
 resp = 192.0.2.10:6379               # RESP2 only, plaintext: the guards below are required
+                                     # (0.7.5: resp = <addr:port> tls, with tls_cert and tls_key, keeps AUTH off the wire)
 resp_allow = 192.0.2.0/24, 198.51.100.0/24
 resp_collections = 0:sessions, 1:counters, 2:presence   # SELECT 0/1/2 -> these
 http = 192.0.2.10:8080
@@ -143,8 +148,8 @@ probe = auto                         # measure the device at startup, recommend 
 fsync = everysec                     # at most one second of acknowledged writes at risk
 segment_mb = 64
 segments = 8
-save = 900 1                         # snapshot after 15 min if anything changed
-save = 300 10000                     # or after 5 min and 10,000 changes
+save = 900 1, 300 10000              # snapshot after 15 min if anything changed,
+                                     # or after 5 min and 10,000 (one line: a second replaces it)
 rdb_mb_s = 64                        # the snapshot walker's write rate
 
 [collection sessions]
@@ -169,7 +174,7 @@ shrink_at_pct = 18                   # resize down once it sits below this (defa
 shrink_cooloff_s = 60                # ...for this long since it last split, was resized or started
 
 [memory]
-arena_mb = 512                       # committed and pinned at start
+arena_mb = 512                       # committed at start
 arena_cap_mb = 4096                  # may grow to this, 2 MB at a time, under pressure
 reclaim_keep = 4                     # drained chunks kept per size class for the next burst
 reclaim_quiet_s = 300                # idle this long before a chunk is given back
@@ -177,8 +182,8 @@ reclaim_cooloff_s = 60               # no give-back this soon after a carve
 reclaim_giveback = 1
 reclaim_floor_mb = 256               # never give back below this
 shrink_step_mb = 64                  # the most give-back one tick may do
-pin = auto                           # require = refuse to start unless the arena is locked
-huge_pages = auto                    # off = plain 4K pages, THP disabled for the process
+pin = no                             # never locked, so idle groups can go back (0.7.5); a locked arena gives nothing back
+huge_pages = off                     # plain 4K pages: a reserved huge-page pool stays reserved whatever is given back
 
 [secrets]
 client = CHANGE-ME-client
@@ -193,7 +198,7 @@ buckets_log2 = 12                    # start at the floor; it grows as the keysp
 
 ## An eager fleet
 
-Every node holds every record.  The same file on every node; membership is automatic; the RESP door and the status page on each.
+Every node holds every record.  The same file on every node; membership is automatic; the RESP door and the HTTP door on each.
 
 ```ini
 # Three (or more) nodes, every node holding every record: the same file
@@ -495,6 +500,7 @@ spec:
     - { name: bulk,    port: 6480, protocol: TCP }
     - { name: lane,    port: 6482, protocol: TCP }
     - { name: relay,   port: 6481, protocol: UDP }
+    - { name: relay-tcp, port: 6481, protocol: TCP }
 ```
 
 and each pod takes its identity from its own uid, so a rescheduled pod
@@ -514,10 +520,10 @@ load balancer.
 ## Reading a running node back
 
 `perfcli -P stats` answers with the collections, the cluster (node,
-role, peers, term), the memory budget and the doors; the status page on
-the `http` listener shows the same as the fleet's view; `/metrics` is
-the Prometheus form.  `perfcli collections` lists what exists at
-runtime; `GET /members` on the `http` listener (or
+role, peers, term), the memory budget and the doors; `/stats` on the
+`http` listener is the same, perfcached-dashboard shows the fleet's
+view; `/metrics` is the Prometheus form.  `perfcli collections` lists
+what exists at runtime; `GET /members` on the `http` listener (or
 `perfcli -j '{"method":"members"}'`) says who is in the fleet.  A fleet that did not
 form is loud about it: `peers_up` stays 0 and the log names the reason
 (a group the network does not carry, a cluster secret that differs, a

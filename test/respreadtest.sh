@@ -1,5 +1,5 @@
 #!/bin/sh
-# respreadtest.sh - S474: an eager fleet of three, a fourth joins, one dies and returns, the fourth fails and returns, under live handles.
+# respreadtest.sh - an eager fleet of three, a fourth joins, one dies and returns, the fourth fails and returns, under live handles.
 # Usage: test/respreadtest.sh [./perfcached] [./respreadtest] [./syncfailshim.so]
 set -u
 BIN=${1:-./perfcached}
@@ -117,6 +117,10 @@ wait "$RP"
 rc=$?
 RP=
 grep -vE '^(ADD-NODE|KILL-NODE|RESTART-NODE|FAIL-NODE|RESTORE-NODE)$' "$D/out"
+# a miss names what the fleet did: who it saw go, admitted, or kept over the lane
+[ $rc -eq 0 ] || for i in 1 2 3 4; do
+	grep -E "gone|joined|admit|ONLINE|CONNECTING|has sent no UDP|lane|return|expel" "$D/n$i.log" | tail -8 | cut -c1-200 | sed "s/^/  ..   n$i: /"
+done
 case "$SAID" in
 "node 4 was failed, the shim refused "[1-9]*) echo "  ok   $SAID" ;;
 *) echo "  FAIL the failure the test relies on did not happen: $SAID"; rc=1 ;;

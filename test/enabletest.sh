@@ -1,15 +1,6 @@
 #!/bin/sh
-# enabletest.sh — S129: DDL needs a PRIVILEGED connection, not just the
-# client secret.
-#
-# WHY THIS EXISTS.  `allow_create` answers "may this NODE originate DDL".
-# It cannot answer "may THIS LINK", because apps, ops tooling and perfcli
-# all present the same [secrets] client value - so turning the node gate
-# on hands create/drop/resize/rename (and restore) to every application
-# connection.  A distinct [secrets] enable raises a bit on the
-# connection; it dies with the connection and never crosses the wire.
-#
-# usage: test/enabletest.sh [./perfcached]
+# enabletest.sh - DDL needs a PRIVILEGED connection ([secrets] enable), not just the client secret every
+# app shares; the privilege dies with the connection and never crosses the wire.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -83,7 +74,7 @@ case "$R" in *"privileged connection"*) ok "an unprivileged connection is refuse
 R=$(seq_json 17991 '{"method":"enable","params":{"secret":"wrong-one"}}')
 case "$R" in *"wrong enable secret"*) ok "a wrong enable secret is refused";; *) bad "wrong secret: $R";; esac
 
-# S417: the third wrong secret from this address within the window locks it out - the RIGHT secret
+# the third wrong secret from this address within the window locks it out - the RIGHT secret
 # is then refused too, another address is not, and the window's end clears it
 seq_from() { # seq_from <source ip> <port> <json-line>... - like seq_json, bound to a source address
 	python3 - "$@" <<'PYEOF'

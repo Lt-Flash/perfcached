@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* Shim for OpenSIPS mi/item.h — mi_item_t becomes a generic key/value
- * sink so the arena's stats emitter compiles unchanged.  The daemon's
- * stats verb supplies the callbacks (S8); selftests can pass a printf
- * sink or NULL-check their way around it. */
+/* Shim for the vendored core's mi/item.h: mi_item_t is a generic key/value sink
+ * so the arena's stats emitter compiles unchanged; the stats verb supplies it. */
 #ifndef PC_COMPAT_MI_ITEM_H
 #define PC_COMPAT_MI_ITEM_H
 

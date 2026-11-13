@@ -1,41 +1,5 @@
-/* clrecontest.c - the B4 reconcile's pacing (clrecon.c; the 0.7.2 split,
- * wave 1): pure functions over struct clrecon, the clock passed in.
- *
- *   A  the second's budget (S393): a quarter of the pending table's free
- *      slots, never under RECONCILE_PER_TICK nor over the ceiling; a new
- *      refusal or a new pull timeout holds it at the floor for
- *      RECONCILE_CALM_MS, then the room counts again
- *   B  the slice's share: renewed once a second (and said so), the share
- *      rounded up - 64 a second is 7 a 100-ms slice, not 6
- *   C  the debt: a slice that overshot is paid by the next; one that owes
- *      more than its share is skipped and still owes the rest
- *   D  the rate and ETA (S395): 0 and 0 while the pass is not open, 0 and
- *      -1 while it is not walking; over the last minute's samples, not
- *      since the start; the ETA what the rate leaves of the total
- *   E  the no-witness clock (ST8): the seconds since the spell began, the
- *      warning once when it reaches RECON_NOWITNESS_WARN_S; stopping the
- *      clock keeps it said, a witness's return ends the spell
- *   F  the pump's gate: only while the beat lets the walk go on and the
- *      pass is on, a slice per RECONCILE_SLICE_MS
- *   G  the fast path (S392), the returning node's half: an ask's request
- *      id (never 0), the counts cleared and the try counted; the wait -
- *      hold while heard from, ask again when quiet, give up after
- *      FP_TRIES, done once every counted number is held; only the frames
- *      of the ask in flight count, and they are heard from; the replay's
- *      numbers - a repeat counted once, the bitmap grown past its first
- *      4 KB and to the last number, one past FP_SEEN_MAX refused, a new
- *      ask starting it afresh; giving up frees it
- *   H  the witness (S223): the death estimate - the later of the last write
- *      and the alive stamp, onto the monotonic clock, unknown without
- *      either, a wall clock behind both read as no time dead; the
- *      predicate at the grace's edge; the first live witness and the live
- *      peers counted to it (all of them when there is none), a dead peer
- *      and an empty slot never one; the count and the last id; the
- *      restart note (S274) - witnesses now, the wait for the next, a peer
- *      with no uptime never one, and the peers waiting on this node
- *   I  the end of a walk (S471): after the walk's answers, and walked again
- *      RECONCILE_ROUNDS times at most while keys have no verdict
- */
+/* clrecontest.c - the reconcile's pacing (clrecon.c): pure functions over struct clrecon, the clock
+ * passed in. */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,7 +18,7 @@ int main(void)
 	long long eta, secs;
 	int renewed, b, k, warns;
 
-	/* A */
+	/* A: the second's budget - a quarter of the free pending slots, floored after refusals */
 	memset(&r, 0, sizeof r);
 	CHK(clrecon_budget(&r, 1000, 4000, 0, 0, 1024) == 1000,
 		"A: 4,000 free slots - a quarter, 1,000 a second");
@@ -71,7 +35,7 @@ int main(void)
 	CHK(clrecon_budget(&r, 20000, 4000, 1, 7, 1024) == RECONCILE_PER_TICK &&
 		r.calm_until == 20000 + RECONCILE_CALM_MS, "A: a new pull timeout calms it too");
 
-	/* B */
+	/* B: the slice's share - renewed once a second, rounded up (64 a second is 7 per 100 ms) */
 	memset(&r, 0, sizeof r);
 	b = clrecon_slice_budget(&r, 1000, 4000, 0, 0, 1024, &renewed);
 	CHK(b == 100 && renewed && r.budget == 1000, "B: 1,000 a second - 100 a slice, renewed");
@@ -82,7 +46,7 @@ int main(void)
 	b = clrecon_slice_budget(&r, 3000, 0, 0, 0, 1024, &renewed);
 	CHK(b == 7 && r.budget == RECONCILE_PER_TICK, "B: 64 a second - 7 a slice, rounded up");
 
-	/* C */
+	/* C: the debt - an overshoot is paid by the next slice; one owing more is skipped */
 	memset(&r, 0, sizeof r);
 	CHK(clrecon_slice_take(&r, 100) == 100 && r.debt == 0, "C: no debt - the whole share");
 	clrecon_owe(&r, -30);
@@ -91,7 +55,7 @@ int main(void)
 	CHK(clrecon_slice_take(&r, 100) == -50 && r.debt == 50, "C: 150 owed - this slice skipped, 50 still owed");
 	CHK(clrecon_slice_take(&r, 100) == 50 && r.debt == 0, "C: and the next pays it - 50");
 
-	/* D */
+	/* D: the rate and ETA - over the last minute's samples, not since the start */
 	memset(&r, 0, sizeof r);
 	clrecon_progress(&r, 1000, 0, 1, 10, 100, &rate, &eta);
 	CHK(rate == 0 && eta == 0, "D: the pass not open - 0, 0");
@@ -117,7 +81,7 @@ int main(void)
 	clrecon_progress(&r, 122000, 1, 1, 1000000, 1000000, &rate, &eta);
 	CHK(eta == 0, "D: everything walked - 0 s left");
 
-	/* E */
+	/* E: the no-witness clock - warned once at RECON_NOWITNESS_WARN_S, ended by a witness */
 	memset(&r, 0, sizeof r);
 	warns = 0;
 	warns += clrecon_nowit(&r, 1000, &secs);
@@ -137,7 +101,7 @@ int main(void)
 	warns += clrecon_nowit(&r, 300000 + RECON_NOWITNESS_WARN_S * 1000LL, &secs);
 	CHK(secs == RECON_NOWITNESS_WARN_S && warns == 2, "E: a witness came back between - the next spell warns again");
 
-	/* F */
+	/* F: the pump's gate - only while the beat allows a walk, a slice per RECONCILE_SLICE_MS */
 	memset(&r, 0, sizeof r);
 	CHK(!clrecon_pump_due(&r, 5000, 1), "F: the beat has not let it walk - no slice");
 	clrecon_walk_start(&r, 1000);
@@ -148,7 +112,7 @@ int main(void)
 	clrecon_walk_stop(&r);
 	CHK(!clrecon_pump_due(&r, 9000, 1), "F: the beat stopped it - none");
 
-	/* G */
+	/* G: the fast path - the ask, the wait, giving up after FP_TRIES, the replay's numbers */
 	{
 		struct clrecon_fp f;
 		uint32_t req;
@@ -194,7 +158,7 @@ int main(void)
 		clrecon_fp_drop_seen(&f);
 	}
 
-	/* H */
+	/* H: the witness - death estimate, grace predicate, live witnesses, the restart note */
 	{
 		static struct clpeers pt;
 		struct clrecon_restart o;
@@ -252,7 +216,7 @@ int main(void)
 		CHK(o.witnesses == 2 && o.wait_ms == -1, "H: both up long enough - 2, nothing to wait for");
 	}
 
-	/* I. S471: the end of a walk */
+	/* I: a walk's end - walked again, RECONCILE_ROUNDS at most, while keys lack a verdict */
 	{
 		struct clrecon r;
 		int i;

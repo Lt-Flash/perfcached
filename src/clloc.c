@@ -1,11 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clloc.c - the locator and negative caches (M3).  See clloc.h.
- *
- * Every body came out of cluster.c unchanged; what differs is that the
- * tables are reached through a pointer and the clock is passed in.
- */
+/* clloc.c - the locator and negative caches.  See clloc.h. */
 #include "clloc.h"
 #include "fnv1a.h"
 
@@ -18,17 +13,8 @@ uint64_t clloc_hash(const char *col, size_t cn, const char *key,
 	return h ? h : 1;
 }
 
-/*
- * RV-15: the negative cache is 4-way set-associative, and a full set
- * evicts the entry CLOSEST TO EXPIRY.  It was direct-mapped: a delete
- * whose key shared a slot with a live tombstone overwrote it, however
- * fresh - and a fresh tombstone is exactly the one guarding its key
- * against a copy of the deleted record still crossing on the wire
- * (S209).  Measured at ~55k deletes/s on two nodes: 19-70% of tombstones
- * displaced before their 2 s lifetime.  Same memory, same capacity; a
- * fresh tombstone now goes only after four newer entries land in its
- * set.
- */
+/* the negative cache is 4-way set-associative and a full set evicts the entry CLOSEST TO EXPIRY:
+ * a fresh tombstone guards its key against a copy of the deleted record still on the wire */
 static size_t neg_base(uint64_t h)
 {
 	return (size_t)(h % (NEG_SLOTS / NEG_WAYS)) * NEG_WAYS;
@@ -90,9 +76,8 @@ static int neg_find(const struct clloc *l, size_t b, uint64_t h, long long now,
 	return -1;
 }
 
-/* where @h goes: its own way, else a free or expired one, else the one
- * closest to expiry - counted as displaced (a tombstone lost, if it
- * carried a version) */
+/* where @h goes: its own way, else a free or expired one, else the one closest to expiry,
+ * counted as displaced (a tombstone lost, if it carried a version) */
 static size_t neg_slot_for(struct clloc *l, size_t b, uint64_t h, long long now)
 {
 	size_t w, old = b;
@@ -127,7 +112,7 @@ int clloc_neg_hit(struct clloc *l, const char *col, size_t cn,
 	return 0;
 }
 
-/* S467: raise neg_until_ms to @until - never lower it */
+/* raise neg_until_ms to @until - never lower it */
 static void neg_until(struct clloc *l, long long until)
 {
 	long long cur = __atomic_load_n(&l->neg_until_ms, __ATOMIC_RELAXED);

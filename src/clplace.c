@@ -1,25 +1,20 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clplace.c — weighted rendezvous, in integers.
- */
+/* clplace.c - weighted rendezvous, in integers */
 #include <string.h>
 
 #include "clplace.h"
 #include "pc_mix.h"                 /* the ONE rendezvous mix */
 
-/* The public name for pc_hrw_mix(): kept because clplace.h exports it
- * and the map placer is unit-tested through it.  The body moved to
- * src/pc_mix.h so this and cluster.c and libperfd cannot drift. */
+/* the public name for pc_hrw_mix(), which lives in pc_mix.h so this, cluster.c and libperfd
+ * cannot drift; the map placer is unit-tested through it */
 uint64_t pc_clplace_mix(uint64_t kh, uint32_t addr, uint16_t port)
 {
 	return pc_hrw_mix(kh, addr, port);
 }
 
-/* log2(1 + i/32) in PC_CLPLACE_FBITS fixed point, for the mantissa.
- * The last entry MUST be exactly 1<<FBITS - log2(2) is 1, and a table
- * that overshoots it makes the D term underflow for large h, which
- * silently reverses the ordering at the top of the range. */
+/* log2(1 + i/32) in PC_CLPLACE_FBITS fixed point; the last entry MUST be exactly 1<<FBITS, or the
+ * D term underflows for large h and silently reverses the order at the top */
 static const uint32_t LOG2_TAB[33] = {
 	      0,   46551,   91711,  135563,  178179,  219628,  259971,  299266,
 	 337566,  374920,  411375,  446971,  481749,  515745,  548995,  581529,
@@ -28,12 +23,8 @@ static const uint32_t LOG2_TAB[33] = {
 	1048576
 };
 
-/*
- * (64 - log2(h)) in fixed point.  Never zero: h < 2^64 always, so
- * log2(h) < 64 - and a zero here would divide the comparison by nothing.
- * h == 0 gives the maximum term, i.e. the lowest possible score, which
- * is the right answer for a node whose mix landed on zero.
- */
+/* (64 - log2(h)) in fixed point, never zero since h < 2^64; h == 0 gives the maximum term, the
+ * lowest score - right for a node whose mix landed on zero */
 uint64_t pc_clplace_dterm(uint64_t h)
 {
 	unsigned int msb, idx;
@@ -59,14 +50,11 @@ uint64_t pc_clplace_dterm(uint64_t h)
 	return ((uint64_t)(64 - msb) << PC_CLPLACE_FBITS) - frac;
 }
 
-/* a beats b?  w_a/D_a > w_b/D_b  <=>  w_a*D_b > w_b*D_a.  Ties break on
- * node id, so two nodes cannot disagree about a colliding key. */
+/* a strict total order: ids break every tie */
 static int beats(uint32_t wa, uint64_t da, uint16_t ida,
 		uint32_t wb, uint64_t db, uint16_t idb)
 {
-	/* w <= 65535 and D <= 64<<20, so the products stay well inside 64
-	 * bits - no widening needed, and none of the rounding a float
-	 * version would bring */
+	/* w <= 65535 and D <= 64<<20: the products fit 64 bits */
 	uint64_t la = (uint64_t)wa * db;
 	uint64_t lb = (uint64_t)wb * da;
 
@@ -147,15 +135,6 @@ int pc_clplace_rank(const struct pc_clmap *m, uint64_t kh,
 	return max;
 }
 
-/*
- * In-set predicate for the copy factor (S127 Z1).
- *
- * Rank is "how many placeable nodes beat me", so membership of the top
- * @k needs no sort and no array: count the nodes ahead and stop the
- * moment @k of them are found.  beats() is a strict total order (ids
- * are unique and break every tie), so the count is exactly the index
- * pc_clplace_rank() would have written this node at.
- */
 int pc_clplace_in_set(const struct pc_clmap *m, uint64_t kh,
 		uint16_t node_id, int k)
 {

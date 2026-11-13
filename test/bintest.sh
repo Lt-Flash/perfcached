@@ -1,19 +1,6 @@
 #!/bin/sh
-# bintest.sh — the binary dialect end to end, from raw frames (no
-# libperfd - this is the WIRE contract a third-party client codes
-# against) over a plaintext loopback listener.
-#  Part 1, single node: every data verb's request/response layout,
-#  raw bytes in values (magic byte, NUL, newline INSIDE a value),
-#  error frames, per-MESSAGE mixing (fixed-layout data-verb frames and
-#  CMD method frames interleaved pipelined on one connection, replies
-#  matched by id - S317: the JSON-RPC text dialect is gone, a method
-#  rides verb 19 with a parameter tree), a 60KB value, and junk-byte
-#  connection teardown (the one-line refusal, then the close).
-#  Part 2, two proxy nodes: the PARKED paths - a binary get answered
-#  by a cluster pull, a binary set/add/del answered by a holder
-#  forward - prove pc_proto_pull_complete speaks the request's
-#  dialect (PULL / FWD_SET / FWD_ADD / FWD_DEL shapes).
-# Usage: test/bintest.sh [./perfcached]
+# bintest.sh - the binary dialect from raw frames (the wire contract, no libperfd): every data verb,
+# CMD frames pipelined beside them, teardown, and parked pulls and forwards.  Usage: test/bintest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -27,10 +14,8 @@ trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
 RES="$D/results"
 : > "$RES"
 
-# the nodes run at log_level = warn, where "perfcached ready" (a NOTICE) is
-# never printed - a wait on it burned its 10 s every time and went on blind
-# (fwdtest's v0.5.6.1 CI red).  Wait for the door itself, and say so if
-# it never opens.
+# the nodes log at warn, where "perfcached ready" (a notice) never shows: wait for the door itself,
+# and say so if it never opens
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 RDY=300; [ -n "$SANRT" ] && RDY=900
 door() { # door <port> <log>
@@ -189,8 +174,8 @@ ok(c.msg()[3] == b"\x01", "60KB set")
 c.send(freq(vh(2, b"c", b"big"), 31))
 ok(c.msg()[3][5:] == big, "60KB get exact")
 
-# junk first byte tears the connection down - after the one plain line
-# that names the door (S317: neither a frame nor RESP)
+# a junk first byte tears the connection down, after one plain line that names
+# the door (neither a frame nor RESP)
 j = Conn(int(os.environ["PORT"]))
 j.send(b"\x00\x01\x02")
 try:
@@ -255,7 +240,18 @@ EOF
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 P1=$!
 door 17062 "$D/n1.log"
-sleep 3.5   # membership
+# a joiner is CONNECTING until its links answer: wait for both ready and seeing each other
+st() { python3 - "$1" <<'EOF' 2>/dev/null
+import socket, sys
+import pcnative
+f = pcnative.wrap(socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5))
+r = pcnative.call(f, "stats")["result"]; print(r.get("state"), r["cluster"].get("peers_up"))
+EOF
+}
+i=0
+while [ $i -lt 300 ] && { [ "$(st 17062)" != "ready 1" ] || [ "$(st 17063)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
 RESFILE="$RES" PORT=17062 CLI="${2:-./perfcli}" python3 - <<'EOF'
 import json, os, socket, struct
@@ -304,9 +300,8 @@ s.sendall(freq(vh(2, b"px", b"pk1"), 100))
 rid, fl, pay = msg()
 ok(rid == 100 and fl == 0 and pay[0] == 1 and pay[5:] == b"held-by-2",
     "parked pull answers binary")
-# S151: node 2 served that pull on its peer rx thread.  It is a hit
-# for the table and NOT a client hit - the two counters must disagree
-# by exactly what the peer did.
+# node 2 served that pull on its peer rx thread: a table hit, NOT a client hit, so
+# the two counters differ by exactly what the peer did
 h1, hc1 = px_counts()
 ok(h1 - h0 >= 1 and hc1 == hc0,
     "S151: the served pull moved hits (+%d) and not hits_client (%s -> %s)" % (h1 - h0, hc0, hc1))

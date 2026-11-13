@@ -1,23 +1,6 @@
 #!/bin/sh
-# sketchtest.sh - 12nx (0.7.1): the fleet's distinct keys in store mode.
-# Each member's held walk builds a HyperLogLog sketch of the keys it holds
-# (the `sketch` verb: 4,096 one-byte registers, one fixed hash on every
-# node); the dashboard merges the members' sketches - the max of each
-# register is the sketch of the union - and /fleet reports the estimate.
-# Two store-mode members: keys 0-1999 written through A, 1000-2999 through
-# B, so each holds 2,000 and the fleet 3,000 DISTINCT keys (1,000 on both).
-# The hash and the keys are fixed, so the estimate is the same on every run
-# and the bounds below are tight on purpose: p = 12's standard error is
-# 1.6%, these allow 4%.
-#   A. the verb: p 12, 4,096 registers, a walk time
-#   B. each member alone: about 2,000
-#   C. /fleet: the union about 3,000 - not 4,000 (the shared keys counted
-#      once) and not 2,000 (the fullest member, store mode's lower bound)
-#   D. an older daemon or a collection with no walk yet: estimate null, not
-#      a wrong number (a collection created after the start)
-# Fail-first: before 0.7.1 there is no sketch verb and /fleet has no
-# "distinct".
-# Usage: test/sketchtest.sh [./perfcached] [./perfcached-dashboard]
+# sketchtest.sh - the fleet's distinct keys in store mode: the dashboard merges the members' HyperLogLog
+# sketches; fixed keys and hash make the estimate deterministic, so the 4% bounds are tight on purpose.
 set -u
 BIN=${1:-./perfcached}
 DASH=${2:-./perfcached-dashboard}
@@ -69,7 +52,18 @@ start() { # start <n> <var>
 }
 node 1 $TCP1; node 2 $TCP2
 start 1 A; start 2 B
-sleep 3.5
+# a joiner is CONNECTING until its links answer: wait for both ready and seeing each other
+st() { # st <n> <port> -> "state peers_up"
+	python3 - "$1" "$2" <<'PY' 2>/dev/null
+import socket, sys, pcnative
+f = pcnative.wrap(socket.create_connection(("127.0.0.7" + sys.argv[1], int(sys.argv[2])), 5))
+r = pcnative.call(f, "stats")["result"]; print(r.get("state"), r["cluster"].get("peers_up"))
+PY
+}
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1 $TCP1)" != "ready 1" ] || [ "$(st 2 $TCP2)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
 RES="$D/res"; : > "$RES"
 RESFILE="$RES" TCP1=$TCP1 TCP2=$TCP2 python3 - <<'PY'
@@ -111,6 +105,7 @@ check(1920 <= ea_ <= 2080 and 1920 <= eb_ <= 2080, "B. each member alone about 2
 with open(os.environ["RESFILE"] + ".est", "w") as f:
     f.write("%.0f %.0f\n" % (ea_, eb_))
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 cat > "$D/dash.conf" <<C
 [dashboard]
 listen = 127.0.0.1:$HP

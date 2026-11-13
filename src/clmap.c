@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clmap.c — encode, decode and validate the cluster map.
- *
- * Deliberately free of cluster.c: this parses bytes that arrived over a
- * network and is the one place a malformed map can be caught, so it is
- * kept small enough to unit-test on its own.
- */
+/* clmap.c - encode, decode and validate the cluster map.  Free of cluster.c: it is the one
+ * place a malformed map from the network is caught, so it is unit-tested on its own. */
 #include <string.h>
 
 #include "clmap.h"
@@ -103,9 +98,8 @@ int pc_clmap_decode(const unsigned char *buf, size_t n, struct pc_clmap *out,
 		return -1;
 	}
 	if (r16(buf + 4) != PC_CLMAP_VER) {
-		/* A map from a build we cannot parse is REFUSED, never
-		 * half-read: placement derived from a misread map splits
-		 * ownership, which is worse than having no map at all. */
+		/* A map from a build we cannot parse is REFUSED, never half-read:
+		 * a misread map splits ownership, which is worse than no map. */
 		*why = "version";
 		return -1;
 	}
@@ -116,8 +110,7 @@ int pc_clmap_decode(const unsigned char *buf, size_t n, struct pc_clmap *out,
 	}
 	if (n != PC_CLMAP_HDR + (size_t)cnt * PC_CLMAP_NODESZ) {
 		/* exact, not "at least": trailing bytes mean the sender and
-		 * this reader disagree about the format, whatever the header
-		 * claims */
+		 * this reader disagree about the format */
 		*why = "trunc";
 		return -1;
 	}
@@ -148,10 +141,8 @@ int pc_clmap_decode(const unsigned char *buf, size_t n, struct pc_clmap *out,
 		p += PC_CLMAP_NODESZ;
 	}
 
-	/* A duplicate id or identity would make pc_clmap_find() and every
-	 * placement decision depend on iteration order.  Refuse: a map that
-	 * cannot be read the same way twice is not a map.  O(n^2) over at
-	 * most 257 entries, on a control-plane message, is free. */
+	/* A duplicate id or identity would make pc_clmap_find() and placement depend on
+	 * iteration order, so refuse.  O(n^2) over at most 257 entries is free here. */
 	for (i = 0; i < cnt; i++) {
 		for (j = i + 1; j < cnt; j++) {
 			if (out->node[i].node_id == out->node[j].node_id ||
@@ -184,7 +175,7 @@ uint32_t pc_clmap_weight(const struct pc_clmap_node *n)
 	if (!n)
 		return 0;
 	/* an override stands even when capacity disagrees - including into
-	 * overload, which is the operator's call to make */
+	 * overload, which is the admin's call to make */
 	if (n->admin_weight != PC_CLMAP_W_UNSET)
 		return n->admin_weight;
 	return n->cap_weight;

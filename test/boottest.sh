@@ -1,24 +1,6 @@
 #!/bin/sh
-# boottest.sh — S83: a node that joins an eager fleet holding nothing PULLS
-# its bootstrap from one ready peer and reports ready only when the stream
-# has ended.  "Ready" means complete - which no push from a sender could
-# ever say, because only the sender knew when it was done (S81, S82).
-#
-# Leg 1, the pull: 2000 records on a 3-node fleet; node 3 restarts empty.
-#  - it joins RECOVERING, not ready, and says it is pulling;
-#  - its own log says "bootstrapped from node L": every record streamed
-#    and stored, BEFORE the line that turns it ready;
-#  - the count read right after "ready" is complete - the property;
-#  - the peer that served it counts the same records out;
-#  - nobody pushed: the survivors' sweep counters stay flat, and the
-#    flags they armed on its cold heartbeat drop as stale;
-#  - it reports itself established at once - no holdoff to wait out.
-# Leg 2, the fallback: the survivors' bulk TCP ports are taken by
-# listeners that accept and hang up - what a build before the pull, or a
-# refusal, looks like to the joiner.  The pull fails on every candidate,
-# the node says so, reports ready anyway, and the PUSH refills it: the
-# old path is the fallback, and still has to work.
-# usage: test/boottest.sh [./perfcached]
+# boottest.sh - a node joining an eager fleet empty pulls its bootstrap from one ready peer and is ready only
+# when the stream ends; with no peer to pull from, the push refills it.  usage: test/boottest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -131,8 +113,8 @@ node 3 17103 239.255.77.52 17152
 start 1 || { echo "node 1 did not start"; tail -3 "$D/n1.log"; exit 1; }
 start 2 || { echo "node 2 did not start"; tail -3 "$D/n2.log"; exit 1; }
 start 3 || { echo "node 3 did not start"; tail -3 "$D/n3.log"; exit 1; }
-# S83: a joiner is RECOVERING until it knows there is nothing to pull; a
-# write into that window is refused, as it should be
+# a joiner is RECOVERING until it knows there is nothing to pull; a write into that window is
+# refused, as it should be
 await_ready 1 2 3 && ok "every node reported ready to serve" || bad "a node never reported ready: $(grep -h 'node state' "$D"/n[123].log | tail -3 | tr '\n' '|')"
 N=2000
 q 17101 fill $N >/dev/null
@@ -149,7 +131,8 @@ start 3 || { bad "node 3 did not restart: $(tail -2 "$D/n3.log" | tr '\n' ' ')";
 await_line "$D/n3.log" "holding nothing - pulling a bootstrap" 15 \
 	&& ok "it joined saying it would pull before reporting ready" \
 	|| bad "no 'pulling a bootstrap' line on the join: $(grep 'joined as' "$D/n3.log" | tail -1)"
-grep -q "node state starting -> recovering" "$D/n3.log" \
+# under admission it is CONNECTING first, then RECOVERING - never ready before the pull
+grep -qE "node state (starting|connecting) -> recovering" "$D/n3.log" \
 	&& ok "it entered RECOVERING, not ready" || bad "it did not enter recovering: $(grep 'node state' "$D/n3.log" | tr '\n' ' ')"
 await_line "$D/n3.log" "bootstrapped from node" 30 \
 	&& ok "it bootstrapped itself (after $(( $(date +%s) - T0 ))s)" \
@@ -188,12 +171,8 @@ grep -q "backfilled node $ID3 after its restart" "$D/n1.log" "$D/n2.log" 2>/dev/
 for p in $P1 $P2 $P3; do kill -9 $p 2>/dev/null; done; P1= P2= P3=
 sleep 1
 
-# ---- leg 2: the fallback ---------------------------------------------------
-# Listeners on the survivors' bulk TCP ports (the cluster port, on the
-# advertised address) that accept and hang up: the daemons warn that the
-# bulk listener is unavailable and cannot serve a pull; the joiner's
-# pull sees the peer close before the first record - what an older build
-# does on the magic count - and falls back to the push.
+# ---- leg 2: the fallback.  Listeners that accept and hang up on the survivors' bulk TCP ports:
+# the joiner's pull sees the peer close before the first record and falls back to the push.
 cat > "$D/hangup.py" <<'PYEOF'
 import socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

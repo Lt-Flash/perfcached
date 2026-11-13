@@ -1,15 +1,5 @@
-/* workerbaltest.c - S460: libperfd places its connections on the daemon's
- * workers.  The kernel hashes each connection to a worker; a client that
- * opens a few long-lived connections gets a lumpy spread.  After connecting,
- * a handle asks `conninfo` and redials off a worker that holds more than one
- * connection beyond the least-loaded one.
- *   1  control: 8 handles with worker_balance = -1, five times - at least
- *      one round must put two on a worker (8!/8^8 = 0.24% a round does not),
- *      or this test could not see the fault it guards against
- *   2  8 balanced handles: one on each of the 8 workers
- *   3  16 balanced handles: two on each
- *   4  a balanced handle stores and reads back
- * Usage: workerbaltest host port secret   (a daemon with workers = 8) */
+/* workerbaltest.c - libperfd redials a connection off a worker holding more than one beyond the
+ * least-loaded, so 8 or 16 balanced handles spread evenly over a daemon's 8 workers. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

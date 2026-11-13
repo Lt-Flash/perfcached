@@ -1,33 +1,6 @@
 #!/bin/sh
-# upwritethroughtest.sh - S385 (0.6.2): upstream_writes = through.  Three
-# fakes (test/fakeupstream.py): M the master, accepting writes and copying
-# its keyspace to R1 and R2, the replicas (which name M as their master).
-# Collection 0 reads the replicas and writes through to M.
-#  1. the writer finds M (ROLE), RedisJSON there (COMMAND INFO)
-#  2. RESP: SET reaches M and never a replica; the fleet then holds what M
-#     holds (read back): GET answers it, TTL is M's; SET NX on a key that
-#     exists answers M's nil and changes nothing; DEL leaves it gone
-#  3. JSON.SET ... EX: the document on M, then an EXPIRE (RedisJSON has no
-#     EX); JSON.GET answers it here
-#  4. the native door: set, setnx, expire, jset, del - forwarded, answered; AR5 (0.6.4): add and
-#     sub (INCRBY/DECRBY and the TTL as the verb means it), hcmd writes (the H command, Redis's
-#     reply as the hash core's tree, at both the CMD and the binary verbs) and mset (one MSET, an
-#     EXPIRE per item with a TTL) - all refused on 0.6.3
-#     as the verb's own reply from M's
-#  5. unknown commands (upstream_unknown = pass): APPEND forwarded and the
-#     key read back; LPUSH then LRANGE (a passed read, from a replica);
-#     DEBUG (admin), BLPOP (blocking) refused; EVAL refused (perfcached's
-#     own); and upstream_unknown = refuse keeps "unknown command"
-#  6. M stops: writes refused ("no master reachable"), reads still served,
-#     the alert write.0 critical;
-#     R1 promoted: writes go there, found at once (no 10 s wait)
-#  7. two masters: the one the replica follows; nobody followed: refused
-#  8. no RedisJSON on the master: JSON writes refused here, others pass,
-#     the alert write.0.json a warning
-#  9. config: upstream_writes = through needs upstream; upstream_unknown
-#     needs through
-# Fail-first: 0.6.1 refuses upstream_writes = through at -C.
-# Usage: test/upwritethroughtest.sh ./perfcached
+# upwritethroughtest.sh - upstream_writes = through: collection 0 reads two fake replicas
+# (test/fakeupstream.py) and writes through to their master M.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -50,10 +23,8 @@ ctl() { # ctl <m|1|2> <json>
 	echo "$2" > "$D/up$1/ctl.json.tmp" && mv "$D/up$1/ctl.json.tmp" "$D/up$1/ctl.json"
 }
 fakes() { # fakes: start M, R1, R2 with an empty keyspace
-	# a triplet still running is stopped first: section 17 left its three
-	# alive and section 18's call overwrote the pids the EXIT trap kills,
-	# so every run left three fakeupstream.py behind (15 found on runner
-	# 225 on 2026-10-15, one triplet per CI job that ran this suite)
+	# a triplet still running is stopped first: a second call would overwrite the pids the
+	# EXIT trap kills and leave three fakeupstream.py behind
 	unfake
 	for n in m 1 2; do
 		rm -rf "$D/up$n"; mkdir -p "$D/up$n"; echo '{}' > "$D/up$n/data.json"
@@ -227,8 +198,8 @@ r=$(resp JSON.SET d:1 '$' '{"x":1}' EX 50)
 [ "$r" = "'+OK'" ] && grep -q '^JSON.SET d:1 \$ {"x":1}$' "$D/upm/writes" && grep -q '^EXPIRE d:1 50$' "$D/upm/writes" &&
 	ok "3. JSON.SET ... EX 50: the document, then EXPIRE 50 (RedisJSON has no EX)" ||
 	bad "3. JSON.SET: $r; M writes: $(grep 'd:1' "$D/upm/writes" | tr '\n' ' ')"
-# the document lands here with the write's read-back, a moment behind the +OK under ASan on a
-# loaded runner (rc5, GitHub: the first JSON.GET missed it, the bad branch's re-read found it)
+# the document lands here with the write's read-back, which can trail the +OK on a loaded
+# ASan runner
 i=0; while [ $i -lt 20 ] && [ "$(resp JSON.GET d:1)" != "'{\"x\":1}'" ]; do sleep 0.25; i=$((i+1)); done
 [ "$(resp JSON.GET d:1)" = "'{\"x\":1}'" ] && t=$(resp TTL d:1) && [ "$t" -ge 45 ] 2>/dev/null &&
 	ok "3. JSON.GET answers the document here, TTL $t" || bad "3. JSON.GET: $(resp JSON.GET d:1), TTL $(resp TTL d:1)"
@@ -249,7 +220,7 @@ echo "$r" | grep -q '"updated": true' && grep -q '^PERSIST n:1$' "$D/upm/writes"
 r=$(native '{"method": "del", "params": {"key": "n:1"}}')
 echo "$r" | grep -q '"deleted": true' && [ "$(mdata m n:1 value)" = None ] &&
 	ok "4. native del: {deleted: true}, gone on the master" || bad "4. del: $r"
-# AR5: counters, hash writes and mset - Redis's reply in the shape the verb promises
+# counters, hash writes and mset - Redis's reply in the shape the verb promises
 r=$(native '{"method": "add", "params": {"key": "n:3", "by": 5, "ttl": 60}}')
 echo "$r" | grep -q '"value": 5' && [ "$(mdata m n:3 value)" = 5 ] && grep -q '^INCRBY n:3 5$' "$D/upm/writes" &&
 	grep -q '^EXPIRE n:3 60$' "$D/upm/writes" &&
@@ -310,7 +281,7 @@ r=$(resp EVAL 'return 1' 0); echo "$r" | grep -qi 'not forwarded' && ok "5. EVAL
 w=$(wt '(w["passed_writes"], w["passed_reads"], w["pass_refused"])')
 [ "$w" = "(2, 1, 2)" ] && ok "5. /stats: 2 passed writes, 1 passed read, 2 refused" || bad "5. pass counts: $w"
 
-# ---- 5b. the write stats (0.6.2): by command, the last errors, one count a write --------------
+# ---- 5b. the write stats: by command, the last errors, one count a write -----------------------
 r=$(resp HSET a:3 f v)                         # a string on the master: WRONGTYPE
 echo "$r" | grep -q WRONGTYPE && ok "5b. HSET on a string: Redis's WRONGTYPE, relayed" || bad "5b. HSET: $r"
 w=$(wt '{r["name"]: (r["applied"], r["not_applied"], r["redis_errors"], r["failed"], r["passed"]) for r in w["by_command"]}')
@@ -385,11 +356,8 @@ waitfor 5 '[ "$(alert write.0.json)" = warning ]'
 stop
 unfake
 
-# ---- 10. a slow master: the queue is bounded, a write's deadline runs from its queueing (AR2) ---
-# The master answers every write 3 s late; upstream_timeout_ms is 1 s and at most 10 writes may
-# wait.  40 writes at once: the one being sent times out ("may or may not"), the ~9 queued behind
-# it are answered "not applied" - under a quarter of their second left, never sent - and the rest
-# are refused at once.  On 0.6.2 nothing was refused and every queued write waited its turn.
+# ---- 10. a slow master: the queue is bounded, a write's deadline runs from its queueing --------
+# 40 writes at a master 3 s late, a 1 s timeout, 10 may wait: none waits in line, none answers OK
 fakes
 ctl m '{"role": "master", "accept_writes": true, "write_delay_ms": 3000, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"]}'
 conf q "upstream_write_queue = 10"
@@ -417,9 +385,8 @@ print(full, expired, maybe, sum(l.startswith("+OK") for _, l in res), "%.1f" % m
 PY
 )
 set -- $r
-# of the ten queued, how many are answered "not applied" (never sent) and how many "may or may not"
-# (sent, the deadline passed on the wire) is the runner's timing - together they are the ten; what
-# the section guards is that none waited in line and none was answered OK (0.6.2 did both)
+# "not applied" (never sent) or "may or may not" (sent, its deadline passed on the wire) is the
+# runner's timing: together they are the ten queued
 [ "${1:-0}" -ge 20 ] && [ $(( ${2:-0} + ${3:-0} )) -ge 5 ] && [ "${2:-0}" -ge 1 ] && [ "${4:-1}" = 0 ] && ok "10. 40 writes at a 3 s master: $1 refused at once (the queue is full), $2 answered not applied after their deadline, $3 may-or-may-not, none OK" ||
 	bad "10. full $1, expired $2, maybe $3, ok $4 (want >= 20 full, >= 5 expired, 0 OK)"
 awk -v m="${5:-99}" 'BEGIN { exit !(m < 2.5) }' && ok "10. no client waited longer than its timeout and a half (slowest ${5}s)" ||
@@ -433,11 +400,8 @@ waitfor 15 '[ "$(alert write.0.queue)" = warning ]'
 stop
 unfake
 
-# ---- 11. another Redis client's changes are seen (AR1) ------------------------------------------
-# Broadcast tracking: a key written through here, then changed DIRECTLY on the master by another
-# client, must read the new value through perfcached; deleted there, it must read as gone.  A key
-# outside upstream_prefixes is the fleet's own and is not touched.  On 0.6.2 the record written
-# through was the fleet's for good: the other client's value never showed.
+# ---- 11. another Redis client's changes are seen (broadcast tracking) ---------------------------
+# a key outside upstream_prefixes is the fleet's own and is not touched
 rawm() { # rawm <args...> - one command straight to the fake MASTER, as another Redis client
 	python3 - $PM "$@" <<'PY'
 import socket, sys
@@ -480,7 +444,7 @@ waitfor 8 '[ "$(wt "w[\"inval_flushes\"] > '$f0'")" = True ]'
 	ok "11. a tracking connection lost: the keys written through are dropped here (a flush counted)" ||
 	bad "11. after the tracking was cut: inval_flushes $(wt 'w["inval_flushes"]') (was $f0)"
 [ "$(resp GET o:2)" = "'v2'" ] && ok "11. and o:2 reads Redis's value again" || bad "11. GET o:2 = $(resp GET o:2)"
-# AR5: a native mset goes to Redis only when every key is the upstream's
+# a native mset goes to Redis only when every key is the upstream's
 r=$(native '{"method": "mset", "params": {"items": [{"key": "o:7", "value": "a"}, {"key": "x:7", "value": "b"}]}}')
 echo "$r" | grep -q 'mixes keys inside and outside' && [ "$(mdata m o:7 value)" = None ] && [ "$(resp GET x:7)" = None ] &&
 	ok "11. AR5: an mset mixing o: and x: keys is refused whole - nothing sent, nothing stored" || bad "11. mixed mset: $r"
@@ -490,11 +454,8 @@ echo "$r" | grep -q '"stored": 2' && [ "$(resp GET x:8)" = "'c'" ] && [ "$(mdata
 stop
 unfake
 
-# ---- 12. a delete Redis confirms is a tombstone even where the key is not held (AR14) -----------
-# Two eager nodes writing through.  A DEL of a key no node holds goes to Redis, which says gone; the
-# deleting node must still send a tombstone at a fresh version - a SET of the key pushed from the
-# other node may be on its way, and without the tombstone it would land and stay.  On 0.6.2 the
-# node removed nothing and sent nothing: its tomb_sent did not move.
+# ---- 12. a delete Redis confirms is a tombstone even where the key is not held -----------------
+# a SET of the key pushed from the other node may be on its way: without the tombstone it stays
 cnode() { # cnode <name> <n> <tcp> <resp> <http>
 	{ cat <<C
 [daemon]
@@ -538,7 +499,8 @@ fakes
 cnode ca 1 $TCP $RESP $HTTP; cnode cb 2 $TCPB $RESPB $HTTPB
 PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/ca.conf" > "$D/ca.log" 2>&1 & PID=$!
 PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/cb.conf" > "$D/cb.log" 2>&1 & PIDB=$!
-waitfor 30 '[ "$(cst $HTTP "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst $HTTPB "s[\"cluster\"][\"peers_up\"]")" = 1 ]'
+# peers_up counts a joiner still CONNECTING, whose RESP door answers -LOADING: both ready too
+waitfor 30 '[ "$(cst $HTTP "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst $HTTPB "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst $HTTP "s[\"state\"]")" = ready ] && [ "$(cst $HTTPB "s[\"state\"]")" = ready ]'
 [ "$(cst $HTTPB 's["cluster"]["peers_up"]')" = 1 ] && ok "12. two eager nodes writing through, joined" ||
 	bad "12. the fleet did not form: A $(cst $HTTP 's["cluster"]["peers_up"]'), B $(cst $HTTPB 's["cluster"]["peers_up"]')"
 waitfor 5 '[ "$(cst $HTTPB "[c for c in s[\"collections\"] if c[\"name\"]==\"0\"][0][\"upstream\"][\"write_through\"][\"target\"]")" = "127.0.0.1:'$PM'" ]'
@@ -567,11 +529,8 @@ fi
 	bad "12. after SET via A + DEL via B: A $ga, B $gb, Redis $gm"
 kill $PID $PIDB 2>/dev/null; wait $PID $PIDB 2>/dev/null; PID= PIDB=
 
-# ---- 12b. members that disagree on a collection's upstream settings (AR6, built in AR11) ----------
-# Node B on upstream_writes = allow beside A on through: B's writes would never reach Redis.  Each
-# member carries a hash of every setting the fleet must agree on in its keepalive; with two members
-# neither is the majority, so BOTH raise config.0.writes naming the other, and A's /members names
-# the setting on B's entry.  0.6.4 carries no settings: nothing is raised there.
+# ---- 12b. members that disagree on a collection's upstream settings ----------------------------
+# B on allow beside A on through: neither is the majority, so both raise config.0.writes
 cnode ca 1 $TCP $RESP $HTTP; cnode cb 2 $TCPB $RESPB $HTTPB
 sed -i 's/^upstream_writes = through$/upstream_writes = allow/' "$D/cb.conf"
 PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/ca.conf" > "$D/ca2.log" 2>&1 & PID=$!
@@ -592,10 +551,8 @@ echo "$r" | grep -q '\[collection 0\] upstream_writes' && ok "12b. /members name
 kill $PID $PIDB 2>/dev/null; wait $PID $PIDB 2>/dev/null; PID= PIDB=
 unfake
 
-# ---- 13. the writer's own credential (AR7) ------------------------------------------------------
-# Redis ACL users: "reader" may not write, "writer" may.  With the readers' credential only, a write
-# meets Redis's NOPERM (relayed); with upstream_write_user/upstream_write_password the writer alone
-# authenticates as "writer" and the readers stay "reader".  0.6.3 refuses the two keys.
+# ---- 13. the writer's own credential ------------------------------------------------------------
+# readers' credential only: NOPERM on a write; upstream_write_user: the writer alone writes
 acl='"acl": {"reader": {"pw": "rpw"}, "writer": {"pw": "wpw", "write": true}}'
 fakes
 ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"], '"$acl"'}'
@@ -633,21 +590,8 @@ grep -q -E 'wpw|rpw' "$D/w2.log" && bad "13. a password reached the log" || ok "
 stop
 unfake
 
-# ---- 14. the keys the fleet owned before through: counted, and upfilled (AR4) ---------------------
-# Written under allow, they are the fleet's own ("1") and Redis never had them.  After the switch,
-# upfill writes each to the master with NX through the writer: a string with its TTL (PX), a document
-# (JSON.SET $ NX, then PEXPIRE only where that applied); a hash is skipped; a key Redis got meanwhile
-# keeps Redis's value (u:5, u:6 - set while the node was down, so no invalidation dropped them first).
-# 0.6.3 has no upfill: the method is unknown there.
-# S400: Redis's value replaces the fleet's on every member, so the sweep says how it compared - u:5
-# and u:6 differ, u:7 is the same, u:8 the same with another TTL, u:9 the same document written
-# with spaces and 2.0 (Redis answers {"a":1,"b":[1,2]}), and three more documents the same - one
-# path each: u:10 differs from Redis's only in spacing (the text pass settles it), u:11 holds its
-# members in the other order (the sorted lookup), u:12 spells a member's name with an escape (the
-# unescaping, in place), and u:13 nests deeper than the walk goes, its bottom spelt 1.0 against
-# Redis's 1: not decided - uncompared, never different (S402) - and names each key that differed, never
-# its value.  `upfill check` makes the same comparison first and writes nothing.  0.6.4 has neither
-# the counts nor check (it starts a real sweep).
+# ---- 14. the keys the fleet owned before through: counted, and upfilled -------------------------
+# upfill writes each with NX (a hash skipped, Redis's own value kept) and reports how each compared
 upf() { # upf <0|1 privileged> [stop|check] - the upfill method; prints its result or error
 	python3 - $TCP "$1" "$T" "${2:-}" <<'PY' 2>&1
 import json, socket, sys
@@ -666,9 +610,7 @@ print(json.dumps(r.get("result", r.get("error"))))
 PY
 }
 fakes
-# a WAL: the keys written under allow must come back after the restart under
-# through (without one the node restarted empty - upfill found 0, the hash
-# gone: the section's first CI run, GitLab 110410)
+# a WAL: the keys written under allow must come back after the restart under through
 rm -rf "$D/wal14"; mkdir -p "$D/wal14"
 WAL14='[wal]
 dir = '"$D"'/wal14
@@ -705,7 +647,7 @@ sed -i 's/^client = upwt-client-secret$/&\nenable = upwt-enable/' "$D/u2.conf"
 KEEP=1 start u2 || bad "14. restart under through: $(grep -m2 -E 'ERROR|CRIT' "$D/u2.log")"
 waitfor 5 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ]'
 r=$(upf 0); echo "$r" | grep -qi -E 'privileg|enable' && ok "14. upfill without privilege is refused" || bad "14. unprivileged upfill: $r"
-# S400: check first - it reads the master and writes nothing
+# check first - it reads the master and writes nothing
 nw=$(wc -l < "$D/upm/writes")
 r=$(upf 1 check); echo "$r" | grep -q '"upfill": "checking"' && ok "14. upfill check starts" || bad "14. upfill check: $r"
 waitfor 10 '[ "$(wt "w[\"upfill\"][\"state\"]")" = done ]'
@@ -719,21 +661,15 @@ cc=$(wt '(w["upfill"]["mode"], w["upfill"]["missing"], w["upfill"]["skipped"], w
 r=$(upf 1); echo "$r" | grep -q '"upfill": "started"' && ok "14. upfill starts" || bad "14. upfill: $r"
 waitfor 10 '[ "$(wt "w[\"upfill\"][\"state\"]")" = done ]'
 u=$(wt '(w["upfill"]["state"], w["upfill"]["found"], w["upfill"]["written"], w["upfill"]["redis_had"], w["upfill"]["skipped"], w["upfill"]["errors"], w["fleet_owned"])')
-# Exact on what the sweep must do - u:1-u:3 written, the hash skipped, no errors, the hash the one
-# key still the fleet's own - and on the arithmetic.  Redis's u:5 and u:6 are "Redis had" when the
-# sweep reaches them; on GitHub (rc3) one of them was not among the keys found, its outcome right
-# all the same (NX respected below).  Why is NOT established - noted, not hidden: the key is named
+# exact on the sweep (u:1-u:3 written, the hash skipped, no errors, the hash still the fleet's own)
+# and on the arithmetic; the sweep may miss Redis's u:5 or u:6, their outcome right either way
 u2c=$(wt '(w["upfill"]["state"], w["upfill"]["written"], w["upfill"]["skipped"], w["upfill"]["errors"], w["fleet_owned"], w["upfill"]["found"] == w["upfill"]["written"] + w["upfill"]["skipped"] + w["upfill"]["redis_had"], w["upfill"]["redis_had"] in range(10))')
 [ "$u2c" = "('done', 3, 1, 0, 1, True, True)" ] &&
 	ok "14. upfill done: 3 written, the hash skipped, no errors, 1 key still the fleet's own; found = written + skipped + Redis had ($u)" ||
 	bad "14. upfill (state, found, written, redis_had, skipped, errors, fleet_owned): $u"
 case "$u" in *"'done', "[4-9]","*|*"'done', 1"[0-2]","*)
-	# GitHub 38419424148 named it: u:6 (no NX for it on the master); 38486080433 found
-	# neither (4: Redis had 0) - with every check after it green, Redis's values read.
-	# Likely: the master's changes reached the restarted node as broadcast
-	# invalidations before the sweep (AR1 then drops the fleet's copy - right, Redis's
-	# value wins either way).  0, 1 or 2 of them are all that outcome; the fake's pushes
-	# and the node's own lines say which, when it happens
+	# likely the master's changes reached the restarted node as invalidations before the sweep;
+	# Redis's value wins either way, and the fake's pushes and the node's lines say which
 	echo "  info 14. not all of Redis's keys were found by the sweep () - NX lines on the master: $(grep -E '^(SET u:[578]|JSON.SET u:(9|1[0-3]))' "$D/upm/writes" | cut -c 1-80 | tr '\n' '|'); the fake's pushes naming u:5-u:13: $(grep -E 'u:([5-9]|1[0-3])' "$D/upm/pushes" 2>/dev/null | tr '\n' '|'); the node on them: $(grep -E 'u:([5-9]|1[0-3])' "$D/u2.log" 2>/dev/null | head -8 | cut -c 1-160 | tr '\n' '|')";;
 esac
 grep -q '^SET u:1 a NX$' "$D/upm/writes" && grep -q -E '^SET u:2 b NX PX [0-9]+$' "$D/upm/writes" &&
@@ -747,10 +683,8 @@ grep -q '^JSON.SET u:3 \$ {"x":1} NX$' "$D/upm/writes" && grep -q -E '^PEXPIRE u
 	ok "14. NX respected: Redis's u:5 and u:6 kept (no PEXPIRE on u:6), and the node reads Redis's value" ||
 	bad "14. NX: M u:5 $(mdata m u:5 value), u:6 $(mdata m u:6 value), GET u:5 $(resp GET u:5); $(grep 'u:6' "$D/upm/writes" | tr '\n' '|')"
 [ "$(mdata m u:4 value)" = None ] && [ "$(resp HGET u:4 f)" = "'v'" ] && ok "14. the hash stays the fleet's own" || bad "14. u:4: M $(mdata m u:4 value)"
-# S400: how Redis's values compared.  All thirteen found: u:5 and u:6 differ, u:7, u:9-u:12 the
-# same, u:8 retimed, u:13 uncompared - exact; and how (S402): u:5, u:7, u:8 and u:10 by their text,
-# u:6, u:9, u:11 and u:12 walked.  Whatever is found, both sums hold and the run agrees with the check.  Fewer found (the info line above): the run must agree with the check
-# before it, nothing having changed between them.
+# how Redis's values compared: all thirteen found is exact; with fewer found (the info line
+# above) the run must still agree with the check before it
 f=$(wt '(w["upfill"]["mode"], w["upfill"]["found"], w["upfill"]["redis_had"] == w["upfill"]["redis_same"] + w["upfill"]["redis_retimed"] + w["upfill"]["redis_differed"] + w["upfill"]["uncompared"], w["upfill"]["redis_had"] == w["upfill"]["compared_text"] + w["upfill"]["compared_walked"] + w["upfill"]["uncompared"])')
 s4=$(wt '(w["upfill"]["redis_same"], w["upfill"]["redis_retimed"], w["upfill"]["redis_differed"], w["upfill"]["uncompared"], w["upfill"]["compared_text"], w["upfill"]["compared_walked"])')
 c4=$(echo "$c" | python3 -c 'import ast,sys; t=ast.literal_eval(sys.stdin.read()); print((t[5], t[6], t[7], t[10], t[11], t[12]))' 2>/dev/null)
@@ -773,17 +707,13 @@ grep -E 'upfill' "$D/u2.log" | grep -q -E 'theirs|mine|lag|"y"' && bad "14. S400
 stop
 unfake
 
-# ---- 15. writes in flight together, in order (AR3) ----------------------------------------------
-# 48 clients write at once behind a slow master (write_delay_ms): the writer sends each batch's
-# commands in one round and reads the answers in order.  Every write applied and answered, the
-# master and the node hold every value, eight writers on one key leave the node agreeing with Redis,
-# and /stats counts writes sent with others.  0.6.3 sends one write a round trip: pipelined is unknown.
+# ---- 15. writes in flight together, in order ----------------------------------------------------
+# 48 clients behind a slow master: the writer sends each batch in one round, reads answers in order
 fakes
 ctl m '{"role": "master", "accept_writes": true, "write_delay_ms": 20, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"]}'
 conf p
-# 48 writes at 20 ms each are ~960 ms of the master's time whatever the pipelining saves, and
-# upstream_timeout_ms (1000) runs from the queueing: the last write sat on its deadline and a
-# slower runner tipped it over (GitHub 38408244573: 47 of 48, every value applied).  5 s here
+# 48 writes at 20 ms each are ~960 ms of the master's time and the deadline runs from the
+# queueing: 5 s keeps the last write off its deadline
 sed -i 's/^upstream_timeout_ms = 1000$/upstream_timeout_ms = 5000/' "$D/p.conf"
 start p || bad "15. start: $(grep -m2 -E 'ERROR|CRIT' "$D/p.log")"
 waitfor 5 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ]'
@@ -813,19 +743,8 @@ ms=$(mdata m p:same value); ns=$(resp GET p:same)
 stop
 unfake
 
-# ---- 16. a written-through key's mark without its record (S404) ---------------------------------
-# A write reaches the other members as two replicated writes, the record and then its mark, and
-# Redis's broadcast invalidation of that same write reaches every member on its own.  Landing
-# between them, it left the mark alone - and the gate read a mark alone as "the fleet holds this
-# key": reads on that member answered nil for a key Redis held (staging, 2026-10-14: 245 answered
-# nil for keys 246 and 247 read).  Now an invalidation drops a record and its mark together but
-# keeps a "t" mark it finds without its record, so a record still on its way lands marked (not as
-# the fleet's own), and a read that finds a "t" mark alone drops it and reads Redis.  On one node
-# the race cannot happen (the apply stores both before any push, a push drops both), so: (a) a key
-# written through and its own invalidation back - both go, the next read costs nothing new; (b) a
-# "t" mark planted alone for a key Redis holds - the read answers Redis's value; (c) a "t" mark
-# planted alone, then the key changed in Redis - the invalidation keeps it, the read drops it;
-# (d) a lone "1" still goes.  rc7 answers nil at (b) and drops the mark at (c).
+# ---- 16. a written-through key's mark without its record ----------------------------------------
+# a lone "t" mark survives an invalidation (its record may still land); a read drops it, reads Redis
 nativec() { # nativec <json request> - one CMD frame at the native door, its collection as given
 	python3 - $TCP "$1" "$T" <<'PY' 2>&1
 import json, socket, sys
@@ -860,8 +779,7 @@ r=$(resp SET s:1 mine)
 waitfor 5 '[ "$(wt "w[\"invalidated\"]")" != "'"$i0"'" ]'
 sleep 0.3                              # every fake's push in: M, R1 and R2 each push the change
 m1=$(mark s:1); h1=$(has_rec s:1); b0=$(wt 'w["bare_marks"]')
-# both gone (the usual), or both still there (AR1's residual window: a push that beat the apply) -
-# never the mark alone
+# both gone (the usual), or both still there (a push that beat the apply) - never the mark alone
 { { [ "$m1" = None ] && [ "$h1" = 0 ]; } || { [ "$m1" = t ] && [ "$h1" = 1 ]; }; } &&
 	ok "16. (a) the node's own write came back as an invalidation: the record and its mark went together (mark $m1, record $h1)" ||
 	bad "16. (a) after the invalidation: mark $m1, record $h1, invalidated $i0 -> $(wt 'w["invalidated"]')"
@@ -884,7 +802,7 @@ sleep 0.3
 [ "$(resp GET s:3)" = "'x'" ] && [ "$(mark s:3)" = None ] && [ "$(wt 'w["bare_marks"]')" = "$((b0 + 2))" ] &&
 	ok "16. (c) the read dropped it and answered Redis's 'x'" ||
 	bad "16. (c) GET s:3 $(resp GET s:3), mark $(mark s:3), bare_marks $(wt 'w["bare_marks"]')"
-# (d) a lone "1" (the fleet's own) still goes on an invalidation, as before
+# (d) a lone "1" (the fleet's own) still goes on an invalidation
 nativec '{"method": "set", "params": {"col": "0.nofall", "key": "s:4", "value": "1"}}' > /dev/null
 i1=$(wt 'w["invalidated"]')
 rawm SET s:4 y > /dev/null
@@ -895,11 +813,8 @@ waitfor 5 '[ "$(wt "w[\"invalidated\"]")" != "'"$i1"'" ]'
 stop
 unfake
 
-# ---- 17. the sweeps' byte rate (S401) -------------------------------------------------------------
-# upstream_drain_mb_rate caps the MB of values a sweep moves a second, beside upstream_drain_rate's
-# keys: 768 keys of 4 KB (3 MB) that only Redis holds, drained at 1 MB a second, take at least 2 s
-# (three batches of 256, each followed by its wait) and all are taken over; the drain block counts
-# their bytes.  0.6.4 does not know the setting: the node refuses the config.
+# ---- 17. the sweeps' byte rate ------------------------------------------------------------------
+# 768 keys of 4 KB drained at upstream_drain_mb_rate 1 take at least 2 s: three batches, each waits
 fakes
 python3 - "$D" <<'PY'
 import json, os, sys
@@ -934,18 +849,8 @@ d17=$(dst '(d["state"], d["taken_over"], d["bytes"], d["errors"], d["finished"] 
 grep -q 'at most 5000 keys and 1 MB a second' "$D/b.log" && ok "17. the sweep's start line names both caps" ||
 	bad "17. start line: $(grep -m1 'drain sweep starts' "$D/b.log" | cut -c 1-200)"
 stop
-# ---- 18. a local drop is never replayed to a peer as a delete (S405) ----------------------------
-# Two eager members on one write-through collection.  A record dropped on Redis's invalidation, a
-# startup flush, a mark found alone: each is this node's own business (every member hears the
-# invalidation itself), yet the first build of 0.6.4 retained those drops like deletes, and the
-# per-peer sweep replayed a restarted node's startup flush to its peers - the fleet's write-through
-# cache emptied on every restart (staging, 2026-10-14: 3,603 deletes replayed to each peer).  Now a
-# local drop is retained as LOCAL - it still refuses an older copy of the key, the catch-up never
-# replays it (tombstones_retained.local counts them): (a) a member's own write comes back as Redis's
-# invalidation within ~50 ms and the record and its mark it drops are retained local; (b) so is a
-# lone mark's drop; (c) a member back from a restart is replayed nothing for them.  rc8 retains
-# them as deletes and replays them.  Only member 1's own counters are asserted on: whether member
-# 2 held the replica when the invalidation reached it is a race (AR1's residual window).
+# ---- 18. a local drop is never replayed to a peer as a delete -----------------------------------
+# a drop on invalidation, a startup flush or a lone mark is retained LOCAL, never replayed to a peer
 cconf() { # cconf <n> - member n (1 or 2) of a two-node eager fleet, write-through to the fakes
 	mkdir -p "$D/c$1/state" "$D/c$1/wal"
 	cat > "$D/c$1.conf" <<C
@@ -987,9 +892,11 @@ C
 	chmod 600 "$D/c$1.conf"
 }
 cstart() { # cstart <n> - its log $D/c<n>.log (appended across restarts: a NEW ready line is waited for)
-	r0=$(grep -c "perfcached ready" "$D/c$1.log" 2>/dev/null || echo 0)
+	# grep -c gives one number either way (grep -c || echo 0 printed "0" twice on no match);
+	# 30 s, as a member on a loaded runner can be slow to come up
+	r0=$(cat "$D/c$1.log" 2>/dev/null | grep -c "perfcached ready")
 	PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/c$1.conf" >> "$D/c$1.log" 2>&1 & eval "CPID$1=\$!"
-	i=0; while [ $i -lt 100 ] && [ "$(grep -c "perfcached ready" "$D/c$1.log")" -le "$r0" ]; do sleep 0.1; i=$((i+1)); done
+	i=0; while [ $i -lt 300 ] && [ "$(grep -c "perfcached ready" "$D/c$1.log")" -le "$r0" ]; do sleep 0.1; i=$((i+1)); done
 	[ "$(grep -c "perfcached ready" "$D/c$1.log")" -gt "$r0" ]
 }
 cstop() { # cstop <n> - TERM, then KILL after 10 s: a stop must never hang the suite
@@ -1056,9 +963,7 @@ waitfor 30 '[ "$(cst 1 "s[\"state\"]")" = ready ] && [ "$(cst 2 "s[\"state\"]")"
 i1=$(cst 1 'w["invalidated"]'); l1=$(cst 1 'r.get("local")'); p1=$(cst 1 'r.get("replayed")'); p2=$(cst 2 'r.get("replayed")')
 r=$(cresp 1 SET w:1 mine)
 waitfor 5 '[ "$(cst 1 "w[\"invalidated\"]")" != "'"$i1"'" ]'
-# both retentions, not a fixed pause: GitLab 111546's check-asan core1
-# read local +1 after 0.3 s - the mark's drop still to come on a loaded
-# ASan runner.  Bounded, so a mark never dropped still fails here
+# wait for both retentions, bounded: on a loaded ASan runner the mark's drop can come later
 waitfor 5 '[ "$(cst 1 "r.get(\"local\")")" = "'"$((l1 + 2))"'" ]'
 [ "$r" = "+OK" ] && [ "$(cst 1 'w["invalidated"]')" != "$i1" ] && [ "$(cst 1 'r.get("local")')" = "$((l1 + 2))" ] &&
 	ok "18. (a) w:1 written through on member 1, dropped on its own invalidation: the record and its mark retained as local (local $l1 -> $((l1 + 2)))" ||
@@ -1067,7 +972,7 @@ rawm SET w:1 theirs > /dev/null
 waitfor 5 '[ "$(cresp 1 GET w:1)" = "'"'"'theirs'"'"'" ] && [ "$(cresp 2 GET w:1)" = "'"'"'theirs'"'"'" ]'
 [ "$(cresp 1 GET w:1)" = "'theirs'" ] && [ "$(cresp 2 GET w:1)" = "'theirs'" ] && ok "18. (a) another client's change in Redis: both read 'theirs'" ||
 	bad "18. (a) GET w:1: $(cresp 1 GET w:1) / $(cresp 2 GET w:1)"
-# (b) a mark found alone, dropped by a read (S404): retained local too
+# (b) a mark found alone, dropped by a read: retained local too
 cplant 1 w:2 t
 rawm SET w:2 there > /dev/null
 l1=$(cst 1 'r.get("local")')
@@ -1075,7 +980,7 @@ l1=$(cst 1 'r.get("local")')
 	ok "18. (b) a lone mark dropped by a read is retained as local (local $l1 -> $((l1 + 1)))" ||
 	bad "18. (b) GET w:2 $(cresp 1 GET w:2), mark $(cmark 1 w:2), local $l1 -> $(cst 1 'r.get("local")')"
 # (c) member 2 away, then back from a restart: member 1's catch-up replays NOTHING for its local
-# drops (rc8 replayed every retained drop to a member back from silence)
+# drops
 i1=$(cst 1 'w["invalidated"]')
 r=$(cresp 1 SET w:3 ours)
 waitfor 5 '[ "$(cst 1 "w[\"invalidated\"]")" != "'"$i1"'" ]'
@@ -1092,15 +997,8 @@ sleep 3
 	ok "18. (c) member 2 back after a restart: member 1 replayed no delete for its $(cst 1 'r.get("local")') local drops (replayed $p1)" ||
 	bad "18. (c) member 1 replayed $p1 -> $(cst 1 'r.get("replayed")'), local $(cst 1 'r.get("local")'); $(grep -E 'is back after|caught up - ' "$D/c1.log" | cut -c 17-140 | tr '\n' '|')"
 [ "$(cresp 1 GET w:3)" = "'changed'" ] && ok "18. (c) member 1 reads Redis's 'changed'" || bad "18. (c) GET w:3 on member 1: $(cresp 1 GET w:3)"
-# (d) S418: a peer's copy of a through collection's record is marked "t" on ARRIVAL - the record is
-# Redis's by construction (its author stored it after Redis confirmed), and the author's mark is a
-# second record in a push of its own: an invalidation landing between the two left a copy without
-# its mark that the owned count and the upfill took for the fleet's own (staging, 2026-10-15: one
-# key written through on .247, its copy on .245 unmarked for good).  Tracking is OFF here so the
-# author's own invalidation does not drop what it wrote and the eager push is what delivers the
-# record to member 2; copies_marked counts the marks member 2 wrote on arrival (rc3: no counter),
-# copies_premarked the arrivals that found the author's mark - newer, sent after the record -
-# already there (GitHub 39753115362 check-asan core1: the mark came first, copies_marked 0 -> 0)
+# (d) a peer's copy of a through record is marked "t" on ARRIVAL (Redis confirmed it); tracking is
+# OFF so the eager push delivers it - copies_premarked counts arrivals the author's mark beat
 cstop 1; cstop 2
 cconf 1 "upstream_tracking = off"; cconf 2 "upstream_tracking = off"
 cstart 1 || bad "18. (d) member 1 did not start"
@@ -1117,16 +1015,8 @@ waitfor 10 '[ "$(cmark 1 w:5)" = t ] && [ "$(cresp 2 GET w:5)" = "'"'"'copyme'"'
 cstop 1; cstop 2
 unfake
 
-# ---- 19. the echo of a write-through refetches the key (S422) ---------------------------------
-# Redis echoes a node's own write as an invalidation (the writer's connection is not the tracked
-# one, so NOLOOP cannot stop it), and that echo dropped the record just stored: a write-through
-# record was never cached, every read after a write fetched.  Now an invalidation inside
-# upstream_echo_ms (2000 ms, raised to twice upstream_max_lag_ms) of this node's own write
-# refetches the key instead of leaving the slot empty; the copy that comes back is Redis's current
-# state, so a change racing the write is honoured too.  Each tracked upstream echoes once (three
-# fakes here), and an echo that drops the refetched copy refetches again - at most one fetch per
-# tracked upstream, inside the window.  Outside the window, and with upstream_echo_ms = 0, an
-# invalidation drops the record as before and the next read fetches.
+# ---- 19. the echo of a write-through refetches the key ------------------------------------------
+# an invalidation inside upstream_echo_ms of this node's own write refetches instead of dropping
 ust() { # ust <stat> - collection 0's upstream.<stat>
 	python3 -c 'import json,sys,urllib.request
 s=json.loads(urllib.request.urlopen("http://127.0.0.1:'$HTTP'/stats", timeout=5).read())
@@ -1135,9 +1025,8 @@ print([c for c in s["collections"] if c["name"]=="0"][0]["upstream"][sys.argv[1]
 fakes
 conf e
 start e || bad "19. start: $(grep -m2 -E 'ERROR|CRIT' "$D/e.log")"
-# and every upstream TRACKED, not only the write target in broadcast: the echo comes back on the
-# tracking connections, and under ASan on GitLab (111798, v0.7.2-rc2) the first write went out
-# before they were up - no echo, no refetch, the record kept
+# and every upstream TRACKED, not only the write target: the echo comes back on the tracking
+# connections, and a write sent before they are up gets no echo
 waitfor 10 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ] && [ "$(wt "w[\"bcast\"]")" = on ] && [ "$(ust tracking)" = True ]'
 e0=$(wt 'w["echo_refetches"]'); f0=$(ust fetches)
 r=$(resp SET e:1 one)
@@ -1159,7 +1048,7 @@ sleep 0.8
 [ "$(resp GET e:2)" = "'theirs'" ] && [ "$(mdata m e:2 value)" = theirs ] &&
 	ok "19. (b) a change racing the write inside the window: the copy that came back is Redis's ('theirs')" ||
 	bad "19. (b) GET e:2 $(resp GET e:2), master $(mdata m e:2 value)"
-# (c) outside the window a change is an invalidation as before: dropped, the next read fetches
+# (c) outside the window a change is an invalidation: dropped, the next read fetches
 resp SET e:3 old > /dev/null
 sleep 2.6                              # past upstream_echo_ms
 e1=$(wt 'w["echo_refetches"]'); f3=$(ust fetches); i0=$(ust invalidations)
@@ -1173,7 +1062,7 @@ sleep 0.3
 	ok "19. (c) the next read fetched 'new' (fetches $f3 -> $((f3 + 1)))" ||
 	bad "19. (c) GET e:3 $(resp GET e:3), fetches $f3 -> $(ust fetches)"
 stop
-# (d) upstream_echo_ms = 0: the echo drops the record, the next read fetches - 0.6.x's way
+# (d) upstream_echo_ms = 0: the echo drops the record, the next read fetches
 conf z "upstream_echo_ms = 0"
 start z || bad "19. (d) start: $(grep -m2 -E 'ERROR|CRIT' "$D/z.log")"
 waitfor 5 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ] && [ "$(wt "w[\"bcast\"]")" = on ]'
@@ -1213,25 +1102,16 @@ print("      fetches %s, fill_failed %s, errors %s, timeouts %s, absent %s, too_
 	grep -E 'tracking on|tracking connection|tracking of|CLIENT ID|re-warm|gap' "$D/r.log" | tail -10 | cut -c1-170 | sed 's/^/      log: /'
 	grep -E 'WARNING|ERROR|CRIT' "$D/r.log" | grep -vE 'tls_verify|mlock|identity' | tail -8 | cut -c1-200 | sed 's/^/      warn: /'
 }
-# ---- 20. the re-warm after a tracking gap (S421) ---------------------------------------------------
-# A restart (or a lost tracking connection) is a gap: the records written through that the WAL
-# replayed cannot be trusted and are dropped (AR1) - and before 0.7.1 the node came back COLD, every
-# held key one fetch on its next read (245-247, rc2 roll: 1,036 -> 12 entries).  Now their NAMES
-# go on a re-warm list and are fetched again in the background at upstream_drain_rate, newest
-# written first, bounded by upstream_rewarm_max; a key a client reads first is skipped; a key the
-# upstream no longer has comes back as an absent mark.  Nothing is read by a client here: the copies
-# come back on their own.
+# ---- 20. the re-warm after a tracking gap -------------------------------------------------------
+# names of records dropped at a gap are refetched in the background, bounded by upstream_rewarm_max
 fakes
 mkdir -p "$D/wal20"                   # the WAL dir must exist (storage identity)
 conf r "[wal]" "dir = $D/wal20" "probe = no" "fsync = no" "save = off"
 start r || bad "20. start: $(grep -m2 -E 'ERROR|CRIT' "$D/r.log")"
 waitfor 5 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ] && [ "$(wt "w[\"bcast\"]")" = on ]'
 for k in $(seq 1 40); do resp SET "rw:$k" "v$k" > /dev/null; done
-# the echo race splits the 40 between records that stayed (the echo beat the apply) and copies
-# refetched into the shadow (the echo came after): held = both
-# the scan is paged - about `count` buckets a call, the overflow leg first - so the cursor is
-# followed to 0: one call of 1000 over this collection's 1024 buckets can leave out a record in
-# the last 24 (GitHub 39744967277 core1 counted 24 records here; the restart dropped 25 at the gap)
+# the echo race splits the 40 between records kept and copies refetched (held = both); the scan
+# is paged, so the cursor is followed to 0 or a record in the last buckets is missed
 nrec() { python3 - $TCP "$T" <<'PY' 2>&1
 import json, socket, sys
 sys.path.insert(0, sys.argv[2])
@@ -1250,11 +1130,8 @@ while True:
 print(n)
 PY
 }
-# quiet: the fetches stop moving.  A copy refetched after its record's echo
-# is in flight a moment, and the sum above counts a key twice while its
-# record and its copy overlap (S435: the record lands before the copy goes) -
-# it can read 40 with one key in the air, and a stop then saves 39 (rc3's
-# GitLab 20 (c): 21 names + 18 records re-warmed, the 40th fetched on read)
+# quiet: the fetches stop moving - the sum above counts a key twice while its record and its
+# refetched copy overlap, so it can read 40 with one key still in the air
 quiet() {
 	q=0; f0=$(ust fetches)
 	while [ $q -lt 20 ]; do sleep 0.5; f1=$(ust fetches); [ "$f1" = "$f0" ] && break; f0=$f1; q=$((q+1)); done
@@ -1262,7 +1139,7 @@ quiet() {
 waitfor 10 '[ $(( $(ust shadow_entries) + $(nrec) )) -ge 40 ]'
 quiet
 sleep 0.5
-# and again: on ASan the key in the air still landed after the quiet (25 + 14)
+# and again: on ASan the key in the air can still land after the quiet
 waitfor 10 '[ $(( $(ust shadow_entries) + $(nrec) )) -ge 40 ]'
 R0=$(nrec); S0=$(ust shadow_entries)
 [ $((R0 + S0)) -ge 40 ] && ok "20. 40 keys written through and held: $R0 records (the echo beat the apply) + $S0 copies refetched after the echo" || bad "20. held before the restart: $R0 records + $S0 copies"
@@ -1278,7 +1155,7 @@ st=$(rw started); sk=$(rw skipped); sh=$(ust shadow_entries); f=$(ust fetches); 
 grep -q "the tracking had a gap - [0-9]* record" "$D/r.log" && grep -q "re-warming" "$D/r.log" && grep -q "the re-warm is done" "$D/r.log" &&
 	ok "20. (a) the restart dropped the $R0 replayed records at the gap and re-warmed every name - no client asked (log)" ||
 	bad "20. (a) log: $(grep -h -E 'tracking had a gap|re-warm|saved' "$D/r.log" | tail -4 | cut -c1-140 | tr '\n' '|')"
-# S431: a name whose copy landed untracked is queued again (requeued) and fetched once more
+# a name whose copy landed untracked is queued again (requeued) and fetched once more
 [ "$st" = $((40 + ${rq:-0})) ] && [ "$sk" = 0 ] && [ "$f" = $((40 + ${rq:-0})) ] && [ "$sh" = 40 ] &&
 	ok "20. (a) all 40 fetched again with no client read: 40 copies back (started $st, skipped $sk, fetches $f, requeued $rq, runs $rn)" ||
 	{ bad "20. (a) started $st, skipped $sk, fetches $f, requeued $rq, shadow_entries $sh, runs $rn"; rwdiag; }
@@ -1288,7 +1165,7 @@ set -- $(allheld)
 [ "$(resp GET rw:7)" = "'v7'" ] && [ "$(ust fetches)" = "$f" ] && ok "20. (a) a read after the re-warm hits the copy: 'v7', no fetch" || bad "20. (a) GET rw:7 $(resp GET rw:7), fetches $f -> $(ust fetches)"
 [ "$(nrec)" = 0 ] && ok "20. (a) the replayed records are gone (Redis's keys live in the shadow now)" || bad "20. (a) $(nrec) records still in the collection"
 stop
-# (b) upstream_rewarm_max = 0: 0.6.x's way - cold after the restart (the saved names are discarded)
+# (b) upstream_rewarm_max = 0: cold after the restart (the saved names are discarded)
 grep -q "40 key name(s) held saved" "$D/r.log" || echo "   (a)'s stop saved: $(grep -o '[0-9]* key name(s) held saved' "$D/r.log" | tail -1)"
 conf z0 "upstream_rewarm_max = 0" "[wal]" "dir = $D/wal20" "probe = no" "fsync = no" "save = off"
 KEEP=1 start z0 || bad "20. (b) start: $(grep -m2 -E 'ERROR|CRIT' "$D/z0.log")"
@@ -1298,22 +1175,19 @@ sleep 2
 	ok "20. (b) upstream_rewarm_max = 0: the saved names are discarded, nothing fetched - cold, as before" ||
 	bad "20. (b) max $(rw max), started $(rw started), fetches $(ust fetches), shadow $(ust shadow_entries), file $(ls "$D/state/" 2>/dev/null | grep -c rewarm); log: $(grep -h -E 'gap|re-warm' "$D/z0.log" | tail -2 | cut -c1-120 | tr '\n' '|')"
 stop
-# (c) S431: a server's tracking comes up late at the start (R2 answers CLIENT ID - asked only by
-# the invalidation connection - 2 s late).  The re-warm began when R1's tracking was up and
-# spread its names over both; one fetched from R2 before its tracking was untracked (it lives at
-# most upstream_negative_ms) or flushed with R2's shadow when the tracking came up: counted done,
-# the copy gone (GitHub 0.7.1-rc1/rc5/rc6: 38 or 39 of 40).  Now the re-warm waits for a tracked
-# server and fetches there: all 40 held, still 3 s after the run - past an untracked copy's life.
+# (c) R2's tracking comes up 2 s late at the start: the re-warm waits for a tracked server and
+# fetches there - all 40 held 3 s on, past an untracked copy's life
 fakes
 rm -rf "$D/wal20"; mkdir -p "$D/wal20"
 conf r "[wal]" "dir = $D/wal20" "probe = no" "fsync = no" "save = off"
-# the node waits upstream_timeout_ms for CLIENT ID and, past it, leaves the server untracked
-# for good (rc7: 1000 here, R2 never tracked, (c) failed on its own premise): 5 s lets R2's
-# 2-s-late answer in, so its tracking comes up late - the case this is about
+# past upstream_timeout_ms without a CLIENT ID the server stays untracked for good: 5 s lets
+# R2's 2-s-late answer in, so its tracking comes up late
 sed -i 's/^upstream_timeout_ms = 1000$/upstream_timeout_ms = 5000/' "$D/r.conf"
 start r || bad "20. (c) start: $(grep -m2 -E 'ERROR|CRIT' "$D/r.log")"
 waitfor 5 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ] && [ "$(wt "w[\"bcast\"]")" = on ]'
 for k in $(seq 1 40); do resp SET "rw:$k" "v$k" > /dev/null; done
+# an invalidation of a key's own write can drop its record before the stop: a read fetches it back
+for k in $(seq 1 40); do resp GET "rw:$k" > /dev/null; done
 waitfor 10 '[ $(( $(ust shadow_entries) + $(nrec) )) -ge 40 ]'
 quiet
 sleep 0.5
@@ -1334,9 +1208,8 @@ print(" ".join("%s:%s" % (x.get("addr"), x.get("shadow_entries")) for x in u.get
 	{ bad "20. (c) R2's tracking late: $sh copies held 3 s after the run (started $st, requeued $rq; by upstream: $up2)"; rwdiag; }
 set -- $(allheld)
 [ "$1" = 40 ] && [ "$2" = 0 ] && ok "20. (c) all 40 read back from the held copies, no fetch" || bad "20. (c) read back: $1 of 40 right, $2 fetched"
-# (d) S431: a lost tracking connection - R1 closes it (kill_seq).  Its shadow is flushed (an
-# invalidation may have been missed); the names it held are queued and fetched again in the
-# background, as a restart's are.  Before, they were left to the next read.
+# (d) a lost tracking connection (R1 closes it): its shadow is flushed and the names it held are
+# fetched again in the background, as a restart's are
 ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM'}'
 q0=$(rw requeued)
 ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "kill_seq": 1}'

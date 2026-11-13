@@ -1,7 +1,6 @@
 #!/bin/sh
-# frozentest.sh - S476: an eager fleet of three, one node frozen by SIGSTOP under live and new handles; test/frozentest.c
-# Node 3 is on the second secret of a rotation: a standby's dial must walk the list as a handle's does.
-# Usage: test/frozentest.sh [./perfcached] [./frozentest]
+# frozentest.sh - an eager fleet of three, one node frozen by SIGSTOP under live and new handles
+# (test/frozentest.c); node 3 is on a rotation's second secret, so a standby's dial walks the list.
 set -u
 BIN=${1:-./perfcached}
 FT=${2:-./frozentest}

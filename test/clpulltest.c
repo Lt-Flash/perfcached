@@ -1,21 +1,5 @@
-/*
- * clpulltest.c - the PULL plane's wire frames.
- *
- * DIFFERENTIAL, like clmembtest: ref_req() and ref_rsp() below are the
- * byte writes copied verbatim out of build_pull_req() and the response
- * builder inside handle_pull_req(), as they stood in cluster.c before
- * the extraction.  A round trip would only prove clpull agrees with
- * itself, which it would do with every offset shifted by one; these
- * bytes are what a peer on an older build actually sends.
- *
- * The pull plane is where a store-mode miss goes, so getting it wrong
- * does not crash anything - it returns the wrong value, or an older one,
- * which is the failure that shows up as a customer complaint rather
- * than an alert.  The VERSION field is the one that guards that, and it
- * is at offset 16 of a 24-byte header.
- *
- * Build: cc -o clpulltest test/clpulltest.c src/clpull.o
- */
+/* clpulltest.c - the PULL frames, byte for byte against the pre-extraction builders: a wrong offset
+ * returns a wrong or older value with no error, and VERSION (offset 16 of 24) guards that. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,7 +49,7 @@ static size_t ref_rsp(unsigned char *rsp, unsigned char type, uint32_t req,
 	p32(rsp + 8, ttl_left);
 	p32(rsp + 12, found ? vlen : 0);
 	p64(rsp + 16, found ? ver : 0);
-	rsp[24] = 0;                       /* S280: flags (a string) */
+	rsp[24] = 0;                       /* flags (a string) */
 	rn = 25;
 	if (found && vlen > 0) {
 		memcpy(rsp + 25, val, vlen);
@@ -173,9 +157,8 @@ int main(void)
 	chk(clpull_rsp_parse(a, la, &r) && memcmp(r.val, val, 18) == 0,
 		"D3 the value is reachable at the end of the header");
 
-	/* ---- E. every field is distinct on the wire -------------------
-	 * a field written into the wrong slot would still round-trip, so
-	 * poke each byte of the header and require the parse to notice */
+	/* ---- E. every field distinct: one written into the wrong slot would still round-trip,
+	 * so poke each header byte and require the parse to notice */
 	{
 		unsigned char base[64];
 		struct clpull_rsp r0, r1;
@@ -192,16 +175,15 @@ int main(void)
 			if (r1.req == r0.req && r1.node == r0.node &&
 			    r1.found == r0.found && r1.ttl_left == r0.ttl_left &&
 			    r1.vlen == r0.vlen && r1.ver == r0.ver &&
-			    r1.flags == r0.flags)               /* S280 */
+			    r1.flags == r0.flags)
 				break;
 		}
 		chk(i == CLPULL_RHDR,
 			"E1 every header byte reaches some field");
 	}
 
-	/* ---- F. the declared value wholly present, without wrapping ---
-	 * cluster.c checked CLPULL_RHDR + vlen > n in 32 bits, so a vlen
-	 * just under 2^32 wrapped to a few bytes and passed */
+	/* ---- F. the declared value wholly present: a 32-bit RHDR + vlen > n check let a vlen
+	 * just under 2^32 wrap to a few bytes and pass */
 	{
 		uint32_t big = 0xFFFFFFF0u;
 

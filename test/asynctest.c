@@ -1,27 +1,5 @@
-/*
- * asynctest.c — libperfd's event-loop surface (S32) driven by a REAL
- * event loop, which is the only way the claim means anything.
- *
- * The consumer here is shaped like the one S32 exists for: rtpengine
- * owns a libevent loop and cannot afford a blocking call in it, because
- * one stall there is every call on the box.  So this test uses libevent,
- * never calls a blocking libperfd function, and proves the "no stall"
- * property with a WATCHDOG rather than by inspection: a 5 ms repeating
- * timer records how late it ever fires.  A blocking handshake (Argon2id
- * alone is ~100 ms) or a blocking drain would show up there as lateness;
- * inspection would not show it at all.
- *
- * Four things are asserted, matching the task's proof obligations:
- *   2. set/get/del/keys complete with zero blocking calls, watchdog clean
- *   3. the daemon is killed MID-LOAD: every in-flight request must get
- *      its callback (correlation is never silently lost), and the
- *      reconnect - handshake included - happens inside the loop
- *   4. a large multi-record KEYS reply drains across several loop
- *      iterations without a single long stall
- * (1, that the blocking suites are unchanged, is the rest of `make check`.)
- *
- * usage: asynctest <host> <port> <secret|-> <col>
- */
+/* asynctest.c - libperfd's event-loop surface in a real libevent loop: no blocking call, a 5 ms
+ * watchdog timer proves no stall, every in-flight callback runs when the daemon dies mid-load. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,7 +93,7 @@ static void cb_get(char *res, size_t len, const char *e, void *ctx)
 		start_phase(3);
 }
 
-/* obligation 4: this reply is big and arrives over several records */
+/* a big reply that arrives over several records */
 static void cb_keys(char *res, size_t len, const char *e, void *ctx)
 {
 	(void)ctx;
@@ -140,7 +118,7 @@ static void cb_keys(char *res, size_t len, const char *e, void *ctx)
 	start_phase(4);
 }
 
-/* obligation 3: these were in flight when the daemon died */
+/* these were in flight when the daemon died */
 static void cb_inflight(char *res, size_t len, const char *e, void *ctx)
 {
 	(void)len; (void)e; (void)ctx;
@@ -216,7 +194,7 @@ static void start_phase(int n)
 			ok("large KEYS reply drained whole");
 		else
 			bad("large KEYS reply drained whole");
-		/* obligation 3: put requests in flight, then pull the rug */
+		/* put requests in flight, then pull the rug */
 		printf("  ..   phase 4: %d requests in flight, then kill\n",
 			200);
 		for (i = 0; i < 200; i++) {
@@ -227,9 +205,8 @@ static void start_phase(int n)
 		}
 		inflight_at_kill = perfd_inflight(P);
 		rearm();
-		/* the bracket keeps the pattern from matching the shell
-		 * system() spawns to run it - pkill -f reads its own
-		 * command line too, and would kill the killer */
+		/* the bracket keeps the pattern from matching the shell system() spawns: pkill -f reads
+		 * its own command line too, and would kill the killer */
 		if (system("pkill -9 -f '[p]erfcached -f /var/tmp/pcasync' "
 		        ">/dev/null 2>&1") == -1)
 			printf("  ..   (kill returned -1)\n");
@@ -255,9 +232,8 @@ static void on_read(evutil_socket_t fd, short what, void *arg)
 			phase = 5;
 		}
 		if (phase >= 5) {
-			/* expected from here on: the node is gone and the
-			 * dead fd would otherwise spin the loop.  Disarm and
-			 * let the watchdog tick drive the reconnect. */
+			/* expected from here on: the dead fd would spin the loop, so disarm and
+			 * let the watchdog tick drive the reconnect */
 			event_del(ev_read);
 			event_del(ev_write);
 			return;
@@ -265,10 +241,8 @@ static void on_read(evutil_socket_t fd, short what, void *arg)
 		die("read_ready");
 		return;
 	}
-	/* the Noise handshake completes on a READ (msg2 arriving), and by
-	 * then the write event is disarmed - so the first phase has to be
-	 * able to start from here as well as from on_write, or a run over
-	 * an encrypted channel simply sits there */
+	/* the Noise handshake completes on a READ, with the write event disarmed: the first phase
+	 * must start from here too, or an encrypted run sits there */
 	if (perfd_state(P) == PERFD_ST_READY && phase == 0)
 		start_phase(1);
 	rearm();
@@ -304,8 +278,7 @@ static void on_tick(evutil_socket_t fd, short what, void *arg)
 	}
 	t_last_tick = t;
 
-	/* phase 5: the daemon is being restarted by the harness; keep
-	 * trying to reconnect from INSIDE the loop, never blocking */
+	/* phase 5: the harness restarts the daemon; reconnect from INSIDE the loop, never blocking */
 	if (phase == 5 && perfd_state(P) == PERFD_ST_FAILED) {
 		perfd_t *n;
 		perfd_opts o;
@@ -327,10 +300,8 @@ static void on_tick(evutil_socket_t fd, short what, void *arg)
 		n = perfd_connect_async(g_host, g_port, &o);
 		if (!n)
 			return;                /* daemon not back yet */
-		/* ORDER MATTERS: drop the events BEFORE freeing the handle.
-		 * perfd_free() closes the fd, and libevent then cannot
-		 * deregister it - "Epoll MOD ... Bad file descriptor" and a
-		 * loop that never fires again. */
+		/* drop the events BEFORE freeing the handle: perfd_free() closes the fd, and
+		 * libevent then cannot deregister it and the loop never fires again */
 		event_del(ev_read);
 		event_del(ev_write);
 		event_free(ev_read);
@@ -348,11 +319,8 @@ static void on_tick(evutil_socket_t fd, short what, void *arg)
 		phase = 6;
 		return;
 	}
-	/* A reconnect attempted while the node is still down fails
-	 * ASYNCHRONOUSLY - connect() returns EINPROGRESS and the refusal
-	 * arrives as writability with SO_ERROR set.  So "failed" here is
-	 * an ordinary retry, not a terminal state; treating it as terminal
-	 * is what made this test hang. */
+	/* a reconnect while the node is down fails ASYNCHRONOUSLY (EINPROGRESS, then SO_ERROR on
+	 * writability): "failed" here is an ordinary retry, not a terminal state */
 	if (phase == 6 && perfd_state(P) == PERFD_ST_FAILED) {
 		static int refused;
 

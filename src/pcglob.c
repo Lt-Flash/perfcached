@@ -1,12 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * pcglob.c - the key glob (pcglob.h).  Moved from verbs.c unchanged (the
- * 0.7.2 split, wave 1 - doc/MODULARITY.md); test/pcglobtest.c.
- */
+/* pcglob.c - the key glob (pcglob.h). */
 #include "pcglob.h"
 
-/* S331: the same matcher for the read-through allow-list */
+/* the same matcher for the read-through allow-list */
 int pc_glob_match(const char *p, int pn, const char *s, int sn)
 {
 	return pc_glob(p, pn, s, sn);

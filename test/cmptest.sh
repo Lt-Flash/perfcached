@@ -1,27 +1,6 @@
 #!/bin/sh
-# cmptest.sh - S297: compare-and-set and compare-and-delete, in Redis
-# 8.4's spelling: SET key value IFEQ cmp / IFNE cmp and DELEX key
-# [IFEQ cmp / IFNE cmp]; the native door's setifeq/setifne/delifeq/delifne.
-#
-#   1  one node: every reply below is what redis 8.10.2 answered for the
-#      same command (probed 2026-10-05) - absent/present/equal/different,
-#      PX with IFEQ, IFEQ beside NX/XX (syntax error), a hash key
-#      (WRONGTYPE; DELEX: "Key should be of string type ..."), DELEX
-#      without a condition is DEL, the arity errors, a counter compares
-#      as its decimal text; IFDEQ/IFDNE are refused by name (no DIGEST);
-#      the token lock - acquire NX, a wrong token neither refreshes nor
-#      releases, the right one does - on RESP and the native door
-#   2  a shard fleet of three: the same lock through the two non-owners
-#      (decided at the owner), WRONGTYPE and the DELEX type error from
-#      the owner
-#   3  an eager fleet of three, 40 rounds: two clients on two nodes race
-#      SET L tokB|tokC IFEQ tokA - exactly one wins every round, and every
-#      node then reads the winner's token
-#   4  an owner that predates S297 (a variant of this tree without the
-#      owner's branch, or $2): a forwarded SET IFEQ / DELEX is "holder
-#      rejected", never a quiet store or delete, and the key is untouched
-# Fail-first: 0.4.6 answers "unsupported SET option" and "unknown command".
-# Usage: test/cmptest.sh [./perfcached] [older-perfcached-for-part-4]
+# cmptest.sh - compare-and-set/-delete as Redis 8.4 spells them (SET ... IFEQ/IFNE, DELEX) and the native
+# setif*/delif* verbs: on one node, at a shard owner, raced on an eager fleet, refused by an older owner.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -122,6 +101,18 @@ fleet() {
 	done
 	return 1
 }
+formed() { # every listed node ready and seeing the others (a CONNECTING joiner is listed already), up to 30 s
+	i=0; while [ $i -lt 300 ]; do
+		good=1
+		for x in "$@"; do
+			fs=$(curl -s "http://127.0.0.1:1773$(( x + 4 ))/stats" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null)
+			[ "$fs" = "ready $(($# - 1))" ] || good=0
+		done
+		[ $good = 1 ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
 fwd_sent() { curl -s "http://127.0.0.1:1773$(( $1 + 4 ))/stats" | python3 -c '
 import json, sys
 def find(x, k):
@@ -205,7 +196,7 @@ echo "part 2: a shard fleet of three - decided at the owner"
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n shard; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the shard fleet did not form"; echo "cmptest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+formed 1 2 3
 L=$(owned_by 1 lock) || { bad "no key of 60 is owned by node 1"; echo "cmptest: $pass passed, $fail failed"; exit 1; }
 echo "  key $L is owned by node 1; nodes 2 and 3 forward"
 eq "acquire through node 2" "$(r 2 SET "$L" tokA NX EX 30)" OK
@@ -229,7 +220,7 @@ echo "part 3: an eager fleet of three - 40 races, one winner each"
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n eager; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the eager fleet did not form"; echo "cmptest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+formed 1 2 3
 python3 - > "$D/race.out" 2>&1 <<'PY'
 import socket, threading, time
 def conn(port):
@@ -245,9 +236,8 @@ c1, c2, c3 = conn(17771), conn(17772), conn(17773)
 bad = 0
 for rnd in range(40):
     key = "race%d" % rnd
-    # acquired as the idiom does - SET NX, decided on the key's deciding
-    # node - so the node that decides the race holds tokA already (a
-    # plain SET lands on node 1 and reaches the decider by push)
+    # acquired as the idiom does (SET NX, decided on the key's deciding node), so the
+    # decider already holds tokA; a plain SET would reach it only by push
     if cmd(c1, "SET", key, "tokA", "NX") != "+OK":
         bad += 1; print("ROUND %d: the NX acquire failed" % rnd); continue
     res = {}
@@ -271,7 +261,7 @@ b=$(sed -n 's/^BAD //p' "$D/race.out")
 	|| bad "$b of 40 rounds wrong: $(grep ROUND "$D/race.out" | head -3 | tr '\n' ' ') $(tail -2 "$D/race.out" | tr '\n' ' ')"
 for n in 1 2 3; do stopn $n; done
 
-# ---- 4. an owner that predates S297 ----------------------------------------
+# ---- 4. an older owner (argument 2, else this tree without the owner's branch) ----
 if [ -z "$OLD" ]; then
 	echo "--- building the variant whose owner has no S297 branch"
 	mkdir -p "$D/t"
@@ -290,7 +280,7 @@ if [ -n "$OLD" ] && [ -x "$OLD" ]; then
 	for n in 1 2 3; do rm -rf "$D/s$n"; conf $n shard; done
 	start 1 "$OLD" && start 2 "$BIN" && start 3 "$BIN" || exit 1
 	fleet 1 2 3 || { bad "the mixed fleet did not form"; echo "cmptest: $pass passed, $fail failed"; exit 1; }
-	sleep 2
+	formed 1 2 3
 	L=$(owned_by 1 old) || { bad "no key of 60 is owned by node 1"; echo "cmptest: $pass passed, $fail failed"; exit 1; }
 	r 1 SET "$L" tokA > /dev/null
 	eq "4. SET IFEQ through node 2: refused, not stored" "$(r 2 SET "$L" tokB IFEQ tokA)" "-ERR holder rejected"

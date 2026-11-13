@@ -1,13 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * upstats.c - the read-through's figures: pc_upstream_stats_tree, a
- * collection's /stats block (its upstreams and their health, the
- * write-through writer, the sweeps, the S351 windows), and
- * pc_upstream_stats_reset, the S358 baselines it subtracts.  Reads the
- * upstream's state through upstreamint.h.  Moved from upstream.c
- * unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* upstats.c - the read-through's figures: a collection's /stats upstream block, and the reset
+ * baselines it subtracts.  Reads the upstream's state through upstreamint.h. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,7 +10,7 @@
 #include "compat/timer.h"                /* get_ticks */
 #include "core/pcache_htable.h"
 #include "ptree.h"
-#include "winctr_tw.h"                  /* S351 */
+#include "winctr_tw.h"
 #include "upstream.h"
 #include "upstreamint.h"
 
@@ -32,34 +26,33 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 
 	if (!uc)
 		return;
-	for (k = 0; k < uc->nsrv; k++) {
+	for (k = 0; k < srv_n(uc); k++) {
 		const struct up_srv *s = &uc->srv[k];
 
 		up += __atomic_load_n(&s->conns_up, __ATOMIC_RELAXED);
 		ents += (long long)pcache_ht_entries(s->shadow);
 		oth += ST_GET(s->other_server);
-		/* one upstream: its tracking, as 0.6.0 said it; several:
-		 * every one in use tracked (S382) */
+		/* one upstream: its tracking; several: every one in use must be tracked */
 		if (__atomic_load_n(&s->inv_id, __ATOMIC_ACQUIRE) <= 0 &&
-		    (uc->nsrv == 1 || srv_state(s) != PC_UPS_OFF))
+		    (srv_n(uc) == 1 || srv_state(s) != PC_UPS_OFF))
 			trk = 0;
 	}
 	pc_tw_key(out, "upstream");
 	pc_tw_map(out);
-	/* the first upstream's address, as 0.6.0 had its only one */
+	/* the first upstream's address, for readers of the single-upstream shape */
 	pc_tw_key(out, "host");
 	pc_tw_str(out, uc->srv[0].host);
 	pc_tw_key(out, "port");
 	pc_tw_i64(out, uc->srv[0].port);
 	pc_tw_key(out, "db");
 	pc_tw_i64(out, uc->srv[0].db);
-	/* S382: each upstream - what it is, what it may do, its share */
+	/* each upstream - what it is, what it may do, its share */
 	pc_tw_key(out, "role_required");
 	pc_tw_str(out, uc->role_req == PC_UP_ROLE_REPLICA ? "replica" : "any");
 	pc_tw_key(out, "master_fallback");
 	pc_tw_bool(out, uc->master_fallback);
 	{
-		/* S382 part 2: the mode, and in failover who is active */
+		/* the mode, and in failover who is active */
 		int act, fo = uc->mode == PC_UP_MODE_FAILOVER;
 		long long since;
 		unsigned long long nfo;
@@ -86,21 +79,55 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 			pc_tw_i64(out, (long long)nfo);
 		}
 	}
-	/* S384: reads by another perfcached's read-through - a daisy-chain
+	/* reads by another perfcached's read-through - a daisy-chain
 	 * cut here, at one hop (5 min window) */
 	pc_tw_ctr_col(out, col, collen, "up.", "chained_reads", ST_GET(uc->chained));
+	{       /* what the sentinels said, when the upstream names one */
+		char st[sizeof uc->sen_text];
+
+		pthread_mutex_lock((pthread_mutex_t *)&uc->sen_mx);
+		memcpy(st, uc->sen_text, sizeof st);
+		pthread_mutex_unlock((pthread_mutex_t *)&uc->sen_mx);
+		pc_tw_key(out, "sentinel");
+		pc_tw_str(out, st);
+	}
+	if (__atomic_load_n(&uc->cluster, __ATOMIC_ACQUIRE)) {
+		char ct[sizeof uc->cl_text];
+
+		pthread_mutex_lock((pthread_mutex_t *)&uc->sen_mx);
+		memcpy(ct, uc->cl_text, sizeof ct);
+		pthread_mutex_unlock((pthread_mutex_t *)&uc->sen_mx);
+		pc_tw_key(out, "redis_cluster");
+		pc_tw_map(out);
+		pc_tw_key(out, "said");
+		pc_tw_str(out, ct);
+		pc_tw_key(out, "unserved_slots");
+		pc_tw_i64(out, (long long)ST_GET(uc->cl_unserved));
+		pc_tw_key(out, "moved");
+		pc_tw_i64(out, (long long)ST_GET(uc->cl_moved));
+		pc_tw_key(out, "asked");
+		pc_tw_i64(out, (long long)ST_GET(uc->cl_asked));
+		pc_tw_key(out, "rounds");
+		pc_tw_i64(out, (long long)ST_GET(uc->cl_rounds));
+		pc_tw_end(out);
+	}
 	pc_tw_key(out, "upstreams");
 	pc_tw_arr(out);
-	for (k = 0; k < uc->nsrv; k++) {
+	for (k = 0; k < srv_n(uc); k++) {
 		const struct up_srv *s = &uc->srv[k];
 		int st = srv_state(s), ro = __atomic_load_n(&s->role,
 			__ATOMIC_RELAXED);
 		long long lag = __atomic_load_n(&s->lag_ms, __ATOMIC_RELAXED);
 		char sub[24];               /* "up.s" + an int + "." */
+		char addr[sizeof s->addr];
 
+		/* a gone slot may be taking another address */
+		pthread_mutex_lock((pthread_mutex_t *)&s->run_mx);
+		memcpy(addr, s->addr, sizeof addr);
+		pthread_mutex_unlock((pthread_mutex_t *)&s->run_mx);
 		pc_tw_map(out);
 		pc_tw_key(out, "addr");
-		pc_tw_str(out, s->addr);
+		pc_tw_str(out, addr);
 		pc_tw_key(out, "role");
 		pc_tw_str(out, ro >= 0 && ro <= 3 ? rname[ro] : "");
 		pc_tw_key(out, "state");
@@ -109,7 +136,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pc_tw_str(out, srv_why(s));
 		pc_tw_key(out, "connections_up");
 		pc_tw_i64(out, __atomic_load_n(&s->conns_up, __ATOMIC_RELAXED));
-		/* S382 part 2: the failover roles; S384: a perfcached */
+		/* the failover roles, and whether it is a perfcached */
 		pc_tw_key(out, "primary");
 		pc_tw_bool(out, uc->mode == PC_UP_MODE_FAILOVER && k == uc->primary);
 		pc_tw_key(out, "active");
@@ -117,6 +144,43 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 			k == __atomic_load_n(&uc->active, __ATOMIC_RELAXED));
 		pc_tw_key(out, "perfcached");
 		pc_tw_bool(out, __atomic_load_n(&s->is_pc, __ATOMIC_RELAXED));
+		pc_tw_key(out, "redis_cluster");
+		pc_tw_bool(out, __atomic_load_n(&s->is_cluster, __ATOMIC_RELAXED));
+		if (__atomic_load_n(&uc->cluster, __ATOMIC_ACQUIRE)) {
+			char sl[sizeof s->slots];
+			int sh;
+
+			pthread_mutex_lock((pthread_mutex_t *)&uc->mx);
+			memcpy(sl, s->slots, sizeof sl);
+			sh = uc->cmap ? s->shard : -1;
+			pthread_mutex_unlock((pthread_mutex_t *)&uc->mx);
+			pc_tw_key(out, "shard");
+			if (sh < 0)
+				pc_tw_nil(out);
+			else
+				pc_tw_i64(out, sh);
+			pc_tw_key(out, "slots");
+			pc_tw_str(out, sl);
+		}
+		{       /* how it came to be listed, how it is reached, what stands behind it */
+			int d = __atomic_load_n(&s->direct, __ATOMIC_RELAXED);
+			char bh[sizeof s->behind];
+
+			pc_tw_key(out, "origin");
+			pc_tw_str(out, s->origin == UPO_ROLE ? "role" :
+				s->origin == UPO_SENTINEL ? "sentinel" : s->origin == UPO_CLUSTER ?
+				"cluster" : "configured");
+			pc_tw_key(out, "direct");
+			if (d < 0)
+				pc_tw_nil(out);
+			else
+				pc_tw_bool(out, d);
+			pthread_mutex_lock((pthread_mutex_t *)&s->run_mx);
+			memcpy(bh, s->behind, sizeof bh);
+			pthread_mutex_unlock((pthread_mutex_t *)&s->run_mx);
+			pc_tw_key(out, "behind");
+			pc_tw_str(out, bh);
+		}
 		pc_tw_key(out, "tracking");
 		pc_tw_bool(out, __atomic_load_n(&s->inv_id, __ATOMIC_ACQUIRE) > 0);
 		/* each with its five-minute window: the page's share of
@@ -148,6 +212,30 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 	pc_tw_i64(out, (long long)UPV(uc, held));
 	pc_tw_key(out, "joined");
 	pc_tw_i64(out, (long long)UPV(uc, joined));
+	if (uc->tls) {                                     /* rediss:// */
+		char last[sizeof uc->tls_last];
+
+		pthread_mutex_lock((pthread_mutex_t *)&uc->tls_mx);
+		memcpy(last, uc->tls_last, sizeof last);
+		pthread_mutex_unlock((pthread_mutex_t *)&uc->tls_mx);
+		pc_tw_key(out, "tls");
+		pc_tw_map(out);
+		pc_tw_key(out, "verify");
+		pc_tw_bool(out, uc->tls_verify);
+		pc_tw_key(out, "ca");
+		pc_tw_str(out, !uc->tls_verify ? "" : uc->tls_ca ? uc->tls_ca : "the system's store");
+		pc_tw_key(out, "name");
+		pc_tw_str(out, uc->tls_name ? uc->tls_name : "");
+		pc_tw_key(out, "client_cert");
+		pc_tw_str(out, uc->tls_cert ? uc->tls_cert : "");
+		pc_tw_key(out, "handshakes");
+		pc_tw_i64(out, (long long)__atomic_load_n(&uc->tls_hs, __ATOMIC_RELAXED));
+		pc_tw_key(out, "failed");
+		pc_tw_i64(out, (long long)__atomic_load_n(&uc->tls_failed, __ATOMIC_RELAXED));
+		pc_tw_key(out, "last_failure");
+		pc_tw_str(out, last);
+		pc_tw_end(out);
+	}
 	pc_tw_ctr_col(out, col, collen, "up.", "fetches", UPV(uc, fetches));
 	pc_tw_ctr_col(out, col, collen, "up.", "fill_string", UPV(uc, fill_string));
 	pc_tw_ctr_col(out, col, collen, "up.", "fill_hash", UPV(uc, fill_hash));
@@ -160,30 +248,30 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 	pc_tw_ctr_col(out, col, collen, "up.", "errors", UPV(uc, errors));
 	pc_tw_ctr_col(out, col, collen, "up.", "timeouts", UPV(uc, timeouts));
 	pc_tw_ctr_col(out, col, collen, "up.", "shadow_hits", UPV(uc, shadow_hits));
-	pc_tw_ctr_col(out, col, collen, "up.", "pull_fetches", UPV(uc, pull_fetches));   /* 12nt */
-	pc_tw_ctr_col(out, col, collen, "up.", "fwd_through", UPV(uc, fwd_through));     /* 12nt TC-2 */
+	pc_tw_ctr_col(out, col, collen, "up.", "pull_fetches", UPV(uc, pull_fetches));
+	pc_tw_ctr_col(out, col, collen, "up.", "fwd_through", UPV(uc, fwd_through));
 	pc_tw_ctr_col(out, col, collen, "up.", "negative_hits", UPV(uc, neg_hits));
-	/* ST2: keys found present by TYPE + PTTL alone (a probe asked), the
-	 * probes those markers answered, and fetches queued again because a
-	 * read joined one after it had stopped at the marker */
+	/* keys found present by TYPE + PTTL alone, the probes those markers answered, and fetches
+	 * queued again because a read joined one after it had stopped at the marker */
 	pc_tw_ctr_col(out, col, collen, "up.", "fill_present", UPV(uc, fill_present));
 	pc_tw_ctr_col(out, col, collen, "up.", "present_hits", UPV(uc, present_hits));
 	pc_tw_key(out, "refetches");
 	pc_tw_i64(out, (long long)UPV(uc, refetches));
-	/* S424: fetches an invalidation of their key overtook, fetched again
-	 * for it, and kept after three rounds (S433: for upstream_negative_ms
-	 * at most) */
+	/* fetches an invalidation of their key overtook, fetched again for it, and kept after three
+	 * rounds (for upstream_negative_ms at most) */
 	pc_tw_ctr_col(out, col, collen, "up.", "inflight_invalidated", UPV(uc, inv_inflight));
 	pc_tw_ctr_col(out, col, collen, "up.", "inflight_refetches", UPV(uc, inv_refetch));
 	pc_tw_ctr_col(out, col, collen, "up.", "inflight_kept", UPV(uc, inv_kept));
-	/* S435: reads whose key went between the gate and the read (an
+	/* reads whose key went between the gate and the read (an
 	 * invalidation or an apply on another thread), gated again */
 	pc_tw_ctr_col(out, col, collen, "up.", "read_lost", UPV(uc, read_lost));
-	pc_tw_key(out, "writes");                                    /* S348 */
+	/* of those, lost again with the re-gates spent - the answer stood */
+	pc_tw_ctr_col(out, col, collen, "up.", "read_lost_spent", UPV(uc, read_lost_spent));
+	pc_tw_key(out, "writes");
 	pc_tw_str(out, uc->refuse ? "refuse" : uc->through ? "through" : "allow");
 	pc_tw_ctr_col(out, col, collen, "up.", "writes_refused", UPV(uc, writes_refused));
 	if (uc->through) {
-		/* S385: the writer - its target, RedisJSON there, and what it
+		/* the writer - its target, RedisJSON there, and what it
 		 * forwarded (each with its window: the page reads 5 min) */
 		int wm = __atomic_load_n(&uc->w_master, __ATOMIC_RELAXED),
 			wj = __atomic_load_n(&uc->w_json, __ATOMIC_RELAXED),
@@ -194,12 +282,12 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		memcpy(why, uc->w_why, sizeof why);
 		pc_tw_key(out, "write_through");
 		pc_tw_map(out);
-		pc_tw_key(out, "queued");          /* AR2: + what the writer holds */
+		pc_tw_key(out, "queued");          /* + what the writer holds */
 		pc_tw_i64(out, uc->wq_n + __atomic_load_n(&uc->w_inflight,
 			__ATOMIC_RELAXED));
 		pthread_mutex_unlock(&uc->mx);
 		pc_tw_key(out, "target");
-		if (wm >= 0 && wm < uc->nsrv)
+		if (wm >= 0 && wm < srv_n(uc))
 			pc_tw_str(out, uc->srv[wm].addr);
 		else
 			pc_tw_nil(out);
@@ -213,10 +301,10 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pc_tw_str(out, uc->unknown_pass ? "pass" : "refuse");
 		pc_tw_key(out, "pass_max_kb");
 		pc_tw_i64(out, uc->pass_max / 1024);
-		pc_tw_key(out, "queue_max");                   /* AR2 */
+		pc_tw_key(out, "queue_max");
 		pc_tw_i64(out, uc->wq_max);
 		{
-			int b = bcast_state(uc);               /* AR1 */
+			int b = bcast_state(uc);
 
 			pc_tw_key(out, "bcast");
 			pc_tw_str(out, b > 0 ? "on" : b < 0 ? "refused" : "off");
@@ -225,18 +313,18 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 			long long o = __atomic_load_n(&uc->wt_owned,
 				__ATOMIC_RELAXED);
 
-			/* AR4: keys the fleet owned before through, here */
+			/* keys the fleet owned before through, here */
 			pc_tw_key(out, "fleet_owned");
 			if (o < 0)
 				pc_tw_nil(out);
 			else
 				pc_tw_i64(out, o);
 		}
-		pc_tw_key(out, "copies_marked");                /* S418 */
+		pc_tw_key(out, "copies_marked");
 		pc_tw_i64(out, (long long)ST_GET(uc->copies_marked));
-		pc_tw_key(out, "copies_premarked");             /* S418 */
+		pc_tw_key(out, "copies_premarked");
 		pc_tw_i64(out, (long long)ST_GET(uc->copies_premarked));
-		pc_tw_key(out, "upfill");                      /* AR4 */
+		pc_tw_key(out, "upfill");
 		pc_tw_map(out);
 		pc_tw_key(out, "state");
 		pc_tw_str(out, updr_name[uc->upf_state]);
@@ -250,7 +338,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pc_tw_i64(out, (long long)ST_GET(uc->upf_written));
 		pc_tw_key(out, "redis_had");
 		pc_tw_i64(out, (long long)ST_GET(uc->upf_kept));
-		/* S400: of redis_had, how Redis's value compared; a check's
+		/* of redis_had, how Redis's value compared; a check's
 		 * keys Redis lacks (a run would write them) */
 		pc_tw_key(out, "mode");
 		pc_tw_str(out, uc->upf_check ? "check" : "fill");
@@ -262,9 +350,9 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pc_tw_i64(out, (long long)ST_GET(uc->upf_differed));
 		pc_tw_key(out, "missing");
 		pc_tw_i64(out, (long long)ST_GET(uc->upf_missing));
-		/* S402: how each verdict on a key Redis had was reached -
+		/* how each verdict on a key Redis had was reached -
 		 * compared_text + compared_walked + uncompared = redis_had */
-		pc_tw_key(out, "bytes");               /* S401: values offered */
+		pc_tw_key(out, "bytes");               /* values offered */
 		pc_tw_i64(out, __atomic_load_n(&uc->upf_bytes, __ATOMIC_RELAXED));
 		pc_tw_key(out, "compared_text");
 		pc_tw_i64(out, (long long)ST_GET(uc->upf_cmp_text));
@@ -280,7 +368,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pc_tw_i64(out, (long long)ST_GET(uc->upf_errors));
 		pc_tw_end(out);
 		pc_tw_ctr_col(out, col, collen, "upw.", "forwarded", UPV(uc, wt_fwd));
-		/* AR3: of them, sent in one round with others */
+		/* of them, sent in one round with others */
 		pc_tw_ctr_col(out, col, collen, "upw.", "pipelined",
 			UPV(uc, wt_pipelined));
 		pc_tw_ctr_col(out, col, collen, "upw.", "applied", UPV(uc, wt_ok));
@@ -302,32 +390,31 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pc_tw_ctr_col(out, col, collen, "upw.", "pass_refused",
 			UPV(uc, pass_refused));
 		pc_tw_ctr_col(out, col, collen, "upw.", "checks", UPV(uc, wt_checks));
-		/* AR2: refused at a full queue; answered "not applied" after
+		/* refused at a full queue; answered "not applied" after
 		 * waiting past upstream_timeout_ms, never sent */
 		pc_tw_ctr_col(out, col, collen, "upw.", "queue_full", UPV(uc, wt_qfull));
 		pc_tw_ctr_col(out, col, collen, "upw.", "queue_expired",
 			UPV(uc, wt_qexpired));
-		/* AR1: records dropped because Redis said the key changed, and
+		/* records dropped because Redis said the key changed, and
 		 * the flushes after a gap in the tracking */
 		pc_tw_ctr_col(out, col, collen, "upw.", "invalidated", UPV(uc, wt_inval));
-		/* S422: refetches after the echo of this node's own write */
+		/* refetches after the echo of this node's own write */
 		pc_tw_ctr_col(out, col, collen, "upw.", "echo_refetches", UPV(uc, wt_echo));
-		/* S423: fetches inside the echo window sent to the master */
+		/* fetches inside the echo window sent to the master */
 		pc_tw_ctr_col(out, col, collen, "upw.", "echo_master_fetches",
 			UPV(uc, wt_echo_master));
-		/* S429: read-backs applied out of order, skipped */
+		/* read-backs applied out of order, skipped */
 		pc_tw_ctr_col(out, col, collen, "upw.", "stale_readbacks_skipped",
 			UPV(uc, wt_stale));
 		pc_tw_ctr_col(out, col, collen, "upw.", "inval_flushes",
 			UPV(uc, wt_invall));
-		/* S404: a written-through key's mark found here without its
+		/* a written-through key's mark found here without its
 		 * record - dropped, and the key read from Redis */
 		pc_tw_ctr_col(out, col, collen, "upw.", "bare_marks",
 			UPV(uc, wt_bare));
 		{
-			/* S403: the writer thread's CPU, and its share of the last
-			 * five minutes - one thread carries every write-through
-			 * write of the collection, and an upfill sweep with them */
+			/* the writer thread's CPU and its five-minute share: one thread carries every
+			 * write-through write of the collection, and an upfill sweep with them */
 			unsigned long long cu = __atomic_load_n(&uc->wt_cpu_us,
 				__ATOMIC_RELAXED);
 			unsigned int secs = 0;
@@ -413,7 +500,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pc_tw_end(out);
 		pc_tw_end(out);
 	}
-	/* every upstream in use tracked (S382) */
+	/* every upstream in use tracked */
 	pc_tw_key(out, "tracking");
 	pc_tw_bool(out, trk);
 	{
@@ -433,7 +520,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 	pc_tw_i64(out, (long long)UPV(uc, flushes));
 	pc_tw_key(out, "untracked_fills");
 	pc_tw_i64(out, (long long)UPV(uc, untracked));
-	/* S421: the re-warm after a tracking gap */
+	/* the re-warm after a tracking gap */
 	pc_tw_key(out, "rewarm");
 	pc_tw_map(out);
 	pc_tw_key(out, "state");
@@ -448,7 +535,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 	pc_tw_i64(out, (long long)uc->rw_dropped);
 	pc_tw_key(out, "runs");
 	pc_tw_i64(out, (long long)uc->rw_runs);
-	pc_tw_key(out, "requeued");                                  /* S431 */
+	pc_tw_key(out, "requeued");
 	pc_tw_i64(out, (long long)uc->rw_requeued);
 	pc_tw_key(out, "max");
 	pc_tw_i64(out, (long long)uc->rewarm_max);
@@ -463,7 +550,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 	pc_tw_i64(out, uc->drain_t1);
 	pc_tw_key(out, "read");
 	pc_tw_i64(out, (long long)ST_GET(uc->dr_scanned));
-	pc_tw_key(out, "bytes");                       /* S401: values read */
+	pc_tw_key(out, "bytes");                       /* values read */
 	pc_tw_i64(out, __atomic_load_n(&uc->dr_bytes, __ATOMIC_RELAXED));
 	pc_tw_key(out, "taken_over");
 	pc_tw_i64(out, (long long)ST_GET(uc->dr_pulled));
@@ -475,7 +562,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 	pc_tw_i64(out, (long long)ST_GET(uc->dr_wrongtype));
 	pc_tw_key(out, "too_big");
 	pc_tw_i64(out, (long long)ST_GET(uc->dr_toobig));
-	pc_tw_key(out, "elsewhere");                   /* 12nt TC-4: other nodes' */
+	pc_tw_key(out, "elsewhere");                   /* other nodes' */
 	pc_tw_i64(out, (long long)ST_GET(uc->dr_elsewhere));
 	pc_tw_key(out, "errors");
 	pc_tw_i64(out, (long long)ST_GET(uc->dr_errors));
@@ -497,16 +584,15 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 	n = UPV(uc, lat_n);
 	pc_tw_key(out, "fetch_us_avg");
 	pc_tw_i64(out, n ? (long long)(UPV(uc, lat_us_sum) / n) : 0);
-	/* S351: the sum and the count, each with its window - the page's
+	/* the sum and the count, each with its window - the page's
 	 * average fetch is the last five minutes' */
 	pc_tw_ctr_col(out, col, collen, "up.", "fetch_us_sum", UPV(uc, lat_us_sum));
 	pc_tw_ctr_col(out, col, collen, "up.", "fetch_n", n);
 	pc_tw_end(out);
 }
 
-/* S358: the stats reset - every collection's counters count from here in
- * /stats (not /metrics, which does not carry them).  The daemon serialises
- * resets; a worker counting concurrently lands on either side of it. */
+/* the stats reset: /stats counters count from here (/metrics does not carry them); resets
+ * are serialised, so a worker counting concurrently lands on either side */
 void pc_upstream_stats_reset(void)
 {
 	int i;
@@ -526,16 +612,17 @@ void pc_upstream_stats_reset(void)
 		uc->base.timeouts = ST_GET(uc->timeouts);
 		uc->base.connects = ST_GET(uc->connects);
 		uc->base.shadow_hits = ST_GET(uc->shadow_hits);
-		uc->base.pull_fetches = ST_GET(uc->pull_fetches);   /* 12nt */
-		uc->base.fwd_through = ST_GET(uc->fwd_through);     /* 12nt TC-2 */
+		uc->base.pull_fetches = ST_GET(uc->pull_fetches);
+		uc->base.fwd_through = ST_GET(uc->fwd_through);
 		uc->base.neg_hits = ST_GET(uc->neg_hits);
-		uc->base.fill_present = ST_GET(uc->fill_present);     /* ST2 */
+		uc->base.fill_present = ST_GET(uc->fill_present);
 		uc->base.present_hits = ST_GET(uc->present_hits);
 		uc->base.refetches = ST_GET(uc->refetches);
-		uc->base.inv_inflight = ST_GET(uc->inv_inflight);   /* S424 */
+		uc->base.inv_inflight = ST_GET(uc->inv_inflight);
 		uc->base.inv_refetch = ST_GET(uc->inv_refetch);
 		uc->base.inv_kept = ST_GET(uc->inv_kept);
-		uc->base.read_lost = ST_GET(uc->read_lost);         /* S435 */
+		uc->base.read_lost = ST_GET(uc->read_lost);
+		uc->base.read_lost_spent = ST_GET(uc->read_lost_spent);
 		uc->base.joined = ST_GET(uc->joined);
 		uc->base.fill_failed = ST_GET(uc->fill_failed);
 		uc->base.lat_us_sum = ST_GET(uc->lat_us_sum);
@@ -566,15 +653,15 @@ void pc_upstream_stats_reset(void)
 		uc->base.pass_r = ST_GET(uc->pass_r);
 		uc->base.pass_refused = ST_GET(uc->pass_refused);
 		uc->base.wt_checks = ST_GET(uc->wt_checks);
-		uc->base.wt_qfull = ST_GET(uc->wt_qfull);       /* AR2 */
-		uc->base.wt_pipelined = ST_GET(uc->wt_pipelined); /* AR3 */
+		uc->base.wt_qfull = ST_GET(uc->wt_qfull);
+		uc->base.wt_pipelined = ST_GET(uc->wt_pipelined);
 		uc->base.wt_qexpired = ST_GET(uc->wt_qexpired);
-		uc->base.wt_inval = ST_GET(uc->wt_inval);       /* AR1 */
-		uc->base.wt_echo = ST_GET(uc->wt_echo);         /* S422 */
-		uc->base.wt_echo_master = ST_GET(uc->wt_echo_master);   /* S423 */
-		uc->base.wt_stale = ST_GET(uc->wt_stale);               /* S429 */
+		uc->base.wt_inval = ST_GET(uc->wt_inval);
+		uc->base.wt_echo = ST_GET(uc->wt_echo);
+		uc->base.wt_echo_master = ST_GET(uc->wt_echo_master);
+		uc->base.wt_stale = ST_GET(uc->wt_stale);
 		uc->base.wt_invall = ST_GET(uc->wt_invall);
-		uc->base.wt_bare = ST_GET(uc->wt_bare);         /* S404 */
+		uc->base.wt_bare = ST_GET(uc->wt_bare);
 		{
 			int r, f, nr = __atomic_load_n(&uc->nwcmd, __ATOMIC_ACQUIRE);
 

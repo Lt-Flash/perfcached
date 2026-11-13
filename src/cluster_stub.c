@@ -1,22 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * cluster_stub.c - S250: the STANDALONE build's side of the cluster seam.
- *
- * A standalone perfcached links this instead of cluster.c and the cl*.c
- * modules (clunk.c and clretain.c stay: they are standalone features).
- * Every call the core makes into the cluster answers as a daemon with no
- * [cluster] section already does at runtime - not enabled, no replicas,
- * nothing forwarded, nothing pulled, no negative cache - so the core's
- * behaviour is the clustered build's with the cluster off, and the
- * difference is only what is not compiled in.
- *
- * Generated from the linker's view of the seam (symbols the core objects
- * leave undefined that the cluster objects define), then written out by
- * hand where "zero" would be the wrong answer: pc_repl_push() must say
- * KEEP (0 tells the caller to delete its copy), and names say what this
- * build is.  The node's lifecycle is not here - it is node.c, in both.
- */
+/* cluster_stub.c - the STANDALONE build's side of the cluster seam, linked instead of cluster.c and
+ * the cl*.c modules: every call answers as a daemon with no [cluster] section does at runtime. */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,7 +12,7 @@
 #include "clunk.h"
 #include "clfleet.h"
 #include "clpeers.h"
-#include "wal.h"                     /* AT-3b: pc_delete_originate logs */
+#include "wal.h"                     /* pc_delete_originate logs */
 
 unsigned long long pc_term_rejected;
 
@@ -102,14 +87,16 @@ int pc_cluster_enabled(void)
 
 int pc_cluster_stats_reset_send(long long at) { (void)at; return 0; }
 void pc_cluster_set_stats_reset_cb(void (*cb)(long long at)) { (void)cb; }
-/* S352c: no fleet - nobody to relay to, nobody elected */
+/* no fleet - nobody to relay to, nobody elected */
 void pc_cluster_set_can_mail(int can) { (void)can; }
+void pc_cluster_admission_stuck_text(char *out, size_t cap) { if (cap) out[0] = 0; }
 int pc_cluster_mailer(int *is_self) { if (is_self) *is_self = 0; return 0; }
-unsigned long long pc_cluster_rx_drops(void) { return 0; }      /* S465 */
+unsigned long long pc_cluster_rx_drops(void) { return 0; }
 void pc_cluster_replay_counts(unsigned long long *dup, unsigned long long *old,
-		unsigned long long *incarn, unsigned long long *full)
+		unsigned long long *incarn, unsigned long long *full,
+		unsigned long long *host)
 {
-	*dup = *old = *incarn = *full = 0;
+	*dup = *old = *incarn = *full = *host = 0;
 }
 int pc_cluster_alert_relay_send(int to, const struct pc_alert_relay *r) { (void)to; (void)r; return -1; }
 void pc_cluster_set_alert_relay_cb(void (*cb)(const struct pc_alert_relay *r)) { (void)cb; }
@@ -223,9 +210,8 @@ int pc_cluster_mode(void)
 
 const char *pc_cluster_mode_name(void)
 {
-	/* what clients parse: the clustered build says "store" with the
-	 * cluster off, and so does this one - the edition is -V's and
-	 * /stats' "edition", not a new mode a client has never seen */
+	/* what clients parse: the clustered build says "store" with the cluster off, and so does
+	 * this one; the edition is -V's and /stats' "edition", not a mode a client never saw */
 	return "store";
 }
 
@@ -302,7 +288,7 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data, siz
 	return 0;
 }
 
-void pc_cluster_repl_tcp_figures(unsigned long long out[6]) { memset(out, 0, 6 * sizeof out[0]); }   /* S469 */
+void pc_cluster_repl_tcp_figures(unsigned long long out[6]) { memset(out, 0, 6 * sizeof out[0]); }
 void pc_cluster_repl_plane_figures(int *peers_direct,
 		unsigned long long *sent_direct, unsigned long long *sent_cluster,
 		unsigned long long *rx_groups, unsigned long long *rx_refused)
@@ -346,7 +332,7 @@ int pc_cluster_rcvbuf(void)
 }
 
 void pc_cluster_respmap_announce(int index, const char *col, uint64_t gen,
-		int set)                               /* S432 */
+		int set)
 {
 	(void)index;
 	(void)col;
@@ -355,7 +341,7 @@ void pc_cluster_respmap_announce(int index, const char *col, uint64_t gen,
 }
 
 void pc_cluster_autoscale_announce(const char *name, size_t nlen, int mode,
-		unsigned long long gen)                /* S436 */
+		unsigned long long gen)
 {
 	(void)name;
 	(void)nlen;
@@ -363,7 +349,7 @@ void pc_cluster_autoscale_announce(const char *name, size_t nlen, int mode,
 	(void)gen;
 }
 
-/* 12ny AT-10: no fleet, nothing to forget by */
+/* no fleet, nothing to forget by */
 int pc_cluster_acks_gate(int *lack, int max, int *nlack)
 {
 	(void)lack;
@@ -373,7 +359,7 @@ int pc_cluster_acks_gate(int *lack, int max, int *nlack)
 	return 0;
 }
 
-int pc_cluster_fleet_has(int feat, int *lacking)       /* S314 */
+int pc_cluster_fleet_has(int feat, int *lacking)
 {
 	(void)feat;
 	if (lacking)
@@ -528,7 +514,7 @@ void pc_cluster_unknown_figures(unsigned long long *recv, unsigned long long *ba
 int pc_cluster_unknown_fleet(const struct clunk_table *self, struct clunk_table *out, int *members, int *reporting)
 {
 	/* the node's own table IS the fleet's - what the clustered build
-	 * answers with the cluster off (S165) */
+	 * answers with the cluster off */
 	memset(out, 0, sizeof *out);
 	clunk_fold(out, self, 0);
 	*members = *reporting = 1;
@@ -647,7 +633,7 @@ void pc_neg_set_ver_local(const char *col, size_t cn, const char *key,
 	(void)ver;
 }
 
-/* AR1: pc_verb_forget_local plants one (no fleet, nothing to keep out) */
+/* pc_verb_forget_local plants one (no fleet, nothing to keep out) */
 void pc_neg_set_ver(const char *col, size_t cn, const char *key, size_t kn,
 		int ms, unsigned long long ver)
 {
@@ -732,7 +718,7 @@ int pc_shard_grace(void)
 	return 0;
 }
 
-int pc_cluster_epoch(void) { return PC_CL_EPOCH; }                /* 12nu */
+int pc_cluster_epoch(void) { return PC_CL_EPOCH; }
 int pc_cluster_epoch_min(void) { return PC_CL_EPOCH_MIN; }
 int pc_cluster_epoch_max(void) { return PC_CL_EPOCH_MAX; }
 int pc_cluster_epoch_commit(int epoch, char *why, size_t n)
@@ -784,8 +770,7 @@ uint32_t pc_term_current(void)
 	return 0;
 }
 
-/* no cluster: the plain record of a delete that removed a copy, as the
- * delete paths wrote before AT-3b; nothing to number or send */
+/* no cluster: the plain record of a delete that removed a copy; nothing to number or send */
 void pc_delete_originate(const char *col, size_t collen, const char *key,
 		size_t klen, unsigned long long ver, int removed)
 {
@@ -870,13 +855,13 @@ void pc_cluster_set_expect(int n)
 	(void)n;
 }
 
-/* S341: no fleet, nothing expected */
+/* no fleet, nothing expected */
 int pc_cluster_expect(void)
 {
 	return 0;
 }
 
-/* S343: no peers, nothing refused */
+/* no peers, nothing refused */
 unsigned long long pc_cluster_bad_col_names(void)
 {
 	return 0;
@@ -929,8 +914,8 @@ int pc_cluster_eager_miss_final(void)
 	return 0;
 }
 
-/* S295/S321: nothing is forwarded or pulled here, so no request has a
- * target - the park holds no hint and no steered miss to retry. */
+/* nothing is forwarded or pulled here, so no request has a target - the park holds no hint
+ * and no steered miss to retry */
 int pc_fwd_target_of(uint32_t req, unsigned int *ttl)
 {
 	(void)req;

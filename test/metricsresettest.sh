@@ -1,20 +1,6 @@
 #!/bin/sh
-# metricsresettest.sh - S358: a stats reset starts /stats again and leaves
-# /metrics alone.  /metrics is what Prometheus scrapes, and it must never
-# read a reset as a counter going back to zero; /stats and the page are
-# the human views, and they count from the last reset - which now takes
-# the read-through figures with it.
-#   - one node, collection 0 reading through a fake upstream
-#   - hits, misses, a fetch from the upstream and an unknown command
-#   - CONFIG RESETSTAT on the RESP door (the daemon's HTTP door takes no
-#     POST since 0.7.0; the dashboard's button is the native verb)
-#   - /stats: the collection's hits and misses and the upstream's fetches
-#     are 0 again, since.reset_at is the reset's time
-#   - /metrics: collection hits/misses and unknown commands are exactly
-#     what they were before the reset
-# Fail-first: on 0.5.6.3 /metrics drops to 0 and the read-through fetches
-# survive the reset.
-# Usage: test/metricsresettest.sh [./perfcached]
+# metricsresettest.sh - a stats reset (CONFIG RESETSTAT) starts /stats and the page again, read-through
+# figures included, and leaves /metrics alone: Prometheus must never see a counter go back to zero.
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -120,6 +106,7 @@ mt = http("/metrics")
 check(mval(mt, r'perfcached_collection_hits_total\{collection="0"\}') == h1 + 1,
       "a hit after the reset adds to /metrics' count, it does not restart it")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

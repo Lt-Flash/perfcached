@@ -1,28 +1,5 @@
-/*
- * clmembtest.c - the membership keepalive frames (M12 slice 2).
- *
- * This is a DIFFERENTIAL test, not a round-trip one, and the difference
- * matters.  A round trip proves clmemb agrees with itself, which it
- * would do just as happily with every offset shifted by one.  What has
- * to hold is that it agrees with the layout that is already on the wire
- * - because MASTER_ALIVE is the frame master-down detection runs on, and
- * a fleet mid-upgrade has both codecs on it at once.
- *
- * So ref_malive() and ref_alive() below are the byte writes copied
- * VERBATIM out of send_master_alive() and send_alive() as they stood
- * before the extraction - raw host-endian memcpy for the 64-bit fields
- * included - and the parse side is checked field by field against reads
- * taken straight from the frame at every length from 0 to full.  When
- * the handlers stopped carrying those offsets, this file became the only
- * remaining copy of the pre-extraction layout, which is what makes it a
- * golden reference rather than a restatement.
- *
- * The digest values include 0x8000000000000000 and ~0 on purpose: those
- * are where a host-endian memcpy and an explicit little-endian pack
- * would diverge if this daemon ever ran big-endian.
- *
- * Build: cc -o clmembtest test/clmembtest.c src/clmemb.o
- */
+/* clmembtest.c - the keepalive and handshake codecs against reference encoders copied verbatim from
+ * the old cluster.c senders (host-endian memcpy and all): the golden layout a mixed fleet shares. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,8 +31,8 @@ static void ref_malive(unsigned char *msg, unsigned char type, int node,
 	msg[26] = (unsigned char)eager;
 	memcpy(msg + 27, &cd, 8);
 	p32(msg + 35, term);
-	msg[39] = (unsigned char)epoch;                 /* S221 */
-	msg[40] = (unsigned char)committed;             /* 12nu */
+	msg[39] = (unsigned char)epoch;
+	msg[40] = (unsigned char)committed;
 }
 
 static void ref_alive(unsigned char *msg, unsigned char type, int node,
@@ -87,26 +64,25 @@ static void ref_alive(unsigned char *msg, unsigned char type, int node,
 	msg[63] = (unsigned char)startkind;
 	p16(msg + 64, (uint16_t)httpport);
 	p32(msg + 66, uptime);
-	p32(msg + 70, clo);                    /* S160 */
+	p32(msg + 70, clo);
 	p32(msg + 74, clr);
 	p32(msg + 78, clb);
-	p32(msg + 82, cln);                    /* S317: cl_json is gone */
-	msg[86] = (unsigned char)ncols;                 /* S163 */
+	p32(msg + 82, cln);
+	msg[86] = (unsigned char)ncols;
 	msg[87] = (unsigned char)ntot;
 	for (i = 0; i < ncols * 7; i++)
 		memcpy(msg + 88 + 8 * i, &cols[i], 8);
-	p16(msg + 88 + 56 * ncols, (uint16_t)psport);  /* PS11: after the block */
+	p16(msg + 88 + 56 * ncols, (uint16_t)psport);
 	memcpy(msg + 90 + 56 * ncols, &psint, 8);
-	msg[98 + 56 * ncols] = (unsigned char)nreason;    /* S186 */
-	msg[99 + 56 * ncols] = (unsigned char)epoch;      /* S221 */
-	msg[100 + 56 * ncols] = (unsigned char)features;  /* S314 */
-	p16(msg + 101 + 56 * ncols, (uint16_t)solewit);   /* 0.5.7.1, last */
+	msg[98 + 56 * ncols] = (unsigned char)nreason;
+	msg[99 + 56 * ncols] = (unsigned char)epoch;
+	msg[100 + 56 * ncols] = (unsigned char)features;
+	p16(msg + 101 + 56 * ncols, (uint16_t)solewit);
 }
 
 
-/* ---- reference encoders for the handshake, verbatim from cluster.c's
- * send_join_req / send_assign / send_join_rej / send_join_wait /
- * send_goodbye as they stood before the extraction ---- */
+/* ---- reference encoders for the handshake, verbatim from cluster.c's send_join_req,
+ * send_assign, send_join_rej, send_join_wait and send_goodbye ---- */
 static void ref_joinreq(unsigned char *msg, unsigned char type, uint64_t tok,
 	int mode, int eager, uint64_t d, const unsigned char *ident,
 	int proposed, uint32_t incarn, int wal, int epoch)
@@ -120,7 +96,7 @@ static void ref_joinreq(unsigned char *msg, unsigned char type, uint64_t tok,
 	p16(msg + 35, (uint16_t)proposed);
 	p32(msg + 37, incarn);
 	msg[41] = (unsigned char)wal;
-	msg[42] = (unsigned char)epoch;              /* S221, last */
+	msg[42] = (unsigned char)epoch;
 }
 
 static void ref_assign_hdr(unsigned char *msg, unsigned char type, uint64_t tok,
@@ -163,7 +139,7 @@ int main(void)
 	for (k = 0; k < 16; k++) ident[k] = (unsigned char)(k * 37 + 5);
 	printf("=== clmembtest ===\n");
 
-	/* ---- encoders must be byte-identical ---- */
+	/* ---- encoders byte-identical; D holds 2^63 and ~0, where host-endian and LE packs differ */
 	for (i = 0; i < sizeof D / sizeof D[0]; i++) {
 		memset(a, 0xAA, sizeof a); memset(b, 0xAA, sizeof b);
 		ref_malive(a, 9, 4097, 3, D[i], 1234, 5678, 91011, 2, 1,
@@ -174,8 +150,8 @@ int main(void)
 			in.free_mb = 1234; in.total_mb = 5678; in.live_kb = 91011;
 			in.mode = 2; in.eager = 1; in.cfg_digest = D[(i + 1) % 6];
 			in.term = 0xdeadbeef;
-			in.epoch = (i % 3) + 1;        /* S221 */
-			in.committed = 2 + (int)(i % 2);   /* 12nu */
+			in.epoch = (i % 3) + 1;
+			in.committed = 2 + (int)(i % 2);
 			CHK(clmemb_malive_write(b, sizeof b, 9, &in) == CLMEMB_MALIVE_LEN,
 				"malive length");
 		}
@@ -198,10 +174,10 @@ int main(void)
 			in.cl_open = 77; in.cl_resp = 10; in.cl_bin = 20;
 			in.cl_nresp = 17;
 			in.ps_port = 17600; in.ps_interest = D[(i + 3) % 6];
-			in.nreason = (i % 5) + 1;      /* S186 */
-			in.epoch = (i % 3) + 1;        /* S221 */
-			in.features = i % 4;           /* S314 */
-			in.sole_witness = 0x1234 + (int)i;   /* 0.5.7.1 */
+			in.nreason = (i % 5) + 1;
+			in.epoch = (i % 3) + 1;
+			in.features = i % 4;
+			in.sole_witness = 0x1234 + (int)i;
 			in.ncols = CLMEMB_COLS_BEAT; in.ncols_total = 19;
 			for (k = 0; k < CLMEMB_COLS_BEAT; k++) {
 				in.cols[k].hash = COLS[k * 7]; in.cols[k].entries = COLS[k * 7 + 1];
@@ -213,9 +189,8 @@ int main(void)
 				"alive length");
 		}
 		CHK(memcmp(a, b, CLMEMB_ALIVE_LEN) == 0, "ALIVE bytes");
-		/* S216: the watchdog's two-byte patch is exactly what a fresh
-		 * encode with that state and reason would have produced - at
-		 * the full length and with no collections at all */
+		/* the watchdog's two-byte patch is exactly what a fresh encode with that state
+		 * and reason would produce - at the full length and with no collections at all */
 		{
 			struct clmemb_alive in, out;
 			unsigned char p1[CLMEMB_ALIVE_LEN], p2[CLMEMB_ALIVE_LEN];
@@ -291,13 +266,10 @@ int main(void)
 			A.cl_resp == g32(a + 74) && A.cl_bin == g32(a + 78) &&
 			A.cl_nresp == g32(a + 82), w);
 		CHK(!!(A.have & CLMEMB_A_COLS) == (n >= 88 + 56 * CLMEMB_COLS_BEAT), w);
-		/* the tail is [relay fields][nreason][epoch][features][sole
-		 * witness (2)], so the relay fields are complete FIVE bytes
-		 * before the full frame */
+		/* the tail is [relay fields][nreason][epoch][features][sole witness (2)], so
+		 * the relay fields are complete FIVE bytes before the full frame */
 		CHK(!!(A.have & CLMEMB_A_PSRELAY) == (n >= CLMEMB_ALIVE_LEN - 5), w);
-		/* S221 appended the epoch behind the reason, S314 the features
-		 * behind the epoch, 0.5.7.1 the sole witness behind those: each
-		 * appears where it always did, before the field after it */
+		/* each appended field appears where it always did, before the field after it */
 		CHK(!!(A.have & CLMEMB_A_REASON) == (n >= CLMEMB_ALIVE_LEN - 4), w);
 		CHK((n >= CLMEMB_ALIVE_LEN - 4) ? A.nreason == 1 : A.nreason == 0, w);
 		CHK(!!(A.have & CLMEMB_A_EPOCH) == (n >= CLMEMB_ALIVE_LEN - 3), w);
@@ -317,7 +289,7 @@ int main(void)
 				A.cols[CLMEMB_COLS_BEAT - 1].expired == COLS[(CLMEMB_COLS_BEAT - 1) * 7 + 6], w);
 		}
 	}
-	/* ---- S163: a shorter collection block is complete at ITS length ---- */
+	/* ---- a shorter collection block is complete at ITS length ---- */
 	{
 		struct clmemb_alive in = { 0 };
 		size_t len;
@@ -325,17 +297,15 @@ int main(void)
 		in.ps_port = 17600;
 		in.cols[0].hash = 0x1111; in.cols[0].hits = 5;
 		in.cols[1].hash = 0x2222; in.cols[1].expired = 9;
-		in.nreason = 1;                       /* S186: PC_NRE_WAL_DROP */
+		in.nreason = 1;                       /* PC_NRE_WAL_DROP */
 		len = clmemb_alive_write(b, sizeof b, 8, &in);
 		CHK(len == 88 + 56 * 2 + 15, "ALIVE with 2 collections is 215 bytes");
 		CHK(clmemb_alive_parse(b, len, &A) && (A.have & CLMEMB_A_COLS) &&
 			A.ncols == 2 && A.cols[1].hash == 0x2222 && A.cols[1].expired == 9 &&
 			A.cols[0].hits == 5 && (A.have & CLMEMB_A_PSRELAY) && A.ps_port == 17600,
 			"and parses whole at that length, relay port included");
-		/* S186, S221 then S314: the tail is [nreason][epoch][features],
-		 * and each is the first to go missing as the frame shortens - a
-		 * frame without one must read as "not sent", never as a value
-		 * invented here */
+		/* the tail is [nreason][epoch][features], each the first to go missing as the frame
+		 * shortens: a frame without one reads as "not sent", never as a value invented here */
 		CHK((A.have & CLMEMB_A_REASON) && A.nreason == 1 &&
 			(A.have & CLMEMB_A_EPOCH) && (A.have & CLMEMB_A_FEATURES),
 			"the state reason, the wire epoch and the features ride at the tail and parse");
@@ -360,14 +330,13 @@ int main(void)
 		CHK(clmemb_alive_parse(b, len - 16, &A) && !(A.have & CLMEMB_A_COLS) &&
 			!(A.have & CLMEMB_A_PSRELAY),
 			"sixteen short: the block is absent, not partial, and nothing after it is read");
-		/* an S163-era frame - the block, nothing after - leaves the relay
-		 * port absent rather than reading the block's bytes as one */
+		/* a frame of the block and nothing after leaves the relay port absent rather
+		 * than reading the block's bytes as one */
 		CHK(clmemb_alive_parse(b, len - 14, &A) && (A.have & CLMEMB_A_COLS) &&
 			!(A.have & CLMEMB_A_PSRELAY) && A.ps_port == 0,
 			"a frame from before the relay fields: no relay port is invented");
 	}
-	/* ---- AR11: the settings group - after the sole witness, only when
-	 * there is one, all or nothing ---- */
+	/* ---- the settings group: after the sole witness, only with one, all or nothing ---- */
 	{
 		struct clmemb_alive in = { 0 };
 		unsigned char p1[CLMEMB_ALIVE_MAX], p2[CLMEMB_ALIVE_MAX];
@@ -416,15 +385,15 @@ int main(void)
 		in.ncols = 16; in.ncols_total = 16; in.ncfg = CLMEMB_CFG_MAX;
 		CHK(clmemb_alive_write(p1, sizeof p1, 8, &in) == CLMEMB_ALIVE_CFGMAX,
 			"AR11: the longest frame without AT-4's group is CLMEMB_ALIVE_CFGMAX");
-		/* S469: 16 asked, CLMEMB_COLS_BEAT written - the rest go on later beats */
+		/* 16 asked, CLMEMB_COLS_BEAT written - the rest go on later beats */
 		CHK(clmemb_alive_parse(p1, CLMEMB_ALIVE_CFGMAX, &A) && A.ncols == CLMEMB_COLS_BEAT &&
 			A.ncols_total == 16, "S469: a frame carries CLMEMB_COLS_BEAT collections of 16");
 		p1[86] = CLMEMB_COLS_BEAT + 1;
 		CHK(clmemb_alive_parse(p1, CLMEMB_ALIVE_CFGMAX, &A) && !(A.have & CLMEMB_A_COLS),
 			"S469: a frame claiming more than CLMEMB_COLS_BEAT - no block");
 	}
-	/* ---- 12ny AT-4: the watermarks group - after the settings, their
-	 * count always before it, the pairs all or nothing ---- */
+	/* ---- the watermarks group: after the settings, their count always before it, the pairs
+	 * all or nothing ---- */
 	{
 		struct clmemb_alive in = { 0 };
 		unsigned char p1[CLMEMB_ALIVE_MAX], p2[CLMEMB_ALIVE_MAX];
@@ -436,7 +405,7 @@ int main(void)
 		in.sole_witness = 0x0102;
 		l0 = clmemb_alive_write(b, sizeof b, 8, &in);       /* no settings, no group */
 		in.ext = 1; in.features32 = 0x00000181u; in.nspaces = 12; in.nmarks = 3;
-		in.link_pct = 97; in.link_level = 2;                   /* S465 */
+		in.link_pct = 97; in.link_level = 2;
 		for (j = 0; j < 3; j++) {
 			in.marks[j].oid = 0x1000000000000000ULL + (uint64_t)j;
 			in.marks[j].incarn = 0xc0de0000u + (uint32_t)j;
@@ -478,7 +447,7 @@ int main(void)
 		CHK(clmemb_alive_parse(b, l0 + 1 + 16, &A) && A.ncfg == 2 &&
 			(A.have & CLMEMB_A_CFGSIG) && !(A.have & CLMEMB_A_FEAT32),
 			"AT-4: what an AR11 parser reads of it is the settings, as before");
-		/* without ext the frame is 0.7.2's to the byte */
+		/* without ext the frame is the pre-group one to the byte */
 		in.ext = 0;
 		n1 = clmemb_alive_write(p1, sizeof p1, 8, &in);
 		in.nmarks = 0;
@@ -534,8 +503,8 @@ int main(void)
 				M.cfg_digest == rd, w); }
 		CHK(!!(M.have & CLMEMB_M_TERM) == (n >= 39), w);
 		if (n >= 39) CHK(M.term == g32(b + 35), w);
-		/* S221: the epoch is the last byte, and a frame from a build
-		 * that predates it reads 0 - which is the grandfather case */
+		/* the epoch is the last byte, and a frame from a build that predates it
+		 * reads 0 - the grandfather case */
 		CHK(!!(M.have & CLMEMB_M_EPOCH) == (n >= 40), w);
 		CHK(M.epoch == (n >= 40 ? b[39] : 0), w);
 	}
@@ -550,7 +519,7 @@ int main(void)
 			in.tok = D[i]; in.mode = 3; in.eager = 1;
 			in.cfg_digest = D[(i + 3) % 6]; in.ident = ident;
 			in.proposed = 4097; in.incarn = 0x11223344; in.wal = 2;
-			in.epoch = (i % 3) + 1;        /* S221 */
+			in.epoch = (i % 3) + 1;
 			CHK(clmemb_joinreq_write(b, sizeof b, 4, &in) == CLMEMB_JOINREQ_LEN,
 				"joinreq length");
 		}
@@ -643,6 +612,25 @@ int main(void)
 			"a record one byte short is not present");
 		CHK(araw != 0x0A63000BU || praw != 7100,
 			"the test values are genuinely network order");
+		{       /* the trailer behind the records, unseen by a reader of the count */
+			unsigned char z[15 + 3 * 20 + CLMEMB_ASSIGN_TRAILER + 1];
+			struct clmemb_trailer tw = { CLMEMB_ASSIGN_CONNECT, 1, 3 }, tr;
+
+			memcpy(z, x, 15 + 3 * 20);
+			CHK(clmemb_trailer_write(z + 75, sizeof z - 75, &tw) == CLMEMB_ASSIGN_TRAILER,
+				"trailer length");
+			CHK(z[75] == CLMEMB_ASSIGN_CONNECT && z[76] == 1 && z[77] == 3, "trailer bytes");
+			CHK(clmemb_trailer_parse(z, 78, 3, &tr) && tr.flags == CLMEMB_ASSIGN_CONNECT &&
+				tr.part == 1 && tr.parts == 3, "trailer parses behind three records");
+			CHK(clmemb_assign_parse(z, 78, &A2) && A2.count == 3 &&
+				clmemb_member_at(z, 78, 2, &M2) && M2.node == 702 &&
+				!clmemb_member_at(z, 78, 3, &M2),
+				"an older joiner reads the three records and nothing behind them");
+			CHK(!clmemb_trailer_parse(x, sizeof x, 3, &tr) && !tr.flags,
+				"no trailer: none parsed, flags 0");
+			CHK(!clmemb_trailer_parse(z, 77, 3, &tr), "a trailer one byte short is not one");
+			CHK(clmemb_trailer_write(z, 2, &tw) == 0, "trailer: no room, nothing written");
+		}
 	}
 
 	/* ---- JOIN_WAIT / JOIN_REJ / GOODBYE ---------------------------- */
@@ -667,6 +655,29 @@ int main(void)
 			reason == 3, "JOIN_REJ reason present at 10");
 		CHK(clmemb_rej_parse(x, 9, &rt, &reason, &hr) && !hr &&
 			reason == 0, "a 9-byte JOIN_REJ has no reason");
+		{       /* JOIN_WAIT with a reason, and the reader that predates it */
+			unsigned char w[CLMEMB_WAIT_LEN + 2], e[CLMEMB_WAIT_LEN + 2];
+			struct clmemb_wait in = { CLMEMB_WAIT_QUEUED, 0xA1B2C3D4u, 4097, 37 }, out;
+
+			memset(w, 0xAA, sizeof w); memset(e, 0xAA, sizeof e);
+			e[0] = 23; memcpy(e + 1, &tok, 8); e[9] = CLMEMB_WAIT_QUEUED;
+			p32(e + 10, 0xA1B2C3D4u); p16(e + 14, 4097); p16(e + 16, 37);
+			CHK(clmemb_wait_write(w, sizeof w, 23, tok, &in) == CLMEMB_WAIT_LEN, "JOIN_WAIT with a reason: length");
+			CHK(memcmp(w, e, CLMEMB_WAIT_LEN) == 0, "JOIN_WAIT with a reason: bytes");
+			CHK(clmemb_wait_parse(w, CLMEMB_WAIT_LEN, &rt, &out) && rt == tok &&
+				out.reason == CLMEMB_WAIT_QUEUED && out.term == 0xA1B2C3D4u &&
+				out.node == 4097 && out.count == 37, "JOIN_WAIT with a reason: round trip");
+			CHK(clmemb_tok_parse(w, CLMEMB_WAIT_LEN, &rt) && rt == tok,
+				"an older joiner reads the token of a JOIN_WAIT with a reason");
+			CHK(clmemb_wait_parse(w, CLMEMB_TOK_LEN, &rt, &out) && rt == tok &&
+				out.reason == CLMEMB_WAIT_HELD && !out.term && !out.node && !out.count,
+				"a 9-byte JOIN_WAIT reads as HELD");
+			CHK(clmemb_wait_parse(w, CLMEMB_WAIT_LEN - 1, &rt, &out) && out.reason == CLMEMB_WAIT_HELD,
+				"a JOIN_WAIT short of 18 reads as HELD");
+			CHK(!clmemb_wait_parse(w, CLMEMB_TOK_LEN - 1, &rt, &out), "a JOIN_WAIT under 9 is refused");
+			CHK(clmemb_wait_write(w, CLMEMB_WAIT_LEN - 1, 23, tok, &in) == 0,
+				"JOIN_WAIT with a reason: no room, no frame");
+		}
 
 		memset(x, 0xAA, sizeof x); memset(y, 0xAA, sizeof y);
 		x[0] = 8; p16(x + 1, 4097); p32(x + 3, 0xA1B2C3D4u);
@@ -690,18 +701,8 @@ int main(void)
 		}
 	}
 
-	/* ---- short frames: nothing written, nothing read past the end --
-	 *
-	 * These exist because the cursor rewrite briefly had both faults.
-	 * A parser that reads its minimum field by field leaves the earlier
-	 * ones in *out behind a "no" return; and a cursor advanced past its
-	 * end computes a NEGATIVE remaining length that becomes SIZE_MAX
-	 * when cast, so every later fits() says yes.  Run under ASan the
-	 * second one is a heap overread on a zero-length frame.
-	 *
-	 * The buffers are sized EXACTLY to the short length - a short `n`
-	 * against a large buffer is not a short buffer, and ASan sees
-	 * nothing. */
+	/* ---- short frames: nothing written on a "no", nothing read past the end (a negative
+	 * remaining length cast to SIZE_MAX); buffers sized EXACTLY so ASan sees it ---- */
 	{
 		struct clmemb_alive A3;
 		struct clmemb_malive M3;

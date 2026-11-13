@@ -1,16 +1,5 @@
-/* clapplytest.c - S217: the sharded apply rings, without a daemon.
- *
- * Asserted:
- *  - every record reaches exactly one thread, and every record of a key
- *    reaches the SAME thread, in the order it was pushed (versions never
- *    go backwards per key, and never repeat);
- *  - nothing is lost or duplicated across many times the ring's size, with
- *    record sizes that make the wrap marker land everywhere;
- *  - a slow consumer makes the producer WAIT (blocks counted), not drop;
- *  - a group is acked exactly once, after its last record, with the stored
- *    count the applies returned - whichever threads applied them;
- *  - an oversized record is refused up front (the caller applies inline).
- */
+/* clapplytest.c - the sharded apply rings: a key's records reach one thread in push order, none lost
+ * or doubled across wraps, a slow consumer makes the producer wait, a group acked once. */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,10 +183,8 @@ int main(void)
 		"a slow consumer made the producer wait %llu time(s) - and drop nothing", sum_blocks);
 	r.vlen = CLAPPLY_RING_SZ;
 	CHK(clapply_push(&A, &r, NULL) == -1, "a record the ring can never hold is refused up front");
-	/* the deadlock the first cut had: an EMPTY ring whose tail sits past
-	 * the middle, and a record bigger than what is left before the end
-	 * AND bigger than tail - the old wrap condition (head > need)
-	 * could never hold and the consumer had nothing to move for */
+	/* an EMPTY ring whose tail sits past the middle and a record bigger than what is left before
+	 * the end AND bigger than tail must wrap, not wait for ever */
 	{
 		struct clapply B;
 		pthread_t t;
@@ -235,10 +222,8 @@ int main(void)
 		free(big);
 	}
 	clapply_free(&A);
-	/* S216 false STALLED (rc34, v0.4.5.2): busy_since_ms used to be the
-	 * caller's now_ms ARGUMENT, read before clapply_take() blocked, so
-	 * the first item after an idle gap was stamped as old as the gap.
-	 * The stamp must be the owner's clock at the take itself. */
+	/* busy_since_ms is the owner's clock at the take, not the caller's now_ms read before the take
+	 * blocked, which would stamp the first item after an idle gap as old as the gap */
 	{
 		struct clapply S;
 		struct clapply_item it;

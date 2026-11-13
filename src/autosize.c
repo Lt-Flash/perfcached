@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * autosize.c - the tables' sizing, from the maintenance thread: S150 D's
- * shrink after a quiet cool-off, S239's advice (what AUTO would do,
- * published in every mode, said under WARN), S328's floor.  Moved from
- * daemon.c unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md); the
- * splitter and the leg drain stay in the maintenance loop.
- */
+/* autosize.c - the tables' sizing, from the maintenance thread: the shrink after a quiet cool-off,
+ * the advice (what AUTO would do, published in every mode), and the floor */
 #include <stdio.h>
 #include <string.h>
 #include "compat/dprint.h"
@@ -15,19 +10,12 @@
 #include "store.h"
 #include "autosize.h"
 
-/* S150 D: the other half of the splitter.  A table that sits below
- * shrink_at_pct of its slot capacity, and has neither split nor been
- * resized nor started within the cool-off, is resized DOWN - by the S69
- * migration, to the size that puts it midway between the two thresholds
- * so one copy lands it where neither fires - and never below one
- * segment, the floor a table always carves.  The old index then goes
- * back to the arena (steps B and C).  Local, like the splitter: each node
- * sizes what it holds. */
+/* a shrink's target sits midway between the thresholds, so one copy lands it where neither fires;
+ * never below one segment.  Local: each node sizes what it holds. */
 static unsigned int col_quiet_since[PC_MAX_COLLECTIONS];
 static unsigned long long col_seen_pub[PC_MAX_COLLECTIONS];
 
-/* S328: the modes that size the table by its keys - AUTO, and FLOOR,
- * which is AUTO that never shrinks below the operator's size */
+/* FLOOR is AUTO that never shrinks below the configured size */
 int as_sizes(int i)
 {
 	int m = pc_store_autoscale(i);
@@ -35,8 +23,8 @@ int as_sizes(int i)
 	return m == PC_AUTOSCALE_AUTO || m == PC_AUTOSCALE_FLOOR;
 }
 
-/* S328: the smallest log2 size a shrink may pick: one segment, or under
- * FLOOR the size the operator gave the collection, whichever is larger */
+/* the smallest log2 size a shrink may pick: one segment, or under
+ * FLOOR the size configured for the collection, whichever is larger */
 static unsigned int shrink_lowest(int i)
 {
 	int fl = pc_store_autoscale(i) == PC_AUTOSCALE_FLOOR ?
@@ -68,7 +56,7 @@ void shrink_consider(int i, pcache_htable_t *cht, unsigned int now,
 		return;
 	nb = pcache_ht_nbuckets(cht);
 	if (nb <= (1U << lo))
-		return;                    /* one segment, or (S328) the floor */
+		return;                    /* one segment, or the floor */
 	pcache_ht_totals(cht, &tot);
 	if (tot.entries * 100 >=
 	    (unsigned long long)pc_shrink_at_pct * PCACHE_SLOTS * nb)
@@ -95,16 +83,8 @@ void shrink_consider(int i, pcache_htable_t *cht, unsigned int now,
 	}
 }
 
-/*
- * S239: what AUTO would do with table @i, as a log2 bucket count - 0 when
- * it would leave it.  Grow: entries past grow_at_pct of the slots.  Shrink:
- * below shrink_at_pct, and more than one segment.  Either way the target
- * is the size midway between the two thresholds, as shrink_consider picks
- * it.  Published for /stats, /metrics and the page, every mode.  Under
- * WARN it is also said in the log - the first time at once (the boot
- * clock starts at 0, S242's lesson), then at most every ten minutes, and
- * again whenever the target changes.
- */
+/* log2 buckets, 0 = leave it; the WARN log comes at once the first time (the boot clock starts at
+ * 0), then at most every ten minutes or when the target changes */
 static unsigned int as_warned_at[PC_MAX_COLLECTIONS];
 static int as_warned_t[PC_MAX_COLLECTIONS];
 

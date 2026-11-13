@@ -541,6 +541,8 @@ static __thread int shadow_reads;      /* S331: pcache_ht_shadow_reads */
  * 2026-10-07: the SBC was blocking from fetched keys while the page showed
  * 0 hits), and the companion a miss for every lookup of its parent. */
 static __thread int ht_nostat;
+static __thread pcache_htable_t *relay_ht;        /* S490: pcache_ht_set_relay */
+static __thread const struct pcache_relay *relay_rl;
 
 static void drain_carry(pcache_htable_t *ht, const str *key);
 static void drain_forget(pcache_htable_t *ht, const str *key);
@@ -591,6 +593,45 @@ static int fetch_main(pcache_htable_t *ht, const str *key,
 	return rc;
 }
 
+/* S490: @key in this thread's relay for @ht, answered as fetch_core
+ * answers a record (no integer: a copy is never a native counter) */
+static int relay_fetch(pcache_htable_t *ht, const str *key, char *dst,
+		unsigned int dstlen, unsigned int *vlen_out, unsigned int now,
+		unsigned int *exp_out, unsigned char *fl_out,
+		unsigned long long *ver_out)
+{
+	const struct pcache_relay *r;
+
+	if (ht != relay_ht)
+		return -2;
+	for (r = relay_rl; r; r = r->next)
+		if (r->key.len == key->len &&
+		    !memcmp(r->key.s, key->s, (size_t)key->len))
+			break;
+	if (!r)
+		return -2;
+	if (exp_out)
+		*exp_out = r->exp;
+	if (r->exp && r->exp <= now)
+		return -2;
+	if (fl_out)
+		*fl_out = r->fl;
+	if (ver_out)
+		*ver_out = r->ver;
+	*vlen_out = (unsigned int)r->val.len;
+	if (dst && dstlen < (unsigned int)r->val.len)
+		return PCACHE_E_TOOSMALL;
+	if (dst && r->val.len)
+		memcpy(dst, r->val.s, (size_t)r->val.len);
+	return 0;
+}
+
+void pcache_ht_set_relay(pcache_htable_t *ht, const struct pcache_relay *r)
+{
+	relay_ht = r ? ht : NULL;
+	relay_rl = r;
+}
+
 /* S331: the read every fetch, probe and copy-out takes.  A table with an
  * upstream shadow reads a miss from the shadow: a fetched copy answers
  * like a record of this table, and a marker (absent upstream, or a type
@@ -619,6 +660,9 @@ static int pcache_ht_fetch_buf_inner(pcache_htable_t *ht, const str *key,
 		if (rc != -2)
 			break;
 	}
+	if (rc == -2)
+		rc = relay_fetch(ht, key, dst, dstlen, vlen_out, now, exp_out,
+			&fl, ver_out);
 	ht_nostat--;
 	if (rc >= 0 && ((fl & PCACHE_F_UPMARK) ||
 	    (ht->shadow_ok && !ht->shadow_ok(ht->shadow_ctx, key)))) {
@@ -686,6 +730,9 @@ int pcache_ht_probe_present(pcache_htable_t *ht, const str *key,
 	        __ATOMIC_ACQUIRE))                      /* S382: the chain */
 		rc = fetch_core(sh, key, b, sizeof b, &len, get_ticks(), &e,
 			NULL, &fl, NULL);
+	if (rc == -2)
+		rc = relay_fetch(ht, key, b, sizeof b, &len, get_ticks(), &e,
+			&fl, NULL);
 	ht_nostat--;
 	if (rc < 0 || !(fl & PCACHE_F_UPMARK) || len < 2 ||
 	    b[0] != PCACHE_UPMARK_PRESENT)
@@ -1358,6 +1405,31 @@ static inline unsigned long long ver_local(const pcache_rec_t *old)
 		v = old->ver + 1;
 	return v;
 }
+/* @use_ver VER_TIE: a peer's copy at OUR version with other bytes - two writers
+ * stamped one Lamport value.  The greater (type, bytes, length) wins on every node */
+#define VER_TIE 2
+static int tie_wins(const pcache_rec_t *old, const str *key, const str *val,
+		unsigned char rflags)
+{
+	const char *ob = old->data + key->len;
+	unsigned int ol = old->vlen, n;
+	char nb[24];
+	long long ll;
+	int c = (int)(rflags & PCACHE_F_CARRY) - (int)(old->rflags & PCACHE_F_CARRY);
+
+	if ((old->rflags & PCACHE_F_INT) && ol == 8) {
+		memcpy(&ll, ob, 8);            /* a native counter goes out as its text */
+		ol = (unsigned int)snprintf(nb, sizeof nb, "%lld", ll);
+		ob = nb;
+	}
+	n = ol < (unsigned int)val->len ? ol : (unsigned int)val->len;
+	if (!c && n)
+		c = memcmp(val->s, ob, n);
+	if (!c)
+		c = (int)((unsigned int)val->len > ol) - (int)((unsigned int)val->len < ol);
+	return c > 0;
+}
+
 static int store_body(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned int expires, unsigned char rflags,
 		unsigned long long inver, int use_ver, int keep_wt,
@@ -1442,7 +1514,8 @@ again:
 	if (i >= 0) {
 		old = w->slot[i];
 
-		if (use_ver && old->ver >= inver) {
+		if (use_ver && (old->ver > inver || (old->ver == inver &&
+		        !(use_ver == VER_TIE && tie_wins(old, key, val, rflags))))) {
 			/* our copy is the same age or newer: the sender is
 			 * behind.  Say so rather than storing - this is the
 			 * whole point of carrying a version. */
@@ -1606,6 +1679,13 @@ int pcache_ht_store_ver(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned long long ver)
 {
 	return store_impl(ht, key, val, expires, rflags, ver, 1, 0, 0);
+}
+
+int pcache_ht_store_peer(pcache_htable_t *ht, const str *key, const str *val,
+		unsigned int expires, unsigned char rflags,
+		unsigned long long ver)
+{
+	return store_impl(ht, key, val, expires, rflags, ver, VER_TIE, 0, 0);
 }
 
 /* PERFCACHED LOCAL MOD (S275): store_ver() for a record MOVED between
@@ -3824,6 +3904,37 @@ int pcache_htable_selftest(void)
 		HCHK(rc == 0 && out.len == 10 && !memcmp(out.s, "newer-copy", 10),
 			"the newer copy did not replace the value\n");
 		pkg_free(out.s);
+
+		/* eager ties (store_peer): one version, other bytes - the greater
+		 * bytes, then the longer, win in either order; equal bytes are refused */
+		{
+			str lo = { "tie-bb", 6 }, mid = { "tie-bbb", 7 }, hi = { "tie-bbc", 7 };
+			str ka = { "tie-a", 5 }, kb = { "tie-b", 5 }, kc = { "tie-c", 5 };
+
+			HCHK(pcache_ht_store_peer(ht, &ka, &mid, 0, PCACHE_F_PASSIVE, 500) == 0 &&
+			     pcache_ht_store_peer(ht, &ka, &hi, 0, PCACHE_F_PASSIVE, 500) == 0 &&
+			     pcache_ht_store_peer(ht, &ka, &hi, 0, PCACHE_F_PASSIVE, 500) == PCACHE_E_OLDER &&
+			     pcache_ht_store_peer(ht, &kb, &hi, 0, PCACHE_F_PASSIVE, 500) == 0 &&
+			     pcache_ht_store_peer(ht, &kb, &mid, 0, PCACHE_F_PASSIVE, 500) == PCACHE_E_OLDER &&
+			     pcache_ht_store_peer(ht, &kc, &lo, 0, PCACHE_F_PASSIVE, 500) == 0 &&
+			     pcache_ht_store_peer(ht, &kc, &mid, 0, PCACHE_F_PASSIVE, 500) == 0 &&
+			     pcache_ht_store_peer(ht, &kc, &lo, 0, PCACHE_F_PASSIVE, 500) == PCACHE_E_OLDER,
+				"an eager tie did not go to the same copy in both orders\n");
+			HCHK(pcache_ht_fetch(ht, &ka, &out) == 0 && out.len == 7 &&
+			     !memcmp(out.s, "tie-bbc", 7), "tie-a holds the losing copy\n");
+			pkg_free(out.s);
+			HCHK(pcache_ht_fetch(ht, &kb, &out) == 0 && out.len == 7 &&
+			     !memcmp(out.s, "tie-bbc", 7), "tie-b holds the losing copy\n");
+			pkg_free(out.s);
+			HCHK(pcache_ht_fetch(ht, &kc, &out) == 0 && out.len == 7 &&
+			     !memcmp(out.s, "tie-bbb", 7), "tie-c holds the shorter copy\n");
+			pkg_free(out.s);
+			HCHK(pcache_ht_store_ver(ht, &kc, &hi, 0, 0, 500) == PCACHE_E_OLDER,
+				"store_ver took an equal version: only store_peer breaks ties\n");
+			/* out again: the walks below count the table's entries */
+			HCHK(pcache_ht_remove(ht, &ka) == 1 && pcache_ht_remove(ht, &kb) == 1 &&
+			     pcache_ht_remove(ht, &kc) == 1, "the tie keys did not go\n");
+		}
 
 		/* S244: drop_older() removes only a copy OLDER than the one
 		 * that could not land - never the current one, never as a

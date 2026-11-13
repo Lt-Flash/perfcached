@@ -1,9 +1,6 @@
 #!/bin/sh
-# gossiptest.sh - S78: a member record carries the peer's HTTP port and
-# uptime, gossiped in the heartbeat, so the fleet grid links to each
-# node's OWN door instead of guessing from location.port, and can show
-# per-node uptime.  Two nodes; only node 1 opens an HTTP door.
-# usage: test/gossiptest.sh [./perfcached] [./perfcli]
+# gossiptest.sh - a member record gossips the peer's HTTP port and uptime, so the fleet grid links
+# to each node's OWN door; two nodes, only node 1 opens an HTTP door.
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -12,10 +9,8 @@ SEC=gs-client-secret
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a
+# reused pid never hits a stranger; the name-bound pattern stays as a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -68,7 +63,13 @@ mk 1 "http = 127.0.57.1:19981"
 mk 2 ""
 start 1 || { echo "node 1 did not start"; exit 1; }
 start 2 || { echo "node 2 did not start"; exit 1; }
-sleep 3.5
+# a joiner is CONNECTING until its links answer: wait for both ready and seeing each other
+st() { "$CLI" -h 127.0.57.$1 -p 1798$1 -a $SEC -q -j '{"method":"stats"}' 2>/dev/null \
+	| python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1)" != "ready 1" ] || [ "$(st 2)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 M2=$(members 2)
 H=$(field "$M2" 127.0.57.1 http)
 [ "$H" = 19981 ] && ok "node 2 learned node 1's HTTP door from the heartbeat (http=$H)" \
@@ -84,7 +85,7 @@ H2=$(field "$M1" 127.0.57.2 http)
 	|| bad "node 1 sees node 2's http as '$H2' (want 0)"
 S1=$(field "$M1" 127.0.57.1 http)
 [ "$S1" = 19981 ] && ok "the self record carries its own door" || bad "self http='$S1'"
-# S88: on a store-mode fleet a single node's listing says it is one node's share
+# on a store-mode fleet a single node's listing says it is one node's share
 "$CLI" -h 127.0.57.1 -p 17981 -a $SEC -q set c k1 v1 >/dev/null 2>&1
 K=$("$CLI" -h 127.0.57.1 -p 17981 -a $SEC -q keys c 2>/dev/null | python3 -c '
 import json,sys; d=json.load(sys.stdin); print("ok" if d.get("complete") is False and d.get("scope")=="node" else "bad:%s"%str(d)[:120])')

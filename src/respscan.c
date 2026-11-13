@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respscan.c - the RESP door's keyspace walk: KEYS, cooperative and
- * bounded by time per turn (pc_keys_chunk, S292; proto.c drives it), and
- * SCAN, about COUNT keys a reply (rh_scan), both over one walk callback.
- * Owns the KEYS turn budget.  Moved from verbs.c unchanged (the 0.7.2
- * split, wave 1 - doc/MODULARITY.md).
- */
+/* respscan.c - the RESP door's keyspace walk: KEYS, cooperative and time-bounded per turn
+ * (proto.c drives it), and SCAN, about COUNT keys a reply, over one walk callback. */
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -21,19 +16,15 @@
 #include "respout.h"
 #include "verbsint.h"
 
-/* RESP walker callbacks: bulk keys into the element scratch.  The RESP
- * door's own walk state - its writer is the RESP text writer, where the
- * native door's (scan_ctx) is the tree's. */
+/* the RESP door's walk state: bulk keys into the element scratch with the RESP text writer
+ * (the native door's scan_ctx writes the tree) */
 struct resp_scan_ctx {
 	struct pc_jw *w;
 	const char *pat;
 	int patlen;                        /* <0 = no pattern */
 	int emitted;
-	int scanned;                       /* keys VISITED, pre-filter: the
-	                                    * SCAN yield loop bounds on this,
-	                                    * never on emitted - a rare MATCH
-	                                    * must not walk the table in one
-	                                    * call (the stall S40 forbids) */
+	int scanned;                       /* keys VISITED, pre-filter: SCAN bounds on this, so a
+	                                    * rare MATCH cannot walk the whole table in one call */
 	int limit;
 	int stopped;                       /* limit reached mid-walk */
 	unsigned int now;
@@ -69,17 +60,8 @@ static long long keys_mono_ns(void)
 	return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-/* S292: a turn walks by TIME, not by a bucket count.  1,024 buckets a
- * turn made a walk's turn count scale with the table's SIZE: a sparse
- * 131,072-bucket table took 128 turns, each as long as everything else
- * the worker served in it, so the KEYS caller waited 128 busy turns for
- * a walk that costs well under a millisecond.  Now a turn walks its
- * floor of 1,024 buckets and then goes on in steps of PC_KEYS_STEP while
- * the turn has spent less than [daemon] keys_turn_us - a sparse table ends
- * in a turn or two, and a dense one still yields after about the budget
- * (or the floor, whichever costs more), which is the stall bound the
- * cooperative walk exists for.  The step is 256 rather than 64 because
- * each pc_store_scan call also looks the table up in the registry. */
+/* A turn walks by TIME, not buckets: the floor, then steps while under [daemon] keys_turn_us, so
+ * a sparse table ends in a turn or two.  Each step does a registry lookup, hence 256 not 64. */
 #define PC_KEYS_FLOOR      1024
 #define PC_KEYS_STEP       256
 static long long keys_budget_ns = PC_KEYS_TURN_US_DEFAULT * 1000LL;
@@ -106,7 +88,7 @@ int pc_keys_chunk(void *htv, unsigned int *cursor, const char *pat,
 	sc.emitted = *emitted;
 	sc.limit = limit;
 	for (;;) {
-		pc_store_scan(ht, cursor, step, PCACHE_SCAN_NOVAL,  /* S257 */
+		pc_store_scan(ht, cursor, step, PCACHE_SCAN_NOVAL,
 			resp_keys_cb, &sc);
 		if (!*cursor || sc.stopped || w->overflow ||
 		        keys_mono_ns() - t0 >= keys_budget_ns)
@@ -164,37 +146,21 @@ int rh_scan(struct resp_ctx *c)
 	if (sc.patlen < 0)
 		sc.pat = NULL;
 	cursor = (unsigned int)cur;
-	/* Yield like Redis: ~COUNT KEYS per reply, not COUNT buckets.
-	 * Measured against redis 8 on an identical dataset: it
-	 * returns ~COUNT keys per call (exactly 1000.0 at COUNT
-	 * 1000), while a single bucket-budget walk returns COUNT x
-	 * density - 27% more round trips at density 0.76, which was
-	 * the whole remaining sweep deficit.  The loop bounds on
-	 * keys SCANNED, never on keys matched, and on a hard bucket
-	 * cap, so neither a sparse table nor a rare MATCH can turn
-	 * one call into the full-table stall S40 exists to prevent.
-	 * (Redis behaves the same way: its MATCH calls can return
-	 * empty.) */
+	/* Yield like Redis: ~COUNT KEYS per reply, not COUNT buckets.  The loop bounds on keys
+	 * SCANNED and a 16x bucket cap, so no sparse table or rare MATCH stalls the worker. */
 	{
 		unsigned int visited = 0, budget = (unsigned int)count;
 		unsigned int chunk = (unsigned int)count;
 
 		while (visited < budget * 16) {
-			pc_store_scan(c->ht, &cursor, chunk,       /* S257 */
+			pc_store_scan(c->ht, &cursor, chunk,
 				PCACHE_SCAN_NOVAL, resp_keys_cb, &sc);
 			visited += chunk;
 			if (!cursor || ew.overflow ||
 			        sc.scanned >= (int)budget)
 				break;
-			/* Size the next chunk from the density this
-			 * call just measured, so the reply lands NEAR
-			 * count instead of overshooting by up to a
-			 * whole chunk (~1515 keys for COUNT 1000 at
-			 * density 0.76, and the fatter replies cost
-			 * more than the saved round trips on some
-			 * hosts).  An empty region so far means no
-			 * estimate: keep the full chunk and let the
-			 * 16x cap bound the walk. */
+			/* size the next chunk from the density just measured, so the reply
+			 * lands near COUNT; no estimate yet keeps the full chunk */
 			if (sc.scanned > 0) {
 				unsigned long long want =
 					(unsigned long long)

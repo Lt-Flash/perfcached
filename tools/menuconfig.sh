@@ -1,32 +1,6 @@
 #!/bin/sh
-# menuconfig.sh - S250: choose what `make` builds, and write config.mk.
-#
-#   standalone - the cache alone: no cluster code linked, a [cluster]
-#                section in the config is refused
-#   clustered  - everything (eager, store, shard, proxy, spread); the
-#                default when there is no config.mk
-#
-# and (S282) which allocator it links:
-#   libc      the C library's own malloc - the default
-#   mimalloc  mimalloc 2.x, linked ahead of the C library
-#   jemalloc  jemalloc, the same way
-# The C library itself is not asked: it is the toolchain's (Debian's gcc
-# = glibc, Alpine's = musl), and the menu says which one it found.
-#
-# and (S357) the build flavor:
-#   release   -O2 -g - the default, and what the packages ship
-#   debug     -Og -g3, frame pointers, the arena's consistency checks
-#   asan      debug + AddressSanitizer/UBSan, runtimes linked statically
-#             (glibc toolchains only: the sanitizers do not support musl)
-#
-# and (S352) the alert mailer's transport:
-#   none      no SMTP client; a [mail] section is refused - the default
-#   libcurl   curl's SMTP client (STARTTLS/TLS, AUTH); needs libcurl's
-#             development files (libcurl4-openssl-dev, Alpine curl-dev)
-#
-# Uses whiptail or dialog when present, plain prompts otherwise, so it
-# works over ssh and in a minimal build container alike.  Non-interactive:
-#   sh tools/menuconfig.sh standalone|clustered [libc|mimalloc|jemalloc] [release|debug|asan] [none|libcurl]
+# menuconfig.sh - choose what `make` builds and write config.mk; non-interactive:
+# sh tools/menuconfig.sh standalone|clustered [libc|mimalloc|jemalloc] [release|debug|asan] [none|libcurl]
 set -u
 CFG=config.mk
 cur=clustered
@@ -81,7 +55,7 @@ if [ -z "$choice" ]; then
 fi
 case "$choice" in standalone|clustered) ;; *) echo "menuconfig: '$choice' - want standalone or clustered"; exit 1;; esac
 
-# ---- S282: the allocator ---------------------------------------------------
+# ---- the allocator ---------------------------------------------------------
 if [ -z "$alloc" ] && [ -n "${1:-}" ]; then
 	alloc=$acur                    # non-interactive, edition only: keep it
 fi
@@ -114,7 +88,7 @@ mimalloc) [ $HAVE_MI = yes ] || { echo "menuconfig: mimalloc 2.x is not installe
 jemalloc) [ $HAVE_JE = yes ] || { echo "menuconfig: jemalloc is not installed (Alpine: apk add jemalloc; Debian: libjemalloc2)"; exit 1; };;
 *) echo "menuconfig: '$alloc' - want libc, mimalloc or jemalloc"; exit 1;;
 esac
-# ---- S357: the build flavor --------------------------------------------------
+# ---- the build flavor ------------------------------------------------------
 if [ -z "$flavor" ] && [ -n "${1:-}" ]; then
 	flavor=$bcur                   # non-interactive without it: keep it
 fi
@@ -146,7 +120,7 @@ release|debug) ;;
 asan) [ "$LIBC" != musl ] || { echo "menuconfig: asan needs a glibc toolchain - this one links musl"; exit 1; };;
 *) echo "menuconfig: '$flavor' - want release, debug or asan"; exit 1;;
 esac
-# ---- S352: the mail transport -------------------------------------------------
+# ---- the mail transport ----------------------------------------------------
 if [ -z "$mail" ] && [ -n "${1:-}" ]; then
 	mail=$mcur                     # non-interactive without it: keep it
 fi

@@ -1,20 +1,6 @@
 #!/bin/sh
-# colnametest.sh - S343: one collection-name rule - 1-32 characters of
-# A-Z a-z 0-9 _ -, not starting with '-' - for whatever ORIGINATES a name.
-#
-# The config file always held names to it (less the leading '-'); the
-# runtime create/rename and a peer's announce took any bytes, so
-# create "<img src=x onerror=...>" was accepted, replicated to every member
-# and persisted (the operator, 2026-10-07: "introduce collection name checks
-# and min/max length so nobody would be able to inject some XSS").
-#  1. config: [collection -x] is refused by -C (the old check allowed it);
-#  2. create/rename: markup, 33 characters, a .nofall name, a space, a
-#     leading '-', a dot - all refused with the rule's own words; a
-#     32-character name is accepted, and a rename INTO a bad name refused;
-#  3. a peer: node A carries a name from before the rule in its own
-#     collections file - KEPT there, said loudly - and announces it; node B
-#     refuses it, counts it (cluster.bad_col_names) and never creates it.
-# Usage: test/colnametest.sh [./perfcached]
+# colnametest.sh - one collection-name rule (1-32 of A-Z a-z 0-9 _ -, no leading '-') for whatever
+# originates a name: the config, create/rename, and a peer's announce.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -67,7 +53,7 @@ PYEOF
 }
 cols() { j "$1" collections | python3 -c "import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['result']['collections'])))"; }
 
-# 1. the config's own check, now the one rule
+# 1. the config's own check
 conf 9 17790
 printf '[collection -lead]\nbuckets_log2 = 8\n' >> "$D/n9.conf"
 OUT=$("$BIN" -C -f "$D/n9.conf" 2>&1); rc=$?

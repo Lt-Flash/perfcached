@@ -1,10 +1,6 @@
 #!/bin/sh
-# waluniformtest.sh - S73b: a fleet is uniform.  Every node logs a WAL or
-# none does; a node that disagrees is refused at the join with a message
-# that names the WAL posture, and never becomes a member.  Two WAL nodes
-# join each other, a third WAL node joins them, a node without [wal] does
-# not.
-# usage: test/waluniformtest.sh [./perfcached] [./perfcli]
+# waluniformtest.sh - a fleet is uniform: every node logs a WAL or none does; a node that disagrees is
+# refused at the join, naming the WAL posture, and never becomes a member.
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -12,10 +8,8 @@ D=$(mktemp -d /var/tmp/pcwu.XXXXXX)
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a reused pid
+# never hits a stranger; the name pattern is only a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -60,7 +54,7 @@ start() {
 	return 1
 }
 # await_members <n> <count> <secs>: poll node n's member count - a fixed
-# sleep sampled once is what GitHub's sanitized runner fails first
+# sleep sampled once fails first on a slow sanitized runner
 await_members() {
 	i=0
 	while [ $i -lt $(( $3 * 2 )) ]; do

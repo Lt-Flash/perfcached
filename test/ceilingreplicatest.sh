@@ -1,29 +1,6 @@
 #!/bin/sh
-# ceilingreplicatest.sh - RV-4c / S244: an eager replica at its arena
-# ceiling while its peers keep pushing to it.
-#
-# Measured first (DESIGN S244): a replica whose arena is full refuses
-# every newer copy of a key it already holds - the store needs a cell -
-# and goes on answering its OLD copy from memory, a local hit, so nothing
-# pulls: 5,000 of 5,000 overwritten keys read back the old value through
-# 12 repair cycles.  Now an overwrite that fits the cell it replaces lands
-# in place with no carve, and one that does not drops the older copy
-# (never a delete: no tombstone, nothing sent) so a read pulls.
-#
-# Three eager nodes; node 3 has a 16 MB arena, nodes 1 and 2 128 MB.
-#   1. 5,000 keys of ~1 KB through node 1; node 3 holds every one
-#   2. 35,000 more: node 3 reaches its ceiling (asserted - without it the
-#      rest proves nothing), and every key still reads through node 3
-#   3. k0000-k2499 overwritten, SAME size: node 3 answers the new value
-#      for all 2,500 (in place; counted apart inside nomem)
-#   4. k2500-k4999 overwritten, 3 KB: node 3 answers the new value for all
-#      2,500 and the old for none; it counts what it dropped
-#   5. the drops deleted nothing: node 2 holds all 2,500, node 1 all
-#      40,000, and node 3 planted no tombstone
-#   6. 30 s of repair cycles later node 3 still serves none of the old
-#      (S278: rc57 served it for 22 - a stale re-send took a freed cell)
-# FAIL-FIRST: rc44 serves the old value in 3 and 4 (5,000 of 5,000).
-# Usage: test/ceilingreplicatest.sh [./perfcached]
+# ceilingreplicatest.sh - an eager replica at its arena ceiling takes newer copies (in place, or by
+# dropping the old one so a read pulls) and deletes nothing.  Usage: test/ceilingreplicatest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -163,9 +140,8 @@ NA=$(reads 3 0 5000 A); NN=$(( $(reads 3 0 2500 B) + $(reads 3 2500 5000 L) ))
 	&& ok "30 s of repair cycles later: node 3 serves the old value for none, the new for all 5,000 (cycles $(st 3 'r["cluster"].get("repl_sweep_cycles", "?")'))" \
 	|| { bad "30 s later node 3 serves OLD $NA, new $NN of 5,000"
 	     echo "      node 3: $(st 3 '"older %s, tombstoned %s, nomem %s, dropped %s, below dropped %s, sweep cycles %s" % tuple(r["cluster"].get(x, "?") for x in ("recv_older", "recv_tombstoned", "recv_nomem", "recv_stale_dropped", "recv_below_dropped", "repl_sweep_cycles"))')"; }
-# S278: a stale re-send arriving after a drop is refused, not planted in
-# the freed cell; how many did depends on timing (rc57 GitLab check-asan
-# planted 22), so it is reported, and the assertion is the one above
+# a stale re-send after a drop is refused, not planted in the freed cell; the count depends on
+# timing, so it is reported only
 echo "  info copies refused as older than a dropped one: $(st 3 'r["cluster"].get("recv_below_dropped", "absent")')"
 echo "ceilingreplicatest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

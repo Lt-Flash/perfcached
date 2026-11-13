@@ -3,33 +3,13 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * pc_noise.h — Noise_NNpsk0_25519_ChaChaPoly_SHA256 over libsodium
- * (task S25').  The client and cluster planes both ride this; the daemon
- * is always the responder, clients the initiator.
- *
- * NNpsk0 message pattern:
- *     -> psk, e
- *     <- e, ee
- * No static keys (NN): a leaked long-term key cannot exist.  The PSK
- * (Argon2id of the principal password) authenticates; the ephemerals
- * give forward secrecy.  Wire, per connection:
- *     msg1  [key_id:1] [e.pub:32] [enc payload+tag]
- *     msg2            [e.pub:32] [enc payload+tag]
- * key_id is cleartext (selects the principal/PSK) and folded into the
- * prologue, so tampering with it breaks msg1's tag.
- *
- * All multi-byte lengths on the transport are little-endian (portability
- * rule).  Nothing here logs or holds a password beyond deriving its PSK.
- */
+/* pc_noise.h - Noise_NNpsk0_25519_ChaChaPoly_SHA256 over libsodium, client and cluster planes (the
+ * daemon responds); msg1 [key_id:1][e.pub:32][enc+tag], msg2 [e.pub:32][enc+tag], LE lengths */
 #ifndef PC_NOISE_H
 #define PC_NOISE_H
 
-/* S79: this header is exported to MIT consumers (tools/sync-libperfd.sh)
- * and must not reach across the licence boundary, not even for a
- * compiler attribute.  The one thing it took from pc_attr.h is spelled
- * out here; the guard keeps the two definitions from colliding in the
- * daemon's own build, where both headers are seen. */
+/* exported to MIT consumers, so pc_attr.h's one attribute is spelled out here; the guard
+ * keeps the two definitions from colliding in the daemon's own build */
 #ifndef PC_MUST_CHECK
 #if defined(__GNUC__)
 #define PC_MUST_CHECK __attribute__((warn_unused_result))
@@ -47,15 +27,15 @@
 #define PC_NOISE_MAXMSG  65535           /* Noise message ceiling */
 #define PC_NOISE_MAXPT   (PC_NOISE_MAXMSG - PC_NOISE_TAGLEN)
 
-/* principals: the key_id byte and the Argon2id context label */
+/* principals: the key_id byte (cleartext, folded into the prologue so tampering breaks msg1's
+ * tag) and the Argon2id context label */
 #define PC_PRIN_CLIENT   0
 #define PC_PRIN_CLUSTER  1
 
-/* the msg1 ENCRYPTED payload carries the client's protocol version as
- * its first byte - part of the handshake contract, shared with every
- * client implementation (perfcli, libperfd, the python interop rig) */
+/* the client's protocol version, the first byte of msg1's ENCRYPTED payload - part of
+ * the handshake contract every client implementation shares */
 #define PC_CLIENT_VER    0x01
-/* S468: msg1's next byte asks for plaintext after the handshake, msg2's next
+/* msg1's next byte asks for plaintext after the handshake, msg2's next
  * grants it; the client's first record, PC_HS_SWITCH, proves the keys */
 #define PC_HS_PLAIN      0x01
 #define PC_HS_SWITCH     "perfcached plaintext v1"
@@ -81,10 +61,8 @@ struct pc_handshake {
 	int     initiator;
 };
 
-/* PSK derivation: password + principal -> 32-byte PSK via Argon2id with
- * a deterministic per-principal salt (shared secret, so the salt cannot
- * be random).  Cost is paid ONCE (startup / per client process), never
- * per connection.  Returns 0, or -1 if Argon2id fails (OOM). */
+/* password + principal -> PSK via Argon2id, salt per principal (a shared secret cannot have a
+ * random one); paid once per process, never per connection.  0, or -1 if Argon2id fails (OOM) */
 PC_MUST_CHECK int pc_psk_derive(const char *password, size_t plen, int principal,
 		uint8_t psk[PC_NOISE_KEYLEN]);
 
@@ -106,9 +84,8 @@ PC_MUST_CHECK int pc_hs_read_msg2(struct pc_handshake *hs, const uint8_t *msg, s
 		uint8_t *payload, size_t *paylen,
 		struct pc_cipherstate *send, struct pc_cipherstate *recv);
 
-/* transport records (post-handshake): AEAD with an empty AD, 8-byte
- * counter nonce.  encrypt: out must hold ptlen+16.  decrypt: out must
- * hold ctlen-16.  Return the output length or -1 (bad tag). */
+/* post-handshake AEAD records, empty AD, 8-byte counter nonce; out holds ptlen+16 to encrypt,
+ * ctlen-16 to decrypt.  Return the output length or -1 (bad tag) */
 PC_MUST_CHECK int pc_transport_encrypt(struct pc_cipherstate *cs, const uint8_t *pt,
 		size_t ptlen, uint8_t *out);
 PC_MUST_CHECK int pc_transport_decrypt(struct pc_cipherstate *cs, const uint8_t *ct,

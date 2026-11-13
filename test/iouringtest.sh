@@ -1,34 +1,6 @@
 #!/bin/sh
-# iouringtest.sh - S361 (0.6.0) step 1: [daemon] io, the startup check and
-# the fallback to epoll.
-#  1. the default (io_uring): -C says what THIS host would run - usable
-#     (with its buffer tier) or not (with the reason); the daemon's start
-#     line, /stats io.backend and /metrics agree with it
-#  2. io = epoll: epoll, no fallback reason; S379 (0.6.1): the check still
-#     runs, and -C, the start line and /stats io.uring_usable say whether
-#     io_uring would run here - as the default's -C says - and, under
-#     PERFCACHED_URING_DENY=1, that it would not
-#  3. PERFCACHED_URING_DENY=1 makes the check refuse: the default falls
-#     back with a NOTICE, a configured io_uring with a WARNING; the reason
-#     is in /stats and /metrics says active="epoll"
-#  4. io = <anything else> is a config error; -E dumps the value
-#  6. a reply never reaches another connection: 1000 times, client A sends
-#     a request that is answered with an error and closes unread, and
-#     client B, connected straight after, must get exactly +PONG.  A queued
-#     SEND names its socket by fd NUMBER; if A's fd closed before the SQE
-#     was submitted, B's accept took the number and got A's reply (found by
-#     fuzztest on GitHub; the fix submits before the close)
-#  7. iowait (0.6.0.1): a ring wait with requests pending is counted as
-#     iowait, and a worker always has some (its connections' receives) - an
-#     idle node read ~97% PSI io pressure on 245-247 (kernel 7.0.6).  A
-#     kernel with IORING_FEAT_NO_IOWAIT (6.15+) is told not to; an older one
-#     cannot be, and the daemon says so.  The kernel's answer is probed here
-#     on its own and compared with /stats, the start line and -C
-#  5. on a usable host the workers RUN io_uring: every worker's ring is up,
-#     requests are served (RESP, pipelined and one at a time, a 200 KB value
-#     both ways), input arrives by receive completions and output leaves
-#     by sends (step 3) - no read(), no write()
-# Usage: test/iouringtest.sh ./perfcached
+# iouringtest.sh - [daemon] io: the io_uring startup check and epoll fallback, workers on io_uring,
+# iowait, and a queued reply never reaching a connection that reused the closed fd's number.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -233,7 +205,7 @@ fi
 PERFCACHED_URING_DENY=1 "$BIN" -C -f "$D/ex.conf" 2>/dev/null | grep -q "^io: epoll - io_uring is not usable on this host: refused by" &&
 	ok "3. -C reports the refusal" || bad "3. -C: $(PERFCACHED_URING_DENY=1 "$BIN" -C -f "$D/ex.conf" 2>&1 | grep io)"
 
-# ---- 7. iowait (0.6.0.1) ------------------------------------------------------------
+# ---- 7. iowait --------------------------------------------------------------------
 NOIOW=$(python3 -c 'import ctypes, os, struct
 libc = ctypes.CDLL(None, use_errno=True); p = ctypes.create_string_buffer(120)
 fd = libc.syscall(425, 4, p)                  # io_uring_setup, one number on every arch

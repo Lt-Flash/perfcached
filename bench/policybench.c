@@ -1,21 +1,5 @@
-/*
- * policybench.c — where do clients actually land?
- *
- * libperfd's spreading policies (S34) choose which node a handle works
- * through.  The question a table has to answer is not "does the code
- * run" but "where did N independent clients end up, and what did it
- * cost them", so this opens N handles under one policy, records the
- * node each one settled on, and drives the same work through every one.
- *
- * Clients are independent on purpose: round-robin picks a RANDOM start
- * per client precisely so a thousand of them spread without
- * coordinating, and that only shows up across many handles.
- *
- * usage: policybench <host> <port> <secret> <col> <policy> <clients> <ops>
- *        policy: failover | rr | leastconn | weighted
- * prints: policy=<name> spread=<n1:c1,n2:c2,...> distinct=<n>
- *         ops_per_s=<total> p50=<us>
- */
+/* policybench.c - where N independent clients land under one libperfd spreading policy, and at what
+ * cost.  usage: policybench <host> <port> <secret> <col> <failover|rr|leastconn|weighted> <clients> <ops> */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,9 +78,8 @@ int main(int argc, char **argv)
 		nodes[i] = perfd_active_node(h[i]);
 	}
 
-	/* interleave the clients so the work is spread in time as well as
-	 * across handles - a burst down one handle would measure that
-	 * handle, not the policy */
+	/* interleave the clients so the work is spread in time too - a burst down one handle would
+	 * measure that handle, not the policy */
 	n = 0;
 	t0 = now_s();
 	for (j = 0; j < ops; j++)

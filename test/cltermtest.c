@@ -1,19 +1,5 @@
-/*
- * cltermtest.c — the mastership term (control plane, step 2).
- *
- * The term exists to order maps issued by different masters.  Every
- * test here is a way that ordering could be lost:
- *   - a promoting node claiming from its own history instead of the
- *     fleet's, and so reissuing a term
- *   - a term acted on before it was persisted, and reissued after a
- *     restart with different content
- *   - a master ignoring a higher term and staying up, which is split
- *     brain by definition
- *   - one bad value taking the term somewhere nothing can out-term,
- *     after which the fleet can never elect a master again
- *
- * Build: cc -o cltermtest test/cltermtest.c src/clterm.o
- */
+/* cltermtest.c - the mastership term, which orders maps from different masters: claimed above the
+ * fleet, persisted before use, a higher term obeyed, and no poison value accepted. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,9 +83,8 @@ int main(void)
 			"is for nonsense, not for a long absence");
 	}
 
-	/* ---- 5b. plausible: the same bound, ours unmoved ---------------
-	 * for a claim weighed rather than folded in (a beacon's, a map's
-	 * before it is adopted) */
+	/* ---- 5b. plausible: the same bound, ours unmoved, for a claim weighed rather
+	 * than folded in (a beacon's, a map's before it is adopted) ------------- */
 	{
 		uint32_t cur = pc_term_current();
 		unsigned long long before = pc_term_rejected;
@@ -153,8 +138,8 @@ int main(void)
 			"silently forgets its term can reissue one");
 	}
 
-	/* ---- 9. S106: the legacy eight-byte form is read once and
-	 * rewritten as text, keeping the term ---------------------- */
+	/* ---- 9. the legacy eight-byte form is read once and rewritten as text,
+	 * keeping the term ------------------------------------------------------- */
 	{
 		char p[512], line[64] = "";
 		FILE *f;
@@ -178,8 +163,8 @@ int main(void)
 			pc_term_current());
 	}
 
-	/* ---- 10. S106: a text term whose check does not match refuses,
-	 * and so does a fourth line ---------------------------------- */
+	/* ---- 10. a text term whose check does not match refuses, and so does
+	 * a fourth line ---------------------------------------------------------- */
 	{
 		char p[512];
 		FILE *f;

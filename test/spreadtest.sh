@@ -1,28 +1,6 @@
 #!/bin/sh
-# spreadtest.sh — S127 Z2: `mode = spread` places each record on K nodes.
-#
-# THE CLAIM, and the only one this makes: a write reaches its K HOLDERS
-# and nobody else.  That is the whole reason the mode exists.  Under
-# eager every node applies every write in the fleet, so per-node apply
-# equals the fleet's total write rate and one node's apply path caps the
-# fleet however many nodes are added.  Under a copy factor the passive
-# work is (K-1)/P per node and FALLS as the fleet grows.  If the push
-# still went to every peer, the mode would be eager with extra config.
-#
-# HOW IT IS ASSERTED, and why not with `get`: under store and proxy a
-# get on a non-holder PULLS from a holder and keeps the copy; under
-# spread the copy is NOT kept (measured 2026-09-15: two full reads
-# through a non-holder pulled the same third twice, entries unchanged),
-# but the pull counters still move and a test that reads its own
-# observable is a test that can lie.  Per-collection `entries` from
-# /stats is pull-free, so the fleet-wide SUM of entries is the
-# observable: K*N under spread, P*N under eager.
-#
-# EAGER IS RUN AS THE CONTROL, in the same harness with the same keys.
-# Without it a broken push that dropped records would also read as
-# "fewer copies than eager" and pass.
-#
-# Usage: test/spreadtest.sh [./perfcached]
+# spreadtest.sh - `mode = spread` keeps each record on its K holders and nobody else, asserted by
+# the fleet-wide sum of pull-free /stats entries, with eager run as the control.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -116,6 +94,21 @@ except Exception:
     print(0); sys.exit(0)
 print(d.get("cluster", {}).get(sys.argv[2], 0))' "$1" "$2" 2>/dev/null || echo 0
 }
+spreadline() { # spreadline <http-port>: one node's copies and what its reclaim did
+	timeout 6 python3 -c '
+import json, sys, urllib.request
+try:
+    d = json.load(urllib.request.urlopen("http://127.0.0.1:%s/stats" % sys.argv[1], timeout=4))
+except Exception:
+    print("no stats"); sys.exit(0)
+c = d.get("cluster", {})
+e = [x.get("entries", 0) for x in d.get("collections", []) if x.get("name") == "b"]
+print("entries %s state %s role %s term %s peers_up %s | reclaimed %s possess sent %s kept %s | ack dropped %s kept %s lost %s short %s | not_held %s repaired %s" % (
+    e[0] if e else "-", d.get("state"), c.get("role"), c.get("term"), c.get("peers_up"),
+    *[c.get(k, "-") for k in ("spread_reclaimed", "spread_possess_sent", "spread_possess_kept",
+      "spread_ack_dropped", "spread_ack_kept", "spread_ack_lost", "spread_ack_short",
+      "spread_not_held", "spread_repaired")]))' "$1" 2>/dev/null
+}
 served_sum() { # fleet-wide pull requests RECEIVED
 	a=$(cstat 18401 pull_served); b=$(cstat 18402 pull_served)
 	c=$(cstat 18403 pull_served); d=$(cstat 18404 pull_served)
@@ -158,22 +151,8 @@ for line in sys.stdin:
     f.write(json.dumps(r).encode() + b"\n"); f.flush()
     f.readline(); n += 1
 print("wrote", n, file=sys.stderr)' 2>/dev/null
-	# WAIT FOR THE COUNT TO SETTLE, do not sleep a fixed time.  The
-	# gather groups flush on a timer and the repair sweep runs on its
-	# own period, so a fixed wait samples a moving number: the same arm
-	# read 240 once and 283 a moment earlier, and neither was wrong -
-	# the measurement was just taken mid-convergence.
-	#
-	# STABLE IS NOT CONVERGED, and that distinction turned v0.3.7-rc7
-	# red: the fleet sat at 283 for five consecutive samples, so the
-	# loop broke and the assertion failed - but 283 was simply the
-	# count BEFORE the reclaim pass fired, and reclaim needs the
-	# master's map plus ten sustained settle ticks.  Where the caller
-	# knows the total the arm is owed, wait for THAT and treat mere
-	# stability as no reason to stop early.  A fleet that never reaches
-	# it still falls out at the bound with its whole trajectory
-	# printed, so the assertion can still fail - including for an
-	# UNDER-replicated total, which must never be waited out.
+	# wait for the owed total, not a fixed time or a stable count: the reclaim pass fires late, and
+	# a fleet that never reaches it falls out at the bound with its trajectory printed
 	OWED=${3:-}
 	prev=-1; stable=0; w=0
 	while [ $w -lt 60 ]; do
@@ -211,11 +190,8 @@ stopall
 run_arm "mode = spread
 replicas = 2" "spread K=2" $(( NKEYS * 2 )) || { echo "spread arm failed"; exit 1; }
 K2=$SUM
-# THE NON-WRITER NODES are where the property is asserted, and the
-# arithmetic is worth writing down.  With K=2 of P=4 and every write
-# entering at node 1: node 1 is a holder for about half the keys, so of
-# the 2N copies the fleet owes, about N/2 land on node 1 and about
-# 3N/2 land on nodes 2-4.  For N=120 that is ~180 across the three.
+# non-writers: with K=2 of P=4 and every write entering at node 1, ~3N/2 of the 2N copies land
+# on nodes 2-4 (~180 for N=120)
 OTHERS=$(( ${E2:-0} + ${E3:-0} + ${E4:-0} ))
 WANT_OTHERS=$(( NKEYS * 3 / 2 ))
 LO=$(( WANT_OTHERS * 75 / 100 )); HI=$(( WANT_OTHERS * 125 / 100 ))
@@ -231,47 +207,27 @@ for e in "${E2:-0}" "${E3:-0}" "${E4:-0}"; do
 		|| bad "a non-writer holds $e of $NKEYS - placement collapsed"
 done
 
-# EXACT-K RETENTION, decided 2026-09-13.  A node that is not in the
-# top-K set may ACCEPT and FORWARD a write - any-member write is about
-# admission, not placement - but must not keep it.  Every client here
-# writes through node 1, so if non-holders retained, node 1 would hold
-# all N; it must instead hold only its placement share, ~N*K/P.
+# exact-K retention: a non-holder may accept and forward a write but must not keep it, so node 1
+# holds only its placement share, ~N*K/P
 WANT_W=$(( NKEYS * 2 / 4 ))
 WLO=$(( WANT_W * 60 / 100 )); WHI=$(( WANT_W * 140 / 100 ))
 [ "${E1:-0}" -ge "$WLO" ] && [ "${E1:-0}" -le "$WHI" ] \
 	&& ok "the writer keeps only its share, not everything (${E1} of $NKEYS, want ~$WANT_W)" \
 	|| bad "the writer holds ${E1:-?} of $NKEYS, expected $WLO..$WHI - non-holders are retaining"
 
-# EXACTLY K*N, now that the settled reclaim pass drops surplus copies.
-#
-# This was a lower bound with a TODO(S127-reclaim) while the converged
-# total was 240 or 283 depending on how membership happened to
-# converge.  Surplus was never merely wasted memory: a non-holder is
-# never sent subsequent writes (pc_repl_push targets the set) and a
-# local hit is served without consulting anyone (op_get_miss runs only
-# on a miss), so a surplus copy could serve STALE data until its TTL.
-#
-# Reclaim is a LOCAL, settled-only policy, not a receive-time refusal:
-# a receiver whose view has not converged refuses copies it should
-# hold, which was measured at 212 where 240 was owed.
+# exactly K*N: a surplus copy on a non-holder is never updated and would serve stale data until
+# its TTL; the settled reclaim pass drops it
 WANT_T=$(( NKEYS * 2 ))
 [ "$K2" = "$WANT_T" ] \
 	&& ok "the fleet holds EXACTLY K*N copies (sum $K2)" \
 	|| bad "fleet holds $K2, owes exactly $WANT_T ($([ "$K2" -gt "$WANT_T" ] && echo "surplus $(( K2 - WANT_T )) not reclaimed" || echo "UNDER-replicated"))"
 
-# The differential is the assertion that cannot be faked by a push that
-# simply drops records: eager and spread ran the same keys through the
-# same harness, and only the copy count differs.
+# the differential a push that drops records cannot fake: same keys, same harness, eager vs spread
 [ "$K2" -lt "$EAGER" ] && ok "spread stores strictly fewer copies than eager ($K2 < $EAGER)" \
 	|| bad "spread stored $K2 and eager $EAGER - the mode changed nothing"
 
-# ---- DROPPING MUST NOT LOSE DATA -------------------------------------
-# Node 1 accepted every write and kept only ~half.  Every key must still
-# be readable THROUGH IT: the ones it holds locally, the ones it has to
-# pull from a holder.  Counting copies proves the bound; this proves the
-# bound was achieved by placing records rather than by losing them.
-# It runs LAST because a get on a non-holder pulls and keeps a copy,
-# which would corrupt the entry counts above.
+# ---- DROPPING MUST NOT LOSE DATA: every key still reads through node 1 ---
+# runs last: a pull through a non-holder could leave a copy and skew the entry counts above
 SERVED0=$(served_sum)
 MISS=$(i=0; while [ $i -lt $NKEYS ]; do
 	printf '{"method":"get","params":{"col":"b","key":"sk%03d"}}\n' $i
@@ -295,10 +251,7 @@ print(miss)' 2>/dev/null)
 	|| bad "${MISS:-?} of $NKEYS keys are GONE - dropping lost data"
 
 # ---- READ AMPLIFICATION: a miss asks ONE holder, not everybody -------
-# pull_served counts every PULL_REQ a node RECEIVES, found or not.  A
-# broadcast miss therefore lands on all P-1 peers and a unicast miss on
-# exactly one, so the fleet-wide delta over a known number of misses is
-# the amplification factor - measured, not inferred from the code path.
+# pull_served counts every PULL_REQ received, so its fleet delta over known misses is the factor
 SERVED1=$(served_sum)
 DELTA=$(( SERVED1 - SERVED0 ))
 LOCALMISS=$(( NKEYS - ${E1:-0} ))
@@ -309,11 +262,7 @@ echo "  reads: $NKEYS through node 1, ~$LOCALMISS of them local misses; pull_ser
 	|| bad "delta $DELTA for ~$LOCALMISS misses - the miss is still broadcasting"
 
 # ---- EXACT-K MUST SURVIVE READS --------------------------------------
-# The read-back above pulled ~53 records THROUGH a node that is not
-# their holder.  If the pull path keeps them, the same orphan the write
-# path was taught to avoid comes back through the read door: node 1
-# would climb from its placement share to the whole keyspace, and the
-# fleet from K*N to something unbounded by K.
+# the read-back pulled through a non-holder; keeping those copies would climb past K*N
 A1=$(entries 18401); A2=$(entries 18402)
 A3=$(entries 18403); A4=$(entries 18404)
 ASUM=$(( ${A1:-0} + ${A2:-0} + ${A3:-0} + ${A4:-0} ))
@@ -323,13 +272,7 @@ echo "  after reading all $NKEYS through node 1: ${A1}/${A2}/${A3}/${A4} sum=$AS
 	|| bad "node 1 climbed ${E1} -> ${A1} by READING - the pull path retains on non-holders"
 
 # ---- THE ROUTING CONTRACT THE CLIENT READS ---------------------------
-# libperfd only routes for a mode it RECOGNISES and needs the copy
-# factor to know how many holders a key has.  Both travel in the stats
-# `routing` block, so if this is wrong every client silently stops
-# routing and pays a pull per read - correct, but the performance floor
-# S127 warned about.  (End-to-end client routing needs the Noise
-# handshake, which this harness cannot do with plaintext = loopback;
-# that arm belongs with Z6's fleet work.)
+# libperfd routes only for a mode it recognises, with the copy factor, both from stats `routing`
 RJ=$(cli 17401 '{"method":"members"}' | timeout 6 python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -342,13 +285,7 @@ set -- $RJ
 	|| bad "routing.replicas is [$2] - a client cannot know how many holders"
 
 # ---- THE GRACE PERIOD: a blip must not re-replicate the keyspace -----
-# Kill one node and watch the SURVIVORS.  Without a grace, the dead
-# node leaves the top-K set the moment it misses a heartbeat, a new
-# holder is promoted for every key it held, and the repair sweep copies
-# them there - a rebuild storm paid for a node that is coming back.
-# With the grace its slots are held, so the survivors' total must NOT
-# climb.  The trade is explicit: during the grace those keys have K-1
-# reachable copies instead of K.
+# kill node 4: its slots are held for the grace, so the survivors' total must not climb
 SURV0=$(( ${A1:-0} + ${A2:-0} + ${A3:-0} ))
 echo "  killing node 4 (held ${A4}); survivors hold $SURV0 (repairs so far: $(cstat 18401 spread_repaired)/$(cstat 18402 spread_repaired)/$(cstat 18403 spread_repaired))"
 kill -9 "$P4" 2>/dev/null; P4=
@@ -364,24 +301,15 @@ echo "  16s after the kill: ${G1}/${G2}/${G3} = $SURV1 (was $SURV0), repairs $(c
 	&& ok "a blip did not re-replicate: survivors $SURV0 -> $SURV1 (a storm would add ~${A4})" \
 	|| bad "survivors climbed $SURV0 -> $SURV1 - the grace is not holding the dead node's slots"
 
-# The counter, asserted directly rather than inferred from totals.  This
-# is what locks the footgun: peer_gone() zeroes ->node, and a
-# fingerprint that includes the node id therefore "changes" while the
-# grace is still holding the slot - arming a repair inside the window
-# the grace exists to create.  The fingerprint must hash what PLACEMENT
-# hashes (advertise address + cluster port), so it moves only when the
-# set moves.  Totals alone could not tell this apart from noise.
+# the repair fingerprint hashes what placement hashes (address + cluster port), not the node id
+# peer_gone() zeroes, so no repair arms inside the grace
 REP=$(( $(cstat 18401 spread_repaired) + $(cstat 18402 spread_repaired) + $(cstat 18403 spread_repaired) ))
 [ "$REP" = "0" ] \
 	&& ok "no repair was armed inside the grace (the set fingerprint held)" \
 	|| bad "$REP repair(s) armed inside the grace - the fingerprint is moving on something that is not the set"
 
 # ---- PAST THE GRACE: the set legitimately changes ---------------------
-# The grace holds a quiet node's slots for 30s past the liveness window.
-# Once it expires the departure is real, node 4's slots must go to the
-# survivors, and the fleet must return to K*N over three nodes.  This is
-# MEASURED rather than assumed: it tells us whether the existing repair
-# sweep already re-places the affected keys or whether Z4 must.
+# once the grace expires node 4's slots go to the survivors: K*N over three nodes
 w=0
 while [ $w -lt 14 ]; do
 	sleep 4; w=$((w+1))
@@ -397,17 +325,7 @@ echo "  after the grace: ${H1}/${H2}/${H3} = $SURV2 (want ~$WANT3 = K*N on three
 	|| bad "survivors stuck at $SURV2, want ~$WANT3 - a departed node's keys were NOT re-placed"
 
 # ---- THE NODE RETURNS: surplus must be RECLAIMED ---------------------
-# This is the case the whole reclaim pass exists for, and it is the
-# realistic one - a node is away and comes back, which is why its id is
-# reserved for a week.  While it was gone its keys were re-placed onto
-# survivors.  When it returns it is a holder again, those survivors are
-# NOT, and their copies are surplus: outside the set, so the repair
-# sweep neither maintains nor reclaims them, and a local hit would
-# serve them without ever being updated again.
-#
-# Nothing before this arm exercised reclaim at all: a clean convergence
-# produces no surplus, so the exact-K*N assertion above can pass without
-# the pass ever running.  This is the arm that makes it mean something.
+# its keys were re-placed on survivors whose copies are now surplus; only this arm exercises reclaim
 echo "  restarting node 4"
 start 4 4 || bad "node 4 did not come back"
 w=0
@@ -440,9 +358,7 @@ echo "  after the return: ${R1}/${R2}/${R3}/${R4} = $RSUM, reclaimed $RECL"
 	|| bad "fleet holds $RSUM, owes exactly $(( NKEYS * 2 ))"
 
 # ---- K=3 on the same fixture -----------------------------------------
-# S127 asks for K=2 and K=3.  The copy count is the property that must
-# track K: the same keys through the same harness must cost 3N copies
-# where K=2 cost 2N, or `replicas` is not doing what its name says.
+# the same keys must cost 3N copies where K=2 cost 2N
 stopall
 run_arm "mode = spread
 replicas = 3" "spread K=3" || { echo "K=3 arm failed"; exit 1; }
@@ -469,19 +385,12 @@ K3=$SUM
 stopall
 
 # ---- FIVE NODES, K=2 and K=3 -----------------------------------------
-# S127 asks for three- and five-node fleets at both copy factors.  Five
-# is not four plus one for a reason worth testing: with P=5 and K=2 the
-# writer is a holder for only 2/5 of the keyspace, so most writes are
-# accepted by a node that must forward and drop - the exact-K retention
-# path runs on the majority of writes rather than on half of them.
+# with P=5 the writer holds only K/5 of the keyspace, so most writes take the forward-and-drop path
 five() { # five <K>
 	stopall
 	block="mode = spread
 replicas = $1"
-	# NOT `i`: start() uses i as its own wait counter and POSIX sh has
-	# no locals, so looping `start $i $i` clobbers the index mid-loop.
-	# The symptom was three nodes never restarting while their STALE
-	# logs still said "ready", and a fleet reporting 0 peers.
+	# not `i`: start() uses i as its own wait counter and POSIX sh has no locals
 	nn=1
 	while [ $nn -le 5 ]; do
 		node $nn $((17400 + nn)) $((18400 + nn)) "$block"
@@ -532,10 +441,17 @@ for line in sys.stdin:
 		[ "$t" = "$want" ] && break
 		sleep 3; j=$((j + 1))
 	done
-	echo "  five nodes K=$1: sum=$t (owed $want)"
-	[ "$t" = "$want" ] \
-		&& ok "five nodes at K=$1 hold exactly K*N ($t)" \
-		|| bad "five nodes at K=$1 hold $t, owe exactly $want"
+	echo "  five nodes K=$1: sum=$t (owed $want) after $((j * 3)) s"
+	if [ "$t" = "$want" ]; then
+		ok "five nodes at K=$1 hold exactly K*N ($t, in $((j * 3)) s)"
+	else
+		bad "five nodes at K=$1 hold $t, owe exactly $want"
+		# which node holds the surplus, and whether its reclaim asked at all
+		for L in 1 2 3 4 5; do
+			echo "    node $L: $(spreadline $((18400 + L)))"
+			grep -iE "reclaim|spread|map |grace|recover|setrepair|backfill" "$D/n$L.log" 2>/dev/null | tail -6 | cut -c1-200 | sed 's/^/      /'
+		done
+	fi
 	stopall
 }
 five 2

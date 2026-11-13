@@ -1,26 +1,5 @@
-/* autosizetest.c - the tables' sizing (autosize.c; the 0.7.2 split, wave
- * 1): shrink_consider and autoscale_advise against stubbed tables (a
- * bucket count and a record count) and a stubbed store; the log kept.
- * Each case its own collection index, so the per-table clocks start clean.
- * With 6 slots a bucket, grow at 75%, shrink at 18%, the target is the
- * size that puts the table at the midpoint, 46%.
- *
- *   A  the shrink: a first sighting starts the cool-off; a second short
- *      of it, nothing; at it, a 2^16 table holding 10,000 records goes to
- *      2^12 - the smallest at or under the midpoint - said, the cool-off
- *      restarted; a split, a new incarnation, a resize under way each
- *      restart or hold it
- *   B  no shrink: above shrink_at_pct; one segment already; shrink off;
- *      less than a halving to gain (shrink_at_pct close to the
- *      midpoint); a resize the store refused is tried again at once
- *   C  FLOOR: the shrink stops at the operator's size, and says so; only
- *      AUTO and FLOOR size by keys
- *   D  the advice, every mode: grow past grow_at_pct to the midpoint
- *      size, shrink below shrink_at_pct, 0 in between
- *   E  under WARN it is said: at once (clock 0 included), not again for
- *      ten minutes at the same target, again when the target changes,
- *      and at ten minutes; nothing when the advice is 0
- */
+/* autosizetest.c - table sizing (shrink_consider, autoscale_advise) over stubbed tables and store:
+ * 6 slots a bucket, grow at 75%, shrink at 18%, so the target puts a table at the midpoint, 46%. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -119,7 +98,7 @@ static void quiet(void)
 	rs_to = -1;
 }
 
-/* table @i: @n records in 2^@l2 buckets */
+/* table @i: @n records in 2^@l2 buckets; each case its own @i, so per-table clocks start clean */
 static void table(int i, unsigned long n, int l2)
 {
 	entries[i] = n;
@@ -135,7 +114,7 @@ static void settle(int i, unsigned int t0)
 
 int main(void)
 {
-	/* A */
+	/* A: shrink - past the cool-off 2^16 holding 10,000 goes to 2^12; splits, resizes reset */
 	table(1, 10000, 16);
 	quiet();
 	shrink_consider(1, tab(1), 100, 0);
@@ -162,7 +141,7 @@ int main(void)
 	shrink_consider(1, tab(1), 461, 0);
 	CHK(rs_calls == 1 && rs_to == 12, "A: the resize done - shrunk");
 
-	/* B */
+	/* B: no shrink - above shrink_at_pct, one segment, off, under a halving; refusal retried */
 	quiet();
 	table(2, 80000, 16);                  /* 20.3% of 393,216 slots */
 	settle(2, 100);
@@ -187,7 +166,7 @@ int main(void)
 	shrink_consider(6, tab(6), 160, 0);
 	CHK(rs_calls == 2 && notices == 1, "B: and the next tick tries again - the cool-off was not restarted");
 
-	/* C */
+	/* C: FLOOR stops the shrink at the configured size; only AUTO and FLOOR size by keys */
 	quiet();
 	mode[7] = PC_AUTOSCALE_FLOOR;
 	floor_l2[7] = 14;
@@ -200,7 +179,7 @@ int main(void)
 	CHK(as_sizes(7) && as_sizes(8) && !as_sizes(9) && !as_sizes(10),
 		"C: FLOOR and AUTO size by keys, WARN and OFF do not");
 
-	/* D */
+	/* D: the advice, every mode - grow past grow_at_pct, shrink below shrink_at_pct, else 0 */
 	quiet();
 	table(11, 20000, 12);                 /* 81% of 24,576 slots */
 	autoscale_advise(11, tab(11), 50);
@@ -212,7 +191,7 @@ int main(void)
 	autoscale_advise(13, tab(13), 50);
 	CHK(target[13] == 12, "D: 10,000 in 2^16 - shrink to 2^12 advised");
 
-	/* E */
+	/* E: under WARN the advice is said at once, again only after ten minutes or a new target */
 	quiet();
 	mode[14] = PC_AUTOSCALE_WARN;
 	table(14, 20000, 12);

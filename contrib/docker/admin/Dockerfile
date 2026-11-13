@@ -1,4 +1,4 @@
-# perfcached-admin - the admin image (DESIGN 12no, S413 part 1).
+# perfcached-admin - the admin image.
 #
 # What it carries: perfcached-dashboard (the status page served over
 # libperfd, with the actions), perfcli, and nginx in front of the

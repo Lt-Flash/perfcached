@@ -1,19 +1,5 @@
-/* clholdtest.c - S394's hold-check frames (clhold.c; the 0.7.2 split, wave
- * 1): the codec cluster.c writes and reads them with.
- *
- *   A  a query byte for byte - [M_HOLD_Q][node2][collen][col][n2] then each
- *      [req4][klen2][key] - and read back: the node, the collection, every
- *      key with its request id, then none
- *   B  the query's bounds: a collection name over 255 or a buffer too small
- *      for the header refused; CLHOLD_MAXN keys at most; a key that does
- *      not fit refused; is_col
- *   C  a damaged query: a header shorter than its own collection refused; a
- *      frame cut inside an entry yields the whole entries only; a count
- *      larger than the entries present stops at the frame's end
- *   D  answers byte for byte - [M_HOLD_A][node2][n2] then [req4][held1]
- *      [ver8] - held normalised to 1, no version when not held; read back,
- *      and an entry past the frame refused
- */
+/* clholdtest.c - the hold-check frames' codec (clhold.c) that cluster.c writes and reads them with:
+ * queries and answers byte for byte, their bounds, and damaged frames. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/clhold.h"
@@ -33,7 +19,7 @@ int main(void)
 	uint32_t req;
 	unsigned int i, node, cnt;
 
-	/* A */
+	/* A: query bytes [M_HOLD_Q][node2][collen][col][n2], each [req4][klen2][key]; read back */
 	CHK(clhold_q_begin(&w, buf, sizeof buf, 3, "0", 1) == 0, "A: a query begun");
 	CHK(clhold_q_add(&w, 0x01020304u, "k1", 2) == 0 &&
 		clhold_q_add(&w, 7, "abc", 3) == 0, "A: two keys added");
@@ -55,7 +41,7 @@ int main(void)
 		kl == 3 && !memcmp(key, "abc", 3), "A: the second");
 	CHK(clhold_q_next(&r, &req, &key, &kl) == 0, "A: then none");
 
-	/* B */
+	/* B: query bounds - a name over 255, a short buffer, CLHOLD_MAXN keys, a long key */
 	{
 		char big[300];
 
@@ -82,7 +68,7 @@ int main(void)
 			!clhold_q_is_col(&w, "cc", 2), "B: is_col");
 	}
 
-	/* C */
+	/* C: a damaged query - short header, a cut entry, an overstated count */
 	clhold_q_begin(&w, buf, sizeof buf, 2, "col", 3);
 	clhold_q_add(&w, 1, "aa", 2);
 	clhold_q_add(&w, 2, "bbbb", 4);
@@ -101,7 +87,7 @@ int main(void)
 			cnt++;
 	CHK(cnt == 2, "C: a count larger than the entries present stops at the frame's end");
 
-	/* D */
+	/* D: answers [M_HOLD_A][node2][n2], each [req4][held1][ver8]; held is 1, else no version */
 	n = clhold_a_begin(buf, 9);
 	n = clhold_a_put(buf, n, 5, 7, 0x0102030405060708ULL);   /* held: any non-zero */
 	n = clhold_a_put(buf, n, 6, 0, 999);

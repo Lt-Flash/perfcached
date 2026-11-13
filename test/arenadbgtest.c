@@ -1,26 +1,5 @@
-/* arenadbgtest.c - RV-3: the allocator's invariants as things that fail.
- *
- * The lock-free free list's no-ABA argument rests on "a cell is never
- * pushed twice while it is on the list".  Nothing checked it, and the
- * thing that breaks it - a double free - corrupts quietly and shows up
- * later, somewhere else, as two users of one cell.
- *
- * Built with -DPCACHE_ARENA_DEBUG (a release build compiles none of it:
- * the arena's object is the same size with and without the source), so
- * every move a cell makes is checked against a side table of where it
- * is.  Asserted here:
- *  - a storm - threads allocating and freeing mixed sizes, handing cells
- *    to EACH OTHER so frees cross threads, private stacks donating home
- *    and refilling from it - ends with the census holding: every cell in
- *    exactly one place, the lists what the table says, the live figure
- *    adding up;
- *  - the census holds with cells still out, and counts them;
- *  - a double free ABORTS, in the thread that did it;
- *  - a second push home - the ABA precondition itself - ABORTS;
- *  - and with the abort switched off the same double free is CAUGHT BY
- *    THE CENSUS, so the census is not a function that returns 0.
- * The three failing legs run in forked children.
- */
+/* arenadbgtest.c - with -DPCACHE_ARENA_DEBUG a cross-thread storm keeps the census whole, a double
+ * free or a second push home (the ABA precondition) aborts; with no abort the census sees it. */
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>

@@ -1,24 +1,6 @@
 #!/bin/sh
-# fastgate.sh — S141: the ninety-second fleet gate.
-#
-# The two worst defects of 2026-09-13 were both in cluster.c's
-# ORCHESTRATION - a buffer sized from the wrong number, and a field
-# tested one line before the parse that sets it.  Neither was visible to
-# gcc 14 with -Werror, to -fanalyzer, or to any of the 21 satellite
-# suites under ASan: the codecs were correct, and the defects were call
-# sites.  A running fleet is the only instrument that sees them, and the
-# fleet gate cost twenty minutes and ran by hand - so it ran before a
-# TAG and not before a CHANGE, which is backwards for a class of bug
-# nothing cheaper finds.
-#
-# This is the cheap half.  Three nodes on loopback, no containers, each
-# PLANE exercised once - form, admit, pull, forward, migrate, promote -
-# and nothing else.  It is not a replacement for the tag gate:
-# splitbraintest, stepdowntest and dualclaimtest need real partitions
-# and stay where they are.  The claim is only that the first ninety
-# seconds of fleet behaviour catches the ordering class.
-#
-# Usage: test/fastgate.sh [./perfcached]
+# fastgate.sh - the ninety-second fleet gate: three loopback nodes, each plane exercised once (form,
+# admit, pull, forward, migrate, bootstrap, promote) to catch call-site ordering bugs early.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -56,10 +38,8 @@ tombstone_ms = 2000
 [collection b]
 buckets_log2 = 12
 pull = 1
-# eager, because the bulk BOOTSTRAP pull is gated on any_eager(): a node
-# joining a non-eager fleet just takes push backfill and never opens a
-# bulk channel, which is how the first version of this gate passed with
-# the bkind bug reintroduced.
+# eager: the bulk bootstrap pull is gated on any_eager(), and a node joining a
+# non-eager fleet takes push backfill and never opens a bulk channel
 mode = eager
 EOF
 }
@@ -73,11 +53,8 @@ start() { # start <n> <var>
 	done
 	echo "  node $1 did not start:"; tail -3 "$D/n$1.log"; return 1
 }
-# The client is clustertest.sh's, verbatim: one request line per stdin
-# line over the TCP client port, framed onto the native door's binary
-# protocol by test/pcnative.py.  My first attempt POSTed to an HTTP /rpc
-# endpoint that does not exist, and every data check returned empty -
-# copy the working example rather than infer the interface.
+# the client is clustertest.sh's, verbatim: one request line per stdin line over the TCP client
+# port, framed onto the native door's binary protocol by test/pcnative.py
 CLI="$D/cli.py"
 cat > "$CLI" <<'PYEOF'
 import json, pcnative, socket, sys
@@ -91,18 +68,14 @@ for line in sys.stdin:
     req = json.loads(line); req["id"] = rid; req["jsonrpc"] = "2.0"
     f.write(json.dumps(req).encode()+b"\n"); f.flush()
     r = next(_m for _m in iter(lambda: json.loads(f.readline()), None) if not (isinstance(_m, dict) and "notify" in _m))
-    # An error reply must not kill the client: with r["result"] a single
-    # error raised KeyError, and every later request on this pipe was
-    # lost while the callers' 2>/dev/null made it look like an empty
-    # field.  Print the error and keep going, as the other suites do.
+    # an error reply must not kill the client: every later request on this pipe would be
+    # lost behind the callers' 2>/dev/null - print the error and keep going
     if "result" not in r:
         sys.stderr.write("rpc error: %s\n" % json.dumps(r.get("error", r)))
     print(json.dumps(r.get("result", r.get("error"))))
 PYEOF
 call()  { echo "$2" | python3 "$CLI" "$1" 2>/dev/null; }
-# rc from the COMMAND, never a pipeline: `rc=$?` after `cmd | tail -1`
-# reads tail's status, and this project's own gate script reported
-# "0 failing" that way on 2026-09-13.
+# rc from the COMMAND, never a pipeline: `rc=$?` after `cmd | tail -1` reads tail's status
 top() { # top <port> <top-level key>  -- state lives here, not in cluster
 	call "$1" '{"method":"stats"}' | python3 -c "
 import json,sys
@@ -151,9 +124,7 @@ while [ $i -lt 100 ]; do
 done
 [ "${up:-0}" = "2" ] && ok "formed: node 1 sees 2 peers" \
 	|| bad "did not form in 20s (peers_up=${up:-none})"
-# peers_up reaching 2 does NOT mean the election has settled and
-# propagated - reading master right after it gave 0 / 0 / 778.  Wait for
-# the condition rather than assume a sleep covers it.
+# peers_up reaching 2 does not mean the election has settled and propagated: wait for it
 i=0
 while [ $i -lt 100 ]; do
 	m1=$(field $C1 master); m2=$(field $C2 master); m3=$(field $C3 master)
@@ -176,10 +147,7 @@ u2=$(field $C2 identity_uuid)
 [ -n "$u1" ] && [ "$u1" != "$u2" ] && ok "distinct identities on the wire" \
 	|| bad "identities missing or equal: [$u1] [$u2]"
 
-# Every node in an EAGER fleet starts empty and enters RECOVERING, which
-# refuses writes.  The first set was being rejected and k1 never existed
-# anywhere - the check reported "node 2 never saw k1", which reads like a
-# replication failure and was not one.  Wait for READY first.
+# every node in an eager fleet starts empty and RECOVERING, which refuses writes: wait for READY
 i=0
 while [ $i -lt 100 ]; do
 	s1=$(top $C1 state); s2=$(top $C2 state); s3=$(top $C3 state)
@@ -209,14 +177,7 @@ wait_val $C2 m59 x && ok "migrate: a 60-record batch is readable across the flee
 	|| bad "migrate: node 2 cannot read m59 [$(value $C2 m59)]"
 
 # ---- 6. BOOTSTRAP: a NEW node pulls the keyspace over the bulk plane ----
-#
-# This check exists because the gate did not earn its keep without it.
-# Reintroducing the bkind ordering bug - the one that made every
-# bootstrap pull return zero records - left the first five checks GREEN,
-# because they all drive the datagram write path and never open a bulk
-# channel.  A fourth node joining an already-populated fleet is what
-# reaches bulk_serve_boot, and it is the difference between a gate that
-# catches this class and one that only looks like it does.
+# the checks above drive only the datagram path; a node joining a populated fleet opens bulk
 node 4 17244 18244
 start 4 4 || exit 1
 i=0

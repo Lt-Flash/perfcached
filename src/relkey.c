@@ -1,13 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * relkey.c - the release keys (UP6n, DESIGN 12nf).  See relkey.h.
- */
+/* relkey.c - the release keys; see relkey.h. */
 #include "relkey.h"
 
-/* The release key (DESIGN 12nf, "The release key"): made on the build
- * host 2026-10-13, private half there only.  A new key is ADDED here;
- * an old one stays as long as a build it signed may be installed. */
+/* Private half on the build host only.  A new key is ADDED here; an old one
+ * stays as long as a build it signed may be installed. */
 const unsigned char pc_upg_release_keys[][32] = {
 	{
 		0x56, 0x46, 0xe8, 0xe4, 0x59, 0x4a, 0x40, 0x77,

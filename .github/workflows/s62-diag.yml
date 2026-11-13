@@ -1,4 +1,4 @@
-# S62 diagnostic — TEMPORARY.  Delete this file once the WAL
+# diagnostic — TEMPORARY.  Delete this file once the WAL
 # intermittent is understood.
 #
 # recoverytest's kill-9 storm and waltest's recycling phase fail on

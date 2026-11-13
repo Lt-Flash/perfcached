@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clack.c - 12ny AT-3: watermarks - the contiguous applied mark of each
- * numbering space and the part of it the WAL has made durable.  See
- * clack.h for the rule and why the durability is folded the way it is.
- */
+/* clack.c - watermarks: the contiguous applied mark of each numbering space and
+ * the part of it the WAL has made durable (the rule is in clack.h). */
 #include <stdlib.h>
 #include <string.h>
 #include "clack.h"

@@ -1,13 +1,12 @@
-# perfcached CI (S55).  Public repo: GitHub-hosted runners are free,
+# perfcached CI.  Public repo: GitHub-hosted runners are free,
 # unlimited minutes.  GitHub-hosted ONLY - never register project hosts
 # as self-hosted runners here; a fork PR could execute on them.
 name: ci
 
 on:
   push:
-    # dev-* : a development line's snapshot gets the same verdict before
-    # it is a release (0.6.0 on dev-060, the operator 2026-10-11: "push to
-    # github, let it work there for now") - master stays release-shaped
+    # dev-*: a development line's snapshot gets the same verdict before it is
+    # a release; master stays release-shaped
     branches: [master, 'dev-*']
     # release CANDIDATES carry their own visible test run (2026-10-14:
     # only an rc is judged; a final tag goes on the soaked rc's commit,
@@ -20,7 +19,7 @@ jobs:
   # As SEVEN suite groups (Makefile CHECK_GROUPS), one job each, as on
   # GitLab (2026-10-03: the single check took 87.5 of its 90 minutes on
   # v0.4.1 and outgrew it on 0.4.2).  fail-fast off: every group reports.
-  # S361: the GitLab runner (a shell executor on Debian 13, kernel 6.12)
+  # the GitLab runner (a shell executor on Debian 13, kernel 6.12)
   # runs every suite on the io_uring backend - check and check-asan both.
   # Here the startup check is told to refuse it, so the same suites run
   # on the epoll fallback: each release is green on BOTH backends.
@@ -36,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev
       - name: build
         run: make -j"$(nproc)"
       - name: make check-g-${{ matrix.group }}
@@ -60,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: deps
         run: |
-          sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+          sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev
           sudo modprobe dm-delay || true
       - name: make ${{ matrix.build }}-g-${{ matrix.group }}
         run: sudo env PC_SKIP_FAILS=1 PATH="$PATH" make ${{ matrix.build }}-g-${{ matrix.group }}
@@ -79,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev
       - name: build
         run: make -j"$(nproc)" perfcached perfcli
       - name: the container fleet
@@ -99,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev
       - name: build
         run: make -j"$(nproc)"
       - name: root-only suites (netns, multicast router)
@@ -117,24 +116,24 @@ jobs:
           grep -oE "[a-z]+test: [0-9]+ passed, [0-9]+ failed" check.log \
             2>/dev/null | grep -vE ", 0 failed$" || true
 
-  # S250: the standalone edition - no cluster code, its own gate
+  # the standalone edition - no cluster code, its own gate
   check-standalone:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev
       - name: build (standalone)
         run: make PC_EDITION=standalone -j"$(nproc)" && ./perfcached -V | grep -q standalone
       - name: make check-standalone
         run: make PC_EDITION=standalone check-standalone
 
-  # S285: Alpine (musl, gcc 15), a supported runtime from 0.5.0.  Runs
+  # Alpine (musl, gcc 15), a supported runtime from 0.5.0.  Runs
   # the alpine container through the runner's container engine rather
   # than as the job container: JavaScript actions (checkout) cannot run
   # inside Alpine, their node is built for glibc.
-  # PE-1: the PHP extension, on the release's php8.3 (Ubuntu 24.04's own)
+  # the PHP extension, on the release's php8.3 (Ubuntu 24.04's own)
   php:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -147,7 +146,7 @@ jobs:
       - name: make check-php
         run: make check-php
 
-  # PE-6: php8.3-perfcached built and proven in throwaway Debian 13 containers
+  # php8.3-perfcached built and proven in throwaway Debian 13 containers
   phpdeb:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -164,7 +163,7 @@ jobs:
       - name: alpine check (both editions build; standalone suites)
         run: sh tools/alpine-check.sh
 
-  # Highest-value job (S55 ordering): the whole suite under ASan+UBSan,
+  # Highest-value job: the whole suite under ASan+UBSan,
   # per group as check above (`make check-asan` still runs them all).
   check-asan:
     runs-on: ubuntu-latest
@@ -176,7 +175,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev
       - name: make check-asan-g-${{ matrix.group }}
         run: make check-asan-g-${{ matrix.group }}
 
@@ -188,7 +187,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev clang-tidy bear
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev clang-tidy bear
       - name: compile_commands
         run: make clean && bear -- make -j"$(nproc)"
       - name: tidy

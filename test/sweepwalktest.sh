@@ -1,19 +1,10 @@
 #!/bin/sh
-# sweepwalktest.sh - S367: a busy client is not slowed by idle ones.  The
-# HTTP sweep walked EVERY connection on its worker on EVERY turn - with no
-# HTTP connection open at all - so each request on a node holding many
-# clients paid a walk of all of them (50,000 on 245: 12,500 list nodes a
-# turn a worker).  One worker here, so every connection shares the list:
-# the median round trip of sequential PINGs with 20,000 idle connections
-# held must stay within 3x (+50 us - a busy CI runner is noisy; the defect
-# is 12x) of the same client's median with none.  Fail-first: 0.5.6.4 walks
-# 20,000 nodes per PING - 60 -> 750 us on 222.
-# Usage: test/sweepwalktest.sh [./perfcached]
+# sweepwalktest.sh - a busy client is not slowed by idle ones: PING's median round trip with 20,000
+# idle connections held stays within 3x (+50 us) of none.  Usage: test/sweepwalktest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcsweepwalk.XXXXXX); P=
-# wait for the daemon too: closing 20,000 sockets takes a while, and the next
-# suite may want a port it still holds
+# wait for the daemon too: closing 20,000 sockets takes a while, and the next suite may want its port
 trap '[ -n "$P" ] && kill -9 "$P" 2>/dev/null && wait "$P" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
 mkdir -p "$D/state"

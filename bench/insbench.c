@@ -1,13 +1,5 @@
-/*
- * insbench — how much does an insert cost the core, in process?
- *
- * The occupancy bitmap adds an atomic RMW on the 0->1 and 1->0 bucket
- * transitions, and over the wire that would vanish under protocol cost.
- * This times pcache_ht_store() and pcache_ht_remove() directly, at a
- * table size the caller picks, so the transition cost is visible.
- *
- * usage: insbench <buckets_log2> <nkeys> <reps>
- */
+/* insbench - times pcache_ht_store/remove in process, so the occupancy bitmap's 0->1 / 1->0
+ * atomic RMW is visible (protocol cost hides it).  usage: insbench <buckets_log2> <nkeys> <reps> */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

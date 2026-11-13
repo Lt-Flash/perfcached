@@ -1,22 +1,5 @@
-/* respscantest.c - the RESP door's keyspace walk (respscan.c; the 0.7.2
- * split, wave 1) over a fake table: bucket b holds the key "k<bbbb>" when
- * b is a multiple of `every` and at least `from`; bucket 10's key has
- * expired, bucket 12's expires later.  The cursor is the next bucket.
- *
- *   A  SCAN 0: the whole small table in one reply, cursor 0, the expired
- *      key left out and the later one kept
- *   B  SCAN ... COUNT 4 yields about four keys a reply - the next chunk
- *      sized from the density just seen - and the cursor resumes exactly;
- *      a rare MATCH bounds on keys VISITED, not matched (an empty reply
- *      with the cursor moved); an empty region stops at 16 x COUNT buckets
- *   C  MATCH filters; TYPE is accepted and ignored; a bad cursor, a COUNT
- *      out of 1..16384, a pattern of 256 bytes or an unknown word refused;
- *      a reply that cannot fit the scratch refused
- *   D  KEYS' turn (pc_keys_chunk): with no time budget each turn walks the
- *      1,024-bucket floor and yields - four turns for 4,096 buckets, every
- *      key once; with time to spare one turn walks it all, the floor then
- *      steps of 256; a limit stops the walk and says so; a pattern filters
- */
+/* respscantest.c - the RESP door's keyspace walk over a fake table: bucket b holds "k<bbbb>"
+ * when b is a multiple of `every` and >= `from`; 10's key expired, 12's later; cursor = bucket. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,14 +107,14 @@ int main(void)
 	unsigned int cur;
 	int emitted, lh, more, turns;
 
-	/* A */
+	/* A: SCAN 0 - the whole small table in one reply, the expired key left out */
 	SCAN("0");
 	CHK(starts("*2\r\n$1\r\n0\r\n*31\r\n$5\r\nk0000\r\n"),
 		"A: SCAN 0 - the whole table, cursor 0, 31 of 32 keys");
 	CHK(!has(&out, "k0010") && has(&out, "k0012") && has(&out, "k0062"),
 		"A: the expired key left out, the later one and the last kept");
 
-	/* B */
+	/* B: COUNT 4 yields about four keys a reply; MATCH bounds keys visited; empty regions stop */
 	SCAN("0", "COUNT", "4");
 	CHK(is("*2\r\n$1\r\n8\r\n*4\r\n$5\r\nk0000\r\n$5\r\nk0002\r\n$5\r\nk0004\r\n$5\r\nk0006\r\n") &&
 		scans == 2, "B: COUNT 4 - four keys in two density-sized chunks, cursor 8");
@@ -146,7 +129,7 @@ int main(void)
 		"B: an empty region - 16 x COUNT buckets in 16 calls, then the reply");
 	from = 0;
 
-	/* C */
+	/* C: MATCH filters, TYPE ignored; bad cursor, COUNT, pattern, word or overflow refused */
 	SCAN("0", "MATCH", "k001*", "COUNT", "1000");
 	CHK(starts("*2\r\n$1\r\n0\r\n*4\r\n") && has(&out, "k0012") && has(&out, "k0018") &&
 		!has(&out, "k0020"), "C: MATCH k001* - four keys (k0010 has expired)");
@@ -172,7 +155,7 @@ int main(void)
 	CHK(is("-ERR reply too large\r\n"), "C: a reply that cannot fit the scratch");
 	scratch_cap = sizeof scratch;
 
-	/* D */
+	/* D: KEYS' turn - a 1,024-bucket floor without budget, all with time; limit, pattern */
 	nb = 4096;
 	every = 4;
 	pc_keys_set_turn_us(0);

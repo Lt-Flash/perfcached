@@ -1,17 +1,6 @@
 #!/bin/sh
-# tailtest.sh - S119: the never-carved tail of the reservation is given
-# back.  The daemon pins and populates its whole reservation at start, and
-# the give-back used to walk only the groups below the chunk frontier, so on
-# a node that never needed its whole reservation RSS = held + the untouched
-# tail for the life of the process (245: 70 MB beside 102 MB held).
-#
-# The daemon runs UNPINNED here - CAP_IPC_LOCK dropped from the bounding
-# set and an 8 MB memlock limit, the fleet's own shape - because a pinned
-# arena refuses the punch by design (that refusal latches give-back off).
-# The kernel's figure is asserted, not a counter: the arena mapping's Rss
-# from the daemon's own /proc/<pid>/smaps.
-# Fail-first: a daemon without the tail punch keeps the whole 32 MB resident
-# beside ~1.5 MB held; a host that cannot drop the capability SKIPs loudly.
+# tailtest.sh - the never-carved tail of the reservation is given back, asserted on the arena
+# mapping's Rss in the daemon's own smaps; the daemon runs unpinned, as a pinned arena refuses the punch.
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 D=$(mktemp -d /var/tmp/pctl.XXXXXX); SEC=tail-client-secret
@@ -21,10 +10,8 @@ bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 P=""
 trap '[ -n "$P" ] && grep -qa -- "$D" /proc/$P/cmdline 2>/dev/null && kill -9 "$P"; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
-# root holds CAP_IPC_LOCK and would pin the arena: drop it from the bounding
-# set.  An unprivileged runner (GitHub's, a developer's shell) cannot pin
-# past RLIMIT_MEMLOCK in the first place, and cannot apply a bounding set
-# either - it runs the daemon plainly.
+# root holds CAP_IPC_LOCK and would pin the arena: drop it from the bounding set.  An unprivileged
+# runner can neither pin nor set one, and runs the daemon plainly.
 ROOT=0; [ "$(id -u)" = 0 ] && ROOT=1
 if [ $ROOT = 1 ] && ! command -v setpriv >/dev/null 2>&1; then
 	echo "SKIP: setpriv not found - cannot drop CAP_IPC_LOCK, the arena would pin and the punch be refused"
@@ -65,9 +52,8 @@ grep -q "perfcached ready" "$D/n1.log" || { echo "node did not start"; cat "$D/n
 grep -q "continuing unpinned" "$D/n1.log" && echo "  ..   mlock refused under the 8 MB limit without CAP_IPC_LOCK: the arena runs unpinned" \
 	|| echo "  ..   the log says pinned - under the sanitizer mlock is intercepted and reports success without locking; the latch below is the truth"
 
-# drive <op> [args] - fill <n> <ttl> (60 KB values; prints stored/full),
-# mem <field> (stats.memory.<field>, dotted path; MISSING when absent),
-# entries (collection c)
+# drive <op> [args] - fill <n> <ttl> (60 KB values; prints stored/full), mem <field>
+# (stats.memory.<field>, dotted; MISSING when absent), entries (collection c)
 drive() {
 	python3 - "$@" <<'PYEOF'
 import json, pcnative, socket, sys
@@ -99,17 +85,8 @@ else:
     print("MISSING" if r is None else r)
 PYEOF
 }
-# The arena mapping's resident bytes, the kernel's figure from the daemon's
-# own smaps - and the mapping is identified by its SIZE, which the daemon
-# publishes exactly as arena_reserved, not by "the biggest resident thing
-# in roughly the right size band".  A sanitizer build carries other
-# read-write anonymous mappings within a few hundred kB of the arena's
-# size, and picking the most resident of them read the WRONG mapping
-# whenever one of those was busy: the rc27 and rc28 tag runs on the public
-# runner failed and passed alternately, on identical commits, for that
-# reason alone.  mlock can split the reservation into several adjacent
-# mappings, so an adjacent RUN whose sizes sum to the reservation counts
-# as the arena; anything ambiguous says so instead of guessing.
+# the arena mapping's resident bytes, the mapping found by its size (arena_reserved), not by being
+# the most resident: sanitizer builds have look-alikes.  An adjacent run summing to it counts.
 arena_rss() {
 	python3 - "$P" "$(drive mem arena_reserved)" <<'PYEOF'
 import sys
@@ -125,10 +102,8 @@ for line in open("/proc/%s/smaps" % pid):
         vmas.append([lo, hi, anon, 0])
     elif line.startswith("Rss:") and vmas:
         vmas[-1][3] = int(line.split()[1]) * 1024
-# every ADJACENT SUB-RUN, from every start - not just those beginning a
-# group.  An anonymous mapping sitting immediately before the arena makes
-# no prefix of its group sum to the reservation, and the first cut of this
-# reader answered MISSING for that reason on the public runner.
+# every adjacent sub-run, from every start: an anonymous mapping right before the
+# arena makes no prefix of its group sum to the reservation
 hits = []
 for i in range(len(vmas)):
     if not vmas[i][2]:
@@ -145,10 +120,8 @@ for i in range(len(vmas)):
 print(hits[0] if len(hits) == 1 else ("AMBIGUOUS" if hits else "MISSING"))
 PYEOF
 }
-# the give-back latch is the truth about pinning: a pinned arena refuses
-# the first punch and latches give-back off - then this suite cannot run
-# and says so.  A daemon without the tail punch never punches at start, so
-# neither figure moves and the assertions below fail on their own terms.
+# the give-back latch is the truth about pinning: a pinned arena latches give-back off and the
+# suite cannot run
 i=0
 while [ $i -lt 30 ]; do
 	T=$(drive mem reclaim.tail_released); G=$(drive mem reclaim.giveback_off)
@@ -156,16 +129,8 @@ while [ $i -lt 30 ]; do
 	[ "$T" != MISSING ] && [ "$T" -gt 0 ] && break
 	sleep 0.2; i=$((i+1))
 done
-# The windows below are generous on purpose.  The give-back is a 1 Hz
-# maintenance duty sharing its thread with the expiry sweep, the held walk
-# and (since S69) a resize tick, and under a sanitizer on a two-processor
-# runner those take long enough that a punch gets a fraction of the ticks
-# it gets here.  A bounded wait that is too short turns "slower than this
-# host" into "the tail was not given back" - which is what happened to the
-# rc26 tag run on the public runner while the same snapshot passed on
-# master.  The ASSERTION is unchanged: the mapping must still come within
-# 8 MB of held, and the failure says how much was released so a real
-# regression still reads as one.
+# generous windows: the give-back is a 1 Hz duty sharing its thread, slow under a sanitizer on two
+# CPUs.  The assertion stands: within 8 MB of held.
 await_le() { # await_le <secs>: rss - held <= 8 MB within <secs>; sets R and H
 	i=0
 	while [ $i -lt $(( $1 * 5 )) ]; do

@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * listenfd.h - the listener sockets (listenfd.c), for daemon.c.
- */
+/* listenfd.h - the listener sockets (listenfd.c), for daemon.c. */
 #ifndef PC_LISTENFD_H
 #define PC_LISTENFD_H
 

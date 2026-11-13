@@ -1,15 +1,6 @@
 #!/bin/sh
-# probetest.sh - S122: the existence probe must find a record wherever the
-# table keeps it.  2,000 records pipelined into 256 buckets of six slots
-# put hundreds of them in the overflow leg, and the leg stays real after
-# the maintenance thread has grown the table (it stops at load factor
-# four, where a few percent of the records still overflow); the leg is
-# MEASURED before and after the checks (the table's own overflow count), so
-# the assertions can never pass on an empty leg.  RESP EXISTS and TYPE
-# (both on the probe) must answer for every record, and the native door's
-# ttl verb (which reads the same path but keeps the metadata) shows get and ttl
-# see them all.  Fail-first: before the fix EXISTS answered 0 for 539 of
-# the 2,000 present keys.
+# probetest.sh - the existence probe (EXISTS, TYPE, ttl) finds a record wherever the table keeps it,
+# the overflow leg included - measured before and after, so the checks never pass on an empty leg.
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 D=$(mktemp -d /var/tmp/pcpr.XXXXXX)
@@ -54,11 +45,8 @@ stored = sum(1 for _ in reqs if json.loads(f.readline()).get("result", {}).get("
 def buckets():
     return [c for c in call("stats")["result"]["collections"] if c["name"] == "0"][0]["buckets"]
 def leg():
-    # the table's OWN count of records in the overflow leg (/stats
-    # collections[].overflow).  It was counted off the dump's tail: every
-    # record returned once the cursor named a chain in the leg, from the
-    # last bucket on - S281 walks the leg FIRST, so from the last bucket
-    # the walk simply ends and that count read 0 (rc62's GitHub red).
+    # the table's own count of records in the overflow leg (/stats collections[].overflow),
+    # not one counted off the dump's tail: the walk visits the leg first
     c = [c for c in call("stats")["result"]["collections"] if c["name"] == "0"][0]
     return c["overflow"], c["buckets"]
 # the table must stand still first: the splitter is still moving records

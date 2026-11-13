@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* clrpt.c - S469: replication groups over TCP to the relay port.  See clrpt.h.
+/* clrpt.c - replication groups over TCP to the relay port.  See clrpt.h.
  * Wire: [len 4, big-endian][sealed frame], as on clane's lane. */
 #include <errno.h>
 #include <fcntl.h>
@@ -54,7 +54,7 @@ struct tx {
 	size_t qlen, qoff, qcap;
 	long long retry_ms, sent_ms;
 };
-static size_t q_total;                 /* OM2-12: queue capacity held, every thread's */
+static size_t q_total;                 /* queue capacity held, every thread's */
 static __thread struct tx tx[CLRPT_PEERS];
 static __thread int ntx;
 
@@ -231,7 +231,7 @@ void clrpt_flush(void)
 
 		tx_check(t);
 		tx_write(t);
-		/* OM2-12: a drained queue a second quiet gives its memory back */
+		/* a drained queue a second quiet gives its memory back */
 		if (!t->qlen && t->qcap > 65536 && now - t->sent_ms > 1000) {
 			free(t->q);
 			t->q = NULL;
@@ -285,9 +285,12 @@ struct clrpt_rx *clrpt_rx_new(int lfd, clrpt_host_fn host_ok)
 	return r;
 }
 
+static unsigned long long rx_held;
+
 static void rx_drop(struct rconn *c)
 {
 	close(c->fd);
+	__atomic_sub_fetch(&rx_held, c->cap, __ATOMIC_RELAXED);
 	free(c->buf);
 	c->fd = -1;
 	c->buf = NULL;
@@ -299,11 +302,11 @@ static size_t rx_flen(const unsigned char *b)
 	return (size_t)b[0] << 24 | (size_t)b[1] << 16 | (size_t)b[2] << 8 | b[3];
 }
 
-/* room for the frame being assembled: RX_FIRST, or the whole frame its
- * header names; -1 for a length past FRAME_MAX */
+/* room for the frame being assembled: RX_FIRST, doubling as it fills, up to the frame its header
+ * names - grown by what the peer has sent, not what it announced; -1 past FRAME_MAX */
 static int rx_room(struct rconn *c)
 {
-	size_t want = RX_FIRST;
+	size_t want = c->cap ? c->cap * 2 : RX_FIRST;
 	unsigned char *nb;
 
 	if (c->len >= 4) {
@@ -313,13 +316,14 @@ static int rx_room(struct rconn *c)
 			BUMP(rx_refused, 1);
 			return -1;
 		}
-		if (4 + fl > want)
+		if (want > 4 + fl)
 			want = 4 + fl;
 	}
-	if (c->cap >= want)
+	if (c->len < c->cap || c->cap >= want)
 		return 0;
 	if (!(nb = realloc(c->buf, want)))
 		return -1;
+	__atomic_add_fetch(&rx_held, want - c->cap, __ATOMIC_RELAXED);
 	c->buf = nb;
 	c->cap = want;
 	return 0;
@@ -416,7 +420,7 @@ void clrpt_rx_serve(struct clrpt_rx *r, const struct pollfd *pf, int n,
 		} else if (now - c->last_ms > CLRPT_IDLE_MS)
 			rx_drop(c);
 		if (c->fd >= 0 && c->len && now - c->t0 > CLRPT_FRAME_MS) {
-			BUMP(rx_refused, 1);       /* OM2-11: a trickled frame */
+			BUMP(rx_refused, 1);       /* a trickled frame */
 			rx_drop(c);
 		}
 	}
@@ -428,7 +432,7 @@ void clrpt_rx_serve(struct clrpt_rx *r, const struct pollfd *pf, int n,
 
 			if (fd < 0)
 				break;
-			if (r->ok && !r->ok(&a)) {     /* OM2-11: members' hosts only */
+			if (r->ok && !r->ok(&a)) {     /* members' hosts only */
 				BUMP(rx_refused, 1);
 				close(fd);
 				continue;
@@ -468,5 +472,6 @@ void clrpt_figures(struct clrpt_figs *f)
 	f->rx_frames = __atomic_load_n(&rx_frames, __ATOMIC_RELAXED);
 	f->rx_bytes = __atomic_load_n(&rx_bytes, __ATOMIC_RELAXED);
 	f->rx_accepts = __atomic_load_n(&rx_accepts, __ATOMIC_RELAXED);
+	f->rx_held = __atomic_load_n(&rx_held, __ATOMIC_RELAXED);
 	f->rx_refused = __atomic_load_n(&rx_refused, __ATOMIC_RELAXED);
 }

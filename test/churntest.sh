@@ -1,28 +1,6 @@
 #!/bin/sh
-# churntest.sh — S42c: membership churn faster than the liveness windows.
-#
-# The thresholds this is built to outrun (src/cluster.c):
-#   PEER_UP_MS     10000   a dead peer is noticed in 10s
-#   PEER_PURGE_MS   6000
-#   MASTER_DEAD_MS  8000
-# A node that leaves and returns every ~6s therefore never gives the
-# fleet a full stability window, which is the state nothing has tested.
-#
-# WHAT IS AND IS NOT ASSERTED.  Data survival is NOT: DESIGN.md is
-# explicit that a proxy collection LOSES the keys held by a node that
-# dies (peers cannot rehydrate them), and store mode only holds what a
-# node was itself written or pulled.  Asserting "no key lost" would be
-# asserting against the design.
-#
-# What must hold regardless of churn:
-#   1. membership converges to the TRUTH once churn stops - no phantom
-#      peer, no node stuck believing in someone who left
-#   2. the fleet still serves: writes and reads work afterwards
-#   3. a node that was never killed keeps its own data
-# A fleet that ends up wedged or permanently miscounting its members is
-# the failure this looks for.
-#
-# Usage: test/churntest.sh [runtime] [cycles]
+# churntest.sh - membership churn faster than the liveness windows: membership converges to the truth
+# afterwards, the fleet serves, an unchurned node keeps its data.  Usage: test/churntest.sh [runtime] [cycles]
 set -u
 
 RT=${1:-${RUNTIME:-}}       # the argument, else $RUNTIME (CI), else nerdctl or docker
@@ -38,8 +16,7 @@ for n in 1 2 3; do
 		echo "churntest: SKIPPED - pcnode$n not running (bench/containers-up.sh)"
 		exit "${PC_SKIP_FAILS:-0}"; }
 done
-# whatever happens, leave the churned node RUNNING - a stopped node
-# would silently break every suite run after this one
+# whatever happens, leave the churned node running: a stopped one breaks every later suite
 trap '$RT start pcnode3 >/dev/null 2>&1' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
 
@@ -70,13 +47,8 @@ B1=$(peers 1); B2=$(peers 2)
 # data on a node that will NOT be churned
 set_k 1 b "survivor-$K" "still-here" >/dev/null
 
-# ---- churn: real leave/join cycles ----------------------------------
-# MEASURED on this fleet, not guessed: a peer death is noticed after 7s
-# (PEER_PURGE_MS 6000 plus a beat), and a node needs ~4s to rejoin from
-# cold.  The first version of this test killed for 3s and restarted -
-# under BOTH numbers - so membership never moved and every assertion
-# below passed without the fleet being disturbed at all.  Down 9s / up
-# 6s makes each cycle a genuine leave AND a genuine rejoin.
+# ---- churn: real leave/join cycles.  A death is noticed after ~7 s (PEER_PURGE_MS plus a beat)
+# and a rejoin takes ~4 s, so down 9 s / up 6 s is a genuine leave and rejoin.
 DOWN=${DOWN:-9}
 UP=${UP:-6}
 echo "  churning pcnode3: down ${DOWN}s / up ${UP}s, $CYCLES cycles"
@@ -97,8 +69,7 @@ while [ $c -lt "$CYCLES" ]; do
 done
 echo "  churn done (lowest peers_up seen from node1: $MINSEEN)"
 
-# The churn must actually have been NOTICED, or nothing below means
-# anything - a fleet that never saw the node leave was never stressed.
+# the churn must have been noticed, or nothing below means anything
 if [ "$MINSEEN" -lt 2 ]; then
 	ok "the churn was real: node1 saw the fleet drop to $MINSEEN peer(s)"
 else

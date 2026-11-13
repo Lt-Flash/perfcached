@@ -1,28 +1,5 @@
-/* respkvtest.c - the RESP door's key-value commands (respkv.c; the 0.7.2
- * split, wave 1) over a fake store: the data cores verbs.c owns are stubbed
- * here (a small table, a fixed clock), so what is tested is the RESP side -
- * the arguments, the options and every reply's bytes.
- *
- *   A  GET: a hit, a miss, WRONGTYPE in Redis's words, a failed read, the
- *      arity
- *   B  SET: plain; EX and PX (rounded up to seconds); a bad or missing
- *      expiry; NX / XX (nil when it does not hold); NX with XX, and IFEQ
- *      with NX, a syntax error; IFEQ to the compare core with its operand;
- *      IFDEQ refused by name; KEEPTTL and the other options refused, never
- *      half-honoured; SETEX / PSETEX and a zero expiry; a full cache, a busy
- *      fleet as -TRYAGAIN; the arity
- *   C  DEL one key (1, then 0), several counted
- *   D  EXISTS counts; TYPE of a string, a document and nothing; TTL -2 for
- *      none, -1 for no expiry, seconds left, PTTL in milliseconds
- *   E  MGET: values, nil for a miss, nil for a document (Redis answers nil
- *      there, not an error); G8, where a miss may be looked up elsewhere
- *      (the fan-out core stubbed): its answer written as it renders it, a
- *      refusal in its code word, a waiting mget parked with nothing
- *      written; and a context with no connection reads locally as before
- *   F  INCR / INCRBY / DECR / DECRBY: the running value, the expiry left
- *      alone; an amount that is not a number, or missing, in Redis's words;
- *      the arity; a value that is not a number; WRONGTYPE; TRYAGAIN
- */
+/* respkvtest.c - the RESP side of the key-value commands (arguments, options, every reply's bytes)
+ * over a fake store: verbs.c's data cores stubbed with a small table and a fixed clock. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +7,7 @@
 #include "verbs.h"
 #include "respout.h"
 #include "verbsint.h"
+#include "presence.h"
 
 static int fails;
 #define CHK(c, ...) do { if (c) printf("  ok   " __VA_ARGS__); \
@@ -276,17 +254,30 @@ long long pc_stats_reset(void) { return 0; }
 int pc_pubsub_pop(void *conn, int pattern, char *name, size_t cap, size_t *nlen, int *left)
 { (void)conn; (void)pattern; (void)name; (void)cap; (void)nlen; (void)left; return 0; }
 
-/* G8: the fan-out core (verbs.c) and the mget (mgetfan.c), stubbed */
-static int fan_on, fan_refuse, fan_waiting, fan_parked, fan_freed;
+/* a key another node holds ("far"): parked on pull 7 */
+static int pres_kind;
+int op_pres_miss(pcache_htable_t *ht, str *k, int kind, unsigned int *park)
+{
+	(void)ht;
+	if (k->len != 3 || memcmp(k->s, "far", 3))
+		return PC_OP_ABSENT;
+	pres_kind = kind;
+	*park = 7;
+	return PC_OP_PARKED;
+}
+
+/* the fan-out core (verbs.c) and the mget (mgetfan.c), stubbed */
+static int fan_on, fan_refuse, fan_waiting, fan_parked, fan_freed, fan_count;
 static unsigned int fan_n;
 static char fan_obj;
 int mget_fans(pcache_htable_t *ht) { (void)ht; return fan_on; }
 int op_mget_fan(pcache_htable_t *ht, const char *const *keys,
-		const size_t *klens, unsigned int n, struct pc_mget **mp,
+		const size_t *klens, unsigned int n, int count, struct pc_mget **mp,
 		const char **code, const char **why)
 {
 	(void)ht; (void)keys; (void)klens;
 	fan_n = n;
+	fan_count = count;
 	if (fan_refuse) {
 		*code = "TRYAGAIN";
 		*why = "mget: busy";
@@ -304,6 +295,8 @@ void pc_mget_free(struct pc_mget *m) { fan_freed += m == (struct pc_mget *)&fan_
 static char outbuf[8192];
 static struct pc_jw out;
 static void *run_conn;                 /* the connection a context carries */
+static const char *run_key;            /* the key a parked command named */
+static unsigned int run_park;
 
 static void run(int (*h)(struct resp_ctx *), const char *const *args)
 {
@@ -332,6 +325,8 @@ static void run(int (*h)(struct resp_ctx *), const char *const *args)
 	c.conn = run_conn;
 	pc_jw_init(&out, outbuf, sizeof outbuf);
 	h(&c);
+	run_key = keyp;
+	run_park = park;
 }
 #define RUN(h, ...) run((h), (const char *const[]){ __VA_ARGS__, NULL })
 
@@ -342,7 +337,7 @@ static int is(const char *want)
 
 int main(void)
 {
-	/* A */
+	/* A: GET - a hit, a miss, WRONGTYPE in Redis's words, a failed read, the arity */
 	RUN(rh_set, "SET", "k", "v");
 	CHK(is("+OK\r\n"), "A: SET k v");
 	RUN(rh_get, "GET", "k");
@@ -357,7 +352,7 @@ int main(void)
 	RUN(rh_get, "GET");
 	CHK(is("-ERR wrong number of arguments for 'get' command\r\n"), "A: GET's arity");
 
-	/* B */
+	/* B: SET - EX/PX, NX/XX, IFEQ, refused options never half-honoured, SETEX, full, -TRYAGAIN */
 	RUN(rh_set, "SET", "k2", "v", "EX", "10");
 	CHK(is("+OK\r\n") && last_ttl == 10, "B: SET EX 10 - ttl 10");
 	RUN(rh_set, "SET", "k3", "v", "px", "1500");
@@ -397,7 +392,7 @@ int main(void)
 	RUN(rh_set, "SET", "k");
 	CHK(is("-ERR wrong number of arguments for 'set' command\r\n"), "B: SET's arity");
 
-	/* C */
+	/* C: DEL one key (1, then 0), several counted */
 	RUN(rh_del, "DEL", "k3");
 	CHK(is(":1\r\n"), "C: DEL k3 - 1");
 	RUN(rh_del, "DEL", "k3");
@@ -405,7 +400,7 @@ int main(void)
 	RUN(rh_del, "DEL", "k4", "k5", "nope");
 	CHK(is(":2\r\n"), "C: DEL of three, two there - 2");
 
-	/* D */
+	/* D: EXISTS counts; TYPE of a string, a document, nothing; TTL -2/-1/seconds, PTTL in ms */
 	put("a", "1", 0, 0);
 	put("doc", "{}", 0, PCACHE_F_JSON);
 	put("t", "x", 10, 0);
@@ -425,8 +420,40 @@ int main(void)
 	CHK(is(":10\r\n"), "D: TTL - the seconds left");
 	RUN(rh_ttl, "PTTL", "t");
 	CHK(is(":10000\r\n"), "D: PTTL - in milliseconds");
+	RUN(rh_exists, "EXISTS", "far");
+	CHK(is(":0\r\n") && run_park == 7 && pres_kind == PC_PRES_EXISTS &&
+		run_key && !strcmp(run_key, "far"),
+		"D: EXISTS of a key another node holds - parked, 0 the fallback");
+	RUN(rh_type, "TYPE", "far");
+	CHK(is("+none\r\n") && run_park == 7 && pres_kind == PC_PRES_TYPE,
+		"D: TYPE of it - parked, none the fallback");
+	RUN(rh_ttl, "PTTL", "far");
+	CHK(is(":-2\r\n") && run_park == 7 && pres_kind == PC_PRES_PTTL,
+		"D: PTTL of it - parked, -2 the fallback");
+	RUN(rh_ttl, "TTL", "nope");
+	CHK(is(":-2\r\n") && run_park == 0, "D: TTL of nothing anywhere - not parked");
+	pc_jw_init(&out, outbuf, sizeof outbuf);
+	pc_pres_resp(&out, PC_PRES_EXISTS, 1, 0, 0);
+	pc_pres_resp(&out, PC_PRES_EXISTS, 0, 0, 0);
+	CHK(is(":1\r\n:0\r\n"), "D: a pull's answer to EXISTS - 1, 0");
+	pc_jw_init(&out, outbuf, sizeof outbuf);
+	pc_pres_resp(&out, PC_PRES_TYPE, 1, PCACHE_F_HASH, 0);
+	pc_pres_resp(&out, PC_PRES_TYPE, 1, PCACHE_F_JSON, 5);
+	pc_pres_resp(&out, PC_PRES_TYPE, 1, 0, 0);
+	pc_pres_resp(&out, PC_PRES_TYPE, 0, 0, 0);
+	CHK(is("+hash\r\n+ReJSON-RL\r\n+string\r\n+none\r\n"),
+		"D: to TYPE - hash, a document, string, none");
+	pc_jw_init(&out, outbuf, sizeof outbuf);
+	pc_pres_resp(&out, PC_PRES_TTL, 1, 0, 10);
+	pc_pres_resp(&out, PC_PRES_TTL, 1, 0, 0);
+	pc_pres_resp(&out, PC_PRES_TTL, 0, 0, 0);
+	pc_pres_resp(&out, PC_PRES_PTTL, 1, 0, 10);
+	pc_pres_resp(&out, PC_PRES_PTTL, 1, 0, 0);
+	pc_pres_resp(&out, PC_PRES_PTTL, 0, 0, 0);
+	CHK(is(":10\r\n:-1\r\n:-2\r\n:10000\r\n:-1\r\n:-2\r\n"),
+		"D: to TTL and PTTL - the seconds, -1 none, -2 absent; PTTL in ms");
 
-	/* E */
+	/* E: MGET - nil for a miss or a document; fan-out answers, refusals, a parked mget, no conn */
 	RUN(rh_mget, "MGET", "a", "nope", "doc");
 	CHK(is("*3\r\n$1\r\n1\r\n$-1\r\n$-1\r\n"),
 		"E: MGET a nope doc - the value, nil for a miss, nil for a document");
@@ -448,10 +475,20 @@ int main(void)
 	RUN(rh_mget, "MGET", "a");
 	CHK(is("-TRYAGAIN mget: busy\r\n") && fan_parked == 1,
 		"E: G8 - refused: the error in the core's code word");
+	fan_refuse = 0;
+	RUN(rh_mget, "MGET", "a", "b");
+	CHK(fan_count == 0, "E: MGET asks for values");
+	RUN(rh_exists, "EXISTS", "a", "far", "nope");
+	CHK(is("*1\r\n$2\r\nfv\r\n") && fan_n == 3 && fan_count == 1 &&
+		fan_freed == 3, "E: EXISTS of several keys: the fan-out core, counting");
+	fan_on = 0;
+	RUN(rh_exists, "EXISTS", "a", "far", "nope");
+	CHK(is(":1\r\n") && run_park == 0,
+		"E: EXISTS of several keys, nothing fans: counted here, not parked");
 	fan_on = fan_refuse = 0;
 	run_conn = NULL;
 
-	/* F */
+	/* F: INCR/INCRBY/DECR/DECRBY - the value, expiry kept, bad amounts, WRONGTYPE, TRYAGAIN */
 	RUN(rh_incr, "INCR", "n");
 	CHK(is(":1\r\n") && last_addsub_ttl == -1,
 		"F: INCR of a missing key - 1, the expiry left alone (ttl -1)");

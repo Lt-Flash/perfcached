@@ -1,40 +1,12 @@
 #!/bin/sh
-# containers-up.sh — the 4-container bench topology on one machine:
-# three perfcached:debian nodes (automatic membership over multicast on
-# the bridge) + one redis:8, all on a user-defined bridge network.
-# Works with docker OR containerd/nerdctl - set RUNTIME, or it picks
-# whichever is installed (nerdctl preferred).
-#
-# GLIBC, NOT MUSL, and this is not a preference.  musl's allocator
-# serialises libperfd's per-reply malloc - a musl-built client peaks at
-# TWO threads and then goes BACKWARDS - so a musl fleet measures the
-# allocator instead of the daemon, and its behaviour is not the
-# behaviour we ship.  musl stays a supported BUILD target for the
-# portability matrix (tools/matrix.sh); it is never what a fleet runs.
-# redis:8 rather than its musl tag for the same reason: the musl tag
-# would drive the RESP arms with a musl client while the native arms
-# are not.
-#
-#   bench/containers-up.sh [arena_mb] [wal]
-#
-# Node configs land in /var/tmp/pccluster/ and differ ONLY by the
-# advertise IP - membership needs nothing else per node.  Collection
-# `b` is STORE mode with pull (a local miss fetches from a peer and
-# keeps the copy); collection `px` is PROXY mode (each key on exactly
-# one node, fleet capacity = the sum of arenas); collection `sh` is
-# SHARD mode, where ownership is computed rather than remembered - the
-# one mode that MOVES keys when membership changes, which is what the
-# reshard fault test (test/reshardtest.sh) needs.  With `wal`, every
-# node gets fsync=everysec WAL + RDB on a bind mount, and a SECOND
-# redis (pcredis-aof, --appendonly yes) joins as the durability-matched
-# arm.  Prints the membership-convergence time before exiting.
+# containers-up.sh - three perfcached:debian nodes and redis:8 on one bridge network (docker or
+# nerdctl); glibc, as musl's allocator serialises libperfd.  Usage: bench/containers-up.sh [arena_mb] [wal]
 set -eu
 
 ARENA=${1:-128}
 WAL=${2:-nowal}
-# IMAGE exists so a suite can stand the SAME fleet up on a different
-# build - which is how a fix is shown to fix something: run the test
-# against the binary that lacks it and watch it fail first.
+# IMAGE stands the same fleet up on another build: run against the binary that lacks a fix and
+# watch it fail first
 IMG=${IMAGE:-perfcached:debian}
 RT=${RUNTIME:-}
 [ -n "$RT" ] || { command -v nerdctl >/dev/null 2>&1 && RT=nerdctl || RT=docker; }
@@ -50,8 +22,7 @@ for i in 1 2 3; do
 	VOL=""
 	if [ "$WAL" = wal ]; then
 		mkdir -p /var/tmp/pccluster/wal$i
-		# explicit sizing: the autosize probe once picked 8 x 256 MB
-		# per node on a fast disk and filled the host filesystem
+		# explicit sizing: the autosize probe once filled the host filesystem
 		WALSEC="[wal]
 dir = /wal
 fsync = everysec
@@ -86,13 +57,8 @@ buckets_log2 = 16
 mode = shard
 EOF
 	$RT rm -f pcnode$i >/dev/null 2>&1 || true
-	# --ulimit memlock: the container default (64KB) makes the arena
-	# mlock fail into a warning; unlimited keeps the arena pinned
-	# the config at /etc/pcnode.conf, a path perfcli does not search: at
-	# /etc/perfcached.conf (S339) perfcli took its client secret and
-	# dialled an encrypted session at the plaintext-only loopback door, and
-	# every `exec perfcli` here and in the fault suites answered nothing -
-	# "cluster did NOT converge" with the fleet up (2026-10-23)
+	# --ulimit memlock: the container default (64 KB) leaves the arena unpinned.  The config sits at
+	# /etc/pcnode.conf, which perfcli does not search, so it never dials the loopback door encrypted.
 	$RT run -d --name pcnode$i --network pcnet --ip 10.99.0.1$i \
 		--ulimit memlock=-1:-1 \
 		-v /var/tmp/pccluster/node$i.conf:/etc/pcnode.conf:ro \
@@ -110,8 +76,7 @@ if [ "$WAL" = wal ]; then
 		redis:8 --appendonly yes >/dev/null
 fi
 
-# membership convergence: elapsed from now until every node reports
-# peers_up=2 (ids assigned, master elected)
+# membership convergence: from now until every node reports peers_up=2
 T0=$(date +%s%N)
 i=0
 while [ $i -lt 300 ]; do

@@ -1,29 +1,16 @@
 # Contributor: Yury Kirsanov <yury@kfi.net.au>
 # Maintainer: Yury Kirsanov <yury@kfi.net.au>
-#
-# perfcached for Alpine (PD-11, DESIGN 12nr; S370 began it with libperfd
-# alone).  One source tarball, six packages:
-#   perfcached             the clustered daemon, perfcli, perfdump, perfload,
-#                          the OpenRC service (not enabled), the example config
-#   perfcached-standalone  the standalone edition under the same names
-#                          (one daemon per host: apk del perfcached, then add it)
-#   perfcached-dashboard   the status page as its own service, its own account
-#   libperfd               the client library (.so.0)
-#   libperfd-dev           perfd.h, libperfd.a, the .so link, pkg-config
-#   perfcached-doc         GUIDE, PRODUCTION, the ChangeLog
-# Built from the release tarball with the tree's own Makefile; signed with
-# the perfcached release key (keys/*.rsa.pub goes in /etc/apk/keys).  See
-# README.md here.  Both daemon packages write INSTALL-MODE = package, so
-# the daemon's upgrade_stage refuses (PD-9): apk upgrades the daemon.
+# perfcached for Alpine: one source tarball, six packages (README.md here); both daemon
+# packages write INSTALL-MODE = package, so apk, not the daemon's upgrade_stage, upgrades them
 pkgname=perfcached
-pkgver=0.7.4.4
+pkgver=0.7.5
 pkgrel=0
 pkgdesc="Clustered in-memory cache and store with a durable write-ahead log"
 url="https://github.com/Lt-Flash/perfcached"
 arch="all"
-license="MIT"
+license="GPL-2.0-or-later AND MIT"
 depends="libsodium"
-makedepends="libsodium-dev linux-headers libmicrohttpd-dev curl-dev"
+makedepends="libsodium-dev linux-headers libmicrohttpd-dev curl-dev openssl-dev"
 install="$pkgname.pre-install $pkgname-standalone.pre-install $pkgname-dashboard.pre-install"
 subpackages="$pkgname-doc $pkgname-standalone:standalone $pkgname-dashboard:dashboard
 	libperfd:lib libperfd-dev:dev"
@@ -35,9 +22,8 @@ options="!check"
 _rev="${PC_BUILD_REV:-$pkgver}"
 
 build() {
-	# the clustered edition, the dashboard and the library, installed into a
-	# staging tree; then the tree cleaned and built again as the standalone
-	# edition (the edition is a compile-time choice - debian/rules does the same)
+	# the clustered edition, dashboard and library into one staging tree, then a clean rebuild
+	# as the standalone edition into another (the edition is a compile-time choice)
 	make PC_BUILD_REV="$_rev" PC_DASH=yes PC_MAIL=libcurl \
 		perfcached perfcli perfdump perfload perfcached-dashboard libperfd.a libperfd.so
 	make PC_BUILD_REV="$_rev" PC_DASH=yes PC_MAIL=libcurl install \
@@ -65,7 +51,8 @@ _daemon_tree() { # <staging tree> <destination>
 package() {
 	_daemon_tree "$builddir/_cl" "$pkgdir"
 	install -Dm755 "$srcdir"/perfcached-dashboard.initd "$pkgdir"/etc/init.d/perfcached-dashboard
-	install -Dm644 "$builddir"/LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+	install -Dm644 "$builddir"/COPYING "$pkgdir"/usr/share/licenses/$pkgname/COPYING
+	install -Dm644 "$builddir"/LICENSING.md "$pkgdir"/usr/share/licenses/$pkgname/LICENSING.md
 	install -Dm644 "$builddir"/GUIDE.md "$pkgdir"/usr/share/doc/$pkgname/GUIDE.md
 	install -Dm644 "$builddir"/PRODUCTION.md "$pkgdir"/usr/share/doc/$pkgname/PRODUCTION.md
 	install -Dm644 "$builddir"/ChangeLog "$pkgdir"/usr/share/doc/$pkgname/ChangeLog

@@ -1,18 +1,6 @@
 #!/bin/sh
-# jsontest.sh — S26 verification: the JSON path verbs (jget/jset/jdel/
-# jincr).  Documents are opaque text in ordinary cells; edits are span
-# splices under a per-key mutex stripe.  Proven here:
-#  - create via jset $, read back whole and by path (member, index,
-#    subtree), missing-leaf vs missing-intermediate vs type errors;
-#  - partial edit: replace a leaf, create a NEW member, nx/xx flags;
-#  - jincr integer leaves (and the non-number refusal);
-#  - jdel of members and array elements keeps the document valid,
-#    absent leaves report deleted:false;
-#  - TTL survives partial edits unless explicitly overridden;
-#  - non-JSON stored values are refused per contract;
-#  - the stripe lock: 200 racing jincrs from two connections land
-#    EXACTLY 200 - no lost update.
-# Usage: test/jsontest.sh [./perfcached]
+# jsontest.sh - the JSON path verbs (jget/jset/jdel/jincr): path reads and edits, TTL kept across edits,
+# non-JSON refused, and 200 racing jincrs from two connections land exactly 200.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -61,10 +49,8 @@ for line in sys.stdin:
     f.write(json.dumps(req).encode()+b"\n"); f.flush()
     r = json.loads(f.readline())
     res = r.get("result", r.get("error"))
-    # a document travels as DATA (D3): jset/jarrappend's val goes out as
-    # one bulk of its JSON text (pcnative DOC_PARAMS), and jget's value
-    # comes back as the fragment's JSON text - parse it so the greps
-    # below see the value, as the JSON door rendered it
+    # jget's value comes back as the fragment's JSON text: parse it so the greps below
+    # see the value as the JSON door rendered it
     if req["method"] == "jget" and isinstance(res, dict) and isinstance(res.get("value"), str):
         res["value"] = json.loads(res["value"])
     print(json.dumps(res))
@@ -167,10 +153,7 @@ T=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ttl"])'
 [ "$T" -gt 800 ] && ok || bad "explicit ttl ignored ($T)"
 
 # ---- a string is refused by the JSON verbs -------------------------------
-# S280: under redis_types = strict (the default) a key `set` wrote is a
-# STRING, refused as the wrong type before its bytes are looked at - as
-# Redis refuses JSON.GET on one.  (Under loose it is parsed, and this one
-# would be "not JSON".)
+# under redis_types = strict (the default) a key `set` wrote is a STRING, refused as the wrong type
 call '{"method":"set","params":{"col":"js","key":"plain","value":"not json at all }{"}}' >/dev/null
 R=$(call '{"method":"jget","params":{"col":"js","key":"plain","path":"$.a"}}')
 echo "$R" | grep -q 'Existing key has wrong Redis type' && ok || bad "a string under jget: $R"

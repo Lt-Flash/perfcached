@@ -1,13 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clboot.c - the bootstrap's decision half (M4).  See clboot.h.
- *
- * Moved out of boot_tick() and boot_request() unchanged; what differs is
- * that the state is reached through a pointer, the clock is passed in,
- * the handoff lock is passed in, and the three outcomes that used to log
- * and set node state are returned instead.
- */
+/* clboot.c - the bootstrap's decision half.  See clboot.h. */
 #include <string.h>
 
 #include "clboot.h"
@@ -46,10 +39,8 @@ int clboot_pending(struct clboot *b, pthread_mutex_t *mx)
 	return pending;
 }
 
-/* Both halves of the tick's view, under ONE acquisition.  boot_tick took
- * the lock twice in a row for these - with a declaration stranded between
- * the two critical sections - so pending and round_failed could come from
- * different instants. */
+/* Both halves of the tick's view under ONE acquisition, so pending and
+ * round_failed come from the same instant. */
 void clboot_tick_state(struct clboot *b, pthread_mutex_t *mx, int *pending,
 		int *failed_round)
 {
@@ -107,9 +98,8 @@ void clboot_pull_ok(struct clboot *b, pthread_mutex_t *mx)
 	pthread_mutex_unlock(mx);
 }
 
-/* every candidate of this round failed: hand the decision back to the
- * tick, which re-picks with the peers known by now, or gives up after
- * three rounds */
+/* every candidate of this round failed: the tick re-picks with the peers
+ * known by now, or gives up after three rounds */
 void clboot_pull_failed(struct clboot *b, pthread_mutex_t *mx)
 {
 	pthread_mutex_lock(mx);
@@ -134,20 +124,13 @@ int clboot_after_pick(struct clboot *b, long long now, int failed_round,
 		int picked)
 {
 	if (failed_round && !picked) {
-		/* Nobody to re-pick yet: wait a beat more.  In boot_tick this
-		 * extension was a DEAD STORE - the branch set br = 1 and the
-		 * `else if (br)` two lines down zeroed the deadline again, so
-		 * a re-pick that found nobody reported READY on the very next
-		 * tick instead of waiting.  The comment says wait; now it
-		 * does. */
+		/* nobody to re-pick yet: wait a beat more */
 		b->deadline_ms = now + BOOT_WAIT_MS;
 		return CLBOOT_WAIT;
 	}
 	if (picked == 2) {
-		/* a fleet that is itself empty - its birth, or a keyspace
-		 * that expired - has nothing to hand over; the few records a
-		 * beat may hide arrive by the push.  Waiting would only hold
-		 * writers off an empty node. */
+		/* an empty fleet has nothing to hand over; the few records a beat may hide
+		 * arrive by the push, and waiting would only hold writers off an empty node */
 		b->deadline_ms = 0;
 		clboot_set_done(b);
 		return CLBOOT_EMPTY;

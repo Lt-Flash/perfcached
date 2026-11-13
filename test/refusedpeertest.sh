@@ -1,28 +1,6 @@
 #!/bin/sh
-# refusedpeertest.sh - S241 + S242: a node the fleet REFUSES cannot move
-# the fleet's mastership, and the refusal says what differs.
-#
-# Seen on 245-247 (2026-09-26): a node restarted without its [wal] was
-# refused by every member (the WAL posture is in the interchange digest),
-# founded a cluster of its own - and its MAPS still reached the fleet,
-# whose master stepped down to the higher term (rule 3), re-promoted one
-# higher, and so on: 111 -> 180 in five minutes, a member flapping
-# between member and backup on the page.  The map plane had no admission
-# check; the keepalive doors did.
-#
-# Two eager nodes with a WAL form a fleet; a third, identical but with no
-# WAL, starts beside them.  Over 30 s:
-#   1. the fleet keeps ONE master and ONE map term - no step-down in its
-#      logs, whatever the refused node claims;
-#   2. the refused node stays alone (0 peers);
-#   3. the fleet saw its maps and ignored them (map.unadmitted > 0 - the
-#      path fired; a quiet 30 s with no maps sent would prove nothing);
-#   4. S242: the refusal names our WAL posture (wal=on) and says mode and
-#      eager MATCH, so the difference is elsewhere - the old line showed
-#      only our placement, which is not what differed.
-# FAIL-FIRST: the build before S241 steps the fleet's master down to the
-# refused node's maps within the window.
-# Usage: test/refusedpeertest.sh [./perfcached]
+# refusedpeertest.sh - a node the fleet refuses cannot move its mastership with its maps, and the
+# refusal says what differs.  Usage: test/refusedpeertest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -93,11 +71,20 @@ try:
     print(c.get("role"), c.get("master_id", c.get("master", "?")), m.get("term"), c.get("peers_up"), m.get("unadmitted", "-"))
 except Exception: print("? ? ? ? ?")' "1737$1" 2>/dev/null || echo "? ? ? ? ?"; }
 w() { echo "$1" | cut -d' ' -f"$2"; }
+rdy() { # rdy <n>: the node's state
+	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"stats"}' | timeout 10 python3 -c '
+import json, socket, sys, pcnative
+try:
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5); f = pcnative.wrap(s)
+    f.write(sys.stdin.read().encode()); f.flush()
+    print(json.loads(f.readline())["result"].get("state"))
+except Exception: print("?")' "1737$1" 2>/dev/null || echo "?"; }
 
 conf 1 1; conf 2 1; conf 3 0
 start 1 && sleep 1 && start 2 || { echo "refusedpeertest: the fleet did not start"; exit 1; }
 i=0; while [ $i -lt 40 ]; do [ "$(w "$(st 1)" 4)" = 1 ] && [ "$(w "$(st 2)" 4)" = 1 ] && break; sleep 0.5; i=$((i+1)); done
-sleep 2
+# peers_up counts a joiner still CONNECTING: then up to 30 s for both to be ready
+i=0; while [ $i -lt 60 ] && [ "$(rdy 1)$(rdy 2)" != readyready ]; do sleep 0.5; i=$((i+1)); done
 A=$(st 1); B=$(st 2)
 M0=""; [ "$(w "$A" 1)" = master ] && M0=1; [ "$(w "$B" 1)" = master ] && M0=2
 T0=$(w "$A" 3)

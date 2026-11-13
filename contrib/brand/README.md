@@ -1,7 +1,7 @@
 # perfcached brand - parked designs (2026-09-21)
 
 Decided in conversation on 2026-09-21.  The status page draws the
-anchor and the compass itself (S202-S207); the project README shows
+anchor and the compass itself; the project README shows
 `perfcached-lockup.svg` at its head and `perfd-mark.svg` for libperfd
 (0.4.0), through the `-light` / `-dark` copies: GitHub picks a
 `<picture>` source by its own theme, which can differ from the

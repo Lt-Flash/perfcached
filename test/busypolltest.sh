@@ -1,18 +1,6 @@
 #!/bin/sh
-# busypolltest.sh - S363: [daemon] busy_poll_us / busy_poll_prefer.
-#  1. off by default: /stats io.busy_poll says 0 us, 0 workers; -E dumps it
-#  2. busy_poll_us = 50, on each backend this host runs (io_uring if it
-#     can, and epoll): -C says whether the host takes it; the daemon agrees
-#     - every worker has it, or none has and /stats says why, and either
-#     way it serves; /metrics carries the worker count
-#  3. busy_poll_prefer = yes is shown; bad values are refused
-#  4. a refusal (forced with PERFCACHED_BUSYPOLL_DENY=1, as an old kernel
-#     refuses): -C says so, no worker has it, /stats says why, a WARNING,
-#     and the daemon serves all the same
-# A kernel before 6.9 refuses busy poll (the workers run without it); on
-# loopback it never engages (no NAPI), so this proves the switch, not the
-# latency - that is measured on a real NIC.
-# Usage: test/busypolltest.sh ./perfcached
+# busypolltest.sh - busy_poll_us / busy_poll_prefer: off by default, taken or refused per backend and
+# said why, and the daemon serves either way; on loopback it proves the switch, not the latency.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

@@ -1,41 +1,13 @@
 #!/bin/sh
-# verwiretest.sh — task A2: the version travels with the bytes.
-#
-# A1 made a record's version survive a restart.  It is still only
-# meaningful on the node that wrote it: a copy that arrives from a peer
-# is stored with a FRESH LOCAL tick, so the same key carries a different
-# number on every node holding it and no two of them can be compared.
-#
-#  1. an eager replica carries the AUTHOR's version, not the receiver's
-#  2. an update propagates and the replica's version follows it
-#  3. a pulled copy carries the HOLDER's version.  This one is not
-#     tidiness: the fleet's clocks converge to the maximum, so a local
-#     tick here can land ABOVE the holder's own number, and the holder's
-#     very next genuine update would then be refused as older.
-#  4. refusals are counted rather than silent.  They are NOT an error
-#     signal on their own: a pull and an eager push can both deliver the
-#     same record, and the second one is correctly refused.  The counter
-#     exists so a RUNAWAY - a sender looping on records nobody takes - is
-#     visible.
-#  5. a TTL re-arm still propagates.  `expire` re-arms without rewriting
-#     the value, so if it does not move the version, the peer refuses the
-#     refresh as not-newer and the deadline silently stops replicating -
-#     a regression A2 introduces unless the touch path ticks too.
-#
-# The refusal itself is proved deterministically in the htable selftest
-# (store_ver: older refused, equal refused, newer taken, a local write
-# still outranks a peer copy) - two nodes cannot be made to disagree on
-# demand from a shell script.
-# Usage: test/verwiretest.sh [./perfcached]
+# verwiretest.sh - the version travels with the bytes: a replica or a pulled copy carries the
+# author's version, refusals are counted, and a TTL re-arm still propagates.
 set -u
 
 BIN=${1:-./perfcached}
 SEC=vw-client-secret
 D=$(mktemp -d /var/tmp/pcvw.XXXXXX)
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a
+# reused pid never hits a stranger; the name-bound pattern stays as a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -117,7 +89,12 @@ await() {
 
 mk 1; mk 2
 start 1 && start 2 || { echo "fleet did not start"; exit 1; }
-sleep 6
+# a joiner is CONNECTING until its links answer: up to 30 s for both ready and seeing each other
+st() { cli $1 -q -j '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1)" != "ready 1" ] || [ "$(st 2)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
 # ---- 1. an eager replica keeps the author's version --------------------
 put 1 wk1 hello
@@ -141,8 +118,7 @@ W1=$(verof 1 wk1)
 	|| bad "update versions diverged: node1=$W1 node2=$W2 (was $V1)"
 
 # ---- 3. a pulled copy carries the holder's version ---------------------
-# write on 2, read it from 1: with eager on both this may already be a
-# replica, so use a key written while 1 is the one asking
+# eager on both may make it a replica already: use a key written while 1 is the one asking
 put 2 pk1 pulled-value
 await 1 pk1 || bad "pk1 never reached node 1"
 P1=$(verof 1 pk1); P2=$(verof 2 pk1)

@@ -1,23 +1,5 @@
-/* upstatstest.c - the read-through's figures (upstats.c; the 0.7.2 split,
- * wave 1): the collection table, its two upstreams and the helpers
- * upstream.c owns are stubbed here, and the tree is rendered as JSON.
- *
- *   A  an unknown collection writes nothing
- *   B  each upstream: its address, role, state and why, connections, its
- *      tracking, lag (null when not known) and shadow entries; the
- *      collection's connections and shadow entries summed over both; its
- *      tracking off while one in use is untracked, on once that one is
- *      not used
- *   C  the counters as /stats shows them (S358: since the last reset) and
- *      the average fetch; the write-through block - its target, the queue
- *      (queued plus the writer's batch), the broadcast and upfill states,
- *      a row per command, the last errors newest first; with no target,
- *      the state's name and why
- *   D  pc_upstream_stats_reset: every counter reads 0 and then counts from
- *      there, the per-command rows too, the error ring empties; gauges
- *      (connections, shadow entries), the per-upstream shares and the
- *      drain run's figures are left as they were
- */
+/* upstatstest.c - the read-through's figures (upstats.c): the collection table, its two upstreams
+ * and upstream.c's helpers stubbed, the tree rendered as JSON. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -135,11 +117,11 @@ int main(void)
 
 	setup();
 
-	/* A */
+	/* A: an unknown collection writes nothing */
 	render("nope");
 	CHK(!strcmp(js, "{}"), "A: an unknown collection writes nothing (%s)", js);
 
-	/* B */
+	/* B: each upstream's address, role, state, connections, tracking, lag and shadow entries */
 	render("c");
 	CHK(has("{\"addr\":\"10.0.0.1:6379\",\"role\":\"master\",\"state\":\"serving\",\"why\":\"\","
 		"\"connections_up\":2,"), "B: the first upstream - master, serving");
@@ -158,7 +140,7 @@ int main(void)
 	CHK(has("\"tracking\":true,\"server\":\"abc\""), "B: on once that one is not used");
 	sstate[1] = PC_UPS_UNKNOWN;
 
-	/* C */
+	/* C: the counters since the last reset, the average fetch, and the write-through block */
 	render("c");
 	CHK(has("\"held\":7,\"joined\":3,\"fetches\":10,\"win_fetches\":"), "C: held, joined, fetches");
 	CHK(has("\"read_lost\":2,\"win_read_lost\":"), "C: read_lost (S435)");
@@ -186,7 +168,7 @@ int main(void)
 	uc->w_master = 0;
 	uc->w_state = UPWS_OK;
 
-	/* D */
+	/* D: pc_upstream_stats_reset zeroes the counters, rows and error ring, and leaves gauges */
 	pc_upstream_stats_reset();
 	render("c");
 	CHK(has("\"held\":0,\"joined\":0,\"fetches\":0,\"win_fetches\":"), "D: the counters read 0");

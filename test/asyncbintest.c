@@ -1,26 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * asyncbintest.c — the fixed-layout async path: warm-up and reply decoding.
- *
- * asynctest.c drives perfd_submit(), whose replies come back rendered
- * as JSON text at the API edge, so perfd_submit_kv() - the data verb's
- * raw frame, raw payload back - had no coverage at all.  The OpenSIPS
- * driver's async fetch (cachedb_perfd, S28) is built on exactly these
- * two things, and both are easy to get wrong:
- *
- *  1. WARM-UP.  perfd_connect_async() returns in PERFD_ST_CONNECTING;
- *     TCP and the Noise handshake are driven by readiness events.  A
- *     consumer that submits before PERFD_ST_READY gets "connection not
- *     ready", so the poll loop below is the shape a caller needs.
- *  2. DECODING.  A binary GET answers [u8 found][u32 ttl][value], and a
- *     MISS is a SUCCESSFUL frame carrying a single zero byte - not an
- *     error frame, and not a NULL result.  Reading the payload as the
- *     value yields a one-byte NUL string on every miss, which looks
- *     like a stored empty value to whatever asked.
- *
- * Usage: asyncbintest <host> <port> <secret|-> <col>
- */
+/* asyncbintest.c - the fixed-layout async path (perfd_submit_kv): warm-up to PERFD_ST_READY under a
+ * poll loop, and a binary GET miss decoded as a successful one-byte frame, not an empty value. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,7 +147,7 @@ int main(int argc, char **argv)
 	}
 	free(rg.res);
 
-	/* 4. THE ONE THAT BITES: a miss is a SUCCESSFUL one-byte frame */
+	/* 4. a miss is a SUCCESSFUL one-byte frame; read as the value it looks like a stored "" */
 	memset(&rm, 0, sizeof rm);
 	if (perfd_submit_kv(p, PERFD_V_GET, col, "abk-absent", NULL, 0, 0, 0,
 	        cb, &rm) != 0 || perfd_push(p) < 0) {

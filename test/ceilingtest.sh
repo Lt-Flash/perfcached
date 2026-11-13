@@ -1,26 +1,13 @@
 #!/bin/sh
-# ceilingtest.sh - S114: the spell at the ceiling ENDS once the arena can
-# carve again, and `held` says what it is made of.  One node with a 16 MB
-# reservation under a 64 MB ceiling (the elastic shape pressuretest uses:
-# a fixed reservation cannot give back by construction) is driven past
-# the ceiling with short-lived 60 KB values (writes refused, at_ceiling
-# true), the records expire and the give-back runs,
-# and the flag must clear within a few ticks - it used to clear only on a
-# successful carve, which a drained table never needs.  The structural
-# figure (regions: bucket directories, hint tables, counters) must be
-# there, a whole number of slots, and unchanged by a burst that grew no
-# table; the warm-free figure must fall when the give-back punches.
-# Fail-first: a daemon without arena_regions answers MISSING, and one
-# that clears the spell only on a carve keeps at_ceiling true here.
+# ceilingtest.sh - the spell at the ceiling ends once the arena can carve again, not only on a carve,
+# and `held` says what it is made of (structure, class chunks, warm free, page slack).
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
 SEC=ceil-client-secret
 D=$(mktemp -d /var/tmp/pcce.XXXXXX)
-# the daemon is killed by the pid this script started, never by a pattern:
-# a pattern assumes the binary's name, and a fail-first run of this suite
-# against a renamed daemon (perfcached-rc21) outlived its trap and held the
-# port against the next two runs
+# the daemon is killed by the pid this script started, never by a pattern: a pattern assumes the
+# binary's name, and a renamed daemon outlives the trap and holds the port
 P=""
 trap '[ -n "$P" ] && grep -qa -- "$D" /proc/$P/cmdline 2>/dev/null && kill -9 "$P"; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -55,9 +42,8 @@ while [ $i -lt 200 ]; do
 	sleep 0.1; i=$((i+1))
 done
 grep -q "perfcached ready" "$D/n1.log" || { echo "node did not start"; cat "$D/n1.log"; exit 1; }
-# drive <op> [args] - ops: fill <n> <ttl> (60 KB values; prints stored/full),
-# mem <field> (stats.memory.<field>, dotted path allowed; MISSING when absent),
-# buckets (sum of collections[].buckets)
+# drive <op> [args]: fill <n> <ttl> (60 KB values; prints stored/full), mem <field> (dotted path
+# under stats.memory; MISSING when absent), buckets (sum of collections[].buckets)
 drive() {
 	python3 - "$@" <<'PYEOF'
 import json, pcnative, socket, sys
@@ -93,10 +79,8 @@ else:
     print("MISSING" if r is None else r)
 PYEOF
 }
-# S118: held is exactly its parts - structure + class chunks + warm free +
-# page slack - read in ONE stats call.  A give-back tick between two of the
-# counters can tear a read, so a mismatch is re-read before it is a failure;
-# a daemon without the two S118 figures answers MISSING and fails at once.
+# held is read in ONE stats call; a give-back tick between two counters can still tear it,
+# so a mismatch is re-read before it is a failure
 parts_ok() { # parts_ok <label>
 	L="$1"; i=0
 	while [ $i -lt 6 ]; do

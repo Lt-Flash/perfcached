@@ -1,15 +1,5 @@
-/* liballoc.c - S284: libperfd allocations per call, counted by
- * test/allocshim.so preloaded into THIS process (test/liballoctest.sh).
- *
- * The shim adds one to a counter in a shared file per malloc/calloc/
- * realloc; this driver maps the same file and reads the counter around
- * N calls of each call on a warm handle.  One line per case:
- * "<call> <allocations per call> <expected>".  Expected is 0, and 1 for
- * the calls whose result is malloc'd for the caller by contract
- * (perfd_get, perfd_jget, perfd_hget) - their S353 _buf twins copy into
- * the caller's buffer and must count 0.
- * Usage: liballoc <port> <counter file>
- */
+/* liballoc.c <port> <counter file> - libperfd allocations per call, counted by test/allocshim.so
+ * preloaded here: 0, or 1 where the result is malloc'd for the caller (its _buf twin counts 0). */
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,7 +33,7 @@ int main(int argc, char **argv)
 	void *v;
 	size_t vl;
 	char *frag;
-	char gb[256];                          /* S353: the caller's buffer */
+	char gb[256];                          /* the caller's buffer */
 	long long n, ttl;
 	int fd, i, bad = 0;
 

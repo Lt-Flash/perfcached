@@ -1,26 +1,6 @@
 #!/bin/bash
-# rpscmp.sh - RESP pub/sub, Redis against perfcached, one client
-# (bench/rpsbench.c) on one host.  Each server runs in a container pinned
-# to SRV_CPUS on the host network, bound to loopback; the driver runs on
-# the host pinned to CLI_CPUS, so publishers and subscribers share a
-# clock and the servers never share the client's cores.
-#
-#   IMG_PC=localhost/perfcached:<rev> bench/rpscmp.sh [reps] [secs]
-#
-# IMG_PC is a bench/Containerfile.debian image (required).  Environment:
-#   REDIS_IMG  docker.io/library/redis:8       RUNTIME   podman
-#   ARMS       "redis-io1 redis-io4 pc-w4"      (also pc-w1)
-#   SRV_CPUS   0-7    CLI_CPUS   8-15           OUT       /var/tmp/rpscmp
-#
-# Cells, 64-byte payloads, 8 publisher connections on 2 threads:
-#   s1-paced100k   1 subscriber, 100k publishes/s     (latency at a rate)
-#   s1-max         1 subscriber, closed loop, 16 in flight per connection
-#   s64-paced20k   64 subscribers on 5 threads, 20k publishes/s
-#   s64-max        64 subscribers, closed loop
-# Arms alternate order between reps.  Writes $OUT/results.tsv: '# ' lines
-# naming the builds and each arm's server, then a row per cell and rep.
-# Read drv_cores and busiest_thr before a number: a busiest driver thread
-# near 1.00 measured the client.
+# rpscmp.sh - RESP pub/sub, Redis against perfcached, one rpsbench client pinned apart from the servers;
+# a busiest driver thread near 1.00 measured the client.  Usage: IMG_PC=<image> bench/rpscmp.sh [reps] [secs]
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPS=${1:-2}
@@ -43,8 +23,8 @@ trap 'cleanup; exit 1' INT TERM
 
 cc -O2 -std=gnu11 -Wall -Wextra -o "$OUT/rpsbench" "$HERE/rpsbench.c" -lpthread || exit 1
 for w in 1 4; do
-	# plaintext = loopback: the native door is unused here, and 0.3.8-rc1
-	# through 0.4.0-rc3 crash with an encrypted door and no cluster secret
+	# plaintext = loopback: the native door is unused here (and an encrypted door without a cluster
+	# secret crashes older builds)
 	cat > "$OUT/pc-w$w.conf" <<CONF
 [daemon]
 workers = $w

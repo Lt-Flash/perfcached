@@ -1,25 +1,5 @@
-/*
- * memprobe — S3 verification runner for the ported memory backing.
- *
- * Exercises the private-anon port end to end on the running host:
- *   1. pcache_mem_probe(): the tier ladder, by trying (prints sizes+tier);
- *   2. pcache_mem_reserve(64M): mapping, PMD alignment, tier, pinning;
- *   3. fill the reservation, verify RSS carries it;
- *   4. the give-back interplay, exactly as the arena experiences it:
- *      - on a PINNED reservation (tiers 2-4) MADV_DONTNEED must be
- *        REFUSED (EINVAL) - this is what latches the arena's
- *        giveback_off: pinned memory is committed memory;
- *      - after munlock the same call must SUCCEED, RSS must drop, and
- *        the mapping must survive readable as zeros (never-unmap);
- *      - on tier 1 (hugetlb, never mlocked) DONTNEED returns pages to
- *        the pool - verified via HugePages_Free, since hugetlb memory
- *        never shows in VmRSS.
- *
- * Exit 0 = every check passed; nonzero = the first failed check, named.
- * PC_EXPECT_TIER=hugetlb|thp_advise|thp_collapse|4k asserts the achieved
- * reserve tier — used by the arch matrix (S27) and to demonstrate the
- * harness CAN fail (fail-before-pass discipline).
- */
+/* memprobe.c - the memory backing on this host: tier ladder, a 64 MB reservation, give-back refused
+ * while pinned and working after munlock.  PC_EXPECT_TIER=<tier> asserts the tier. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,13 +115,8 @@ int main(void)
 			return 6;
 		}
 	} else {
-		/* pinned reservation: the arena's give-back call must be
-		 * REFUSED while the pin holds - this is the giveback_off
-		 * latch working as designed, not a defect.  Trust the
-		 * KERNEL's VmLck, not the library's locked_mb belief:
-		 * sanitizer runtimes intercept mlock as a success-returning
-		 * no-op, and then there is no pin to verify - skip loudly
-		 * instead of failing on a pin that never existed. */
+		/* pinned: give-back must be REFUSED (the giveback_off latch).  Trust the kernel's
+		 * VmLck: a sanitizer's no-op mlock leaves no pin to verify, so skip loudly */
 		if (locked_mb > 0 && status_kb("VmLck:", 6) == 0) {
 			printf("SKIP: mlock claimed %lu MB but VmLck=0 kB - an "
 				"interceptor (sanitizer?) no-op'd the pin; "
@@ -160,10 +135,8 @@ int main(void)
 				return 5;
 			}
 		}
-		/* resample AFTER the pattern write: with a real pin the pages
-		 * were resident since reserve, but a no-op'd mlock populates
-		 * nothing and residency only arrived with the writes above -
-		 * the give-back claim is about what is resident NOW */
+		/* resample after the pattern write: a no-op'd mlock populated nothing, and
+		 * the give-back claim is about what is resident now */
 		rss_full = status_kb("VmRSS:", 6);
 		if (madvise(base, sz, MADV_DONTNEED) != 0) {
 			perror("FAIL: MADV_DONTNEED after unpin");

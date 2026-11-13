@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* spawnio.h - S344: run zstd from an argv, never through a shell, and open
+/* spawnio.h - run zstd from an argv, never through a shell, and open
  * the files a dump's manifest names only as plain names in its directory */
 #ifndef PC_SPAWNIO_H
 #define PC_SPAWNIO_H

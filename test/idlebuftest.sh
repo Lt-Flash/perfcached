@@ -1,31 +1,6 @@
 #!/bin/sh
-# idlebuftest.sh - S366: an idle connection gives its buffers back, and a
-# burst of freed connection memory goes back to the system.  10-09 on 245
-# (0.5.6.4): a held RESP connection cost 12.0 KB of heap - pc_conn plus its
-# in/out/wire buffers, kept for its life - and after 50,000 closed the
-# daemon's RSS stayed at 606 MB (baseline 154 MB): glibc keeps a freed heap.
-#
-#   - N RESP connections, each answered once: RSS grows by ~12 KB each (the
-#     positive control - the measurement sees buffers when they are there);
-#   - left idle, every one releases its buffers (clients.buffers.held 0,
-#     idle_released N) and, the burst over, malloc_trim runs: RSS growth is
-#     under 3 KB a connection - pc_conn and its CLIENT LIST row;
-#   - released connections still answer (the buffers grow back);
-#   - a BUSY connection keeps its buffers (no allocator churn per request)
-#     while the idle ones around it release theirs;
-#   - closing N connections holding buffers trims again: RSS within 8 MB of
-#     where it started.
-# RSS assertions are skipped under a sanitizer (its allocator, its RSS);
-# the counters and the behaviour are checked regardless.
-# The daemon runs with transparent huge pages off (PR_SET_THP_DISABLE): on
-# a host with THP "always" and the default max_ptes_none 511, khugepaged
-# turns any 2 MB range with one live page back into a whole huge page, so
-# the RSS this test reads jumps in 2 MB steps that are the host's policy,
-# not the daemon's give-back.  GitLab 110135 (v0.6.0, 224): two such steps
-# made "+8.4 MB" after the close; 224 with khugepaged sped up fails the
-# same way (+8.9 MB, huge pages 36 -> 44 MB) and passes with THP off.
-# Fail-first: 0.5.6.4 releases nothing and has no clients.buffers.
-# Usage: test/idlebuftest.sh [./perfcached]
+# idlebuftest.sh - an idle connection gives its buffers back and a burst of freed connection memory goes
+# back to the system (malloc_trim), judged by RSS; a busy connection keeps its buffers.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcidlebuf.XXXXXX); P=
@@ -56,7 +31,8 @@ if [ "$(ulimit -n)" != unlimited ] && [ "$(ulimit -n)" -lt 7000 ]; then
 	echo "  skip descriptor limit $(ulimit -n) (hard $(ulimit -H -n)) < 7000 - nothing was tested"
 	echo "idlebuftest: 0 passed, 0 failed (skipped)"; exit 0
 fi
-# prctl(PR_SET_THP_DISABLE = 41) survives the exec, and P is the daemon's pid
+# THP off (prctl 41, survives the exec; P is the daemon's pid): khugepaged would refill 2 MB ranges
+# holding one live page, and RSS would move in 2 MB steps of host policy
 python3 -c 'import ctypes, os, sys
 ctypes.CDLL(None).prctl(41, 1, 0, 0, 0)
 os.execv(sys.argv[1], sys.argv[1:])' "$BIN" -f "$D/pc.conf" -D > "$D/pc.log" 2>&1 & P=$!

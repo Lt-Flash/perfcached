@@ -1,10 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clhold.c - S394's hold-check frames: the codec (clhold.h).  The frame
- * layout and its bounds as cluster.c had them inline, moved here (the 0.7.2
- * split, wave 1); test/clholdtest.c.
- */
+/* clhold.c - the hold-check frames' codec (see clhold.h; test/clholdtest.c) */
 #include <string.h>
 
 #include "clhold.h"

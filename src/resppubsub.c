@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * resppubsub.c - the RESP door's pub/sub (PS2): SUBSCRIBE, PSUBSCRIBE,
- * UNSUBSCRIBE, PUNSUBSCRIBE, PUBLISH and PUBSUB over RESP2.  Moved from
- * verbs.c unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md); it
- * reaches verbs.c through verbsint.h.
- */
+/* resppubsub.c - the RESP door's pub/sub over RESP2 (SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE,
+ * PUNSUBSCRIBE, PUBLISH, PUBSUB); it reaches verbs.c through verbsint.h. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,8 +10,6 @@
 #include "pubsub.h"
 #include "respout.h"
 #include "verbsint.h"
-
-/* ---- PS2: pub/sub over RESP2 ------------------------------------------- */
 
 static void ps_confirm(struct pc_jw *out, const char *what, const char *name,
 		size_t nlen, int count)
@@ -165,7 +159,7 @@ int rh_pubsub(struct resp_ctx *c)
 	} else if (resp_is(sub, subl, "NUMPAT")) {
 		resp_int(c->out, pc_pubsub_numpat());
 	} else {
-		unk_sub(c);                    /* S165 */
+		unk_sub(c);
 		resp_err(c->out, "unsupported PUBSUB subcommand (CHANNELS, "
 			"NUMSUB, NUMPAT)");
 	}

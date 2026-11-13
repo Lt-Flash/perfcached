@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- *
- * clinit.c - the node identity file format.  See clinit.h.
- */
+ * clinit.c - the node identity file format (clinit.h). */
 #include <stdio.h>
 #include <string.h>
 
@@ -127,8 +125,6 @@ int clinit_proposed_id(const unsigned char *id)
 	return 1 + (int)(clinit_fnv1a64(id, CLINIT_IDENT_LEN) % 1023);
 }
 
-/* ---- the config digest ------------------------------------------------- */
-
 uint64_t clinit_config_digest(const struct clinit_digest_in *in)
 {
 	uint64_t h = FNV1A64_BASIS;
@@ -140,24 +136,20 @@ uint64_t clinit_config_digest(const struct clinit_digest_in *in)
 
 	DIG(in->mode);
 	DIG(in->eager);
-	/* folded only when ON, so a fleet without a WAL keeps the digest it
-	 * had before the flag existed and a rolling upgrade does not split
-	 * it (S73b) */
+	/* folded only when on, so a fleet without a WAL keeps its digest and a
+	 * rolling upgrade does not split it */
 	if (in->wal) {
 		DIG('W');
 		DIG(1);
 	}
-	/* S127: the copy factor decides WHICH nodes hold a key, so two
-	 * members running different K put the same record in different
-	 * places and each thinks the other is missing it.  Folded only
-	 * when set, exactly as the WAL flag above is. */
+	/* the copy factor decides WHICH nodes hold a key; folded only when set,
+	 * like the WAL flag */
 	if (in->replicas) {
 		DIG('K');
 		DIG(in->replicas);
 	}
-	/* PLACEMENT is interchange-relevant, and more so than anything else
-	 * here: two nodes that hash keys differently agree about every
-	 * collection and still put the same key in two places. */
+	/* placement: two nodes that hash keys differently agree about every
+	 * collection and still put the same key in two places */
 	{
 		const char *q;
 

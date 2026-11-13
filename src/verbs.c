@@ -1,33 +1,26 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * verbs.c — the verb set behind the native door (task S8; S317 made the
- * door binary-only).  See verbs.h.  pc_verb_cmd answers every method
- * that arrives in a PC_VERB_CMD frame - parameters read off a tree, the
- * reply written as one - pc_verb_bin the fixed-layout data verbs, and
- * pc_verb_resp the RESP door; all three answer through the same
- * dialect-neutral op cores.  TTLs on the wire are RELATIVE seconds; the
- * store keeps absolute ticks (0 = never), converted here at the boundary.
- */
+/* verbs.c - the verb set: PC_VERB_CMD methods (pc_verb_cmd), the fixed-layout binary verbs
+ * (pc_verb_bin) and RESP (pc_verb_resp), all through the same dialect-neutral op cores. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <errno.h>                          /* S313 */
-#include <strings.h>                        /* S313: strncasecmp */
+#include <errno.h>
+#include <strings.h>                        /* strncasecmp */
 #include <time.h>
 
 #include <pthread.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 
-#include "reload.h"                    /* 12nw */
+#include "reload.h"
 #include "compat/dprint.h"
 #include "compat/timer.h"
 #include "json.h"
 #include "jsonpath.h"
-#include "hashrec.h"                       /* S313 */
-#include "sha1.h"                          /* S170a */
+#include "hashrec.h"
+#include "sha1.h"
 #include "store.h"
 #include "colname.h"
 #include "winctr_tw.h"
@@ -35,10 +28,10 @@
 #include "config.h"        /* PC_MAX_COLLECTIONS */
 #include "verbs.h"
 #include "upstream.h"
-#include "respout.h"                    /* the RESP reply writers (wave 1) */
+#include "respout.h"                    /* the RESP reply writers */
 #include "verbsint.h"                   /* the families' shared interface */
 #include "pcglob.h"                     /* pc_glob */
-#include "upgrade.h"                /* UP6n */
+#include "upgrade.h"
 #include <sodium.h>
 #include "mail.h"
 #include "core/pcache_htable.h"
@@ -50,36 +43,22 @@
 #include "cluster.h"
 #include "clcol.h"          /* CLCOL_OP_* for the DDL announce */
 #include "pc_slot.h"                   /* the shared key->slot */
-#include "obs.h"                       /* S53: the Grafana surfaces */
+#include "obs.h"                       /* the Grafana surfaces */
 #include "proto.h"                     /* PC_VERB_* / PC_BIN_F_ERR */
-#include "../lib/perfd_push.h"         /* PS5: PFP_* */
-#include "pubsub.h"                    /* PS1/PS2 */
+#include "../lib/perfd_push.h"         /* PFP_* */
+#include "pubsub.h"
 #include "daemon.h"                    /* pc_worker_id, pc_wal_reprobe */
 #include "version.h"
-#include "respmap.h"                   /* S432: map, unmap, maps */
-#include "mgetfan.h"                   /* G8 */
+#include "respmap.h"                   /* map, unmap, maps */
+#include "mgetfan.h"
+#include "presence.h"
 
-/* a method's failure: the message becomes the error frame's payload (S317
- * - no code; nothing ever read the JSON-RPC ones) */
+/* a method's failure: the message becomes the error frame's payload (no code) */
 #define ERR(msg) do { *errmsg = (msg); return -1; } while (0)
-#define JW_REPLY_INIT (1u << 20)           /* S112: dump's heap reply, grows to PT_HEAP_MAX */
+#define JW_REPLY_INIT (1u << 20)           /* dump's heap reply, grows to PT_HEAP_MAX */
 
-/* Per-thread READ scratch, never freed: workers live as long as the
- * daemon.  (The matching WRITE scratch went with the JSON dialect, S317:
- * a value now arrives as bytes inside the request and is stored from
- * where it lies.)  A GET used to cost a malloc + memcpy + free on top of
- * the copy-out the seqlock already requires: pcache_ht_fetch_ex() copies
- * the record into its own
- * per-thread buffer, then allocates a second one, copies again, and the
- * verb layer frees it after writing it to the wire.  Measured at ~8% of
- * the binary dialect's CPU (page zeroing 6.06%, cfree 1.27%, malloc
- * 0.75%) - the largest addressable cost on the fastest path.
- * VAL_MAX-sized, so PCACHE_E_TOOSMALL cannot happen for a stored value. */
-
-/* ST2: EXISTS / TTL / TYPE of a client behind a miss: the key is there
- * if the upstream shadow holds a PRESENT marker for it (only TYPE + PTTL
- * were read).  rc is pcache_ht_probe's; *exp, *vln and *is_ctr are set as
- * a probe would for a value-less record. */
+/* a probe that also takes an upstream PRESENT marker as the key (EXISTS / TTL / TYPE behind a
+ * miss); rc and outputs as pcache_ht_probe's, for a value-less record */
 int probe_or_present(pcache_htable_t *ht, const str *k,
 		unsigned int *vln, unsigned int *exp, int *is_ctr,
 		unsigned char *tflags)
@@ -96,6 +75,8 @@ int probe_or_present(pcache_htable_t *ht, const str *k,
 		*is_ctr = 0;
 	return 0;
 }
+/* per-thread READ scratch, never freed (workers live as long as the daemon); VAL_MAX-sized, so
+ * PCACHE_E_TOOSMALL cannot happen for a stored value */
 static __thread char *get_scratch_v;
 
 char *get_buf(void)
@@ -105,19 +86,8 @@ char *get_buf(void)
 	return get_scratch_v;
 }
 
-/* S318: the hash edit scratch.  A hash write is a read-modify-write on
- * one record: the copy-out lands in get_buf() (a read is a read), and
- * each edit reads one buffer and writes the other, so a second one is
- * all a write needs - PC_HR_MAX + 64, the largest record an edit can
- * produce plus the room hashrec asks for.  It used to be two mallocs and
- * two frees per HSET on top of the fetch's own: invisible under glibc's
- * caching allocator, an mmap+munmap+fault cycle each under a non-caching
- * one (the reply scratch in proto.c measured that at ~50x).  Per thread,
- * taken on the first hash write - or the first HRANDFIELD with a count,
- * which borrows it for its index array, it being idle during a read - on
- * any thread that runs hash commands (workers, and the cluster thread
- * through hcmd_remote), and never freed: threads live as long as the
- * daemon. */
+/* the hash edit scratch: an edit reads get_buf() and writes this (the largest record plus hashrec's
+ * room).  Per thread, any thread running hash commands, never freed; HRANDFIELD borrows it too. */
 static __thread unsigned char *hr_scratch_v;
 
 static unsigned char *hr_buf(void)
@@ -127,14 +97,8 @@ static unsigned char *hr_buf(void)
 	return hr_scratch_v;
 }
 
-/* the smallest entry a hash record can hold is 7 bytes (a 6-byte entry
- * header, a one-byte name, an empty value), so the field count - and with
- * it HRANDFIELD's index array, one u32 per field - is bounded by the
- * record, and the array fits the scratch it borrows.  The premise is
- * that a record is at most PC_HR_MAX bytes: pc_hr_valid enforces it on
- * every record hcmd_exec reads (a record from recover or a cluster apply
- * is stamped F_HASH at any cell size, so the writers' cap alone is not
- * the bound) */
+/* a hash entry is at least 7 bytes and pc_hr_valid caps every record hcmd_exec reads at
+ * PC_HR_MAX, so HRANDFIELD's index array (one u32 per field) fits the scratch it borrows */
 _Static_assert((PC_HR_MAX - PC_HR_HDR) / 7 * sizeof(unsigned int) <=
 	PC_HR_MAX + 64, "HRANDFIELD's index array must fit the edit scratch");
 /* and a forwarded hash command's encoding, capped at the forward ceiling
@@ -150,10 +114,8 @@ static unsigned int ttl_to_abs(long long ttl)
 	return get_ticks() + (unsigned int)ttl;
 }
 
-/* S317: a bytes parameter read IN PLACE - the node's span inside the
- * request tree, so a value, a payload or a key is stored from where it
- * arrived (no copy, no decode leg).  -1 = absent or not a 'b'; the cap
- * refuses what the caller's limit would have. */
+/* a bytes parameter read IN PLACE (its span in the request tree, no copy).  -1 = absent, not a
+ * 'b', or over @cap */
 static int get_bytes(const struct pc_tv *v, int map, const char *key,
 		const char **p, size_t *n, size_t cap)
 {
@@ -166,7 +128,6 @@ static int get_bytes(const struct pc_tv *v, int map, const char *key,
 	return 0;
 }
 
-/* the method name, compared on its bytes */
 static int m_is(const char *method, size_t mlen, const char *name)
 {
 	return strlen(name) == mlen && !memcmp(method, name, mlen);
@@ -183,7 +144,6 @@ const char *col_name_of(pcache_htable_t *ht)
 	return "?";
 }
 
-/* resolve the "col" param to a live collection */
 static pcache_htable_t *get_col(const struct pc_tv *v, int params,
 		const char **errmsg)
 {
@@ -200,49 +160,37 @@ static pcache_htable_t *get_col(const struct pc_tv *v, int params,
 	return ht;
 }
 
-/* ---- dialect-neutral data-verb cores ------------------------------------
- * Every codec (the CMD methods, the fixed-layout binary verbs, RESP)
- * answers through these, so the cluster semantics - pull-on-miss, holder
- * forwarding, placement, WAL, tombstones - cannot drift between them.
- * The codec owns only the reply SHAPE (including its own park-failure
- * fallback, pre-written before returning PC_OP_PARKED). */
+/* ---- dialect-neutral data-verb cores: every codec answers through these, so the cluster
+ * semantics cannot drift; a codec owns only the reply shape (its park-failure one too) */
 
 
-/* pc_*_begin() returns 0 for three unrelated reasons and this used to
- * flatten all of them into "forward failed".  Only a full parked-request
- * table is the daemon applying backpressure, and only that is worth a
- * client retrying.  S38. */
 const char pc_wrongtype_msg[] =
 	"WRONGTYPE Operation against a key holding the wrong kind of value";
 const char pc_json_wrongtype_msg[] = "Existing key has wrong Redis type";
 
+/* only a full parked-request table (PC_CLFAIL_BUSY) is backpressure worth a client's retry; the
+ * other reasons a pc_*_begin() returns 0 are "forward failed" */
 static int fwd_fail_code(void)
 {
 	return pc_cluster_last_fail() == PC_CLFAIL_BUSY
 		? PC_OP_ERR_BUSY : PC_OP_ERR_FWD;
 }
 
-/* Defined beside serving_denied(), where the two gates are explained
- * together; declared here because the op_ helpers come first. */
+/* defined beside serving_denied(), where the two gates are explained */
 static int writes_denied(void);
-/* S397 (DESIGN 12ng): a request entering a data-verb core is a hot-key
- * sample candidate (store.c keeps 1 in pc_store_hot_rate()); every door
- * answers through these cores, so one hook each covers them all.  SET
- * and INCR resumed after a park (probed = 1, pc_op_*_resume) were counted
- * when they came in. */
+/* each data-verb core is a hot-key sample point (store.c keeps 1 in pc_store_hot_rate()); a SET
+ * or INCR resumed after a park (pc_op_*_resume) was counted when it came in */
 
-static int op_refused(pcache_htable_t *ht);                      /* S348 */
+static int op_refused(pcache_htable_t *ht);
 static int op_refused_col(const char *cn, size_t cl);
 
 /* The miss tail, shared by both get flavours: everything that happens
  * once the local table has said "absent". */
-static int op_get_miss(pcache_htable_t *ht, str *k, unsigned int *park)
+int op_get_miss(pcache_htable_t *ht, str *k, unsigned int *park)
 {
 	if (pc_store_shard_enabled(ht)) {
-		/* deterministic ownership: unicast the owner; an owner miss
-		 * is AUTHORITATIVE - no broadcast, no negative cache - except
-		 * inside the reshard grace, when the data may not have moved
-		 * yet and one broadcast covers the window */
+		/* ownership: unicast the owner; its miss is AUTHORITATIVE (no broadcast, no
+		 * negative cache) except in the reshard grace, when one broadcast covers it */
 		if (pc_cluster_enabled()) {
 			const char *cn = col_name_of(ht);
 			int owner = pc_shard_owner(cn, strlen(cn), k->s,
@@ -262,38 +210,15 @@ static int op_get_miss(pcache_htable_t *ht, str *k, unsigned int *park)
 		}
 		return PC_OP_ABSENT;
 	}
-	/* S303: EAGER - every node holds every record, so once this node is
-	 * READY its own miss is the fleet's answer: no pull, no parked
-	 * client.  Asking cost every miss a network round trip and, when a
-	 * peer was slow, the 80 ms pull timeout - on 245-247 0 of 67,000
-	 * such pulls ever found the key.  A write acknowledged elsewhere
-	 * and still in its push batch reads as a miss here; the read raced
-	 * the write either way.  A node that is not READY (recovering,
-	 * joining) still asks: that is when a peer knows more than it does.
-	 * So does one inside 30 s of starting or of a peer coming back (the
-	 * sweep has not re-sent what it lacks yet - outagetest), and one
-	 * that has refused a replica copy for memory (at its ceiling it does
-	 * not hold every record - ceilingreplicatest):
-	 * pc_cluster_eager_miss_final().
-	 * Spread is eager-flagged but holds K copies, so it keeps asking.
-	 * A value over PC_MAX_FWD_VAL is not pushed - the sweep carries it
-	 * over the bulk plane (S174) - so it reads as a miss on the other
-	 * nodes until the next sweep (~10-20 s); accepted by the operator
-	 * (2026-10-02), a write-time bulk push is a later task.
-	 * Deletes still probe (RV-11): a delete that missed a record in its
-	 * push window would be LOST, which a read cannot do. */
+	/* EAGER: every node holds every record, so a READY node's miss is final, no pull
+	 * (pc_cluster_eager_miss_final).  A value over PC_MAX_FWD_VAL misses until a sweep. */
 	if (pc_store_eager_enabled(ht) && !pc_cluster_replicas() &&
 	        pc_cluster_eager_miss_final())
 		return PC_OP_ABSENT;
-	/* a local miss asks the cluster: broadcast (store mode) or
-	 * locator-unicast-first (proxy mode) - unless the negative cache
-	 * already heard "no" */
-	/* S127: under spread only K of P nodes hold the record, so a
-	 * broadcast asks P-1 peers a question K of them can answer.
-	 * Unicast the best-ranked holder instead.  If no holder is live the
-	 * fall-through below still broadcasts, which is the honest answer
-	 * during a membership change: the set we computed may be stale and
-	 * somebody out there may still have the record. */
+	/* a local miss asks the cluster - broadcast (store), locator unicast first (proxy) -
+	 * unless the negative cache already heard "no" */
+	/* spread: only K of P nodes hold it, so unicast the best-ranked live holder; with none
+	 * live the broadcast below still runs (mid membership change the set may be stale) */
 	{
 		int kk = pc_cluster_replicas();
 
@@ -326,7 +251,7 @@ static int op_get_miss(pcache_htable_t *ht, str *k, unsigned int *park)
 				pc_loc_get(cn, strlen(cn), k->s, (size_t)k->len) : 0;
 
 			if (!holder && pc_store_eager_enabled(ht))
-				holder = pc_cluster_eager_doubt_one();   /* S464 */
+				holder = pc_cluster_eager_doubt_one();
 
 			if (holder)
 				req = pc_pull_begin_at(cn, strlen(cn), k->s,
@@ -343,9 +268,8 @@ static int op_get_miss(pcache_htable_t *ht, str *k, unsigned int *park)
 	return PC_OP_ABSENT;
 }
 
-/* As op_get, but the value lands in @buf and nothing is allocated or
- * freed - @buf stays valid until this thread's next get.  @cap must be
- * VAL_MAX so a stored value can never be too large for it. */
+/* as op_get, but the value lands in @buf (valid until this thread's next get), nothing is
+ * allocated; @cap must be VAL_MAX so a stored value always fits */
 int op_get_buf(pcache_htable_t *ht, str *k, char *buf, unsigned int cap,
 		unsigned int *vlen, unsigned int *exp, unsigned int *park)
 {
@@ -353,10 +277,10 @@ int op_get_buf(pcache_htable_t *ht, str *k, char *buf, unsigned int cap,
 	unsigned char fl = 0;
 	int rc = pcache_ht_fetch_buf_fl(ht, k, buf, cap, vlen, &needed, exp,
 		&fl);
-	HOT(ht, k->s, k->len);              /* S397 */
+	HOT(ht, k->s, k->len);
 
 	if (rc == 0) {
-		/* S280: a document is not a string (S314: nor any typed record) */
+		/* a document is not a string, nor is any typed record */
 		if ((fl & PCACHE_F_TYPES) && pc_store_types_strict(ht)) {
 			*vlen = 0;
 			return PC_OP_ERR_TYPE;
@@ -365,14 +289,13 @@ int op_get_buf(pcache_htable_t *ht, str *k, char *buf, unsigned int cap,
 	}
 	if (rc != -2)
 		return PC_OP_ERR_GET;   /* TOOSMALL lands here too: cap is VAL_MAX */
-	/* S153: with the core reporting a past expiry on a miss, the line can
-	 * say WHY - a TTL question and a keyspace question are different. */
+	/* the core reports a past expiry on a miss: the event says expired vs never there */
 	pc_ev_miss(ht, k, exp && *exp ? 1 : 0);
 	return op_get_miss(ht, k, park);
 }
 
-/* G8: may a local miss in @ht be looked up on another node - the test
- * op_get_miss makes before it asks anyone */
+/* may a local miss in @ht be looked up on another node - the test op_get_miss makes before it
+ * asks anyone */
 int mget_fans(pcache_htable_t *ht)
 {
 	if (!ht || !pc_cluster_enabled())
@@ -385,14 +308,10 @@ int mget_fans(pcache_htable_t *ht)
 	return pc_store_pull_enabled(ht);
 }
 
-/* G8: an mget's @n keys, read here; each this node does not hold looked up
- * as a get looks it up (op_get_miss), every lookup at once and none past
- * the mget's one deadline.  A NULL key, an empty one or one over KEY_MAX is
- * absent.  0 with *@mp the mget - answered when pc_mget_waiting() is 0,
- * else to be parked by the door; or -1, nothing waiting, with the error's
- * RESP code word ("ERR" / "TRYAGAIN") in *@code and its text in *@why */
+/* an mget's @n keys; each not held here is looked up as op_get_miss would, all at once, one
+ * deadline.  0: *@mp set (park it unless pc_mget_waiting() is 0); -1: *@code and *@why set */
 int op_mget_fan(pcache_htable_t *ht, const char *const *keys,
-		const size_t *klens, unsigned int n, struct pc_mget **mp,
+		const size_t *klens, unsigned int n, int count, struct pc_mget **mp,
 		const char **code, const char **why)
 {
 	const char *cn = col_name_of(ht);
@@ -405,6 +324,8 @@ int op_mget_fan(pcache_htable_t *ht, const char *const *keys,
 		*why = "out of memory";
 		return -1;
 	}
+	if (count)
+		pc_mget_set_count(m);
 	for (i = 0; i < n; i++) {
 		unsigned char fl = 0;
 		unsigned int exp = 0, req = 0;
@@ -417,11 +338,16 @@ int op_mget_fan(pcache_htable_t *ht, const char *const *keys,
 		}
 		k.s = (char *)keys[i];
 		k.len = (int)klens[i];
-		HOT(ht, k.s, k.len);           /* S397: each key of the MGET */
-		rc = pcache_ht_fetch_ex(ht, &k, &v, &exp, &fl);
+		HOT(ht, k.s, k.len);           /* each key of the MGET */
+		rc = count ? probe_or_present(ht, &k, NULL, NULL, NULL, NULL) :
+			pcache_ht_fetch_ex(ht, &k, &v, &exp, &fl);
+		if (rc == 0 && count) {
+			pc_mget_hit(m, i, NULL, 0, 0);
+			continue;
+		}
 		if (rc == 0) {
-			/* S280: a document answers an mget as a miss under
-			 * strict - it is here, so nobody else is asked */
+			/* under strict a document answers an mget as a miss - it is here, so
+			 * nobody else is asked */
 			if ((fl & PCACHE_F_TYPES) && pc_store_types_strict(ht)) {
 				free(v.s);
 				pc_mget_absent(m, i);
@@ -456,11 +382,8 @@ int op_mget_fan(pcache_htable_t *ht, const char *const *keys,
 	return 0;
 }
 
-/* S73: an eager collection replicates a write to every live peer the
- * moment it lands - on the write path, fire-and-forget, no TTL filter.
- * The sweep is repair behind this.  Only records this node AUTHORED:
- * a copy pushed back would echo the keyspace around the fleet, the
- * same rule the sweep keeps. */
+/* eager: a write goes to every live peer as it lands (fire-and-forget, the sweep repairs).  Only
+ * records this node AUTHORED: a pushed-back copy would echo around the fleet. */
 static void eager_push(pcache_htable_t *ht, const str *k, const char *val,
 		size_t vlen, unsigned int exp, unsigned long long ver,
 		unsigned char type)
@@ -470,34 +393,14 @@ static void eager_push(pcache_htable_t *ht, const str *k, const char *val,
 	if (!pc_cluster_enabled() || !pc_store_eager_enabled(ht))
 		return;
 	cn = col_name_of(ht);
-	/* S127: a 0 means this node is NOT one of the record's K holders.
-	 * It accepted the write and forwarded it to the set - "any member
-	 * may write" is about ADMISSION, not placement - and it must not keep
-	 * a long-lived copy, or spread quietly becomes K+1 for every writing
-	 * node.
-	 *
-	 * S247: BUT NOT BEFORE A HOLDER HAS IT.  The push is fire-and-forget
-	 * and goes only to holders this node counts as live; the copy used to
-	 * be removed right here, so a write acknowledged during a cut existed
-	 * nowhere after the heal (35 of them, measured).  S253: the copy is
-	 * dropped by the holder's ACK of the push group it travelled in
-	 * (clwork.c pc_repl_push, cluster.c M_MIGRATE_ACK) - nothing to do
-	 * here, whatever pc_repl_push says. */
+	/* a spread non-holder must not keep a copy, but not before a holder has it: the
+	 * holder's ACK of the push group drops it (M_MIGRATE_ACK), whatever this returns */
 	(void)pc_repl_push(cn, strlen(cn), k->s, (size_t)k->len, val, vlen,
-		exp, ver, (unsigned char)(type & PCACHE_F_TYPES));  /* S314: every type */
+		exp, ver, (unsigned char)(type & PCACHE_F_TYPES));  /* every type */
 }
 
-/* S213: a TTL re-arm on the record this node holds, whichever way it
- * arrived - the client's expire, or one forwarded by the node that took
- * it.  The touch ADOPTS a passive copy: the node now holds the latest
- * version, so the record is its own from here.  A copy that just became
- * ours goes to the WAL whole - copies are off the WAL, and a bare touch
- * entry replays to nothing after a restart.  Then it travels as
- * authored: bytes, expiry and version out of ONE read, so the copy pairs
- * the right value with the right version.  Before this a passive copy
- * was re-armed and left passive: the author's clock ran out while this
- * node's copy lived on, which is how a re-registered device sat on one
- * node of the fleet.  1 = re-armed, 0 = absent. */
+/* a TTL re-arm (client's or forwarded) that ADOPTS a passive copy: it goes to the WAL whole and
+ * travels as authored, bytes, expiry and version from one read.  1 = re-armed, 0 = absent */
 static int op_expire_local(pcache_htable_t *ht, const str *k,
 		unsigned int exp)
 {
@@ -510,19 +413,10 @@ static int op_expire_local(pcache_htable_t *ht, const str *k,
 
 	if (pcache_ht_touch_adopt(ht, k, exp, &was_passive) != 1)
 		return 0;
-	/* The touch's OWN version: stamped under the bucket lock and left
-	 * in pcache_last_ver by this thread.  The fetch below is a second,
-	 * unlocked read, and a SET from another worker can land between the
-	 * two; the touch record then carried THAT write's version with the
-	 * touch's expiry, and on replay - by version, S240 - it met an older
-	 * record first, gave it the SET's version, and the SET itself was
-	 * refused as older than what it met: an acknowledged write replaced
-	 * by an earlier one (walordertest's expirer round, 5 of 20,000 on a
-	 * loaded runner, 0.4.6).  The push below still pairs bytes, expiry
-	 * and version out of the one read, as S213 wants. */
+	/* the touch's OWN version, stamped under the bucket lock: a SET landing before the unlocked
+	 * fetch below must not lend the touch its version, or replay refuses the SET as older */
 	tver = pcache_last_ver;
-	/* logged before the read: an EXPIRE 1 lapses when the tick turns between
-	 * the two, and the touch went unlogged (walordertest round 7, 1 of 160,000) */
+	/* logged before the read: an EXPIRE 1 can lapse by the fetch, which then returns early */
 	if (!was_passive)
 		pc_wal_touch(cn, k->s, k->len, exp, tver);
 	if (pcache_ht_fetch_full(ht, k, &val, &e, &fl, &ver) != 0)
@@ -530,11 +424,7 @@ static int op_expire_local(pcache_htable_t *ht, const str *k,
 	if (was_passive)
 		pc_wal_upsert_fl(cn, k->s, k->len, val.s, val.len, e, ver, fl);
 	eager_push(ht, k, val.s, (size_t)val.len, e, ver, fl);
-	/* S254: the fetch hands back a copy the caller owns.  This line was
-	 * missing from S213 on - every EXPIRE that hit leaked the value
-	 * (expireleaktest: 203 MB for 200,000 re-arms of 1 KB), and at 12
-	 * workers glibc growing the thread heaps for it serialised them on
-	 * the mm lock in mprotect: 58% of the CPU. */
+	/* the fetch hands back a copy the caller owns */
 	free(val.s);
 	return 1;
 }
@@ -552,9 +442,8 @@ int pc_op_expire_apply(const char *col, size_t collen, const char *key,
 	return op_expire_local(ht, &k, exp);
 }
 
-/* S69: a delete reaches the table a resize is filling as well as the live
- * one - the copier has already carried some keys across, and a key deleted
- * after it passed would come back at the swap. */
+/* a delete reaches the table a resize is filling too: a key the copier already carried
+ * across would come back at the swap */
 static int store_remove(pcache_htable_t *ht, const str *k)
 {
 	pcache_htable_t *sh = pc_store_resize_shadow(ht);
@@ -565,12 +454,12 @@ static int store_remove(pcache_htable_t *ht, const str *k)
 		(void)pcache_ht_remove(sh, k);
 	rc = pcache_ht_remove(ht, k);
 	if (rc == 1)
-		pc_ev_remove(ht, k);                              /* S153 */
+		pc_ev_remove(ht, k);
 	return rc;
 }
 
-/* as store_remove, with the delete's version stamped under the live
- * table's bucket lock - for a remove a tombstone follows (S234) */
+/* as store_remove, with the delete's version stamped under the live table's bucket lock, for
+ * the tombstone that follows */
 static int store_remove_ver(pcache_htable_t *ht, const str *k,
 		unsigned long long *ver)
 {
@@ -581,7 +470,7 @@ static int store_remove_ver(pcache_htable_t *ht, const str *k,
 		(void)pcache_ht_remove(sh, k);
 	rc = pcache_ht_remove_ver(ht, k, ver);
 	if (rc == 1)
-		pc_ev_remove(ht, k);                              /* S153 */
+		pc_ev_remove(ht, k);
 	return rc;
 }
 
@@ -590,7 +479,7 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 	const char *cn;
 	unsigned long long dver = 0;
 	int rc;
-	HOT(ht, k->s, k->len);              /* S397 */
+	HOT(ht, k->s, k->len);
 
 	if (op_refused(ht))
 		return PC_OP_ERR_WRFAIL;
@@ -634,17 +523,8 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 				return PC_OP_PARKED;
 			}
 		}
-		/* S249: unknown holder - ask the fleet, as expire does and
-		 * as RV-11 made store/eager/spread do.  This was a tombstone
-		 * broadcast under THIS node's clock, which is below the
-		 * holder's record version whenever this node never saw the
-		 * write (a proxy ingress holds no copies), so the holder
-		 * refused it as older: the key lived on, and the client read
-		 * {"deleted": false} as "there was no such key".  Measured
-		 * (resizefleettest, then by hand): a delete through a node
-		 * that had not read the key first deleted nothing.  A positive
-		 * answer becomes the forward - the holder deletes and
-		 * tombstones under its own clock; all-negative is absent. */
+		/* unknown holder: ask the fleet - a tombstone under THIS node's clock can be older
+		 * than the holder's record; a positive answer becomes the forward */
 		{
 			unsigned int req = pc_probe_fwd_begin(1, cn, strlen(cn),
 				k->s, (size_t)k->len, NULL, 0, 0, 0);
@@ -656,30 +536,8 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 		}
 		return PC_OP_ABSENT;
 	}
-	/* RV-11: store, eager, spread - and the key is not HERE.  That used
-	 * to be the whole answer: "absent", no tombstone.  But a write taken
-	 * by another node is applied and acknowledged there while its push
-	 * to this one batches for up to REPL_FLUSH_MS, so a delete that a
-	 * balancer lands here inside that window deleted nothing, and the
-	 * push then put the record on every member.  A client cannot carry
-	 * the ordering across - RESP has nowhere to put it - so the daemon
-	 * does what it does for a read: it looks where the record IS.
-	 *
-	 * The node that HOLDS the record deletes it and tombstones under its
-	 * OWN clock, and that clock has observed the record's version (every
-	 * apply folds the sender's version in), so its tombstone is newer by
-	 * construction and S209's compare orders it on every member - this
-	 * node included, where the late push is then refused.  No cross-node
-	 * clock comparison anywhere, which is what sank "tombstone on an
-	 * absent key".
-	 *
-	 * Spread knows its holders: unicast the best-ranked live one.  Store
-	 * and eager ask the fleet with the probe set/add/touch use - a
-	 * positive answer becomes the forward, all-negative is "absent" and
-	 * is remembered, so a repeated miss costs nothing.  A delete looks
-	 * where a read would look: `pull = 0` keeps both local.  Only an
-	 * UNVERSIONED negative entry skips the probe - a versioned one is a
-	 * tombstone, and the key may have been written again since. */
+	/* key not HERE: a write acked elsewhere may still be batched toward it, so the holder
+	 * deletes under its own clock; only an UNVERSIONED negative entry skips the probe */
 	if (pc_cluster_enabled() && !pc_store_proxy_enabled(ht) &&
 	        pcache_ht_probe(ht, k, NULL, NULL, NULL) != 0) {
 		unsigned long long tv = 0;
@@ -690,13 +548,8 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 			int h = pc_spread_pick_peer(kslot, pc_cluster_replicas());
 			int tries;
 
-			/* S247: the best-ranked holder can be one the send
-			 * fails to (a peer cut off, not yet declared gone):
-			 * try the next live holder.  Answering "absent" after
-			 * one failed send told the client there was no such
-			 * key while another holder still had it - measured in
-			 * spreadparttest, the delete of a118 went to the
-			 * unreachable node only, and the key outlived it. */
+			/* the best-ranked holder can be one the send fails to (cut off,
+			 * not yet declared gone): try the next live holder before "absent" */
 			for (tries = 0; h && tries < pc_cluster_replicas();
 			        tries++) {
 				unsigned int req = pc_fwd_begin(h, 1, cn,
@@ -728,28 +581,21 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 	rc = store_remove_ver(ht, k, &dver);
 	if (rc == 1) {
 		cn = col_name_of(ht);
-		/* logged, and with a cluster numbered and sent (AT-3b) */
+		/* logged, and with a cluster numbered and sent */
 		pc_delete_originate(cn, strlen(cn), k->s, (size_t)k->len,
 			dver, 1);
 	}
 	return rc == 1 ? PC_OP_OK : PC_OP_ABSENT;
 }
 
-/* S213: a re-arm is a write and takes the write's road.  It used to
- * touch whatever the local table held and answer "absent" for a key the
- * fleet holds - the one mutating verb without a mode branch, while set,
- * del and add/sub all forward to the owner.  Shard: the owner.  Proxy:
- * the locator's holder, else the same probe set/add use (a positive
- * answer becomes the forward; all-negative is "absent" - a re-arm never
- * places).  Spread: the best-ranked live holder, which adopts and pushes
- * to the rest.  Store and eager have nobody to forward to: absent here
- * is absent. */
+/* a re-arm takes the write's road: shard -> owner, proxy -> holder (locator, else probe; never
+ * places), spread -> best live holder; store and eager have nobody to forward to */
 int op_expire(pcache_htable_t *ht, str *k, long long ttl,
 		unsigned int *park)
 {
 	unsigned int ttl_rel = ttl > 0 ? (unsigned int)ttl : 0;
 	const char *cn;
-	HOT(ht, k->s, k->len);              /* S397 */
+	HOT(ht, k->s, k->len);
 
 	if (op_refused(ht))
 		return PC_OP_ERR_WRFAIL;
@@ -820,7 +666,7 @@ int op_expire(pcache_htable_t *ht, str *k, long long ttl,
 int op_addsub(pcache_htable_t *ht, str *k, long long by, long long ttl,
 		long long *nv, unsigned int *park, int probed)
 {
-	if (!probed)                         /* S397: a resume was counted */
+	if (!probed)                         /* a resume was counted */
 		HOT(ht, k->s, k->len);
 
 	if (op_refused(ht))
@@ -882,7 +728,7 @@ int op_addsub(pcache_htable_t *ht, str *k, long long by, long long ttl,
 		unsigned int eff = 0;
 		unsigned char fl = 0;
 
-		/* S280: INCR on a document is WRONGTYPE, not "not an integer" */
+		/* INCR on a document is WRONGTYPE, not "not an integer" */
 		if (pc_store_types_strict(ht) &&
 		        pcache_ht_getflags(ht, k, &fl) == 0 &&
 		        (fl & PCACHE_F_TYPES))
@@ -891,9 +737,8 @@ int op_addsub(pcache_htable_t *ht, str *k, long long by, long long ttl,
 		        ttl < 0 ? PCACHE_EXP_PRESERVE : ttl_to_abs(ttl),
 		        nv, &eff) < 0)
 			return PC_OP_ERR_NOTINT;
-		/* the absolute-resulting-value rule: replay is idempotent -
-		 * under preserve (ttl < 0, the Redis INCR contract) the WAL
-		 * row carries the record's EFFECTIVE expiry */
+		/* replay is idempotent: the WAL row is the resulting value and, under preserve
+		 * (ttl < 0, Redis's INCR), the record's EFFECTIVE expiry */
 		{
 			char nvbuf[24];
 			int nvl = snprintf(nvbuf, sizeof nvbuf, "%lld", *nv);
@@ -915,7 +760,7 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 {
 	if (op_refused(ht))
 		return PC_OP_ERR_WRFAIL;
-	if (!probed)                         /* S397: a resume was counted */
+	if (!probed)                         /* a resume was counted */
 		HOT(ht, k->s, k->len);
 
 	if (pc_store_shard_enabled(ht) && pc_cluster_enabled()) {
@@ -927,11 +772,8 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 			unsigned int req;
 
 			if (v->len > PC_MAX_FWD_VAL)
-				return PC_OP_ERR_2BIG; /* the forward plane's
-				                        * ceiling; storing it
-				                        * locally would break
-				                        * ownership - refuse
-				                        * honestly */
+				return PC_OP_ERR_2BIG; /* the forward plane's ceiling: a
+				                        * local store would break ownership */
 			req = pc_fwd_begin(owner, 0, cn, strlen(cn), k->s,
 				(size_t)k->len, v->s, (size_t)v->len,
 				ttl > 0 ? (unsigned int)ttl : 0, 0);
@@ -951,15 +793,8 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 		int target = pc_loc_get(cn, strlen(cn), k->s, (size_t)k->len);
 
 		if (v->len > PC_MAX_FWD_VAL) {
-			/* The forward plane cannot carry it, so this write can
-			 * never reach a remote holder - and until 2026-09-01 it
-			 * silently fell through to a LOCAL store, forking any
-			 * remote holder it had (the S54 open defect; the shard
-			 * branch has refused this honestly all along).  Only a
-			 * key the fleet recently confirmed ABSENT may be BORN
-			 * here - the get-miss->set pattern stamps that
-			 * confirmation - and the bulk plane can migrate the
-			 * born value later. */
+			/* too big to forward to a remote holder: only a key the fleet
+			 * recently confirmed ABSENT may be born here (bulk plane migrates it) */
 			if (target ||
 			        !pc_neg_hit(cn, strlen(cn), k->s, (size_t)k->len))
 				return PC_OP_ERR_2BIG;
@@ -967,13 +802,8 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 		} else {
 			if (!target && !probed &&
 			        !pc_neg_hit(cn, strlen(cn), k->s, (size_t)k->len)) {
-				/* holder unknown and not recently-confirmed-
-				 * absent: probe the fleet BEFORE placement can
-				 * fork an existing key (the locator is a cache;
-				 * an evicted entry must not turn a re-write
-				 * into a second holder).  The get-miss->set
-				 * pattern skips this: the get already stamped
-				 * the negative cache. */
+				/* holder unknown, not confirmed absent: probe the fleet
+				 * BEFORE placement can fork a key (the locator is a cache) */
 				unsigned int req = pc_probe_fwd_begin(0, cn,
 					strlen(cn), k->s, (size_t)k->len, v->s,
 					(size_t)v->len,
@@ -983,7 +813,7 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 					*park = req;
 					return PC_OP_PARKED;
 				}
-				/* no peers: place as before */
+				/* no peers: place it */
 			}
 			if (!target)
 				target = pc_place();   /* a new key: place it */
@@ -1005,9 +835,8 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 	return set_local(ht, k, v, ttl);
 }
 
-/* the write a SET makes on the node that stores it: the table, the WAL,
- * the event, the eager push - shared by op_set and S279's conditional
- * set, so the two cannot drift */
+/* the write a SET makes on the node that stores it (table, WAL, event, eager push), shared by
+ * op_set and the conditional set so the two cannot drift */
 static int set_local(pcache_htable_t *ht, const str *k, const str *v,
 		long long ttl)
 {
@@ -1018,41 +847,19 @@ static int set_local(pcache_htable_t *ht, const str *k, const str *v,
 
 		pc_wal_upsert(cn, k->s, k->len, v->s, v->len, ttl_to_abs(ttl),
 			pcache_last_ver);
-		pc_ev_store(ht, k, (unsigned int)v->len, ttl);      /* S153 */
+		pc_ev_store(ht, k, (unsigned int)v->len, ttl);
 		eager_push(ht, k, v->s, (size_t)v->len, ttl_to_abs(ttl),
 			pcache_last_ver, 0);
 		if (pc_cluster_enabled())
 			pc_neg_clear(cn, strlen(cn), k->s, (size_t)k->len);
-		pc_store_note_set(ht, (size_t)k->len, (size_t)v->len);   /* S67 */
+		pc_store_note_set(ht, (size_t)k->len, (size_t)v->len);
 		return PC_OP_OK;
 	}
 	return rc == -2 ? PC_OP_ERR_FULL : PC_OP_ERR_2BIG;
 }
 
-/*
- * S279: SET NX / SET XX.
- *
- * The condition and the store happen under the key's stripe - the one
- * JSON's read-modify-write already serialises on - so two conditional
- * sets of one key on one node cannot both see it absent.  A PLAIN set
- * does not take the stripe and can land between the check and the
- * store; the idiom this serves (a lock: SET k token EX n NX, released by
- * DEL or expiry) never mixes the two on one key.
- *
- * Which node decides: every copy-keeping mode sends the key to ONE node,
- * the slot's owner (pc_shard_owner - map first, rendezvous over live
- * peers as the fallback), so every NX for a key is decided in one table.
- * In shard that is simply the owner.  In eager and spread every node
- * holds the key and each would otherwise decide alone: two clients on
- * two nodes both got OK within one replication window - worse than
- * refusing.  The decider stores and pushes like any authored write.
- * What stays open: a decider that dies with a grant not yet pushed, and
- * a new owner that has not received it, can grant it again - as a Redis
- * replica promoted before replication can.
- *
- * Proxy and pull-only clusters have no such node (a key lives wherever
- * it was placed or written): refused with PC_OP_ERR_MODE.
- */
+/* SET NX/XX: checked and stored under the key's stripe, decided by the slot owner in every
+ * copy-keeping mode; proxy and pull-only have no deciding node (PC_OP_ERR_MODE) */
 static pthread_mutex_t *jp_lock(const char *key, int klen);
 
 static int setcond_local(pcache_htable_t *ht, const str *k, const str *v,
@@ -1099,7 +906,7 @@ int op_setcond(pcache_htable_t *ht, str *k, str *v, long long ttl,
 		int cond, unsigned int *park)
 {
 	int rc;
-	HOT(ht, k->s, k->len);              /* S397 */
+	HOT(ht, k->s, k->len);
 
 	if (op_refused(ht))
 		return PC_OP_ERR_WRFAIL;
@@ -1132,26 +939,8 @@ int op_setcond(pcache_htable_t *ht, str *k, str *v, long long ttl,
 	return rc == 1 ? PC_OP_OK : rc == 0 ? PC_OP_ABSENT : rc;
 }
 
-/*
- * S297: compare-and-set and compare-and-delete, in Redis 8.4's spelling -
- * SET key value IFEQ cmp / IFNE cmp, DELEX key IFEQ cmp / IFNE cmp (both
- * probed against redis 8.10.2, 2026-10-05).  A token lock needs them: its
- * refresh and release are "only if the value is still MY token", and as
- * GET-then-DEL that races - a lock that expired between the two and was
- * taken by another client is deleted by its old holder.
- *
- *   SET IFEQ   stores when the key holds a string equal to cmp
- *   SET IFNE   stores when the key is absent or holds a different string
- *   DELEX IFEQ deletes when the key holds a string equal to cmp
- *   DELEX IFNE deletes when the key holds a different string
- *
- * A key holding a hash, a document or a rate-limit record is a type
- * error (SET: WRONGTYPE; DELEX: Redis's "Key should be of string type if
- * conditions are specified").  A counter compares as its decimal text, as
- * GET reads it.  Decided where SET NX is - under the key's stripe, on the
- * key's deciding node (op_setcond's rule and its comment) - and stored or
- * deleted there like any authored write: WAL, push, tombstones.
- */
+/* SET IFEQ/IFNE and DELEX IFEQ/IFNE (Redis 8.4), decided as SET NX is; a hash, document or
+ * rate-limit record is a type error, a counter compares as its decimal text */
 _Static_assert(PC_OP_ERR_TYPE == -11 && PC_FWD_E_TYPE == -11,
 	"cluster.c's forward handler spells the type refusal as -11");
 
@@ -1232,7 +1021,7 @@ int op_cmp(pcache_htable_t *ht, str *k, const char *cmp,
 {
 	str none = { NULL, 0 };
 	int rc;
-	HOT(ht, k->s, k->len);              /* S397 */
+	HOT(ht, k->s, k->len);
 
 	if (!v)
 		v = &none;
@@ -1254,9 +1043,8 @@ int op_cmp(pcache_htable_t *ht, str *k, const char *cmp,
 
 			if (need > PC_MAX_FWD_VAL)
 				return PC_OP_ERR_2BIG;
-			/* the edit scratch: pc_fwd_begin builds its datagram
-			 * from it before returning (sized by the assert
-			 * beside hr_buf) */
+			/* the edit scratch (sized by hr_buf's assert): pc_fwd_begin builds its
+			 * datagram from it before returning */
 			enc = hr_buf();
 			if (!enc)
 				return PC_OP_ERR_FWD;
@@ -1302,10 +1090,8 @@ static long long rel_ttl(unsigned int expires, unsigned int now)
 	return expires <= now ? 0 : (long long)expires - now;
 }
 
-/* S112: the first pass of dump - the keys of a bucket-bounded scan, packed
- * as u32 length + bytes, filtered by the Redis slot of the key.  The buffer
- * is one reply's worth: a chunk whose keys alone overflow it is refused
- * with "halve count" rather than cut mid-bucket, which would repeat. */
+/* dump's first pass: a scan chunk's keys as u32 length + bytes, by Redis slot; keys that overflow
+ * one reply refuse the chunk ("halve count") rather than cut mid-bucket and repeat */
 struct dump_keys {
 	char *buf;
 	size_t len, cap;
@@ -1382,12 +1168,8 @@ static int keys_cb(const str *key, const str *val, unsigned int exp,
 	return 0;
 }
 
-/* ---- json path verbs (S26) --------------------------------------------
- * The document is read, edited as text and stored back, so concurrent
- * partial edits of the SAME key must not lose updates: a 64-way mutex
- * stripe (keyed on the key bytes) serializes the read-modify-write.
- * All writers live in this process - the daemon IS the serialization
- * point - so a local stripe is a complete answer, no CAS needed. */
+/* ---- json path verbs: a document is read, edited as text and stored back, so a 64-way
+ * stripe on the key bytes serializes the read-modify-write (all writers are in-process) */
 static pthread_mutex_t jp_mu[64];
 static pthread_once_t jp_mu_once = PTHREAD_ONCE_INIT;
 
@@ -1428,28 +1210,8 @@ const char *jp_strerror(int rc)
 	return "json path error";
 }
 
-/* the striped JSON read-modify-write core: the verb layer and the
- * cluster forward plane both land HERE, from any thread - the stripe
- * is the serialization.  op = PC_JOP_*.  Returns 0 ok, 1 benign-absent
- * (jget miss / jdel absent), -1 error (*errmsg static).  GET fills
- * *frag_out (borrowed: this thread's buffer, good until its next call -
- * S283) / *fraglen_out; INCR fills *newval; APPEND
- * fills *count_out. */
-/* ---- S314: an atomic sliding-window rate-limit record ------------------
- * What a Redis client does as MULTI { ZADD k now now; ZREMRANGEBYSCORE k
- * -inf now-window; ZCOUNT k -inf +inf; EXPIRE k window } (DESIGN 12aa: the
- * SBC/RGS limiter, ~12.9M ZADD a day) in ONE command and one round trip:
- * record this hit, drop what fell out of the window, answer the count and
- * whether it is within the limit.  Every hit is recorded, an over-limit one
- * too, as the ZADD-first idiom does.
- *
- * The record: [ver 1][0][0][0][n u32 LE][n x ts u64 LE], hit times in ms,
- * oldest first, type PCACHE_F_RL.  Edited under the key's stripe - the
- * JSON read-modify-write's lock - on the key's DECIDING node, as SET NX is
- * (op_rlhit), so every hit on a key is counted in one table.  Times come
- * from that node's wall clock and are kept monotonic per key (a clock
- * stepped back never reorders the array).  At PC_RL_MAX hits the oldest
- * goes - the count then stays at the cap, so a limit must be below it. */
+/* ---- RL.HIT: one sliding-window hit, decided as SET NX is, under the key's stripe.  Record:
+ * [ver 1][0][0][0][n u32 LE][n x ms u64 LE], oldest first; at PC_RL_MAX the oldest goes */
 #define RL_HDR 8
 
 static void rl_w64(unsigned char *p, unsigned long long v)
@@ -1578,7 +1340,7 @@ static int rl_hit_local(pcache_htable_t *ht, const char *key, int klen,
 	return 0;
 }
 
-/* S314: the gate's refusal, with the member that holds it back */
+/* the gate's refusal, with the member that holds it back */
 static char rl_gate_msg[160];
 
 const char *rl_gate_text(int lacking)
@@ -1592,16 +1354,14 @@ const char *rl_gate_text(int lacking)
 const char rl_mode_msg[] = "RL.HIT needs a shard or eager "
 	"collection in a cluster: this collection has no node that decides it";
 
-/* PC_OP_OK (*count, *allowed), PARKED forwarded to the deciding node, or
- * PC_OP_ERR_*.  Which node decides: SET NX's rule (op_setcond) - the
- * slot's owner in every copy-keeping mode, so every hit on a key lands in
- * one table; proxy and pull-only clusters have no such node. */
+/* PC_OP_OK (*count, *allowed), PARKED forwarded to the deciding node (SET NX's rule), or
+ * PC_OP_ERR_* */
 int op_rlhit(pcache_htable_t *ht, str *k, long long window_ms,
 		long long limit, long long *count, int *allowed,
 		unsigned int *park, int *lacking)
 {
 	const char *emsg = NULL;
-	HOT(ht, k->s, k->len);              /* S397 */
+	HOT(ht, k->s, k->len);
 
 	if (op_refused(ht))
 		return PC_OP_ERR_WRFAIL;
@@ -1636,22 +1396,8 @@ int op_rlhit(pcache_htable_t *ht, str *k, long long window_ms,
 	return PC_OP_OK;
 }
 
-/* ---- S170a: Symfony's lock scripts, run natively ----------------------
- * Symfony's Lock component (RedisStore) keeps a lock in a sorted set: the
- * members are the holders' tokens and "__write__", each scored with its
- * expiry in ms, and it drives the set with five fixed Lua scripts (six
- * with the read lock) - the only scripting any client of ours sends
- * (DESIGN 12hp).  They are approved here by the SHA1 of their bodies
- * (identical in every Symfony line 5.4-7.4, DESIGN 12il) and run as C,
- * step for step after the Lua: no interpreter, no client code.
- *
- * The record (type PCACHE_F_LOCK): [ver 1][0][0][0][n u32 LE] then n x
- * [exp_ms u64 LE][len u16 LE][member].  Edited under the key's stripe on
- * the key's deciding node, as RL.HIT's record is, and stored like any
- * authored write.  The key's expiry is the latest member's - in whole
- * seconds here, so a key can outlive its last member by under a second;
- * the scripts trim by the members' own ms expiries, so no lock outlives
- * its TTL. */
+/* ---- Symfony Lock's (RedisStore) fixed Lua scripts, approved by body SHA1 and run as C.  Record:
+ * [ver 1][0][0][0][n u32 LE] then n x [exp_ms u64 LE][len u16 LE][member]; decided as RL.HIT */
 #define LK_HDR      8
 #define LK_MAX      1024               /* members a lock record holds */
 #define LK_TOK_MAX  4096               /* bytes in one token */
@@ -1932,7 +1678,7 @@ int op_slock(pcache_htable_t *ht, str *k, int script,
 		size_t toklen, int *result, unsigned int *park, int *lacking)
 {
 	const char *emsg = NULL;
-	HOT(ht, k->s, k->len);              /* S397 */
+	HOT(ht, k->s, k->len);
 
 	*result = 0;
 	if (script == PC_SLOCK_PROBE) {
@@ -1980,23 +1726,8 @@ int op_slock(pcache_htable_t *ht, str *k, int script,
 	return PC_OP_OK;
 }
 
-/* ---- S313: the hash commands -------------------------------------------
- * A hash is ONE record, typed PCACHE_F_HASH (src/hashrec.c holds the
- * format and the edits).  Every H command runs in hcmd_exec() on ONE
- * node: the key's deciding node for a write (SET NX's rule, op_setcond)
- * and for every command in shard mode, this node for an eager read
- * (every eager node holds the record).  So two writes on two nodes to
- * different fields of one hash both land - whole-value replication alone
- * would let the later one erase the other.  On that node a write holds
- * the key's stripe from its copy-out to its store; a read holds nothing
- * (S318: the lock-free fetch GET takes, see hcmd_exec).
- *
- * The reply is built once, dialect-neutral (a small typed tree - the
- * i b n a o e subset of src/ptree.h, which S317 made the native door's
- * whole codec), so a forwarded command needs no state on the asking
- * node: the decider runs the command and ships the tree back in the JSON
- * forward plane's ack, and the asker renders it as RESP or sends it as
- * the CMD reply, bytes unchanged. */
+/* ---- hash commands: a hash is ONE record (hashrec.c); hcmd_exec runs a write on the deciding
+ * node, so field writes on two nodes both land.  The reply is a ptree that forwards unchanged. */
 
 /* the little-endian u32 the two argument decoders read: a forwarded
  * command's [argc u16][(len u32)(bytes)]* and the HCMD frame's */
@@ -2050,9 +1781,8 @@ static const char hc_wrongtype[] =
 	"WRONGTYPE Operation against a key holding the wrong kind of value";
 static const char hc_toolarge[] = "ERR hash too large - this is a cache";
 
-/* the empty hash deletes its key, as Redis does - and the delete takes the
- * delete's road (op_del): a shard owner's plain remove, or a tombstone so
- * every eager node drops it too */
+/* the empty hash deletes its key, as Redis does, by the delete's road: a shard owner's plain
+ * remove, or a tombstone so every eager node drops it too */
 static void hash_drop_local(pcache_htable_t *ht, const str *k)
 {
 	const char *cn = col_name_of(ht);
@@ -2065,21 +1795,11 @@ static void hash_drop_local(pcache_htable_t *ht, const str *k)
 	}
 	if (store_remove_ver(ht, k, &dver) == 1)
 		pc_delete_originate(cn, strlen(cn), k->s, (size_t)k->len,
-			dver, 1);                  /* AT-3b */
+			dver, 1);
 }
 
-/* S385: a key removed here as a client delete would be - the table, the
- * WAL, the tombstone to every eager node (the write-through's read-back
- * found it gone upstream, or of a type the fleet cannot hold).
- * AR14: also when this node does not hold the key (yet).  A write of it
- * may be on its way from a peer - set through node A, deleted through
- * node B before A's eager push lands on B: B removed nothing and sent
- * nothing, the push then landed, and the fleet kept a key Redis had
- * said was gone.  A tombstone at a fresh version refuses that older copy
- * on every node.  Only here, where Redis is the record: a plain eager
- * DEL of an absent key still sends nothing - with versions from a
- * Lamport clock a later SET of the key through another node that had
- * not heard of the tombstone yet would sit below it and be lost. */
+/* a key removed as a client delete would be, tombstone included even when not held here: Redis
+ * is the record, and a peer's eager push of it may still be on its way */
 void pc_verb_remove_local(pcache_htable_t *ht, const str *k)
 {
 	const char *cn = col_name_of(ht);
@@ -2091,20 +1811,14 @@ void pc_verb_remove_local(pcache_htable_t *ht, const str *k)
 	}
 	if (store_remove_ver(ht, k, &dver) == 1)
 		pc_delete_originate(cn, strlen(cn), k->s, (size_t)k->len,
-			dver, 1);                  /* AT-3b */
+			dver, 1);
 	else if (pc_cluster_enabled() && pc_store_eager_enabled(ht))
 		pc_delete_originate(cn, strlen(cn), k->s, (size_t)k->len,
 			0, 0);                     /* a fresh tick, numbered too */
 }
 
-/* AR1: a record this node drops because Redis said the key changed (a
- * write-through collection's broadcast invalidation): the table and the
- * WAL here, no tombstone and no push - every node hears the invalidation
- * itself.  A short local mark at the dropped record's version refuses that
- * same record if a peer that has not dropped it yet sends it back (the
- * repair sweep); a genuinely newer write is still taken.  S405: the mark
- * is retained to go on refusing it, but never replayed to a peer as a
- * delete - a startup flush replayed that way emptied the fleet's cache. */
+/* a record dropped because Redis said the key changed (every node hears that itself): table and
+ * WAL, no push; a local mark refuses the same version from a peer, never replayed as a delete */
 void pc_verb_forget_local(pcache_htable_t *ht, const str *k)
 {
 	const char *cn = col_name_of(ht);
@@ -2118,10 +1832,8 @@ void pc_verb_forget_local(pcache_htable_t *ht, const str *k)
 	}
 }
 
-/* S331: a record written here as a client write would be - the table,
- * the WAL, the eager push - for read-through: a fetched copy PROMOTED into
- * the collection before a command changes it, and the no-fall entries in
- * the companion.  @fl the record's TYPE bits. */
+/* a record written here as a client write would be (table, WAL, eager push), for read-through's
+ * promoted copies and no-fall entries; @fl its TYPE bits */
 int pc_verb_store_local(pcache_htable_t *ht, const str *k, const char *v,
 		size_t n, unsigned int exp, unsigned char fl)
 {
@@ -2142,15 +1854,8 @@ int pc_verb_store_local(pcache_htable_t *ht, const str *k, const char *v,
 	return 0;
 }
 
-/* The rebuilt record goes in through the store's own copy, and the WAL
- * append and the push read it from the scratch afterwards.  S318 weighed
- * building it in the destination cell instead (one copy fewer) and left
- * it: the version the WAL and the push must carry is stamped only as the
- * cell is published (S234, under the bucket lock), and once published
- * the cell is the table's - a SET, a DEL, the expiry sweep, a cluster
- * apply or the evacuator may replace it and free it before the append
- * reads a byte.  So the record has to exist outside the arena anyway,
- * and that is the scratch the store copies from. */
+/* the record goes in via the store's own copy and the WAL/push read the scratch after: the cell's
+ * version is stamped only at publish, and a published cell may be replaced and freed at once */
 static int hash_store_local(pcache_htable_t *ht, const str *k,
 		const unsigned char *rec, size_t n, unsigned int exp)
 {
@@ -2222,11 +1927,8 @@ static int hcmd_check_fields(int ci, int argc, const size_t *argl,
 	return 0;
 }
 
-/* S319: render a READ command's reply over one hash record (@r of @n
- * bytes holding @cnt fields; NULL/0/0 = the key is absent).  Shared by
- * hcmd_exec (the record from this node's table) and the asking node of a
- * forwarded read (the record the owner sent) - so a reply is the same
- * whichever node answers it. */
+/* render a READ command's reply over one hash record (NULL/0/0 = absent), for hcmd_exec and for
+ * the asker of a forwarded read, so the reply is the same whichever node answers */
 static void hcmd_render(int ci, int argc, const char *const *argv,
 		const size_t *argl, const unsigned char *r, size_t n,
 		unsigned int cnt, struct pc_tw *t)
@@ -2318,10 +2020,8 @@ static void hcmd_render(int ci, int argc, const char *const *argv,
 			pc_tw_end(t);
 			break;
 		}
-		/* a positive count is distinct fields: a partial shuffle of
-		 * every index, in the edit scratch (idle during a read, and
-		 * sized for it - the assert beside hr_buf).  A negative count
-		 * allows repeats, so each pick stands alone and needs no array. */
+		/* positive count: distinct fields, a partial shuffle in the edit
+		 * scratch (idle in a read); negative: repeats, each pick alone */
 		m = want > 0 ? (want > cnt ? cnt : (unsigned int)want) :
 			(unsigned int)(want < -1000000 ? 1000000 : -want);
 		if (want > 0) {
@@ -2475,19 +2175,8 @@ int pc_hcmd_render_read(const unsigned char *args, size_t argsl,
 	return 0;
 }
 
-/* Run one hash command on THIS node's table; the reply goes in @t.
- *
- * S318: a read takes the road GET takes - the seqlock copy-out into this
- * thread's get_buf(), no stripe, nothing allocated.  The optimistic
- * section retries a torn snapshot and sleeps on the bucket lock behind
- * a stalled writer, so what arrives here is a whole record or a miss,
- * exactly what the stripe used to guarantee; the flags come with it, so
- * WRONGTYPE is answered as before.  A write holds the key's stripe from
- * that same copy-out to its store: two writers on one key would
- * otherwise each edit the copy they took, and the second store erase the
- * first's field.  Its edits ping-pong between get_buf() (the copy-out)
- * and hr_buf(), so a write allocates nothing either - the reply writer's
- * own buffer is the one allocation left on the path. */
+/* run one hash command on THIS node's table, reply in @t.  A read takes GET's lock-free copy-out;
+ * a write holds the key's stripe from copy-out to store, editing between get_buf() and hr_buf() */
 static void hcmd_exec(pcache_htable_t *ht, int ci, int argc,
 		const char *const *argv, const size_t *argl, struct pc_tw *t)
 {
@@ -2513,9 +2202,8 @@ static void hcmd_exec(pcache_htable_t *ht, int ci, int argc,
 		mu = jp_lock(k.s, k.len);
 		pthread_mutex_lock(mu);
 	}
-	/* VAL_MAX-sized, so a record of any type fits (TOOSMALL cannot
-	 * happen) and a string where a hash was expected still reads whole
-	 * enough to be refused by its flags */
+	/* VAL_MAX-sized: any record fits (no TOOSMALL), so a string where a hash was expected still
+	 * reads whole enough to be refused by its flags */
 	rc = pcache_ht_fetch_buf_fl(ht, &k, (char *)a, VAL_MAX, &rlen, NULL,
 		&exp, &fl);
 	if (rc == 0 && !(fl & PCACHE_F_HASH)) {
@@ -2534,17 +2222,14 @@ static void hcmd_exec(pcache_htable_t *ht, int ci, int argc,
 			goto out;
 		}
 	} else {
-		/* an absent key has no TTL.  On an expired miss the fetch
-		 * reports the PAST expiry (S153: so a GET can say why), and a
-		 * hash created over it must not inherit it - stored with that
-		 * stamp it was expired-as-absent on its first read.  The JSON
-		 * path resets it the same way (pc_json_rmw). */
+		/* an absent key has no TTL: an expired miss reports the PAST expiry,
+		 * which a new hash must not inherit (pc_json_rmw resets it too) */
 		exp = 0;
 	}
 	if (hcmd_check_fields(ci, argc, argl, t) != 0)
 		goto out;
 	if (!hcmds[ci].write) {
-		/* S319: the same rendering the asking node of a forwarded read
+		/* the same rendering the asking node of a forwarded read
 		 * runs over the record the owner sent it */
 		hcmd_render(ci, argc, argv, argl, r, n, cnt, t);
 		goto out;
@@ -2645,10 +2330,8 @@ static void hcmd_exec(pcache_htable_t *ht, int ci, int argc,
 		const unsigned char *fv;
 		size_t fvl;
 
-		/* which refusal: the increment, the field's value, or the
-		 * result - pc_hr_incrbyfloat says "not a number" for all three.
-		 * The probes write a one-field record into b, which the real
-		 * edit then overwrites; r stays whole in a. */
+		/* which refusal (pc_hr_incrbyfloat says "not a number" for all three):
+		 * probes write a one-field record into b, the real edit overwrites it */
 		if (pc_hr_incrbyfloat(NULL, 0, "x", 1, argv[3], argl[3], tmp, b,
 		        PC_HR_MAX + 64) < 0) {
 			pc_tw_err(t, "ERR value is not a valid float");
@@ -2695,28 +2378,128 @@ static const char *hc_gate_text(int lacking)
 	return hc_gate_msg;
 }
 
-/* PC_OP_OK (the reply in @t), PARKED (forwarded to the deciding node), or
- * PC_OP_ERR_* (GATE / MODE / WRFAIL / 2BIG / BUSY / FWD) */
-/* S319: a forwarded read's encoded arguments, left for the door's park
- * entry to take - same thread, same call stack (the door parks right
- * after the verb returns PARKED); taking clears it */
+/* a forwarded read's encoded arguments, left for the door's park entry (same thread, the door
+ * parks right after PARKED); taking clears it */
 static __thread unsigned char *hcmd_park_args_v;
 static __thread size_t hcmd_park_argl_v;
 
+/* the arguments encoded as a forward carries them, on the heap for the park entry */
+static unsigned char *hcmd_enc_heap(int argc, const char *const *argv,
+		const size_t *argl, size_t *need_out)
+{
+	size_t need = 2, o = 2;
+	unsigned char *enc;
+	int i;
+
+	for (i = 0; i < argc; i++)
+		need += 4 + argl[i];
+	enc = malloc(need);
+	if (!enc)
+		return NULL;
+	enc[0] = (unsigned char)argc;
+	enc[1] = (unsigned char)(argc >> 8);
+	for (i = 0; i < argc; i++) {
+		enc[o] = (unsigned char)argl[i];
+		enc[o + 1] = (unsigned char)(argl[i] >> 8);
+		enc[o + 2] = (unsigned char)(argl[i] >> 16);
+		enc[o + 3] = (unsigned char)(argl[i] >> 24);
+		memcpy(enc + o + 4, argv[i], argl[i]);
+		o += 4 + argl[i];
+	}
+	*need_out = need;
+	return enc;
+}
+
+/* the node a read pulls the record from to render here, or 0: shard, the owner of a read-through
+ * key (a plain key is forwarded); spread, a holder when this node is not one and lacks the key */
+static int read_pull_peer(pcache_htable_t *ht, const char *cn, int shard,
+		int owner, const char *key, size_t klen)
+{
+	size_t cl = strlen(cn);
+	unsigned long long v;
+	int kk = pc_cluster_replicas(), slot;
+	str k;
+
+	if (shard)
+		return owner && pc_upstream_allowed(cn, cl, key, klen) ? owner : 0;
+	slot = pc_key_slot(key, klen);
+	if (kk <= 0 || !pc_store_pull_enabled(ht) ||
+	        pc_spread_in_set(slot, 0, kk))
+		return 0;
+	k.s = (char *)key;
+	k.len = (int)klen;
+	if (pcache_ht_getmeta(ht, &k, &v, NULL) == 0 ||
+	        pc_neg_hit(cn, cl, key, klen))
+		return 0;
+	return pc_spread_pick_peer(slot, kk);
+}
+
+int pc_jget_park(pcache_htable_t *ht, const char *key, size_t klen,
+		const char *path, size_t plen, int shape, unsigned int *park)
+{
+	const char *cn = col_name_of(ht);
+	int sh = pc_store_shard_enabled(ht), at;
+	unsigned char sb = (unsigned char)shape;
+	const char *ja[4];
+	size_t jl[4], need;
+	unsigned char *enc;
+	unsigned int req;
+
+	if (!pc_cluster_enabled() || pc_store_proxy_enabled(ht))
+		return 0;
+	at = read_pull_peer(ht, cn, sh, sh ? pc_shard_owner(cn, strlen(cn),
+		key, klen) : 0, key, klen);
+	if (at <= 0)
+		return 0;
+	ja[0] = PC_JGET_PARK;
+	jl[0] = sizeof PC_JGET_PARK - 1;
+	ja[1] = key;
+	jl[1] = klen;
+	ja[2] = path;
+	jl[2] = plen;
+	ja[3] = (const char *)&sb;
+	jl[3] = 1;
+	if (!(enc = hcmd_enc_heap(4, ja, jl, &need)))
+		return 0;
+	req = pc_pull_begin_at(cn, strlen(cn), key, klen, at);
+	if (!req) {
+		free(enc);
+		return 0;
+	}
+	free(hcmd_park_args_v);
+	hcmd_park_args_v = enc;
+	hcmd_park_argl_v = need;
+	*park = req;
+	return 1;
+}
+
+int pc_jget_park_shape(const unsigned char *args, size_t argsl)
+{
+	const char *argv[PC_HCMD_MAXARGS];
+	size_t argl[PC_HCMD_MAXARGS];
+	int argc;
+
+	if (!args || hcmd_decode(args, argsl, argv, argl, &argc) != 0 ||
+	        argc != 4 || argl[3] != 1)
+		return -1;
+	return (unsigned char)argv[3][0];
+}
+
+/* PC_OP_OK (the reply in @t), PARKED (forwarded to the deciding node), or
+ * PC_OP_ERR_* (GATE / MODE / WRFAIL / 2BIG / BUSY / FWD) */
 static int op_hcmd(pcache_htable_t *ht, int ci, int argc,
 		const char *const *argv, const size_t *argl, struct pc_tw *t,
 		unsigned int *park, int *lacking)
 {
-	if (argc > 1)                        /* S397: argv[1] is the key */
+	if (argc > 1)                        /* argv[1] is the key */
 		HOT(ht, argv[1], argl[1]);
 	if (hcmds[ci].write && op_refused(ht))
 		return PC_OP_ERR_WRFAIL;
 	if (!pc_cluster_fleet_has(PC_FEAT_TYPES2, lacking))
 		return PC_OP_ERR_GATE;
 	{
-		/* S319: one ceiling for the arguments wherever the command runs
-		 * - the forward frame's - so a command does not work on the
-		 * owner and fail through a forwarder */
+		/* one ceiling for the arguments wherever the command runs (the forward
+		 * frame's), so a command cannot work on the owner yet fail via a forwarder */
 		size_t need = 2;
 		int i;
 
@@ -2734,6 +2517,27 @@ static int op_hcmd(pcache_htable_t *ht, int ci, int argc,
 			return PC_OP_ERR_MODE;
 		owner = (shard || hcmds[ci].write) ? pc_shard_owner(cn,
 			strlen(cn), argv[1], argl[1]) : 0;
+		if (!hcmds[ci].write) {
+			int at = read_pull_peer(ht, cn, shard, owner, argv[1],
+				argl[1]);
+			size_t need;
+			unsigned char *enc;
+			unsigned int req;
+
+			if (at > 0 && (enc = hcmd_enc_heap(argc, argv, argl,
+			        &need)) != NULL) {
+				req = pc_pull_begin_at(cn, strlen(cn), argv[1],
+					argl[1], at);
+				if (req) {
+					free(hcmd_park_args_v);
+					hcmd_park_args_v = enc;
+					hcmd_park_argl_v = need;
+					*park = req;
+					return PC_OP_PARKED;
+				}
+				free(enc);
+			}
+		}
 		if (owner) {
 			size_t need = 2, o = 2;
 			unsigned char *enc;
@@ -2742,17 +2546,12 @@ static int op_hcmd(pcache_htable_t *ht, int ci, int argc,
 
 			for (i = 0; i < argc; i++)
 				need += 4 + argl[i];
-			/* S319: a READ asks the owner for the record and renders
-			 * here - once every node speaks it (a rolling restart
-			 * meets older owners, which run the old plane as before) */
+			/* a READ asks the owner for the record and renders it here, once
+			 * every node speaks it (an older owner runs the old plane) */
 			rd = !hcmds[ci].write &&
 				pc_cluster_fleet_has(PC_FEAT_HREAD, NULL);
-			/* S318: a write's encoding goes in the edit scratch, not
-			 * a malloc - the forward plane builds its datagram from
-			 * it before returning, and the ceiling checked above
-			 * keeps it inside (the assert beside hr_buf).  A read's
-			 * arguments outlive this call in the door's park entry,
-			 * so they are heap (S319). */
+			/* a write's encoding goes in the edit scratch (the forward plane copies it
+			 * before returning); a read's outlives the call in the park entry: heap */
 			enc = rd ? malloc(need) : hr_buf();
 			if (!enc)
 				return PC_OP_ERR_FWD;
@@ -2802,18 +2601,8 @@ unsigned char *pc_hcmd_take_park_args(size_t *n)
 	return p;
 }
 
-/*
- * S283: the JSON read-modify-write (and the forward plane's hash ops that
- * share its entry) works in two per-thread buffers - the stored record and
- * the result - each VAL_MAX, taken on a thread's first call and kept for
- * its life.  It used to malloc a copy of the document and a VAL_MAX result
- * per request: three allocations per JSON command (counted on 0.4.6 with
- * test/allocshim.so), and 256 KB is above musl's mmap threshold, so on
- * musl every JSON command paid an mmap, page faults and an munmap - the
- * JSON collapse of DESIGN 12hd.  Every fragment pc_json_rmw hands back
- * (GET, PC_JOP_HCMD, PC_JOP_HCMD_READ) is BORROWED from these buffers:
- * valid until this thread's next pc_json_rmw, never freed by the caller.
- */
+/* the JSON read-modify-write's two per-thread VAL_MAX buffers (record, result), kept for the
+ * thread's life; a fragment pc_json_rmw hands back is borrowed until its next call */
 static __thread char *jr_doc, *jr_out;
 
 static int jr_scratch(void)
@@ -2841,21 +2630,50 @@ static int hcmd_remote(pcache_htable_t *ht, const char *val, int vlen,
 	ci = hcmd_find(argv[0], argl[0]);
 	if (ci < 0 || !hcmd_arity_ok(ci, argc))
 		return -1;
-	/* S283: into this thread's result buffer, borrowed by the caller */
+	/* into this thread's result buffer, borrowed by the caller */
 	pc_tw_init(&t, (unsigned char *)jr_out, VAL_MAX);
 	hcmd_exec(ht, ci, argc, argv, argl, &t);
 	*frag_out = jr_out;
 	if (t.over) {
-		/* larger than the buffer, so far past the forward ack's
-		 * ceiling: say "too big" - the caller counts and refuses
-		 * that by its length (fwd_reply_too_big), as it did when
-		 * the tree was a heap buffer that grew */
+		/* larger than the buffer, so far past the forward ack's ceiling: report
+		 * too big by length, which the caller refuses (fwd_reply_too_big) */
 		*fraglen_out = VAL_MAX + 1;
 		return 0;
 	}
 	if (pc_tw_done(&t) != 0)
 		return -1;
 	*fraglen_out = (int)t.n;
+	return 0;
+}
+
+int pc_jget_render_pull(const unsigned char *args, size_t argsl,
+		const char *col, size_t collen, const char *rec, size_t rlen,
+		int found, long long type, char **frag, int *fraglen)
+{
+	const char *argv[PC_HCMD_MAXARGS];
+	size_t argl[PC_HCMD_MAXARGS];
+	pcache_htable_t *ht;
+	int argc, rc;
+
+	if (!args || hcmd_decode(args, argsl, argv, argl, &argc) != 0 ||
+	        argc < 3 || argl[0] != sizeof PC_JGET_PARK - 1 ||
+	        memcmp(argv[0], PC_JGET_PARK, argl[0]) != 0)
+		return -1;
+	if (!found)
+		return 1;
+	ht = pc_store_find(col, collen);
+	/* as the owner's jget - a string is not a document */
+	if (!(type & PCACHE_F_JSON) && (!ht || pc_store_types_strict(ht)))
+		return 3;
+	if (jr_scratch() != 0)
+		return 2;
+	rc = pc_jp_get(rec, rlen, argv[2], argl[2], jr_out, VAL_MAX);
+	if (rc == PC_JP_E_NOLEAF)
+		return 1;
+	if (rc < 0)
+		return 2;
+	*frag = jr_out;
+	*fraglen = rc;
 	return 0;
 }
 
@@ -2871,7 +2689,7 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 	char *doc = NULL, *nd = NULL;
 	const char *fmsg = NULL;
 	int rc, rc2 = 0, absent;
-	HOT(ht, key, klen);                  /* S397 */
+	HOT(ht, key, klen);
 
 	k.s = (char *)key;
 	k.len = klen;
@@ -2880,9 +2698,9 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 		return -1;
 	}
 
-	/* S314: not a document op - the same stripe, the same forward plane,
-	 * so a forwarded RL.HIT runs here on the deciding node unchanged */
-	if (op == PC_JOP_HCMD) {                       /* S313 */
+	/* not document ops (hash, lock, rate limit): the same stripe and forward plane,
+	 * so a forwarded one runs here on the deciding node unchanged */
+	if (op == PC_JOP_HCMD) {
 		(void)klen; (void)nx; (void)xx; (void)mkpath; (void)path;
 		(void)plen; (void)by; (void)have_ttl; (void)ttl;
 		if (hcmd_remote(ht, val, vlen, frag_out, fraglen_out) != 0) {
@@ -2891,7 +2709,7 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 		}
 		return 0;
 	}
-	if (op == PC_JOP_HCMD_READ) {                  /* S319 */
+	if (op == PC_JOP_HCMD_READ) {
 		unsigned char fl = 0;
 		unsigned int vl = 0;
 
@@ -2908,14 +2726,13 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 			*errmsg = pc_json_wrongtype_msg;   /* st 3: the asker says WRONGTYPE */
 			return -1;
 		}
-		/* the record itself is the fragment - at most PC_HR_MAX bytes
-		 * by its own invariant, so it always fits the ack; the asker
-		 * renders HGETALL and the rest over it.  Borrowed (S283). */
+		/* the record itself is the fragment (borrowed; at most PC_HR_MAX, so it
+		 * always fits the ack) - the asker renders HGETALL and the rest over it */
 		*frag_out = jr_doc;
 		*fraglen_out = (int)vl;
 		return 0;
 	}
-	if (op == PC_JOP_SLOCK) {                      /* S170a */
+	if (op == PC_JOP_SLOCK) {
 		const unsigned char *e = (const unsigned char *)val;
 		int res = 0, r;
 
@@ -2962,7 +2779,7 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 			*errmsg = "get failed";
 			return -1;
 		}
-		/* S280: a string is not a document, whatever its bytes */
+		/* a string is not a document, whatever its bytes */
 		if (!(fl & PCACHE_F_JSON) && pc_store_types_strict(ht)) {
 			*errmsg = pc_json_wrongtype_msg;
 			return -1;
@@ -2975,7 +2792,7 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 			*errmsg = jp_strerror(rc2);
 			return -1;
 		}
-		*frag_out = jr_out;                    /* borrowed (S283) */
+		*frag_out = jr_out;                    /* borrowed */
 		*fraglen_out = rc2;
 		return 0;
 	}
@@ -2990,7 +2807,7 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 			&exp, &fl);
 		v.s = jr_doc;
 		v.len = (int)vl;
-		/* S280: every JSON write - $ or a path, set, del, incr,
+		/* every JSON write - $ or a path, set, del, incr,
 		 * append - refuses a key that holds a string */
 		if (rc == 0 && !(fl & PCACHE_F_JSON) &&
 		        pc_store_types_strict(ht)) {
@@ -3050,9 +2867,9 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 		newexp = have_ttl ? ttl_to_abs(ttl) : exp;
 		nvs.s = nd;
 		nvs.len = rc2;
-		/* S280: what a JSON write stores is a document */
+		/* what a JSON write stores is a document */
 		if (pcache_ht_store_ex(ht, &k, &nvs, newexp, PCACHE_F_JSON) == 0) {
-			pc_ev_store(ht, &k, (unsigned int)nvs.len, 0);   /* S153 */
+			pc_ev_store(ht, &k, (unsigned int)nvs.len, 0);
 			pc_wal_upsert_fl(cn, k.s, k.len, nd, rc2, newexp,
 				pcache_last_ver, PCACHE_F_JSON);
 			eager_push(ht, &k, nd, (size_t)rc2, newexp,
@@ -3089,61 +2906,20 @@ static void write_hit(struct pc_tw *w, const char *v, size_t vn,
 	pc_tw_end(w);
 }
 
-/* C7: a RECOVERING node holds data it cannot vouch for.  Its replay can
- * still carry a key that was DELETED while it was down, so serving from
- * it does not answer late - it answers WRONGLY, and a wrong answer is
- * the one failure a cache cannot let a client detect.
- *
- * STARTING IS NOT GATED, and that is the whole distinction.  A node that
- * has not joined yet holds NOTHING, so a miss from it is the truth; it
- * answers honestly, just emptily.  Gating it would refuse every data
- * verb for JOIN_WAIT_MS at every cold start of every clustered node -
- * measured here when the first cut of this gate refused its own test
- * fixture's 200-key fill - and would buy nothing, because there is no
- * wrong answer to prevent.  Truthfully empty is not the same as
- * untrustworthy.  Data verbs are therefore refused until READY.
- *
- * Observability is NOT gated.  A node stuck non-READY is exactly when
- * an operator needs to ask it what is wrong, so ping / stats / members
- * / probe answer throughout, as do the operator-initiated admin verbs.
- *
- * DRAINING SERVES.  It is being emptied, not doubted, and it still
- * holds everything it has not handed over.  That is deliberately NOT
- * the same rule as pc_clsel_eligible(), which gates SELECTION and
- * excludes DRAINING: do not DIAL a node that is going away, but do
- * answer on one you are already talking to.  Two different questions -
- * if you are here to unify them, they were separated on purpose.
- * (Today DRAINING is only entered on the way out, in the shutdown path,
- * so this arm is a forward-looking rule rather than live behaviour -
- * nothing exercises it yet, and waldroptest-style proof is not
- * available until a drain verb exists.)
- *
- * The client half is libperfd reading the `state` the members verb has
- * published since B1, so a cluster-aware client skips a non-READY node
- * rather than being refused by it.  This gate is what makes that
- * advisory rather than load-bearing. */
+/* a RECOVERING node may serve a key deleted while it was down - a WRONG answer - so it refuses
+ * data verbs; STARTING (empty: truthful) and DRAINING serve, unlike pc_clsel_eligible on purpose */
 static int serving_denied(void)
 {
-	return pc_node_state() == PC_NST_RECOVERING;
+	return pc_nst_refuses(pc_node_state());   /* CONNECTING too */
 }
 
-/*
- * FAILED refuses WRITES only, which is the whole difference between it
- * and the gate above.  A node whose WAL is discarding acknowledged
- * writes still holds correct data and must go on answering for it -
- * what it must stop doing is accepting more it cannot honour.  Refusing
- * reads too would turn a durability fault into an availability one.
- *
- * The three dialects all funnel their mutations through op_set/op_del/
- * op_addsub, so the check lives there: one place per mutation rather
- * than one per dialect, and a new dialect inherits it.
- */
+/* FAILED refuses WRITES only: its data is still correct, so refusing reads would turn a durability
+ * fault into an availability one.  Every dialect's mutation funnels through the op_ cores. */
 static int writes_denied(void)
 {
 	int st = pc_node_state();
 
-	/* S229: HEALING refuses writes too - more of what it is still making
-	 * durable - and serves reads, for the same reason FAILED does */
+	/* HEALING refuses writes too and serves reads, for the same reason FAILED does */
 	return st == PC_NST_FAILED || st == PC_NST_HEALING;
 }
 
@@ -3153,10 +2929,8 @@ static int writes_denied(void)
 	"a snapshot is making them durable) - reads still served here, send "\
 	"writes to another member or retry shortly"
 
-/* S348: why the last mutation on THIS thread was refused when the reason
- * is the collection (upstream_writes = refuse) rather than the node - the
- * dialects all answer PC_OP_ERR_WRFAIL through wr_refused_msg(), so they
- * all say it the same way */
+/* why this thread's last mutation was refused when the reason is the collection (upstream_writes
+ * = refuse), not the node; every dialect says it through wr_refused_msg() */
 static __thread const char *wr_reason;
 
 const char *wr_refused_msg(void)
@@ -3170,8 +2944,8 @@ const char *wr_refused_msg(void)
 	return pc_node_state() == PC_NST_HEALING ? PC_WRHEAL_MSG : PC_WRFAIL_MSG;
 }
 
-/* every mutation asks this: the node refusing (FAILED, HEALING), or the
- * collection (S348) - the latter by name, so a forwarded apply asks too */
+/* every mutation asks this: the node refusing (FAILED, HEALING), or the collection - by name,
+ * so a forwarded apply asks too */
 static int op_refused_col(const char *cn, size_t cl)
 {
 	wr_reason = NULL;
@@ -3190,13 +2964,10 @@ static int op_refused(pcache_htable_t *ht)
 	return op_refused_col(cn, cn ? strlen(cn) : 0);
 }
 
-/* one message, so all three dialects say the same thing */
-/* S69 */
 #define PC_COL_DEFAULT_LOG2 12         /* 4,096 buckets: ~1.5 MB of index,
                                         * and the splitter grows it */
 #define PC_NOCREATE_MSG "creating and dropping collections is not enabled "\
 	"here - set [daemon] allow_create = yes on this node"
-/* S448 */
 #define PC_RENAME_BOUND_MSG "a read-through collection and its .nofall "\
 	"companion are not renamed live - their upstream is bound to the name "\
 	"in the config: rename it there and restart every node at once"
@@ -3205,31 +2976,16 @@ static int op_refused(pcache_htable_t *ht)
 	"into it would bind this collection to that upstream"
 static int allow_create;
 
-/* S129.  Two DIFFERENT questions, and collapsing them is the bug this
- * exists to prevent: allow_create answers "may this NODE originate DDL
- * at all", the connection's privilege bit answers "may THIS LINK".  The
- * client secret cannot answer the second - apps, ops tooling and
- * perfcli all present the same value, so gating on it hands drop and
- * resize to every application connection.
- *
- * The privileged set is chosen by BLAST RADIUS, not by the word DDL:
- * create/drop/resize/rename, and `restore` with them, because a restore
- * replaces every record it is given at a fresh version - a larger blast
- * radius than a resize.  `probe` is the next candidate (it stalls a
- * worker for up to thirty seconds) and is left out of v1 deliberately.
- */
+/* allow_create asks may this NODE originate DDL, the link's privilege bit may THIS LINK (the
+ * shared client secret cannot); privileged by blast radius: create/drop/resize/rename, restore */
 #define PC_NOPRIV_MSG "this operation needs a privileged connection - "\
 	"call enable with the [secrets] enable value first"
 #define PC_NOENABLE_MSG "no [secrets] enable is configured on this node, "\
 	"so privilege cannot be raised and this operation is unreachable"
 static unsigned long long enable_fail;   /* failed enable attempts */
 
-/* S417: wrong enable secrets are counted PER SOURCE ADDRESS, and after
- * pc_enable_lockout_after of them within pc_enable_lockout_s seconds every
- * enable from that address is refused for pc_enable_lockout_s - the
- * fleet-level stop on a secret being guessed, independent of how many
- * dashboards or perfcli copies sit in front (each dashboard's own lockout
- * is the first line).  A right secret clears the address.  0 = off. */
+/* wrong enable secrets count per source address: pc_enable_lockout_after within
+ * pc_enable_lockout_s seconds locks the address out that long; a right one clears it.  0 = off */
 int pc_enable_lockout_after = 5;
 int pc_enable_lockout_s = 60;
 #define EN_LOCK_MAX 64
@@ -3357,7 +3113,7 @@ void pc_verb_set_allow_create(int on)
 	allow_create = on;
 }
 
-/* RV-10: [listen] resp_redirect - see pc_verb_resp */
+/* [listen] resp_redirect - see pc_verb_resp */
 static int resp_redirect_moved;
 
 void pc_verb_set_resp_redirect(int moved)
@@ -3365,26 +3121,8 @@ void pc_verb_set_resp_redirect(int moved)
 	resp_redirect_moved = moved;
 }
 
-/* S128: why a table could not be built.  A create or a resize is the one
- * client word that carves a multi-gigabyte structure in one go - 2^24
- * buckets is 3.0 GB of index - and until now the REGION carve had no
- * ceiling test at all, so one verb could put a node 21% past its
- * configured arena_mb.
- *
- * The CORE is what refuses now, before it carves the first region, which
- * is what makes the bound honest and is the only place that can be sure:
- * a resize to the size a collection already is builds nothing, and a
- * create of a name that exists builds nothing, so a test made before the
- * store has decided would refuse operations that never carve.  This runs
- * on the refusal the store hands back, and only names the three figures
- * an operator needs - what it would take, what is held, what the ceiling
- * is - when the ceiling really is the reason.  Anything else keeps the
- * generic message, because "the arena has no room" is a claim.
- *
- * A resize needs no special arithmetic for holding both tables at once:
- * the OLD table is already inside `held` and the NEW one is what was
- * asked for, so the single test IS the both-at-once question.  Returns
- * the detailed message, or NULL when the ceiling is not the cause. */
+/* why a table could not be built: the detailed message when the arena ceiling (checked by the
+ * core before it carves) is the cause, else NULL; a resize's old table is already in `held` */
 static __thread char index_fit_msg[224];
 
 static const char *index_ceiling_msg(int bl)
@@ -3403,14 +3141,11 @@ static const char *index_ceiling_msg(int bl)
 	return index_fit_msg;
 }
 
-#define PC_NOTREADY_MSG "node is not READY (recovering) - retry, or use "\
+#define PC_NOTREADY_MSG "node is not READY (recovering or connecting) - retry, or use "\
 	"another member"
 
-/* S299: the member list is PC_CL_MAXMEMBERS entries of ~1 KB - half a
- * megabyte, which three request handlers used to put on their stacks
- * (68 KB each while the bound was 64).  One buffer per thread, made on
- * first use and never freed: only the entries a call fills are touched,
- * so a small fleet's RSS does not pay for the bound. */
+/* the member list (PC_CL_MAXMEMBERS x ~1 KB) is too big for a stack: one buffer per thread,
+ * made on first use, never freed; only the entries a call fills are touched */
 struct pc_member *members_scratch(void)
 {
 	static __thread struct pc_member *buf;
@@ -3422,7 +3157,7 @@ struct pc_member *members_scratch(void)
 
 const char pc_unknown_method[] = "method not found";
 
-/* AR5: what a native verb written through answers with */
+/* what a native verb written through answers with */
 struct up_ans {
 	long long ival;                /* Redis's number: OK 1, an integer, nil 0 */
 	int stored, dropped;           /* mset: the items sent, the ones refused */
@@ -3431,11 +3166,11 @@ struct up_ans {
 };
 static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		const struct pc_tv *v, int params, const char **errmsg,
-		struct up_ans *ans);                               /* S331, S385 */
-/* S385: the gate answered a write-through write with Redis's success; the
+		struct up_ans *ans);
+/* the gate answered a write-through write with Redis's success; the
  * door renders the verb's own reply from ans->ival */
 #define UPG_REPLY 3
-/* AR5: the gate built the verb's reply in ans->tree (hcmd: Redis's reply,
+/* the gate built the verb's reply in ans->tree (hcmd: Redis's reply,
  * an error too, as the tree the hash core builds) */
 #define UPG_TREE 4
 
@@ -3448,22 +3183,21 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	str k, v_;
 	long long by, ttl;
 	int rc;
-	unsigned int vln, exp;
-	int is_ctr;
+	unsigned int exp;
 
 	*outcome = 0;
 	/* every accessor answers "absent" for params -1, so a method that
 	 * takes no parameters and one called without them read alike */
-	/* the key is read where it lies in the request tree: the op cores
-	 * take a span, and nothing below outlives the request */
+	/* keys, values and payloads are used where they lie in the request tree: the op
+	 * cores take spans, and nothing below outlives the request */
 #define NEEDKEY() do { \
 	const char *kp_; size_t kn_; \
 	if (get_bytes(v, params, "key", &kp_, &kn_, KEY_MAX) != 0) \
 		ERR("missing or bad key"); \
 	k.s = (char *)kp_; k.len = (int)kn_; } while (0)
 
-	/* ---- conninfo : S460 - the worker this connection is on and every
-	 * worker's live native connections, so a client can move off a crowded one */
+	/* ---- conninfo: the worker this connection is on and every worker's live native
+	 * connections, so a client can move off a crowded one */
 	if (m_is(method, mlen, "conninfo")) {
 		int c[256], n = pc_obs_worker_conns(c, 256), me = pc_worker_id(), i, least = -1;
 
@@ -3495,7 +3229,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_map(out);
 		pc_tw_key(out, "pong");
 		pc_tw_bool(out, 1);
-		/* an echo that is not bytes is left out, as a non-string was */
 		if (te >= 0 && v->n[te].type == 'b') {
 			pc_tw_key(out, "echo");
 			pc_tw_bulk(out, v->n[te].p, v->n[te].len);
@@ -3504,15 +3237,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- PS4: pub/sub on the native door ----------------------------
-	 * subscribe {channel} / psubscribe {pattern} / unsubscribe {channel?}
-	 * / punsubscribe {pattern?} answer {subscribed: N}; publish {channel,
-	 * payload} answers {receivers: N}.  Deliveries are NOTIFY frames
-	 * carrying {method: "message", params: {channel, payload}} and
-	 * "pmessage" with pattern first (proto.c builds them) - the S107
-	 * shape, so libperfd's notify hook receives them and a blocking get
-	 * keeps waiting for its own id: the connection stays multiplexed,
-	 * which is the whole reason a frame carries an id. */
+	/* ---- pub/sub: deliveries are NOTIFY frames (proto.c builds them), so a blocking get
+	 * keeps waiting for its own id - the connection stays multiplexed */
 	if (m_is(method, mlen, "subscribe") ||
 	    m_is(method, mlen, "psubscribe") ||
 	    m_is(method, mlen, "unsubscribe") ||
@@ -3562,7 +3288,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if ((size_t)clen >= sizeof PC_PUBSUB_RESERVED - 1 &&
 		    !memcmp(chan, PC_PUBSUB_RESERVED, sizeof PC_PUBSUB_RESERVED - 1))
 			ERR("channel prefix __pc. is reserved");
-		/* the payload is published from where it lies in the request */
 		if (get_bytes(v, params, "payload", &pay, &plen, VAL_MAX) != 0)
 			ERR("missing or bad payload");
 		pc_tw_map(out);
@@ -3572,14 +3297,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* PS5: pushes over UDP to this connection's own address
-	 * (lib/perfd_push.h):
-	 *   pubsub_udp {port: N}          -> {stream, key, ...}; port 0 stops
-	 *   pubsub_udp_confirm {cookie}   -> {udp: true, seq: N}; a probe's
-	 *                                    cookie; messages follow N
-	 *   pubsub_udp_ack {seq: N}       -> {acked: N}
-	 * stream, key and the cookie stay HEX TEXT, as lib/perfd_push.h's
-	 * consumers read them. */
+	/* pushes over UDP to this connection's own address (lib/perfd_push.h); stream, key
+	 * and the cookie stay HEX TEXT, as that header's consumers read them */
 	if (m_is(method, mlen, "pubsub_udp")) {
 		long long port;
 		uint64_t stream;
@@ -3646,17 +3365,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* ---- fleetstop {timeout_ms?} : S222 - stop the whole fleet -----
-	 * PRIVILEGED, by S129's own rule: the set is chosen by blast radius,
-	 * and nothing a client can say has a larger one - every node in the
-	 * fleet goes down.  The client secret cannot gate it: applications
-	 * hold that.  Each peer stops the way SIGTERM stops it (drain, a
-	 * snapshot, goodbye); this node waits for them, reports who went and
-	 * who did not, and then stops itself, last. */
-	/* 12nx: the distinct-key sketch of a collection's last held walk, for
-	 * the dashboard to merge across the members - base64 of PC_HLL_M
-	 * one-byte HyperLogLog registers (hash fnv1a64 + fmix64).  Reads
-	 * nothing but a copy of what the walk left; unprivileged, as stats. */
+	/* sketch: a collection's distinct-key HyperLogLog from its last held walk (base64 of
+	 * PC_HLL_M one-byte registers, fnv1a64 + fmix64), for the dashboard to merge */
 	if (m_is(method, mlen, "sketch")) {
 		const char *em = NULL;
 		pcache_htable_t *sht = get_col(v, params, &em);
@@ -3686,7 +3396,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* 12nw: reload this node's configuration file now, answered when it is
+	/* reload this node's configuration file now, answered when it is
 	 * done - the same run SIGHUP and `systemctl reload` make */
 	if (m_is(method, mlen, "reload")) {
 		char rm[512];
@@ -3704,6 +3414,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
+	/* ---- fleetstop {timeout_ms?}: privileged - nothing has a larger blast radius.  Each peer
+	 * stops as SIGTERM stops it; this node waits, reports who went, then stops itself last */
 	if (m_is(method, mlen, "fleetstop")) {
 		int gone[64], still[64], lost[64], ng = 0, ns = 0, nl = 0,
 			nt, j;
@@ -3739,7 +3451,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		for (j = 0; j < ns; j++)
 			pc_tw_i64(out, still[j]);
 		pc_tw_end(out);
-		/* S233: left the live set without a goodbye */
+		/* left the live set without a goodbye */
 		pc_tw_key(out, "lost");
 		pc_tw_arr(out);
 		for (j = 0; j < nl; j++)
@@ -3748,7 +3460,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* CH-9: master_prefer {node} on the master hands mastership to that
+	/* master_prefer {node} on the master hands mastership to that
 	 * member once it is the synced standby; master_auto (node 0) cancels */
 	if (m_is(method, mlen, "master_prefer") || m_is(method, mlen, "master_auto")) {
 		long long node = 0;
@@ -3800,8 +3512,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		rc2 = pc_wal_sync((int)tmo);
 		if (rc2 == 1)
 			ERR("persistence is not configured");
-		/* S215: before this, a refused fdatasync moved the watermark
-		 * anyway and this verb answered {synced: true} over it */
 		if (rc2 == -2)
 			ERR("the WAL's storage failed - what was "
 				"written after the last good sync is not on "
@@ -3813,16 +3523,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			struct pc_wal_stats ws;
 
 			pc_wal_get_stats(&ws);
-			/* S58: the barrier covers every record that REACHED a
-			 * ring, and a ring-full drop discards one that already
-			 * holds a sequence number - the gap does not hold
-			 * synced_seq back, so this reply used to say
-			 * {"synced":true,"seq":N} while N included records the
-			 * WAL never carried (measured: 20000 writes, seq 20000,
-			 * 1223 dropped, 18777 replayed after a kill).  The
-			 * count rides the receipt so a caller can tell a full
-			 * barrier from a partial one; never-block-a-worker
-			 * means drops stay possible by design. */
+			/* a ring-full drop discards a record that already holds a
+			 * sequence number: `dropped` tells a partial barrier from a full one */
 			pc_tw_map(out);
 			pc_tw_key(out, "synced");
 			pc_tw_bool(out, 1);
@@ -3855,19 +3557,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- S69: create {col, buckets_log2?} / drop {col, force?} -----
-	 * A cache should not need a config edit and a fleet restart to hold
-	 * a new keyspace.  Gated by [daemon] allow_create, which is OFF by
-	 * default: a driver that creates on miss turns a typo into a second
-	 * empty collection and an operator into someone whose cache "lost
-	 * everything", so this is opt-in on the DAEMON.  The gate governs
-	 * ORIGINATION only - a create made anywhere reaches every member
-	 * whatever its own setting, so the collection set stays uniform and
-	 * turning the gate on does not need a fleet restart.
-	 *
-	 * A created collection takes the CLUSTER's mode: a fleet is one mode
-	 * over one collection set, and a per-collection variant nobody
-	 * declared is how a keyspace goes quietly unreplicated. */
+	/* ---- create {col, buckets_log2?} / drop {col, force?}: [daemon] allow_create gates
+	 * only ORIGINATION - a create reaches every member, and takes the cluster's mode */
 	if (m_is(method, mlen, "create")) {
 		char nm[PC_COL_NAME_MAX];
 		long long bl = PC_COL_DEFAULT_LOG2;
@@ -3884,7 +3575,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if (nl <= 0)
 			ERR("missing col");
 		nm[nl] = '\0';
-		/* S343: a client names a collection as the config does */
+		/* a client names a collection as the config does */
 		if (!pc_col_name_ok(nm, (size_t)nl))
 			ERR(PC_COL_NAME_RULE);
 		pc_tv_get_int(v, params, "buckets_log2", &bl);
@@ -3894,7 +3585,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if (rc2 == -2)
 			ERR("the collection limit is reached");
 		if (rc2 == -3) {
-			const char *why = index_ceiling_msg((int)bl);   /* S128 */
+			const char *why = index_ceiling_msg((int)bl);
 
 			ERR(why ? why : "the table could not be created "
 				"- the arena has no room for its index");
@@ -3970,16 +3661,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- S69: rename {col, to} -------------------------------------
-	 * The atomic cutover perfload's restore-into-a-second-collection
-	 * always wanted: restore, verify, swap, drop.  One pointer swap, so
-	 * a lookup sees one name or the other and never a half-written one.
-	 *
-	 * The collections file is NOT brought forward here: records written
-	 * before this are in the WAL under the old name, and a replay has to
-	 * meet that name before the rename record moves it.  A checkpoint
-	 * retires that window and persists the new name; with no WAL running
-	 * there is no window and the file is written at once. */
+	/* ---- rename {col, to}: one pointer swap.  The collections file waits for a checkpoint:
+	 * WAL records before this carry the old name, and a replay must meet it first */
 	if (m_is(method, mlen, "rename")) {
 		char nm[PC_COL_NAME_MAX], to[PC_COL_NAME_MAX];
 		int nl, tl, rc2;
@@ -3997,19 +3680,12 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR("rename takes col and to");
 		nm[nl] = '\0';
 		to[tl] = '\0';
-		/* S343: the new name under the rule; the old one is whatever
-		 * is held - renaming a name that predates the rule is how it
-		 * gets one */
+		/* only the new name must follow the rule: a rename is how an
+		 * older name gets one */
 		if (!pc_col_name_ok(to, (size_t)tl))
 			ERR(PC_COL_NAME_RULE);
-		/* S448: an upstream binds a collection, and its .nofall
-		 * companion, by the name in the config.  Renamed live, the
-		 * collection stopped reading and writing through - silently -
-		 * and the binding stayed on a name no table answers.  The way
-		 * that works is the config and a restart of every node at once
-		 * (the collection list is in the interchange digest, so a
-		 * rolling one splits the fleet); and a rename INTO a bound name
-		 * would bind a collection the config never meant to */
+		/* an upstream binds a collection (and its .nofall companion) by its config
+		 * name: a bound name moves only by config and a restart of every node */
 		if (pc_upstream_binds(nm, (size_t)nl))
 			ERR(PC_RENAME_BOUND_MSG);
 		if (pc_upstream_binds(to, (size_t)tl))
@@ -4038,14 +3714,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- S432: map {index, col} / unmap {index} / maps --------------
-	 * The RESP door's DB-index map, changed while it serves (respmap.h).
-	 * A change is fleet state - a Lamport generation, the collection
-	 * plane carries it, the newer one wins - so it is refused while any
-	 * live member predates it (an older build would read the MAP op as a
-	 * SET and create a collection named by the index).  Gated as rename
-	 * is.  Every connection sees it on its next command: one that is
-	 * inside a MULTI or a pipeline may straddle the change. */
+	/* ---- map {index, col} / unmap {index}: the RESP door's DB-index map, fleet state by
+	 * Lamport generation - refused while a live member predates it; gated as rename is */
 	if (m_is(method, mlen, "map") || m_is(method, mlen, "unmap")) {
 		static __thread char why[192];
 		char col[PC_COL_NAME_MAX] = "", was[PC_COL_NAME_MAX];
@@ -4128,9 +3798,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* maps: every index the door answers, what it reaches and who put it
-	 * there (respmap_rows), with the config's own list.  Read-only,
-	 * ungated. */
+	/* maps: every index the door answers, what it reaches and who put it there; ungated */
 	if (m_is(method, mlen, "maps")) {
 		pc_tw_map(out);
 		pc_tw_key(out, "config");
@@ -4146,32 +3814,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- S69: resize {col, buckets_log2} ---------------------------
-	 * Either direction, one mechanism, while the collection serves.  The
-	 * work runs on the maintenance thread in bounded passes, so this
-	 * returns as soon as it has started rather than holding a worker for
-	 * the length of a migration; `stats` carries the progress and the
-	 * daemon logs the swap and the completion. */
-	/* ---- autoscale {col, mode} : S239 - how a collection is sized -----
-	 * auto (grow and shrink by key count, the default), warn (change
-	 * nothing, say what auto would do), off (change nothing, say
-	 * nothing).  Privileged, as resize is: it decides the table's size.
-	 * Persisted (the collections file), outranking the config from
-	 * then on.  S436: fleet state - announced to every member, ordered
-	 * by generation, re-sent to a member that was away; refused while a
-	 * member predates it.  The sizing under auto stays each member's,
-	 * for the share it holds. */
-	/* ---- updrain {col, stop?} (S331): the read-through drain sweep -
-	 * read every key the upstream holds under the allow-list, and take
-	 * over what the fleet does not have yet.  Privileged: it reads a
-	 * whole keyspace from what may be a production server.  Progress is
-	 * the upstream block's `drain` in stats. */
-	/* ---- mailtest : S352 - one mail now, and the SMTP server's answer.
-	 * Privileged: it sends mail on the operator's behalf.  It waits for
-	 * the answer (the send timeout plus a margin), holding this worker the
-	 * way fleetstop does - a command run by hand.  A refused or failed
-	 * mail is a RESULT ({sent: false, reply}), not an error: the reply is
-	 * what the operator came for. */
+	/* ---- mailtest: one mail now, holding this worker for the SMTP answer; a refused mail
+	 * is a RESULT ({sent: false, reply}), not an error - the reply is what was asked for */
 	if (m_is(method, mlen, "mailtest")) {
 		static __thread char mail_err[PC_MAIL_REPLY_MAX];
 		char reply[PC_MAIL_REPLY_MAX];
@@ -4194,10 +3838,9 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	if (m_is(method, mlen, "cluster_epoch_commit")) {       /* 12nu */
+	if (m_is(method, mlen, "cluster_epoch_commit")) {
 		/* the refusal's words outlive this frame: the door strlen()s
-		 * errmsg after the verb returns (a stack buffer here was a
-		 * use-after-return - 0.7.1-rc1's ASan pipelines, both CIs) */
+		 * errmsg after the verb returns */
 		static __thread char why[200];
 		char who[160];
 		long long epoch = 0;
@@ -4218,6 +3861,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
+	/* ---- updrain {col, stop?}: take over every key the upstream holds that the fleet lacks;
+	 * privileged - it reads a whole keyspace from what may be a production server */
 	if (m_is(method, mlen, "updrain")) {
 		char nm[PC_COL_NAME_MAX];
 		const char *msg = "";
@@ -4234,7 +3879,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if (pc_upstream_drain_ctl(nm, (size_t)nl, st, &msg) != 0)
 			ERR(msg);
 		{
-			char who[160];               /* S420: the audit line */
+			char who[160];
 
 			LM_NOTICE("collection '%.*s': updrain%s %s - by %s\n", nl, nm,
 				st ? " stop" : "", msg, pc_conn_who(conn, who, sizeof who));
@@ -4248,10 +3893,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- upfill {col, stop?, check?} (AR4): the keys the fleet owned before
-	 * upstream_writes = through, written to the master with NX through
-	 * the writer.  Privileged, as updrain is: it writes to what may be a
-	 * production server.  Progress is write_through.upfill in stats. */
+	/* ---- upfill {col, stop?, check?}: keys the fleet owned before upstream_writes = through,
+	 * written with NX to the master - privileged: it may be a production server */
 	if (m_is(method, mlen, "upfill")) {
 		char nm[PC_COL_NAME_MAX];
 		const char *msg = "";
@@ -4265,12 +3908,12 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR("missing col");
 		nm[nl] = '\0';
 		st = pc_tv_get_bool(v, params, "stop") > 0;
-		/* S400: check compares with Redis, writing nothing */
+		/* check compares with Redis, writing nothing */
 		if (pc_upstream_upfill_ctl(nm, (size_t)nl, st,
 		        pc_tv_get_bool(v, params, "check") > 0, &msg) != 0)
 			ERR(msg);
 		{
-			char who[160];               /* S420: the audit line */
+			char who[160];
 
 			LM_NOTICE("collection '%.*s': upfill%s %s - by %s\n", nl, nm,
 				pc_tv_get_bool(v, params, "check") > 0 ? " check" : "",
@@ -4285,14 +3928,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- UP6n: upgrade_stage {op, ...} - a build to install, staged on
-	 * this node.  Privileged: it is what a node may later be told to run.
-	 *   begin {size, sha256, sig?, version} -> {id, chunk_max}
-	 *   chunk {id, off, data (base64)}      -> {got}
-	 *   end   {id}                          -> {sha256, signer}
-	 *   abort {id}
-	 * The end verifies the whole file before it is published (upgrade.c);
-	 * a chunk is written as it arrives, in order. */
+	/* ---- upgrade_stage {op: begin|chunk|end|abort, ...}: a build staged on this node.
+	 * Chunks are written in order as they arrive; end verifies the whole file first */
 	if (m_is(method, mlen, "upgrade_stage")) {
 		char op[8], id[33], sha[65], sx[2 * PC_UPG_SIG_LEN + 1], ver[48];
 		char who[96];
@@ -4400,10 +4037,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		}
 		ERR("op: begin, chunk, end or abort");
 	}
-	/* ---- UPS: upgrade_switch {sha256, force?} - ask this host's root
-	 * helper to install a build staged here.  Privileged.  The helper
-	 * stops this node cleanly, switches, and starts the new build; its
-	 * word comes back in upgrade_status.requested.result. */
+	/* ---- upgrade_switch {sha256, force?}: the host's root helper installs a build staged
+	 * here, restarting this node into it; its word is upgrade_status.requested.result */
 	if (m_is(method, mlen, "upgrade_switch")) {
 		char sha[65], id[33], ver[48];
 		const char *e = "";
@@ -4417,7 +4052,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR("missing sha256");
 		sha[l] = '\0';
 		{
-			/* UPS: {member: "a.b.c.d"} asks that member instead
+			/* {member: "a.b.c.d"} asks that member instead
 			 * (M_UPG_SWITCH); its answer is upgrade_status.asked */
 			char mb[INET_ADDRSTRLEN];
 			struct in_addr ma;
@@ -4449,9 +4084,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* ---- UP7b: upgrade_revert {force?} - the helper switches this node
-	 * back to the prefix it kept before its last switch (12ns case 3: a
-	 * failed gate reverts that node; the driver's rollback).  Privileged. */
+	/* ---- upgrade_revert {force?}: the helper switches this node back to the prefix it
+	 * kept before its last switch - a failed gate's revert, the driver's rollback */
 	if (m_is(method, mlen, "upgrade_revert")) {
 		char id[33], to[200], who[160];
 		const char *e = "";
@@ -4475,18 +4109,15 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- UP6n: upgrade_status - what is staged here, and the upload in
-	 * progress.  Read-only: unprivileged, as stats is. */
+	/* ---- upgrade_status: what is staged here and the upload in progress; unprivileged */
 	if (m_is(method, mlen, "upgrade_status")) {
 		pc_upg_status_tree(out);
 		return 0;
 	}
 
+	/* ---- autoscale {col, mode}: persisted, outranking the config; fleet state ordered by
+	 * generation, refused while a member predates it - auto sizes each member's share */
 	if (m_is(method, mlen, "autoscale")) {
-		/* S436: ERR hands the caller the POINTER and returns, so the
-		 * message outlives this frame - thread storage, as every verb's
-		 * (a stack buffer here was read after the return: ASan killed
-		 * the node on the first refusal, GitHub 39959849797) */
 		static __thread char why[96];
 		char nm[PC_COL_NAME_MAX], md[16];
 		int nl, ml, mode, lacking = 0, rc, was = -1;
@@ -4505,9 +4136,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		md[ml] = '\0';
 		if ((mode = pc_autoscale_parse(md)) < 0)
 			ERR("mode is auto, floor, warn or off");
-		/* S436: a member that cannot take it would keep its own, and
-		 * the fleet would size one collection two ways unsaid (245-247,
-		 * 2026-10-23: one member at 4,194,304 buckets, two at ~35,000) */
+		/* a member that cannot take it would keep its own: one collection sized two ways */
 		if (!pc_cluster_fleet_has(PC_FEAT_AUTOSCALE, &lacking)) {
 			snprintf(why, sizeof why, "every member must run 0.7.2 or "
 				"later to set autoscale - node %d is older", lacking);
@@ -4531,6 +4160,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
+	/* ---- resize {col, buckets_log2}: runs on the maintenance thread in bounded passes and
+	 * returns once started; `stats` carries the progress */
 	if (m_is(method, mlen, "resize")) {
 		char nm[PC_COL_NAME_MAX];
 		long long bl = 0;
@@ -4559,19 +4190,19 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				"the collection already holds - the splitter would "
 				"grow it straight back");
 		if (rc2 == -4) {
-			const char *why = index_ceiling_msg((int)bl);   /* S128 */
+			const char *why = index_ceiling_msg((int)bl);
 
 			ERR(why ? why : "the new table could not be "
 				"created - the arena has no room for its index");
 		}
 		if (rc2 == -5)
 			ERR("the collection is already that size");
-		/* S255: this node's own resize is the newest it has seen */
+		/* this node's own resize is the newest it has seen */
 		pc_store_resize_gen_note(nm, (size_t)nl, pc_cluster_col_announce(
 			nm, (size_t)nl, (int)bl, CLCOL_OP_RESIZE));
 		LM_NOTICE("collection '%s': resize to 2^%d buckets started by a "
 			"client\n", nm, (int)bl);
-		pc_store_set_floor(nm, (size_t)nl, (int)bl);    /* S328 */
+		pc_store_set_floor(nm, (size_t)nl, (int)bl);
 		pc_tw_map(out);
 		pc_tw_key(out, "resizing");
 		pc_tw_bool(out, 1);
@@ -4583,29 +4214,15 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- S123: reset_stats : the running totals start again --------
-	 * Admin scope like load: the node's counters, not the fleet's; live
-	 * gauges are untouched.  The RESP door's CONFIG RESETSTAT and the
-	 * page's POST /reset-stats are the same call. */
-	/* ---- S129: enable / disable -----------------------------------
-	 * NATIVE DOOR ONLY, and that is the whole point of where this lives.
-	 * The brief put ENABLE/DISABLE on the RESP door too; refused,
-	 * because that door may run plaintext OFF-BOX under an allow-list,
-	 * which would put the highest-value secret in the fleet on the
-	 * wire in the clear - a worse exposure than the AUTH password it
-	 * would sit beside, since this one grants keyspace deletion.  The
-	 * native door is Noise-encrypted off the loopback.  Redis clients
-	 * have no reason to issue DDL.
-	 *
-	 * @privileged NULL means a door with no privilege concept (RESP):
-	 * enable is refused there rather than silently succeeding. */
+	/* ---- enable / disable: native door only (@privileged NULL elsewhere) - the RESP door
+	 * may run plaintext off-box, and this secret grants keyspace deletion */
 	if (m_is(method, mlen, "enable")) {
 		char sec[256], who[160];
 		int sl;
 
 		if (!privileged)
 			ERR("enable is available on the native door only");
-		/* S468: the privilege secret never crosses the network in the clear */
+		/* the privilege secret never crosses the network in the clear */
 		if (pc_conn_plain_auth(conn))
 			ERR("enable needs an encrypted connection - this one is "
 				"authenticated but plaintext (libperfd: perfd_opts.encrypt "
@@ -4620,7 +4237,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR("missing secret");
 		}
 		sec[sl] = 0;
-		if (en_locked(conn))                       /* S417 */
+		if (en_locked(conn))
 			ERR("too many wrong enable secrets from this address - "
 				"try again later");
 		if (!pc_enable_secret_ok(sec, (size_t)sl)) {
@@ -4630,10 +4247,10 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			LM_NOTICE("%s offered a wrong enable secret "
 				"(%llu failed so far)\n", pc_conn_who(conn, who, sizeof who),
 				(unsigned long long)enable_fail);
-			en_wrong(conn);                        /* S417 */
+			en_wrong(conn);
 			ERR("wrong enable secret");
 		}
-		en_right(conn);                            /* S417 */
+		en_right(conn);
 		*privileged = 1;
 		LM_NOTICE("%s raised privilege with enable\n",
 			pc_conn_who(conn, who, sizeof who));
@@ -4643,9 +4260,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* S420: name this connection - CLIENT SETNAME's native form.  Shown in
-	 * `clients` and carried by the node's enable, sweep and reset log
-	 * lines, so ten dashboards or perfcli copies are told apart. */
+	/* name this connection - CLIENT SETNAME's native form, shown in `clients` and
+	 * carried by the enable, sweep and reset log lines */
 	if (m_is(method, mlen, "name")) {
 		char nm[PC_OBS_NAME + 32];       /* room to see a too-long one */
 		int nl, i;
@@ -4684,13 +4300,12 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 
 	if (m_is(method, mlen, "reset_stats")) {
 		char who[160];
-		/* S407 part 3: {fleet: true} is what the page's POST /reset-stats
-		 * did - this node and, as of its moment, every live peer; the
-		 * HTTP door no longer takes a POST, so the dashboard asks here */
+		/* this node's running totals, live gauges untouched; {fleet: true} resets
+		 * every live peer too.  CONFIG RESETSTAT on the RESP door is the same call */
 		int fleet = pc_tv_get_bool(v, params, "fleet") > 0;
 
 		LM_NOTICE("stats reset%s by %s\n", fleet ? " (the fleet)" : "",
-			pc_conn_who(conn, who, sizeof who));  /* S420 */
+			pc_conn_who(conn, who, sizeof who));
 		pc_tw_map(out);
 		pc_tw_key(out, "reset");
 		pc_tw_bool(out, 1);
@@ -4700,11 +4315,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- probe {secs?} : re-measure the WAL storage on demand ------
-	 * Blocks THIS request (and the calling worker) for the probe's
-	 * duration; the I/O shares the device with the live pump, so
-	 * fsync latency is perturbed while it runs - inherent to
-	 * re-measuring.  stats flips to cached:false afterwards. */
+	/* ---- probe {secs?}: re-measure the WAL storage, blocking this worker for the probe;
+	 * its I/O shares the device with the live pump, so fsync latency is perturbed */
 	if (m_is(method, mlen, "probe")) {
 		struct pc_wal_policy pol;
 		const struct pc_wal_probe *pr;
@@ -4743,9 +4355,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_str(out, pol.fsync_recommend);
 		pc_tw_key(out, "max_durable_wps");
 		pc_tw_i64(out, pol.max_durable_wps);
-		/* say what that number is: a burst ceiling, with the volume
-		 * it was measured over, so a consumer cannot read it as a
-		 * sustained rate the probe never established */
+		/* a burst ceiling over the probe's volume, not a sustained rate */
 		pc_tw_key(out, "max_durable_wps_is_upper_bound");
 		pc_tw_bool(out, 1);
 		{
@@ -4771,12 +4381,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_key(out, "segment_mb");
 		pc_tw_i64(out, pol.segment_mb);
 		{
-			/* total-size recommendation from OBSERVED traffic:
-			 * enough WAL to cover the worst-case gap between
-			 * snapshots at the lifetime-average write rate,
-			 * x3 safety - every input reported next to the
-			 * number (a size without its basis is as naked as
-			 * iops without bs/qd) */
+			/* size: the worst snapshot gap at the lifetime-average write rate, x3;
+			 * every input is reported beside the number */
 			struct pc_wal_stats ws2;
 			long long up = (long long)get_ticks();
 			long long ckpt = pc_rdb_max_interval_s();
@@ -4823,23 +4429,14 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- stats {col?} ---------------------------------------------- */
-	/* ---- members (S34): the fleet as a CLIENT needs it -------------
-	 * Addresses + client ports so a library can pre-warm connections
-	 * to the other nodes, load so it can weight them, and the ROUTING
-	 * CONTRACT (mode + algorithm id) so a client may compute where a
-	 * key belongs.  The algorithm carries a VERSION: a client that
-	 * does not recognise it must fall back to plain spreading, and a
-	 * mismatch then costs a forward, never correctness - the daemon
-	 * re-checks ownership regardless of what the client believed. */
+	/* ---- members: addresses, client ports, load and the routing contract; a client that
+	 * does not know the algorithm version spreads plainly - ownership is re-checked here */
 	if (m_is(method, mlen, "members")) {
 		pc_members_tree(out);
 		return 0;
 	}
 
-	/* ---- 0.6.6: clients {cap?} - what /clients renders, for a dashboard
-	 * that reads the native door (DESIGN 12no); cap at most 4096 rows,
-	 * 200 by default as the HTTP route gives */
+	/* ---- clients {cap?}: what /clients renders, for a dashboard on the native door */
 	if (m_is(method, mlen, "clients")) {
 		long long cap = 0;
 
@@ -4849,11 +4446,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- S88: collections -> [{name, mode, entries, buckets}] -----------
-	 * The second question every operator asks after connecting, and the
-	 * one `stats` answered only as a large document.  (The array's count
-	 * is back-patched, so a dropped slot 0 no longer leaves a separator
-	 * in front of the first row, as the streamed JSON did.) */
+	/* ---- collections -> [{name, mode, entries, buckets}] */
 	if (m_is(method, mlen, "collections")) {
 		int i;
 
@@ -4862,7 +4455,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_arr(out);
 		for (i = 0; i < pc_store_count(); i++) {
 			if (!pc_store_live(i))
-				continue;   /* S69: a dropped collection */
+				continue;
 			pcache_htable_t *cht = pc_store_ht(i);
 			pcache_ht_totals_t tot;
 
@@ -4890,11 +4483,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		const char *only = NULL;
 		int cl;
 
-		/* pc_tv_get_str returns a LENGTH and does not terminate: every
-		 * other caller carries the length alongside the buffer.
-		 * pc_stats_tree takes a C string, so terminate here or the
-		 * compare runs off the end and the filter matches nothing -
-		 * which is exactly what verbtest caught. */
+		/* pc_tv_get_str does not terminate, and pc_stats_tree takes a C string */
 		cl = pc_tv_get_str(v, params, "col", colbuf, sizeof colbuf - 1);
 		if (cl >= 0) {
 			colbuf[cl] = '\0';
@@ -4911,9 +4500,9 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			"del", "exists",
 			"expire", "ttl", "add", "sub", "mget", "mset", "keys",
 			"scan", "jget", "jset", "jdel", "jincr",
-			"jarrappend", "dump", "restore", "rlhit",   /* S314 */
-			"hcmd",                                    /* S313 */
-			"setifeq", "setifne", "delifeq", "delifne" };   /* S297 */
+			"jarrappend", "dump", "restore", "rlhit",
+			"hcmd",
+			"setifeq", "setifne", "delifeq", "delifne" };
 		size_t i;
 		int known = 0;
 
@@ -4923,25 +4512,13 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				break;
 			}
 		if (!known)
-			ERR(pc_unknown_method);    /* S165: proto counts it by this pointer */
+			ERR(pc_unknown_method);    /* proto counts it by this pointer */
 	}
-	/* C7: every verb below this line touches collection data */
+	/* every verb below this line touches collection data */
 	if (serving_denied())
 		ERR(PC_NOTREADY_MSG);
-	/* ---- S112: dump {col, cursor?, count?, slot_lo?, slot_hi?, table?} --
-	 * A chunk of whole records for perfdump: key, value, ttl, version.
-	 * Two passes on purpose.  The bucket-budgeted key scan stops exactly
-	 * on a bucket boundary, so a chunk never repeats a record (the
-	 * metadata walk resumes mid-bucket and re-emits, right for its
-	 * replication consumers, wrong for a file that promises each record
-	 * once); then one atomic fetch per key pairs value, expiry and
-	 * version out of the same read.  `count` is BUCKETS (default 1024,
-	 * S40's chunk), never records: records per chunk follow the load
-	 * factor.  A slot range filters by the key's Redis slot (hashtag-
-	 * aware, PC_SLOTS), so several connections split a keyspace
-	 * deterministically.  Expired records are not emitted.  A chunk
-	 * that does not fit the reply is refused whole ("halve count"), the
-	 * partial reply rolled back, so the caller never sees a cut. */
+	/* ---- dump {col, cursor?, count?, end?, slot_lo?, slot_hi?, table?}: records for
+	 * perfdump.  `count` is BUCKETS: a bucket-bounded key scan never repeats a record */
 	if (m_is(method, mlen, "dump")) {
 		struct dump_keys dk;
 		long long cur = 0, count = 1024, slo = 0, shi = PC_SLOTS - 1, endb = -1;
@@ -4960,14 +4537,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			v->n[tcol].len, &tpub);
 		if (!ht)
 			ERR("no such collection");
-		/* the dump bug: a cursor is a BUCKET index, and a resize swap
-		 * between two chunks puts it into a table of another shape -
-		 * after a grow the records of buckets already walked reappear
-		 * past the cursor (duplicates), after a shrink those not yet
-		 * walked fold in behind it (MISSED, silently).  The reply names
-		 * the table it walked; a caller that hands it back is refused
-		 * the moment the collection has been republished, and restarts
-		 * the collection.  A caller that does not is served as before. */
+		/* a cursor is a BUCKET index: after a resize it walks another shape (duplicates,
+		 * silent misses), so a caller handing `table` back is refused once republished */
 		if (!pc_tv_get_int(v, params, "table", &want) &&
 		        (want < 0 || (unsigned long long)want != tpub))
 			ERR("table resized during the dump: restart this "
@@ -4978,13 +4549,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tv_get_int(v, params, "count", &count);
 		if (count < 1 || count > 16384)
 			ERR("count out of range");
-		/* S112: `end` = the first bucket this walker does NOT own - a
-		 * bucket-range split for several connections on one node, each
-		 * walking its own buckets once (a slot range makes every
-		 * connection scan every bucket and discard the rest: measured
-		 * 1.7x on eight connections).  The tail belongs to the walker
-		 * whose range holds the last bucket; a walker whose `end` is
-		 * short of it never enters the tail. */
+		/* `end`: the first bucket this walker does NOT own - several connections on one
+		 * node each walk their own buckets (a slot range scans every bucket) */
 		pc_tv_get_int(v, params, "end", &endb);
 		if (endb < -1 || endb > 0xFFFFFFFFLL)
 			ERR("bad end");
@@ -5000,13 +4566,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		dk.buf = malloc(dk.cap);
 		if (!dk.buf)
 			ERR("out of memory");
-		/* S121: one cursor space, the leg included.  A chunk is `count`
-		 * buckets, or about `count` buckets' worth of records from the
-		 * overflow leg - the walk budgets the leg itself (a cursor with
-		 * PCACHE_CURSOR_OVF names a chain in it).  S281: the leg comes
-		 * FIRST, at cursor 0, so the walker whose range starts at bucket
-		 * 0 carries it and every other walker starts past it; a bounded
-		 * range still ends at its `end`. */
+		/* one cursor space: the overflow leg (PCACHE_CURSOR_OVF) comes FIRST, at cursor 0,
+		 * so the walker whose range starts at bucket 0 carries it */
 		{
 			unsigned int nb = pcache_ht_nbuckets(ht);
 			unsigned int take = (unsigned int)count;
@@ -5071,16 +4632,16 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			pc_tw_i64(out, rel_ttl(rexp, dk.now));
 			pc_tw_key(out, "ver");
 			pc_tw_i64(out, (long long)ver);
-			if (fl & PCACHE_F_JSON) {          /* S280: the type */
+			if (fl & PCACHE_F_JSON) {
 				pc_tw_key(out, "t");
 				pc_tw_str(out, "json");
-			} else if (fl & PCACHE_F_RL) {     /* S314 */
+			} else if (fl & PCACHE_F_RL) {
 				pc_tw_key(out, "t");
 				pc_tw_str(out, "rl");
-			} else if (fl & PCACHE_F_HASH) {   /* S313 */
+			} else if (fl & PCACHE_F_HASH) {
 				pc_tw_key(out, "t");
 				pc_tw_str(out, "hash");
-			} else if (fl & PCACHE_F_LOCK) {   /* S170a */
+			} else if (fl & PCACHE_F_LOCK) {
 				pc_tw_key(out, "t");
 				pc_tw_str(out, "lock");
 			}
@@ -5109,25 +4670,12 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* ---- S113: restore {col, policy?, records: [{k, v, exp?, ver, t?}]}
-	 * perfload's batch: each record installed with ITS version and ITS
-	 * absolute expiry, through the write path (WAL, the eager push), not
-	 * as a fresh client write.  policy: "newer" (the store's own rule -
-	 * a copy older than the one held loses, counted), "skip" (an existing
-	 * key is left alone, counted), "overwrite" (the loaded VALUE wins
-	 * under a fresh version, so every replica takes it - a fleet rolled
-	 * back to a dump).  A record whose expiry has passed is skipped and
-	 * counted.  A key this node does not own (shard/proxy) is refused and
-	 * counted rather than forwarded: the forward frame carries no
-	 * version, and a batch cannot park; the loader routes to owners. */
+	/* ---- restore {col, policy?, records: [{k, v, exp?, ver, t?}]}: perfload's batch - each
+	 * record keeps ITS version and expiry and goes through the write path */
 	if (m_is(method, mlen, "restore")) {
 		const char *em = "missing col";
-		/* S129: privileged by BLAST RADIUS.  restore with
-		 * policy:overwrite replaces every record it is handed at a
-		 * fresh version - perfload rolls a fleet back with it - which
-		 * is a larger blast radius than the resize beside it in this
-		 * set.  It is NOT gated on allow_create: that switch is about
-		 * originating DDL, and a restore creates no collection. */
+		/* privileged by blast radius (policy:overwrite rolls a fleet back), but not
+		 * gated on allow_create: that is about originating DDL */
 		if (!privileged || !*privileged)
 			ERR(pc_enable_configured() ? PC_NOPRIV_MSG
 				: PC_NOENABLE_MSG);
@@ -5143,7 +4691,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR(em);
 		if (writes_denied())
 			ERR(PC_NOTREADY_MSG);
-		/* S348: a restore writes every record it carries */
+		/* a restore writes every record it carries */
 		if (op_refused(ht))
 			ERR(wr_refused_msg());
 		tpol = pc_tv_get(v, params, "policy");
@@ -5169,12 +4717,10 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_key(out, "misrouted");
 		pc_tw_arr(out);
 		for (i = 0; i < nrec; i++) {
-			/* each record's key and value are stored from where they
-			 * lie in the request tree */
 			int r = pc_tv_at(v, trec, i), tt, rc2;
 			const char *kp, *vp;
 			size_t kl, vl;
-			unsigned char rtype;           /* S280: the record's type */
+			unsigned char rtype;
 			str rk, rv;
 			long long expms = 0, ver = 0;
 			unsigned int exp;
@@ -5197,10 +4743,9 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				pc_tv_streq(v, tt, "json") ? PCACHE_F_JSON :
 				pc_tv_streq(v, tt, "rl") ? PCACHE_F_RL :
 				pc_tv_streq(v, tt, "hash") ? PCACHE_F_HASH :
-				pc_tv_streq(v, tt, "lock") ? PCACHE_F_LOCK : 0;   /* S170a */
-			/* a hash record is stored as the hash commands will read
-			 * it: a corrupt or over-ceiling one is refused here, not
-			 * discovered by the first HGET (S318 review, 10-04) */
+				pc_tv_streq(v, tt, "lock") ? PCACHE_F_LOCK : 0;
+			/* a hash record is stored as the hash commands will read it: a corrupt or
+			 * over-ceiling one is refused here, not discovered by the first HGET */
 			if (rtype == PCACHE_F_HASH &&
 			        !pc_hr_valid((const unsigned char *)vp, vl, NULL)) {
 				bad++;
@@ -5234,7 +4779,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				}
 			}
 			/* getver, not probe: the probe misreports a record in the
-			 * overflow leg as absent (S122) */
+			 * overflow leg as absent */
 			if (policy == 1 && pcache_ht_getver(ht, &rk, &held_ver) == 0) {
 				existing++;
 				continue;
@@ -5282,28 +4827,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* ---- S88: keys {col: <glob>|absent, match?, limit?} -----------------
-	 * "keys *" means every collection, not a collection named star: the
-	 * collection argument is a glob and the answer is grouped by
-	 * collection.
-	 *
-	 * THE LIMIT IS PER COLLECTION (default 100), not a budget shared
-	 * across the result.  It was shared once, drawn down in collection
-	 * order, and the comment here claimed that stopped "one large
-	 * collection starving the rest" - it did the opposite.  The FIRST
-	 * collection spent the budget, the outer loop stopped, and every
-	 * later collection was omitted from the reply without even being
-	 * named; `truncated` was the only hint and it does not distinguish
-	 * "some keys missing" from "whole collections missing".  Reported
-	 * from the field 2026-09-14.
-	 *
-	 * So: every matched collection is listed, each up to `limit`, and
-	 * each one that hit its cap is named in `truncated_collections` -
-	 * additive, so nothing that reads `collections` today breaks.
-	 * Enumeration is still the most expensive thing this daemon does,
-	 * and the bound that matters is the RESPONSE SIZE, so the writer's
-	 * overflow now stops the outer loop too - it used to keep walking
-	 * collections it could no longer emit. */
+	/* ---- keys {col: <glob>|absent, match?, limit?}: grouped by collection, `limit` PER
+	 * collection; each that hit it is named in truncated_collections */
 	if (m_is(method, mlen, "keys")) {
 		int tc = pc_tv_get(v, params, "col");
 		const char *cg = "*";
@@ -5340,7 +4865,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			pc_tw_map(out);
 			for (i = 0; i < pc_store_count() && !out->over; i++) {
 				if (!pc_store_live(i))
-					continue;   /* S69: a dropped collection */
+					continue;
 				const char *nm = pc_store_name(i);
 				unsigned int cursor = 0;
 				int rc2;
@@ -5381,8 +4906,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	ht = get_col(v, params, errmsg);
 	if (!ht)
 		return -1;
-	/* S331: read-through - a key this node must fetch first parks the
-	 * frame (proto copies it and dispatches it again on completion) */
+	/* an upstream-backed collection: the gate may park the frame, refuse it, or answer
+	 * with Redis's reply */
 	if (ht->shadow && conn) {
 		struct up_ans ans;
 		int g;
@@ -5391,7 +4916,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_init(&ans.tree, NULL, 0);
 		g = up_cmd_gate(ht, method, mlen, v, params, errmsg, &ans);
 		if (g == UPG_TREE) {
-			/* AR5: hcmd written through - the tree goes as the reply */
+			/* hcmd written through - the tree goes as the reply */
 			if (pc_tw_done(&ans.tree) != 0 || !ans.tree.n) {
 				pc_tw_free(&ans.tree);
 				ERR("internal reply error");
@@ -5407,14 +4932,14 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			return -1;
 		if (g == UPG_REPLY && (m_is(method, mlen, "add") ||
 		    m_is(method, mlen, "sub"))) {
-			pc_tw_map(out);                /* AR5: Redis's new value */
+			pc_tw_map(out);                /* Redis's new value */
 			pc_tw_key(out, "value");
 			pc_tw_i64(out, ans.ival);
 			pc_tw_end(out);
 			return 0;
 		}
 		if (g == UPG_REPLY && m_is(method, mlen, "mset")) {
-			pc_tw_map(out);                /* AR5: one MSET, applied */
+			pc_tw_map(out);                /* one MSET, applied */
 			pc_tw_key(out, "stored");
 			pc_tw_i64(out, ans.ival > 0 ? ans.stored : 0);
 			pc_tw_key(out, "dropped");
@@ -5423,7 +4948,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			return 0;
 		}
 		if (g == UPG_REPLY) {
-			/* S385: written through - the verb's reply from Redis's */
+			/* written through - the verb's reply from Redis's */
 			const char *rk = m_is(method, mlen, "del") ||
 				m_is(method, mlen, "jdel") ? "deleted" :
 				m_is(method, mlen, "expire") ? "updated" :
@@ -5437,7 +4962,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		}
 	}
 
-	/* ---- get {col,key} --------------------------------------------- */
 	if (m_is(method, mlen, "get")) {
 		NEEDKEY();
 		{
@@ -5454,15 +4978,13 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				return 0;
 			}
 		}
-		if (rc == PC_OP_ERR_TYPE)                  /* S280 */
+		if (rc == PC_OP_ERR_TYPE)
 			ERR(pc_wrongtype_msg);
 		if (rc == PC_OP_ERR_GET) {
 			ERR("get failed");
 		} else {
-			/* miss AND the parked case: the fallback shape below
-			 * is used only if the proto layer cannot park - it
-			 * must match THIS verb (a set once got a pull-miss
-			 * reply at park pressure) */
+			/* a miss, and the fallback if the proto layer cannot park: it must be
+			 * THIS verb's shape */
 			pc_tw_map(out);
 			pc_tw_key(out, "found");
 			pc_tw_bool(out, 0);
@@ -5472,60 +4994,15 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- exists {col,key} ------------------------------------------ */
-	if (m_is(method, mlen, "exists")) {
+	/* ---- exists {col,key} : {exists, ver} ; ttl {col,key} : -2 absent,
+	 * -1 no expiry, else seconds - a key elsewhere asked of its node */
+	if (m_is(method, mlen, "exists") || m_is(method, mlen, "ttl")) {
 		NEEDKEY();
-		{
-			unsigned long long ver = 0;
-
-			/* ver rides on exists rather than get: it is a
-			 * property of the record, not of the value, and a
-			 * caller comparing two copies should not have to
-			 * move the bytes to do it */
-			rc = pcache_ht_getver(ht, &k, &ver);
-			/* ST2: a read-through key held as a fetched copy or a
-			 * PRESENT marker exists too (no version of ours) - 0.5.6.6
-			 * answered false for both, unlike EXISTS on every other
-			 * door */
-			if (rc != 0 &&
-			    probe_or_present(ht, &k, NULL, NULL, NULL, NULL) == 0) {
-				rc = 0;
-				ver = 0;
-			}
-			if (rc != 0) {
-				pc_tw_map(out);
-				pc_tw_key(out, "exists");
-				pc_tw_bool(out, 0);
-				pc_tw_end(out);
-				return 0;
-			}
-			pc_tw_map(out);
-			pc_tw_key(out, "exists");
-			pc_tw_bool(out, 1);
-			pc_tw_key(out, "ver");
-			pc_tw_i64(out, (long long)ver);
-			pc_tw_end(out);
-		}
+		pc_pres_cmd(ht, &k, method[0] == 'e' ? PC_PRES_EXISTS : PC_PRES_TTL,
+			out, park_req);
 		return 0;
 	}
 
-	/* ---- ttl {col,key} : -2 absent, -1 no expiry, else seconds ----- */
-	if (m_is(method, mlen, "ttl")) {
-		NEEDKEY();
-		rc = probe_or_present(ht, &k, &vln, &exp, &is_ctr, NULL);
-		pc_tw_map(out);
-		pc_tw_key(out, "ttl");
-		if (rc == -2)
-			pc_tw_i64(out, -2);
-		else if (exp == 0)
-			pc_tw_i64(out, -1);
-		else
-			pc_tw_i64(out, (long long)exp - (long long)get_ticks());
-		pc_tw_end(out);
-		return 0;
-	}
-
-	/* ---- del {col,key} --------------------------------------------- */
 	if (m_is(method, mlen, "del")) {
 		NEEDKEY();
 		rc = op_del(ht, &k, park_req);
@@ -5562,7 +5039,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			by = -by;
 		rc = op_addsub(ht, &k, by, ttl, &nv, park_req, 0);
 		if (rc == PC_OP_PARKED) {
-			/* the park fallback is a RESULT, not a failure (D2) */
+			/* the park fallback is a RESULT, not a failure */
 			pc_tw_map(out);
 			pc_tw_key(out, "error");
 			pc_tw_str(out, "cluster busy");
@@ -5573,7 +5050,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR("parked-request table full - retry");
 		if (rc == PC_OP_ERR_FWD)
 			ERR("forward failed");
-		if (rc == PC_OP_ERR_TYPE)                  /* S280 */
+		if (rc == PC_OP_ERR_TYPE)
 			ERR(pc_wrongtype_msg);
 		if (rc == PC_OP_ERR_NOTINT)
 			ERR("value is not an integer");
@@ -5586,13 +5063,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- S297: setifeq / setifne {col,key,value,cmp,ttl?} and
-	 * delifeq / delifne {col,key,cmp} ---------------------------------- *
-	 * Redis 8.4's SET IFEQ/IFNE and DELEX IFEQ/IFNE.  Methods, not
-	 * params on set and del, for S279b's reason: an older daemon would
-	 * ignore an unknown param and act unconditionally; it refuses an
-	 * unknown method.  {stored|deleted: bool}; a key holding a hash, a
-	 * document or a rate-limit record is an error. */
+	/* ---- setifeq / setifne {col,key,value,cmp,ttl?}, delifeq / delifne {col,key,cmp}: Redis
+	 * 8.4's SET/DELEX IFEQ/IFNE - methods, as an older daemon ignores an unknown param */
 	if (m_is(method, mlen, "setifeq") || m_is(method, mlen, "setifne") ||
 	        m_is(method, mlen, "delifeq") || m_is(method, mlen, "delifne")) {
 		int kind = m_is(method, mlen, "setifeq") ? PC_CMP_SET_IFEQ :
@@ -5638,12 +5110,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* ---- set {col,key,value,ttl?} ---------------------------------- *
-	 * S279b: setnx / setxx take the same params and store only when the
-	 * key is absent / present - {stored: false} when declined.  Methods,
-	 * not params on set: an older daemon ignores an unknown param and
-	 * would store unconditionally, and a client library replays set
-	 * after a failover, which would turn a won lock into "declined". */
+	/* ---- set / setnx / setxx {col,key,value,ttl?}: methods, not params - an older daemon
+	 * would ignore an unknown param and store unconditionally */
 	if (m_is(method, mlen, "set") || m_is(method, mlen, "setnx") ||
 	        m_is(method, mlen, "setxx")) {
 		int cond = m_is(method, mlen, "setnx") ? PC_SETCOND_NX :
@@ -5652,8 +5120,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		size_t vl;
 
 		NEEDKEY();
-		/* the value is stored from where it lies in the request: the
-		 * copy-and-decode leg went with the JSON dialect (S317) */
 		if (get_bytes(v, params, "value", &vp, &vl, (size_t)-1) != 0)
 			ERR("missing or oversized value");
 		ttl = 0;
@@ -5690,10 +5156,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 
-	/* S313: hcmd {col, key, cmd, args?: [..]} -> the command's reply tree
-	 * ITSELF (D9) - any H command, e.g. {cmd: "HSET", args: ["f", "v"]};
-	 * the reply is the command's Redis reply: an integer, bytes, nil, an
-	 * array, OK or an error line, as the hash core built it */
+	/* ---- hcmd {col, key, cmd, args?: [..]}: any H command, e.g. {cmd: "HSET", args:
+	 * ["f", "v"]}; the reply is its Redis reply as the hash core's tree */
 	if (m_is(method, mlen, "hcmd")) {
 		const char *argv[PC_HCMD_MAXARGS];
 		size_t argl[PC_HCMD_MAXARGS];
@@ -5719,7 +5183,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 
 			if (v->n[ta].type != 'a')
 				ERR("args must be an array of strings");
-			/* the arguments are used where they lie in the request */
 			for (ai = 0; ai < v->n[ta].len; ai++) {
 				int an = pc_tv_at(v, ta, ai);
 
@@ -5764,7 +5227,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR(wr_refused_msg());
 		ERR("hash command failed");
 	}
-	/* S314: rlhit {col,key,window_ms,limit?} -> {count: N, allowed: b} */
+	/* rlhit {col,key,window_ms,limit?} -> {count: N, allowed: b} */
 	if (m_is(method, mlen, "rlhit")) {
 		long long win = 0, lim = 0, cnt = 0;
 		int al = 0, lacking = 0;
@@ -5805,20 +5268,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR(wr_refused_msg());
 		ERR("rate-limit hit failed");
 	}
-	/* ---- json path verbs (S26 + the v1.1 extras): -------------------
-	 * jget  {col,key,path?}            -> {found: true, value: <frag>}
-	 * jset  {col,key,path?,val,nx?,xx?,mkpath?,ttl?} -> {set: true}
-	 * jdel  {col,key,path}             -> {deleted: bool}
-	 * jincr {col,key,path,by?}         -> {value: N}
-	 * jarrappend {col,key,path,val}    -> {count: N}
-	 * Documents are opaque JSON text in ordinary cells; edits are span
-	 * splices (jsonpath.c) under the key's mutex stripe (pc_json_rmw -
-	 * shared with the cluster forward plane).  A document travels as
-	 * DATA: `val` is one bulk holding the value's JSON text (a string
-	 * value arrives quoted - the client encodes), and jget's `value` is
-	 * a bulk holding the fragment's JSON text (D3).  TTL preserved
-	 * unless ttl given.  On a proxy collection a non-holder FORWARDS
-	 * the op to the holder (M_FWD_JSON); paths use plain names. */
+	/* ---- jget/jset/jdel/jincr/jarrappend: documents are JSON text spliced under the key's
+	 * mutex stripe (pc_json_rmw); `val` and jget's `value` are JSON text, strings quoted */
 	if (m_is(method, mlen, "jget") || m_is(method, mlen, "jset") ||
 	        m_is(method, mlen, "jdel") ||
 	        m_is(method, mlen, "jincr") ||
@@ -5851,8 +5302,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			plen = 1;              /* default: the root */
 		}
 		if (op == PC_JOP_SET || op == PC_JOP_APPEND) {
-			/* the document's JSON text, used where it lies in the
-			 * request; the path layer validates it */
+			/* the path layer validates the document's JSON text */
 			if (get_bytes(v, params, "val", &sval, &svlen,
 			        (size_t)-1) != 0)
 				ERR("missing val");
@@ -5864,25 +5314,13 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		xx = pc_tv_get_bool(v, params, "xx");
 		mk = pc_tv_get_bool(v, params, "mkpath");
 
-		/* S201: jdel at the ROOT is a key removal, not a document
-		 * edit - what the RESP door has done for JSON.DEL key [$]
-		 * all along (rh_json, rootpath).  This door sent it through
-		 * pc_json_rmw -> pc_jp_del, which cannot delete the root: every
-		 * root jdel answered -32022 "bad path" and left the key, on a
-		 * fresh document, an edited one, an implicit path and a plain
-		 * value alike.  Found gating cachedb_perfd for the staging
-		 * RGSs, whose de-registration is JSON.DEL <key>: the record
-		 * survived and the device kept reading as registered.  Same
-		 * call as the native del verb, so a proxy or shard collection
-		 * forwards and parks exactly as del does. */
+		/* jdel at the ROOT removes the key, as RESP JSON.DEL key does (pc_jp_del cannot
+		 * delete the root); del's own call, so it forwards and parks as del does */
 		if (op == PC_JOP_DEL && plen == 1 && path[0] == '$') {
 			unsigned char fl = 0;
 
-			/* S280: a string is refused, not deleted - Redis 8's
-			 * JSON.DEL on one is the wrong-type error and the key
-			 * survives (probed); the RESP door does the same.  Only
-			 * a record held HERE can be checked: a shard non-owner
-			 * forwards the delete as before. */
+			/* a string is refused (Redis 8's JSON.DEL wrong-type error); only a record
+			 * held HERE can be checked - a shard non-owner forwards the delete */
 			if (pc_store_types_strict(ht) &&
 			        pcache_ht_getflags(ht, &k, &fl) == 0 &&
 			        !(fl & PCACHE_F_JSON))
@@ -5895,10 +5333,20 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			return 0;
 		}
 
-		/* proxy non-holder (or shard non-owner): forward the whole
-		 * op to the holder.  Shard needs no locator and no placement
-		 * - the owner is deterministic, which closes the
-		 * loc-miss-fork hole for shard collections by construction */
+		/* a read-through key's owner, or a spread holder, is
+		 * pulled from as a hash read is; the path is taken here */
+		if (op == PC_JOP_GET && pc_jget_park(ht, k.s, (size_t)k.len, path,
+		        (size_t)plen, 0, park_req)) {
+			pc_tw_map(out);                /* the park's fallback */
+			pc_tw_key(out, "found");
+			pc_tw_bool(out, 0);
+			pc_tw_end(out);
+			*outcome = PC_OUT_MISS;
+			return 0;
+		}
+
+		/* a proxy non-holder or shard non-owner forwards the whole op; a shard owner is
+		 * deterministic, so it needs no locator and no placement */
 		if ((pc_store_proxy_enabled(ht) &&
 		        pcache_ht_probe(ht, &k, NULL, NULL, NULL) != 0) ||
 		        pc_store_shard_enabled(ht)) {
@@ -5920,9 +5368,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 					target = pc_place();
 			}
 			if (target) {
-				/* remember the holder-to-be: every later op
-				 * on this key forwards sticky instead of
-				 * re-guessing placement */
+				/* remember the holder-to-be: later ops on this
+				 * key forward sticky instead of re-guessing placement */
 				pc_loc_set(cn, strlen(cn), k.s,
 					(size_t)k.len, target);
 				req = pc_fwd_json_begin(target, op, cn,
@@ -5999,7 +5446,7 @@ jlocal:
 				pc_tw_bulk(out, frag, (size_t)fraglen);
 				*outcome = PC_OUT_HIT;
 			}
-			pc_tw_end(out);                /* frag is borrowed (S283) */
+			pc_tw_end(out);                /* frag is borrowed */
 			break;
 		case PC_JOP_SET:
 			pc_tw_map(out);
@@ -6028,8 +5475,7 @@ jlocal:
 		return 0;
 	}
 
-	/* ---- scan {col,cursor?,match?,count?,values?} ------------------ */
-	/* ---- keys {col,match?,limit?} ---------------------------------- */
+	/* ---- scan {col,cursor?,match?,count?,values?} / keys {col,match?,limit?} */
 	if (m_is(method, mlen, "scan") || m_is(method, mlen, "keys")) {
 		struct scan_ctx sc;
 		char pat[256];
@@ -6054,11 +5500,8 @@ jlocal:
 			if (limit < 1 || limit > 100000)
 				ERR("limit out of range");
 			sc.limit = (int)limit;
-			/* S88: say which collection, so a listed key pastes straight
-			 * back into get, and say when this is ONE node's share: a
-			 * placement-spread collection is a third of the truth on a
-			 * three-node fleet, and an operator read it as "two nodes are
-			 * not saving their keys" */
+			/* name the collection, so a key pastes back into get, and flag ONE node's
+			 * share of a placement-spread collection */
 			{
 				struct pc_cl_stats cs;
 				const char *cn = col_name_of(ht);
@@ -6077,7 +5520,7 @@ jlocal:
 			}
 			cursor = 0;
 			do {
-				rc = pc_store_scan(ht, &cursor, 1024,   /* S257 */
+				rc = pc_store_scan(ht, &cursor, 1024,
 					PCACHE_SCAN_NOVAL, keys_cb, &sc);
 			} while (rc == 0 && cursor && !out->over);
 			pc_tw_end(out);
@@ -6099,8 +5542,8 @@ jlocal:
 		pc_tw_key(out, "items");
 		pc_tw_arr(out);
 		/* values requested = copy them out; otherwise keys-only, which
-		 * skips the value memcpy AND its cold cachelines (S40) */
-		pc_store_scan(ht, &cursor, (unsigned int)count,  /* S257 */
+		 * skips the value memcpy AND its cold cachelines */
+		pc_store_scan(ht, &cursor, (unsigned int)count,
 			sc.values ? 0 : PCACHE_SCAN_NOVAL, scan_cb, &sc);
 		pc_tw_end(out);
 		pc_tw_key(out, "cursor");
@@ -6111,7 +5554,6 @@ jlocal:
 		return 0;
 	}
 
-	/* ---- mget {col,keys:[...]} ------------------------------------- */
 	if (m_is(method, mlen, "mget")) {
 		int tk = pc_tv_get(v, params, "keys");
 		unsigned int i;
@@ -6119,9 +5561,8 @@ jlocal:
 		if (tk < 0 || v->n[tk].type != 'a')
 			ERR("missing keys array");
 		if (mget_fans(ht)) {
-			/* G8: a key on another node is looked up, never a
-			 * silent miss.  The keys as the loop below takes them:
-			 * a non-bytes element skipped, a long one absent */
+			/* a key on another node is looked up, never a silent miss; the keys as
+			 * the loop below takes them: non-bytes skipped, a long one absent */
 			const char **ks;
 			size_t *kl;
 			struct pc_mget *mg;
@@ -6140,7 +5581,7 @@ jlocal:
 					ks[nk] = (const char *)v->n[kn].p;
 					kl[nk++] = v->n[kn].len;
 				}
-				frc = op_mget_fan(ht, ks, kl, nk, &mg, &code, &why);
+				frc = op_mget_fan(ht, ks, kl, nk, 0, &mg, &code, &why);
 			}
 			free(ks);
 			free(kl);
@@ -6160,8 +5601,7 @@ jlocal:
 		for (i = 0; i < v->n[tk].len; i++) {
 			int kn = pc_tv_at(v, tk, i);
 
-			/* an element that is not bytes is skipped, not counted,
-			 * as the JSON door skipped a non-string */
+			/* an element that is not bytes is skipped, not counted */
 			if (kn < 0 || v->n[kn].type != 'b')
 				continue;
 			if (v->n[kn].len > KEY_MAX) {
@@ -6172,13 +5612,13 @@ jlocal:
 				continue;
 			}
 			k.s = (char *)v->n[kn].p; k.len = (int)v->n[kn].len;
-			HOT(ht, k.s, k.len);           /* S397: each key of the MGET */
+			HOT(ht, k.s, k.len);
 			{
 				unsigned char fl = 0;
 
 				rc = pcache_ht_fetch_ex(ht, &k, &v_, &exp, &fl);
-				/* S280: as RESP MGET - a document answers as
-				 * a miss under strict, not as an error */
+				/* as RESP MGET: a document answers as a
+				 * miss under strict, not as an error */
 				if (rc == 0 && (fl & PCACHE_F_TYPES) &&
 				        pc_store_types_strict(ht)) {
 					free(v_.s);
@@ -6200,7 +5640,6 @@ jlocal:
 		return 0;
 	}
 
-	/* ---- mset {col,items:[{key,value,ttl?},...]} ------------------- */
 	if (m_is(method, mlen, "mset")) {
 		int ti = pc_tv_get(v, params, "items");
 		int stored = 0, dropped = 0;
@@ -6218,7 +5657,6 @@ jlocal:
 
 			if (it < 0 || v->n[it].type != 'm')
 				continue;
-			/* key and value are stored from where they lie */
 			if (get_bytes(v, it, "key", &kp, &kl, KEY_MAX) != 0 ||
 			        get_bytes(v, it, "value", &vp, &vl, VAL_MAX) != 0) {
 				dropped++;
@@ -6228,11 +5666,7 @@ jlocal:
 			pc_tv_get_int(v, it, "ttl", &ttl);
 			k.s = (char *)kp; k.len = (int)kl;
 			v_.s = (char *)vp; v_.len = (int)vl;
-			/* S303: the same local write a set makes - WAL, event,
-			 * eager push.  This stored and logged only, so on an
-			 * eager fleet an mset reached the peers at the next
-			 * sweep (~10 s) and a read there pulled it meanwhile;
-			 * an eager miss no longer pulls. */
+			/* the same local write a set makes - WAL, event, eager push */
 			if (set_local(ht, &k, &v_, ttl) == PC_OP_OK)
 				stored++;
 			else
@@ -6253,13 +5687,8 @@ jlocal:
 #undef NEEDKEY
 }
 
-/* ---- the binary codec (item 7: the libperfd hot path) -------------------
- * One frame = one data verb; layouts in proto.h.  col/key/value bytes
- * arrive RAW inside the frame and are used in place (zero copy).  @out
- * is a plain byte sink here (pc_jw_raw only).  When parking, the codec
- * pre-writes its own park-failure shape into @out/@flags and reports
- * col/key spans for the park table.  The pub/sub verbs 10-14 are gone
- * (S317): publish and the subscriptions are CMD methods. */
+/* ---- the binary codec: one frame = one data verb (layouts in proto.h), its bytes used
+ * in place.  When parking, a verb pre-writes its own park-failure shape into @out/@flags */
 
 static void bw_u8(struct pc_jw *w, unsigned int v)
 {
@@ -6305,9 +5734,8 @@ static long long br_i64(const char *p)
 #define ERRB(msg) do { *errmsg = (msg); return -1; } while (0)
 const char pc_bin_unknown_verb[] = "unknown verb";
 
-/* AR5: Redis's reply to a forwarded H command as the tree the hash core
- * builds for it (hcmd_exec): an integer, OK, a bulk (HINCRBYFLOAT), nil,
- * or Redis's error as the tree's error item */
+/* Redis's reply to a forwarded H command as the tree hcmd_exec builds: an integer, OK,
+ * a bulk (HINCRBYFLOAT), nil, or Redis's error as the error item */
 static void up_reply_tree(struct pc_tw *t, const struct pc_upg *g)
 {
 	const char *r = g->raw, *e;
@@ -6352,11 +5780,8 @@ static void up_reply_tree(struct pc_tw *t, const struct pc_upg *g)
 	pc_tw_err(t, "ERR upstream: an unexpected reply");
 }
 
-/* ---- S331: read-through on the native doors ------------------------------
- * The RESP door's gate sits in pc_verb_resp; these are the binary verbs'
- * and the CMD methods'.  HELD: proto parks the FRAME (a copy) under the
- * request id and dispatches it again on completion - frames carry ids,
- * so the connection is not held.  ANSWERED: an error frame. */
+/* ---- read-through on the native doors (the RESP door's gate is in pc_verb_resp).  HELD:
+ * proto parks a copy of the FRAME under its id and dispatches it again on completion */
 static int up_native(pcache_htable_t *ht, int cls, int del,
 		const char *const *keys, const size_t *kl, int n,
 		const char **errmsg, const struct pc_upfw *fw, struct up_ans *ans)
@@ -6369,22 +5794,19 @@ static int up_native(pcache_htable_t *ht, int cls, int del,
 	if (rc == PC_UPG_HELD)
 		pc_conn_upstream_park_frame(g.req);
 	else if (rc == PC_UPG_ANSWERED && g.done && ans && ans->want_tree) {
-		up_reply_tree(&ans->tree, &g);  /* AR5: hcmd */
+		up_reply_tree(&ans->tree, &g);
 		return UPG_TREE;
 	} else if (rc == PC_UPG_ANSWERED && g.done && !g.rerr) {
 		if (ans)
-			ans->ival = g.ival;        /* S385: Redis applied it */
+			ans->ival = g.ival;        /* Redis applied it */
 		return UPG_REPLY;
 	} else if (rc == PC_UPG_ANSWERED)
 		*errmsg = g.rerr ? g.rerr : g.wrongtype ? pc_wrongtype_msg : g.err;
 	return rc;
 }
 
-/* S385: the native verbs upstream_writes = through forwards - what
- * cachedb's store, remove, expire and its JSON.SET/JSON.DEL raw queries
- * send; AR5: counters, hash writes and mset too.  The rest (conditional
- * sets and deletes, jincr, jarrappend, rlhit) are refused there, not
- * guessed at */
+/* the verbs upstream_writes = through forwards; the rest (conditional sets and
+ * deletes, jincr, jarrappend, rlhit) are refused there, not guessed at */
 static const char up_fw_refused[] = "upstream_writes = through does not "
 	"forward this verb (set, setnx, setxx, add, sub, del, expire, hcmd, "
 	"mset, jset and jdel are)";
@@ -6403,9 +5825,8 @@ static void fw_one(struct pc_upfw *fw, const char **av, size_t *al, int ac,
 	fw->guess = guess;
 }
 
-/* AR5: an add/sub's TTL as the verb means it (op_addsub): < 0 keeps the
- * key's, 0 removes it, > 0 sets it - the command after INCRBY/DECRBY, or
- * none (0 returned) */
+/* an add/sub's TTL as op_addsub means it: < 0 keeps the key's, 0 removes it, > 0 sets
+ * it - the command after INCRBY/DECRBY, or none (0 returned) */
 static int up_ctr_ttl(const char *kp, size_t kn, long long ttl,
 		const char **a2, size_t *l2, char *tb, size_t tbn)
 {
@@ -6422,9 +5843,8 @@ static int up_ctr_ttl(const char *kp, size_t kn, long long ttl,
 	return 3;
 }
 
-/* AR5: an H write forwarded as itself - argv [name, key, args...]; the
- * reply is Redis's, as the hash core's tree.  Arguments the handler would
- * refuse are left to it (PROCEED) */
+/* an H write forwarded as itself - argv [name, key, args...], Redis's reply as the hash
+ * core's tree; arguments the handler would refuse are left to it (PROCEED) */
 static int up_hcmd_fw(pcache_htable_t *ht, int cls, int del,
 		const char **hv, size_t *hl, int argc, const char **errmsg,
 		struct up_ans *ans)
@@ -6452,7 +5872,7 @@ static int up_bin_gate(pcache_htable_t *ht, unsigned int verb,
 	case PC_VERB_GET:
 		cls = PC_UPC_READ;
 		break;
-	case PC_VERB_EXISTS: case PC_VERB_TTL:            /* ST2 */
+	case PC_VERB_EXISTS: case PC_VERB_TTL:
 		cls = PC_UPC_PROBE;
 		break;
 	case PC_VERB_SET:
@@ -6483,8 +5903,6 @@ static int up_bin_gate(pcache_htable_t *ht, unsigned int verb,
 		break;
 	}
 	default:
-		/* S385: the rate limiter writes perfcached only - not on a
-		 * write-through collection */
 		if (verb == PC_VERB_RLHIT &&
 		    pc_upstream_through(col_name_of(ht), strlen(col_name_of(ht)))) {
 			pc_upstream_wt_refused(col_name_of(ht),
@@ -6496,8 +5914,8 @@ static int up_bin_gate(pcache_htable_t *ht, unsigned int verb,
 	}
 	if (verb == PC_VERB_HCMD && cls == PC_UPC_MUTATE &&
 	    pc_upstream_through(col_name_of(ht), strlen(col_name_of(ht)))) {
-		/* AR5: the H write as itself - [argc u16][(len u32)(bytes)]*
-		 * after the key, the name first (checked above: 6 bytes) */
+		/* the H write as itself - [argc u16][(len u32)(bytes)]* after
+		 * the key, the name first (checked above: 6 bytes) */
 		const unsigned char *e = (const unsigned char *)kp + klen;
 		size_t el = plen - koff - klen, o = 2;
 		const char *hv[PC_HCMD_MAXARGS];
@@ -6524,7 +5942,7 @@ static int up_bin_gate(pcache_htable_t *ht, unsigned int verb,
 	}
 	if ((cls == PC_UPC_PLAIN || cls == PC_UPC_MUTATE || del) &&
 	    pc_upstream_through(col_name_of(ht), strlen(col_name_of(ht)))) {
-		/* S385: the Redis command the verb means (TTLs are seconds) */
+		/* the Redis command the verb means (TTLs are seconds) */
 		const char *av[7], *a2[3];
 		size_t al[7], l2[3];
 		char tb[24], bb[24];
@@ -6566,7 +5984,7 @@ static int up_bin_gate(pcache_htable_t *ht, unsigned int verb,
 			}
 			break;
 		case PC_VERB_ADD: case PC_VERB_SUB:
-			/* AR5: INCRBY/DECRBY, read back as the string Redis
+			/* INCRBY/DECRBY, read back as the string Redis
 			 * holds; the reply is Redis's new value */
 			av[ac] = verb == PC_VERB_ADD ? "INCRBY" : "DECRBY";
 			al[ac++] = 6;
@@ -6594,10 +6012,8 @@ static int up_bin_gate(pcache_htable_t *ht, unsigned int verb,
 	return up_native(ht, cls, del, &kp, &klen, 1, errmsg, NULL, ans);
 }
 
-/* AR5: a native mset on a write-through collection - one MSET, an EXPIRE
- * after it for each item with a TTL, every key read back.  Items the
- * handler would drop are counted dropped and not sent; an mset whose keys
- * are all the fleet's own (outside upstream_prefixes) is the handler's */
+/* a native mset on a write-through collection: one MSET, an EXPIRE per item with a TTL;
+ * an mset whose keys are all the fleet's own (outside upstream_prefixes) is the handler's */
 static int up_mset_fw(pcache_htable_t *ht, const struct pc_tv *v, int ta,
 		const char *const *ks, const size_t *kl, int n, const char **errmsg,
 		struct up_ans *ans)
@@ -6701,7 +6117,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 	    m_is(method, mlen, "jget"))
 		cls = PC_UPC_READ;
 	else if (m_is(method, mlen, "exists") || m_is(method, mlen, "ttl"))
-		cls = PC_UPC_PROBE;                        /* ST2 */
+		cls = PC_UPC_PROBE;
 	else if (m_is(method, mlen, "set"))
 		cls = PC_UPC_PLAIN;
 	else if (m_is(method, mlen, "jset")) {
@@ -6730,7 +6146,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		cls = pc_upstream_cmd_class(cmd, (size_t)cl, NULL, NULL, 0, &del,
 			&all);
 	} else if (m_is(method, mlen, "rlhit")) {
-		/* AR5: the rate limiter writes perfcached only - refused on a
+		/* the rate limiter writes perfcached only - refused on a
 		 * write-through collection, as the binary verb and RL.HIT are */
 		if (!pc_upstream_through(col_name_of(ht), strlen(col_name_of(ht))))
 			return PC_UPG_PROCEED;
@@ -6776,7 +6192,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		}
 		if (ism && n && pc_upstream_through(col_name_of(ht),
 		        strlen(col_name_of(ht)))) {
-			rc = up_mset_fw(ht, v, ta, ks, kl, n, errmsg, ans);  /* AR5 */
+			rc = up_mset_fw(ht, v, ta, ks, kl, n, errmsg, ans);
 			free(ks);
 			free(kl);
 			return rc;
@@ -6793,7 +6209,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		return PC_UPG_PROCEED;          /* the method refuses it below */
 	if ((cls == PC_UPC_PLAIN || cls == PC_UPC_MUTATE || del) &&
 	    pc_upstream_through(col_name_of(ht), strlen(col_name_of(ht)))) {
-		/* S385: the Redis command the method means */
+		/* the Redis command the method means */
 		const char *av[7], *a2[3];
 		size_t al[7], l2[3];
 		char tb[24], bb[24], path[JP_NAME_PARAM];
@@ -6880,7 +6296,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 				av[ac] = path; al[ac++] = (size_t)pl;
 			}
 		} else if (m_is(method, mlen, "add") || m_is(method, mlen, "sub")) {
-			/* AR5: INCRBY/DECRBY, the handler's defaults (by 1, ttl 0) */
+			/* INCRBY/DECRBY, the handler's defaults (by 1, ttl 0) */
 			long long by = 1;
 
 			if (pc_tv_get_int(v, params, "by", &by) != 0)
@@ -6894,7 +6310,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 			fw.argv2 = a2;
 			fw.argl2 = l2;
 		} else if (m_is(method, mlen, "hcmd")) {
-			/* AR5: the H write as itself, its args after the key */
+			/* the H write as itself, its args after the key */
 			const char *hv[PC_HCMD_MAXARGS];
 			size_t hl[PC_HCMD_MAXARGS];
 			char cmd[16];
@@ -6958,10 +6374,10 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 	pcache_htable_t *ht;
 	str k, v;
 	long long by = 1, ttl = 0, nv = 0;
-	unsigned int exp, vln;
-	int rc, is_ctr;
+	unsigned int exp;
+	int rc;
 
-	(void)conn;                            /* the pub/sub verbs took it */
+	(void)conn;
 	if (!plen)
 		ERRB("empty request");
 	verb = (unsigned char)pl[0];
@@ -6972,8 +6388,8 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 	if ((verb < PC_VERB_GET || verb > PC_VERB_SUB) &&
 	        verb != PC_VERB_SETNX && verb != PC_VERB_SETXX &&
 	        verb != PC_VERB_RLHIT && verb != PC_VERB_HCMD)
-		ERRB(pc_bin_unknown_verb);     /* S165: proto.c counts it by this pointer */
-	if (serving_denied())                  /* C7 - PING above is exempt */
+		ERRB(pc_bin_unknown_verb);     /* proto.c counts it by this pointer */
+	if (serving_denied())                  /* PING above is exempt */
 		ERRB(PC_NOTREADY_MSG);
 	if (plen < 4)
 		ERRB("short request");
@@ -7000,8 +6416,6 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 	*keyp = k.s;
 	*klenp = klen;
 
-	/* S331: read-through - a key this node must fetch first parks the
-	 * frame (proto copies it and dispatches it again on completion) */
 	if (ht->shadow && conn) {
 		struct up_ans ans;
 		int g;
@@ -7010,7 +6424,6 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 		pc_tw_init(&ans.tree, NULL, 0);
 		g = up_bin_gate(ht, verb, pl, plen, off + cn, klen, errmsg, &ans);
 		if (g == UPG_TREE) {
-			/* AR5: hcmd written through - the tree is the payload */
 			if (pc_tw_done(&ans.tree) != 0 || !ans.tree.n) {
 				pc_tw_free(&ans.tree);
 				ERRB("internal reply error");
@@ -7025,11 +6438,11 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 		if (g == PC_UPG_ANSWERED)
 			return -1;
 		if (g == UPG_REPLY && (verb == PC_VERB_ADD || verb == PC_VERB_SUB)) {
-			bw_i64(out, ans.ival);     /* AR5: Redis's new value */
+			bw_i64(out, ans.ival);
 			return 0;
 		}
 		if (g == UPG_REPLY) {
-			bw_u8(out, ans.ival > 0);  /* S385: written through */
+			bw_u8(out, ans.ival > 0);
 			return 0;
 		}
 	}
@@ -7051,7 +6464,7 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 				return 0;
 			}
 		}
-		if (rc == PC_OP_ERR_TYPE)                  /* S280 */
+		if (rc == PC_OP_ERR_TYPE)
 			ERRB(pc_wrongtype_msg);
 		if (rc == PC_OP_ERR_GET) {
 			ERRB("get failed");
@@ -7061,17 +6474,9 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 		return 0;
 
 	case PC_VERB_EXISTS:
-		bw_u8(out, probe_or_present(ht, &k, NULL, NULL, NULL, NULL) == 0);
-		return 0;
-
 	case PC_VERB_TTL:
-		rc = probe_or_present(ht, &k, &vln, &exp, &is_ctr, NULL);
-		if (rc == -2)
-			bw_i64(out, -2);
-		else if (exp == 0)
-			bw_i64(out, -1);
-		else
-			bw_i64(out, (long long)exp - (long long)get_ticks());
+		pc_pres_verb(ht, &k, verb == PC_VERB_EXISTS ? PC_PRES_EXISTS :
+			PC_PRES_TTL, out, park_req);
 		return 0;
 
 	case PC_VERB_DEL:
@@ -7101,7 +6506,7 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 			ERRB("parked-request table full - retry");
 		if (rc == PC_OP_ERR_FWD)
 			ERRB("forward failed");
-		if (rc == PC_OP_ERR_TYPE)                  /* S280 */
+		if (rc == PC_OP_ERR_TYPE)
 			ERRB(pc_wrongtype_msg);
 		if (rc == PC_OP_ERR_NOTINT)
 			ERRB("value is not an integer");
@@ -7110,7 +6515,7 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 		bw_i64(out, nv);
 		return 0;
 
-	case PC_VERB_HCMD: {                   /* S313: any H command */
+	case PC_VERB_HCMD: {
 		const unsigned char *e = (const unsigned char *)pl + off + cn + klen;
 		size_t el = plen - off - cn - klen, o = 2;
 		const char *hargv[PC_HCMD_MAXARGS];
@@ -7167,7 +6572,7 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 		ERRB("hash command failed");
 	}
 
-	case PC_VERB_RLHIT: {                  /* S314 */
+	case PC_VERB_RLHIT: {
 		long long win = br_i64(pl + 4), lim = br_i64(pl + 12), cnt = 0;
 		int al = 0, lacking = 0;
 
@@ -7199,7 +6604,7 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 		return 0;
 	}
 
-	case PC_VERB_SETNX:                    /* S279b */
+	case PC_VERB_SETNX:
 	case PC_VERB_SETXX:
 		v.s = (char *)pl + off + cn + klen;
 		v.len = (int)(plen - off - cn - klen);
@@ -7247,10 +6652,8 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 	}
 }
 
-/* ---- the probe-resume replays (proto.c, PC_DONE_SET_RESUME) -------------
- * A probe confirmed the key absent fleet-wide; the deferred write runs
- * the normal core with the probe suppressed, so placement decides and
- * may still forward (re-park). */
+/* ---- probe-resume replays (proto.c, PC_DONE_SET_RESUME): the key is absent fleet-wide,
+ * so the deferred write runs the normal core with the probe off - it may still forward */
 
 int pc_op_set_resume(const char *col, size_t collen, const char *key,
 		size_t klen, const char *val, int vlen, long long ttl,
@@ -7282,30 +6685,11 @@ int pc_op_add_resume(const char *col, size_t collen, const char *key,
 	return op_addsub(ht, &k, by, ttl, nv, park, 1);
 }
 
-/* ---- RESP compatibility dialect (task S29) ------------------------------
- * RESP2 requests from unmodified Redis clients (redis-cli, rtpengine,
- * hiredis apps) answer through the SAME op cores as the other two
- * dialects, so cluster semantics cannot drift.  The proto layer frames
- * (multibulk or inline) into an argv; this codec maps commands onto
- * verbs and writes the RESP reply - errors included - into @out.
- *
- * The Redis database-index model maps onto collections BY NAME: the
- * connection starts on the collection named "0", SELECT n moves to the
- * collection named "n" (a RESP-serving deployment names collections
- * "0".."15").  Unsupported commands and options refuse loudly with
- * -ERR; nothing is silently accepted.  Cut 1 command set is the
- * universal KV core - the rtpengine-specific list is settled by the
- * S29 wire capture, per the task spec. */
+/* ---- RESP2 dialect: Redis clients answer through the SAME op cores as the native door,
+ * so cluster semantics cannot drift; unsupported commands and options refuse with -ERR */
 
-/* S69: the RESP door addresses collections by Redis DB INDEX, so until
- * now a collection had to be NAMED "0" to be reachable at all - and a
- * Redis-native monitor pointed at a node holding live data under real
- * names reported one empty database, which is a correctness problem for
- * the audience the door exists to serve.  An entry of resp_collections
- * may now be `INDEX:NAME`, which makes NAME the collection SELECT INDEX
- * lands on; a bare NAME keeps the old meaning (allowed, addressed by
- * itself).  Resolution happens once per command, so everything
- * downstream still works on a collection name. */
+/* a resp_collections entry `INDEX:NAME` makes NAME the collection SELECT INDEX lands on;
+ * a bare NAME is allowed and addressed by itself.  Resolved once per command */
 size_t resp_map_index(const char *sel, size_t sl, char *out, size_t cap)
 {
 	const char *list = pc_resp_collections(), *p;
@@ -7343,9 +6727,8 @@ size_t resp_map_index(const char *sel, size_t sl, char *out, size_t cap)
 	return sl;
 }
 
-/* S69: the index a RESP client selects to reach @name - the reverse, for
- * INFO keyspace.  A collection with no index entry is reachable by its
- * own name and reported under it. */
+/* the index a RESP client selects to reach @name, for INFO keyspace; a collection with
+ * no index entry is reported under its own name */
 size_t resp_index_for(const char *name, size_t nl, char *out, size_t cap)
 {
 	const char *list = pc_resp_collections(), *p;
@@ -7387,11 +6770,8 @@ size_t resp_index_for(const char *name, size_t nl, char *out, size_t cap)
 	return nl;
 }
 
-/* Is @name inside the RESP collection allow-list?  resp_collections is
- * a comma list; NULL means every collection is visible (S33).  This is
- * what stops a RESP client reaching collections meant for native
- * clients - SELECT maps a db index onto a collection NAME, so without
- * it any name is reachable. */
+/* is @name inside the RESP allow-list (resp_collections, NULL = all)?  SELECT maps a db
+ * index onto a collection NAME, so without it any name is reachable */
 int resp_col_allowed(const char *name, size_t n)
 {
 	const char *list = pc_resp_collections(), *p;
@@ -7413,9 +6793,7 @@ int resp_col_allowed(const char *name, size_t n)
 		{
 			const char *colon = memchr(p, ':', len);
 
-			/* S69: `INDEX:NAME` allows NAME - the index is how a
-			 * RESP client asks for it, the name is what the rest
-			 * of the daemon calls it */
+			/* `INDEX:NAME` allows NAME: the index is how a RESP client asks */
 			if (colon) {
 				size_t off = (size_t)(colon - p) + 1;
 
@@ -7423,9 +6801,7 @@ int resp_col_allowed(const char *name, size_t n)
 				    !memcmp(colon + 1, name, n))
 					return 1;
 			} else if (len == 1 && *p == '*') {
-				return 1;      /* S432: the file had no list - every
-				                * name stays visible beside an index
-				                * mapped at runtime (respmap.c) */
+				return 1;      /* no list in the file: every name visible */
 			} else if (len == n && !memcmp(p, name, n)) {
 				return 1;
 			}
@@ -7441,7 +6817,7 @@ pcache_htable_t *resp_col(struct pc_jw *out, const char *cur_col,
 {
 	pcache_htable_t *ht;
 	char nm[64];
-	size_t nl = resp_map_index(cur_col, cur_collen, nm, sizeof nm);   /* S69 */
+	size_t nl = resp_map_index(cur_col, cur_collen, nm, sizeof nm);
 
 	cur_col = nm;
 	cur_collen = nl;
@@ -7456,49 +6832,28 @@ pcache_htable_t *resp_col(struct pc_jw *out, const char *cur_col,
 	return ht;
 }
 
-/* S74: the ONE answer to "is this a cluster" that INFO server, INFO
- * cluster and CLUSTER INFO all derive from.  They drifted apart once -
- * INFO said standalone while CLUSTER INFO said enabled:1 - and every
- * cluster-aware client trusts INFO, so none of them ever fetched the map
- * the slot work exists to serve.  pc_cluster_members() returns 0 exactly
- * when the plane is off, so "nm > 0" and this are the same fact. */
+/* the ONE answer to "is this a cluster" that INFO server, INFO cluster and CLUSTER INFO
+ * all derive from: cluster-aware clients trust INFO, so they must never disagree */
 int resp_cluster_on(void)
 {
 	return pc_cluster_enabled();
 }
 
-/* ---- the command table (S140) -----------------------------------------
- * Two lists used to say which RESP commands exist: the `dc[]` array the
- * data-plane pre-check carried, and the if-chain below that dispatches
- * them.  A command in one and not the other answers "unknown command"
- * before reaching its handler, or falls through to the tail and answers
- * "protocol".  This is that one list.  Matching is `resp_is`, so it is
- * exactly what the chain does.
- *
- * The `fn` column arrives task by task as handlers come out of the
- * chain; until a row has one, the chain below still dispatches it, which
- * is why this lands first and alone. */
-/* Which of the three positions in pc_verb_resp answers a command.  They
- * are NOT interchangeable: two gates cut across the old chain - the
- * readiness gate and the collection resolution - and a command answered
- * on the wrong side of one changes behaviour even though name matching
- * keeps the commands mutually exclusive.  S140 moved DBSIZE, FLUSHDB and
- * FLUSHALL across the readiness gate before that was noticed: a
- * RECOVERING node reported its keyspace and accepted a flush where it
- * owes the client -LOADING (readygatetest covers all three now). */
+/* ---- the command table: the one list of the RESP commands this door answers */
+/* the plane: which side of the readiness gate and the collection resolution answers a
+ * command - not interchangeable (a RECOVERING node owes FLUSHDB -LOADING) */
 #define RESP_CONN   0x01               /* before the readiness gate */
 #define RESP_READY  0x02               /* past it, before the collection */
 #define RESP_DATA   0x04               /* past both: needs the collection */
-#define RESP_KEYED  0x10               /* RV-10: argv[1] is THE key (one-key
-                                        * commands; of several, the first) */
+#define RESP_KEYED  0x10               /* argv[1] is THE key (of several, the first) */
 
 struct resp_cmd {
 	const char *name;
 	unsigned flags;
-	int (*fn)(struct resp_ctx *);  /* NULL: the chain still dispatches it */
+	int (*fn)(struct resp_ctx *);
 };
 
-/* S165: a subcommand this door does not implement, counted by name -
+/* a subcommand this door does not implement, counted by name -
  * the command and the subcommand, never an argument after them */
 void unk_sub(const struct resp_ctx *c)
 {
@@ -7508,7 +6863,7 @@ void unk_sub(const struct resp_ctx *c)
 }
 
 
-/* S313: every H command - the reply tree rendered as RESP */
+/* every H command - the reply tree rendered as RESP */
 static int rh_hash(struct resp_ctx *c)
 {
 	int ci = hcmd_find(c->cmd, c->cl), rc, lacking = 0;
@@ -7555,11 +6910,10 @@ static int rh_hash(struct resp_ctx *c)
 }
 
 static const struct resp_cmd resp_cmds[] = {
-	/* connection plane, in the order the chain tries them */
 	{ "PING", RESP_CONN, rh_ping }, { "ECHO", RESP_CONN, rh_echo },
 	{ "QUIT", RESP_CONN, rh_quit },
 	{ "AUTH", RESP_CONN, rh_auth }, { "HELLO", RESP_CONN, rh_hello },
-	/* PS2: pub/sub lives on the connection plane - a subscriber is a
+	/* pub/sub lives on the connection plane - a subscriber is a
 	 * socket, and a publish touches no collection */
 	{ "SUBSCRIBE", RESP_CONN, rh_subscribe },
 	{ "UNSUBSCRIBE", RESP_CONN, rh_unsubscribe },
@@ -7574,16 +6928,14 @@ static const struct resp_cmd resp_cmds[] = {
 	{ "CLIENT", RESP_CONN, rh_client },
 	{ "SLOWLOG", RESP_CONN, rh_slowlog },
 	{ "SELECT", RESP_CONN, rh_select }, { "INFO", RESP_CONN, rh_info },
-	/* ready plane: a serving node, but no collection of their own */
 	{ "DBSIZE", RESP_READY, rh_dbsize }, { "TIME", RESP_READY, rh_time },
 	{ "FLUSHDB", RESP_READY, rh_flush },
 	{ "FLUSHALL", RESP_READY, rh_flush },
-	/* data plane: this was dc[] */
 	{ "GET", RESP_DATA | RESP_KEYED, rh_get }, { "SET", RESP_DATA | RESP_KEYED, rh_set },
 	{ "SETEX", RESP_DATA | RESP_KEYED, rh_set }, { "PSETEX", RESP_DATA | RESP_KEYED, rh_set },
 	{ "DEL", RESP_DATA | RESP_KEYED, rh_del }, { "UNLINK", RESP_DATA | RESP_KEYED, rh_del },
-	{ "DELEX", RESP_DATA | RESP_KEYED, rh_delex },     /* S297 */
-	{ "EVAL", RESP_DATA, rh_eval }, { "EVALSHA", RESP_DATA, rh_eval },   /* S170a */
+	{ "DELEX", RESP_DATA | RESP_KEYED, rh_delex },
+	{ "EVAL", RESP_DATA, rh_eval }, { "EVALSHA", RESP_DATA, rh_eval },
 	{ "SCRIPT", RESP_DATA, rh_script },
 	{ "EXISTS", RESP_DATA | RESP_KEYED, rh_exists }, { "TYPE", RESP_DATA | RESP_KEYED, rh_type },
 	{ "EXPIRE", RESP_DATA | RESP_KEYED, rh_expire }, { "PEXPIRE", RESP_DATA | RESP_KEYED, rh_expire },
@@ -7593,10 +6945,9 @@ static const struct resp_cmd resp_cmds[] = {
 	{ "INCRBY", RESP_DATA | RESP_KEYED, rh_incr }, { "DECRBY", RESP_DATA | RESP_KEYED, rh_incr },
 	{ "MGET", RESP_DATA, rh_mget }, { "KEYS", RESP_DATA, rh_keys },
 	{ "SCAN", RESP_DATA, rh_scan }, { "MEMORY", RESP_DATA, rh_memory },
-	/* S86: RedisJSON's surface over the native path ops */
 	{ "JSON.SET", RESP_DATA | RESP_KEYED, rh_json }, { "JSON.GET", RESP_DATA | RESP_KEYED, rh_json },
-	{ "RL.HIT", RESP_DATA | RESP_KEYED, rh_rlhit },                    /* S314 */
-	{ "HSET", RESP_DATA | RESP_KEYED, rh_hash }, { "HSETNX", RESP_DATA | RESP_KEYED, rh_hash },  /* S313 */
+	{ "RL.HIT", RESP_DATA | RESP_KEYED, rh_rlhit },
+	{ "HSET", RESP_DATA | RESP_KEYED, rh_hash }, { "HSETNX", RESP_DATA | RESP_KEYED, rh_hash },
 	{ "HMSET", RESP_DATA | RESP_KEYED, rh_hash }, { "HGET", RESP_DATA | RESP_KEYED, rh_hash },
 	{ "HMGET", RESP_DATA | RESP_KEYED, rh_hash }, { "HDEL", RESP_DATA | RESP_KEYED, rh_hash },
 	{ "HEXISTS", RESP_DATA | RESP_KEYED, rh_hash }, { "HLEN", RESP_DATA | RESP_KEYED, rh_hash },
@@ -7610,9 +6961,8 @@ static const struct resp_cmd resp_cmds[] = {
 	{ "JSON.DEBUG", RESP_DATA, rh_json_debug }
 };
 
-/* RV-10: -MOVED <slot> <ip>:<port> for a key @node owns.  0 when the
- * member cannot be named - the caller then forwards, as it always has:
- * a redirect must never turn a request the fleet can serve into an error */
+/* -MOVED <slot> <ip>:<port> for a key @node owns; 0 when the member cannot be named and
+ * the caller forwards - a redirect must never turn a servable request into an error */
 static int resp_moved(struct pc_jw *out, int node, unsigned int slot)
 {
 	struct pc_member *mem = members_scratch();
@@ -7639,12 +6989,8 @@ static int resp_moved(struct pc_jw *out, int node, unsigned int slot)
 	return 0;
 }
 
-/* The command table as an open-addressed index over the case-folded
- * name, so a lookup is one hash and usually one compare - GET is the
- * 24th row, and the linear scan compared it against the 23 before it.
- * Built on first use by whichever worker claims it (CAS), published with
- * a release store; a caller that finds it not ready yet scans the table,
- * which is always right.  A name longer than any command cannot match. */
+/* the command table as an open-addressed index over the case-folded name, built once by
+ * the worker that claims it (CAS, release store); until then a caller scans the table */
 #define RESP_IDX_SLOTS 256                      /* power of two, > 2x the rows */
 #define RESP_NAME_MAX  32
 static unsigned short resp_idx[RESP_IDX_SLOTS]; /* row + 1; 0 = empty */
@@ -7729,20 +7075,18 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 	cmd = argv[0];
 	cl = argl[0];
 
-	/* An unauthenticated connection (RESP listener with a password
-	 * configured, S33) may only greet, authenticate and hang up -
-	 * exactly Redis's requirepass behaviour, PING included, so stock
-	 * clients need no special-casing. */
+	/* unauthenticated: only greet, authenticate and hang up - Redis's requirepass
+	 * behaviour, PING included, so stock clients need no special-casing */
 	if (!*authed && !resp_is(cmd, cl, "AUTH") &&
 	        !resp_is(cmd, cl, "HELLO") && !resp_is(cmd, cl, "QUIT")) {
-		/* S165: an unknown command before AUTH is counted, never
+		/* an unknown command before AUTH is counted, never
 		 * named - that is where port scanners live */
 		if (!resp_cmd_find(cmd, cl))
 			pc_obs_unknown_preauth(CLUNK_RESP);
 		pc_jw_lit(out, "-NOAUTH Authentication required.\r\n");
 		return 0;
 	}
-	/* PS2: SUBSCRIBED MODE, exactly redis's gate - predis's pubSubLoop
+	/* SUBSCRIBED MODE, exactly redis's gate - predis's pubSubLoop
 	 * breaks on anything else answering on a subscribed connection */
 	if (pc_pubsub_count(conn) > 0 &&
 	    !resp_is(cmd, cl, "SUBSCRIBE") && !resp_is(cmd, cl, "UNSUBSCRIBE") &&
@@ -7762,19 +7106,8 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 		return 0;
 	}
 
-	/* ---- connection plane ----
-	 * Every command is answered from its row's plane now - the chain of
-	 * if (resp_is(...)) blocks this replaced is gone.  Name matching
-	 * makes the commands mutually exclusive, but that alone does NOT
-	 * make a plane safe to change: a command may only be answered from
-	 * the same side of BOTH gates - the readiness gate and the
-	 * collection resolution - as the block it replaced, which is what
-	 * the three planes encode.
-	 *
-	 * The row is looked up ONCE here and read by all four sites below.
-	 * Each used to look it up again: four linear scans of the table
-	 * per command, ~96 case-folding compares for a GET (the 24th row),
-	 * measured at 14% of a SET's worker CPU and 18% of a GET's. */
+	/* ---- connection plane: a command is answered only from its row's side of BOTH gates
+	 * (readiness, collection); the row is looked up once and read by every site below */
 	row = resp_cmd_find(cmd, cl);
 	{
 		if (row && row->fn && (row->flags & RESP_CONN)) {
@@ -7787,28 +7120,15 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 		}
 	}
 
-	/* C7.  RESP gets Redis's OWN error for this condition: -LOADING is
-	 * what a real server sends while it reads its dataset, so redis-py,
-	 * jedis, phpredis and hiredis-based clients already recognise it
-	 * and retry rather than surfacing it as a hard failure.  Using our
-	 * own error string here would be compatible in form and useless in
-	 * practice.
-	 *
-	 * S138: it has to go out through resp_err_code().  resp_err()
-	 * hardcodes -ERR, so the condition arrived as `-ERR LOADING ...`,
-	 * where the code a client dispatches on is ERR and LOADING is just
-	 * the first word of a message nobody parses - the same reason S38
-	 * gave this emitter to TRYAGAIN. */
+	/* Redis's own -LOADING, via resp_err_code (resp_err would send -ERR LOADING):
+	 * clients already recognise it and retry rather than failing hard */
 	if (serving_denied()) {
 		resp_err_code(out, "LOADING", PC_NOTREADY_MSG);
 		return 0;
 	}
 
-	/* ---- ready plane ----
-	 * Past the readiness gate, before any collection resolves.  These
-	 * need a node that is serving but no collection of their own:
-	 * DBSIZE reports the keyspace, FLUSHDB would destroy it, and TIME
-	 * is collection-independent (S48) but still owed the gate. */
+	/* ---- ready plane: past the readiness gate, before any collection - DBSIZE reports
+	 * the keyspace, FLUSHDB would destroy it, TIME is still owed the gate */
 	{
 		if (row && row->fn && (row->flags & RESP_READY)) {
 			struct resp_ctx c = { argv, argl, nargs, out, scratch,
@@ -7820,19 +7140,15 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 		}
 	}
 
-	/* ---- data plane ----
-	 * Recognize the command BEFORE resolving the collection: an
-	 * unknown command must answer "unknown command" even on a daemon
-	 * with no collection named "0" (found by prototest's XYZZY probe
-	 * answering "no such collection"). */
+	/* ---- data plane: recognise the command BEFORE resolving the collection - an unknown
+	 * command answers "unknown command" even with no collection named "0" */
 	{
 		if (!row || !(row->flags & RESP_DATA)) {
 			char nb[64];
 			size_t n = cl < sizeof nb - 1 ? cl : sizeof nb - 1;
 
-			/* S385: upstream_unknown = pass - a command this node does
-			 * not know, on a write-through collection, goes to the
-			 * upstream as Redis's COMMAND INFO classes it */
+			/* upstream_unknown = pass: an unknown command on a write-through collection
+			 * goes to the upstream as Redis's COMMAND INFO classes it */
 			if (!row && conn && pc_upstream_any()) {
 				char upnm[64];
 				size_t upl = resp_map_index(cur_col, *cur_collen, upnm,
@@ -7844,7 +7160,7 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 			}
 			memcpy(nb, cmd, n);
 			nb[n] = 0;
-			pc_obs_unknown(CLUNK_RESP, cmd, cl, NULL, 0, obs);   /* S165 */
+			pc_obs_unknown(CLUNK_RESP, cmd, cl, NULL, 0, obs);
 			pc_jw_lit(out, "-ERR unknown command '");
 			pc_jw_raw(out, nb, n);
 			pc_jw_lit(out, "'\r\n");
@@ -7857,17 +7173,9 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 	*colp = cur_col;
 	*collenp = *cur_collen;
 
-	/* the data plane's own dispatch: these handlers need the collection,
-	 * so they cannot be answered at the site above (S140) */
 	{
-		/* RV-10: resp_redirect = moved.  Under shard and spread a
-		 * key's home is computable, and a cluster-aware Redis client
-		 * computed one from CLUSTER SLOTS - it refreshes that table
-		 * on -MOVED and on nothing else, so a forward (S44's
-		 * default) leaves it stale for ever after a rebalance.
-		 * With the policy on, a key this node does not own is
-		 * answered with the redirect and NOT forwarded.  Off, or
-		 * when the owner cannot be named, the forward stands. */
+		/* resp_redirect = moved: cluster clients refresh their slot map only on -MOVED,
+		 * so a key owned elsewhere is redirected, not forwarded, when the owner is known */
 		if (resp_redirect_moved && row && (row->flags & RESP_KEYED) &&
 		        nargs >= 2 && argl[1] && pc_cluster_enabled()) {
 			unsigned int slot = pc_key_slot(argv[1], argl[1]);
@@ -7889,16 +7197,10 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 				klenp, cur_col, cur_collen, quit, authed, es,
 				obs, ht, cmd, cl, conn };
 
-			/* S331: read-through - a key this node must fetch from
-			 * the upstream first parks the command (the connection
-			 * holds; it runs again on completion).  S338: by the
-			 * COLLECTION's name - cur_col is what SELECT named, and
-			 * under resp_collections (1:trial) that is "1": the gate
-			 * found no upstream for it and the read answered nil
-			 * from the empty table, never fetching */
-			/* S384: never for another perfcached's fetcher - its read
-			 * of a read-through collection is a daisy-chain cut here,
-			 * counted for this node's alert and page */
+			/* read-through: a key to fetch first parks the command; the gate takes the
+			 * COLLECTION's name - cur_col may be a SELECT index (resp_collections) */
+			/* never for another perfcached's fetcher: a daisy-chain cut, counted for
+			 * this node's alert and page */
 			if (ht->shadow && conn) {
 				char upnm[64];
 				size_t upl = resp_map_index(cur_col, *cur_collen,
@@ -7910,12 +7212,8 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 					pc_upstream_chain_note(upnm, upl);
 					return row->fn(&c);
 				}
-				/* S435: a pure read whose key went between the gate's
-				 * look and the handler's read (an invalidation, an
-				 * echo's drop on another worker) answered nil for a key
-				 * the upstream holds - the reply is dropped and the
-				 * command gated again, which fetches; twice at most.
-				 * Not a read that parked on a peer or began a walk */
+				/* a pure read whose key went between the gate and the handler
+				 * answered nil: dropped and gated again (fetches), twice at most */
 				for (;;) {
 					if (pc_upstream_resp_gate(ht, upnm, upl, argv,
 					        argl, nargs, out, conn) != PC_UPG_PROCEED)
@@ -7923,12 +7221,15 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 					pc_upstream_test_pause();
 					rc = row->fn(&c);
 					if (rc < 0 || (park_req && *park_req) ||
-					    pc_mget_parked() ||       /* G8 */
+					    pc_mget_parked() ||
 					    (es && es->start) || out->owned ||
 					    !pc_upstream_resp_lost(ht, upnm, upl, argv,
-					        argl, nargs) ||
-					    !pc_conn_upstream_retry(conn))
+					        argl, nargs))
 						return rc;
+					if (!pc_conn_upstream_retry(conn)) {
+						pc_upstream_lost_spent();
+						return rc;
+					}
 					out->len = at;
 					out->overflow = 0;
 				}

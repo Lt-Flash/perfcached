@@ -1,8 +1,6 @@
 #!/bin/sh
-# reservetest.sh - S90: a departed member's binding is reserved.  A node
-# that leaves cleanly keeps its id reserved on the master; a replacement
-# at the same address inherits it; the identity, returning, gets it back.
-# usage: test/reservetest.sh [./perfcached]
+# reservetest.sh - a departed member's id stays reserved: a replacement at the same address inherits
+# it, the identity returning gets it back.  usage: test/reservetest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -57,16 +55,25 @@ port = int(sys.argv[1]); what = sys.argv[2]
 s = socket.create_connection(("127.0.1.9" + sys.argv[3], port), timeout=8)
 f = pcnative.wrap(s)
 f.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"stats"}).encode()+b"\n"); f.flush()
-c = json.loads(f.readline())["result"]["cluster"]
-print(c["node"] if what == "node" else c.get("reserved_ids", "absent"))
+r = json.loads(f.readline())["result"]; c = r["cluster"]
+if what == "state": print(r.get("state"), c.get("peers_up"))
+else: print(c["node"] if what == "node" else c.get("reserved_ids", "absent"))
 EOF
 node()     { python3 "$CLI" "$1" node "$2" 2>/dev/null; }
 reserved() { python3 "$CLI" "$1" reserved "$2" 2>/dev/null; }
 settle() { sleep 3; }
+# formed: node 1 and the node at node 2's address ready and seeing each other, up to 30 s - a
+# joiner is CONNECTING until its links answer
+formed() {
+	i=0
+	while [ $i -lt 300 ] && [ "$(python3 "$CLI" 18091 state 1 2>/dev/null) $(python3 "$CLI" 18092 state 2 2>/dev/null)" != "ready 1 ready 1" ]; do
+		sleep 0.1; i=$((i+1))
+	done
+}
 conf 1 18091 1 "$D/s1"; conf 2 18092 2 "$D/s2"
 start 1 || { echo "node 1 did not start: $(tail -2 "$D/n1.log")"; exit 1; }
 start 2 || { echo "node 2 did not start: $(tail -2 "$D/n2.log")"; exit 1; }
-settle
+formed
 ID2=$(node 18092 2); echo "  node 2 joined as id $ID2"
 [ -n "$ID2" ] && [ "$ID2" != 0 ] && ok "two nodes formed a fleet" || bad "node 2 has no id"
 stop 2; settle
@@ -77,7 +84,7 @@ grep -q "its id is reserved for it" "$D/n1.log" && ok "the master says so" || ba
 # a replacement at the SAME address (fresh identity) inherits the id
 conf 3 18092 2 "$D/s3"
 start 3 || { bad "node 3 (the replacement) did not start: $(tail -2 "$D/n3.log")"; }
-settle
+formed
 ID3=$(node 18092 2); echo "  the replacement at node 2's address joined as id $ID3"
 [ "$ID3" = "$ID2" ] && ok "a replacement at the same address inherits the id" \
 	|| bad "S90: the replacement got id '$ID3', the departed had $ID2"
@@ -86,7 +93,7 @@ grep -q "returns as node $ID2 (reserved, matched by address)" "$D/n1.log" && ok 
 stop 3; settle
 # the original identity returns and gets its id back
 start 2 || { bad "node 2 did not restart: $(tail -2 "$D/n2.log")"; }
-settle
+formed
 ID2b=$(node 18092 2); echo "  node 2 returned as id $ID2b"
 [ "$ID2b" = "$ID2" ] && ok "the returning identity is itself again" \
 	|| bad "S90: the identity came back as '$ID2b', had $ID2"

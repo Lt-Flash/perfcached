@@ -1,19 +1,5 @@
-/*
- * psqueuetest.c - a worker's pub/sub queue is bounded, and its drain is.
- *
- * The PS11 rig sent 200k relays/s at one subscriber: the owning worker's
- * queue grew without limit, and the drain emptied all of it in one pass,
- * so the node took 12.9 s to notice SIGTERM.  This links the real
- * src/pubsub.o against stubs (as bench/psengine.c does) and checks, on one
- * thread, with worker 2 never draining until told to:
- *
- *   - at a cap, the queue's bytes stay under it and the rest are dropped
- *     and counted: every publish is either queued or dropped;
- *   - with no cap, nothing is dropped;
- *   - one drain delivers at most one batch and re-arms the worker's
- *     eventfd while something is left, and no more once it is empty;
- *   - the byte gauge returns to zero.
- */
+/* psqueuetest.c - a worker's pub/sub queue is bounded and so is its drain: under a cap each publish
+ * is queued or dropped and counted; one drain delivers at most one batch and re-arms its eventfd */
 #include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -168,10 +154,8 @@ int main(void)
 	pc_pubsub_drain(2);
 	CHECK(pushed == total + 1, "the last message was not delivered");
 
-	/* 5. 0.6.1: a drain is bounded by bytes too.  300 messages of 8 KB
-	 * fit one 1,024-message batch - 4.8 MB onto each subscriber in one
-	 * turn, which under io_uring killed readers that were keeping up.  A
-	 * drain now stops at ~1 MB (PS_DRAIN_BYTES) and re-arms the worker */
+	/* 5. a drain is bounded by bytes too: 300 messages of 8 KB fit one batch, so it stops at
+	 * ~1 MB (PS_DRAIN_BYTES) and re-arms the worker */
 	{
 		static char big[8192];
 		unsigned long long base = pushed, first;

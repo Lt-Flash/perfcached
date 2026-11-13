@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * busypoll.c - S363: opt-in busy polling, per worker (busypoll.h).  The
- * kernel ABI is spelled out here, as in uring.c, so it builds on old
- * kernel headers and musl.
- */
+/* busypoll.c - opt-in busy polling, per worker (busypoll.h); the kernel ABI is spelled
+ * out here, as in uring.c, so it builds on old kernel headers and musl. */
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>

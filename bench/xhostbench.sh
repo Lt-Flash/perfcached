@@ -1,42 +1,14 @@
 #!/bin/sh
-# xhostbench.sh — the comparison run PROPERLY: redis-benchmark on one
-# host, both servers on another, a real NIC between them.
-#
-# The README's "Across a real network" table (build 78b122b) was produced
-# by hand.  This is that method as a script, so it can be re-run for a
-# release instead of re-invented: MTU 9000 verified end to end with
-# `ping -M do -s 8972` BEFORE anything is trusted, both servers bound to
-# the server host's NIC address, arms ALTERNATED so drift cannot favour
-# either, median of REPS per cell, and the build/versions stamped into
-# the result.
-#
-# CONTAINERISED 2026-09-12.  Neither host needs redis-server, redis-
-# benchmark or a perfcached build any more: the servers run from this
-# tree's image on the server host and the load generator from redis:8 on
-# the client host.  Both run with --network host, and that is not a
-# shortcut - this bench exists to measure a 9000-byte path between two
-# physical NICs, and a container bridge would put a 1500-byte hop in the
-# middle and report it as the network.  --network host keeps the wire the
-# wire; the containers supply only the binaries.
-#
-# It cannot use bench/containerlib.sh: that library drives containers on
-# the machine it is sourced on, and every container here lives on one of
-# two OTHER hosts, reached over ssh.
-#
-# Runs from a third machine (or the client) and drives both hosts over
-# ssh.  Refuses to start if the server host is busy: a benchmark on a
-# shared box measures the other tenant.
-#
-#   SERVER=<server-ip> CLIENT=<client-ip> bench/xhostbench.sh [reps]
+# xhostbench.sh - redis-benchmark on one host against redis and perfcached on another, over a real
+# NIC (MTU 9000 verified), arms alternated.  Usage: SERVER=<ip> CLIENT=<ip> bench/xhostbench.sh [reps]
 set -u
 
 SERVER=${SERVER:?set SERVER=<ip of the host that runs both servers>}
 CLIENT=${CLIENT:?set CLIENT=<ip of the host that runs redis-benchmark>}
 REPS=${1:-3}
 SRCDIR=${SRCDIR:-/dn/perfcached}       # tree on the SERVER host
-# Same parameters respbench.sh uses, so the two tables are comparable:
-# 100k requests over a 20k keyspace, 200 B values, FOUR workers - not
-# nproc, which would give perfcached 16 cores against a 1-thread Redis.
+# respbench.sh's parameters, so the tables compare; four workers, not nproc against a
+# one-thread Redis
 N=${N:-100000}; KEYSPACE=${KEYSPACE:-20000}; VAL=${VAL:-200}
 N_MAX=${N_MAX:-2000000}   # cap on N x pipeline per cell, as respbench.sh
 CLIENTS=${CLIENTS:-50}
@@ -58,18 +30,14 @@ BUSY=$(ss_ 'ps -eo comm --no-headers | grep -cE "^(perfcached|pcbench|make|fio|r
 sc_ "ping -c1 -W2 -M do -s 8972 $SERVER >/dev/null 2>&1" \
 	|| { echo "xhostbench: jumbo path $CLIENT -> $SERVER NOT verified (8972 fragments) - refusing"; exit 1; }
 
-# A runtime on each host.  `info` rather than `command -v`: an installed
-# client whose daemon is down passes the PATH test and then fails every
-# call, which is the confusing failure this ordering avoids.
+# a runtime on each host: `info`, not `command -v`, so a client whose daemon is down fails here
 findrt='for c in podman nerdctl docker; do command -v $c >/dev/null 2>&1 && $c info >/dev/null 2>&1 && { echo $c; break; }; done'
 RTS=${RUNTIME_SRV:-$(ss_ "$findrt")}
 RTC=${RUNTIME_CLI:-$(sc_ "$findrt")}
 [ -n "$RTS" ] || { echo "xhostbench: no working container runtime on $SERVER"; exit 1; }
 [ -n "$RTC" ] || { echo "xhostbench: no working container runtime on $CLIENT"; exit 1; }
 
-# ---- images ------------------------------------------------------------
-# Built on the SERVER from its own checkout, so the binary measured is
-# the one that tree produces - not one carried over from elsewhere.
+# ---- images, built on the server from its own checkout
 ss_ "cd $SRCDIR && $RTS build --platform linux/amd64 \
 	-f bench/Containerfile.debian \
 	--build-arg REV=\$(git rev-parse --short HEAD 2>/dev/null || echo unknown) \
@@ -78,8 +46,7 @@ ss_ "cd $SRCDIR && $RTS build --platform linux/amd64 \
 sc_ "$RTC pull $REDIS_IMG >/dev/null 2>&1" \
 	|| { echo "xhostbench: could not pull $REDIS_IMG on $CLIENT"; exit 1; }
 
-# PROVENANCE: read every version out of the IMAGE that will run, never
-# from the host or the directory name.
+# read every version out of the image that will run, never from the host or the directory name
 BINREV=$(ss_ "$RTS run --rm --entrypoint perfcached $IMG -V 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p'")
 RSV=$(ss_ "$RTS run --rm --entrypoint redis-server $REDIS_IMG --version | grep -oE 'v=[0-9.]+' | cut -c3-")
 RBV=$(sc_ "$RTC run --rm --entrypoint redis-benchmark $REDIS_IMG --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'")
@@ -101,11 +68,8 @@ cleanup() {
 trap cleanup EXIT
 ss_ "$RTS rm -f $RCON $PCON >/dev/null 2>&1; $RTC rm -f $DCON >/dev/null 2>&1" || true
 
-# --network host on BOTH servers: the point of this bench is the real
-# 9000-byte path, and a bridge would insert a 1500-byte hop and report
-# it as the network.  It also removes the old ssh-channel problem
-# entirely - a detached container holds no fd of the ssh session, so the
-# "background a subshell and sshd never returns" dance is gone.
+# --network host on both servers: a bridge would insert a 1500-byte hop into the 9000-byte path,
+# and a detached container holds no fd of the ssh session
 ss_ "$RTS run -d --name $RCON --network host $REDIS_IMG \
 	--port $RPORT --bind $SERVER --protected-mode no --save '' \
 	--appendonly no >/dev/null 2>&1" \
@@ -126,16 +90,11 @@ resp = $SERVER:$PPORT
 [collection 0]
 buckets_log2 = 17
 EOF"
-# --ulimit memlock=-1: a container's default memlock sits far below the
-# arena, so mlock() fails and the arena runs UNPINNED and swappable.
+# a container's default memlock is below the arena: mlock() would fail and leave it swappable
 ss_ "$RTS run -d --name $PCON --network host --ulimit memlock=-1 \
 	-v $D/pc.conf:/etc/perfcached.conf:ro $IMG >/dev/null 2>&1" \
 	|| { echo "xhostbench: perfcached container did not start"; exit 1; }
-# ASK THE SERVICE, do not read the logs: a detached container here runs
-# perfectly and `podman logs` returns nothing at all (containerbench.sh
-# learned the same on 2026-09-13, this harness on 2026-09-16 - its first
-# end-to-end run), so readiness is the driver's PING below, retried while
-# the daemon binds and pins a 512 MB arena.
+# readiness is the driver's PING below, not the logs: a detached container's logs are empty
 
 # a PERSISTENT driver on the client, so the per-cell cost is an exec and
 # not a container start
@@ -151,12 +110,8 @@ ping_wait() { # ping_wait <port> <what>: up to 20 s for a PONG
 ping_wait $RPORT "redis" || exit 1
 ping_wait $PPORT "perfcached RESP door" || exit 1
 
-# ---- one cell, on the CLIENT ------------------------------------------
-# Requests per cell scale with the pipeline depth, as in respbench.sh:
-# redis-benchmark times a run in WHOLE MILLISECONDS, so 100k requests at
-# 1.3M ops/s is a 77 ms run reported on a 1.3% grid.  N x P keeps every
-# cell above a second, capped at N_MAX so one connection at depth 64
-# does not run for a minute.
+# ---- one cell, on the client.  redis-benchmark times in whole milliseconds, so N x pipeline
+# (capped at N_MAX) keeps every cell above a second, as in respbench.sh
 reqs() { r=$((N * $1)); [ "$r" -gt "$N_MAX" ] && r=$N_MAX; echo "$r"; }
 point() { # point <port> <clients> <pipeline>  -> "sets gets sp50 gp50 sp99 gp99"
 	sc_ "$RTC exec $DCON redis-benchmark -h $SERVER -p $1 -t set,get \

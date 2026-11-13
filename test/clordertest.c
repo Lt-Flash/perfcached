@@ -1,5 +1,5 @@
-/* clordertest.c - S461: a replicated set and delete of one key on two receive
- * threads; the hook runs the other side inside each side's gap, deterministically */
+/* clordertest.c - a replicated set and delete of one key on two receive threads; the hook runs
+ * the other side inside each side's gap, deterministically */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

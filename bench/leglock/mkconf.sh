@@ -1,5 +1,5 @@
 # mkconf.sh <i> <buckets_log2> <autoscale> - one fleet node's config, collection "th" under test
-# MODE=eager (default): the 245-247 shape; MODE=local: legacy per-collection store mode, nothing replicates
+# MODE=eager (default): the replicated fleet shape; MODE=local: per-collection store mode, nothing replicates
 cat <<CONF
 [daemon]
 workers = ${WORKERS:-8}

@@ -1,20 +1,6 @@
 #!/bin/sh
-# upfailovertest.sh - S382 part 2 (0.6.1): upstream_mode = failover.  Two
-# replica fakes (test/fakeupstream.py), listed R2 then R1, with
-# upstream_primary = R1 (the second listed - the key decides, not the
-# order) and upstream_preempt_hold_s = 15; PERFCACHED_ALERT_FAST=60.
-#  1. /stats: mode failover, the primary R1, R1 active; every read goes to
-#     R1, none to the standby R2
-#  2. R1 down: R2 takes over (logged "failed over"), serves every read; the
-#     failover alert names it
-#  3. R1 back, upstream_preempt = yes: R2 stays active through the hold,
-#     then R1 takes over again (logged); the alert clears; reads go to R1
-#  4. upstream_preempt = no: after a failover R2 stays active although R1
-#     serves again; the alert clears (the primary serves)
-#  5. config: a primary that is not listed, the failover keys without
-#     failover, a hold under 15 s, a bad mode - each refused
-# Fail-first: 0.6.0.1 refuses upstream_mode as an unknown key.
-# Usage: test/upfailovertest.sh ./perfcached
+# upfailovertest.sh - upstream_mode = failover: the primary (by key, not list order) serves, the standby
+# takes over while it is down, upstream_preempt decides whether it hands back, bad config is refused.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

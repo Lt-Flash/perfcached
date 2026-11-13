@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clcid.c - S302: the cluster id's lifecycle.  See clcid.h.
- */
+/* clcid.c - the cluster id's lifecycle.  See clcid.h. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -59,9 +57,8 @@ const char *pc_cid_state_name(int state)
 		state == CLWIRE_CID_PROVISIONAL ? "provisional" : "none";
 }
 
-/* a UUID (with or without dashes) parses to its bytes; anything else is
- * a name, hashed into a v8 UUID - so `cluster_id = billing-prod` works as
- * well, and every id is a well-formed UUID (a minted one is v7) */
+/* a UUID (with or without dashes) parses to its bytes; anything else is a name
+ * hashed into a v8 UUID, so `cluster_id = billing-prod` works too */
 static void pin_bytes(const char *pin, unsigned char out[16])
 {
 	unsigned char b[16];
@@ -138,8 +135,8 @@ static int cid_load(unsigned char out[16])
 	if (!fgets(buf, sizeof buf, f))
 		buf[0] = 0;
 	if (!strncmp(buf, "perfcached-cluster-id ", 22) && atoi(buf + 22) > 1) {
-		/* UP3: a newer header is a downgrade, not damage: "join or found
-		 * as if new" would put this node in ANOTHER cluster */
+		/* a newer header is a downgrade, not damage: "join or found as if new" would
+		 * put this node in ANOTHER cluster */
 		LM_CRIT("cluster: %s is version %d, written by a NEWER build (this "
 			"one reads version 1) - refusing to start rather than join "
 			"or found a cluster as if new; run the newer build\n", path,
@@ -179,7 +176,7 @@ int pc_cid_init(const char *state_dir, const char *pin)
 		snprintf(K.dir, sizeof K.dir, "%s", state_dir);
 	have = cid_load(disk);
 	if (have < 0)
-		return -1;                 /* UP3: a newer build's file */
+		return -1;                 /* a newer build's file */
 	if (pin && *pin) {
 		pin_bytes(pin, want);
 		if (have && memcmp(disk, want, 16) != 0) {

@@ -1,7 +1,5 @@
-/* sha1.h - S170a: SHA-1 (FIPS 180-4), written for perfcached - used ONLY to
- * name a script the way Redis's EVALSHA / SCRIPT LOAD do (the SHA1 of its
- * body, lowercase hex).  Not a security primitive here: a script is
- * approved by a list the daemon carries, not by the hash's strength. */
+/* sha1.h - SHA-1 (FIPS 180-4) to name a script as EVALSHA / SCRIPT LOAD do;
+ * not a security primitive: a script is approved by the daemon's list. */
 #ifndef PC_SHA1_H
 #define PC_SHA1_H
 

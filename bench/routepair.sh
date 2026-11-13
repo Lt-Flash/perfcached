@@ -1,10 +1,6 @@
 #!/bin/sh
-# routepair.sh - what per-key routing is worth, measured apart: the SAME
-# 3-node host fleet, natbench at 50 connections / depth 32, GET-only over
-# a seeded keyspace, route=0 (dial one node, daemon forwards) against
-# route=1 (client computes the owner), store and shard.  This is the
-# README's "1.5x from spreading / 11.5x for shard" decomposition as a
-# script instead of a hand-run.  Fleet recipe is modematrix.sh's.
+# routepair.sh - what per-key routing is worth, measured apart: the same 3-node fleet, natbench
+# GET-only at 50 connections / depth 32, route=0 against route=1, store and shard.
 set -u
 # usage: bench/routepair.sh [./perfcached] [./natbench] [./perfcli]
 BIN=${1:-./perfcached}; NB=${2:-./natbench}; CLI=${3:-./perfcli}
@@ -21,9 +17,8 @@ cnum() { "$CLI" -h "$(addr $1)" -p "$(port $1)" -a "$SECRET" -j '{"method":"stat
 	| python3 -c "import json,sys; d=json.load(sys.stdin); c=d.get('cluster') or {}; print(c.get('$2', '?'))" 2>/dev/null; }
 members() { "$CLI" -h "$(addr $1)" -p "$(port $1)" -a "$SECRET" -j '{"method":"members"}' 2>/dev/null \
 	| python3 -c "import json,sys; print(len(json.load(sys.stdin)['members']))" 2>/dev/null; }
-# reads of a key another node owns are PULLS (pull_sent), writes that are
-# placed elsewhere are FORWARDS (fwd_sent) - a routed client drives both
-# to zero, an un-routed GET load shows up in the first
+# reads of a key another node owns are PULLS (pull_sent), misplaced writes FORWARDS (fwd_sent):
+# a routed client drives both to zero
 ctotal() { t=0; for n in 1 2 3; do v=$(cnum $n "$1"); case "$v" in ''|*[!0-9]*) v=0;; esac; t=$((t + v)); done; echo $t; }
 start_fleet() { # start_fleet <cluster-block>
 	i=1
@@ -67,8 +62,8 @@ stop_fleet() {
 trap 'stop_fleet; rm -rf "$D"' EXIT
 
 nat() { # nat <getpct> <route> <secs> -> natbench output
-	# trailing positionals: kv=1 (the data verbs on their fixed-layout
-	# frames, the only wire since S317), latrate=0, spares=-1, route
+	# trailing positionals: kv=1 (the data verbs on their fixed-layout frames, the only wire),
+	# latrate=0, spares=-1, route
 	"$NB" "$(addr 1)" "$(port 1)" "$SECRET" c $CONNS $THREADS $DEPTH "$3" \
 		$KEYS $VAL "$1" 1 0 -1 "$2" 2>&1
 }

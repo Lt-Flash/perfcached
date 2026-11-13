@@ -1,25 +1,6 @@
 #!/bin/sh
-# tombjointest.sh - 12ny AT-7: a node that joins takes its floors from the
-# nodes it bootstraps from, so the prefixes forgotten before it was a member
-# are never asked for, and it confirms like any member.
-#
-# Before: a joiner never held the start of a space whose deletes the fleet
-# had already forgotten.  Its mark for that space stayed 0, the lowest among
-# the members with it, and from the day it joined nothing of the space was
-# forgotten again (the time rule only); with AT-6 it also asked for the
-# forgotten prefix every second.  Now a node that came back with nothing
-# floors each space at the lowest mark its bootstrap's candidates announced
-# - every delete they had confirmed is already reflected in what they send.
-# Nodes 1 and 2, then node 3 joins empty:
-#   1. 200 deletes through node 1 are forgotten by nodes 1 and 2
-#   2. node 3 joins: it floors node 1's space (acks.floors), confirming it
-#      at 200 or more without a single delete of it applied
-#   3. 100 more deletes: node 1 forgets them all, node 3 counted
-#   4. node 3 holds none of the 300 deleted keys, and it asked for no more
-#      than a handful of holes
-# FAIL-FIRST: before AT-7 node 3's mark for the space is 0 - node 1 keeps
-# the 100, and node 3 asks for [1, 200] over and over.
-# Usage: test/tombjointest.sh [./perfcached]
+# tombjointest.sh - a joiner takes its floors from the nodes it bootstraps from: it never asks for
+# prefixes forgotten before it joined, and confirms like any member.  Usage: test/tombjointest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -112,10 +93,7 @@ PY
 start 1; start 2
 k=0; while [ $k -lt 75 ] && { [ "$(st 1 'c.get("peers_up")')" != 1 ] || [ "$(st 1 'c["acks"]["fleet"]["confirming"]')" != True ]; }; do sleep 0.2; k=$((k+1)); done
 
-# writes taken before any are made: rc2 and rc3 (both CIs, every run) showed
-# node 1 with not one delete applied, noted or numbered after the 200 below -
-# the writes went unanswered-for while the fleet looked formed.  Wait for a
-# write node 1 takes, and say what refused the others
+# wait for a write node 1 takes before making any, and say what refused the others
 k=0; P0=; while [ $k -lt 75 ]; do
 	P1=$(probe); [ "$P1" = ok ] && break
 	[ -z "$P0" ] && P0=$P1
@@ -130,9 +108,7 @@ H1=$(held1 0 250)
 [ "$H1" = 50 ] || bad "1. node 1 holds $H1 of the 250 written (want the 50 not deleted)"
 k=0; while [ $k -lt 75 ] && [ "$(st 1 'c["tombstones_retained"]["numbered"]') $(st 2 'c["tombstones_retained"]["numbered"]')" != "0 0" ]; do sleep 0.2; k=$((k+1)); done
 O1=$(st 1 "c['acks']['marks'][0]['origin']"); I1=$(st 1 "c['acks']['marks'][0]['incarn']")
-# the premise: node 1 numbered them - its own space is in its marks.  rc2
-# (both CIs) passed this step with no space at all, and step 2 had nothing
-# to look for: say what node 1 held instead
+# the premise: node 1 numbered them, its own space is in its marks; else say what node 1 held
 [ -n "$O1" ] && [ -n "$I1" ] ||
 	bad "1. node 1 shows no numbering space of its own: acks $(st 1 '{x: c["acks"][x] for x in ("spaces", "applied", "dups", "far", "full", "marks")}'); fleet $(st 1 'c["acks"]["fleet"]'); retained $(st 1 'c["tombstones_retained"]')"
 [ "$(st 1 'c["tombstones_retained"]["numbered"]') $(st 2 'c["tombstones_retained"]["numbered"]')" = "0 0" ] &&
@@ -142,7 +118,8 @@ O1=$(st 1 "c['acks']['marks'][0]['origin']"); I1=$(st 1 "c['acks']['marks'][0]['
 # 2. node 3 joins empty
 start 3
 k=0; while [ $k -lt 100 ] && [ "$(st 3 'c.get("peers_up")')" != 2 ]; do sleep 0.2; k=$((k+1)); done
-sleep 3
+# it sees its peers while still CONNECTING; its floors are set by the bootstrap it pulls before ready
+python3 "$T/waitready.py" -t 30 127.0.150.1:19451 127.0.150.2:19452 127.0.150.3:19453
 F3=$(st 3 'c["acks"]["floors"]')
 M3=$(st 3 "next((m['confirmed'] for m in c['acks']['marks'] if m['origin'] == '$O1' and m['incarn'] == $I1), -1)")
 [ "${F3:-0}" -ge 1 ] 2>/dev/null && [ "${M3:--1}" -ge 200 ] 2>/dev/null &&

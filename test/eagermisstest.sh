@@ -1,28 +1,6 @@
 #!/bin/sh
-# eagermisstest.sh - S303: in EAGER mode a local miss is the answer; in
-# STORE mode a miss asks the fleet and keeps what it finds.
-#
-# Eager replicates every record to every node, so a READY node's miss is
-# the fleet's.  It used to ask anyway: every miss parked the client for a
-# pull round trip, and a slow peer cost the 80 ms pull timeout (245-247:
-# 0 of 67,000 such pulls ever found the key).  Store mode is the
-# opposite: a record lives where it was written, so a miss must ask,
-# and the copy it pulls is kept, so the next read is local.
-#   1  eager: a record written on node 2 reads on node 1 (replicated),
-#      and so does one written by `mset` within a second (pushed, not
-#      left to the ~10 s sweep - mset did not push before S303); just
-#      formed, node 1 is not yet settled (eager_miss_final false: for
-#      30 s after a start or a peer coming back a miss still asks), and
-#      once settled 50 missing keys read through it all miss and send
-#      NO pull
-#   2  store: a record written on node 2 only reads through node 1 (one
-#      pull), is then HELD on node 1, and a second read sends no pull;
-#      a missing key still asks (one pull)
-# The mode is declared fleet-wide ([cluster] mode + collections), as
-# 245-247 run it: that is what turns pulls on - a per-collection mode
-# alone does not, and a test written that way sees no pulls at all.
-# Fail-first: before S303 part 1 sends one pull per missing key (50).
-# Usage: test/eagermisstest.sh [./perfcached]
+# eagermisstest.sh - a settled eager node's local miss is final (no pull); a store miss pulls once and keeps the
+# copy.  The mode is declared fleet-wide, which turns pulls on.  Usage: test/eagermisstest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

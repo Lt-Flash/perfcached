@@ -1,16 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clps.c - the pub/sub relay plane (M16, wave 4).  See clps.h.
- *
- * Moved from cluster.c at c76dfce: PS3's relay fan-out, PS7's receive
- * windows, PS11's relay port (its receive threads and probes) and PS12's
- * interest exchange.  Nothing here was rewritten - each C field is read
- * through its clstate.h accessor, the cluster socket and secret are
- * clsend's (M14), and the six log lines are now reasons the caller
- * turns into words (rule 4): clps_rx_open's *why, clps_probe_peer's
- * return.
- */
+/* clps.c - the pub/sub relay plane: fan-out, receive windows, the relay port and
+ * the interest exchange; log wording is the caller's.  See clps.h. */
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
@@ -28,10 +19,10 @@
 
 #include "iostat.h"
 #include "clps.h"
-#include "clrpt.h"                     /* S469 */
+#include "clrpt.h"
 #include "clrp.h"
 #include "cluster.h"
-#include "clreplay.h"                  /* CH-1 */
+#include "clreplay.h"
 #include "clstate.h"
 #include "clpeers.h"
 #include "clsend.h"
@@ -43,7 +34,6 @@
 #include "pubsub.h"
 #include "quiesce.h"
 
-/* 0.6.0 step 1: the relay's own datagrams, one sendto each today */
 static ssize_t relay_sendto(int fd, const void *buf, size_t n,
 		const pc_addr *to)
 {
@@ -53,31 +43,41 @@ static ssize_t relay_sendto(int fd, const void *buf, size_t n,
 	return r;
 }
 
-/* ---- PS3: the pub/sub relay ---------------------------------------------
- * One sealed datagram per live peer, from the publishing WORKER - the same
- * path and the same posture as the eager push: fire-and-forget on the
- * unicast plane, never the multicast group (S124, S36).  There is no
- * repair sweep behind a message, so the receiver counts what it missed
- * instead: a per-sender sequence, and a gap is `relay_lost`.  At the
- * production rates S52 measured (hundreds a second) the P-1 seals are
- * noise; coalescing across a worker turn is filed, not built. */
-/* PS7: the relay sequence is [epoch 16][lane 8][counter 40] (psrelay.h).
- * One global counter taken by whichever worker published let two workers
- * put N+1 on the wire before N, which the receiver counted as a loss. */
+/* ---- the relay ---- one sealed datagram per live peer, fire-and-forget from the
+ * publishing worker; no repair: a gap in a sender's sequence counts as relay_lost */
+/* the sequence is [epoch 16][lane 8][counter 40] (psrelay.h): a counter per worker
+ * lane, as a shared one let N+1 reach the wire before N and read as a loss */
 static uint16_t pubsub_epoch;          /* drawn with the incarnation */
 static unsigned int pubsub_lanes;      /* lanes handed out; wraps at 256 */
 static __thread int pubsub_lane = -1;
 static __thread uint64_t pubsub_lane_ctr;
-/* PS11: the dedicated relay plane - see pc_cluster_pubsub_rx_open */
+/* the dedicated relay plane: see clps_rx_open */
 #define PS_RX_MAX 16
 static int ps_rx_port;                 /* bound and advertised; 0 = off */
 static int ps_rx_n;
-static int ps_rx_bylane;               /* S461: the lane spread is attached */
+static int ps_rx_bylane;               /* the lane spread is attached */
 static int ps_rx_fd[PS_RX_MAX];
-static int ps_rx_lfd[PS_RX_MAX];       /* S469: the TCP listener beside each */
+static int ps_rx_lfd[PS_RX_MAX];       /* the TCP listener beside each */
 static unsigned long long ps_sent_direct, ps_sent_cluster, ps_rx_dgrams,
 	ps_rx_other;
-static __thread int ps_send_fd = -1;
+static __thread int ps_send_fd = -1;  /* -2: no socket here, the cluster path */
+
+/* bound to this node's own host, as clrp's: a receiver takes a frame only from
+ * the host its header names, and unbound the route picks it */
+static int ps_socket(int family)
+{
+	pc_addr me = cl_self_addr();
+	int fd = socket(family, SOCK_DGRAM, 0);
+
+	if (fd < 0)
+		return -2;
+	pc_addr_set_port(&me, 0);
+	if (pc_addr_family(&me) != family || bind(fd, &me.sa, pc_addr_len(&me)) != 0) {
+		close(fd);
+		return -2;
+	}
+	return fd;
+}
 static pthread_mutex_t ps_rx_lk = PTHREAD_MUTEX_INITIALIZER;
 static void ps_put16(unsigned char *p, unsigned v) { p[0] = (unsigned char)(v >> 8); p[1] = (unsigned char)v; }
 static void ps_put32(unsigned char *p, unsigned long v) { ps_put16(p, (unsigned)(v >> 16)); ps_put16(p + 2, (unsigned)v); }
@@ -86,28 +86,8 @@ static unsigned ps_get16(const unsigned char *p) { return ((unsigned)p[0] << 8) 
 static unsigned long ps_get32(const unsigned char *p) { return ((unsigned long)ps_get16(p) << 16) | ps_get16(p + 2); }
 static unsigned long long ps_get64(const unsigned char *p) { return ((unsigned long long)ps_get32(p) << 32) | ps_get32(p + 4); }
 
-/* ---- PS12: relaying only what a peer wants --------------------------------
- * A peer set to `pubsub_relay = interested` puts an interest version on its
- * heartbeat and sends its first subscriptions as they happen (psinterest.h
- * has the protocol).  The cluster thread keeps, per peer, a mode the
- * publishing workers read:
- *   PV_ALL        it wants everything: the shared seal, the shared counters
- *   PV_FILTER     our copy of its interest is current: skip what cannot match
- *   PV_BROADCAST  it filters, but our copy is not current (no full state,
- *                 an update missing, its full state said "everything"):
- *                 send everything until it is
- * A filtering peer gets relays on counters of its own - in a sequence
- * space of their own, PS_PEER_EPOCH - because the shared counters would
- * show every publish it was not sent as a loss.  That costs one seal per
- * such peer per relay (~0.7 us on 222).
- *
- * The workers read the modes, filters and the fleet pattern index under
- * a seqlock the cluster thread bumps around every change: a reader that
- * saw it move reads again, and one that cannot get a stable read in a few
- * tries sends to everyone.  Pattern entries are retired through quiesce.h.
- *
- * THE WINDOW: a publish on this node in the moment after a peer's first
- * subscription, before its update lands here, is not sent to it. */
+/* ---- relaying only what a peer wants (psinterest.h) ---- the window: a publish
+ * just after a peer's first subscription, before its update lands here, misses it */
 #define PS_PEER_EPOCH   0x8000
 #define PS_PEER_WORDS   ((PC_CL_MAXPEER + 63) / 64)
 
@@ -221,7 +201,7 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 			continue;
 		if (filtering && (skip[i / 64] >> (i % 64) & 1)) {
 			__atomic_add_fetch(&ps_skipped, 1, __ATOMIC_RELAXED);
-			continue;                  /* PS12: it cannot want this */
+			continue;                  /* it cannot want this */
 		}
 		if (__atomic_load_n(&p->pv_mode, __ATOMIC_ACQUIRE) == PV_ALL) {
 			/* the same bytes go to every such peer: sealed once */
@@ -233,7 +213,7 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 			out = sealed;
 			olen = slen;
 		} else {
-			/* PS12: its own counter, so what it is not sent is
+			/* its own counter, so what it is not sent is
 			 * not a loss to it */
 			if (!ps_peer_seal &&
 			    !(ps_peer_seal = malloc(HDR_LEN + MAX_DGRAM + 16)))
@@ -244,16 +224,15 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 				continue;
 			out = ps_peer_seal;
 		}
-		/* S36: a frame over the datagram limit goes by the cluster
+		/* a frame over the datagram limit goes by the cluster
 		 * socket's path, which hands it to the frame lane */
 		if (psr_path_direct(&p->ps, now) && !clsend_lanes(olen)) {
-			/* PS11: this worker's own socket, so each sending thread
-			 * is its own flow and the peer's receive threads keep
-			 * each lane in order */
+			/* this worker's own socket: each sending thread is its own flow,
+			 * so the peer's receive threads keep each lane in order */
 			pc_addr to = p->addr;
 
-			if (ps_send_fd < 0)
-				ps_send_fd = socket(pc_addr_family(&to), SOCK_DGRAM, 0);
+			if (ps_send_fd == -1)
+				ps_send_fd = ps_socket(pc_addr_family(&to));
 			pc_addr_set_port(&to, (uint16_t)__atomic_load_n(&p->ps.port,
 				__ATOMIC_ACQUIRE));
 			if (ps_send_fd >= 0 && relay_sendto(ps_send_fd, out, olen,
@@ -271,28 +250,12 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 	return sent;
 }
 
-/* the receiver: per sender node, a window per lane (psrelay.h), allocated
- * on the first datagram from that node.  Reordering is not loss; a counter
- * is lost when it leaves the window unseen; a duplicate is dropped.
- *
- * S299: indexed DIRECTLY by node id.  It was a 64-slot list filled in
- * order and never freed, so the 65th sender ever seen - a fleet past 64,
- * or one that had replaced 64 nodes over its life - got no window: its
- * publishes were delivered but their loss went uncounted.
- *
- * CH-20: the id space it covers is the one a master hands out,
- * 1..PC_CL_NODE_MAX, and a node's lanes (256 windows, 8 KB) are made only
- * once a live member holds that id.  It covered the whole 16-bit field,
- * and any id a frame named got its lanes: up to 512 MB from frames alone.
- * Lanes are still never freed - the receive threads read them without a
- * lock - so the bound is the id space: 8 MB at most, an id reused by a
- * later node finding its predecessor's windows, which a new epoch resets. */
+/* per sender id held by a live member, 256 lane windows (8 KB); never freed, as
+ * the receive threads read them unlocked, so the id space bounds it at 8 MB */
 static struct psr_lane *ps_rx[PC_CL_NODE_MAX + 1];
 
-/* PS11: several receive threads look nodes up here; a new node's lanes
- * are made under ps_rx_lk and published once.  One sender lane arrives on
- * one receive thread (its wire lane, or its flow's hash, picks one socket),
- * so a lane's window has one writer. */
+/* a node's lanes are made under ps_rx_lk and published once; a sender lane arrives
+ * on one receive thread (one socket), so each window has one writer */
 static struct psr_lane *ps_rx_lanes(unsigned node)
 {
 	struct psr_lane *l;
@@ -303,7 +266,7 @@ static struct psr_lane *ps_rx_lanes(unsigned node)
 	if (l)
 		return l;
 	if (!clpeers_by_id_live(cl_peers(), (int)node, cl_now_ms()))
-		return NULL;                   /* CH-20: no member holds it */
+		return NULL;                   /* no live member holds it */
 	pthread_mutex_lock(&ps_rx_lk);
 	l = ps_rx[node];
 	if (!l) {
@@ -344,16 +307,8 @@ void clps_handle_publish(const unsigned char *pt, size_t n)
 		(const char *)pt + 17 + clen, dlen, 1);
 }
 
-/* ---- PS11: the dedicated relay plane --------------------------------------
- * Every cluster datagram used to arrive on one socket read by one thread:
- * membership, pulls, forwards, replication and the pub/sub relay.  The
- * two-host bench lost relays at that socket's buffer from near 100k a
- * second, and a publish flood there also delays the heartbeats membership
- * decides from.  So relays get a port of their own, read by several
- * threads: sockets sharing it with SO_REUSEPORT, each sending worker using
- * its own socket so each lane is a flow the kernel keeps on one receive
- * thread.  Same cluster secret, same seal - the same trust domain.  A peer
- * uses the port only after it answered a probe there (psr_path). */
+/* ---- the dedicated relay plane ---- a port of its own, so a publish flood cannot
+ * delay heartbeats: SO_REUSEPORT threads, used once a probe there is answered */
 
 /* nothing else may hold the port: a stray daemon of the same user would
  * silently join a SO_REUSEPORT group and take a share of the flows */
@@ -424,8 +379,8 @@ fail:
 	return 0;
 }
 
-/* S461: the kernel's hash left one node's two receive threads at 97% and
- * 26% CPU (12 flows).  A lane spread is even by count. */
+/* the kernel's flow hash can load receive threads unevenly; a spread by wire lane
+ * is even by count */
 int clps_lane_spread(int fd, int n)
 {
 #if defined(__linux__) && defined(SO_ATTACH_REUSEPORT_CBPF)
@@ -462,10 +417,8 @@ static void ps_answer_probe(int fd, const unsigned char *pt, size_t n,
 
 	if (n < 11)
 		return;
-	/* CH-14: a member's probe - the live peer holding the id it names, at
-	 * the address it came from.  Any sender's was answered.  (The relay's
-	 * receive threads read the peer table through clpeers_by_id_live,
-	 * which any thread may call.) */
+	/* answered only for the live peer holding the id it names, at the address it
+	 * came from (clpeers_by_id_live is safe from any thread) */
 	{
 		struct peer *pp = clpeers_by_id_live(cl_peers(),
 			(int)ps_get16(pt + 1), cl_now_ms());
@@ -481,7 +434,7 @@ static void ps_answer_probe(int fd, const unsigned char *pt, size_t n,
 		sendto(fd, buf, len, 0, &from->sa, pc_addr_len(from));
 }
 
-/* one relay frame, from a datagram or (S469) a TCP connection */
+/* one relay frame, from a datagram or a TCP connection */
 struct ps_rx_ctx {
 	int fd;
 	unsigned char *pt;
@@ -498,7 +451,7 @@ static void ps_rx_one(void *vctx, const unsigned char *buf, size_t r,
 		__atomic_add_fetch(&ps_rx_other, 1, __ATOMIC_RELAXED);
 		return;
 	}
-	/* S302: relays are data - only this node's own cluster's,
+	/* relays are data - only this node's own cluster's,
 	 * once it has one (a relay never bootstraps anything) */
 	{
 		unsigned char mine[CLWIRE_CID_LEN];
@@ -509,12 +462,12 @@ static void ps_rx_one(void *vctx, const unsigned char *buf, size_t r,
 			return;
 		}
 	}
-	{                                       /* CH-1: each frame once */
+	{                                       /* each frame once */
 		struct clwire_id wid;
 		int rr;
 
 		clwire_id_read(buf, &wid);
-		rr = clreplay_admit(&wid, cl_now_ms());
+		rr = clreplay_admit(&wid, from->in4.sin_addr.s_addr, cl_now_ms());
 		if (rr != CLREPLAY_OK && rr != CLREPLAY_FULL) {
 			__atomic_add_fetch(&ps_rx_other, 1, __ATOMIC_RELAXED);
 			return;
@@ -525,7 +478,7 @@ static void ps_rx_one(void *vctx, const unsigned char *buf, size_t r,
 		clps_handle_publish(pt, ptlen);
 	else if (pt[0] == M_PSPROBE)
 		ps_answer_probe(x->fd, pt, ptlen, from, M_PSPROBE_ACK);
-	else if (pt[0] == M_REPL_MANY)          /* S461 */
+	else if (pt[0] == M_REPL_MANY)
 		clrp_rx(pt, ptlen, from);
 	else if (pt[0] == M_RPPROBE && clrp_taking())
 		ps_answer_probe(x->fd, pt, ptlen, from, M_RPPROBE_ACK);
@@ -548,7 +501,7 @@ void pc_cluster_pubsub_rx_thread(volatile int *stop, int idx)
 		return;
 	}
 	if (ps_rx_lfd[idx] >= 0)
-		tr = clrpt_rx_new(ps_rx_lfd[idx], clrp_host_ok);  /* S469, OM2-11 */
+		tr = clrpt_rx_new(ps_rx_lfd[idx], clrp_host_ok);
 	x.fd = fd;
 	x.pt = pt;
 	pf[0].fd = fd;
@@ -573,7 +526,7 @@ void pc_cluster_pubsub_rx_thread(volatile int *stop, int idx)
 			ssize_t r = recvfrom(fd, buf, HDR_LEN + MAX_DGRAM + 64,
 				MSG_DONTWAIT, &from.sa, &fl);
 
-			pc_iostat_udp_rx(PC_UDP_RELAY, 1, r > 0); /* 0.6.0 step 1 */
+			pc_iostat_udp_rx(PC_UDP_RELAY, 1, r > 0);
 			if (r <= 0)
 				break;
 			ps_rx_one(&x, buf, (size_t)r, &from);
@@ -585,10 +538,8 @@ void pc_cluster_pubsub_rx_thread(volatile int *stop, int idx)
 	free(pt);
 }
 
-/* one live peer's step of the cluster thread's once-a-second probe: probe
- * its relay port until it answers, re-confirm while it does, and return
- * the change for the caller to say (the loop and the words are
- * cluster.c's - M16) */
+/* one live peer's step of the once-a-second probe: probe its relay port until it
+ * answers, re-confirm while it does, and return the change for the caller to say */
 int clps_probe_peer(struct peer *p, long long now)
 {
 	uint64_t nonce;
@@ -598,7 +549,7 @@ int clps_probe_peer(struct peer *p, long long now)
 	    !clpeers_live(p, now))
 		return CLPS_EV_NONE;
 	if (!cl_node_id())
-		return CLPS_EV_NONE;           /* CH-14: answered by id - one first */
+		return CLPS_EV_NONE;           /* probes are answered by id: need one first */
 	randombytes_buf(&nonce, sizeof nonce);
 	if (psr_path_probe_due(&p->ps, now, nonce | 1)) {
 		unsigned char msg[11];
@@ -670,7 +621,7 @@ void pc_cluster_pubsub_relay_figures(int *port, int *threads, int *peers_direct,
 	*rx_dgrams = __atomic_load_n(&ps_rx_dgrams, __ATOMIC_RELAXED);
 }
 
-/* ---- PS12: the cluster thread's side of interest ------------------------- */
+/* ---- the cluster thread's side of interest ------------------------------ */
 
 static void pv_begin(void) { __atomic_add_fetch(&ps_int_seq, 1, __ATOMIC_ACQ_REL); }
 static void pv_end(void) { __atomic_add_fetch(&ps_int_seq, 1, __ATOMIC_ACQ_REL); }
@@ -827,13 +778,13 @@ static void pv_heartbeat(struct peer *p, uint64_t iv, long long now)
 	pv_maybe_request(p, now);
 }
 
-/* a heartbeat's relay fields, from the peer thread (was inline in its
- * ALIVE handling): 1 when it withdrew a port it was being sent on */
+/* a heartbeat's relay fields, from the peer thread: 1 when it withdrew a port
+ * it was being sent on */
 int clps_heard(struct peer *p, uint16_t np, uint64_t interest, long long now)
 {
 	int withdrawn = 0;
 
-	/* PS11: a new or withdrawn relay port starts unproven */
+	/* a new or withdrawn relay port starts unproven */
 	if (np != __atomic_load_n(&p->ps.port, __ATOMIC_ACQUIRE)) {
 		/* a withdrawn port is a peer's configuration, not an
 		 * outage: the caller says so, and not as a fallback */
@@ -846,8 +797,8 @@ int clps_heard(struct peer *p, uint16_t np, uint64_t interest, long long now)
 		p->rp_warned = 0;
 	}
 	psr_path_port(&p->ps, np);
-	psr_path_port(&p->rp, np);                  /* S461: the same port */
-	/* PS12: what it wants relayed */
+	psr_path_port(&p->rp, np);                  /* the same port */
+	/* what it wants relayed */
 	pv_heartbeat(p, interest, now);
 	return withdrawn;
 }
@@ -1037,13 +988,13 @@ void pc_cluster_pubsub_interest_figures(struct pc_psint_figures *f)
 
 /* ---- the plane's state, for cluster.c ------------------------------------ */
 
-/* PS12: patterns the peers hold; fixed buckets, read without a lock */
+/* patterns the peers hold; fixed buckets, read without a lock */
 void clps_init(void)
 {
 	ps_fpat_ready = psi_init(&ps_fpat, 4096, PSI_PATTERNS) == 0;
 }
 
-/* PS7: a receiver tells this process's relay sequence from the last one's
+/* a receiver tells this process's relay sequence from the last one's
  * by it (psrelay.h) */
 void clps_new_epoch(void)
 {

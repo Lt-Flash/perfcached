@@ -1,4 +1,4 @@
-# perfcached-upgrade.service - UP5 (DESIGN 12nf): installs the signed build
+# perfcached-upgrade.service - installs the signed build
 # a node asked for, switches to it, and switches back if it is not READY.
 # Started by perfcached-upgrade.path; see @SBINDIR@/perfcached-upgrade for
 # what it trusts and /etc/perfcached/upgrade.conf for its settings.

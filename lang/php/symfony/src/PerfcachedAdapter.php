@@ -60,7 +60,8 @@ class PerfcachedAdapter extends AbstractAdapter
     protected function doClear(string $namespace): bool
     {
         do {
-            $ids = $this->client->keys($this->collection, $namespace . '*');
+            // S498: the server's glob reads \ * ? [ ] - the namespace's own are literal
+            $ids = $this->client->keys($this->collection, addcslashes($namespace, '\\*?[]') . '*');
             foreach ($ids as $id) {
                 $this->client->del($this->collection, $id);
             }

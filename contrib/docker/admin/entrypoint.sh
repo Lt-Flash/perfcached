@@ -1,26 +1,6 @@
 #!/bin/sh
-# The admin image's entrypoint (DESIGN 12no, S413): the dashboard on the
-# container's loopback as its own user, nginx in front on 8080 (plain) or
-# 8443 (TLS, when /etc/perfcached/tls/cert.pem and key.pem are mounted).
-#
-# Configuration, one of:
-#   - mount /etc/perfcached/perfcached-dashboard.conf (the file wins), or
-#   - environment: PCD_SEEDS (comma-separated host:port, required),
-#     PCD_SECRET (the client secret) or PCD_SECRET_FILE (a mounted file),
-#     PCD_SESSION_KEY (64 hex, for several replicas) - optional;
-#     PCD_FRONT_PROXY=yes when a proxy of your own (HAProxy, nginx) is
-#     the ONLY thing that reaches the published port: nginx then passes
-#     the X-Forwarded-For it received through unchanged, so the dashboard's
-#     lockout counts the browser the front saw, not the front.  Never set
-#     it on a port browsers reach directly - a client could forge the
-#     header and dodge the lockout.
-# `listen` is always 127.0.0.1:8090 and `trusted_proxy` 127.0.0.1 here:
-# nginx is the only thing that reaches the dashboard, and the lockout
-# counts the client nginx saw.
-#
-# Anything after the image name runs instead of the services, with the
-# config rendered first (e.g. `perfcli -h ... stats`, `perfcached-dashboard
-# -V`, `sh`).
+# The admin image's entrypoint: the dashboard on loopback behind nginx on 8080, or 8443 when
+# tls/cert.pem and key.pem are mounted; arguments run instead of the services, config rendered first.
 set -eu
 CONF=/etc/perfcached/perfcached-dashboard.conf
 if [ ! -s "$CONF" ] && [ -n "${PCD_SEEDS:-}" ]; then

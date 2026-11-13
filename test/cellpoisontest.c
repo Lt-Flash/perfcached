@@ -1,22 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * cellpoisontest.c - TM-2 (DESIGN 12ob): what AddressSanitizer is told
- * about the arena's cells, read back from ASan's own shadow.
- *
- * In an ASan build (check-asan; a plain build says so and skips):
- *  A  a cell handed out is open whole - the table rewrites a record in
- *     place up to the cell's bound
- *  B  the chunk's next cell, not handed out yet, is closed past its head
- *  C  a freed cell is closed past PCACHE_CELL_OPEN, and its class byte and
- *     link stay open
- *  D  handed out again, it is open whole again
- *  E  sent home (the process's private cells flushed), still closed
- *  F  a chunk retired is closed whole, head and all; the next carve opens
- *     what it hands out
- * Fail-first: an arena that tells ASan nothing leaves the freed cell open
- * (C), and the retired chunk (F).
- */
+/* cellpoisontest.c - what AddressSanitizer is told about the arena's cells, read back from ASan's
+ * shadow (a plain build skips); an arena that tells ASan nothing fails C and F. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"
@@ -65,7 +50,7 @@ int main(void)
 	pcache_reclaim_cooloff_s = 0;
 	pcache_reclaim_keep = 0;           /* a drained chunk retires at once */
 
-	/* A, B: the first cell of a class comes off a fresh chunk's bump */
+	/* A: a cell handed out is open whole; B: the chunk's next cell is closed past its head */
 	a = pcache_cell_alloc(100);
 	sz = pcache_cell_bound(a);
 	CHK(a && sz >= 100, "a cell for 100 bytes: %u", sz);
@@ -74,25 +59,25 @@ int main(void)
 		closed(a + sz + PCACHE_CELL_OPEN) && closed(a + 2 * sz - 1),
 		"B: the next cell, not handed out: its head open, the rest closed");
 
-	/* C */
+	/* C: a freed cell is closed past PCACHE_CELL_OPEN, its class byte and link open */
 	pcache_cell_free(a);
 	CHK(!closed(a) && !closed(a + 8) && closed(a + PCACHE_CELL_OPEN) &&
 		closed(a + sz - 1),
 		"C: freed - the class byte and the link open, bytes %d..%u closed",
 		PCACHE_CELL_OPEN, sz - 1);
 
-	/* D: the private stack hands the same cell back */
+	/* D: handed out again, open whole again - the private stack hands the same cell back */
 	b = pcache_cell_alloc(100);
 	CHK(b == a && open_whole(b, sz), "D: handed out again (%s), open whole",
 		b == a ? "the same cell" : "another cell");
 
-	/* E */
+	/* E: sent home (the private cells flushed), still closed */
 	pcache_cell_free(b);
 	pcache_arena_flush_private();
 	CHK(closed(b + PCACHE_CELL_OPEN) && !closed(b),
 		"E: sent home, still closed past its head");
 
-	/* F: a whole chunk of one class, freed and retired */
+	/* F: a retired chunk is closed whole; the next carve opens what it hands out */
 	for (i = 0; i < NBIG; i++)
 		big[i] = pcache_cell_alloc(BIG - 64);
 	for (i = 0; i < NBIG; i++)

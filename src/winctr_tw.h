@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * winctr_tw.h - S351: write a counter into a /stats tree with its
- * five-minute window beside it.  `name` and `win_name`: the cumulative
- * figure stays for /metrics and for anyone joining on it, the window is
- * what the status page shows, null until there is a baseline (winctr.h).
- */
+/* winctr_tw.h - write a counter into a /stats tree with its five-minute window beside it:
+ * `name` stays cumulative (/metrics), `win_name` is null until there is a baseline. */
 #ifndef PC_WINCTR_TW_H
 #define PC_WINCTR_TW_H
 
@@ -14,10 +10,8 @@
 #include "ptree.h"
 #include "winctr.h"
 
-/* @wk: the counter's key in the window table - unique across the tree.
- * Every counter that reaches the tree this way started with the process
- * (or, for a collection, with its table), so it counts from zero while
- * the process is younger than a window. */
+/* @wk: the counter's key in the window table, unique across the tree.  Each such counter
+ * started with the process (or its table), so it counts from zero in the first window. */
 static inline void pc_tw_ctr(struct pc_tw *out, const char *wk,
 		const char *name, unsigned long long v)
 {

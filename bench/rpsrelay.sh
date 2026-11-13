@@ -1,44 +1,6 @@
 #!/bin/bash
-# rpsrelay.sh [reps] [secs] - pub/sub across two nodes: publishers on node
-# A, subscribers on node B, the driver (bench/rpsbench.c) on a third host,
-# so a publish crosses the fleet's relay (perfcached) or the cluster bus
-# (a two-master Redis Cluster) before it is delivered, and the latency is
-# read against one clock.  Run it ON node A; B and the driver are reached
-# over ssh (keys, no passwords).
-#
-#   A_HOST=<A's address> B_HOST=<B's address> DRIVER=<driver's address> \
-#   PERFCACHED=./perfcached RPSBENCH=./rpsbench bench/rpsrelay.sh 2 8
-#
-# Environment (defaults in brackets):
-#   A_HOST, B_HOST, DRIVER    addresses; required
-#   PERFCACHED, RPSBENCH      binaries to copy out [./perfcached ./rpsbench]
-#   RUNTIME_A, RUNTIME_B      container runtimes for Redis [podman]
-#   REDIS_IMG                 [docker.io/library/redis:8]
-#   SERVER_CPUS               the servers' cores on A and B [0-7]
-#   WORKERS                   perfcached workers [4]
-#   ARMS                      "pc redis"; ONLY picks cells by name
-#   PUBHOST                   publish somewhere other than A (a control)
-#   IFACE_B, IFACE_DRIVER     NICs to sample B's tx and the driver's softirq
-#   DRIVER_RPS                e.g. ff: spread the driver's receive softirq
-#                             over its CPUs for the run, restored after
-#   MULTICAST                 the fleet's group [239.255.77.62:17262]
-#   OUT                       where results.tsv goes [/tmp/rpsrelay-out]
-#
-# READ THE DRIVER'S RECEIVE PATH FIRST.  A driver whose NIC has one
-# receive queue and no RPS does all receive softirq on one CPU.  perfcached
-# with four workers writes 2.4-3.5x the packets one Redis thread does for
-# the same bytes, and that one CPU saturates: measured, 64 subscribers at
-# 20k/s read p50 9.7 ms with RPS off and 1.06 ms with it on - a figure of
-# the driver, not the server.  The script warns when it sees that shape;
-# DRIVER_RPS fixes it for the run.  driver_softirq_cores is in every row.
-#
-# Cells, 64-byte payloads, 8 publisher connections on 2 threads:
-#   s1-paced20k, s1-max, s64-paced20k (64 subscribers on 5 threads), s64-max
-# Before each cell B must stop taking in the last one's traffic; after it,
-# the relay's counters (perfcached) or the bus's (Redis) and B's client
-# output buffers (Redis) are recorded.  Flat out the two fail differently:
-# the relay is at-most-once and counts its losses (relay_lost); the bus
-# never drops, lags, and disconnects subscribers at their output limit.
+# rpsrelay.sh [reps] [secs] - pub/sub latency across two nodes, perfcached's relay vs a Redis
+# Cluster bus; run ON node A with A_HOST, B_HOST, DRIVER set (ssh keys to B and the driver).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPS=${1:-2}

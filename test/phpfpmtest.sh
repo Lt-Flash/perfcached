@@ -1,18 +1,6 @@
 #!/bin/sh
-# phpfpmtest.sh - PE-2: the extension's handles under a real PHP-FPM pool.
-#   A. workers recycled every 10 requests: each holds one handle, dialled once and
-#      taken up again on every later request; the daemon sees one connection a worker
-#   B. perfcached.prepare_secrets_file: the master derives once, and a worker's first
-#      dial skips Argon2id - at most half of A's, which is the control
-#   C. the daemon frozen, the one worker killed in the middle of its call: the worker
-#      FPM starts in its place answers
-#   D. the daemon restarted under a worker: its next request re-dials before its first
-#      call and raises nothing, on the same worker
-#   E. a call times out against a frozen daemon: that request's next call, on the same
-#      handle, works once it thaws
-#   F. a list of seeds, the dead one first, workers recycled: every worker answers, on
-#      one handle and one dial; the dead one alone fails, which is the control
-# Usage: test/phpfpmtest.sh [./perfcached] [php-fpm8.3] [lang/php/modules/perfcached.so]
+# phpfpmtest.sh - the PHP extension's handles under a real PHP-FPM pool: one dial per worker kept
+# across requests, through recycled and killed workers, a restarted or frozen daemon, a dead seed.
 set -u
 BIN=${1:-./perfcached}
 FPM=${2:-php-fpm8.3}
@@ -132,7 +120,7 @@ read -r N G W H DI RU PR DB FB < "$D/b.st"
 [ "$G" = 45 ] && [ "$PR" = 1 ] && [ "$FB" -ge 1 ] && [ "$DA" -ge 20 ] && [ $((DB * 2)) -le "$DA" ] \
 	&& ok "prepared in the master: a worker's first dial takes ${DB} ms, against ${DA} ms without" \
 	|| bad "prepared $PR, $G of 45 right; first dial ${DB} ms against ${DA} ms without (want at most half, and that at least 20 ms): $(sed -n 2p "$D/b.st" | cut -c1-200)"
-grep -q "can be read by anyone" "$D/fpmB.log" "$D/fpmB.out" && bad "the warning fired on a 0600 file" || ok "no warning on a file only its owner reads"
+grep -q "read by others than its owner" "$D/fpmB.log" "$D/fpmB.out" && bad "the warning fired on a 0600 file" || ok "no warning on a file only its owner reads"
 fpm_stop
 
 echo "--- C. a worker killed in the middle of its call"

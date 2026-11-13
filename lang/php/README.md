@@ -14,6 +14,10 @@ phpize8.3
 make
 ```
 
+`DIR` is libperfd's prefix, or a perfcached source tree with `libperfd.so`
+built (`--with-perfcached=../..` from here); `make phpext` at the top of the
+tree does all of this against the tree's own library.
+
 Load `modules/perfcached.so` with `extension=` in the SAPI's `php.ini`.
 
 On Debian 13 with Sury's PHP 8.3, `lang/php/debian` builds the package
@@ -42,8 +46,11 @@ once none has.  Once connected the handle works from the member list it learned,
 so the list need not name every node.
 
 A value is bytes both ways.  A collection, key or field is a C string: a NUL
-in one is a `ValueError`.  The largest record, key and value together, is
-262,080 bytes; a larger value is refused.
+in one is a `ValueError`.  A record - key, value and a 28-byte header - is at
+most 262,080 bytes, so key and value together at most 262,052; a larger value
+is refused (`PerfcachedServerException`, "value too large").  A write that a
+node must forward to the key's owner (a shard fleet, without `route_keys`)
+carries at most 58,000 bytes of value.
 
 | Method | Answers |
 |---|---|
@@ -61,11 +68,12 @@ in one is a `ValueError`.  The largest record, key and value together, is
 | `hlen(col, key)` | the field count |
 | `hincrby(col, key, field, by = 1)` | the new value |
 | `hgetall(col, key)` | field => value |
-| `members()`, `ownerOf(col, key)`, `activeNode()`, `failovers()`, `routing()`, `serverVersion()`, `maintain()`, `ping()`, `close()` | the fleet as this handle sees it |
+| `members()`, `ownerOf(col, key)`, `activeNode()`, `failovers()`, `routing()`, `serverVersion()` | the fleet as this handle sees it |
+| `maintain()`, `ping()`, `close()` | nothing |
 | `stats(col = null)` | the daemon's stats document, as an array |
 
-An `mget` with a key whose node did not answer in time throws, and never reads
-as a miss: ask again.
+An `mget` with a key whose node did not answer in time throws
+`PerfcachedRefusedException`, and never reads as a miss: ask again.
 
 ## Options
 
@@ -73,13 +81,13 @@ The third argument of the constructor:
 
 | Option | Meaning |
 |---|---|
-| `secrets` | a string, or a list tried in order (rotation); none = plaintext, for a loopback door. A `plaintext = loopback` door takes no handshake: a secret fails there with `PerfcachedAuthException` |
+| `secrets` | a string, or a list of at most 8 tried in order (rotation); none = plaintext, for a loopback door. A secret holding a NUL is a `ValueError`. A `plaintext = loopback` door takes no handshake: a secret fails there with `PerfcachedAuthException` |
 | `encrypt` | default true: stay encrypted after the handshake.  false lets a node that allows it drop to plaintext |
-| `unix` | a socket path, in place of host and port |
+| `unix` | a socket path, in place of host and port (a host must still be given; it is not dialled) |
 | `persistent` | default true: keep the handle for this process's next request.  false: it closes with the object |
 | `connect_timeout_ms`, `io_timeout_ms` | 5000 each: a dial (TCP and handshake), and each send or receive |
 | `policy` | `Perfcached::POLICY_FAILOVER` (default, stays where it connected), `POLICY_ROUND_ROBIN`, `POLICY_LEAST_CONN`, `POLICY_WEIGHTED`: these spread at connect, and when a member comes up 1 in N handles moves to it |
-| `spares` | standby connections: 0 = one per other member; `Perfcached::SPARES_NONE` = a bare handle |
+| `spares` | standby connections: 0 = one per other member, at most 8; `Perfcached::SPARES_NONE` = a bare handle |
 | `route_keys`, `route_hints` | send a request to the node that should hold its key |
 | `refresh_ms`, `keepalive_s`, `idle_ping_ms`, `worker_balance`, `name` | as `perfd_opts` in `perfd.h` |
 
@@ -103,13 +111,14 @@ perfcached.prepare_secrets_file=/etc/perfcached/php-secrets
 ```
 
 The file holds the secrets, one a line, readable by root alone: the master reads
-it before it drops privileges.  The application still passes `secrets` as usual.
+it before it drops privileges, and warns when anyone but its owner may read it.
+The application still passes `secrets` as usual.
 `Perfcached::pool()` says what this process's pool has done.
 
 ## With Symfony
 
 `symfony/` is a composer package, `perfcached/symfony-cache`: `PerfcachedAdapter`,
-a cache pool on a collection, for `symfony/cache` 5.4 and later.
+a cache pool on a collection, for `symfony/cache` 5.4, 6.4 and 7.
 
 ```php
 $pc = new \Perfcached($host, 6479, ['secrets' => [$secret]]);
@@ -123,8 +132,9 @@ every time.
 
 ## Errors
 
-Every failure throws a `PerfcachedException`, a `RuntimeException`, with
-`perfd_error_kind` as its code: `PerfcachedTransportException`,
+A bad argument is a `ValueError`.  Every other failure throws a
+`PerfcachedException`, a `RuntimeException`, with `perfd_error_kind` as its
+code: `PerfcachedTransportException`,
 `PerfcachedAuthException`, `PerfcachedRefusedException`,
 `PerfcachedServerException` or `PerfcachedArgumentException`, or the base class
 for the rest.

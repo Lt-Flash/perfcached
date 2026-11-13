@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * config.c — INI-style config parser + strict validation (task S5).
- * See config.h for the contract and the hard rules.
- */
+/* config.c - INI-style config parser and strict validation; config.h holds the contract. */
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,12 +18,11 @@
 #include "colname.h"
 #include "events.h"
 #include "relkey.h"
-#include "configint.h"                 /* the parser's state (wave 1) */
+#include "configint.h"                 /* the parser's state */
 #include <strings.h>
 
-/* S153: the log_events list parser.  It lives here, not in events.c,
- * because wipetest links config.c on its own - a parser is config's job,
- * and events.c is the consumer of the mask, not its source. */
+/* the log_events list parser lives here, not in events.c: wipetest links
+ * config.c on its own, and events.c consumes the mask, not its source */
 int pc_ev_parse(const char *list, unsigned int *mask)
 {
 	char *dup, *tok, *save;
@@ -113,14 +109,13 @@ int level_of(const char *v)
 	return -100;
 }
 
-/* S343: the one rule (colname.h) - the config's own check was it, less
- * the leading '-' */
+/* the one collection-name rule (colname.h) */
 static int name_ok(const char *s)
 {
 	return pc_col_name_ok(s, strlen(s));
 }
 
-/* S352: smtp://host[:port][/] or smtps://host[:port][/] - no credentials
+/* smtp://host[:port][/] or smtps://host[:port][/] - no credentials
  * in the URL (they belong in user = and [secrets] mail), no path, no query */
 int mail_url_ok(struct pstate *ps, const char *url)
 {
@@ -153,7 +148,7 @@ int mail_url_ok(struct pstate *ps, const char *url)
 	return 1;
 }
 
-/* S352: local@domain.tld in printable ASCII, no spaces, brackets or
+/* local@domain.tld in printable ASCII, no spaces, brackets or
  * separators - enough to catch a typo or a pasted display name */
 int mail_addr_ok(const char *a)
 {
@@ -194,8 +189,8 @@ static int enter_section(struct pstate *ps, char *hdr)
 		ps->sect = S_WAL;
 	} else if (!strcasecmp(hdr, "cluster") && !arg) {
 #ifdef PC_EDITION_STANDALONE
-		/* S250: refused, never ignored - a node that silently ran
-		 * alone would look like a fleet member to its operator */
+		/* refused, never ignored - a node that silently ran
+		 * alone would look like a fleet member */
 		PERR(ps, "[cluster]: this is the STANDALONE build of perfcached "
 			"- no cluster code is compiled in.  Remove the section, "
 			"or build the clustered edition (make menuconfig, then "
@@ -206,17 +201,16 @@ static int enter_section(struct pstate *ps, char *hdr)
 		ps->cfg->cl_enabled = 1;
 	} else if (!strcasecmp(hdr, "mail") && !arg) {
 #ifndef PC_MAIL_CURL
-		/* S352: refused, never ignored - an operator who wrote
-		 * [mail] expects mail, and a build that cannot send must
-		 * say so at the check, not stay silent at the incident */
+		/* refused, never ignored - [mail] expects mail, and a build that
+		 * cannot send must say so at the check, not at the incident */
 		PERR(ps, "[mail]: %s\n", PC_MAIL_NOT_BUILT);
 		return -1;
 #endif
 		ps->sect = S_MAIL;
 		cfg->mail_on = 1;
-	} else if (!strcasecmp(hdr, "alerts") && !arg) {     /* S380 */
+	} else if (!strcasecmp(hdr, "alerts") && !arg) {
 		ps->sect = S_ALERTS;
-	} else if (!strcasecmp(hdr, "upgrade") && !arg) {    /* UP6n */
+	} else if (!strcasecmp(hdr, "upgrade") && !arg) {
 		ps->sect = S_UPGRADE;
 	} else if (!strcasecmp(hdr, "collection")) {
 		if (!arg || !name_ok(arg)) {
@@ -233,22 +227,21 @@ static int enter_section(struct pstate *ps, char *hdr)
 		ps->col->name = strdup(arg);
 		ps->col->buckets_log2 = -1;
 		ps->col->mode = PC_MODE_STORE;
-		ps->col->up_negative_ms = 2000;          /* S331 */
-		ps->col->up_rewarm_max = 100000;         /* S421 */
-		ps->col->up_echo_ms = 2000;              /* S422 */
+		ps->col->up_negative_ms = 2000;
+		ps->col->up_rewarm_max = 100000;
+		ps->col->up_echo_ms = 2000;
 		ps->col->up_timeout_ms = 500;
 		ps->col->up_conns = 2;
 		ps->col->up_tracking = 1;
+		ps->col->up_tls_verify = 1;
 		ps->col->up_on_error = PC_UP_ON_ERROR_ERROR;
 		ps->col->up_drain_rate = 5000;
-		/* S401: what keeps an upfill sweep within a quarter of the
-		 * writer thread at any value size (measured on 224, DESIGN
-		 * 12nl) - 5,000 keys a second alone already hold small values
-		 * there */
+		/* keeps an upfill sweep within a quarter of the writer thread at
+		 * any value size; 5,000 keys a second alone hold small values there */
 		ps->col->up_drain_mb_rate = 16;
-		ps->col->up_pass_max_kb = 1024;        /* S385 */
-		ps->col->up_write_queue = 10000;       /* AR2 */
-		ps->col->up_preempt = 1;                 /* S382: the operator's */
+		ps->col->up_pass_max_kb = 1024;
+		ps->col->up_write_queue = 10000;
+		ps->col->up_preempt = 1;
 		ps->col->up_preempt_hold_s = 30;
 	} else {
 		PERR(ps, "unknown section [%s]\n", hdr);
@@ -257,24 +250,8 @@ static int enter_section(struct pstate *ps, char *hdr)
 	return 0;
 }
 
-/* "store|eager|proxy|shard" -> enum; -1 = not a mode word.
- *
- * eager is spelled as a MODE rather than as a second parameter because
- * the config never allowed it anywhere else: it was refused beside
- * proxy and beside shard, so the pair named four states and not six.
- * Carried as an attribute it went missing from every report - the
- * built-in page called a fully eager fleet "all in store mode" while
- * every node was replicating every record to every peer.
- *
- * Internally it stays PC_MODE_STORE plus a flag, which is what the
- * cluster config digest and the ALIVE wire already carry, so a node
- * running `mode = eager` produces the same digest as an older node
- * running `mode = store` + `eager = 1` and a rolling upgrade cannot
- * split the cluster on it.
- *
- * @eager receives 1 for the eager spelling; NULL means eager is not
- * accepted at this call site.
- */
+/* mode word -> enum, -1 = none.  eager is PC_MODE_STORE plus *@eager = 1, the same digest as
+ * `mode = store` + `eager = 1`, so a rolling upgrade cannot split on it; @eager NULL refuses it */
 int mode_of(const char *v, int *eager)
 {
 	if (eager)
@@ -306,11 +283,8 @@ const char *mode_name(enum pc_pull_mode m, int eager)
 	}
 }
 
-/* @kind: 0 native, 1 RESP-only (S33), 2 HTTP metrics (S46) */
-/* IP6-1: "host:port" or "[v6]:port" through the one parser (pcaddr.c),
- * the old words kept for what it refuses.  Without brackets the port is
- * after the last colon, as this file always split it; the port is a plain
- * decimal number now (strtol also took "+80" and " 80") */
+/* "host:port" or "[v6]:port" through the one parser (pcaddr.c); without brackets the port
+ * is after the last colon */
 int split_hostport(struct pstate *ps, const char *v, const char *form,
 		char **host, int *port)
 {
@@ -329,6 +303,7 @@ int split_hostport(struct pstate *ps, const char *v, const char *form,
 	return -1;
 }
 
+/* @kind: 0 native, 1 RESP-only, 2 HTTP metrics */
 int add_listener_ex(struct pstate *ps, enum pc_listen_type type,
 		const char *v, int kind)
 {
@@ -356,7 +331,7 @@ int add_listener_ex(struct pstate *ps, enum pc_listen_type type,
 		if (split_hostport(ps, v, "tcp listener must be host:port",
 		        &addr, &port))
 			return -1;
-		/* 12np: an EXPLICIT IPv6 listener on a host without IPv6 is
+		/* an EXPLICIT IPv6 listener on a host without IPv6 is
 		 * refused by name - never silently dropped, never IPv4 */
 		if (pc_addr_parse(addr, 0, &a6) == 0 &&
 		    pc_addr_family(&a6) == AF_INET6 && !pc_ipv6_usable(&why)) {
@@ -386,10 +361,8 @@ int add_listener(struct pstate *ps, enum pc_listen_type type,
 	return add_listener_ex(ps, type, v, 0);
 }
 
-/* one "a.b.c.d/len" (or a bare address = /32) into an allow-list.
- * Shared by resp_allow and http_allow: both guard a listener that
- * has no handshake, so the network is its authentication.  12np IP6-2:
- * or "v6/len" ("[v6]/len" too; a bare IPv6 address = /128) */
+/* one CIDR (bare address = /32 or /128, "[v6]/len" too) into an allow-list; resp_allow and
+ * http_allow guard listeners with no handshake, so the network is their authentication */
 static int add_allow(struct pstate *ps, const char *v, const char *what,
 		struct pc_cidr *list, int *n)
 {
@@ -417,7 +390,7 @@ static int add_allow(struct pstate *ps, const char *v, const char *what,
 	}
 	memset(&list[*n], 0, sizeof list[*n]);
 	if (inet_aton(host, &ia)) {
-		/* IPv4 as before - inet_aton's short forms ("10/8") included */
+		/* IPv4 - inet_aton's short forms ("10/8") included */
 		if (slash && parse_int(ps, slash + 1, 0, 32, &len))
 			return -1;
 		list[*n].family = AF_INET;
@@ -464,7 +437,7 @@ int add_http_allow(struct pstate *ps, const char *v)
 		&ps->cfg->n_http_allow);
 }
 
-/* S358: "off" or 1d..7d - how often /stats and the page start counting
+/* "off" or 1d..7d - how often /stats and the page start counting
  * again.  0 days = never. */
 int stats_reset_parse(const char *v, int *days)
 {
@@ -482,7 +455,7 @@ int stats_reset_parse(const char *v, int *days)
 	return 0;
 }
 
-/* S358: HH:MM or HH:MM:SS, local time - seconds past midnight */
+/* HH:MM or HH:MM:SS, local time - seconds past midnight */
 int hhmm_parse(const char *v, int *secs)
 {
 	int h, m, s = 0, n = 0;
@@ -522,13 +495,13 @@ static int handle_kv(struct pstate *ps, char *key, char *val)
 	case S_COLLECTION:
 		rc = cfg_kv_collection(ps, key, val);
 		break;
-	case S_MAIL:                                     /* S352 */
+	case S_MAIL:
 		rc = cfg_kv_mail(ps, key, val);
 		break;
-	case S_ALERTS:                                   /* S380 */
+	case S_ALERTS:
 		rc = cfg_kv_alerts(ps, key, val);
 		break;
-	case S_UPGRADE:                                  /* UP6n */
+	case S_UPGRADE:
 		rc = cfg_kv_upgrade(ps, key, val);
 		break;
 	case S_NONE:
@@ -541,7 +514,7 @@ static int handle_kv(struct pstate *ps, char *key, char *val)
 	return -1;
 }
 
-/* 12nw: the keymap's digest key, minted once per process */
+/* the keymap's digest key, minted once per process */
 static unsigned char km_key[crypto_generichash_KEYBYTES];
 static int km_key_set;
 
@@ -602,55 +575,52 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 
 	memset(cfg, 0, sizeof *cfg);
 	cfg->workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
-	cfg->io_backend = PC_IO_URING;   /* S361: epoll where refused */
-	cfg->output_stall_s = 30;        /* S372 */
-	cfg->address_wait_s = 30;        /* S294 */
-	cfg->mail.timeout_s = 30;        /* S352 */
+	cfg->io_backend = PC_IO_URING;   /* epoll where refused */
+	cfg->output_stall_s = 30;
+	cfg->address_wait_s = 30;
+	cfg->mail.timeout_s = 30;
 	cfg->mail.tls_verify = 1;
 	cfg->mail.min_interval_s = 900;
 	cfg->mail.digest_s = 60;
 	cfg->mail.level = PC_MAIL_LVL_WARNING;
-	cfg->upgrade.stage_mb = 256;                       /* UP6n */
+	cfg->upgrade.stage_mb = 256;
 	snprintf(cfg->upgrade.results_dir, sizeof cfg->upgrade.results_dir,
-		"/var/lib/perfcached-upgrade");             /* UPS: the helper's default */
-	cfg->alerts.cpu_warn = cfg->alerts.io_warn = 65;   /* S380: the operator's */
+		"/var/lib/perfcached-upgrade");             /* the helper's default */
+	cfg->alerts.cpu_warn = cfg->alerts.io_warn = 65;
 	cfg->alerts.mem_warn = cfg->alerts.arena_warn = 65;
 	cfg->alerts.cpu_crit = cfg->alerts.io_crit = 75;
 	cfg->alerts.mem_crit = cfg->alerts.arena_crit = 75;
-	cfg->alerts.epoll_busy = 80;     /* S379 */
-	cfg->alerts.link_warn = 80;      /* S465 */
+	cfg->alerts.epoll_busy = 80;
+	cfg->alerts.link_warn = 80;
 	cfg->alerts.link_crit = 95;
-	cfg->keys_turn_us = PC_KEYS_TURN_US_DEFAULT;  /* S292 */
-	cfg->grow_at_pct = 75;           /* S150: the operator's figure; 4/6 = 67 was the hardcode */
-	cfg->autoscale = PC_AUTOSCALE_AUTO; /* S239: today's behaviour */
-	cfg->redis_types = PC_TYPES_STRICT; /* S280: Redis 8's, by default */
-	cfg->shrink_at_pct = 0;          /* S150 D: 0 = a quarter of grow_at_pct */
-	/* S175: at six slots a bucket and a 75% target, Poisson(4.5) leaves
-	 * ~7% of records in the leg whatever the drain does; 50% leaves
-	 * ~1.7% for about half a megabyte more index per 62,000 records,
-	 * which is the trade the operator asked for.  1% of entries stuck
-	 * is the line at which the leg counts as a tax worth paying it. */
+	cfg->keys_turn_us = PC_KEYS_TURN_US_DEFAULT;
+	cfg->grow_at_pct = 75;
+	cfg->autoscale = PC_AUTOSCALE_AUTO;
+	cfg->redis_types = PC_TYPES_STRICT; /* Redis 8's, by default */
+	cfg->shrink_at_pct = 0;          /* 0 = a quarter of grow_at_pct */
+	/* six slots a bucket at a 75% target leave ~7% of records in the leg, 50% ~1.7%;
+	 * 1% of entries stuck is where the leg counts as a tax worth paying */
 	cfg->grow_floor_pct = 50;
 	cfg->leg_stuck_pct = 1;
-	cfg->shrink_cooloff_s = 60;      /* S150 D: the operator's starting figure */
-	cfg->prefetch_min_keys = 65536;  /* S232: ~16 MB LLC / ~200 B a record */
+	cfg->shrink_cooloff_s = 60;
+	cfg->prefetch_min_keys = 65536;  /* ~16 MB LLC / ~200 B a record */
 	cfg->slowlog_usec = 10000;
-	cfg->stats_reset_days = 1;  /* S358: daily, so no count reaches billions */
+	cfg->stats_reset_days = 1;  /* daily, so no count reaches billions */
 	cfg->stats_reset_at_s = 0;  /* ... at local midnight */
-	cfg->max_clients = 0;       /* S161: derived from the descriptor limit */
-	cfg->memory_floor_pct = 15; /* S366: refuse clients under 15% free */
+	cfg->max_clients = 0;       /* derived from the descriptor limit */
+	cfg->memory_floor_pct = 15; /* refuse clients under 15% free */
 	cfg->memory_floor_mb = 0;
 	cfg->pubsub_queue_mb = 16;  /* a burst's worth for one worker, not a flood's */
 	cfg->query_log = 0;
 	cfg->query_log_keys = 1;          /* hashed unless asked otherwise */
-	cfg->http_timeout_s = 5;    /* S46: a scrape takes milliseconds */
-	cfg->http_rate = 20;        /* 0.6.2: a page tab asks about once a second */
-	cfg->http_cache_ms = 1000;  /* 0.6.2: the page polls every 3 s */
-	cfg->enable_lockout_after = 5;   /* S417: a guessed privilege secret */
+	cfg->http_timeout_s = 5;    /* a scrape takes milliseconds */
+	cfg->http_rate = 20;        /* a page tab asks about once a second */
+	cfg->http_cache_ms = 1000;  /* the page polls every 3 s */
+	cfg->enable_lockout_after = 5;   /* a guessed privilege secret */
 	cfg->enable_lockout_s = 60;
-	cfg->install_mode = PC_INSTALL_AUTO;   /* PD-9 */
-	cfg->pubsub_udp = 1;        /* PS5: only a client that asks gets UDP */
-	cfg->keepalive_s = 300;     /* PS2: redis's tcp-keepalive default; a
+	cfg->install_mode = PC_INSTALL_AUTO;
+	cfg->pubsub_udp = 1;        /* only a client that asks gets UDP */
+	cfg->keepalive_s = 300;     /* redis's tcp-keepalive default; a
 	                             * dead subscriber is found by the kernel */
 	if (cfg->workers < 1)
 		cfg->workers = 1;
@@ -660,8 +630,8 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 	cfg->arena_mb = 64;
 	cfg->plaintext = PC_PLAINTEXT_NEVER;
 	cfg->reclaim_keep = 1;
-	cfg->pin_require = 0;                       /* S167: warn, as before */
-	cfg->huge_pages_off = 0;                    /* S167: probe the ladder */
+	cfg->pin_require = 0;                       /* warn */
+	cfg->huge_pages_off = 0;                    /* probe the ladder */
 	cfg->reclaim_quiet_s = 5;
 	cfg->reclaim_cooloff_s = 10;
 	cfg->reclaim_giveback = 1;
@@ -669,23 +639,23 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 	cfg->wal_ring_kb = 1024;
 	cfg->n_rdb_rules = -1;             /* -1 = the default rule set */
 	cfg->cl_pull_timeout_ms = 80;
-	cfg->cl_apply_stall_ms = 10000;         /* S216 */
-	cfg->cl_apply_threads = 1;              /* S217 */
+	cfg->cl_apply_stall_ms = 10000;
+	cfg->cl_apply_threads = 1;
 	cfg->cl_max_pending = 0;       /* 0 = the daemon's PEND_DEFAULT */
-	cfg->cl_ps_rx_threads = -1;    /* S461: auto = half the workers; 0 = relays on the cluster socket */
-	cfg->cl_ps_port = 0;           /* PS11: 0 = the cluster port + 1 */
+	cfg->cl_ps_rx_threads = -1;    /* auto = half the workers; 0 = relays on the cluster socket */
+	cfg->cl_ps_port = 0;           /* 0 = the cluster port + 1 */
 	cfg->cl_negative_ms = 300;
 	cfg->cl_tombstone_ms = 2000;
-	cfg->cl_sweep_digests = 1;         /* S260 */
-	cfg->cl_reconcile_fast = 1;        /* S392 */
-	cfg->cl_tomb_acks = 1;             /* 12ny AT-5 */
-	cfg->cl_data_mcast = 1;            /* 12ny AT-9: auto */
-	cfg->cl_reconcile_rate_max = 1024; /* S393 */
-	cfg->cl_mcast_ttl = 1;             /* S291: one L2 segment */
-	cfg->cl_max_dgram = 1232;          /* S36b, S469: IPv6's minimum MTU less 48 - above it, TCP */
-	cfg->cl_tomb_retain_s = 900;      /* S238 */
-	cfg->cl_resync_after_s = 86400;   /* S455: a day */
-	cfg->cl_tomb_retain_max = 250000; /* S238: ~25 MB; 1,000,000 at most */
+	cfg->cl_sweep_digests = 1;
+	cfg->cl_reconcile_fast = 1;
+	cfg->cl_tomb_acks = 1;
+	cfg->cl_data_mcast = 1;            /* auto */
+	cfg->cl_reconcile_rate_max = 1024;
+	cfg->cl_mcast_ttl = 1;             /* one L2 segment */
+	cfg->cl_max_dgram = 1232;          /* IPv6's minimum MTU less 48 - above it, TCP */
+	cfg->cl_tomb_retain_s = 900;
+	cfg->cl_resync_after_s = 86400;   /* a day */
+	cfg->cl_tomb_retain_max = 250000; /* ~25 MB; 1,000,000 at most */
 
 	memset(&ps, 0, sizeof ps);
 	ps.path = path;
@@ -713,7 +683,7 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 				goto err;
 			}
 			*e = 0;
-			snprintf(cursect, sizeof cursect, "%s", s + 1);  /* 12nw: before enter_section splits it */
+			snprintf(cursect, sizeof cursect, "%s", s + 1);  /* before enter_section splits it */
 			if (enter_section(&ps, s + 1))
 				goto err;
 			continue;
@@ -727,15 +697,14 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 		val = parse_value(&ps, eq + 1);
 		if (!val)
 			goto err;
-		km_add(km, cursect, trim(s), val);             /* 12nw */
+		km_add(km, cursect, trim(s), val);
 		if (handle_kv(&ps, trim(s), val))
 			goto err;
 	}
 	fclose(f);
 
-	/* S358: the environment beats the file, so `make check` can switch
-	 * the schedule off for every suite - one that spans midnight would
-	 * otherwise see its counters start again under it */
+	/* the environment beats the file, so `make check` can switch the schedule
+	 * off: a suite spanning midnight would see its counters restart under it */
 	{
 		const char *e = getenv("PERFCACHED_STATS_RESET");
 
@@ -783,7 +752,7 @@ void pc_config_dump(const struct pc_config *cfg)
 	for (i = 0; i < cfg->n_client_secrets; i++)
 		printf("client = ******** (len %zu)\n",
 			strlen(cfg->client_secret[i]));
-	if (cfg->mail.pass)                                     /* S352 */
+	if (cfg->mail.pass)
 		printf("mail = ******** (len %zu)\n", strlen(cfg->mail.pass));
 	if (cfg->cluster_accept_secret)
 		printf("cluster_accept = ******** (len %zu)\n",
@@ -793,7 +762,7 @@ void pc_config_dump(const struct pc_config *cfg)
 			strlen(cfg->cluster_secret));
 	else
 		printf("cluster = (not set)\n\n");
-	printf("[alerts]\ncpu_warn_pct = %d\ncpu_crit_pct = %d\n"     /* S380 */
+	printf("[alerts]\ncpu_warn_pct = %d\ncpu_crit_pct = %d\n"
 		"io_warn_pct = %d\nio_crit_pct = %d\nmemory_warn_pct = %d\n"
 		"memory_crit_pct = %d\narena_warn_pct = %d\narena_crit_pct = %d\n"
 		"epoll_busy_pct = %d\nlink_warn_pct = %d\nlink_crit_pct = %d\n\n",
@@ -801,7 +770,7 @@ void pc_config_dump(const struct pc_config *cfg)
 		cfg->alerts.io_crit, cfg->alerts.mem_warn, cfg->alerts.mem_crit,
 		cfg->alerts.arena_warn, cfg->alerts.arena_crit,
 		cfg->alerts.epoll_busy, cfg->alerts.link_warn, cfg->alerts.link_crit);
-	{                                                  /* UP6n */
+	{
 		int k, j;
 
 		printf("[upgrade]\n");
@@ -823,7 +792,7 @@ void pc_config_dump(const struct pc_config *cfg)
 			cfg->upgrade.allow_unsigned ? "yes" : "no",
 			cfg->upgrade.stage_mb, cfg->upgrade.results_dir);
 	}
-	if (cfg->mail_on) {                                     /* S352 */
+	if (cfg->mail_on) {
 		printf("[mail]\nsmtp = %s\n", cfg->mail.url);
 		if (cfg->mail.user)
 			printf("user = %s\n", cfg->mail.user);
@@ -873,8 +842,8 @@ void pc_config_dump(const struct pc_config *cfg)
 	if (cfg->resp_collections)
 		printf("resp_collections = %s\n", cfg->resp_collections);
 	if (cfg->cl_enabled) {
-		/* PS11: the two ports a firewall must pass, side by side */
-		if (cfg->cl_unicast)                    /* S36 */
+		/* the two ports a firewall must pass, side by side */
+		if (cfg->cl_unicast)
 			printf("\n[cluster]\ndiscovery = unicast\nport = %d   # "
 				"the cluster port, UDP and TCP\nseeds = %s\n"
 				"max_datagram = %d\nlane_port = %d   # TCP, frames over "
@@ -888,11 +857,11 @@ void pc_config_dump(const struct pc_config *cfg)
 			printf("cluster_id = %s\n", cfg->cl_cluster_id);
 		if (cfg->cl_max_members)
 			printf("max_members = %d\n", cfg->cl_max_members);
-		if (!cfg->cl_unicast)                   /* S36: no group to route */
+		if (!cfg->cl_unicast)                   /* no group to route */
 			printf("multicast_ttl = %d%s\n", cfg->cl_mcast_ttl,
 				cfg->cl_mcast_ttl > 1 ? "   # beyond one L2 segment: "
 				"needs multicast routing" : "   # one L2 segment");
-		{                                       /* S143 */
+		{
 			static const char *ids[] = { "auto", "dmi", "mac", "env", "file" };
 
 			printf("identity_source = %s\n", ids[cfg->cl_id_source]);
@@ -915,22 +884,14 @@ void pc_config_dump(const struct pc_config *cfg)
 			"mode = %s\n", cfg->col[i].name, cfg->col[i].buckets_log2,
 			1u << cfg->col[i].buckets_log2,
 			mode_name(cfg->col[i].mode, cfg->col[i].eager));
-		if (cfg->col[i].nondurable)                  /* G5 */
+		if (cfg->col[i].nondurable)
 			printf("durable = no   # a cache: off the WAL and the "
 				"snapshot, empty after a restart\n");
 	}
 }
 
-/* S59/CWE-14: a secret's heap copy must not outlive its use.  The
- * PSKs are derived once at startup and cached; nothing re-reads the
- * raw strings after that, so their bytes are zeroed through
- * sodium_memzero - which the optimizer cannot elide - before the
- * buffers are freed or abandoned.  NULL-tolerant: a failed mid-parse
- * leaves gaps where free(NULL) was legal but strlen(NULL) is not.
- * (resp_password and http_token are NOT wiped here: both doors
- * compare them for the process lifetime, so zeroing them at
- * derivation time would break every subsequent request rather than
- * protect anything - they are wiped at teardown instead.) */
+/* CWE-14: the raw secrets are zeroed once the PSKs are derived; NULL-tolerant for a failed
+ * parse.  resp_password and http_token are compared for life: wiped at teardown instead. */
 #ifdef PC_TESTHOOKS
 int pc_test_secret_wipes;
 #endif
@@ -968,15 +929,13 @@ void pc_config_free(struct pc_config *cfg)
 		free(cfg->client_secret[i]);
 	free(cfg->cluster_secret);
 	free(cfg->cluster_accept_secret);
-	/* S37/S59: the http token is NOT wiped by pc_config_wipe_secrets.
-	 * That runs as soon as the PSKs are derived, and the client and
-	 * cluster secrets are genuinely finished at that point - this one
-	 * is compared on EVERY request for the process lifetime, exactly
-	 * like resp_password.  Wiping it there zeroed the token in place
-	 * and every correct request was answered 401. */
+	/* the http token is compared on every request, so it is wiped here at
+	 * teardown, never by pc_config_wipe_secrets */
 	if (cfg->http_token)
 		sodium_memzero(cfg->http_token, strlen(cfg->http_token));
 	free(cfg->http_token);
+	free(cfg->tls_cert);
+	free(cfg->tls_key);
 	for (i = 0; i < cfg->n_listen; i++)
 		free(cfg->listen[i].addr);
 	free(cfg->wal_dir);
@@ -984,23 +943,32 @@ void pc_config_free(struct pc_config *cfg)
 	free(cfg->cl_mcast);
 	free(cfg->cl_seeds);
 	free(cfg->cl_advertise);
-	free(cfg->cl_cluster_id);                /* S302 */
+	free(cfg->cl_cluster_id);
 	for (i = 0; i < cfg->n_col; i++) {
 		free(cfg->col[i].name);
-		free(cfg->col[i].upstream);              /* S331 */
+		free(cfg->col[i].upstream);
 		free(cfg->col[i].up_prefixes);
-		free(cfg->col[i].up_primary);            /* S382 */
-		if (cfg->col[i].up_password)             /* S383 */
+		free(cfg->col[i].up_primary);
+		if (cfg->col[i].up_password)
 			sodium_memzero(cfg->col[i].up_password,
 				strlen(cfg->col[i].up_password));
 		free(cfg->col[i].up_password);
-		if (cfg->col[i].up_wpassword)            /* AR7 */
+		if (cfg->col[i].up_spassword)
+			sodium_memzero(cfg->col[i].up_spassword,
+				strlen(cfg->col[i].up_spassword));
+		free(cfg->col[i].up_spassword);
+		free(cfg->col[i].up_smaster);
+		free(cfg->col[i].up_tls_ca);
+		free(cfg->col[i].up_tls_name);
+		free(cfg->col[i].up_tls_cert);
+		free(cfg->col[i].up_tls_key);
+		if (cfg->col[i].up_wpassword)
 			sodium_memzero(cfg->col[i].up_wpassword,
 				strlen(cfg->col[i].up_wpassword));
 		free(cfg->col[i].up_wpassword);
 		free(cfg->col[i].up_wuser);
 	}
-	if (cfg->mail.pass)                                     /* S352 */
+	if (cfg->mail.pass)
 		sodium_memzero(cfg->mail.pass, strlen(cfg->mail.pass));
 	free(cfg->mail.pass);
 	free(cfg->mail.url);
@@ -1013,7 +981,6 @@ void pc_config_free(struct pc_config *cfg)
 	memset(cfg, 0, sizeof *cfg);
 }
 
-/* S239 */
 int pc_types_parse(const char *s)
 {
 	if (!strcasecmp(s, "strict"))
@@ -1038,7 +1005,7 @@ int pc_autoscale_parse(const char *s)
 		return PC_AUTOSCALE_WARN;
 	if (!strcmp(s, "off"))
 		return PC_AUTOSCALE_OFF;
-	if (!strcmp(s, "floor"))                           /* S328 */
+	if (!strcmp(s, "floor"))
 		return PC_AUTOSCALE_FLOOR;
 	return -1;
 }

@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * lineedit.c — see lineedit.h.  One static editor instance; perfcli is
- * single-threaded by design.
- */
+/* lineedit.c - see lineedit.h.  One static editor instance: perfcli is single-threaded. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

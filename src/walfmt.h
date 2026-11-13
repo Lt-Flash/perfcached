@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * walfmt.h - the WAL's on-disk format helpers, shared by its writer
- * (wal.c) and its reader (walscan.c): the largest record, and the
- * little-endian field accessors.  Moved from wal.c (the 0.7.2 split,
- * wave 1); the format itself is wal.h's.
- */
+/* walfmt.h - the WAL's on-disk format helpers shared by wal.c and walscan.c: the largest
+ * record and the little-endian field accessors.  The format itself is wal.h's. */
 #ifndef PC_WALFMT_H
 #define PC_WALFMT_H
 
@@ -13,12 +9,8 @@
 #include "wal.h"
 #include "core/pcache_arena.h"          /* PCACHE_CELL_MAX: the record ceiling */
 
-/* S174: the WAL has to carry any record the STORE accepts, or a write
- * the client was told succeeded is not there after a restart.  It was a
- * flat 80 KB, which was above the old 64 KB cell ceiling and below the
- * new one - so it is derived from the ceiling now and cannot drift
- * behind it again.  A record is header + fixed fields + collection name
- * + key + value, and key and value together cannot exceed a cell. */
+/* The WAL must carry any record the store accepts, so the ceiling derives from the cell's:
+ * header + fixed fields + collection name + key and value (together at most a cell). */
 #define MAX_REC     ((long)(PC_WAL_RECHDR + 32 + 255 + PCACHE_CELL_MAX))
 
 /* ---- LE helpers -------------------------------------------------------- */

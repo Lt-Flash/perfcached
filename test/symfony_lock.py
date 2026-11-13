@@ -1,4 +1,4 @@
-"""symfony_lock.py - S170a: the Lua scripts of Symfony's Lock component
+"""symfony_lock.py - the Lua scripts of Symfony's Lock component
 (src/Symfony/Component/Lock/Store/RedisStore.php), exactly as Symfony 5.4
 through 7.4 send them - the TIME variant and the ARGV variant of each - so
 test/symlocktest.sh can load them by body and run them by SHA1.  perfcached

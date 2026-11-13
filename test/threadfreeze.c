@@ -1,30 +1,5 @@
-/* threadfreeze.c - S216: stop ONE thread of a daemon, from outside.
- *
- * A wedged thread is the fault, and nothing in the daemon can be asked to
- * produce it: SIGSTOP stops the whole process (heartbeat thread included,
- * which is a different fault with a different answer), and a "please
- * hang" verb would be a hang shipped in the production binary.  ptrace
- * can do it: PTRACE_SEIZE + PTRACE_INTERRUPT stops the one task it names
- * and leaves its siblings running.
- *
- * So this is the daemon's PARENT - which is what makes the trace legal
- * for an unprivileged user under ptrace_scope = 1 - and it takes orders
- * from a file:
- *
- *   threadfreeze <ctl> -- ./perfcached -f conf
- *
- *   echo "1 pc-cluster 9000" > ctl     freeze the thread whose comm is
- *                                      pc-cluster for 9000 ms; the first
- *                                      field is a serial, so the same
- *                                      order can be given twice
- *   <ctl>.ack                          "<serial> frozen <tid>" when the
- *                                      thread has stopped, then
- *                                      "<serial> released" - or
- *                                      "<serial> error <why>"
- *
- * It exits when the daemon does, with its status; SIGTERM/SIGINT kill
- * the daemon first.
- */
+/* threadfreeze.c - stops ONE thread of the daemon it parents (ptrace, legal under ptrace_scope 1):
+ * "<serial> <comm> <ms>" in the ctl file freezes that thread; <ctl>.ack reports what happened. */
 #include <dirent.h>
 #include <errno.h>
 #include <signal.h>

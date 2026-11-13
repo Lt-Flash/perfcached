@@ -1,27 +1,6 @@
 #!/bin/sh
-# standbypassovertest.sh - S277: a standby that stops answering is passed
-# over, and the master keeps publishing maps.
-#
-# A map change is staged past the standby and broadcast only once it has
-# acked; an unacked stage is abandoned after CLSYNC_ACK_MS.  But the next
-# stage picked the standby the same way - the lowest live peer id - so a
-# standby that was LIVE (its multicast ALIVE still arriving) and could not
-# answer was named again, every time, and the master published nothing for
-# as long as that lasted.  rc57's GitHub check-asan (restartsharetest,
-# shard): the restarted member had been the standby, the master froze on a
-# map without it, and a member placing from that map answered 267 of 800
-# names wrong for 150 s.
-#
-# Three shard nodes.  The standby is cut from the master's unicast AND its
-# maps (the netcut shim, by peer address); its own multicast still goes
-# out, so the master keeps counting it live.  Then:
-#   1. within 20 s the master publishes at least two more maps (rc57:
-#      none) - the lapse costs CLSYNC_ACK_MS, then one per CLMAP_PUB_MS
-#   2. the map names another standby, and sync.timeouts counts the lapse
-#   3. the third node - not cut - receives those maps and its map is usable
-#   4. healed, publication continues
-# Fail-first: rc57 publishes nothing in step 1 and has no sync.timeouts.
-# Usage: test/standbypassovertest.sh [./perfcached] [./netcutshim.so]
+# standbypassovertest.sh - a standby that stops answering while still live (its multicast ALIVE arriving)
+# is passed over: the master keeps publishing maps, names another standby and counts the lapse.
 set -u
 BIN=${1:-./perfcached}
 SHIM=${2:-./netcutshim.so}
@@ -112,11 +91,9 @@ echo "  master node $M, standby node $B (id $BK), the other node $O"
 P0=$(pub); R0=$(st $O 'r["cluster"]["map"]["received"]')
 # the standby stops hearing the master - unicast and maps; its own
 # multicast ALIVE still reaches the master, so it stays live there
-echo "cut 127.0.27.$M" > "$D/cut$B"
-# two more maps: the lapse (CLSYNC_ACK_MS) and up to one CLMAP_PUB_MS to the
-# next stage, then one more CLMAP_PUB_MS - 11-13 s on a quiet box.  Polled to
-# 20 s: GitLab 110406's cluster2 group, sharing 224 with six others, got one
-# map in a fixed 13 s.  rc57 (the fail-first) publishes none in any time
+echo "cut 127.0.27.$M rst" > "$D/cut$B"
+# two more maps: the lapse (CLSYNC_ACK_MS), up to one CLMAP_PUB_MS to the next stage, then one more -
+# 11-13 s on a quiet box, polled to 20 s for a loaded one
 i=0; P1=$(pub)
 while [ $i -lt 20 ] && ! [ "${P1:-0}" -ge $((${P0:-0} + 2)) ] 2>/dev/null; do
 	sleep 1; i=$((i + 1)); P1=$(pub)

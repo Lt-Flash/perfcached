@@ -1,22 +1,6 @@
 #!/bin/sh
-# foundtest.sh - S36 step c: who founds a cluster on a BLANK cold start
-# in discovery = unicast, so a cold start ends as one fleet.
-#
-# A blank node (no cluster id on disk, none pinned) founds only when the
-# joiners it hears have been stable 5 s, it sees `[cluster] expect`
-# blank nodes (itself included), and no live joiner has a higher
-# address.  A joining node shares the addresses it learns with every
-# address it knows, so nodes seeded only with a third still find each
-# other.
-#   1  five blank nodes, every node seeded with all five (a headless
-#      Service's answer), started together: one cluster, one id - three
-#      rounds
-#   2  expect = 3 and only two nodes up for 20 s: neither founds; the
-#      third arrives and the three form one fleet
-#   3  expect = 3, nodes 2 and 3 seeded ONLY with node 1, which starts
-#      40 s later - past S302's 30 s provisional window, where two lone
-#      founders would have split for good: one fleet of three
-# Usage: test/foundtest.sh [./perfcached]
+# foundtest.sh - who founds a cluster on a blank cold start under discovery = unicast (stable joiners,
+# `expect` met, highest address), so it ends as one fleet.  Usage: test/foundtest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcfnd.XXXXXX)

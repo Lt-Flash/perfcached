@@ -1,17 +1,5 @@
-/* hinttest.c - S295: proxy holder hints.  A handle with route_hints on,
- * connected to node 1 of a three-node proxy fleet whose keys were written
- * through nodes 2 and 3; bare handles on each node for writes and stats.
- *   1  cold: the first read of every key comes back with its holder; the
- *      second goes there - node 1 pulls nothing for it, the holders count
- *      the requests as already-at-holder, every one a hint hit
- *   2  stale: a key moved from node 2 to node 3 behind the handle's back
- *      reads right, by one extra hop, and counts as stale; the next read
- *      lands on node 3
- *   3  ttl: a record with EX 2 is read by hint for 2 s; past its TTL the
- *      entry is dead and the read takes the default way
- *   4  membership: node 3 killed - reads of its keys answer (absent, its
- *      single copies died with it), never an error; node 2's still hit
- * Usage: hinttest host1 host2 host3 port node3-pid */
+/* hinttest.c - proxy holder hints: a route_hints handle on node 1 of three learns each key's holder
+ * and goes there; a stale hint costs one hop, a TTL ends it, a dead node never makes an error. */
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,7 +114,7 @@ int main(int argc, char **argv)
 	}
 	OK(!bad, "200 keys written through nodes 2 and 3");
 
-	/* 1. cold, then by hint */
+	/* 1. cold: the first read brings the holder, the second goes there - every one a hint hit */
 	for (i = 0, bad = 0; i < K; i++) {
 		snprintf(key, sizeof key, "h2_%d", i); snprintf(val, sizeof val, "v2_%d", i);
 		bad += get_is(c, key, val) != 1;
@@ -157,16 +145,14 @@ int main(int argc, char **argv)
 	snprintf(m, sizeof m, "1. node 1 sent a hint with every first-pass answer (%lld)", n);
 	OK(n == 2 * K, m);
 
-	/* 2. stale: h2_0 moves to node 3 */
+	/* 2. stale: h2_0 moves to node 3 - one extra hop, counted, then the next read lands there */
 	OK(perfd_del(b[1], "0", "h2_0") == 1 &&
 		perfd_set(b[2], "0", "h2_0", "moved", 5, 0) == 0, "2. h2_0 moved from node 2 to node 3");
-	/* the move is a delete and a re-create, and a delete leaves node 2 a
-	 * tombstone that answers "absent" for tombstone_ms (2 s) without
+	/* a delete leaves node 2 a tombstone answering "absent" for tombstone_ms (2 s) without
 	 * asking; a rebalancer move leaves none - outlast it */
 	sleep(3);
 	hits0 = (long long)perfd_hint_hits(c);
-	/* a red step said only that it was red (GitLab 111591 check repl3,
-	 * all three): what the reads returned, and the counters each reads */
+	/* a failure says what the reads returned and the counters behind them */
 	pull0 = stat(b[1], "pull_sent");
 	n = get_say(c, "h2_0", "moved", say, sizeof say);
 	snprintf(m, sizeof m, "2. the read by the old hint is right (%s; node 2 pull_sent +%lld, "
@@ -184,7 +170,7 @@ int main(int argc, char **argv)
 	OK(n == 1 && (long long)perfd_hint_hits(c) == hits0 + 1 &&
 		stat(b[2], "holder_hint_local") == loc0 + 1, m);
 
-	/* 3. ttl */
+	/* 3. ttl: an EX 2 record is read by hint for 2 s, then the default way */
 	OK(perfd_set(b[1], "0", "t2", "x", 1, 2) == 0, "3. t2 written through node 2 with EX 2");
 	OK(get_is(c, "t2", "x") == 1, "3. first read (cold)");
 	hits0 = (long long)perfd_hint_hits(c);
@@ -194,7 +180,7 @@ int main(int argc, char **argv)
 	OK(get_is(c, "t2", "x") == 0 && (long long)perfd_hint_hits(c) == hits0 + 1,
 		"3. past the TTL: absent, and not sent by the dead entry");
 
-	/* 4. membership */
+	/* 4. membership: node 3 killed - its keys answer absent, never an error; node 2's still hit */
 	kill((pid_t)atoi(argv[5]), SIGKILL);
 	sleep(1);
 	for (i = 0, bad = 0; i < 20; i++) {

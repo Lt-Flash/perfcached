@@ -1,34 +1,6 @@
 #!/bin/sh
-# jsonalloctest.sh - S283: the JSON verbs allocate nothing per request.
-#
-# Every JSON verb tokenizes its document, and until S283 the token array
-# was malloc'd per call and freed (JSON.SET tokenized twice: the value,
-# then the document).  One malloc/free pair per request is nothing to
-# glibc's per-thread cache, and on musl's allocator it was the whole
-# 50-130x JSON.SET collapse (DESIGN 12hd: ~2 page faults and 2-4 context
-# switches per command).  The array is now per-thread scratch, grown to
-# the largest document seen.
-#
-# 0.5.0 port: the same three allocations were still there on 0.4.6 - a
-# copy of the document, a VAL_MAX result and the token array, on both
-# doors (counted with this shim) - and the hash forward ops that share
-# pc_json_rmw allocated their fragment too.  Every fragment is now
-# borrowed from the thread's two buffers.
-#
-# test/allocshim.so counts every malloc/calloc/realloc in the daemon into
-# a shared file.  One node, no WAL, both doors:
-#   0. positive control: the daemon allocated at startup (the shim is in
-#      effect - under a sanitizer or on another libc it is not: SKIP)
-#   1. after a warm-up of every verb, 2,000 of each - JSON.SET (root and
-#      path), JSON.GET, JSON.NUMINCRBY, JSON.ARRAPPEND, JSON.DEL on the
-#      RESP door; jset, jget, jincr, jarrappend, jdel on the native door
-#      - and the allocations per request, net of what the idle daemon
-#      allocated over as long a window, are below 0.01 for each
-# Deterministic: it counts calls, it does not time them - the assertion
-# that guards musl runs on a glibc runner.
-# Fail-first: the build before S283 allocates 1 (2 for JSON.SET and jset)
-# per request; 0.4.6 allocates 3 for every JSON command on both doors.
-# Usage: test/jsonalloctest.sh [./perfcached] [./allocshim.so]
+# jsonalloctest.sh - the JSON verbs allocate nothing per request on either door: allocshim.so counts
+# the daemon's mallocs, under 0.01 per request for each verb (calls counted, not timed).
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -127,9 +99,8 @@ J = {   # native door: key prefix j
 def batch(name, keys):
     if name in R: resp([R[name]("r%d" % i) for i in keys])
     else: rpc([J[name]("j%d" % i) for i in keys])
-# warm-up: every verb on keys the measured pass never touches, so each
-# grow-once buffer (scratch, reply, connection) reaches its size first;
-# then the documents the measured pass edits (DEL last: it removes $.gone)
+# warm-up on keys the measured pass never touches, so each grow-once buffer reaches its
+# size first; then the documents the measured pass edits (DEL last: it removes $.gone)
 for name in list(R) + list(J):
     batch(name, range(N, N + 200))
 batch("JSON.SET root", range(N)); batch("jset root", range(N))

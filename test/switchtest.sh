@@ -1,25 +1,6 @@
 #!/bin/sh
-# switchtest.sh - UP5 (0.6.5, DESIGN 12nf): the root helper, contrib/
-# perfcached-upgrade, against a temporary prefix layout (/opt/perfcached ->
-# perfcached-<v>-old, state_dir in the prefix's var/) and a stub systemctl
-# that starts and stops the daemon through the link - run as this user.
-#  1. a signed build: result ok, the link on the new prefix, a NEW process
-#     ready (its node file), the state carried, the old prefix kept;
-#     the same request again: "already running"
-#  2. a signature by a key nobody trusts: refused, nothing stopped
-#  3. a sha256 that is not the artifact's: refused
-#  4. an artifact path out of upgrade/staged: refused
-#  5. the request a symlink: refused, its target untouched
-#  6. a signed tarball with an entry outside its top directory: refused
-#  7. a build that never gets READY: rolled back - the link back, the
-#     previous build's new process ready, the result says why
-#  8. UPS end to end: a build uploaded to the running node
-#     (upgrade_stage), upgrade_switch with no helper enabled refused
-#     and then forced, a second switch refused while the request waits;
-#     the helper installs it, and the NEW process's upgrade_status names
-#     the request and the helper's "ok"
-# FAIL-FIRST: before UP5 there is no helper and no node file.
-# Usage: test/switchtest.sh [./perfcached] [contrib/perfcached-upgrade]
+# switchtest.sh - the root helper contrib/perfcached-upgrade against a temporary prefix layout and a stub
+# systemctl: a signed build switches, bad ones are refused untouched, one never READY is rolled back.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=$(cd "$(dirname "${1:-./perfcached}")" && pwd)/$(basename "${1:-./perfcached}")
@@ -93,9 +74,8 @@ waitready() { # waitready <seconds> - the node file says ready, its pid alive
 		[ "$(node state)" = ready ] && kill -0 "$(node pid)" 2>/dev/null && return 0
 		sleep 0.1; i=$((i+1)); done; return 1
 }
-# mk <top> <key> [extra-top] - a tarball of <top>/bin/perfcached (the real
-# binary, or with NEVER=1 one that answers -V/-C/-K/-E and never serves),
-# signed by <key>; prints its sha256
+# mk <top> <key> [extra-top] - a tarball of <top>/bin/perfcached (the real binary, or with NEVER=1 one
+# that answers -V/-C/-K/-E and never serves), signed by <key>; prints its sha256
 mk() {
 	rm -rf "$D/build"; mkdir -p "$D/build/$1/bin"
 	if [ -n "${NEVER:-}" ]; then
@@ -182,7 +162,7 @@ req r7 "$S"; run r7; rc=$?
 	ok "7. the link back on $(basename "$L1"), a new process of it ready" || bad "7. after: link $(readlink "$D/opt/perfcached"), node $(tr '\n' ' ' < "$UPG/node")"
 [ -d "$D/opt/perfcached-$VER-never" ] && ok "7. the refused prefix is kept for a look, not deleted" || bad "7. the never-ready prefix is gone"
 
-# ---- 8. UPS end to end ------------------------------------------------------------
+# ---- 8. upload, switch and install, end to end -----------------------------------
 waitready 5 || bad "8. no ready node before the arm"
 S=$(mk "perfcached-$VER-e2e" k)
 nat() { # nat <python statements; c(method, **params) is a privileged call>

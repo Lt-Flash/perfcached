@@ -1,12 +1,6 @@
 #!/bin/sh
-# relayinteresttest.sh - PS12: a node set to `pubsub_relay = interested` is
-# relayed only what may match its subscriptions.  Three nodes: 1 and 2
-# interested, 3 on `all`.  Exact channels and patterns are filtered, a node
-# on `all` still gets everything, loss stays exact on filtered peers, a new
-# subscription is relayed at once, a restarted sender or receiver resyncs,
-# and a channel nobody holds any more stops being relayed after the rebuild.
-# Fail-first: the PS11 build refuses `pubsub_relay` (unknown key).
-# Usage: test/relayinteresttest.sh [./perfcached]
+# relayinteresttest.sh - a node on `pubsub_relay = interested` is relayed only what may match its
+# subscriptions, through new subscriptions, restarts and the rebuild; `all` still gets everything.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcrelayint.XXXXXX); P1= P2= P3=
@@ -101,7 +95,8 @@ class R:
         for _ in range(len(chans) * rounds): self.f.readline()
 PY
 
-run() { RESFILE="$RES" timeout 120 python3 -c "import sys; sys.path.insert(0, '$D'); from lib import *; $1" 2>> "$D/py.err"; }
+run() { RESFILE="$RES" timeout 120 python3 -c "import sys; sys.path.insert(0, '$D'); from lib import *; $1" 2>> "$D/py.err"
+	drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"; }   # S488
 run '
 ok = wait(lambda: interest(3, 1) == "filtered" and interest(3, 2) == "filtered" and interest(1, 2) == "filtered" and interest(1, 3) == "all" and interest(2, 3) == "all", 15)
 check(ok, "each node filters relays to the interested nodes and sends everything to the node on all (3->1 %s, 3->2 %s, 1->3 %s)" % (interest(3, 1), interest(3, 2), interest(1, 3)))
@@ -200,6 +195,7 @@ print(m.get("127.0.16.1",{}).get("relay",{}).get("interest"), m.get("127.0.16.2"
 : > "$D/phase2"
 i=0; while [ ! -f "$D/phase3" ] && kill -0 $PY 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
 : > "$D/phase4"; wait $PY 2>/dev/null
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 
 # ---- a receiver restarts: its old patterns go with it -------------------------------------
 stop 2; start 2 || bad "node 2 did not restart"

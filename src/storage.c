@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * storage.c — the storage identity walk (task S11).  See storage.h.
- */
+/* storage.c - the storage identity walk (see storage.h) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,8 +68,8 @@ static int find_mount(const char *real, char *mnt, size_t mcap,
 		dash = strstr(line, " - ");
 		if (!dash || sscanf(dash + 3, "%63s %255s", fs, src) != 2)
 			continue;
-		p = mp;                        /* octal-escape decode skipped:
-		                                  bench/prod paths are plain */
+		p = mp;                        /* octal escapes not decoded:
+		                                  the daemon's paths are plain */
 		{
 			size_t l = strlen(p);
 

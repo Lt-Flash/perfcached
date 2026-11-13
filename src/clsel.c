@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clsel.c — client-side node selection over the map.
- */
+/* clsel.c - client-side node selection over the map. */
 #include <stddef.h>
 
 #include "clsel.h"
@@ -48,7 +46,6 @@ uint16_t pc_clsel_pick(const struct pc_clmap *m, int policy, uint64_t seed,
 	if (!m)
 		return 0;
 
-	/* count what is usable, having removed the node to avoid */
 	for (i = 0; i < m->nnodes; i++) {
 		const struct pc_clmap_node *nd = &m->node[i];
 
@@ -59,9 +56,7 @@ uint16_t pc_clsel_pick(const struct pc_clmap *m, int policy, uint64_t seed,
 			first = nd->node_id;
 	}
 	if (!n) {
-		/* everything eligible was avoided: better the node we were
-		 * told to skip than nothing at all, since the alternative is
-		 * no service whatsoever */
+		/* everything eligible was avoided: the node to skip beats no service */
 		if (avoid)
 			return pc_clsel_pick(m, policy, seed, 0);
 		return 0;
@@ -69,9 +64,7 @@ uint16_t pc_clsel_pick(const struct pc_clmap *m, int policy, uint64_t seed,
 
 	switch (policy) {
 	case PC_CLSEL_ROUND_ROBIN:
-		/* an independent start per client.  A fixed start here would
-		 * put every client in the fleet on one node - which is the
-		 * failure the fleet-level spread check exists to catch. */
+		/* an independent start per client: a fixed one would put every client on one node */
 		want = (int)(mix64(seed) % (uint64_t)n);
 		for (i = 0; i < m->nnodes; i++) {
 			const struct pc_clmap_node *nd = &m->node[i];
@@ -89,9 +82,8 @@ uint16_t pc_clsel_pick(const struct pc_clmap *m, int policy, uint64_t seed,
 
 			if (!pc_clsel_eligible(nd) || nd->node_id == avoid)
 				continue;
-			/* cap_weight carries the master's view of capacity;
-			 * ties break on id so two clients with the same view
-			 * agree */
+			/* cap_weight is the master's view of capacity; ties break on id so
+			 * two clients with the same view agree */
 			if (!best || nd->cap_weight > best->cap_weight ||
 			        (nd->cap_weight == best->cap_weight &&
 			         nd->node_id < best->node_id))

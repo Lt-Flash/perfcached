@@ -1,5 +1,5 @@
-/* respreadtest.c - S474: a spreading handle takes its share of a member that comes up, told by the push or by the list.
- * A member not serving stays known and gets none.  Usage: respreadtest host host4 p1 p2 p3 p4 secret; the shell acts on the cues. */
+/* respreadtest.c - a spreading handle takes its share of a member that comes up, told by the push
+ * or by the list; a member not serving stays known and gets none.  The shell acts on the cues. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,10 +7,11 @@
 #include <unistd.h>
 #include "perfd.h"
 
-#define NEACH 60               /* round robin: 1 in 4 of 60 is 15, 4 to 28 misses by chance about 1 run in 10,000 */
+#define NEACH 60               /* 1 in 4 of 60 is 15; 4 to 28 misses by chance about 1 run in 10,000 */
 #define NFO 6
 #define NALL (NEACH * 2 + NFO)
 #define NKEYS 50
+#define LEAVE_S 5.0            /* told within a beat or two, not at the 16-24 s refresh */
 static perfd_t *h[NALL];       /* 0..59 told by the push, 60..119 by the list, the rest the default policy */
 static int was[NFO];
 static int pass, fail, errs, wrong, turn;
@@ -75,7 +76,7 @@ static void settle(double secs)
 		sweep();
 }
 
-/* a node takes its time to come up: until each group has its share or the limit, then a little longer for the rest */
+/* until each group has its share or the limit, then a little longer for the rest */
 static double wait_share(int port, double limit)
 {
 	double t0 = now(), took;
@@ -85,6 +86,45 @@ static double wait_share(int port, double limit)
 	took = now() - t0;
 	settle(2);
 	return took;
+}
+
+/* on a miss: how each group's handles see that member - not listed, or this handle's state for it */
+static void views(int port)
+{
+	int g;
+
+	for (g = 0; g < 2; g++) {
+		char seen[8][16], why[96] = "", w[96];
+		int cnt[8] = { 0 }, ns = 0, absent = 0, i, j;
+
+		for (i = g * NEACH; i < (g + 1) * NEACH; i++) {
+			const char *st = NULL;
+			int pt = 0;
+
+			for (j = 0; j < perfd_member_count(h[i]) && !st; j++)
+				if (perfd_member_info(h[i], j, NULL, 0, &pt, NULL, NULL) == 0 && pt == port) {
+					w[0] = 0;
+					st = perfd_member_state(h[i], j, w, sizeof w);
+				}
+			if (!st) {
+				absent++;
+				continue;
+			}
+			if (!why[0] && w[0])
+				snprintf(why, sizeof why, "%s", w);
+			j = 0;
+			while (j < ns && strcmp(seen[j], st))
+				j++;
+			if (j == ns && ns < 8)
+				snprintf(seen[ns++], sizeof seen[0], "%s", st);
+			if (j < ns)
+				cnt[j]++;
+		}
+		printf("  ..   the %s group's view of port %d: %d not listed", g ? "list" : "push", port, absent);
+		for (j = 0; j < ns; j++)
+			printf(", %d %s", cnt[j], seen[j]);
+		printf("%s%s%s\n", why[0] ? " (" : "", why, why[0] ? ")" : "");
+	}
 }
 
 static int all_know(int members)
@@ -100,8 +140,9 @@ static int all_know(int members)
 int main(int ac, char **av)
 {
 	const char *secs[2];
-	int i, j, p2, p4, a, b;
-	double t0;
+	int i, j, p2, p4, a, b, rc;
+	double t0, took;
+	perfd_t *x = NULL;
 
 	if (ac != 8)
 		return 2;
@@ -111,7 +152,7 @@ int main(int ac, char **av)
 	secs[1] = NULL;
 	if (perfd_psk_prepare(secs) != 0)
 		return 2;
-	{       /* just after a fleet forms the list can be short and peers not yet ready: connect when both are done */
+	{       /* a just-formed fleet's list can be short: connect when both are done */
 		perfd_opts o;
 		perfd_t *w;
 
@@ -206,10 +247,21 @@ int main(int ac, char **av)
 	b = count_on(NEACH, NEACH * 2, p2);
 	OK(a >= 4 && a <= 28, "told by the push: %d of %d came back to the restarted node (1 in 4 is 15)", a, NEACH);
 	OK(b >= 4 && b <= 28, "told by the list: %d of %d came back to the restarted node (1 in 4 is 15)", b, NEACH);
+	if (a < 4 || b < 4)
+		views(p2);
 	OK(count_on(NEACH * 2, NALL, p2) == 0, "the default policy did not go back: %d of %d", count_on(NEACH * 2, NALL, p2), NFO);
 	OK(!errs && !wrong, "no call failed or read wrong across the return (%d errors, %d wrong)", errs, wrong);
 	errs = wrong = 0;
 
+	{       /* the default policy on node 4: deaf to pushes, refreshing once a minute */
+		perfd_opts o;
+
+		perfd_opts_init(&o);
+		o.secrets = secs;
+		o.ignore_member_push = 1;
+		o.refresh_ms = 60000;
+		x = perfd_connect(av[2], p4, &o);
+	}
 	/* FAILED: as healing, it serves reads, refuses writes, and the client takes both as not usable */
 	printf("FAIL-NODE\n");
 	fflush(stdout);
@@ -232,7 +284,12 @@ int main(int ac, char **av)
 	t0 = now();
 	while (count_on(0, NEACH * 2, p4) && now() - t0 < 30)
 		sweep();
-	OK(a > 0 && count_on(0, NEACH * 2, p4) == 0, "%d handles left the failed node, in %.1f s, all round robin ones are off it", a, now() - t0);
+	took = now() - t0;
+	OK(a > 0 && count_on(0, NEACH * 2, p4) == 0 && took < LEAVE_S,
+		"%d handles left the failed node, in %.1f s, all round robin ones are off it", a, took);
+	rc = x && on_port(x) == p4 ? perfd_set(x, "c", "moved", "y", 1, 0) : -2;
+	OK(rc == 0 && on_port(x) != p4, "a write it refused as failed went to another member at once: %s",
+		rc == -2 ? "no handle on node 4" : rc ? perfd_error(x) : "stored");
 	settle(3);
 	OK(count_on(0, NEACH * 2, p4) == 0, "and none went back to it while it stayed failed (%d)", count_on(0, NEACH * 2, p4));
 	OK(all_know(4), "it is still known: every handle lists four members");
@@ -246,9 +303,13 @@ int main(int ac, char **av)
 	b = count_on(NEACH, NEACH * 2, p4);
 	OK(a >= 4 && a <= 28, "told by the push: %d of %d came back when it served again (1 in 4 is 15)", a, NEACH);
 	OK(b >= 4 && b <= 28, "told by the list: %d of %d came back when it served again (1 in 4 is 15)", b, NEACH);
+	if (a < 4 || b < 4)
+		views(p4);
 	OK(!errs && !wrong, "no call failed or read wrong across the restore (%d errors, %d wrong)", errs, wrong);
 	for (i = 0; i < NALL; i++)
 		perfd_free(h[i]);
+	if (x)
+		perfd_free(x);
 	printf("respreadtest: %d passed, %d failed\n", pass, fail);
 	return fail != 0;
 }

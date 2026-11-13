@@ -1,25 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * proto.c — connection + protocol machinery (tasks S7, S25', S317).
- * See proto.h for the wire contract.
- *
- * A connection on an encryption-required listener runs the Noise
- * responder handshake first (task S25'), then every socket byte is a
- * transport record; the decrypted plaintext feeds the exact same framing
- * machinery a loopback plaintext connection uses.  So the sniff / codec /
- * out-of-order reply core are written once and both planes share them.
- *
- * Two framers: binary frames (the native protocol - the data verbs'
- * fixed layouts and PC_VERB_CMD carrying every other method as a tree,
- * src/ptree.h) and RESP2 (redis-cli and friends).  The JSON-RPC text
- * dialect that used to be the third was removed in 0.4.5 (S317, DESIGN
- * 12if); JSON is rendered here only as DATA, for the HTTP door.
- *
- * Buffers per connection: in (plaintext for the framers), out (plaintext
- * replies the verbs append), wire (the bytes actually written to the
- * socket), and - only when encrypted - raw (undecrypted socket input).
- */
+/* proto.c - connections and the two framers, binary frames (src/ptree.h) and RESP2, written
+ * once for the plaintext and the encrypted planes.  The wire contract is in proto.h. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,39 +17,40 @@
 #include <sodium.h>
 
 #include "iostat.h"
-#include "uring.h"                     /* S361 */
+#include "uring.h"
 #include "compat/dprint.h"
 #include "json.h"                      /* the HTTP bodies, the RESP writer */
-#include "ptree.h"                     /* S317: the native door's codec */
+#include "ptree.h"                     /* the native door's codec */
 #include "metrics.h"
 #include "pc_noise.h"
 #include "verbs.h"
 #include "obs.h"
-#include "clunk.h"                     /* S165 */
+#include "clunk.h"
 #include "store.h"
 #include "events.h"
 #include <arpa/inet.h>
-#include "pc_slot.h"     /* S127: pc_key_slot, for the spread holder test */
+#include "pc_slot.h"     /* pc_key_slot, for the spread holder test */
 #include "core/pcache_htable.h"
 #include "compat/timer.h"
 #include "daemon.h"
 #include "pcaddr.h"
 #include "proto.h"
-#include "resident.h"                   /* S265 */
+#include "resident.h"
 #include "pubsub.h"
-#include "psudp.h"                  /* PS5 */
-#include "memguard.h"                /* S366 */
-#include "protoint.h"                /* the connection (wave 1) */
-#include "upstream.h"                /* S449: pc_upstream_copy_exp */
-#include "mgetfan.h"                 /* G8 */
-#include "wal.h"                     /* S466: the writer pause */
+#include "psudp.h"
+#include "memguard.h"
+#include "protoint.h"
+#include "tls.h"
+#include "upstream.h"                /* pc_upstream_copy_exp */
+#include "mgetfan.h"
+#include "presence.h"
+#include "wal.h"                     /* the writer pause */
 #include <sodium.h>
 #include <time.h>
 
 
-/* S153: name this request's origin for the event log.  The door is the
- * dialect it arrived in, which only the dispatch site knows; the peer is
- * read once per connection. */
+/* the event log's origin: the door is the dialect, known only at the dispatch site; the peer
+ * is read once per connection */
 void ev_origin(struct pc_conn *c, const char *door)
 {
 	if (!c->peer[0]) {
@@ -76,7 +59,7 @@ void ev_origin(struct pc_conn *c, const char *door)
 
 		if (getpeername(c->fd, &sa.sa, &sl) == 0 &&
 		        (pc_addr_family(&sa) == AF_INET ||
-		         pc_addr_family(&sa) == AF_INET6))   /* IP6-2 */
+		         pc_addr_family(&sa) == AF_INET6))
 			pc_addr_ntop_port(&sa, c->peer, sizeof c->peer);
 		else
 			snprintf(c->peer, sizeof c->peer, "-");
@@ -86,16 +69,15 @@ void ev_origin(struct pc_conn *c, const char *door)
 
 /* ---- growable buffers -------------------------------------------------- */
 
-/* S366: the connections of THIS worker holding any buffer (its wait stays
- * bounded while there are some, so the idle sweep runs), the node's total
- * for /stats, and the worker's tick as of its last wake */
+/* connections of THIS worker holding a buffer (its wait stays bounded so the idle sweep runs),
+ * the node's total for /stats, and the worker's tick as of its last wake */
 static __thread int bufs_held_here;
 static int bufs_held_all;
 static __thread unsigned int conn_now;
 
 static inline void bufs_mark(struct pc_conn *c)
 {
-	/* an HTTP connection is one-shot and swept on its own clock (S46) */
+	/* an HTTP connection is one-shot and swept on its own clock */
 	if (!c->bufs_held && !c->http_only) {
 		c->bufs_held = 1;
 		bufs_held_here++;
@@ -138,20 +120,12 @@ int out_append(struct pc_conn *c, const char *p, size_t n)
 {
 	int rc;
 
-	/* S331: a command parked on a read-through fetch answers nothing yet,
-	 * and a connection that has answered nothing has no buffer - a
-	 * zero-length memcpy to NULL is undefined (UBSan stopped the daemon) */
+	/* a command parked on a read-through fetch answers nothing yet, and a connection with no
+	 * answer has no buffer: a zero-length memcpy to NULL is undefined */
 	if (!n)
 		return 0;
-	/* 0.6.0.1: while an io_uring send is in flight, its unsent part is
-	 * still this connection's backlog.  The cap is on BOTH, as it is on
-	 * epoll, where c->out drains into c->wire at every flush.  Capping
-	 * c->out alone let it fill beside a nearly full wire; the send's
-	 * completion then merged the two past the wire's limit, and the
-	 * connection closed as a failed flush no counter records - a slow
-	 * subscriber not counted as a slow kill (pushbatchtest two-workers,
-	 * GitHub, v0.6.0.1).  Under this cap the completion's merge is at most
-	 * PC_MAX_OUTQ: the wire's pending part has only shrunk since. */
+	/* an io_uring send's unsent part is still backlog: the cap covers both, as on epoll, so
+	 * the send's completion merges them within PC_MAX_OUTQ */
 	if (c->ur_send &&
 	    c->out_len + n + (c->wire_len - c->wire_off) > PC_MAX_OUTQ) {
 		if (!c->out_failed)
@@ -175,20 +149,12 @@ int wire_append(struct pc_conn *c, const char *p, size_t n)
 {
 	const size_t limit = PC_MAX_OUTQ + (PC_MAX_OUTQ >> 4);
 
-	/* S361 step 3: a send in flight reads c->wire - never moved or grown
-	 * under it.  conn_flush keeps replies in c->out meanwhile, and the
-	 * handshake appends before anything is sent; this cannot happen. */
+	/* a send in flight reads c->wire: never move or grow it.  conn_flush keeps replies in
+	 * c->out meanwhile and the handshake appends before any send, so this cannot happen */
 	if (c->ur_send)
 		return -1;
-	/* The limit is on what is PENDING, [wire_off, wire_len).  The bytes
-	 * before wire_off are already in the socket, and the buffer is only
-	 * reset when it drains completely - so a reader that keeps up but
-	 * never quite empties it (a subscriber under a pipelined burst) used
-	 * to hit the limit after 8.5 MB of TRAFFIC, not of backlog, and was
-	 * closed as a "write error" that no counter records: pushbatchtest,
-	 * GitHub rc46, a subscriber cut at 1,931 of 4,000 4 KB frames.
-	 * Slide the pending tail to the front when the written head is in
-	 * the way. */
+	/* the limit is on what is PENDING, [wire_off, wire_len): the buffer resets only when it
+	 * drains, so slide the pending tail to the front when the written head is in the way */
 	if (c->wire_off &&
 	    (c->wire_len + n > c->wire_cap || c->wire_len + n > limit)) {
 		c->wire_len -= c->wire_off;
@@ -205,18 +171,8 @@ int wire_append(struct pc_conn *c, const char *p, size_t n)
 
 /* ---- parked pulls (thread-local: worker-owned) -------------------------- */
 
-/* Sized from the cluster's parked-request capacity, which is now a
- * runtime knob ([cluster] max_pending).  The invariant is what matters:
- * a worker must never out-park the pending table, or parking becomes
- * the first thing to refuse and the cluster's own backpressure - the
- * retryable TRYAGAIN - never gets a chance to speak.  Raising
- * max_pending while this stayed at 1024 did exactly that: the refusals
- * moved here and the client saw "-ERR busy" with the cluster table
- * reporting pend_exhausted 0.
- *
- * Worst case on purpose: every parked request could belong to ONE
- * worker, so each worker's table is the full capacity.  Allocated once
- * per worker thread, never resized. */
+/* each worker's table holds the cluster's whole pending capacity ([cluster] max_pending): a
+ * worker that out-parks the pending table answers "busy" before the retryable TRYAGAIN can */
 #define PARK_FALLBACK 1024            /* cluster off: parking is unused */
 
 
@@ -231,19 +187,19 @@ struct parked {
 	size_t collen;
 	char *key;
 	size_t klen;
-	/* S295: the request asked for a holder hint (PC_BIN_F_HINT); the node
-	 * a forward or a unicast pull went to (0: a broadcast, or not known)
-	 * and a forward's ttl_rel - S321 retries a proxy miss there */
+	/* a holder hint was asked for (PC_BIN_F_HINT); the node a forward or unicast pull went to
+	 * (0: broadcast or unknown) and a forward's ttl_rel, where a proxy miss is retried */
 	int hint;
 	int target;
 	unsigned int target_ttl;
-	/* S319: a forwarded hash READ's encoded arguments (op_hcmd's), to
+	/* a forwarded hash READ's encoded arguments (op_hcmd's), to
 	 * render its reply over the record the owner answers with */
 	unsigned char *hargs;
 	size_t hargl;
+	int pres;                      /* an EXISTS/TYPE/TTL's PC_PRES_*, else 0 */
 };
 
-/* S295: hints sent, and hint-asking requests a proxy collection answered
+/* hints sent, and hint-asking requests a proxy collection answered
  * from this node's own table - the client was already at the holder */
 static unsigned long long hint_sent_n, hint_local_n;
 
@@ -266,7 +222,7 @@ int park_add(struct pc_conn *c, unsigned int req, const char *id,
 		const char *col, size_t collen, const char *key, size_t klen,
 		int bin, int hint)
 {
-	int i;
+	int i, pres = pc_pres_park_take(req);
 
 	if (!parks_ready()) {
 		free(pc_hcmd_take_park_args(NULL));
@@ -277,7 +233,7 @@ int park_add(struct pc_conn *c, unsigned int req, const char *id,
 			parks[i].conn = c;
 			parks[i].req = req;
 			parks[i].bin = bin;
-			parks[i].hint = hint;                       /* S295 */
+			parks[i].hint = hint;
 			parks[i].target_ttl = 0;
 			parks[i].target = pc_fwd_target_of(req,
 				&parks[i].target_ttl);
@@ -296,9 +252,9 @@ int park_add(struct pc_conn *c, unsigned int req, const char *id,
 			}
 			memcpy(parks[i].key, key, klen);
 			parks[i].klen = klen;
-			/* S319: a forwarded hash read's arguments, if the verb
-			 * left any; NULL for every other park */
+			/* NULL unless the verb left a hash read's arguments */
 			parks[i].hargs = pc_hcmd_take_park_args(&parks[i].hargl);
+			parks[i].pres = pres;
 			return 0;
 		}
 	free(pc_hcmd_take_park_args(NULL));
@@ -321,7 +277,7 @@ static void park_drop_conn(struct pc_conn *c)
 		}
 }
 
-/* ---- S331: connections held on a read-through fetch (this worker's) --- */
+/* ---- connections held on a read-through fetch (this worker's) --------- */
 
 static __thread struct pc_conn **up_held;
 static __thread int up_held_n, up_held_cap;
@@ -347,9 +303,8 @@ void pc_conn_upstream_hold(void *conn, unsigned int req)
 		struct pc_conn **n = realloc(up_held, (size_t)nc * sizeof *n);
 
 		if (!n) {
-			/* not remembered: the completion will not find it and
-			 * the connection would wait for ever - better the
-			 * command runs now, as a miss */
+			/* not remembered: the completion would never find it,
+			 * so better the command runs now, as a miss */
 			LM_ERR("upstream: no memory to hold a connection\n");
 			return;
 		}
@@ -365,10 +320,8 @@ int pc_conn_upstream_verdict(void *conn)
 	return conn ? ((struct pc_conn *)conn)->up_verdict : 0;
 }
 
-/* S435: a read the gate let through lost its key before the handler read it
- * (pc_upstream_resp_lost) - 1: gate the command again, its verdict cleared
- * so the gate fetches; 0: twice already for this command, the answer
- * stands.  Both counts clear once a command runs without parking */
+/* pc_conn_upstream_retry: a gated read lost its key before the handler read it - 1: gate
+ * it again, verdict cleared so it fetches; 0: twice already, the answer stands */
 void pc_conn_upstream_set_mark(void *conn, unsigned long long m)
 {
 	if (conn)
@@ -410,11 +363,8 @@ void pc_conn_upstream_park_frame(unsigned int req)
 	up_frame_pending = req;
 }
 
-/* S384: CLIENT SETNAME perfcached-readthrough - a read-through fetch
- * connection of another perfcached (or of this one).  Its reads are
- * answered from what this node holds; a miss is a miss, never a fetch
- * onward, so a key crosses at most one perfcached hop and no ring of
- * read-throughs can form */
+/* CLIENT SETNAME perfcached-readthrough: another perfcached's fetch connection.  A miss is
+ * a miss, never a fetch onward, so a key crosses at most one hop and no ring forms */
 void pc_conn_set_rt_fetcher(void *conn)
 {
 	if (conn)
@@ -477,47 +427,34 @@ static void up_frames_drop(struct pc_conn *c)
 
 /* ---- lifecycle --------------------------------------------------------- */
 
-static int conn_log_ok(void);          /* S70: defined with pc_conn_accept */
+static int conn_log_ok(void);          /* defined with pc_conn_accept */
 
-static void udp_free(struct pc_conn *c);   /* PS5, with the push stream */
+static void udp_free(struct pc_conn *c);   /* with the push stream */
 static void push_unstage(struct pc_conn *c);   /* with the staged pushes */
 static void pause_unlink(struct pc_conn *c);   /* with the paused publishers */
-static void out_pause(struct pc_conn *c);      /* S372: with the resume pass */
+static void out_pause(struct pc_conn *c);      /* with the resume pass */
 static void out_unlink(struct pc_conn *c);
 static int conn_pause(struct pc_conn *c);
-static void wal_pause(struct pc_conn *c);      /* S466: with the resume pass */
+static void wal_pause(struct pc_conn *c);      /* with the resume pass */
 static void wal_unlink(struct pc_conn *c);
-/* this worker's HTTP connections, counted where they are made and
- * destroyed - the worker's wait reads it (pc_conn_http_open), not the
- * sweep's last answer, which was taken before the turn's accepts */
+/* this worker's HTTP connections, counted at make and destroy: the wait reads this, not
+ * the sweep's last answer, which predates the turn's accepts */
 static __thread int http_open_here;
-/* S356: a connection destroyed while its worker is still dispatching an
- * epoll batch can have an event of its own further on in that batch - the
- * metrics sweep runs between epoll_wait() and the dispatch, and S331's
- * upstream completions destroy held connections from inside it.  So the
- * destroy does all of the closing at once (unlinked, fd closed, buffers
- * freed) but leaves the struct itself here, marked dead, until
- * pc_conn_reap() frees it before the next wait; pc_conn_event() ignores a
- * dead connection.  The fd is closed before that wait, so the kernel can
- * no longer report it.  Linked through c->next: a dead connection is on
- * no other list. */
+/* destroyed connections, closed and marked dead but not freed: an event later in the same
+ * epoll batch may still name one.  pc_conn_reap() frees them before the next wait */
 static __thread struct pc_conn *graveyard;
 
-/* ST5: connections whose handshake a worker turn put off, oldest first.
- * Parked, a connection asks epoll for nothing (EPOLLHUP and EPOLLERR are
- * reported regardless), so it never stands in the ready list ahead of an
- * established client's request; pc_conn_hs_run() takes them in order. */
+/* connections whose handshake a turn put off, oldest first.  Parked, they ask epoll for
+ * nothing, so none stands in the ready list ahead of an established client's request */
 static __thread struct pc_conn *hs_head, *hs_tail;
 static __thread int hs_parked_here;
 
-/* ---- S372: a connection whose replies outrun its socket ----------------
- * Its input is OFF while it is paused for output, as it is while a pub/sub
- * queue it publishes into is full: the one predicate below is what every
- * read decision asks, on both backends. */
+/* ---- a connection whose replies outrun its socket ----------------------
+ * input is OFF while paused for output or for a full pub/sub queue: see conn_input_off */
 static __thread struct pc_conn *outp_head;
 static __thread int outp_here;
 static unsigned long long outp_now_all, outp_pauses_all, outp_stalls_all;
-/* S466: writers held while this worker's WAL ring is nearly full */
+/* writers held while this worker's WAL ring is nearly full */
 static __thread struct pc_conn *walp_head;
 static __thread int walp_here;
 static unsigned long long walp_now_all, walp_pauses_all;
@@ -533,36 +470,16 @@ static inline size_t out_pending(const struct pc_conn *c)
 	return c->out_len + (c->wire_len - c->wire_off);
 }
 
-/* ---- S361: the io_uring backend, the connection side -------------------
- * On an io_uring worker (c->ep < 0) a connection's input arrives by ONE
- * multishot receive into the worker's provided buffers - no read() - and
- * its output leaves by a SEND of [wire_off, wire_len), submitted with the
- * turn's wait - no write() (step 3).  While a send is in flight the
- * kernel reads c->wire, so nothing may append to it, move it or free it:
- * replies made meanwhile wait in c->out, and the send's completion
- * flushes them; a destroyed connection's wire is held (ur_wire_hold)
- * until that completion.  Without a free SQE a flush falls back to
- * write(), and a socket that will not take it waits on a one-shot POLLOUT
- * poll.  What epoll keeps as interest bits is here requests in flight:
- *   ur_recv     the receive is armed (until its last completion: one
- *               without IORING_CQE_F_MORE)
- *   ur_cancel   ... and its cancel has been asked (pause, park, close)
- *   ur_pollout  the POLLOUT poll is armed
- *   ur_send     a send is in flight
- * ur_inflight counts the requests whose last completion is still due.
- * A completion carries the connection's address, so a destroyed
- * connection outlives S356's graveyard while any is due: the reap moves
- * it to ur_limbo, and its last completion frees it.  The destroy also
- * shuts the socket down, which ends an armed receive and poll even if
- * their cancel could not be queued. */
+/* ---- the io_uring backend, the connection side (c->ep < 0) -------------
+ * the kernel reads c->wire while a send is in flight: nothing appends to, moves or frees it */
 static __thread struct pc_ur *ur_ring;
-static __thread struct pc_conn *ur_limbo;   /* dead, completions due */
+static __thread struct pc_conn *ur_limbo;   /* dead, completions due: the last one frees it */
 static __thread struct pc_conn *ur_starved_head;  /* no SQE to arm with */
 
 #define UR_OP_MASK      15ULL
 #define UR_OP_RECV      1ULL
 #define UR_OP_POLLOUT   2ULL
-#define UR_OP_SEND      3ULL            /* step 3 */
+#define UR_OP_SEND      3ULL
 #define UR_UD(c, op)    ((uint64_t)(uintptr_t)(c) | (op))
 
 static int conn_take(struct pc_conn *c, const char *buf, size_t n);
@@ -659,13 +576,8 @@ static void ur_drop(struct pc_conn *c)
 		pc_ur_prep_cancel(s, UR_UD(c, UR_OP_POLLOUT), PC_UR_UD_IGNORE);
 	if (c->ur_send && (s = ur_sqe()) != NULL)
 		pc_ur_prep_cancel(s, UR_UD(c, UR_OP_SEND), PC_UR_UD_IGNORE);
-	/* SUBMIT before the close.  A queued SQE names the socket by its fd
-	 * NUMBER, and the kernel takes the file only when the SQE is
-	 * submitted - at the turn's io_uring_enter.  Closed first, the number
-	 * goes to the next accept, often in the same turn, and this
-	 * connection's queued SEND writes its reply into THAT socket, or its
-	 * re-armed receive steals that socket's bytes.  fuzztest found it: a
-	 * fresh connection's PING answered with another client's error. */
+	/* submit before the close: a queued SQE names the fd NUMBER, taken only at submit.  Closed
+	 * first, the number can go to the next accept and the SEND or receive hits THAT socket */
 	pc_ur_submit(ur_ring, 0, 0);
 	PC_IOSTAT_ADD(ur_enters, 1);
 	shutdown(c->fd, SHUT_RDWR);        /* ends them regardless */
@@ -705,32 +617,29 @@ static void hs_unlink(struct pc_conn *c)
 
 void conn_destroy(struct pc_conn *c)
 {
-	if (c->dead)                       /* S356: once, whoever asks */
+	if (c->dead)                       /* once, whoever asks */
 		return;
-	/* a reply that did not fit is why, unless something named a reason
-	 * first - it used to close as "peer closed" */
+	/* a reply that did not fit is why, unless something named a reason first */
 	if (!c->why && c->out_failed)
 		c->why = c->out_failed == 1 ? "slow consumer: replies past the "
 			"8 MB output cap, unread" : "out of memory for its replies";
-	/* PS1: its subscriptions go.  Only a connection the engine has seen
-	 * takes the engine's lock: every close in the daemon used to. */
+	/* only a connection the pub/sub engine has seen takes the engine's lock */
 	if (c->ps_used)
 		pc_pubsub_conn_closed(c);
 	push_unstage(c);
 	pause_unlink(c);
-	out_unlink(c);                     /* S372 */
-	wal_unlink(c);                     /* S466 */
-	hs_unlink(c);                      /* ST5 */
+	out_unlink(c);
+	wal_unlink(c);
+	hs_unlink(c);
 	if (c->udp)
 		udp_free(c);
 	if (c->http_only)
 		http_open_here--;
-	if (c->client_counted) {              /* S161 */
+	if (c->client_counted) {
 		PC_RESP_DEC(pc_clients_open);
 		c->client_counted = 0;
 	}
-	/* S123: out of the open-connections gauge it was counted into - by
-	 * the memo, which is where the count went in */
+	/* out of the open-connections gauge, by the open_counted memo that counted it in */
 	if (c->open_counted) {
 		if (c->resp_only)
 			PC_RESP_DEC(pc_resp_open);
@@ -740,15 +649,13 @@ void conn_destroy(struct pc_conn *c)
 			PC_RESP_DEC(pc_nat_resp_open);
 		c->open_counted = 0;
 	}
-	/* S70: a connection that settled a protocol said hello, so it says
-	 * goodbye; one that never sent a byte said nothing and stays silent
-	 * (a port probe makes no lines) - unless it died for a REASON, which
-	 * is the case the filing is about: a handshake that never happened */
+	/* a connection that settled a protocol says goodbye; one that never sent a byte (a port
+	 * probe) stays silent unless it died for a reason, e.g. a handshake that never happened */
 	if (!c->http_only && (c->dialect != PC_D_SNIFF || c->why) &&
 	    conn_log_ok()) {
 		char thr[40] = "";
 
-		if (c->out_pauses_n)           /* S372 */
+		if (c->out_pauses_n)
 			snprintf(thr, sizeof thr, ", throttled %u time%s",
 				c->out_pauses_n, c->out_pauses_n == 1 ? "" : "s");
 		LM_NOTICE("client %s disconnected (%s) after %us, %llu "
@@ -760,8 +667,8 @@ void conn_destroy(struct pc_conn *c)
 	pc_obs_conn_del(c->obs);
 	enum_abort(c);
 	park_drop_conn(c);
-	pc_mget_drop_conn(c);              /* G8 */
-	up_unhold(c);                      /* S331 */
+	pc_mget_drop_conn(c);
+	up_unhold(c);
 	up_frames_drop(c);
 	if (c->prev)
 		c->prev->next = c->next;
@@ -769,14 +676,14 @@ void conn_destroy(struct pc_conn *c)
 		*c->list = c->next;
 	if (c->next)
 		c->next->prev = c->prev;
-	if (c->ep < 0)                     /* S361 */
+	if (c->ep < 0)
 		ur_drop(c);
-	if (c->ur_send) {                  /* S361 step 3: the kernel still */
-		c->ur_wire_hold = c->wire; /* reads it - freed by the send's */
-		c->wire = NULL;            /* completion */
+	if (c->ur_send) {                  /* the kernel still reads it: */
+		c->ur_wire_hold = c->wire; /* the send's completion frees it */
+		c->wire = NULL;
 	}
 	close(c->fd);
-	if (c->bufs_held) {                /* S366 */
+	if (c->bufs_held) {
 		bufs_held_here--;
 		__atomic_sub_fetch(&bufs_held_all, 1, __ATOMIC_RELAXED);
 		c->bufs_held = 0;
@@ -789,6 +696,8 @@ void conn_destroy(struct pc_conn *c)
 	free(c->raw);
 	c->in = c->out = NULL;
 	c->wire = c->raw = NULL;
+	pc_tls_free(c->tls);
+	c->tls = NULL;
 	c->dead = 1;
 	c->prev = NULL;
 	c->list = NULL;
@@ -802,7 +711,7 @@ void pc_conn_reap(void)
 
 	while ((c = graveyard) != NULL) {
 		graveyard = c->next;
-		if (c->ur_inflight > 0) {      /* S361: completions still due */
+		if (c->ur_inflight > 0) {      /* completions still due */
 			c->ur_in_limbo = 1;
 			c->prev = NULL;
 			c->next = ur_limbo;
@@ -825,27 +734,8 @@ void pc_conn_destroy_all(struct pc_conn **list)
 	pc_conn_reap();
 }
 
-/* RESP listener guards (task S33) live in daemon.c, which owns CFG.
- * These three counters are written by EVERY worker, so a plain ++ drops
- * increments under load - measured: 199 counted of 200 connections.
- * They are 32-bit and RELAXED-atomic: 32-bit atomics need no libatomic
- * on any target arch, which is what the no-cross-thread-64-bit-atomics
- * rule (par 4) is protecting.  They wrap at 4G events, which for a
- * connection counter is a stat artefact, not a correctness one. */
-
-/* S366: an IDLE connection's buffers go back.  A held connection kept its
- * in, out and wire buffers (4 KB each at first use, doubling) for its
- * whole life: 12 KB of heap per idle RESP client, measured on 245 - the
- * larger half of what took a 1 GB node down at 50,000 connections.  A
- * busy connection must not churn the allocator (freeing on every drained
- * request would cost three malloc/free pairs a request), so the release
- * waits until the connection has been quiet for PC_IDLE_RELEASE_S, and
- * the sweep runs once a second on a worker holding any such connection
- * (its wait is bounded while it does - pc_conn_bufs_held).  Only a
- * connection with nothing in any buffer and nothing in flight - no walk,
- * no parked read-through, no pending write, no close under way - is
- * touched; the next request grows the buffers again from nothing.
- * Every call also stamps the worker's tick for the turn's events. */
+/* an IDLE connection's buffers go back once it has been quiet PC_IDLE_RELEASE_S with nothing
+ * buffered or in flight, so busy ones do not churn; every call stamps the worker's tick */
 #define PC_IDLE_RELEASE_S 2
 
 int pc_conn_bufs_held(void)
@@ -893,26 +783,14 @@ void pc_conn_sweep_idle(struct pc_conn **list)
 	}
 }
 
-/* S46: a request head that never arrives must not hold a slot for
- * ever - the slowloris shape, and cheap to do here because an HTTP
- * connection is one-shot by construction: it is born, it asks once,
- * it is closed.  Native and RESP connections are deliberately NOT
- * swept: those are long-lived by design (a SIP worker holds one for
- * its process lifetime), so an idle timeout there would be a bug, not
- * a defence.
- *
- * Returns the number of HTTP connections still open, so the worker
- * knows whether it must keep waking to sweep at all. */
+/* this worker's open HTTP connections: whether it must keep waking to sweep them */
 int pc_conn_http_open(void)
 {
 	return http_open_here;
 }
 
-/* S367: the walk covers EVERY connection on the worker, and it ran on every
- * turn - with no HTTP connection open at all, and once per request on a
- * busy one: 50,000 held clients on 245 made that 12,500 list nodes a turn
- * a worker.  Nothing to do without an HTTP connection; with one, the
- * timeout is whole seconds, so once a tick is enough. */
+/* HTTP only, against a request head that never arrives; native and RESP links are long-lived
+ * by design and never swept.  Once a tick: the timeout is whole seconds */
 int pc_conn_sweep_http(struct pc_conn **list, int timeout_s)
 {
 	static __thread unsigned int last;
@@ -942,23 +820,19 @@ int pc_conn_sweep_http(struct pc_conn **list, int timeout_s)
 }
 
 unsigned int pc_resp_conns, pc_resp_rejected, pc_resp_authfail;
-unsigned int pc_resp_slots_hits, pc_resp_slots_builds;          /* S75 */
+unsigned int pc_resp_slots_hits, pc_resp_slots_builds;
 unsigned int pc_resp_reqs, pc_nat_conns, pc_nat_bin_conns,
 	pc_nat_resp_conns, pc_nat_bin_reqs, pc_nat_resp_reqs,
 	pc_nat_bin_records, pc_nat_plain_conns, pc_nat_plain_refused;
-unsigned int pc_resp_open, pc_nat_bin_open, pc_nat_resp_open;   /* S123 */
-int pc_max_clients;                             /* S161: 0 = no limit */
-const char *pc_max_clients_basis = "descriptors";  /* S366: or memory, configured */
-int pc_keepalive_s;                             /* PS2: 0 = off */
+unsigned int pc_resp_open, pc_nat_bin_open, pc_nat_resp_open;
+int pc_max_clients;                             /* 0 = no limit */
+const char *pc_max_clients_basis = "descriptors";  /* or memory, configured */
+int pc_keepalive_s;                             /* 0 = off */
 unsigned int pc_clients_open;
 unsigned long long pc_clients_refused;
 static int clients_full_logged;                 /* one line per transition */
-/* S360: the door totals widened to 64 bits on the read side (daemon.h).
- * The workers keep their 32-bit relaxed increments; every reading folds
- * each counter's distance since the last reading - unsigned 32-bit
- * arithmetic, right across one wrap - into dw_total.  The maintenance
- * thread reads every second, so a wrap is missed only above 4.29 G events
- * a second on one counter. */
+/* the door totals are 64-bit on the read side: workers keep 32-bit relaxed increments, and
+ * each read folds the distance since the last (safe across one wrap; read every second) */
 static unsigned int *const dw_src[PC_DW_N] = {
 	&pc_resp_conns, &pc_resp_rejected, &pc_resp_authfail, &pc_resp_reqs,
 	&pc_resp_slots_hits, &pc_resp_slots_builds, &pc_nat_conns,
@@ -1012,9 +886,8 @@ void pc_doors_test_start(unsigned int v)
 	pthread_mutex_unlock(&dw_mx);
 }
 
-/* S123: the running totals start again from here - see daemon.h.  S360:
- * as of the 64-bit totals, so a counter that wraps after the reset still
- * counts up from it */
+/* the running totals restart from here (see daemon.h), based on the 64-bit totals, so a
+ * counter that wraps after the reset still counts up from it */
 void pc_doors_reset(void)
 {
 	pthread_mutex_lock(&dw_mx);
@@ -1023,14 +896,8 @@ void pc_doors_reset(void)
 	pthread_mutex_unlock(&dw_mx);
 }
 
-/* S70: say who connected and who left.  Per connection, not per request,
- * so the volume is bounded by clients - except a reconnect loop, which is
- * exactly the fault this exists to make visible and would make it
- * unbounded.  So: up to CONN_LOG_BURST lines per CONN_LOG_WIN_S seconds,
- * then one line with the count.  The counters are shared across workers
- * and deliberately unlocked (a torn count mis-limits a log line, nothing
- * else - the CP-06 stance).  HTTP connections are never logged here: the
- * page polls every second and a poll is not a client. */
+/* connect/disconnect lines: at most CONN_LOG_BURST per CONN_LOG_WIN_S, then one count, so a
+ * reconnect loop stays visible but bounded.  Unlocked: a torn count mis-limits one line */
 #define CONN_LOG_BURST 20
 #define CONN_LOG_WIN_S 10
 static unsigned int conn_log_win, conn_log_n, conn_log_dropped;
@@ -1056,12 +923,11 @@ static int conn_log_ok(void)
 	return 0;
 }
 
-/* @dialect: "binary" or "resp" - what the first byte settled (S317: the
- * "json" value went with the text door) */
+/* @dialect: "binary" or "resp" - what the first byte settled */
 static void conn_log_open(struct pc_conn *c, const char *dialect)
 {
 	pc_obs_conn_door(c->obs, NULL, c->resp_only ? "resp" : dialect,
-		c->encrypted);                                   /* S160 */
+		c->encrypted);
 	if (c->http_only || !conn_log_ok())
 		return;
 	LM_NOTICE("client %s connected (%s, %s)\n", pc_obs_conn_addr(c->obs),
@@ -1069,12 +935,8 @@ static void conn_log_open(struct pc_conn *c, const char *dialect)
 		"authenticated, plaintext" : "plaintext");
 }
 
-/* 0.6.2: refused HTTP peers - their 403 sent and their side shut, each
- * waiting for its request to arrive and be read, so that close() sends a
- * FIN and not the RST that would take the 403 with it (S66).  Drained
- * without waiting, a turn at a time: closed at EOF or a second after the
- * refusal, the oldest closed at once when the list is full.  Per worker,
- * so no lock. */
+/* refused HTTP peers, 403 sent and write side shut, drained a turn at a time so close() sends
+ * a FIN, not a RST that loses the 403; closed at EOF or after DENY_MS.  Per worker, no lock */
 #define DENY_MAX 32
 #define DENY_MS  1000
 static __thread struct { int fd; long long until; } deny_q[DENY_MAX];
@@ -1141,20 +1003,19 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 {
 	struct epoll_event ev;
 	struct pc_conn *c;
+	int tls = kind & PC_LK_TLS;
 	pc_addr peer;
 	socklen_t plen;
 	int fd, one = 1, refused, taken = 0;
 
+	kind &= ~PC_LK_TLS;
 	for (;;) {
-		/* ST5: a turn takes at most PC_ACCEPT_PER_TURN; the rest wait
-		 * in the kernel's backlog, the listener stays readable, and
-		 * the level-triggered epoll hands it back next turn */
+		/* at most PC_ACCEPT_PER_TURN a turn; the rest wait in the
+		 * backlog and the level-triggered listener returns next turn */
 		if (taken++ >= PC_ACCEPT_PER_TURN)
-			return 1;              /* S361: more may be waiting */
+			return 1;              /* more may be waiting */
 		plen = sizeof peer;
-		/* the peer address used to be collected only for RESP
-		 * listeners (their allow-list needs it); CLIENT LIST (S53)
-		 * wants it for every connection */
+		/* the peer, for every connection: CLIENT LIST shows it */
 		fd = accept(lfd, &peer.sa, &plen);
 		if (fd < 0)
 			return 0;
@@ -1167,16 +1028,8 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 		}
 		if (kind == PC_LK_HTTP &&
 		    !pc_http_peer_allowed(&peer, plen)) {
-			/* S66: say so on the wire.  A silent close renders in a
-			 * browser as ERR_EMPTY_RESPONSE - indistinguishable from
-			 * a dead daemon, a wrong port or a firewall drop - and it
-			 * cost a bring-up an hour of "the dashboard did not
-			 * start" while the log said exactly what was happening.
-			 * The trade is a thin secret: the open port already says a
-			 * listener is here.  The body names the mechanism and
-			 * nothing else - no version, no addresses.  Drain what the
-			 * client sent before closing, or the kernel answers the
-			 * unread request with a RST and the 403 never arrives. */
+			/* a 403, not a silent close (a browser shows that as a
+			 * dead daemon); the body names the mechanism, nothing more */
 			static const char body[] =
 				"perfcached: this address is not in http_allow\n";
 			char deny[256];
@@ -1187,17 +1040,12 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 
 			(void)send(fd, deny, (size_t)dn, MSG_NOSIGNAL | MSG_DONTWAIT);
 			shutdown(fd, SHUT_WR);
-			/* 0.6.2: the drain no longer WAITS here.  This is a
-			 * worker: up to 200 ms of poll() a refused connection
-			 * stalled every client on it, and a peer sending a byte
-			 * every 150 ms held it for as long as it liked - from
-			 * an address the allow-list refuses.  The socket is
-			 * parked instead and drained a turn at a time */
+			/* parked, not drained here: a worker never waits on a refused peer */
 			deny_park(fd);
 			continue;
 		}
 		if (kind == PC_LK_HTTP && !http_rate_ok(&peer)) {
-			/* 0.6.2: over http_rate - answered, never read */
+			/* over http_rate: answered, never read */
 			static const char body[] = "perfcached: too many requests "
 				"from this address - see http_rate\n";
 			char head[320];
@@ -1213,13 +1061,8 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 		}
 		fcntl(fd, F_SETFL, O_NONBLOCK);
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-		/* PS2: the daemon never idle-sweeps a data connection (S46 says
-		 * why), so a subscriber whose host died silently would sit here
-		 * looking live until a message went out and TCP gave up on it
-		 * a quarter of an hour later.  The kernel finds it instead:
-		 * probes after keepalive_s idle, a third of that apart, three
-		 * misses and the socket errors.  redis ships tcp-keepalive 300
-		 * beside timeout 0, the same shape. */
+		/* data links are never idle-swept: keepalive finds a peer that died
+		 * silently - probes after keepalive_s idle, a third of that apart, 3 misses */
 		if (pc_keepalive_s > 0 && kind != PC_LK_HTTP) {
 			int ka = pc_keepalive_s, iv = ka / 3 > 0 ? ka / 3 : 1, cnt = 3;
 
@@ -1228,22 +1071,8 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 			setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &iv, sizeof iv);
 			setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
 		}
-		/* A pipelined batch of replies is only small for WRITES.
-		 * 64 SETs answer in ~320 bytes of "+OK"; 64 GETs of a
-		 * 200-byte value answer in ~13 KB - and the kernel's default
-		 * send buffer is 16 KB (net.ipv4.tcp_wmem), so reads run into
-		 * it and writes never do.  Measured across a bridge: raising
-		 * it lifted GET 515,629 -> 719,655/s with SET unchanged, and
-		 * on a 2-vCPU host it moved GET from x0.89 of redis to x0.97
-		 * while SET went x1.08 -> x1.13.
-		 *
-		 * Asking for 1 MB, not demanding it: the kernel silently
-		 * clamps to net.core.wmem_max, so this is "use what you are
-		 * allowed" rather than a requirement, and a host that has
-		 * tuned wmem_max upward gets the benefit without configuring
-		 * anything here.  The failure mode of asking is a smaller
-		 * buffer, which is what we had anyway.
-		 */
+		/* ask for 1 MB, the kernel clamps to net.core.wmem_max: pipelined GET
+		 * replies outgrow the 16 KB default, SET replies never do */
 		{
 			int sndbuf = 1 << 20;
 
@@ -1251,28 +1080,12 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 				sizeof sndbuf);
 		}
 
-		/* S161: THE LIMIT.  Counted across the data doors; HTTP stays
-		 * outside it so /stats and the page answer at the limit (the
-		 * descriptor reserve covers them).  A RESP client gets Redis's
-		 * exact text on the spot, which every Redis client already
-		 * maps; a native client is answered an error frame at its
-		 * first request, once the frame's id is here to answer with.
-		 * One log line into the limit and one out of it. */
-		/* S366: and the MEMORY.  Past max_clients, the memory guard
-		 * takes one connection from its budget (memguard.h); an empty
-		 * budget is the same refusal, counted beside it, logged once
-		 * a spell by the guard.  A native client is told the same
-		 * text - its library maps it - and the close names the floor. */
-		/* S368: an ENCRYPTED native client is refused HERE, before the
-		 * Noise handshake, as a RESP one is: answering its first request
-		 * meant a full handshake for every connection about to be turned
-		 * away - 38,666 of them in one 100,000-client storm on 245, the
-		 * RESP probe's p99 4 -> 37 ms beside them.  It is told the RESP
-		 * text (a library that does not read it sees the handshake fail,
-		 * as on any close).  What it already sent is drained first, so
-		 * the close is a FIN behind the text, not a reset that loses it.
-		 * A plaintext door (loopback, unix) does no crypto and keeps the
-		 * error frame with the request's id. */
+		/* max_clients counts the data doors only (HTTP answers at the limit); RESP is told
+		 * Redis's text now, a plaintext native client at its first request */
+		/* past max_clients the memory guard takes one connection from its
+		 * budget (memguard.h); an empty budget is the same refusal */
+		/* an encrypted native client is refused here with the RESP text, before the
+		 * Noise handshake; its msg1 is drained first so the close is a FIN, not a reset */
 		refused = 0;
 		if (kind != PC_LK_HTTP) {
 			int full = pc_max_clients > 0 &&
@@ -1292,7 +1105,7 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 						"-ERR max number of clients reached\r\n";
 					char sink[512];
 
-					if (kind != PC_LK_RESP)    /* S368: its msg1 */
+					if (kind != PC_LK_RESP)    /* its msg1 */
 						(void)recv(fd, sink, sizeof sink,
 							MSG_DONTWAIT);
 					if (write(fd, full, sizeof full - 1) < 0)
@@ -1310,6 +1123,10 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 			}
 		}
 		c = calloc(1, sizeof *c);
+		if (c && tls && !(c->tls = pc_tls_new())) {
+			free(c);                   /* no session, no connection */
+			c = NULL;
+		}
 		if (!c) {
 			close(fd);
 			continue;
@@ -1323,7 +1140,7 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 			fd, kind == PC_LK_RESP);
 		pc_obs_conn_door(c->obs, kind == PC_LK_RESP ? "resp"
 			: kind == PC_LK_HTTP ? "http" : "native",
-			kind == PC_LK_RESP ? "resp" : "?", plaintext_ok != PC_DOOR_PLAIN);   /* S160 */
+			kind == PC_LK_RESP ? "resp" : "?", plaintext_ok != PC_DOOR_PLAIN);
 		c->fd = fd;
 		c->ep = ep;
 		c->list = list;
@@ -1331,39 +1148,40 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 		c->resp_collen = 1;
 		c->resp_only = kind == PC_LK_RESP;
 		c->http_only = kind == PC_LK_HTTP;
-		c->http_loop = c->http_only &&    /* IP6-2: ::1 too */
+		c->peer_loop = pc_addr_is_loopback(&peer);
+		c->http_loop = c->http_only &&    /* ::1 too */
 			pc_addr_is_loopback(&peer);
 		if (c->http_only)
 			http_open_here++;
 		c->born = get_ticks();
-		c->last_io = conn_now;         /* S366 */
+		c->last_io = conn_now;
 		if (kind == PC_LK_RESP) {
 			c->dialect = PC_D_RESP;   /* pinned: no sniff, ever */
 			/* unauthenticated until AUTH when a password is set */
 			c->resp_authed = !pc_resp_password_set();
 			PC_RESP_BUMP(pc_resp_conns);
-			PC_RESP_BUMP(pc_resp_open);            /* S123 */
+			PC_RESP_BUMP(pc_resp_open);
 			c->open_counted = 1;
 		} else {
 			c->resp_authed = 1;
 			if (kind == PC_LK_NATIVE)
-				PC_RESP_BUMP(pc_nat_conns);   /* S76 */
+				PC_RESP_BUMP(pc_nat_conns);
 		}
 		if (plaintext_ok != PC_DOOR_PLAIN) {
 			c->encrypted = 1;
 			c->pa_ok = plaintext_ok == PC_DOOR_AUTH;
-			/* 12nw: the CURRENT table - a reload of [secrets] client
+			/* the CURRENT table - a reload of [secrets] client
 			 * publishes a new one for connections accepted after it */
 			c->psk = psk ? (pc_psk_current() ? pc_psk_current() : psk) : NULL;
 		}
 		if (kind == PC_LK_RESP)
-			conn_log_open(c, "resp door");   /* S70: pinned, known now */
+			conn_log_open(c, "resp door");   /* pinned, known now */
 		c->next = *list;
 		if (c->next)
 			c->next->prev = c;
 		*list = c;
 
-		if (ep < 0) {                  /* S361: an io_uring worker */
+		if (ep < 0) {                  /* an io_uring worker */
 			ur_events(c);
 			continue;
 		}
@@ -1374,6 +1192,8 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 }
 
 /* ---- output: stage plaintext, then flush (encrypting if needed) -------- */
+
+static int tls_wire(void *ctx, const char *p, size_t n);
 
 static int encrypt_pending(struct pc_conn *c)
 {
@@ -1399,9 +1219,8 @@ static int encrypt_pending(struct pc_conn *c)
 	return 0;
 }
 
-/* S361 step 3: hand [wire_off, wire_len) to the ring; its completion
- * (pc_conn_ur_complete) advances wire_off and flushes again.  -1: no SQE -
- * the caller writes it now instead */
+/* hand [wire_off, wire_len) to the ring; its completion (pc_conn_ur_complete) advances
+ * wire_off and flushes again.  -1: no SQE - the caller writes it now instead */
 static int ur_send_wire(struct pc_conn *c)
 {
 	struct pc_ur_sqe *s = ur_sqe();
@@ -1421,8 +1240,8 @@ int conn_flush(struct pc_conn *c)
 	struct epoll_event ev;
 	ssize_t n;
 
-	/* S361 step 3: a send in flight owns c->wire; what is staged waits in
-	 * c->out for its completion.  S160: CLIENT LIST sees it pending. */
+	/* a send in flight owns c->wire: staged replies wait in c->out for its completion,
+	 * and CLIENT LIST sees them pending */
 	if (c->ur_send) {
 		size_t p = c->out_len + (c->wire_len - c->wire_off);
 
@@ -1432,6 +1251,9 @@ int conn_flush(struct pc_conn *c)
 		}
 		return 0;
 	}
+	/* records OpenSSL wrote while a send was in flight (a KeyUpdate's answer) */
+	if (c->tls && !c->out_len && pc_tls_flush(c->tls, tls_wire, c) < 0)
+		return -1;
 	/* move staged plaintext into the socket buffer */
 	if (c->out_len) {
 		if (c->encrypted) {
@@ -1439,6 +1261,12 @@ int conn_flush(struct pc_conn *c)
 				c->out_len = 0;        /* no app data before handshake */
 			} else if (encrypt_pending(c) < 0) {
 				return -1;
+			}
+		} else if (c->tls) {           /* held until the handshake is done */
+			if (pc_tls_up(c->tls)) {
+				if (pc_tls_output(c->tls, c->out, c->out_len, tls_wire, c) < 0)
+					return -1;
+				c->out_len = 0;
 			}
 		} else {
 			if (wire_append(c, c->out, c->out_len) < 0)
@@ -1448,17 +1276,17 @@ int conn_flush(struct pc_conn *c)
 	}
 
 	if (c->ep < 0 && c->wire_off < c->wire_len && ur_send_wire(c) == 0)
-		return 0;                  /* S361 step 3: it leaves with the wait */
+		return 0;                  /* it leaves with the wait */
 	while (c->wire_off < c->wire_len) {
 		n = write(c->fd, c->wire + c->wire_off, c->wire_len - c->wire_off);
-		PC_IOSTAT_ADD(writes, 1);              /* 0.6.0 step 1 */
+		PC_IOSTAT_ADD(writes, 1);
 		if (n > 0) {
 			c->wire_off += (size_t)n;
-			c->out_progress = conn_now;    /* S372 */
+			c->out_progress = conn_now;
 			continue;
 		}
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			if (!c->want_write && c->ep < 0) {    /* S361 */
+			if (!c->want_write && c->ep < 0) {
 				c->want_write = 1;
 				ur_events(c);
 			} else if (!c->want_write) {
@@ -1467,7 +1295,7 @@ int conn_flush(struct pc_conn *c)
 				epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &ev);
 				c->want_write = 1;
 			}
-			/* S160: what the socket would not take - the figure that
+			/* what the socket would not take - the figure that
 			 * predicts a slow-consumer kill at PC_MAX_OUTQ */
 			c->obs_pending = c->out_len + (c->wire_len - c->wire_off);
 			pc_obs_conn_pending(c->obs, c->obs_pending);
@@ -1480,7 +1308,7 @@ int conn_flush(struct pc_conn *c)
 		c->obs_pending = 0;
 		pc_obs_conn_pending(c->obs, 0);
 	}
-	if (c->want_write && c->ep < 0)    /* S361: its poll may still fire, */
+	if (c->want_write && c->ep < 0)    /* its poll may still fire, */
 		c->want_write = 0;         /* and finds nothing to write */
 	else if (c->want_write) {
 		ev.events = conn_input_off(c) ? 0 : EPOLLIN;
@@ -1493,41 +1321,28 @@ int conn_flush(struct pc_conn *c)
 
 /* ---- the reply scratch ------------------------------------------------- */
 
-/* Per-thread reply scratch.  These were malloc'd/freed on EVERY
- * request - invisible under glibc's caching allocator, catastrophic
- * under a non-caching allocator, where each 1MB allocation is an
- * mmap+munmap+fault cycle: a container bench measured a ~50x
- * throughput loss before the scratch became thread-owned, and the
- * fix is worth keeping regardless.  Workers live as long as
- * the daemon; the buffers are never freed.  Slot 0 holds the reply a
- * frame or a RESP command builds, slot 1 the RESP codec's assembly
- * space. */
+/* per-thread reply scratch, never freed (workers live as long as the daemon): a 1 MB malloc
+ * per request is an mmap cycle under a non-caching allocator.  0: the reply, 1: RESP assembly */
 static __thread char *jw_scratch[2];
 
 char *scratch_buf(int i)
 {
 	if (!jw_scratch[i]) {
 		jw_scratch[i] = malloc(JW_REPLY_CAP);
-		/* S265: resident whole, not as far as the largest reply */
+		/* resident whole, not as far as the largest reply */
 		pc_touch_pages(jw_scratch[i], JW_REPLY_CAP);
 	}
 	return jw_scratch[i];
 }
 
-/* S159: the clock carried from the end of one request to the start of
- * the next inside one drain of a connection's buffer - a pipelined
- * batch pays one clock read per request instead of two (the second
- * read measured 2% of a 1 us path).  Zeroed per drain, so the first
- * request of a batch reads a fresh clock; the RESP wrapper refreshes
- * it too, so a connection that mixes frames and RESP commands never
- * charges a RESP command to the frame behind it. */
+/* the clock carried from one request's end to the next one's start within a drain: one read
+ * a request.  Zeroed per drain; the RESP wrapper refreshes it too */
 __thread unsigned long long obs_carry;
 
 /* ---- binary frames ----------------------------------------------------- */
 
-/* a response frame.  @trail (S317, RV-10) rides after the payload under
- * PC_BIN_F_MOVED: the stamp of the map this node routed by, [term u32]
- * [seq u32], so a client holding another stamp re-learns the map. */
+/* a response frame.  @trail rides after the payload under PC_BIN_F_MOVED: the routing map's
+ * stamp, [term u32][seq u32], so a client holding another stamp re-learns the map */
 static int bin_reply_ex(struct pc_conn *c, uint64_t id, int flags,
 		const char *payload, size_t n, const char *trail, size_t tn)
 {
@@ -1564,15 +1379,8 @@ static void tv_span(const struct pc_tv *v, int map, const char *key,
 	}
 }
 
-/* S317: one PC_VERB_CMD request - every native method that has no fixed
- * layout.  [verb 19][mlen u8][method][params tree?] -> one tree item,
- * or an error frame carrying the message (the JSON-RPC numeric codes
- * went with the text door: nothing read them).  The parameters are
- * indexed once - pc_tv_parse validates every length - into a node array
- * that is per worker and only grows, like the reply scratch: a malloc
- * per request is what the scratch exists to avoid.  @base is the frame
- * (its id bytes park as they sit on the wire), @pl/@plen its payload.
- * Returns the bytes consumed, -1 fatal. */
+/* one PC_VERB_CMD request: [verb 19][mlen u8][method][params tree?] -> one tree item or an
+ * error frame.  The params index is per worker and only grows.  Bytes consumed, -1 fatal */
 static int cmd_frame(struct pc_conn *c, const char *base, uint64_t id,
 		const char *pl, size_t plen)
 {
@@ -1609,46 +1417,31 @@ static int cmd_frame(struct pc_conn *c, const char *base, uint64_t id,
 		return -1;
 	pc_tw_init(&tw, resbuf, JW_REPLY_CAP);
 	{
-		/* S159: timed and counted like a RESP command - as cmd:<method>,
-		 * into the same rows and the same slow log; a clock read is the
-		 * whole cost on the fast path, the parameter lookups below run
-		 * only for a slow-log or query-log entry */
+		/* timed and counted like a RESP command, as cmd:<method>; the parameter
+		 * lookups below run only for a slow-log or query-log entry */
 		unsigned long long qt0 = obs_carry ? obs_carry : pc_obs_usec_now(), qdt;
 		int qlog = pc_obs_qlog_on();
 
-		/* S111: the connection's request count and last command, on
-		 * every door - it was touched on the RESP dispatch only, so a
-		 * native link closed with "0 requests" whatever it did.  The
-		 * METHOD, so /clients last_cmd reads `ping`, not `cmd`. */
+		/* counted on every door; the METHOD, so last_cmd reads `ping`, not `cmd` */
 		pc_obs_conn_touch(c->obs, method, mlen, get_ticks());
-		ev_origin(c, "binary");                     /* S153 */
+		ev_origin(c, "binary");
 		rc = pc_verb_cmd(method, mlen, &tv, params, &tw, &errmsg,
 			&park_req, &c->privileged, &outcome, c);
-		if (rc < 0 && errmsg == pc_unknown_method)   /* S165 */
+		if (rc < 0 && errmsg == pc_unknown_method)
 			pc_obs_unknown(CLUNK_BIN, method, mlen, NULL, 0, c->obs);
 		obs_carry = pc_obs_usec_now();
 		qdt = obs_carry - qt0;
-		/* 0.6.2: a frame that parked (a read-through fetch, a write to
-		 * the master) runs again when it completes and is counted THEN
-		 * - counted here as well, every such request was two calls */
+		/* a parked frame runs again on completion and is counted then, not twice */
 		if (!up_frame_pending) {
-			/* S189: "cmd:" with a COLON, not a dot.  A Redis
-			 * command name may contain a dot - JSON.GET, TS.ADD,
-			 * FT.SEARCH are real commands - so a RESP client
-			 * sending JSON.GET would land on the same row as the
-			 * native `get` and nothing would distinguish them.  A
-			 * colon cannot appear in a RESP command name, so the
-			 * prefix is unambiguous.  Its own prefix, not bin:, so
-			 * a `get` sent as a method and the fixed GET verb keep
-			 * separate rows - the two cost differently. */
+			/* "cmd:", a COLON: a RESP name may hold a dot (JSON.GET),
+			 * never a colon; not bin:, so method `get` keeps its own row */
 			char cn[32] = "cmd:";      /* length-counted, never a C string */
 			size_t ml = mlen;
 
 			if (ml > sizeof cn - 5)
 				ml = sizeof cn - 5;
-			/* the row slot of the last method seen on this worker -
-			 * a door serves one or two methods at a time, so the
-			 * compare hits and the hash is paid on a change only */
+			/* the row slot of the last method on this worker: a door
+			 * serves one or two, so the hash is paid on a change only */
 			static __thread char lm[32];
 			static __thread size_t lml;
 			static __thread void *lslot;
@@ -1690,7 +1483,7 @@ static int cmd_frame(struct pc_conn *c, const char *base, uint64_t id,
 		}
 	}
 	{
-		/* G8: an mget waits on lookups of keys on other nodes - the
+		/* an mget waits on lookups of keys on other nodes - the
 		 * frame's reply comes when they answer, under its id */
 		struct pc_mget *mg = pc_mget_take();
 
@@ -1705,7 +1498,7 @@ static int cmd_frame(struct pc_conn *c, const char *base, uint64_t id,
 		}
 	}
 	if (up_frame_pending) {
-		/* S331: waiting on a read-through fetch - the frame parks */
+		/* waiting on a read-through fetch - the frame parks */
 		pc_tw_free(&tw);
 		if (rc == 0 && up_frame_park(c, base, plen, 1) == 0)
 			return (int)(PC_BIN_HDR + plen);
@@ -1723,10 +1516,8 @@ static int cmd_frame(struct pc_conn *c, const char *base, uint64_t id,
 			pc_tw_free(&tw);       /* no-op unless a verb grew one */
 			return (int)(PC_BIN_HDR + plen);
 		}
-		/* could not park: the verb pre-wrote its OWN failure shape -
-		 * a set answers stored:false, never a pull-miss (the shape
-		 * bug this comment used to be); one that wrote nothing is
-		 * refused outright */
+		/* could not park: the verb pre-wrote its OWN failure shape
+		 * (a set answers stored:false); one that wrote nothing is refused */
 		if (!tw.n) {
 			rc = -1;
 			errmsg = "busy";
@@ -1740,16 +1531,14 @@ static int cmd_frame(struct pc_conn *c, const char *base, uint64_t id,
 		rc = bin_reply(c, id, PC_BIN_F_ERR, "malformed reply", 15);
 	else
 		rc = bin_reply(c, id, 0, (const char *)tw.b, tw.n);
-	/* S112/S317: a method whose reply a request does not bound (dump)
+	/* a method whose reply a request does not bound (dump)
 	 * switched the writer to a heap buffer; out_append copied it */
 	pc_tw_free(&tw);
 	return rc < 0 ? -1 : (int)(PC_BIN_HDR + plen);
 }
 
-/* one frame starting at in+off; returns bytes consumed (0 = need
- * more), -1 fatal.  Compaction is the caller's, once per drain.  The
- * data verbs' fixed layouts are answered here through pc_verb_bin; a
- * PC_VERB_CMD frame goes to cmd_frame. */
+/* one frame at in+off: bytes consumed, 0 = need more, -1 fatal; the caller compacts once
+ * per drain.  A PC_VERB_CMD frame goes to cmd_frame. */
 static int bin_dispatch(struct pc_conn *c, char *base, uint64_t id, char *pl,
 		uint32_t plen);
 
@@ -1774,15 +1563,14 @@ static int bin_frame(struct pc_conn *c, size_t off)
 		return -1;
 	id = get64(base + 8);
 	pl = base + PC_BIN_HDR;
-	/* S317: a method by name - counted per method there, never on a
-	 * catch-all row here */
+	/* a method by name: counted per method there, never on a catch-all row here */
 	if (plen && (unsigned char)pl[0] == PC_VERB_CMD)
 		return cmd_frame(c, base, id, pl, plen);
 	return bin_dispatch(c, base, id, pl, plen);
 }
 
-/* a data verb's frame at @base - from the input buffer, or (S331) a
- * parked copy dispatched again: bytes consumed, -1 fatal */
+/* a data verb's frame at @base, from the input buffer or a parked copy dispatched again:
+ * bytes consumed, -1 fatal */
 static int bin_dispatch(struct pc_conn *c, char *base, uint64_t id, char *pl,
 		uint32_t plen)
 {
@@ -1798,19 +1586,14 @@ static int bin_dispatch(struct pc_conn *c, char *base, uint64_t id, char *pl,
 		return -1;
 	pc_jw_init(&rw, resbuf, JW_REPLY_CAP);
 	{
-		/* S159: timed and counted like a RESP command, as bin:<verb>.
-		 * S317: 10-14 were the binary pub/sub verbs (PS4), gone with
-		 * the text door - publish and the subscriptions are methods
-		 * now, so those numbers count on the catch-all row. */
+		/* timed and counted like a RESP command, as bin:<verb>; 10-14
+		 * are unassigned (pub/sub runs as methods): the catch-all row */
 		unsigned long long qt0 = obs_carry ? obs_carry : pc_obs_usec_now(), qdt;
 		static const char *const names[] = { "?", "ping", "get",
 			"set", "del", "exists", "ttl", "expire", "add", "sub",
 			"?", "?", "?", "?", "?", "setnx", "setxx", "rlhit", "hcmd",
 			"cmd" };
-		/* S189: a colon for the same reason as cmd: above - the
-		 * binary door's names could not collide today, but one
-		 * convention beats two and a reader should not have to know
-		 * which door invented which separator. */
+		/* a colon, as for cmd:, so both doors name their rows one way */
 		static const char *const bnames[] = { "bin:?", "bin:ping",
 			"bin:get", "bin:set", "bin:del", "bin:exists", "bin:ttl",
 			"bin:expire", "bin:add", "bin:sub", "bin:?", "bin:?",
@@ -1822,11 +1605,11 @@ static int bin_dispatch(struct pc_conn *c, char *base, uint64_t id, char *pl,
 		const char *bn = vb < sizeof bnames / sizeof bnames[0]
 			? bnames[vb] : "bin:?";
 
-		pc_obs_conn_touch(c->obs, vn, strlen(vn), get_ticks());   /* S111 */
-	ev_origin(c, "binary");                      /* S153 */
+		pc_obs_conn_touch(c->obs, vn, strlen(vn), get_ticks());
+	ev_origin(c, "binary");
 	rc = pc_verb_bin(pl, plen, &rw, &flags, &park_req,
 		&col, &collen, &key, &klen, &errmsg, c);
-		if (rc < 0 && errmsg == pc_bin_unknown_verb) {   /* S165 */
+		if (rc < 0 && errmsg == pc_bin_unknown_verb) {
 			char vnum[8];
 			int vl = snprintf(vnum, sizeof vnum, "%u", vb);
 
@@ -1835,12 +1618,9 @@ static int bin_dispatch(struct pc_conn *c, char *base, uint64_t id, char *pl,
 		}
 		obs_carry = pc_obs_usec_now();
 		qdt = obs_carry - qt0;
-		if (!up_frame_pending) {           /* 0.6.2: parked - counted
-		                                    * when it runs again */
-			/* the row slot per verb, resolved once per worker */
-			/* one row per named verb, the last for "bin:?" -
-			 * sized from the table, so a new verb cannot share
-			 * the catch-all's row (S279b) */
+		if (!up_frame_pending) {           /* parked: counted when it runs again */
+			/* a row per named verb plus the catch-all, resolved once per worker; sized
+			 * from the table so a new verb cannot share the catch-all's row */
 			static __thread void *slot[sizeof bnames / sizeof bnames[0] + 1];
 			unsigned int nb = sizeof bnames / sizeof bnames[0];
 			unsigned int si = vb < nb ? vb : nb;
@@ -1874,14 +1654,14 @@ static int bin_dispatch(struct pc_conn *c, char *base, uint64_t id, char *pl,
 		}
 	}
 	if (rc == 0 && !park_req && (base[3] & PC_BIN_F_HINT) && col) {
-		/* S295: answered here, where the client's hint sent it */
+		/* answered here, where the client's hint sent it */
 		pcache_htable_t *hht = pc_store_find(col, collen);
 
 		if (hht && pc_store_proxy_enabled(hht))
 			__atomic_fetch_add(&hint_local_n, 1, __ATOMIC_RELAXED);
 	}
 	if (up_frame_pending) {
-		/* S331: waiting on a read-through fetch - the frame parks */
+		/* waiting on a read-through fetch - the frame parks */
 		if (rc == 0 && up_frame_park(c, base, plen, 0) == 0)
 			goto consume;
 		up_frame_pending = 0;
@@ -1911,30 +1691,10 @@ consume:
 
 /* ---- a connection's buffered requests, each on its first byte ---------- */
 
-/* the protocol is per MESSAGE (see proto.h): each message self-describes
- * on its first byte - 0x9E a binary frame, '*' or a letter a RESP
- * command (redis-cli/rtpengine, task S29) - so one connection can mix
- * the two.  c->dialect keeps the FIRST message's protocol as the memo
- * that picks the notification framing (RESP clients get none - Redis
- * clients cannot parse push frames).  S317: a first byte that is neither
- * is refused with one plain line - until 0.4.5 a '{' or whitespace
- * opened the JSON-RPC text dialect here. */
-/*
- * S232: LOOK AHEAD ACROSS A PIPELINED RESP BATCH.
- *
- * At 1M keys a SET's time is the bucket lock's cache miss and a GET's the
- * record's first byte (DESIGN 12gj).  A client that pipelines has already
- * sent the next requests: they sit parsed-able in c->in.  Before running
- * each frame, this parses ahead - key only, never executed - hashes the
- * key, prefetches its bucket PF_D2 frames early and its record PF_D frames
- * early, so the misses overlap instead of arriving one per request.
- *
- * resp_peek(): one multibulk frame at @p - its length, with the second
- * argument (the key of every keyed command) hashed into *hash.  0 = not
- * all here, -1 = not a frame this can read (inline, oversized): stop.
- * A guess is all it is - SELECT, MGET or a keyless verb prefetch a line
- * nobody reads, which costs a line.
- */
+/* each message self-describes on its first byte (0x9E binary, '*' or a letter RESP);
+ * c->dialect keeps the first one's, which picks push framing (RESP clients get none) */
+/* pipelined RESP lookahead: resp_peek parses the frames already in c->in (key only, never
+ * run; 0 = not all here, -1 = stop) to prefetch bucket and record PF_D2 / PF_D frames ahead */
 #define PF_D   4
 #define PF_D2  (2 * PF_D)
 
@@ -1986,11 +1746,8 @@ static int resp_peek(const char *p, size_t avail, unsigned int *hash,
 	return pos > (size_t)0x7fffffff ? -1 : (int)pos;
 }
 
-/* S232: the gate.  Below [daemon] prefetch_min_keys the table is cache-
- * resident and the lookahead is pure cost (10k keys: SET -9% measured);
- * above it, the misses it hides are the time (1M keys: +3-8%).  The
- * entry count reads every worker's stat line, so each worker keeps its
- * answer for the collection it last asked about, for a second. */
+/* below [daemon] prefetch_min_keys the table is cache-resident and the lookahead pure cost;
+ * the entry count reads every worker's stat line, so a worker keeps its answer for a second */
 int pc_prefetch_min_keys = 65536;
 static __thread pcache_htable_t *pf_gate_ht;
 static __thread unsigned int pf_gate_tick;
@@ -2015,8 +1772,8 @@ int process_plaintext(struct pc_conn *c)
 {
 	size_t off = 0;
 	int rc = 0;
-	/* S232: the lookahead - hashes (and key spans) of the frames parsed
-	 * ahead of `off`, oldest (the next to run) at pf_head */
+	/* the lookahead: hashes (and key spans) of the frames parsed ahead of `off`,
+	 * oldest (the next to run) at pf_head */
 	pcache_htable_t *pf_ht = NULL;
 	unsigned int pf_hash[PF_D2];
 	unsigned char pf_has[PF_D2];
@@ -2030,22 +1787,21 @@ int process_plaintext(struct pc_conn *c)
 		pf_on = pf_ht != NULL && pf_gate(pf_ht);
 	}
 
-	obs_carry = 0;                     /* S159: a fresh clock per drain */
+	obs_carry = 0;                     /* a fresh clock per drain */
 	if (pc_ps_pressed)
 		pc_pubsub_pressure_take(NULL); /* not ours: nothing waits on it */
 
-	pc_wal_wrote = &c->wal_writer;     /* S466: cleared on every way out */
+	pc_wal_wrote = &c->wal_writer;     /* cleared on every way out */
 	while (off < c->in_len) {
-		/* a cooperative walk is in flight: its reply must precede
-		 * any later request's (RESP replies are ordered), so leave
-		 * the rest of the input buffered until the walk completes */
+		/* a cooperative walk's reply must precede any later request's (RESP replies are
+		 * ordered): the rest stays buffered until the walk completes */
 		if (c->enum_active)
 			break;
-		/* S331: a command waits on a read-through fetch: it and all
+		/* a command waits on a read-through fetch: it and all
 		 * that follows stay buffered until the completion */
 		if (c->up_hold)
 			break;
-		/* S332, G8: a RESP command waits on the cluster - what
+		/* a RESP command waits on the cluster - what
 		 * follows waits for its reply */
 		if (c->park_hold)
 			break;
@@ -2053,7 +1809,7 @@ int process_plaintext(struct pc_conn *c)
 		 * second event would answer the same bytes a second time */
 		if (c->close_after)
 			break;
-		/* S372: its replies outrun its socket - the rest of its requests
+		/* its replies outrun its socket - the rest of its requests
 		 * wait, unread, until they drain (pc_conn_resume_out) */
 		if (c->out_paused)
 			break;
@@ -2061,10 +1817,8 @@ int process_plaintext(struct pc_conn *c)
 			out_pause(c);
 			break;
 		}
-		/* S466: it writes and this worker's WAL ring is down to its last
-		 * quarter - the rest waits, unread, until the pump frees room
-		 * (pc_conn_resume_wal), rather than hold the worker in the ring
-		 * wait while its other connections - a /stats among them - wait */
+		/* a writer and this worker's WAL ring in its last quarter: the rest waits unread
+		 * (pc_conn_resume_wal), so its other connections are not held in the ring wait */
 		if (c->wal_writer && pc_wal_tight(0)) {
 			wal_pause(c);
 			break;
@@ -2072,10 +1826,8 @@ int process_plaintext(struct pc_conn *c)
 		unsigned char f = (unsigned char)c->in[off];
 
 		if (c->refused && !c->http_only && !c->resp_only) {
-			/* S161: the refusal, as an error frame carrying the
-			 * request's id when a whole header is here (0 when it is
-			 * not: the client matches nothing, and the close that
-			 * follows says the rest) */
+			/* the refusal as an error frame, with the request's id when a whole
+			 * header is here (0 otherwise: the close that follows says the rest) */
 			uint64_t id = c->in_len - off >= PC_BIN_HDR
 				? get64((const unsigned char *)c->in + off + 8) : 0;
 
@@ -2086,7 +1838,7 @@ int process_plaintext(struct pc_conn *c)
 			break;
 		}
 		if (pf_on && f == '*') {
-			/* S232: keep PF_D2 frames parsed ahead; stage 2 for the
+			/* keep PF_D2 frames parsed ahead; stage 2 for the
 			 * one PF_D ahead, whose bucket stage 1 fetched earlier */
 			if (pf_off < off || !pf_n) {
 				pf_off = off;
@@ -2113,9 +1865,8 @@ int process_plaintext(struct pc_conn *c)
 			if (pf_n > PF_D && pf_has[(pf_head + PF_D) % PF_D2])
 				pcache_ht_prefetch_hashed(pf_ht,
 					pf_hash[(pf_head + PF_D) % PF_D2], 2);
-			/* hash once: the frame about to run was hashed when it
-			 * was parsed ahead - hand that to the table.  Only when
-			 * the ring's head IS this frame (it starts at `off`). */
+			/* hash once: hand the table the hash taken when this frame
+			 * was parsed ahead, if the ring's head IS this frame */
 			if (pf_n && pf_off > off && pf_has[pf_head] &&
 			    pf_kp[pf_head] > c->in + off &&
 			    pf_kp[pf_head] < c->in + pf_off) {
@@ -2127,10 +1878,8 @@ int process_plaintext(struct pc_conn *c)
 		if (c->http_only) {
 			rc = http_one(c, off);
 		} else if (c->resp_only) {
-			/* pinned at accept: this listener speaks RESP and
-			 * NOTHING else, so the native protocol - and with
-			 * it the admin verbs - is unreachable here even if
-			 * a client tries to open with 0x9E */
+			/* pinned at accept: RESP and NOTHING else, so the native
+			 * protocol and its admin verbs are unreachable here */
 			if (f != '*' && !(f >= 'A' && f <= 'Z') &&
 			        !(f >= 'a' && f <= 'z') &&
 			        f != '\r' && f != '\n') {
@@ -2144,7 +1893,7 @@ int process_plaintext(struct pc_conn *c)
 			if (c->dialect == PC_D_SNIFF) {
 				c->dialect = PC_D_BIN;
 				PC_RESP_BUMP(pc_nat_bin_conns);
-				PC_RESP_BUMP(pc_nat_bin_open);     /* S123 */
+				PC_RESP_BUMP(pc_nat_bin_open);
 				c->open_counted = 1;
 				conn_log_open(c, "binary");
 			}
@@ -2156,7 +1905,7 @@ int process_plaintext(struct pc_conn *c)
 			if (c->dialect == PC_D_SNIFF) {
 				c->dialect = PC_D_RESP;
 				PC_RESP_BUMP(pc_nat_resp_conns);
-				PC_RESP_BUMP(pc_nat_resp_open);    /* S123 */
+				PC_RESP_BUMP(pc_nat_resp_open);
 				c->open_counted = 1;
 				conn_log_open(c, "resp");
 			}
@@ -2164,13 +1913,8 @@ int process_plaintext(struct pc_conn *c)
 			if (rc > 0)
 				PC_RESP_BUMP(pc_nat_resp_reqs);
 		} else {
-			/* S317: neither a frame nor RESP.  A '{' or whitespace
-			 * opened the JSON-RPC text dialect until 0.4.5; a client
-			 * still speaking it is told so in one plain line and
-			 * closed, where a silent drop would read as a dead
-			 * daemon.  Anything else - a probe, a TLS hello - gets
-			 * the same line: it costs nothing and names the door.
-			 * The line is staged, the close follows the flush. */
+			/* neither a frame nor RESP: one plain line naming the door,
+			 * then the close - a silent drop reads as a dead daemon */
 			static const char gone[] =
 				"perfcached: this door speaks binary frames or RESP "
 				"- the JSON-RPC dialect was removed in 0.4.5\n";
@@ -2180,11 +1924,11 @@ int process_plaintext(struct pc_conn *c)
 			c->why = "not a frame or RESP (JSON-RPC was removed in 0.4.5)";
 			break;
 		}
-		pcache_hh_s = NULL;            /* S232: the hint ends with its frame */
+		pcache_hh_s = NULL;            /* the hint ends with its frame */
 		if (rc <= 0)
 			break;
 		off += (size_t)rc;
-		if (pf_n) {                    /* S232: that frame has run */
+		if (pf_n) {                    /* that frame has run */
 			pf_head = (pf_head + 1) % PF_D2;
 			pf_n--;
 		}
@@ -2218,7 +1962,7 @@ static int raw_append(struct pc_conn *c, const char *p, size_t n)
 
 /* ---- pull completion (runs on the owning worker) ------------------------ */
 
-/* S317: the one-key result maps a parked CMD method answers with */
+/* the one-key result maps a parked CMD method answers with */
 static void tw_flag(struct pc_tw *w, const char *key, int v)
 {
 	pc_tw_map(w);
@@ -2243,19 +1987,8 @@ static void tw_error(struct pc_tw *w, const char *msg)
 	pc_tw_end(w);
 }
 
-/* RV-10: a parked reply means the node could not answer from its own
- * table.  Under shard and spread that means the client asked the wrong
- * node, and nothing told it: it paid the hop again on the next such key,
- * until a membership push or its own periodic refresh (libperfd:
- * refresh_ms, 30 s) caught up.  The reply says so - PC_BIN_F_MOVED, with
- * the stamp of the map this node routed by after the payload; a client
- * holding another stamp re-learns.  The map itself never rides here - the
- * slot space is ~11k ranges (S44) and this is the data path.  Store,
- * eager and proxy say nothing: a pull or a forward there is the mode
- * working, not a client that is behind.  Every park kind carries it (S317:
- * the fixed-layout verbs too - the library asks for its data that way
- * now, where it used to ask in JSON and read the hint off that reply).
- * Returns the trailer length, 0 when nothing moved. */
+/* under shard and spread a parked reply means the client asked the wrong node: say so with
+ * PC_BIN_F_MOVED and this node's map stamp after the payload; trailer length, 0 if none */
 static size_t park_moved(const struct parked *pk, int *flags, char *trail)
 {
 	pcache_htable_t *mht = pc_store_find(pk->col, pk->collen);
@@ -2276,10 +2009,8 @@ void pc_proto_hint_stats(unsigned long long *sent, unsigned long long *local)
 	*local = __atomic_load_n(&hint_local_n, __ATOMIC_RELAXED);
 }
 
-/* S295: the holder hint after the payload (and after any moved stamp),
- * when the request asked for one and another node answered it in a proxy
- * collection: a pull names the node that had the record, a forward the
- * node it went to.  Returns the bytes added at @trail. */
+/* the holder hint after the payload (and any moved stamp) for a proxy collection that
+ * another node answered: the node that had the record, or the node a forward went to */
 static size_t park_hint(const struct parked *pk, const struct pc_pull_done *d,
 		int *flags, char *trail)
 {
@@ -2322,10 +2053,8 @@ static struct parked *park_find(unsigned int req)
 }
 
 static void pull_complete_body(const struct pc_pull_done *d);
-/* S331: a read-through fetch this worker's connection waited on is done:
- * release the hold and run what is buffered - the parked command first,
- * now answered from the shadow (or as the verdict says), then whatever
- * the client pipelined behind it, in order. */
+/* a read-through fetch this worker's connection waited on is done: release the hold and
+ * run the parked command, then what the client pipelined behind it, in order */
 void pc_proto_upstream_complete(unsigned int req, int status)
 {
 	struct pc_conn *c = NULL;
@@ -2387,13 +2116,7 @@ void pc_proto_upstream_complete(unsigned int req, int status)
 }
 
 
-/* S319: a forwarded hash READ comes back as the owner's RECORD (or as
- * absent / wrong type); the reply the client gets is rendered HERE, over
- * the arguments the park entry kept, and then handed to the same sinks a
- * PC_JOP_HCMD reply tree takes - the three doors cannot tell the two
- * apart.  An owner that could not answer (error, timeout) is passed on
- * as it was: "holder rejected" / "holder timed out". */
-/* S332, G8: a RESP command that waited on the cluster has its reply in
+/* a RESP command that waited on the cluster has its reply in
  * place: the hold goes, and what the client pipelined behind it runs */
 static void resp_park_done(struct pc_conn *c)
 {
@@ -2412,8 +2135,8 @@ static void resp_park_done(struct pc_conn *c)
 		conn_destroy(c);
 }
 
-/* G8: an mget's last lookup answered - its reply, in its door's shape.  A
- * RESP connection held behind it runs what it pipelined after */
+/* an mget's last lookup answered: its reply in its door's shape; a held RESP connection
+ * then runs what it pipelined after */
 static void mget_answer(struct pc_mget *m)
 {
 	struct pc_conn *c = pc_mget_conn(m);
@@ -2463,6 +2186,8 @@ static void mget_answer(struct pc_mget *m)
 	resp_park_done(c);
 }
 
+/* a forwarded hash read returns the owner's record: the client's reply is rendered here
+ * over the park's arguments and handed on as a PC_JOP_HCMD reply tree would be */
 void pc_proto_pull_complete(const struct pc_pull_done *d)
 {
 	struct pc_pull_done dd;
@@ -2470,24 +2195,53 @@ void pc_proto_pull_complete(const struct pc_pull_done *d)
 	struct pc_mget *mg;
 	int rendered = 0;
 
-	if (pc_mget_pull_done(d, &mg)) {           /* G8 */
+	if (pc_mget_pull_done(d, &mg)) {
 		if (mg)
 			mget_answer(mg);
 		return;
 	}
-	if (d->kind == PC_DONE_JSON && d->jop == PC_JOP_HCMD_READ) {
+	if ((d->kind == PC_DONE_JSON && d->jop == PC_JOP_HCMD_READ) ||
+	    d->kind == PC_DONE_PULL) {
 		struct parked *pk = park_find(d->req);
+		int st = d->ok;
 
 		if (!pk)
 			return;                /* conn died while pulling */
+		if (d->kind == PC_DONE_PULL) {
+			char *frag = NULL;
+			int fl = 0;
+
+			if (!pk->hargs || pk->pres)
+				goto plain;
+			/* a jget pulled the document - its fragment, as the
+			 * owner's forwarded jget answers */
+			st = pc_jget_render_pull(pk->hargs, pk->hargl, pk->col,
+				pk->collen, d->val, (size_t)d->vlen, d->found,
+				d->newval, &frag, &fl);
+			if (st >= 0) {
+				if (d->timedout)
+					st = 2;
+				dd = *d;
+				dd.kind = PC_DONE_JSON;
+				dd.jop = PC_JOP_GET;
+				dd.ok = st;
+				dd.val = st == 0 ? frag : NULL;
+				dd.vlen = st == 0 ? fl : 0;
+				pull_complete_body(&dd);
+				return;
+			}
+			/* a hash read pulled the record: 0 a hash, 1 absent, 3 wrong type */
+			st = !d->found ? 1 : (d->newval & PCACHE_F_HASH) ? 0 : 3;
+		}
 		dd = *d;
+		dd.kind = PC_DONE_JSON;
 		dd.jop = PC_JOP_HCMD;
 		dd.val = NULL;
 		dd.vlen = 0;
 		pc_tw_init(&rt, NULL, 0);
-		if (!d->timedout && (d->ok == 0 || d->ok == 1 || d->ok == 3) &&
+		if (!d->timedout && (st == 0 || st == 1 || st == 3) &&
 		    pc_hcmd_render_read(pk->hargs, pk->hargl,
-		        (const unsigned char *)d->val, (size_t)d->vlen, d->ok,
+		        (const unsigned char *)d->val, (size_t)d->vlen, st,
 		        &rt) == 0 && pc_tw_done(&rt) == 0) {
 			rendered = 1;
 			dd.ok = 0;
@@ -2499,15 +2253,14 @@ void pc_proto_pull_complete(const struct pc_pull_done *d)
 		}
 		d = &dd;
 	}
+plain:
 	pull_complete_body(d);
 	if (rendered)
 		pc_tw_free(&rt);
 }
 
-/* a pull found the key: what this node keeps of the answer - nothing
- * (shard; spread on a node that is not a holder), a passive copy (store),
- * or the holder's name (proxy).  A single get's park and an mget's fan-out
- * (G8) both keep it the same way. */
+/* a pull found the key: this node keeps nothing (shard; spread on a non-holder), a passive
+ * copy (store) or the holder's name (proxy) - for a get's park and an mget's fan-out alike */
 void pc_pull_found_keep(const char *col, size_t collen, const char *key,
 		size_t klen, const struct pc_pull_done *d)
 {
@@ -2517,19 +2270,13 @@ void pc_pull_found_keep(const char *col, size_t collen, const char *key,
 	        (pc_cluster_replicas() &&
 	         !pc_spread_in_set(pc_key_slot(key, klen), 0,
 	                pc_cluster_replicas())))) {
-		/* serve only.  Shard: the one copy stays with the owner.
-		 * S127: spread, and placement does not make this node a
-		 * holder - SERVE ONLY.  Keeping it would let the orphan the
-		 * write path was taught to avoid back in through the read
-		 * door: measured, reading the whole keyspace through one
-		 * non-holder took it from its placement share of 67 back to
-		 * all 120, and the fleet from K*N to 293.  A holder that
-		 * pulled DOES keep it - that is repair, not an extra copy. */
+		/* serve only: shard keeps the one copy at the owner, and a spread non-holder would
+		 * bring back the orphans the write path avoids (a holder that pulled keeps it) */
 	} else if (ht && !pc_store_proxy_enabled(ht)) {
 		/* store mode: keep the pulled value PASSIVE, TTL
 		 * re-anchored - the replicate-on-demand behavior */
 		str k, v;
-		/* S449: a copy of an upstream-bound collection's record
+		/* a copy of an upstream-bound collection's record
 		 * never outlives its key */
 		unsigned int exp = pc_upstream_copy_exp(col, collen, d->ttl_left);
 
@@ -2537,13 +2284,11 @@ void pc_pull_found_keep(const char *col, size_t collen, const char *key,
 		k.len = (int)klen;
 		v.s = d->val;
 		v.len = d->vlen;
-		/* store it under the HOLDER's version, not a fresh local
-		 * tick: the clocks converge to the fleet maximum, so a local
-		 * number here can land ABOVE the holder's and make its very
-		 * next genuine update look older than this copy of it */
+		/* the HOLDER's version, not a local tick: clocks converge to the fleet maximum, so
+		 * a local one could outrank the holder's next genuine update */
 		pcache_ht_store_ver(ht, &k, &v, exp,
 			(unsigned char)(PCACHE_F_PASSIVE |
-			(d->newval & PCACHE_F_CARRY)), d->ver);   /* S280 */
+			(d->newval & PCACHE_F_CARRY)), d->ver);
 	} else if (ht) {
 		/* proxy mode: serve WITHOUT storing, remember the holder */
 		pc_loc_set(col, collen, key, klen, d->from_node);
@@ -2561,9 +2306,10 @@ static void pull_complete_body(const struct pc_pull_done *d)
 	if (!pk)
 		return;                        /* conn died while pulling */
 	c = pk->conn;
-	/* S280: a pulled document answers a string GET with WRONGTYPE under
+	/* a pulled document answers a string GET with WRONGTYPE under
 	 * this node's redis_types = strict (the copy is still kept, typed) */
-	if (d->kind == PC_DONE_PULL && d->found && (d->newval & PCACHE_F_TYPES)) {
+	if (d->kind == PC_DONE_PULL && d->found && !pk->pres &&
+	    (d->newval & PCACHE_F_TYPES)) {
 		pcache_htable_t *tht = pc_store_find(pk->col, pk->collen);
 
 		pull_wrongtype = tht && pc_store_types_strict(tht);
@@ -2575,10 +2321,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		pcache_htable_t *ht = pc_store_find(pk->col, pk->collen);
 
 		if (ht && pc_store_shard_enabled(ht)) {
-			/* an owner miss is authoritative - no negative cache
-			 * needed.  EXCEPT during the reshard grace: the data
-			 * may still sit on the old owner, so retry ONCE as a
-			 * broadcast before answering the miss. */
+			/* an owner miss is final, except in the reshard grace: the data may
+			 * still be on the old owner, so retry ONCE as a broadcast */
 			if (!pk->retried && pc_shard_grace()) {
 				unsigned int req2 = pc_pull_begin(pk->col,
 					pk->collen, pk->key, pk->klen);
@@ -2590,12 +2334,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 				}
 			}
 		} else {
-			/* S321: a pull the proxy LOCATOR steered missed on the
-			 * node it named.  The locator can be stale - the record
-			 * was deleted there and written again through another
-			 * node - and that miss was answered as "absent" for a
-			 * key the fleet holds (0.4.6 measured it).  Forget the
-			 * entry and ask the fleet once before answering. */
+			/* the locator's node missed, but it can be stale (rewritten
+			 * elsewhere): forget it and ask the fleet once before answering */
 			if (ht && pc_store_proxy_enabled(ht) && pk->target &&
 			        !pk->retried) {
 				unsigned int req2;
@@ -2619,11 +2359,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 	        !d->ok && !d->timedout && pk->target && !pk->retried &&
 	        pc_store_find(pk->col, pk->collen) &&
 	        pc_store_proxy_enabled(pc_store_find(pk->col, pk->collen))) {
-		/* S321: a DEL or EXPIRE the proxy locator sent to a node that
-		 * no longer holds the key - "nothing there" from it is not
-		 * the fleet's answer.  Ask the fleet: the probe forwards to
-		 * whoever holds it (FWD_DEL / FWD_TOUCH again) or answers
-		 * absent (SET_RESUME), which every door already renders. */
+		/* a DEL or EXPIRE the locator sent to a node that no longer holds the key: ask the
+		 * fleet - the probe forwards to the holder or answers absent (SET_RESUME) */
 		unsigned int req2;
 
 		pc_loc_clear(pk->col, pk->collen, pk->key, pk->klen);
@@ -2638,26 +2375,23 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		}
 	} else if ((d->kind == PC_DONE_FWD_SET || d->kind == PC_DONE_FWD_TOUCH ||
 	        (d->kind == PC_DONE_FWD_SETCOND && d->newval)) && d->ok) {
-		/* the write landed at the holder: remember where */
+		/* the write landed at the holder: the key is no longer a known miss */
 		pcache_htable_t *ht = pc_store_find(pk->col, pk->collen);
 
 		(void)ht;
 		pc_neg_clear(pk->col, pk->collen, pk->key, pk->klen);
 	}
 
-	/* probe-before-place resolved to a fleet-wide miss: replay the
-	 * write through the normal core (probe suppressed - placement
-	 * decides).  A forward re-parks THIS entry: the ack completes it
-	 * later as FWD_SET/FWD_ADD, nothing is written now. */
+	/* probe-before-place found a fleet-wide miss: replay the write through the normal core;
+	 * a forward re-parks THIS entry and its ack completes it later */
 	resume_rc = -1000;
 	resume_nv = 0;
 	if (d->kind == PC_DONE_SET_RESUME && d->ok) {
 		unsigned int req2 = 0;
 
 		if (d->jop == 3 || d->jop == 4) {
-			/* S213, RV-11: a re-arm or a delete never places.  The
-			 * fleet said no - remember it, so the next miss of this
-			 * key costs nothing */
+			/* a re-arm or a delete never places; remember the fleet's
+			 * no, so the next miss of this key costs nothing */
 			resume_rc = PC_OP_ABSENT;
 			pc_neg_set(pk->col, pk->collen, pk->key, pk->klen,
 				pc_cluster_neg_ms());
@@ -2685,7 +2419,11 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		pc_jw_init(&w, nb, sizeof nb);
 		switch (d->kind) {
 		case PC_DONE_PULL:
-			if (pull_wrongtype) {                     /* S280 */
+			if (pk->pres) {
+				pc_pres_resp(&w, pk->pres, d->found,
+					(unsigned int)d->newval, d->ttl_left);
+				out_append(c, w.buf, w.len);
+			} else if (pull_wrongtype) {
 				out_append(c, "-", 1);
 				out_append(c, pc_wrongtype_msg,
 					strlen(pc_wrongtype_msg));
@@ -2702,16 +2440,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 			}
 			break;
 		case PC_DONE_FWD_SET:
-			/* "forward failed" used to cover BOTH of these and
-			 * the begin-time failure in verbs.c, so an operator
-			 * could not tell a network problem from an
-			 * overloaded holder.  Measured under load: 3642
-			 * timeouts with every begin-time counter at zero -
-			 * nothing was wrong with the network at all.
-			 *
-			 * Deliberately NOT retryable: the holder may have
-			 * stored it, so a retry is safe for SET and not for
-			 * INCR.  An honest refusal beats a potential fork. */
+			/* deliberately NOT retryable: the holder may have stored it, so a retry
+			 * is safe for SET and not for INCR */
 			if (d->ok)
 				out_append(c, "+OK\r\n", 5);
 			else if (d->timedout)
@@ -2720,14 +2450,14 @@ static void pull_complete_body(const struct pc_pull_done *d)
 				out_append(c, "-ERR holder rejected\r\n", 22);
 			break;
 		case PC_DONE_FWD_DEL:
-		case PC_DONE_FWD_TOUCH:        /* S213 */
+		case PC_DONE_FWD_TOUCH:
 			out_append(c, d->ok ? ":1\r\n" : ":0\r\n", 4);
 			break;
-		case PC_DONE_FWD_SETCOND:      /* S279: OK, nil, or refused */
+		case PC_DONE_FWD_SETCOND:      /* OK, nil, or refused */
 			if (d->ok)
 				out_append(c, d->newval ? "+OK\r\n" : "$-1\r\n",
 					5);
-			else if (d->newval == PC_FWD_E_TYPE) {   /* S297 */
+			else if (d->newval == PC_FWD_E_TYPE) {
 				out_append(c, "-", 1);
 				out_append(c, pc_wrongtype_msg,
 					strlen(pc_wrongtype_msg));
@@ -2737,7 +2467,7 @@ static void pull_complete_body(const struct pc_pull_done *d)
 			else
 				out_append(c, "-ERR holder rejected\r\n", 22);
 			break;
-		case PC_DONE_FWD_DELCOND:      /* S297: DELEX - 1, 0, or refused */
+		case PC_DONE_FWD_DELCOND:      /* DELEX: 1, 0, or refused */
 			if (d->ok)
 				out_append(c, d->newval ? ":1\r\n" : ":0\r\n", 4);
 			else if (d->newval == PC_FWD_E_TYPE)
@@ -2749,15 +2479,31 @@ static void pull_complete_body(const struct pc_pull_done *d)
 				out_append(c, "-ERR holder rejected\r\n", 22);
 			break;
 		case PC_DONE_JSON:
-			/* S314: on RESP only RL.HIT parks on the JSON plane -
-			 * the deciding node's count and allowed, as *2 :n :0|1.
-			 * d->ok is the holder status here: 0 ok, 3 wrong type */
-			if (d->ok == 0 && d->jop == PC_JOP_HCMD && d->val) {
-				/* S313: the deciding node's reply tree.  Sized by
-				 * the WORST item: a nil is one tree byte and five
-				 * of RESP ($-1\r\n), so an HMGET of 343 absent
-				 * fields overflowed twice-the-tree and answered
-				 * "bad reply" (found by hashfwdtest, S319). */
+			/* RL.HIT's count and allowed as *2 :n :0|1, the hash reads and JSON.GET;
+			 * d->ok: 0 ok, 3 wrong type */
+			if (d->jop == PC_JOP_GET &&
+			    pc_jget_park_shape(pk->hargs, pk->hargl) >= 0) {
+				/* JSON.GET over a pulled document */
+				int sh = pc_jget_park_shape(pk->hargs, pk->hargl);
+				size_t cap = (size_t)d->vlen + 128;
+				char *rb = malloc(cap);
+				struct pc_jw rw2;
+
+				if (rb) {
+					pc_jw_init(&rw2, rb, cap);
+					pc_resp_jget_reply(&rw2, d->ok, d->val, d->vlen,
+						sh & 1, (sh & 2) != 0);
+					if (!rw2.overflow)
+						out_append(c, rw2.buf, rw2.len);
+					else
+						out_append(c, "-ERR bad reply\r\n", 16);
+					free(rb);
+				} else {
+					out_append(c, "-ERR out of memory\r\n", 20);
+				}
+			} else if (d->ok == 0 && d->jop == PC_JOP_HCMD && d->val) {
+				/* sized by the WORST item: a nil is one tree byte
+				 * and five of RESP ($-1\r\n) */
 				size_t cap = (size_t)d->vlen * 6 + 1024;
 				char *rb = malloc(cap);
 				struct pc_jw rw2;
@@ -2775,7 +2521,7 @@ static void pull_complete_body(const struct pc_pull_done *d)
 					out_append(c, "-ERR out of memory\r\n", 20);
 				}
 			} else if (d->ok == 0 && d->jop == PC_JOP_SLOCK) {
-				/* S170a: the script's answer - Lua true / false */
+				/* the script's answer: Lua true / false */
 				if (d->newval)
 					out_append(c, ":1\r\n", 4);
 				else
@@ -2802,7 +2548,7 @@ static void pull_complete_body(const struct pc_pull_done *d)
 				pc_jw_i64(&w, d->newval);
 				pc_jw_lit(&w, "\r\n");
 				out_append(c, w.buf, w.len);
-			} else if (d->newval == PC_FWD_E_TYPE) {   /* S280 */
+			} else if (d->newval == PC_FWD_E_TYPE) {
 				out_append(c, "-", 1);
 				out_append(c, pc_wrongtype_msg,
 					strlen(pc_wrongtype_msg));
@@ -2847,7 +2593,7 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		free(pk->hargs);
 		pk->hargs = NULL;
 		pk->conn = NULL;
-		resp_park_done(c);             /* S332 */
+		resp_park_done(c);
 		return;
 	}
 
@@ -2857,27 +2603,25 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		char pay[16], trail[16];       /* moved stamp + holder hint */
 		const char *emsg = NULL;
 		size_t pn = 0, tn;
-		int tree = 0;                  /* S313: the reply is d->val */
+		int tree = 0;                  /* the reply is d->val */
 		int flags = 0;
 
 		switch (d->kind) {
 		case PC_DONE_FWD_SET:          /* [stored u8] */
 		case PC_DONE_FWD_DEL:          /* [deleted u8] */
-		case PC_DONE_FWD_TOUCH:        /* [updated u8] (S213) */
+		case PC_DONE_FWD_TOUCH:        /* [updated u8] */
 			pay[0] = d->ok ? 1 : 0;
 			pn = 1;
 			break;
-		case PC_DONE_FWD_SETCOND:      /* [stored u8] (S279) */
-		case PC_DONE_FWD_DELCOND:      /* [deleted u8] (S297; no verb
-		                                * asks for it, kept total) */
+		case PC_DONE_FWD_SETCOND:      /* [stored u8] */
+		case PC_DONE_FWD_DELCOND:      /* [deleted u8]: no verb asks, kept total */
 			pay[0] = d->ok && d->newval ? 1 : 0;
 			pn = 1;
 			break;
-		case PC_DONE_JSON:             /* S314: [count i64][allowed u8] */
-			/* only RL.HIT parks on the JSON plane from the binary
-			 * door; d->ok is the holder status (0 ok, 3 wrong type) */
+		case PC_DONE_JSON:             /* [count i64][allowed u8] */
+			/* d->ok is the holder status (0 ok, 3 wrong type) */
 			if (d->ok == 0 && d->jop == PC_JOP_HCMD && d->val) {
-				tree = 1;              /* S313: the reply tree */
+				tree = 1;
 			} else if (d->ok == 0 && d->jop == PC_JOP_RLHIT) {
 				put64(pay, (uint64_t)d->newval);
 				pay[8] = d->count ? 1 : 0;
@@ -2894,14 +2638,14 @@ static void pull_complete_body(const struct pc_pull_done *d)
 				pn = 8;
 			} else {
 				emsg = d->newval == PC_FWD_E_TYPE ?
-					pc_wrongtype_msg :           /* S280 */
+					pc_wrongtype_msg :
 					d->timedout ? "holder timed out"
 					: "holder rejected";
 			}
 			break;
 		case PC_DONE_PULL:             /* the get reply shape */
 			if (pull_wrongtype)
-				emsg = pc_wrongtype_msg;          /* S280 */
+				emsg = pc_wrongtype_msg;
 			break;
 		case PC_DONE_SET_RESUME:
 			if (!d->ok) {          /* probe timeout: refuse */
@@ -2931,17 +2675,19 @@ static void pull_complete_body(const struct pc_pull_done *d)
 			}
 			break;
 		default:
-			emsg = "protocol";     /* the document ops park CMD
-			                        * frames, never a data verb's */
+			emsg = "protocol";     /* document ops park CMD frames only */
 		}
 		tn = park_moved(pk, &flags, trail);
 		if (!emsg)
-			tn += park_hint(pk, d, &flags, trail + tn);   /* S295 */
+			tn += park_hint(pk, d, &flags, trail + tn);
 		if (emsg) {
 			bin_reply(c, id, PC_BIN_F_ERR, emsg, strlen(emsg));
 		} else if (tree) {
 			bin_reply_ex(c, id, flags, d->val, (size_t)d->vlen,
 				trail, tn);
+		} else if (d->kind == PC_DONE_PULL && pk->pres) {
+			pn = pc_pres_bin(pay, pk->pres, d->found, d->ttl_left);
+			bin_reply_ex(c, id, flags, pay, pn, trail, tn);
 		} else if (d->kind == PC_DONE_PULL) {
 			if (d->found) {
 				char *pb = malloc(5 + (size_t)d->vlen);
@@ -2971,12 +2717,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 	}
 
 	if (pk->bin == PARK_CMD) {
-		/* S317: the request was a CMD frame - the method's reply as a
-		 * tree, the shapes its JSON-RPC result had, key for key.  A
-		 * refusal the HOLDER made ("holder rejected", "cluster busy",
-		 * WRONGTYPE) is a result map {error: ...}, not an error frame:
-		 * the method ran and the fleet answered; an error frame is a
-		 * method that could not run at all. */
+		/* a CMD frame: the method's reply tree; a refusal the HOLDER made is a result map
+		 * {error: ...}, not an error frame (that is a method that could not run at all) */
 		uint64_t id = get64(pk->id);
 		unsigned char *tb = (unsigned char *)scratch_buf(0);
 		struct pc_tw w;
@@ -2994,16 +2736,16 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		case PC_DONE_FWD_DEL:
 			tw_flag(&w, "deleted", d->ok);
 			break;
-		case PC_DONE_FWD_TOUCH:        /* S213 */
+		case PC_DONE_FWD_TOUCH:
 			tw_flag(&w, "updated", d->ok);
 			break;
-		case PC_DONE_FWD_SETCOND:      /* S279 */
-			if (!d->ok && d->newval == PC_FWD_E_TYPE)   /* S297 */
+		case PC_DONE_FWD_SETCOND:
+			if (!d->ok && d->newval == PC_FWD_E_TYPE)
 				tw_error(&w, pc_wrongtype_msg);
 			else
 				tw_flag(&w, "stored", d->ok && d->newval);
 			break;
-		case PC_DONE_FWD_DELCOND:      /* S297 */
+		case PC_DONE_FWD_DELCOND:
 			if (d->ok)
 				tw_flag(&w, "deleted", d->newval != 0);
 			else if (d->newval == PC_FWD_E_TYPE)
@@ -3016,7 +2758,7 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		case PC_DONE_FWD_ADD:
 			if (d->ok)
 				tw_int(&w, "value", d->newval);
-			else if (d->newval == PC_FWD_E_TYPE)        /* S280 */
+			else if (d->newval == PC_FWD_E_TYPE)
 				tw_error(&w, pc_wrongtype_msg);
 			else
 				tw_error(&w, d->timedout ? "holder timed out"
@@ -3049,9 +2791,9 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		case PC_DONE_JSON:
 			/* d->ok carries the holder status: 0 ok, 1 benign
 			 * absent, 2 error/timeout, 3 the key holds a string */
-			if (d->ok == 3) {                         /* S280 */
+			if (d->ok == 3) {
 				tw_error(&w, d->jop == PC_JOP_RLHIT ?
-					pc_wrongtype_msg :     /* S314: a string op's */
+					pc_wrongtype_msg :     /* a string op's */
 					pc_json_wrongtype_msg);
 				break;
 			}
@@ -3074,16 +2816,15 @@ static void pull_complete_body(const struct pc_pull_done *d)
 				else
 					tw_error(&w, "holder rejected");
 				break;
-			case PC_JOP_HCMD:                  /* S313 */
-				/* the deciding node's reply tree IS the reply: a
-				 * valid item of this codec (i b n a o e), handed
-				 * on as it came */
+			case PC_JOP_HCMD:
+				/* the deciding node's reply tree IS the reply: a valid
+				 * item of this codec (i b n a o e), handed on as it came */
 				if (d->ok == 0 && d->val)
 					pc_tw_raw(&w, d->val, (size_t)d->vlen);
 				else
 					tw_error(&w, "holder rejected");
 				break;
-			case PC_JOP_RLHIT:                 /* S314 */
+			case PC_JOP_RLHIT:
 				if (d->ok == 0) {
 					pc_tw_map(&w);
 					pc_tw_key(&w, "count");
@@ -3109,7 +2850,10 @@ static void pull_complete_body(const struct pc_pull_done *d)
 			}
 			break;
 		default:                       /* PC_DONE_PULL: the get reply */
-			if (pull_wrongtype) {                     /* S280 */
+			if (pk->pres) {
+				pc_pres_tree(&w, pk->pres, d->found, d->ver,
+					d->ttl_left);
+			} else if (pull_wrongtype) {
 				tw_error(&w, pc_wrongtype_msg);
 			} else if (d->found) {
 				pc_tw_map(&w);
@@ -3127,7 +2871,7 @@ static void pull_complete_body(const struct pc_pull_done *d)
 				tw_flag(&w, "found", 0);
 			}
 		}
-		tn = park_moved(pk, &flags, trail);   /* RV-10, see park_moved */
+		tn = park_moved(pk, &flags, trail);
 		if (pc_tw_done(&w) == 0)
 			bin_reply_ex(c, id, flags, (const char *)w.b, w.n, trail, tn);
 		else
@@ -3146,21 +2890,13 @@ done:
 
 /* ---- notifications ----------------------------------------------------- */
 
-/* PS1: a pub/sub frame onto a connection THIS thread owns.  The engine
- * resolved the subscriber on the owner's turn, so the append and the
- * flush run where every other write to this connection runs.  A refused
- * append is the output cap - the slow subscriber - and the engine kills
- * the connection for it. */
+/* a pub/sub frame goes onto a connection THIS thread owns, appended and flushed on the
+ * owner's turn; a refused append is the output cap, and the engine kills the connection */
 static int push_flush(struct pc_conn *c);   /* with pc_conn_notify */
 static int push_stage(struct pc_conn *c);   /* staged per worker turn */
 
-/* ---- PS5: pub/sub pushes over UDP ------------------------------------------
- * The protocol is lib/perfd_push.h, the stream's life src/psudp.h.  A
- * stream belongs to its connection and so to one worker: no lock.  Its
- * datagrams go to the connection's own TCP peer address - never one the
- * client names - and leave from the door's UDP socket, bound by daemon.c
- * to the door's address and port and shared by the workers (a sendto on
- * one UDP socket is safe from several threads). */
+/* ---- pub/sub pushes over UDP (lib/perfd_push.h): a stream is one worker's, no lock;
+ * datagrams go only to the TCP peer's address, from the door's shared UDP socket */
 struct pc_udp {
 	struct psu_stream st;
 	uint64_t confirmed_seq;            /* the last sequence before messages */
@@ -3405,10 +3141,8 @@ static void udp_prune(struct pc_conn *c, int why)
 	char sid[17];
 	struct pc_tw w;
 
-	/* the notification, {method: "pubsub_udp_pruned", params: {stream,
-	 * reason}} - the stream id as the 16 hex characters pubsub_udp
-	 * answered it in, so lib/perfd_push.h's consumers match it as text.
-	 * Built before the stream is freed: the id lives there. */
+	/* the stream id as the 16 hex characters pubsub_udp answered, so lib/perfd_push.h's
+	 * consumers match it as text; built before udp_free, since the id lives in the stream */
 	snprintf(sid, sizeof sid, "%016llx", (unsigned long long)c->udp->st.id);
 	pc_tw_init(&w, msg, sizeof msg);
 	pc_tw_map(&w);
@@ -3498,22 +3232,15 @@ int pc_conn_pubsub_push(void *conn, const char *pat, size_t plen,
 		rc = out_append(c, resp_frame, flen);
 		return rc < 0 ? rc : push_stage(c);
 	}
-	/* PS5: a confirmed UDP stream takes what fits a datagram.  A send the
+	/* a confirmed UDP stream takes what fits a datagram.  A send the
 	 * socket refused is a gap the client counts, not a reason for TCP */
 	if (c->udp && c->udp->st.active &&
 	    udp_push(c->udp, pat, plen, chan, clen, data, dlen) <= 0)
 		return 0;
 	if (c->dialect != PC_D_BIN)
-		return 0;                      /* still sniffing: nothing to
-		                                * frame it in yet */
-	/* PS4/S317: a native subscriber gets a NOTIFY frame carrying the
-	 * delivery as a tree - {method: "message"|"pmessage", params:
-	 * {pattern?, channel, payload}}, the shape the JSON-RPC line had,
-	 * the payload as bytes (a tree bulk IS bytes: the base64 leg and
-	 * its "enc" sibling went with the text door).  The body is the same
-	 * for every native subscriber of the message (and pattern), so the
-	 * first one builds it into the caller's note: built per subscriber
-	 * it was 45% of the door's CPU delivering to 64. */
+		return 0;                      /* still sniffing: nothing to frame it in yet */
+	/* a native subscriber gets a NOTIFY tree {method: "message"|"pmessage", params: {pattern?,
+	 * channel, payload}}, built once into the caller's note for every native subscriber */
 	if (!note->state) {
 		size_t cap = 128 + plen + clen + dlen;   /* the tags are ~100 */
 		struct pc_tw w;
@@ -3548,7 +3275,7 @@ int pc_conn_pubsub_push(void *conn, const char *pat, size_t plen,
 	return pc_conn_notify(c, note->buf, note->len);
 }
 
-/* S160: the row's subscription count, kept by the engine's bookkeeping */
+/* the row's subscription count, kept by the engine's bookkeeping */
 void pc_conn_subs_note(void *conn, int n)
 {
 	struct pc_conn *c = conn;
@@ -3569,10 +3296,8 @@ int pc_conn_kill(void *conn, const char *why)
 	return 1;
 }
 
-/* a push has been staged: send what the socket takes.  A failure is the
- * slow consumer when the output is at the cap, a broken socket otherwise -
- * the two close the connection for different reasons and are counted
- * differently. */
+/* a push was staged: send what the socket takes; a failure at the output cap is the slow
+ * consumer, otherwise a broken socket (closed and counted differently) */
 static int push_flush(struct pc_conn *c)
 {
 	if (conn_flush(c) == 0)
@@ -3581,13 +3306,8 @@ static int push_flush(struct pc_conn *c)
 		? PC_PS_PUSH_SLOW : PC_PS_PUSH_BROKEN;
 }
 
-/* Staged pushes.  A push appends its frame and puts the connection on
- * this worker's list; the worker writes the list once its turn is over
- * (pc_conn_flush_pushes) - one write for a turn's frames, where a write
- * per frame capped a worker at ~120k deliveries a second.  Output past
- * PUSH_FLUSH_AT is written at once, so a burst meets the slow-consumer
- * cap only on output the socket refused.  Only a worker stages: a push
- * on any other thread writes at once, since nothing there would flush. */
+/* staged pushes, written once per worker turn (pc_conn_flush_pushes); past PUSH_FLUSH_AT, or
+ * off a worker (nothing there would flush), a push writes at once */
 #define PUSH_FLUSH_AT (64u << 10)
 static __thread struct pc_conn *push_dirty;
 static __thread int push_batching;
@@ -3624,13 +3344,8 @@ void pc_conn_push_batching(void)
 	push_batching = 1;
 }
 
-/* Paused publishers (see pubsub.h, pressure).  A command that left a
- * worker's queue at half its cap pauses its connection: no more of its
- * input is served or read - the socket fills and the client's own writes
- * wait, which is the backpressure - until every queue it pressed is below
- * a quarter.  The drains wake this worker when they pass that mark; the
- * worker also asks again on a short timer, so a missed wake costs 50 ms,
- * not a stuck client.  Other connections on the worker are untouched. */
+/* paused publishers (pubsub.h): a command that left a worker's queue at half its cap stops
+ * its connection's input until every queue it pressed is below a quarter (50 ms re-check) */
 static __thread struct pc_conn *paused_head;
 static __thread int paused_here;
 
@@ -3638,7 +3353,7 @@ static void pause_set_events(struct pc_conn *c)
 {
 	struct epoll_event ev;
 
-	if (c->ep < 0) {                   /* S361: cancel or re-arm */
+	if (c->ep < 0) {                   /* io_uring: cancel or re-arm */
 		ur_events(c);
 		return;
 	}
@@ -3718,11 +3433,8 @@ void pc_conn_resume_paused(void)
 		c->pause_mask = NULL;
 		paused_here--;
 		pause_set_events(c);
-		/* what it sent while paused is still buffered: serve it now,
-		 * in order; what is still in the socket is read on its event.
-		 * S361: an io_uring connection's receive may have delivered
-		 * records after the pause, before its cancel took - raw, not
-		 * yet opened: conn_take opens them first */
+		/* serve what it sent while paused, in order; conn_take first opens raw records an
+		 * io_uring receive delivered before its cancel took */
 		if ((c->ep < 0 ? conn_take(c, NULL, 0) : process_plaintext(c)) < 0) {
 			c->why = "protocol error";
 			conn_destroy(c);
@@ -3741,7 +3453,7 @@ void pc_conn_resume_paused(void)
 	}
 }
 
-/* S372: off the output-paused list (a destroy, or the resume pass) */
+/* off the output-paused list (a destroy, or the resume pass) */
 static void out_unlink(struct pc_conn *c)
 {
 	struct pc_conn **pp;
@@ -3785,7 +3497,7 @@ int pc_conn_out_paused_open(void)
 	return outp_here;
 }
 
-/* S466: a writer held until this worker's WAL ring has room again */
+/* a writer held until this worker's WAL ring has room again */
 static void wal_pause(struct pc_conn *c)
 {
 	if (c->wal_paused)
@@ -3827,9 +3539,8 @@ void pc_conn_wal_pause_stats(unsigned long long *now, unsigned long long *pauses
 	*pauses = __atomic_load_n(&walp_pauses_all, __ATOMIC_RELAXED);
 }
 
-/* S466: once a turn - with the ring half free again, every writer it held
- * is served from where it stopped (what it sent meanwhile is buffered, in
- * order).  The list is taken whole: one served here can pause again */
+/* once a turn, with the ring half free: every writer it held is served from where it
+ * stopped; the list is taken whole, as one served here can pause again */
 void pc_conn_resume_wal(void)
 {
 	struct pc_conn *c, *next, *list = walp_head;
@@ -3873,11 +3584,8 @@ void pc_conn_out_pause_stats(struct pc_out_pause_stats *st)
 	st->stall_kills = __atomic_load_n(&outp_stalls_all, __ATOMIC_RELAXED);
 }
 
-/* S372: once a turn, before the wait - a paused connection whose replies
- * drained below PC_OUT_RESUME_AT is served again, from where it stopped;
- * one whose output has not moved for output_stall_s is closed as the slow
- * consumer it is.  The list is taken whole: a connection served here can
- * pause again, onto a list this walk is no longer reading. */
+/* once a turn: a paused connection drained below PC_OUT_RESUME_AT is served again, one
+ * stalled for output_stall_s is closed as a slow consumer; the list is taken whole */
 void pc_conn_resume_out(void)
 {
 	struct pc_conn *c, *next, *list = outp_head;
@@ -3902,9 +3610,7 @@ void pc_conn_resume_out(void)
 			conn_destroy(c);
 			continue;
 		}
-		/* drained: input on again, and what it sent meanwhile - buffered,
-		 * in order - is served now (conn_take opens any records an
-		 * io_uring receive delivered before its cancel took) */
+		/* drained: input on, and what it sent meanwhile is served now, in order */
 		c->out_paused = 0;
 		outp_here--;
 		__atomic_sub_fetch(&outp_now_all, 1, __ATOMIC_RELAXED);
@@ -3978,15 +3684,14 @@ void pc_conn_notify_all(struct pc_conn *list, const char *payload, size_t n)
 		if (c->resp_only || c->http_only)
 			continue;
 		if (c->dialect != PC_D_BIN)
-			continue;                  /* RESP, or still sniffing:
-			                            * nothing to frame it in */
+			continue;                  /* RESP or still sniffing */
 		pc_conn_notify(c, payload, n);
 	}
 }
 
 /* ---- the event pump ---------------------------------------------------- */
 
-static unsigned long long hs_deferred_all;   /* ST5 */
+static unsigned long long hs_deferred_all;
 
 void pc_conn_hs_park(struct pc_conn *c)
 {
@@ -4008,7 +3713,7 @@ void pc_conn_hs_park(struct pc_conn *c)
 		hs_head = c;
 	hs_tail = c;
 	hs_parked_here++;
-	if (c->ep < 0)                     /* S361: its receive is cancelled; */
+	if (c->ep < 0)                     /* io_uring: its receive is cancelled; */
 		ur_events(c);              /* what came is held in raw */
 }
 
@@ -4020,7 +3725,7 @@ int pc_conn_hs_run(int budget)
 
 	while (n < budget && (c = hs_head) != NULL) {
 		hs_unlink(c);
-		if (c->ep < 0) {               /* S361: its bytes are held here */
+		if (c->ep < 0) {               /* io_uring: its bytes are held here */
 			ur_events(c);
 			ur_serve(c, NULL, 0);
 			n++;
@@ -4050,12 +3755,31 @@ unsigned long long pc_conn_hs_deferred_total(void)
 	return __atomic_load_n(&hs_deferred_all, __ATOMIC_RELAXED);
 }
 
-/* S361: one chunk of a connection's input - read() by the epoll loop,
- * handed over by an io_uring receive - taken in: appended (raw for an
- * encrypted connection, plaintext otherwise), the handshake advanced,
- * records opened, requests served.  @n == 0 serves what is already
- * buffered (a parked handshake's turn, a resumed publisher).  -1: drop
- * it (c->why says why); 1: the handshake needs more bytes; 0: done. */
+/* a secret this connection carries stays off the network: TLS, or a loopback peer */
+int pc_conn_secure(const void *conn)
+{
+	const struct pc_conn *c = conn;
+
+	return c && (c->tls || c->peer_loop);
+}
+
+/* the TLS layer's two outlets */
+static int tls_plain(void *ctx, const char *p, size_t n)
+{
+	return in_append(ctx, p, n);
+}
+
+static int tls_wire(void *ctx, const char *p, size_t n)
+{
+	const struct pc_conn *c = ctx;
+
+	if (!n)                            /* asked first: 1 = a send in flight, leave them */
+		return c->ur_send ? 1 : 0;
+	return wire_append(ctx, p, n);
+}
+
+/* one chunk of input (an epoll read or an io_uring receive) taken in and served; @n == 0
+ * serves what is buffered.  -1 drop (c->why says why), 1 handshake needs more, 0 done */
 static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 {
 	if (c->encrypted) {
@@ -4066,11 +3790,8 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 		while (!c->established) {
 			st = channel_handshake(c);
 			if (st < 0) {
-				/* S89: the commonest one-digit mistake is
-				 * a RESP client on the native door.  A
-				 * Noise handshake never opens with '*'
-				 * or a letter; say what was contacted
-				 * and where the RESP door is. */
+				/* no Noise handshake opens with '*' or a letter: a RESP
+				 * client on the native door, the commonest mistake */
 				unsigned char f = c->raw_len
 					? (unsigned char)c->raw[0] : 0;
 
@@ -4093,7 +3814,7 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 							: "not configured");
 					c->why = "RESP on the native door";
 				} else if (f == PC_BIN_MAGIC) {
-					/* S339: a native client that has no
+					/* a native client that has no
 					 * secret: it skipped the handshake */
 					if (conn_log_ok())
 						LM_NOTICE("client %s sent a request "
@@ -4111,15 +3832,29 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 				return 1;
 			if (conn_flush(c) < 0)   /* send msg2 now */
 				return -1;
-			if (st == 2 && !c->raw_len)  /* S468: msg2 out, the switch record due */
+			if (st == 2 && !c->raw_len)  /* msg2 out, the switch record due */
 				return 1;
 		}
-		if (!c->encrypted) {         /* S468: switched - the rest is plaintext */
+		if (!c->encrypted) {         /* switched: the rest is plaintext */
 			if (c->raw_len && in_append(c, c->raw, c->raw_len) < 0)
 				return -1;
 			c->raw_len = 0;
 		} else if (channel_records(c) < 0)
 			return -1;
+	} else if (c->tls) {               /* records in, plaintext to the parser */
+		if (c->raw_len) {          /* records held while paused or parked (ur_hold) */
+			size_t hl = c->raw_len;
+
+			c->raw_len = 0;
+			if (pc_tls_input(c->tls, c->raw, hl, tls_plain, tls_wire, c, &c->why) < 0)
+				return -1;
+		}
+		if (pc_tls_input(c->tls, buf, n, tls_plain, tls_wire, c, &c->why) < 0)
+			return -1;
+		if (c->wire_off < c->wire_len && conn_flush(c) < 0)
+			return -1;
+		if (!pc_tls_up(c->tls))
+			return 1;
 	} else {
 		if (n && in_append(c, buf, n) < 0)
 			return -1;
@@ -4129,9 +3864,8 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 	return 0;
 }
 
-/* S361: an io_uring connection's input, as the epoll loop serves a
- * read: taken in, then flushed; a QUIT closes once its reply is out.
- * @n == 0 serves what is held (a parked handshake's turn). */
+/* an io_uring connection's input, served as the epoll loop serves a read; a QUIT closes
+ * once its reply is out, @n == 0 serves what is held */
 static void ur_serve(struct pc_conn *c, const char *buf, size_t n)
 {
 	if (conn_take(c, buf, n) < 0)
@@ -4148,13 +3882,14 @@ drop:
 	conn_destroy(c);
 }
 
-/* S361: hold all a receive delivered to a paused or parked connection before
- * its cancel took - more than one request's worth (S466: a 1.9 MB burst) */
+/* hold all a receive delivered to a paused or parked connection before its cancel took,
+ * which can be more than one request's worth */
 static int ur_hold(struct pc_conn *c, const char *buf, size_t n)
 {
-	char **b = c->encrypted ? &c->raw : &c->in;
-	size_t *cap = c->encrypted ? &c->raw_cap : &c->in_cap;
-	size_t *len = c->encrypted ? &c->raw_len : &c->in_len;
+	int rec = c->encrypted || c->tls;  /* TLS bytes are records: raw, not input */
+	char **b = rec ? &c->raw : &c->in;
+	size_t *cap = rec ? &c->raw_cap : &c->in_cap;
+	size_t *len = rec ? &c->raw_len : &c->in_len;
 	int rc = buf_reserve(b, cap, *len, n, PC_MAX_REQ + 4 * PC_NOISE_MAXMSG +
 	        PC_UR_HOLD_MAX);
 
@@ -4169,11 +3904,8 @@ static int ur_hold(struct pc_conn *c, const char *buf, size_t n)
 	return 0;
 }
 
-/* S361: one completion of a connection's request, from the worker's loop.
- * @hs counts the turn's handshakes against PC_HS_PER_TURN (ST5): past it,
- * a handshake's bytes are held and the connection parked, as the epoll
- * loop parks one whose bytes wait in the socket; @hs_deferred counts
- * those. */
+/* one io_uring completion from the worker's loop; past PC_HS_PER_TURN (@hs) a handshake's
+ * bytes are held and the connection parked, as epoll parks one, counted in @hs_deferred */
 void pc_conn_ur_complete(uint64_t ud, int res, uint32_t flags, int *hs,
 		unsigned int *hs_deferred)
 {
@@ -4195,7 +3927,7 @@ void pc_conn_ur_complete(uint64_t ud, int res, uint32_t flags, int *hs,
 		} else {
 			c->wire_off += (size_t)res;
 			if (res > 0)
-				c->out_progress = conn_now;   /* S372 */
+				c->out_progress = conn_now;
 			if (c->wire_off >= c->wire_len) {
 				c->wire_off = c->wire_len = 0;
 				if (c->obs_pending) {
@@ -4274,8 +4006,8 @@ void pc_conn_ur_complete(uint64_t ud, int res, uint32_t flags, int *hs,
 
 int pc_conn_hs_pending(const struct pc_conn *c, uint32_t events)
 {
-	return c->encrypted && !c->established && !c->dead &&
-		(events & EPOLLIN) && !(events & (EPOLLHUP | EPOLLERR));
+	return ((c->encrypted && !c->established) || (c->tls && !pc_tls_up(c->tls))) &&
+		!c->dead && (events & EPOLLIN) && !(events & (EPOLLHUP | EPOLLERR));
 }
 
 int pc_conn_event(struct pc_conn *c, uint32_t events)
@@ -4284,13 +4016,13 @@ int pc_conn_event(struct pc_conn *c, uint32_t events)
 	char tmp[16384];
 	int st;
 
-	/* S356: destroyed earlier in this turn, its event still in the batch */
+	/* destroyed earlier in this turn, its event still in the batch */
 	if (c->dead)
 		return -1;
-	c->last_io = conn_now;             /* S366: not idle this second */
+	c->last_io = conn_now;             /* not idle this second */
 	if (events & (EPOLLHUP | EPOLLERR))
 		goto drop;
-	if (c->ep < 0)                     /* S361: its receive owns the input */
+	if (c->ep < 0)                     /* io_uring: its receive owns the input */
 		events &= ~(uint32_t)EPOLLIN;
 
 	if (events & EPOLLIN) {
@@ -4298,7 +4030,7 @@ int pc_conn_event(struct pc_conn *c, uint32_t events)
 			if (conn_input_off(c))
 				break;                 /* its input waits in the socket */
 			n = read(c->fd, tmp, sizeof tmp);
-			PC_IOSTAT_ADD(reads, 1);       /* 0.6.0 step 1 */
+			PC_IOSTAT_ADD(reads, 1);
 			if (n == 0)
 				goto drop;
 			if (n < 0) {
@@ -4315,12 +4047,8 @@ int pc_conn_event(struct pc_conn *c, uint32_t events)
 					break;     /* none yet: they wake us */
 				continue;
 			}
-			/* 0.6.0 (DESIGN 12lj/12lk): a short read has taken all
-			 * the socket held - the sockets are level-triggered, so
-			 * anything that arrives after it wakes this worker again.
-			 * Reading on to collect the EAGAIN cost every depth-1
-			 * request a second, empty read(): 2.0 reads a request,
-			 * a third of its system calls. */
+			/* a short read took all the socket held, and the sockets are level-
+			 * triggered: reading on for the EAGAIN costs every request a 2nd read() */
 			if ((size_t)n < sizeof tmp)
 				break;
 		}
@@ -4328,8 +4056,8 @@ int pc_conn_event(struct pc_conn *c, uint32_t events)
 	if (conn_flush(c) < 0)
 		goto drop;
 	if (c->close_after && !c->out_len && c->wire_off >= c->wire_len) {
-		/* QUIT: reply flushed, close - unless a refusal already named
-		 * the reason (max_clients, S317's not-a-frame line) */
+		/* QUIT: reply flushed, close - unless a refusal already named the
+		 * reason (max_clients, the not-a-frame line) */
 		if (!c->why)
 			c->why = "quit";
 		goto drop;
@@ -4340,7 +4068,7 @@ drop:
 	return -1;
 }
 
-/* S420: the connection named by a verb - the same row CLIENT SETNAME fills */
+/* the connection named by a verb - the same row CLIENT SETNAME fills */
 void pc_conn_set_name(void *conn, const char *name, size_t n)
 {
 	struct pc_conn *c = conn;
@@ -4372,7 +4100,7 @@ int pc_conn_plain_auth(const void *conn)
 	return c && c->plain_auth;
 }
 
-/* S417: the peer of @conn as the CLIENT LIST row renders it */
+/* the peer of @conn as the CLIENT LIST row renders it */
 const char *pc_conn_peer_text(void *conn)
 {
 	struct pc_conn *c = conn;

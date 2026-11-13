@@ -111,6 +111,8 @@ throws(fn() => (new Perfcached('127.0.0.1', $np))->ping(), 'PerfcachedException'
 throws(fn() => new Perfcached('127.0.0.1', 1), 'PerfcachedTransportException', 'nothing listening');
 throws(fn() => new Perfcached('127.0.0.1', $np, ['secret' => $sec]), 'ValueError', 'an unknown option');
 throws(fn() => new Perfcached('127.0.0.1', $np, ['secrets' => 42]), 'ValueError', 'secrets of the wrong type');
+throws(fn() => new Perfcached('127.0.0.1', $np, ['secrets' => "a\x00b"]), 'ValueError', 'S499: a NUL in a secret');
+throws(fn() => new Perfcached('127.0.0.1', $np, ['secrets' => ['ok', "a\x00b"]]), 'ValueError', 'S499: a NUL in one of the secrets');
 throws(fn() => clone $rot, 'Error', 'a handle cannot be cloned');
 throws(fn() => serialize($rot), 'Exception', 'nor serialized');
 ok(Perfcached::VERSION !== '' && Perfcached::LIBPERFD !== '', 'VERSION ' . Perfcached::VERSION . ', LIBPERFD ' . Perfcached::LIBPERFD);

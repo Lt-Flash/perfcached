@@ -1,38 +1,6 @@
 #!/bin/sh
-# backfilltest.sh — S81: a node that restarts empty must be backfilled
-# even when the designated sender changes hands mid-way.
-#
-# The production shape (rolling restart, 2026-09-04): the empty node
-# rejoins while the lowest-id survivor is still live, so a HIGHER
-# survivor is not the sender and runs one ORDINARY sweep cycle to it -
-# no copies sent - and advances its mark.  The lowest survivor dies
-# before its own tick.  The higher one inherits the role and walks from
-# the advanced mark, which discards every passive copy on wtick <=
-# since, walks "clean", clears the flag and logs "backfilled".  The
-# empty node then holds the fleet's NEW writes and none of its old
-# records, for ever - and reads still succeed through pull-on-miss, so
-# nothing alerts.
-#
-# Reproduced with SIGSTOP on the sender (it stays "live" for PEER_UP_MS
-# and cannot tick).  ORDER MATTERS: the empty node must rejoin and be
-# given its id by the still-live master BEFORE the sender is frozen -
-# the lowest id is the master, and freezing it first stalls the join
-# until a new master is elected, by which time the sender is already
-# dead to everyone and the role never moves.  The case is then DETECTED
-# rather than assumed: a
-# marker the higher node AUTHORED arriving on the empty node proves its
-# ordinary cycle ran; the passive record missing beside it proves that
-# cycle was not a backfill.  Only then is the role transfer awaited.
-# An attempt where both arrive together (the higher node's tick landed
-# after the sender died) is ambiguous and is retried.
-#
-# S83 (2026-09-07): the empty node now PULLS its bootstrap from the lowest
-# ready peer holding records, and the push walk is the fallback (exercised
-# by boottest).  The two scenarios below keep their shape - the sender
-# frozen mid-way, two restarts inside one sweep - but assert the property
-# the pull gives: a node that reports ready holds the keyspace, says from
-# whom it got it, and serves it locally.
-# Usage: test/backfilltest.sh [./perfcached]
+# backfilltest.sh - a node that restarts empty ends holding the keyspace, says from whom it pulled
+# it and serves it locally, even when its sender freezes mid-way or two nodes restart in one sweep.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -103,7 +71,7 @@ pidof_node() { eval "echo \$P$1"; }
 
 node 1 17081; node 2 17082; node 3 17083
 start 1; start 2; start 3
-# S83: a joiner is RECOVERING until it knows there is nothing to pull, and
+# a joiner is RECOVERING until it knows there is nothing to pull, and
 # a write into that window is refused; wait for each node's own ready line
 i=0
 while [ $i -lt 200 ]; do
@@ -116,7 +84,7 @@ sleep 1
 T0=$(date +%s)
 
 # E = node 3 restarts empty.  Of the survivors, the LOWER id is the
-# designated sender (L); the other (H) is where the bug lives.
+# designated sender (L); the other (H) is where a lost backfill would hide.
 ID1=$(cstat 17081 node); ID2=$(cstat 17082 node)
 case "$ID1$ID2" in *\?*) echo "no node ids ($ID1/$ID2)"; exit 1 ;; esac
 if [ "$ID1" -lt "$ID2" ]; then LN=1; LP=17081; HN=2; HP=17082
@@ -135,18 +103,12 @@ done
 [ "$(entc $LP)" = 2 ] && [ "$(entc $HP)" = 2 ] && ok \
 	|| { bad "setup: copies did not reach both survivors (L=$(entc $LP) H=$(entc $HP))"; exit 1; }
 
-# Everyone joined this cluster EMPTY, so every node holds a fresh stamp
-# for every peer from the cold start.  Within the sender holdoff (S82,
-# 30 s) H would skip L and self-designate for E from its first tick -
-# there would be no ordinary cycle to observe.  Let the cold-start
-# stamps age out first; this is the property under test, not a wait.
+# everyone joined EMPTY, so within the sender holdoff (30 s) H would self-designate for E from its
+# first tick; let the cold-start stamps age out first
 while [ $(( $(date +%s) - T0 )) -lt 36 ]; do sleep 1; done
 
-# Restart E and let the LIVE master hand it an id; then freeze the
-# lowest holder L.  S83: E pulls from L if its pull beat the freeze, and
-# from H after the pull to a frozen L times out (5 s); either way E must
-# end complete, say from whom, and serve the record locally.  A frozen
-# peer is the shape of a sender dying mid-transfer.
+# restart E and let the LIVE master hand it an id, then freeze L (a sender dying mid-transfer):
+# E pulls from L or, after the pull to a frozen L times out, from H
 kill -9 "$(pidof_node 3)" 2>/dev/null; wait "$(pidof_node 3)" 2>/dev/null
 P3=; start 3
 i=0; eid=0
@@ -175,17 +137,17 @@ if [ "$(entc $EP)" = 2 ]; then
 	[ "$PS1" = "$PS0" ] && ok || bad "backfilled record was served by a pull ($PS0 -> $PS1), not held locally"
 else
 	bad "S81: the passive record never reached the restarted node with its lowest holder frozen (E holds $(entc $EP) of 2)"
-	grep -hE "bootstrap|backfill" "$D/n3.log" | tail -2 | sed 's/^/  E said: /'
+	# the whole story, not only the bootstrap lines: admission, the frozen sender's purge, the push
+	ES=$({ call $EP '{"method":"stats"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])'; } 2>/dev/null)
+	echo "  E is ${ES:-?}; H is $(cstat $HP role), sees $(cstat $HP peers_up) peer(s)"
+	grep -h "cluster:" "$D/n3.log" | tail -8 | cut -c1-200 | sed 's/^/  E said: /'
+	grep -h "cluster:" "$D/n$HN.log" | tail -4 | cut -c1-200 | sed 's/^/  H said: /'
+	grep -hE "promoting instead|holding the election|stepping down|standby" "$D/n$HN.log" | tail -3 | cut -c1-200 | sed 's/^/  H on electing: /'
 fi
 
 
-# ---- phase 2 (S82): two restarts within one sweep of each other --------
-# Restart A empty, then B empty right behind it.  Under the push, B's
-# designated sender was the lowest live id - if A drew it, A sent B its
-# nothing and B stayed short for ever.  Under the pull (S83) a node that
-# is still recovering is never a candidate: B pulls from a READY holder,
-# and A, once complete, is one.  Both must end complete, from a node
-# that held the data, served locally.
+# ---- phase 2: two restarts within one sweep of each other --------
+# a node still recovering is never a pull candidate: B pulls from a READY holder
 if [ $fail -eq 0 ]; then
 	kill -9 "$(pidof_node 3)" 2>/dev/null; wait "$(pidof_node 3)" 2>/dev/null
 	P3=; start 3

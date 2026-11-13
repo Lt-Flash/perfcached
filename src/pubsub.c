@@ -1,44 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * pubsub.c - the pub/sub engine.  See pubsub.h for the contract and
- * doc/DESIGN.md 12eb (PS1, PS9) for why it is shaped this way.
- *
- * WHO OWNS WHAT.  A subscription belongs to a connection, and a connection
- * belongs to one worker for its whole life - every subscribe, unsubscribe
- * and close runs on that worker.  So each worker keeps its OWN tables (a
- * shard): its channel and pattern entries, their subscriber lists, its
- * subscribed connections.  Nothing else ever touches a shard, so the shard
- * needs no lock, and delivery - which runs on the owner too - walks it
- * directly and writes the frames.
- *
- * WHAT A PUBLISHER NEEDS is not the subscribers themselves but which
- * workers hold any, and how many subscriptions there are (PUBLISH's
- * answer).  That is the SHARED index: one entry per distinct name, with a
- * subscription count and a bitmap of owning workers, patterns filed by
- * literal prefix (psindex.h).  Publishers read it without a lock.  It is
- * written only when a worker gains its first or loses its last
- * subscription to a name, under one writer mutex, and a removed entry is
- * freed only after every reader has passed a quiescent point (quiesce.h).
- * A reader that is not inside the quiescence protocol takes the writer
- * mutex instead.
- *
- * WHY.  The first engine guarded everything with one mutex: every publish
- * resolved under it, every worker's delivery resolved again under it, and
- * every RESP command took it to ask "is this connection subscribed".
- * Measured on 12 cores (bench/psengine): 2.37M publishes/s on one worker
- * fell to 122k/s TOTAL on eight, and a thousand patterns - every one
- * globbed on every publish - brought eight workers to 7k/s with a
- * SUBSCRIBE waiting up to 6.4 ms.
- *
- * DELIVERY.  A publish on worker A delivers inline to A's own subscribers
- * and queues the message for every other owning worker, waking it through
- * its eventfd only when its queue was empty.  The message is
- * reference-counted across the workers it was queued to.
- *
- * SLOW SUBSCRIBERS die at the output cap (proto.c refuses the append),
- * which is redis's client-output-buffer-limit behaviour.
- */
+/* pubsub.c - the pub/sub engine (contract in pubsub.h): each worker owns a lock-free shard of its
+ * connections' subscriptions; publishers read a shared per-name index of counts and owner bitmaps. */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -64,7 +27,8 @@
  * this file's includes to its own contract */
 int pc_worker_id(void);
 
-/* ---- the shared index: one entry per distinct name on this node ---------- */
+/* ---- the shared index: one entry per distinct name, read lock-free; written under ps_wlk on a
+ * worker's first join or last leave, an unlinked entry freed past quiescence (quiesce.h) ---- */
 struct ps_shared {
 	struct psi_node node;              /* first: the index hands it back */
 	unsigned long long count;          /* atomic: subscriptions on this node */
@@ -139,54 +103,31 @@ static int ps_nworkers;
 static long ps_nsubs;                          /* atomic */
 static struct ps_wq ps_wq[PS_MAX_WORKERS];
 static unsigned long long ps_published, ps_slow_kills, ps_queued;
-/* DELIVERED, per worker.  One shared counter bumped for every delivery by
- * every worker was 24% of the server's CPU delivering 12M messages a
- * second to 64 subscribers: the line it sat on bounced between the four
- * workers.  Each worker now adds a message's deliveries to a counter on
- * a cache line of its own, and /stats sums them. */
+/* delivered, per worker on a cache line of its own (one shared counter bouncing between workers
+ * cost 24% of the CPU at 12M deliveries/s); /stats sums them */
 static struct ps_wcount {
 	unsigned long long delivered;
 } __attribute__((aligned(64))) ps_wcount[PS_MAX_WORKERS];
 static unsigned long long ps_relay_sent, ps_relay_recv, ps_relay_lost,
 	ps_relay_dropped;
 static unsigned long long ps_alloc_failed, ps_relay_dup, ps_keyspace;
-/* QUEUES.  A worker's queue used to have no bound and its drain no limit:
- * on the two-host rig, relays arriving faster than one subscriber could be
- * written grew a queue that the worker then emptied in ONE pass, serving
- * nothing else and not noticing SIGTERM - the node took 12.9 s to exit.
- * The relay plane (PS11) made that likely, because relays that used to
- * drop at the socket now reach the queues.  So a queue has a byte cap,
- * past which a message for that worker is dropped and counted (delivery
- * is at-most-once), and a drain takes a bounded batch and wakes its worker
- * again for the rest. */
+/* a queue has a byte cap past which a message for that worker is dropped and counted (delivery is
+ * at-most-once), and a drain takes a bounded batch so its worker still serves and sees SIGTERM */
 #define PS_DRAIN_BATCH 1024
-/* 0.6.1: and a byte bound.  1,024 messages of 4 KB is 4 MB onto each of a
- * worker's subscribers in ONE turn.  Under io_uring a connection with a
- * send in flight keeps its pushes in c->out until the completion is reaped
- * - between turns - and that send counts as unsent until then, so two late
- * turns put a subscriber reading as fast as it could past the 8 MB cap: a
- * slow kill of a reader that was not slow (pushbatchtest two-workers on
- * GitHub's 2-vCPU runner, three times; on 224 once in four runs with the
- * test pinned to one CPU).  At 1 MB a reader must miss ~7 turns, not 2,
- * and small messages still drain 1,024 at a time. */
+/* and a byte bound: under io_uring a send in flight counts as unsent until reaped, so 4 MB a turn
+ * put a fast reader past the 8 MB output cap; at 1 MB it must miss ~7 turns, not 2 */
 #define PS_DRAIN_BYTES ((size_t)1 << 20)
 static size_t ps_queue_cap = (size_t)16 << 20;
 static unsigned long long ps_queue_dropped;
-/* PRESSURE.  A drop at the cap came after PUBLISH had counted the
- * receivers, so a publisher that outran a worker was told its messages
- * were delivered while most were not (66% of 1 KB publishes lost on the
- * 223 rig).  A door's publish that leaves a queue at half the cap now
- * pauses its connection until the queue is below a quarter; the cap
- * itself stays for what cannot wait - relays from peers, keyspace events
- * - and for the one message per connection a pause lets through. */
+/* a door's publish that leaves a queue at half the cap pauses its connection until below a quarter,
+ * so PUBLISH does not count receivers the cap then drops; relays and keyspace events never wait */
 static size_t ps_pause_at = (size_t)8 << 20, ps_resume_at = (size_t)4 << 20;
 static unsigned long long ps_publish_paused;
 __thread int pc_ps_pressed;
 static __thread uint64_t ps_pressed_mask[PS_OWNER_WORDS];
 _Static_assert(PC_PS_MASK_WORDS == PS_OWNER_WORDS, "pressure masks are owner masks");
-/* PS12: what this node tells its peers it holds (psinterest.h).  The filter
- * and the counters change under ps_wlk, where first joins and last leaves
- * already happen; the version is read by the heartbeat without it. */
+/* what this node tells its peers it holds (psinterest.h): the filter and counters change under
+ * ps_wlk, where first joins and last leaves happen; the heartbeat reads the version without it */
 #define PS_INT_REBUILD_MS 30000
 static int ps_int_on;
 static uint16_t ps_int_epoch, ps_int_rebuild;
@@ -262,7 +203,7 @@ static struct ps_shared *shared_join(const char *name, size_t nlen,
 		e->node.nlen = (uint32_t)nlen;
 		e->pattern = pattern;
 		psi_insert(t, &e->node);
-		if (ps_int_on) {                   /* PS12: the node's first */
+		if (ps_int_on) {                   /* the node's first */
 			if (!pattern) {
 				psb_hash(name, nlen, &h1, &h2);
 				psb_add(ps_int_bloom, h1, h2);
@@ -293,7 +234,7 @@ static void shared_leave(struct ps_shared *e, int worker)
 		if (LOAD(e->owners[i]))
 			empty = 0;
 	if (empty) {
-		ps_int_removed = 1;                /* PS12: the next rebuild drops it */
+		ps_int_removed = 1;                /* the next rebuild drops it */
 		psi_remove(e->pattern ? &ps_spat : &ps_sch, &e->node);
 		e->stamp = pc_qs_stamp();          /* after the unlink */
 		e->retired_next = NULL;
@@ -383,7 +324,7 @@ static void sub_unlink(struct ps_shard *sh, struct ps_sub *s, int worker)
 		s->owner->nchan--;
 	__atomic_sub_fetch(&le->shared->count, 1, __ATOMIC_ACQ_REL);
 	__atomic_sub_fetch(&ps_nsubs, 1, __ATOMIC_RELAXED);
-	pc_conn_subs_note(s->owner->conn, s->owner->nchan + s->owner->npat);   /* S160 */
+	pc_conn_subs_note(s->owner->conn, s->owner->nchan + s->owner->npat);
 	free(s);
 	local_drop_if_empty(sh, le, worker);
 }
@@ -496,7 +437,7 @@ int pc_pubsub_subscribe(void *conn, int worker, const char *name,
 	__atomic_add_fetch(&le->shared->count, 1, __ATOMIC_ACQ_REL);
 	__atomic_add_fetch(&ps_nsubs, 1, __ATOMIC_RELAXED);
 	n = pc->nchan + pc->npat;
-	pc_conn_subs_note(conn, n);                    /* S160 */
+	pc_conn_subs_note(conn, n);
 	return n;
 }
 
@@ -576,9 +517,8 @@ void pc_pubsub_conn_closed(void *conn)
 	pc = conn_find(sh, conn, 0);
 	if (!pc)
 		return;
-	/* the link is read before sub_unlink frees the subscription; each
-	 * one is the head of its connection's list by then, so the unlink's
-	 * own walk still ends at its first step */
+	/* the link is read before sub_unlink frees the subscription; each is its list's head by then,
+	 * so the unlink's own walk ends at its first step */
 	for (s = pc->subs; s; s = next) {
 		next = s->next_in_conn;
 		sub_unlink(sh, s, worker);
@@ -586,10 +526,8 @@ void pc_pubsub_conn_closed(void *conn)
 	conn_drop_if_empty(sh, pc);
 }
 
-/* ---- frames --------------------------------------------------------------
- * RESP2 arrays, the one wire every subscriber speaks today:
- *   ["message", channel, payload]
- *   ["pmessage", pattern, channel, payload] */
+/* ---- frames: RESP2 arrays, ["message", channel, payload] and
+ * ["pmessage", pattern, channel, payload] ---- */
 
 static size_t bulk_len(size_t n)
 {
@@ -660,9 +598,8 @@ static void msg_release(struct ps_msg *m)
 	free(m);
 }
 
-/* only a subscriber whose output is at the cap is a slow kill, and only
- * once; our own allocation failure never closes a healthy connection.
- * Answers 1 for a delivery, which the caller counts on its worker's line */
+/* only a subscriber whose output is at the cap is a slow kill, and only once; our own allocation
+ * failure never closes a healthy connection.  1 = a delivery, counted on the worker's line */
 static int account(void *conn, int rc)
 {
 	if (rc == 0)
@@ -681,9 +618,8 @@ void pc_pubsub_push_failed(void *conn, int rc)
 		(void)account(conn, rc);
 }
 
-/* A push never unlinks a subscription: a kill only shuts the socket down
- * and the close runs later in the worker's loop, so the lists walked here
- * stay put while their frames are written. */
+/* a push never unlinks a subscription (a kill shuts the socket, the close runs later in the
+ * worker's loop), so the lists walked here stay put while their frames are written */
 struct delivery {
 	struct ps_msg *m;
 	unsigned long long ok;             /* deliveries, for the worker's line */
@@ -753,16 +689,8 @@ static void resolve_one(struct psi_node *node, void *arg)
 		r->owners[i] |= LOAD(e->owners[i]);
 }
 
-/* A worker defers its wakes to the end of its turn: one eventfd write
- * per target worker however many messages the turn queued there, and the
- * target drains them as one batch - a wake per message had the target
- * draining, and flushing, one or two at a time.  Once a deferred wake's
- * queue holds a drain batch or PS_WAKE_EARLY bytes it is sent at once:
- * one long turn - a pipelined burst - must not fill the queue's cap
- * before the target starts draining, or messages a subscriber could
- * have taken are dropped (measured: 9,950 of 12,000 4 KB publishes, with
- * the waiting wake).  Any other thread (the relay receivers, the cluster
- * thread) wakes at once: nothing there would flush a deferred wake. */
+/* a worker defers wakes to its turn's end (one eventfd write per target, drained as one batch), early
+ * at a drain batch or PS_WAKE_EARLY bytes so a burst cannot fill the cap; other threads wake at once */
 #define PS_WAKE_EARLY (256u << 10)
 static __thread int ps_wake_defer;
 static __thread uint64_t ps_wake_pending[PS_OWNER_WORDS];
@@ -862,9 +790,8 @@ int pc_pubsub_publish(const char *chan, size_t clen, const char *data,
 	} else if (relayed == 1) {
 		__atomic_fetch_add(&ps_relay_recv, 1, __ATOMIC_RELAXED);
 	} else {
-		/* PS3: the fleet first, before "nobody here" can cut this
-		 * short - the subscribers may all sit on other nodes.  A
-		 * message that arrived from a peer is never relayed again. */
+		/* the fleet first, before "nobody here" cuts this short - the subscribers may all sit on
+		 * other nodes; a message from a peer is never relayed again */
 		int rs = pc_cluster_pubsub_relay(chan, clen, data, dlen);
 
 		if (rs > 0)
@@ -940,9 +867,8 @@ void pc_pubsub_drain(int worker)
 	pthread_mutex_lock(&wq->lk);
 	q = wq->head;
 	if (q) {
-		/* a bounded batch: the rest stays queued and the worker is
-		 * woken again, so its other connections and its stop flag are
-		 * seen between batches */
+		/* a bounded batch: the rest stays queued and the worker is woken again, so its other
+		 * connections and its stop flag are seen between batches */
 		struct ps_qnode *last = q;
 		size_t bytes = q->bytes;
 		int k = 1;
@@ -1048,7 +974,7 @@ void pc_pubsub_pause_note(void)
 	__atomic_fetch_add(&ps_publish_paused, 1, __ATOMIC_RELAXED);
 }
 
-/* ---- PS12: interest ------------------------------------------------------- */
+/* ---- interest ------------------------------------------------------------- */
 
 void pc_pubsub_set_interest(int on)
 {
@@ -1145,9 +1071,8 @@ void pc_pubsub_interest_tick(long long now_ms)
 	        now_ms - ps_int_rebuilt_ms < PS_INT_REBUILD_MS)
 		return;
 	pthread_mutex_lock(&ps_wlk);
-	/* the filter only ever gains bits between rebuilds; a peer holding the
-	 * old one holds a superset, which is safe, and asks for this one when
-	 * it sees the rebuild count move */
+	/* the filter only gains bits between rebuilds: a peer holding the old one holds a safe superset,
+	 * and asks for this one when it sees the rebuild count move */
 	memset(ps_int_bloom, 0, sizeof ps_int_bloom);
 	psi_each(&ps_sch, int_rebuild_one, NULL);
 	ps_int_rebuild++;

@@ -1,47 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 Yury Kirsanov - see COPYING
-#
-# perfcached-upgrade - UP5 (DESIGN 12nf): the privileged half of a node's
-# upgrade.  perfcached-upgrade.service runs it when the daemon writes
-# <state_dir>/upgrade/request; the daemon itself never gains a privilege
-# (it keeps NoNewPrivileges and writes only its own state directory).
-#
-# A request is a wish from an unprivileged process, never an instruction to
-# trust.  This installs the one build it names, and only if the INSTALLED
-# binary verifies the copy this script took (perfcached -K):
-#   1. the request and the artifact are copied into a directory only root
-#      writes (work) - READ AS THE DAEMON'S USER (setpriv), no symlink
-#      followed, no FIFO waited on, sizes capped - so a request can lead
-#      only where the daemon could read already, nothing there is read
-#      twice, and root writes nothing in the daemon's directory;
-#   2. its sha256 must be the request's, its signature good by the
-#      installed binary (the release key, [upgrade] trusted_keys);
-#   3. it is unpacked beside the live prefix (one top directory,
-#      perfcached-<something>, nothing outside it), its stamp read, and the
-#      live configuration checked with it (-C);
-#   4. stop; the state carried into the new prefix when it lives there
-#      (state_dir under the link); the link switched; start;
-#   5. READY from the NEW process: <state_dir>/upgrade/node naming a live
-#      pid other than the old one, the new revision, state=ready - within
-#      ready_s, or stop, switch back, start, and say so;
-#   6. <results>/result-<request id>: status ok | rolled-back | refused,
-#   (UP7b) a request with op=revert and to=<prefix> skips 1-3: the prefix
-#      must be the one this helper's newest ok result switched FROM; then
-#      4-5 as for a switch, back to it, with the same ready wait and the
-#      same switch-forward if the previous build does not come up.
-#      the reason, from and to.
-# A previous prefix is never deleted.
-#
-# Settings, /etc/perfcached/upgrade.conf (key = value lines - READ, never
-# sourced), each optional:
-#   unit      = perfcached                  the systemd unit
-#   link      = /opt/perfcached             the prefix link ExecStart runs through
-#   conf      = /etc/perfcached/perfcached.conf
-#   state_dir = (the config's [daemon] state_dir)
-#   ready_s   = 600                         a big snapshot loads in minutes
-#   results   = /var/lib/perfcached-upgrade root's: the work and the results
-#   systemctl = systemctl
+# perfcached-upgrade - the privileged half of a node's upgrade, run when the daemon writes
+# <state_dir>/upgrade/request; it installs only a build the INSTALLED binary verifies (-K)
 set -u
 umask 022
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -73,11 +34,8 @@ if [ -z "$STATE" ]; then
 	[ -n "$STATE" ] || die "the configuration has no [daemon] state_dir - set state_dir in $CONFF"
 fi
 UPG=$STATE/upgrade
-# the daemon's directory is the daemon's: what is read there is read as its
-# owner, and every check is the open itself (nofollow, nonblock) - never a
-# test followed by an open a compromised daemon could race
-# -L: a state_dir that is itself a link (root's, as links are) names its
-# TARGET's owner - without it the drop below was silently skipped
+# what is read in the daemon's directory is read as its owner (stat -L: a linked state_dir's
+# target), each check the open itself - never a test then an open a daemon could race
 DU=$(stat -L -c %u "$STATE" 2>/dev/null) DG=$(stat -L -c %g "$STATE" 2>/dev/null)
 [ -n "$DU" ] || die "cannot stat $STATE"
 if [ "$(id -u)" = 0 ] && [ "$DU" != 0 ] && ! command -v setpriv > /dev/null; then
@@ -132,9 +90,8 @@ case "$ID" in ''|*[!0-9A-Za-z_-]*) ID=invalid; refuse "the request's id is missi
 [ ${#ID} -le 64 ] || { ID=invalid; refuse "the request's id is longer than 64"; }
 case "$OP" in switch|revert) ;; *) refuse "op '$OP' is not switch or revert";; esac
 if [ "$OP" = revert ]; then
-	# ---- UP7b: back to the prefix this helper switched away from last.  The
-	# daemon names it; root believes only its own records: the newest result
-	# with status=ok must say from=<that prefix>.
+	# ---- revert: back to the prefix this helper switched away from last; the daemon names
+	# it, and the newest ok result must say from=<that prefix>
 	OPT=$(readlink -f "$(dirname "$LINK")")
 	case "$REVTO" in "$OPT"/perfcached-*) ;; *) refuse "to '$REVTO' is not a prefix under $OPT";; esac
 	case "$REVTO" in *[!0-9A-Za-z./+_-]*|*..*) refuse "to '$REVTO' has odd characters";; esac

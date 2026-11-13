@@ -1,49 +1,5 @@
-/*
- * natbench — a native-dialect load generator that can actually saturate
- * the daemon, and says so when it cannot.
- *
- * Why this exists.  pcbench has -d but speaks plaintext, and a
- * non-loopback listener refuses that, so it cannot drive a remote
- * server at depth.  concbench authenticates but is synchronous - one
- * operation per connection at a time.  A first attempt at an async
- * client used one OS thread per connection with its own poll(), and
- * capped at ~500k ops/s whether or not a network was in the path, while
- * pcbench drove the same server at 6.15M on loopback: it was measuring
- * itself.  That is the failure this file is built to avoid.
- *
- * So: few threads, MANY connections each, one poll() per loop over all
- * of a thread's sockets, @depth requests in flight per connection.  And
- * it reports its own CPU and its hit count, because a client that is
- * saturated - or that is reading keys nobody stored - produces a
- * confident number that means nothing.
- *
- * usage: natbench <host> <port> <secret|-> <col> <conns> <threads>
- *                 <depth> <secs> <keyspace> <valsize> <getpct>
- *                 <kv 0|1> [latrate] [spares] [route]
- *
- * kv:     1 = the data verbs on their fixed-layout frames
- *         (perfd_submit_kv: no encoding, no parsing on either leg);
- *         0 = get/set as CMD trees through perfd_submit's JSON edge
- *         (params text -> tree per request, the reply tree rendered
- *         back), which measures that conversion's cost on top.
- * spares: -1 (default) lets libperfd open standbys; 0 pins every
- * connection to <host>.  Standbys are a PREREQUISITE for routing, not a
- * trigger.
- * route:  1 turns on per-key routing (opts.route_keys), which is what
- * actually makes the client compute each key's owner and skip the
- * daemon's forward hop.  Default 0 - the un-routed path, which is what
- * every benchmark before this measured.
- *
- * NB_ENCRYPT=1 keeps the channel encrypted (perfd_opts.encrypt): it never asks for plaintext.
- *
- * NB_RATE=<ops/s> in the environment paces the run to that many requests
- * a second in total, spread over the threads (the operator, 2026-10-20:
- * epoll vs io_uring at PROD's light load, which a closed loop cannot
- * show).  Each thread keeps a budget - its share of the rate times the
- * time so far, less what it issued - and tops a connection up only within
- * it; the poll waits 1 ms instead of 50.  The achieved rate is printed:
- * below the target means the client or the server could not keep it.
- */
+/* natbench - native-dialect load generator: few threads, MANY connections, @depth in flight
+ * each; reports its own CPU and hits.  kv 1 = fixed-layout frames; env NB_ENCRYPT, NB_RATE=ops/s */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,46 +15,21 @@
 
 static const char *g_host, *g_sec, *g_col;
 static int g_port, g_depth, g_secs, g_keys, g_val, g_getpct, g_kv;
-/* Latency sampling rate: 1 = time every request (default), N = every
- * Nth, 0 = off.  Two clock_gettime() calls per request cost a measured
- * 9.3% of this client's CPU at depth 256, and the callback that
- * consumes them another 9% - a quarter of the client's time is the
- * instrument.  When the question is how fast the LIBRARY goes, that
- * has to be able to step out of the way. */
+/* latency sampling: 1 = every request, N = every Nth, 0 = off - the clock calls and their
+ * callback are a quarter of this client's CPU at depth 256 */
 static int g_lat = 1;
 
-/* Standbys, and therefore per-key ROUTING (S35): libperfd computes each
- * key's owner and talks to it directly, which removes the daemon's
- * forward hop.  -1 = as many as the fleet offers, 0 = none.
- *
- * A capacity measurement needs 0.  With routing on, the CLIENT does the
- * distributing, so every mode spreads across the fleet and store looks
- * exactly like shard - which is how the first capacity run reported
- * store holding 115,000 keys across three nodes when store is supposed
- * to keep them local.  Turn it off to see what the DAEMON's placement
- * does on its own. */
+/* standbys, and so per-key ROUTING: -1 = as many as the fleet offers, 0 = none; a capacity run
+ * needs 0, or the CLIENT distributes and every mode looks like shard */
 static int g_spares = -1;
 
-/* opts.route_keys - per-key routing (S35), and it is OPT-IN.  Setting
- * spares alone is not enough: route_want comes from this flag, so a
- * client that asks for standbys and nothing else still sends every
- * request to the node it dialled and lets the daemon forward.  Every
- * shard number this harness has ever produced was that un-routed path,
- * which is why shard measured 6.6x behind store with the daemon's own
- * fwd_sent counter at 845,762 against store's 0. */
+/* opts.route_keys: per-key routing is OPT-IN - spares alone still send every request to
+ * the dialled node and let the daemon forward */
 static int g_route = 0;
 static double g_rate = 0;              /* NB_RATE: ops/s in total, 0 = closed loop */
 
-/* THE ROUTED CLIENT.  libperfd computes owners but cannot route on the
- * async API: routing needs a connection per node, and the library must
- * not open connections an async caller would never poll.  So the
- * APPLICATION does it - which is the shape a real async client has to
- * take anyway.
- *
- * Each connection dials a different member and draws only from that
- * member's keys, so no request ever needs forwarding.  The owner of
- * every key is asked once at startup via perfd_owner_of(), the same
- * computation the daemon uses, rather than reimplemented here. */
+/* the routed client: the async API cannot route (it must not open connections nobody polls),
+ * so each connection dials one member and draws only its keys (owners via perfd_owner_of) */
 #define NB_MAXMEM 32
 static perfd_t *g_map;                 /* holds the learned fleet */
 static int g_nmem;
@@ -227,10 +158,7 @@ static int top_up(struct conn *c, long long max)
 		c->nfree--;
 		n_sub++;
 	}
-	/* One write for the whole batch.  Without opts.defer_push each
-	 * submit writes on its own, so a depth of 64 costs 64 write()
-	 * syscalls - which is what made a profile of this client 24%+
-	 * kernel and capped it well below what the daemon can serve. */
+	/* one write for the whole batch, not a write() per submit */
 	if (n_sub && perfd_push(c->h) < 0)
 		return -1;
 	return n_sub;
@@ -256,17 +184,15 @@ static void *worker(void *arg)
 	o.secrets = strcmp(g_sec, "-") ? sec : NULL;
 	o.spares = g_spares;
 	o.route_keys = g_route;
-	o.encrypt = getenv("NB_ENCRYPT") != NULL;     /* S468: stay encrypted */
-	/* batching is libperfd's default now; nothing to ask for */
+	o.encrypt = getenv("NB_ENCRYPT") != NULL;     /* stay encrypted */
 
 	for (i = 0; i < t->nconn; i++) {
 		struct conn *c = &t->cs[i];
 
 		c->t = t;
 		c->seed = (unsigned int)(uintptr_t)c + (unsigned int)i * 7919u;
-		/* spread across the fleet when routing; otherwise every
-		 * connection dials the host given on the command line and
-		 * the daemon forwards, which is the un-routed baseline */
+		/* spread across the fleet when routing; otherwise every connection dials the
+		 * given host and the daemon forwards - the un-routed baseline */
 		c->mem = g_nmem > 0 ? i % g_nmem : 0;
 		c->h = g_nmem > 0
 			? perfd_connect_async(g_maddr[c->mem], g_mport[c->mem], &o)
@@ -428,11 +354,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "need conns >= threads >= 1\n");
 		return 2;
 	}
-	/* Learn the fleet ONCE, before any worker connects.  An async
-	 * handle discovers members through its own pipeline, so this has
-	 * to pump events until routing turns on rather than blocking on a
-	 * reply.  Everything after is read-only, so the workers share it
-	 * without a lock. */
+	/* Learn the fleet ONCE, before any worker connects, pumping events until routing turns
+	 * on; read-only afterwards, so the workers share it without a lock. */
 	if (g_route) {
 		perfd_opts mo;
 		const char *msec[2] = { g_sec, NULL };
@@ -551,14 +474,8 @@ int main(int argc, char **argv)
 	      (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) +
 	      (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) / 1e6;
 
-	/* Whether per-key ROUTING actually engaged, which the client was
-	 * never asked before.  A routed client talks to each key's owner
-	 * and pays no forward; an unrouted one sends everything to the
-	 * node it connected to and the daemon forwards.  Those are wildly
-	 * different experiments, and "shard is slow" means nothing until
-	 * you know which one ran.  route_missed counts requests whose
-	 * owner was known but not connected - they went to the active node
-	 * and paid the hop anyway. */
+	/* Whether per-key ROUTING engaged - routed and un-routed runs are different experiments;
+	 * route_missed counts requests whose owner was known but not connected. */
 	{
 		int routed = 0;
 		unsigned long long missed = 0;

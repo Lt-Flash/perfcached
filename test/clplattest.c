@@ -1,16 +1,5 @@
-/*
- * clplattest.c - platform-derived identity (clplat).
- *
- * The point of this module is that a CLONE gets a different identity.
- * So the cases that matter are the ones where two inputs must NOT
- * collide, and the ones where a re-derivation must reproduce exactly.
- *
- * The /sys probe is not tested here - it reads the machine it runs on,
- * which is not a fixture.  Everything it feeds is, and that split is why
- * the composition and derivation are separate functions.
- *
- * Build: cc -o clplattest test/clplattest.c src/clplat.o -lsodium
- */
+/* clplattest.c - platform-derived identity (clplat): a clone derives a different identity, a
+ * re-derivation the same one; /sys itself is not a fixture, so only what it feeds is tested. */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -94,7 +83,7 @@ int main(void)
 	chk((a[8] & 0xc0) == 0x80, "C7 v8 carries the RFC variant");
 	chk((b[8] & 0xc0) == 0x80, "C8 v7 carries the RFC variant");
 
-	/* ---- D. the canonical rendering operators will read ------------ */
+	/* ---- D. the canonical text rendering ----------------------------- */
 	memset(a, 0, 16);
 	a[0] = 0x01; a[15] = 0xef;
 	clplat_uuid_str(a, s);

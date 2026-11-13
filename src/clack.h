@@ -1,43 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clack.h - 12ny AT-3: WATERMARKS.  What this member has applied, and
- * made durable, of each origin's numbered deletes.
- *
- * An origin numbers the deletes it originates (AT-2): seq 1, 2, 3 ...
- * within a NUMBERING SPACE, (oid, incarn) - the origin's identity hash
- * and its incarnation, fresh at every process start, so a restart (or a
- * restore from a backup) opens a new space and can never reuse a seq.
- * A member confirms, per space, the highest CONTIGUOUS seq it has
- * applied AND made durable - the WAL synced through every record that
- * applied one at or below it.  Origins forget what every member has
- * confirmed (AT-5); a hole holds the mark below it until a gap request
- * fills it (AT-6), so nothing past a lost delete is ever confirmed.
- *
- * Durability is tracked without a WAL position per seq: as the
- * contiguous mark advances, the WAL seqs that got it there are folded
- * into a running maximum, and (mark, that maximum) pairs wait in a short
- * queue for the WAL's synced seq to pass them.  What arrived out of
- * order is folded in as ONE maximum over everything ahead of the mark -
- * conservative: a seq may be confirmed later than it could have been,
- * never earlier.  A full queue merges its last two pairs the same way.
- *
- * Pure over its own struct: no socket, no clock, no log, no lock - the
- * caller serialises every call on one instance.  The WAL is parameters:
- * clack_applied() takes the WAL seq of the record that applied the
- * delete (0: nothing to wait for - a collection without a WAL, or a
- * record replayed from it), clack_synced() the WAL's synced seq.  With
- * durable_on_apply (fsync = no: never synced) the mark is the applied
- * one, and the caller says so where it reports it.
- */
+/* clack.h - watermarks: per numbering space, the highest CONTIGUOUS delete seq this
+ * member applied AND made durable.  No lock: the caller serialises calls on one. */
 #ifndef PC_CLACK_H
 #define PC_CLACK_H
 
 #include <stdint.h>
 
-#define CLACK_SPACES   1026  /* two a member at PC_CL_MAXMEMBERS (513):
-                              * a restarted origin's old space stays
-                              * until its entries are gone */
+#define CLACK_SPACES   1026  /* two a member (513 max): an old space
+                              * stays until its entries are gone */
 #define CLACK_WIN      4096  /* seqs recorded ahead of the mark: ~30 s
                               * of a hole at 140 deletes a second */
 #define CLACK_PEND       16  /* (mark, WAL max) pairs awaiting a sync */
@@ -78,17 +49,12 @@ int clack_mark(const struct clack *a, uint64_t oid, uint32_t incarn,
 int clack_gap(const struct clack *a, uint64_t oid, uint32_t incarn,
 		uint64_t *from, uint64_t *to);
 
-/* the space's mark as a snapshot recorded it, applied and confirmed -
- * LOWER than before when the snapshot is older (a restore): the member
- * then announces the lower mark, and what lies above it comes again */
+/* the space's mark as a snapshot recorded it - LOWER after restoring an older one:
+ * the member then announces the lower mark, and what lies above it comes again */
 int clack_restore(struct clack *a, uint64_t oid, uint32_t incarn,
 		uint64_t mark);
-/* 12ny AT-7: everything of the space at or below @floor is held here
- * already - every member of the fleet confirmed it before this node held
- * anything of the space, and its state came whole from them.  The mark
- * moves up to @floor (applied and confirmed: the state that reflects it is
- * the fleet's, not this node's WAL), what was held ahead of it connects.
- * Lower than the mark: nothing.  Returns CLACK_NEW, CLACK_DUP, CLACK_FULL */
+/* the fleet confirmed the space through @floor before this node held any of it, and
+ * its state came whole from them: the mark moves up to @floor.  NEW, DUP or FULL. */
 int clack_floor(struct clack *a, uint64_t oid, uint32_t incarn,
 		uint64_t floor);
 /* 1 when the space is known here - something of it applied or restored */
@@ -96,9 +62,8 @@ int clack_known(const struct clack *a, uint64_t oid, uint32_t incarn);
 /* the space is closed and nothing of it is held any more: forget it */
 void clack_drop(struct clack *a, uint64_t oid, uint32_t incarn);
 
-/* every space: the keepalive's group (AT-4), the snapshot, /members.
- * mark = confirmed, applied = contiguous applied, hi = highest seen.
- * A non-zero return from cb stops the walk and is returned. */
+/* every space: mark = confirmed, applied = contiguous applied, hi = highest seen;
+ * a non-zero return from cb stops the walk and is returned */
 typedef int (*clack_each_cb)(uint64_t oid, uint32_t incarn, uint64_t mark,
 		uint64_t applied, uint64_t hi, void *ctx);
 int clack_each(const struct clack *a, clack_each_cb cb, void *ctx);

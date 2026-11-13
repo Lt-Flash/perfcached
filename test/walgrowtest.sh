@@ -1,23 +1,6 @@
 #!/bin/sh
-# walgrowtest.sh - S466 step 2: the WAL's segments follow the load, between
-# [wal] segments (the floor, always kept) and segments_max (the cap).
-#
-# A ring sized for an ordinary hour fills during a burst, and before this
-# a full ring was a wait for a snapshot (S466 step 1) at best.  Now the
-# log grows in the background when it is half full - or when its free
-# segments would last under three snapshots - and gives the extra segments
-# back after a quiet spell.  Measured on 207 (4 x 1 MB, a 40,000 x 1 KB
-# fill): a fixed ring took 2.77 s and waited 2,684 ms for snapshots; one
-# allowed to grow to 24 took 0.77 s, waited 674 ms, and was back at 4
-# segments 48 s after the load stopped.
-#   1. segments = 4, segments_max = 24: the fill grows the log, nothing is
-#      overwritten or healed, every key is stored;
-#   2. kill -9 and a restart: the grown log is kept (CONTROL's count) and
-#      every key is back;
-#   3. a quiet spell (PERFCACHED_WAL_SHRINK_S shortens it): the log is back
-#      at the floor and the extra segment files are gone;
-#   4. the control - no segments_max: the same fill leaves the log at 4.
-# usage: test/walgrowtest.sh [./perfcached] [./pcbench] [./perfcli]
+# walgrowtest.sh - the WAL's segments follow the load between [wal] segments (the floor) and
+# segments_max: a fill grows the log, a kill -9 keeps it, a quiet spell gives the extra back.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

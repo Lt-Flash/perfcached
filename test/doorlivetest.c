@@ -1,22 +1,5 @@
-/* doorlivetest.c - the doors' live settings (doorlive.c; the 0.7.2 split,
- * wave 1): snapshots made from configs built here and installed as a
- * reload would; the log and the monotonic clock stubbed.
- *
- *   A  before any snapshot: every check fail-closed - no password, no
- *      enable secret, no token - and the allow-lists open (a door without
- *      a list was refused at validate)
- *   B  a snapshot is a deep copy: its strings are its own, a config
- *      changed afterwards does not reach it
- *   C  the RESP password: exact only - a wrong length, one byte off; the
- *      enable secrets: either of a rotation list, none, no input
- *   D  the allow-lists: IPv4 in and out of a prefix, IPv6, an IPv4 client
- *      of a dual-stack door as ::ffff:a.b.c.d, a length short of an
- *      address; each refusal logged by address, ten at most, the tenth
- *      saying so; the HTTP list its own
- *   E  a reload: the new snapshot answers at once; the one it replaced is
- *      retired, still readable and unwiped for a reader that holds it,
- *      and still so one second before its retirement ends
- */
+/* doorlivetest.c - the doors' live settings: snapshots from configs built here, installed as a
+ * reload would, with the log and the monotonic clock stubbed. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -116,14 +99,14 @@ int main(void)
 	struct pc_live *l1, *l2;
 	int i, n;
 
-	/* A */
+	/* A: before any snapshot every check fails closed and the allow-lists are open */
 	a = v4("11.0.0.1");
 	CHK(!pc_resp_password_set() && !pc_resp_password_ok("", 0) && !pc_enable_configured() &&
 		!pc_enable_secret_ok("x", 1) && !pc_http_token(),
 		"A: no snapshot - no password, no enable secret, no token: every check fails closed");
 	CHK(resp_ok(&a) && http_ok(&a), "A: no snapshot - the allow-lists open");
 
-	/* B */
+	/* B: a snapshot is a deep copy - a config changed afterwards does not reach it */
 	cfg.resp_password = pw;
 	cfg.http_token = tk;
 	cfg.enable_secret[0] = e1;
@@ -144,7 +127,7 @@ int main(void)
 	CHK(live() == l1 && pc_resp_password_ok("resp-pass-1", 11), "B: the config changed afterwards - the snapshot is not");
 	pw[0] = 'r';
 
-	/* C */
+	/* C: the RESP password exact only; the enable secrets - a rotation list, none, no input */
 	CHK(pc_resp_password_set() && pc_resp_password_ok("resp-pass-1", 11), "C: the RESP password - exact, taken");
 	CHK(!pc_resp_password_ok("resp-pass-12", 12) && !pc_resp_password_ok("resp-pass-1", 10) &&
 		!pc_resp_password_ok("resp-pass-2", 11), "C: a byte more, a byte less, the last byte off - refused");
@@ -154,7 +137,7 @@ int main(void)
 		!pc_enable_secret_ok(NULL, 10), "C: neither, a prefix of one, no input - refused");
 	CHK(pc_http_token() && !strcmp(pc_http_token(), "token-1"), "C: the HTTP token");
 
-	/* D */
+	/* D: allow-lists - IPv4, IPv6, ::ffff: clients; refusals logged by address, ten at most */
 	a = v4("10.200.0.7");
 	CHK(resp_ok(&a), "D: 10.200.0.7 in 10.0.0.0/8 - allowed");
 	a = v6("2001:db8:5::1");
@@ -182,7 +165,7 @@ int main(void)
 	CHK(!http_ok(&a) && warns == 1 && strstr(logbuf, "http connection from 10.200.0.7 refused: not in http_allow"),
 		"D: the RESP list's 10.200.0.7 - refused at the HTTP door, logged on its own count");
 
-	/* E */
+	/* E: a reload answers at once; the replaced snapshot stays readable until retired */
 	cfg.resp_password = "resp-pass-2";
 	cfg.n_enable_secrets = 1;
 	cfg.n_http_allow = 0;

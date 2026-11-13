@@ -35,16 +35,26 @@ on `127.0.0.1`) and the `[secrets] client` value from whichever it finds
 first. **Options go before the command word; anything after it is an
 argument to that command** - `perfcli stats -a secret` sends `-a` and
 `secret` to `stats`, not to perfcli, and the client says so rather than
-silently connecting unauthenticated.
+silently connecting unauthenticated. On a node with `[listen] plaintext
+= loopback`, whose loopback door runs no handshake, the client secret
+read from the file makes the handshake fail; give `-h`/`-p` and the
+file is not read.
 
-A `create`/`drop`/`resize`/`rename`/`map`/`unmap`/`restore` call additionally needs
-**privilege**, raised on the connection with `-E <secret>` (the
-`[secrets] enable` value - not the client secret `-a` takes) or `-e` to
-be prompted; privilege dies with the connection, so a session that
-redials after a dropped link (perfcli redials once, automatically, and
-says so) re-raises it automatically only because `-E`/`-e` was given at
-startup - a bare `enable` typed later reaches the same effect for the
-rest of that session (see [Privilege](#privilege-enable--disable)
+A command goes to the node `-h`/`-p` (or `-u`) names, and that node's
+answer is the answer (0.7.5): perfcli learns the fleet, for
+`fleet-status` and `upgrade`, but never moves a call to another member -
+not on a refusal, a node that is not READY, or a dead link.
+
+A `create`/`drop`/`resize`/`rename`/`map`/`unmap`/`restore` call, and
+every other command marked **needs privilege** below, additionally
+needs **privilege**, raised on the connection with `-E <secret>` (the
+`[secrets] enable` value - not the client secret `-a` takes), `-e` to
+be prompted, or `PERFCLI_ENABLE`; privilege dies with the connection,
+so a session that redials after a dropped link (perfcli redials once,
+automatically, and says so) re-raises it automatically only because
+`-E`/`-e`/`PERFCLI_ENABLE` gave it at startup - a raw `enable` request
+typed later raises it for that connection only, and it is not raised
+again after a redial (see [Privilege](#privilege-enable--disable)
 below).
 
 `pretty on` / `pretty off` / bare `pretty` (or `-P` at startup)
@@ -67,14 +77,20 @@ daemon) - checked before anything was sent.
 | `-u path` | unix socket instead of TCP |
 | `-a secret` | client secret (`[secrets] client`); also `PERFCLI_AUTH` |
 | `-A` | prompt for the client secret (no echo) |
-| `-E secret` | raise privilege on this connection (`[secrets] enable`) |
-| `-e` | prompt for the enable secret (no echo); also `PERFCLI_ENABLE` |
+| `-N name` | this connection's name on the node (default `perfcli@<short hostname>`) - see `name` below |
+| `-E secret` | raise privilege on this connection (`[secrets] enable`); also `PERFCLI_ENABLE` |
+| `-e` | prompt for the enable secret (no echo) |
 | `--encrypt` | keep the connection encrypted after the handshake (`-E` and `-e` imply it); also `PERFCLI_ENCRYPT` |
 | `-q` | quiet: result to stdout only, no prompt or banner |
 | `-P` | pretty-print every result |
 | `-j json` | send one raw request, typed as JSON, and exit |
 | `-V` | print `perfcli <version> (libperfd <version>)` and exit |
 | `--help`, `-?` | usage |
+
+perfcli talks to the node it dialled (0.7.5): it learns the fleet, but a
+refusal or a lost link never moves it to another member, and its one
+redial comes back to the same node - what that node answers is the
+answer.
 
 ## Connection and diagnostics
 
@@ -112,7 +128,7 @@ libperfd.
 | `exists <col> <key>` | `{"exists":true,"ver":N}` or `{"exists":false}` | `ver` is the record's version counter, not its value - lets a caller compare two copies without moving the bytes |
 | `ttl <col> <key>` | `{"ttl":N}` | `-2` no such key, `-1` never expires, else seconds remaining |
 | `expire <col> <key> <ttl>` | `{"updated":true}` or `{"updated":false}` | re-arms the TTL in place - no value rewrite; `false` = no such key |
-| `add <col> <key> [by] [ttl]` | `{"value":N}` | `by` defaults to `1`; a missing key starts at `0`; `ttl` only applies on the key's first touch |
+| `add <col> <key> [by] [ttl]` | `{"value":N}` | `by` defaults to `1`; a missing key starts at `0`; `ttl` is set on every call, and a call without one leaves the key with no expiry - an expiry it had is dropped (the RESP door's `INCR` keeps it) |
 | `sub <col> <key> [by] [ttl]` | `{"value":N}` | exactly `add` with `by` negated |
 
 ```
@@ -145,9 +161,9 @@ all - see [Errors](#errors).
 | command | reply | notes |
 |---|---|---|
 | `mget <col> <key> [key ...]` | `{"values":[{"found":true,"value":"…","ttl":N}, {"found":false}, …]}` | one element per key, same order, each shaped exactly like `get`'s reply |
-| `mset <col> <key> <value> [<key> <value> ...]` | `{"stored":N,"dropped":N}` | pairs, not a shared value; every pair gets the SAME `ttl` if one is added via `-j` (the word-command form has no `ttl` slot at all - every `mset` key is stored with no expiry); refused whole on a **shard** collection ("use pipelined set") |
+| `mset <col> <key> <value> [<key> <value> ...]` | `{"stored":N,"dropped":N}` | pairs, not a shared value; `-j` takes a `ttl` per item (`{"items":[{"key":"a","value":"1","ttl":60}, …]}` - a top-level `ttl` is ignored); the word-command form has no `ttl` slot at all - every `mset` key is stored with no expiry; refused whole on a **shard** collection ("use pipelined set") |
 | `keys [col-glob] [pattern] [limit]` | see below | `col-glob` matches **collection names**, `pattern` matches **key names** inside them - two different arguments, two different things they glob; **and two different reply shapes depending on `col-glob`**, below |
-| `scan <col> [cursor] [match] [count]` | `{"items":[{"k":"…","ttl":N}, …],"cursor":N,"more":bool}` | cursored, Redis-`SCAN`-style; **the word-command form never requests values** - every item is key+ttl only, even though the method also accepts `"values":true` |
+| `scan <col> [cursor] [match] [count]` | `{"items":[{"k":"…","ttl":N}, …],"cursor":N,"more":bool}` | cursored, Redis-`SCAN`-style, but **`count` is buckets walked in this call, not keys** (default 100, at most 16384): a reply can be empty with `more` true - call again with the `cursor` it gave (an opaque number) until `cursor` is `0`; **the word-command form never requests values** - every item is key+ttl only, even though the method also accepts `"values":true` |
 
 ```
 $ perfcli -p 6479 mset sessions a 1 b 2 c 3
@@ -155,15 +171,17 @@ $ perfcli -p 6479 mset sessions a 1 b 2 c 3
 $ perfcli -p 6479 mget sessions a b nosuchkey
 {"values":[{"found":true,"value":"1","ttl":-1},{"found":true,"value":"2","ttl":-1},{"found":false}]}
 $ perfcli -p 6479 scan sessions
-{"items":[{"k":"a","ttl":-1},{"k":"b","ttl":-1},{"k":"c","ttl":-1}],"cursor":0,"more":false}
-$ perfcli -p 6479 -j '{"method":"scan","params":{"col":"sessions","values":true}}'
-{"items":[{"k":"a","v":"1","ttl":-1},{"k":"b","v":"2","ttl":-1},{"k":"c","v":"3","ttl":-1}],"cursor":0,"more":false}
+{"items":[],"cursor":268435556,"more":true}
+$ perfcli -p 6479 scan sessions 0 "*" 4096
+{"items":[{"k":"b","ttl":-1},{"k":"a","ttl":-1},{"k":"c","ttl":-1}],"cursor":0,"more":false}
+$ perfcli -p 6479 -j '{"method":"scan","params":{"col":"sessions","count":4096,"values":true}}'
+{"items":[{"k":"b","v":"2","ttl":-1},{"k":"a","v":"1","ttl":-1},{"k":"c","v":"3","ttl":-1}],"cursor":0,"more":false}
 ```
 
 **`keys`'s two shapes.** A *literal* collection name (`keys sessions`)
 answers the single-collection form:
 
-    {"collection":"sessions","complete":true,"scope":"node","keys":["a","b","c"],"truncated":false}
+    {"collection":"sessions","complete":true,"scope":"node","keys":["b","a","c"],"truncated":false}
 
 `complete:false` means this reply is only this node's share of a
 placement-spread collection, not the whole keyspace. Anything else -
@@ -171,7 +189,7 @@ bare `keys`, `keys *`, or a `col-glob` containing `*`/`?`/`[` - answers
 the grouped, every-matching-collection form instead:
 
     $ perfcli -p 6479 keys
-    {"collections":{"sessions":["a","b","c"],"counters":["hits"]},"truncated":false,"truncated_collections":[],"matched":2}
+    {"collections":{"sessions":["b","a","c"],"counters":["hits"]},"truncated":false,"truncated_collections":[],"matched":2}
 
 Here `[pattern]` is a key glob applied inside each matched collection,
 and `[limit]` (default 100) is **per collection**, not shared across
@@ -182,17 +200,18 @@ shape's key array.
 
 ## JSON documents
 
-Paths are `$`, `.name` / bare `name` (equivalent), and `[index]`; a
-document is one opaque JSON value per key, under the same value-size
-limit as a plain string.
+Paths start at `$`: `$`, `$.name`, `$.name.inner` and `$.name[index]`.
+A `.name` or bare `name` path is `bad path` here (the RESP door's
+`JSON.*` commands take those spellings).  A document is one opaque JSON
+value per key, of up to 64 KB.
 
 | command | reply | notes |
 |---|---|---|
 | `jget <col> <key> [path]` | `{"found":true,"value":<fragment>}` or `{"found":false}` | no path = the whole document |
 | `jset <col> <key> <path> <raw-json> [ttl]` | `{"set":true}` | `<raw-json>` is **unescaped, literal JSON** - quote it for the shell, not for JSON; `-j` also offers `nx`/`xx`/`mkpath` that the word-command form has no slot for |
 | `jdel <col> <key> [path]` | `{"deleted":true}` or `{"deleted":false}` | no path = deletes the whole key |
-| `jincr <col> <key> <path> [by]` | `{"value":N}` | `by` defaults to `1`; errors (not an error reply, an in-band one - see notes below) if the target is not numeric |
-| `jarrappend <col> <key> <path> <raw-json>` | `{"count":N}` | `<raw-json>` may itself be an array literal to append several elements in one call; `count` is the array's new length |
+| `jincr <col> <key> <path> [by]` | `{"value":N}` | `by` defaults to `1`; the error `path value is not an integer` (exit 1) if the target is not an integer |
+| `jarrappend <col> <key> <path> <raw-json>` | `{"count":N}` | `<raw-json>` is ONE value: an array literal is appended as one element, a nested array (the RESP door's `JSON.ARRAPPEND` takes several values); `count` is the array's new length |
 
 ```
 $ perfcli -p 6479 jset sessions user:17 '$' \
@@ -206,21 +225,23 @@ $ perfcli -p 6479 -P jget sessions user:17 '$.quota'
     "max": 10
   }
 }
-$ perfcli -p 6479 jincr sessions user:17 quota.used
+$ perfcli -p 6479 jincr sessions user:17 '$.quota.used'
 {"value":4}
-$ perfcli -p 6479 jarrappend sessions user:17 roles '"support"'
+$ perfcli -p 6479 jarrappend sessions user:17 '$.roles' '"support"'
 {"count":3}
-$ perfcli -p 6479 jdel sessions user:17 quota
+$ perfcli -p 6479 jdel sessions user:17 '$.quota'
 {"deleted":true}
 ```
 
 On a **proxy** collection where this node is not the holder, or a
 **shard** collection where it is not the owner, a JSON op is forwarded
-to the node that is - and if that forward could not be parked, the
-reply comes back with the verb's OWN false/absent shape
+to the node that is - and if that forward could not be parked, or the
+node that holds the key refused it, the reply comes back with the
+verb's OWN false/absent shape
 (`{"found":false}` for `jget`, `{"set":false}` for `jset`,
-`{"deleted":false}` for `jdel`, `{"error":"cluster busy"}` embedded in
-an otherwise-normal reply for `jincr`/`jarrappend`) rather than an
+`{"deleted":false}` for `jdel`, `{"error":"cluster busy"}` or
+`{"error":"holder rejected"}` embedded in an otherwise-normal reply
+for `jincr`/`jarrappend`) rather than an
 error reply - a client checking only for the top-level `error` key
 will miss this and should treat these specific false/absent shapes on a
 clustered collection as "retry", not "confirmed no".
@@ -251,10 +272,12 @@ $ perfcli -E 's3cret' -p 6479 resize staging 12
 {"resizing":true,"col":"staging","buckets":4096}
 $ perfcli -E 's3cret' -p 6479 rename staging archive
 {"renamed":true,"col":"staging","to":"archive"}
+$ perfcli -p 6479 set archive k v
+{"stored":true}
 $ perfcli -E 's3cret' -p 6479 drop archive
-{"dropped":false,"entries":0,"why":"the collection is not empty - pass force to drop it with its records"}
+{"dropped":false,"entries":1,"why":"the collection is not empty - pass force to drop it with its records"}
 $ perfcli -E 's3cret' -p 6479 drop archive force
-{"dropped":true,"col":"archive","records":0}
+{"dropped":true,"col":"archive","records":1}
 ```
 
 Without `allow_create` on the node: `creating and dropping collections
@@ -283,9 +306,8 @@ read that map **on the running fleet**:
   `map cache 0` (the words swapped) is refused by perfcli before it
   is sent.
 - **Every connection sees the change on its next command** - no reconnect,
-  no `SELECT`.  A `MULTI` block or a pipeline that straddles the change
-  runs its earlier commands against the old map and its later ones against
-  the new.
+  no `SELECT`.  A pipeline that straddles the change runs its earlier
+  commands against the old map and its later ones against the new.
 - **Fleet-wide and persistent.**  The change reaches every member at once,
   is written to `<state_dir>/respmap` on each, and survives a restart; a
   member that was down when it was made takes it from its peers when it
@@ -316,7 +338,7 @@ $ perfcli -E 's3cret' -p 6479 unmap 0
 
 Not a perfcli word command - `build()` has no `enable` branch, so typing
 `enable ...` in the REPL is "unknown command". Reach it three ways:
-`-E <secret>` or `-e` at startup (the normal path - see
+`-E <secret>`, `-e` or `PERFCLI_ENABLE` at startup (the normal path - see
 [Reaching it](#reaching-it)), or, mid-session, the raw form:
 
 ```
@@ -332,55 +354,65 @@ perfcached> {"method":"disable"}
 refused on the RESP door, since the RESP door may run plaintext
 off-box under an allow-list and this secret grants keyspace deletion.
 Privilege lives on the connection and is lost on redial; perfcli itself
-re-raises it automatically after an automatic reconnect only when `-E`
-was given at startup.
+re-raises it automatically after an automatic reconnect only when `-E`,
+`-e` or `PERFCLI_ENABLE` gave it at startup - privilege raised with the
+raw form above is not raised again.
 
 ## Maintenance and persistence
 
 | command | reply | notes |
 |---|---|---|
-| `stats [col]` | a large document: node version/rev/state, per-door and per-collection counters, memory/arena, WAL, cluster | no argument = the whole node; `stats sessions` narrows it to one collection's numbers |
+| `stats [col]` | a large document: node version/rev/state, per-door and per-collection counters, memory/arena, WAL, cluster | no argument = the whole node; `stats sessions` is the same node document with only that collection in its `collections` array |
 | `name <name>` | `{"named":"…"}` | names this connection (CLIENT SETNAME's native form, 0.7.0): shown as the row's `name` in `clients` and carried by the node's enable, sweep and reset log lines (`name@ip:port`).  perfcli names its connection `perfcli@<host>` unless `-N <name>`; libperfd sends `opts.name` after every dial.  Printable ASCII without spaces or quotes |
 | `clients` (`-j '{"method":"clients","params":{"cap":N}}'`; no word form yet) | `{"clients":[...]}` | 0.6.6: this node's connections as `/clients` renders them - door, protocol, wire, pending bytes, subscriptions - on the native door, for a dashboard that reads it; at most `cap` rows (200, up to 4096) |
-| `members` | `{"members":[{…per-member fields, below…}]}` | the fleet as a client sees it - enough to pre-warm connections and weight them by load |
-| `sketch` (`-j '{"method":"sketch","params":{"col":"sessions"}}'`; no word form) | `{"p":12,"hash":"fnv1a64+fmix64","walked_at":1792372527,"registers":"<base64, 4096 bytes>"}` | 0.7.1 (DESIGN 12nx): the HyperLogLog sketch of the keys this node held at its last held walk of the collection - one byte a register, the same hash on every node, so sketches from several members merge by the register-wise maximum into the sketch of their union (what `perfcached-dashboard` does for `store` mode's distinct keys).  Unprivileged.  An error until the collection's next walk after a start, a create or a stats reset (`reset stats`) |
-| `save` | `{"started":true}` or `{"started":false,"reason":"already running"}` | starts an RDB snapshot in the background; the error `persistence is not configured` if no `[rdb]`/`[wal]` section is set up |
-| `sync [timeout_ms]` | `{"synced":true,"seq":N,"dropped":N}` | a WAL barrier - blocks until everything appended so far has reached the platter; **the word-command form never sends `timeout_ms`** - use `-j` to bound the wait; `dropped` is the fleet-wide count of records the WAL ring discarded under backpressure, not zero just because `synced` is true |
+| `members` (`-j '{"method":"members"}'`; no word form) | `{"members":[{…per-member fields, below…}],"fleet":{…},"routing":{…},"version":"…","rev":"…"}` | the fleet as a client sees it - enough to pre-warm connections and weight them by load; a node that is not clustered answers an empty `members` list |
+| `sketch` (`-j '{"method":"sketch","params":{"col":"sessions"}}'`; no word form) | `{"p":12,"hash":"fnv1a64+fmix64","walked_at":1792372527,"registers":"<base64, 4096 bytes>"}` | 0.7.1: the HyperLogLog sketch of the keys this node held at its last held walk of the collection - one byte a register, the same hash on every node, so sketches from several members merge by the register-wise maximum into the sketch of their union (what `perfcached-dashboard` does for `store` mode's distinct keys).  Unprivileged.  An error until the collection's next walk after a start, a create or a stats reset (`reset stats`) |
+| `save` | `{"started":true}` or `{"started":false,"reason":"already running"}` | starts an RDB snapshot in the background; the error `persistence is not configured` if no `[wal] dir` is set up |
+| `sync [timeout_ms]` | `{"synced":true,"seq":N,"dropped":N}` | a WAL barrier - blocks until everything appended so far has reached the platter; **the word-command form never sends `timeout_ms`** - use `-j` to bound the wait; `dropped` is this node's count, since it started, of records its WAL rings discarded under backpressure, not zero just because `synced` is true |
 | `load` | `{"loaded":N,"skipped_existing":N,"skipped_expired":N}` | imports the on-disk snapshot **additively** - an existing key always wins, an already-expired record is skipped and counted |
-| `probe [secs]` | `{…,"recommend":{…},"observed":{…}}` | re-measures WAL storage IOPS/fsync latency on demand; **blocks the request for its duration and perturbs live fsync latency while it runs** - `secs` capped at `30`; full shape below |
+| `probe [secs]` | `{"cached":false,…,"recommend":{…,"observed":{…},…}}` | re-measures WAL storage IOPS/fsync latency on demand; **blocks the request for its duration and perturbs live fsync latency while it runs** - `secs` capped at `30`; full shape below |
 | `updrain <col> [stop]` | `{"col":"sessions","drain":"started"}` (or `"stopping"`) | **needs privilege** (`-E`): the read-through drain sweep - reads every key the collection's upstream holds under its `upstream_prefixes` and takes over (writes here, replicated) each one the fleet does not hold, has not written and has not deleted; at most `upstream_drain_rate` keys and (0.6.5) `upstream_drain_mb_rate` MB of values a second; refused with `this collection has no upstream`, `a drain sweep is already running`, or (`stop`) `no drain sweep is running`; progress is `upstream.drain` in `stats` (`state` running/done/stopped/failed, `read`, `taken_over`, `fleet_had`, `gone`, `wrongtype`, `too_big`, `errors`); run it on ONE node |
 | `upfill <col> [stop\|check]` | `{"col":"sessions","upfill":"started"}` (or `"checking"`, `"stopping"`) | **needs privilege** (`-E`), 0.6.4: on a collection with `upstream_writes = through`, writes each key the fleet owned before the switch (written here under `allow`, which Redis never had) to the upstream's master with `NX` - `SET ... NX [PX]` for a string or a counter, `JSON.SET $ ... NX` and then a `PEXPIRE` for a document - through the writer, so in order with the clients' writes; where Redis has the key its value wins: it is read back and replaces the fleet's record on every member.  0.6.5: the sweep first compares the two and counts Redis's as `redis_same`, `redis_retimed` (the same value with another expiry) or `redis_differed`, naming each key that differed in the log (the first 100 of a sweep, never a value).  `check` (0.6.5) reads each key from the master instead and makes the same comparison, writing and applying nothing; `missing` counts the keys a run would write.  Hashes, rate-limit and lock records are skipped.  At most `upstream_drain_rate` keys and (0.6.5) `upstream_drain_mb_rate` MB of values a second, and half of `upstream_write_queue` at once; refused with `this collection has no upstream`, `... needs upstream_writes = through`, `an upfill sweep is already running`, (`stop`) `no upfill sweep is running`, or (`check`) `upfill check reads the upstream's master - the writer has none now ...`; progress is `upstream.write_through.upfill` in `stats` (`state`, `mode`, `found`, `written`, `redis_had`, `redis_same`, `redis_retimed`, `redis_differed`, `missing`, `compared_text`, `compared_walked`, `uncompared`, `skipped`, `gone`, `errors`; `redis_had` = same + retimed + differed + uncompared = compared_text + compared_walked + uncompared), and `upstream.write_through.fleet_owned` counts the keys still owned (a minute apart); run it on ONE node |
 | `upgrade-stage <tarball> <version>` | `{"sha256":"…","signer":"the release key 5646e8e4 (built in)"}` | **needs privilege** (`-E`), 0.6.5: sends the tarball and `<tarball>.sig` beside it (64 raw bytes, or 128 hex characters) to this node, 192 KB at a time, through the `upgrade_stage` method (`begin`, `chunk`s, `end`).  The node verifies the WHOLE file when the last chunk is in - the sha256 perfcli computed, then the signature against the release key built into it and `[upgrade] trusted_keys` - and only then keeps it in `<state_dir>/upgrade/staged/`; refused with the reason (`the signature does not verify - refused`, `sha256 mismatch - refused`, `unsigned - refused ([upgrade] allow_unsigned = no)`, `another upload is in progress`, `larger than [upgrade] stage_mb`), and a refusal keeps nothing.  At most two builds stay staged |
-| `upgrade plan <tarball> version=<v> [switch_cmd=<program>] [journal=<file>] [ready_s=<n>] [gate_s=<n>]` | text: the plan and the next command | **needs privilege** (`-E`), 0.7.0 (UP7a, DESIGN 12ns): writes the plan line (artifact, sha256, version, seed, gates) to the journal; 0.7.1 (UP12b): reads the tarball's `share/perfcached/RELEASE` first and refuses a tarball of another version than `version=`, or one whose wire epochs exclude the fleet's committed epoch (exit 1, nothing journalled), names a possible commit when the candidate speaks a newer epoch, and says "not checked" for a tarball without the file (before 0.7.1) |
-| `upgrade start\|resume\|status\|abort\|rollback [journal=<file>]` | the journal lines as they are written (`start`/`resume`/`rollback`), a table (`status`) | the roll driver: stage on the seed and wait for every member; then one node at a time, members first, the master last, each gated (restart-safe before; a new pid on the version asked, ready with peers up, the peers' records kept after); the first failure reverts that node and stops with the rollback commands printed; `abort` connects to nothing (0.7.3), so it works while the seed is restarting; exit 0 done, 1 stopped, 2 usage |
-| `upgrade-revert [force]` | `{"request":"<id>","to":"/opt/perfcached-0.6.6","helper":"enabled"}` | **needs privilege** (`-E`), 0.7.0 (UP7b): asks the helper to switch this node back to the prefix it kept before its last switch (`upgrade_status.previous.from`); refused on a package or local install, with no switch on record, while a request waits, or when this node does not run the build the helper switched to (`force` overrides that and the helper check) |
-| `fleet-status` | a table, not JSON | this node and every member the connection learned, each dialled: node id, `addr:port`, version, the state this handle sees (`this`, `active`, `standby`, `idle`, `down`), the install mode (`package`, `prefix`, `local` - PD-9) and the versions staged there, newest first.  Exit 1 when a member could not be dialled.  UP8's `upgrade status`, first piece (0.7.0) |
+| `upgrade plan <tarball> version=<v> [switch_cmd=<program>] [journal=<file>] [ready_s=<n>] [gate_s=<n>]` | text: the plan and the next command | 0.7.0, unprivileged (it reads each member's `stats`): writes the plan line (artifact, sha256, version, seed, gates) to the journal, by default `~/.perfcached/upgrade-<host>_<port>.journal`; 0.7.1: reads the tarball's `share/perfcached/RELEASE` first and refuses a tarball of another version than `version=`, or one whose wire epochs exclude the fleet's committed epoch (exit 1, nothing journalled), names a possible commit when the candidate speaks a newer epoch, and says "not checked" for a tarball without the file (before 0.7.1) |
+| `upgrade start\|resume\|status\|abort\|rollback [journal=<file>]` | the journal lines as they are written (`start`/`resume`/`rollback`), a table (`status`) | the roll driver - `start`, `resume` and `rollback` **need privilege** (`-E`), `status` and `abort` do not: stage on the seed and wait for every member; then one node at a time, members first, the master last, each gated (restart-safe before; a new pid on the version asked, ready with peers up, the peers' records kept after); the first failure reverts that node and stops with the rollback commands printed; `abort` connects to nothing (0.7.3), so it works while the seed is restarting; exit 0 done, 1 stopped, 2 usage.  `upgrade` and `upgrade-revert` are one-shot commands: the REPL does not take them |
+| `upgrade commit epoch=<n>` | text: `the fleet speaks wire epoch <n> now (committed by node N, addr:port)` | **needs privilege** (`-E`), 0.7.1: asks the master to make `<n>` the fleet's committed wire epoch (`cluster.epoch.committed` in `stats`); refused, naming the node, while a member speaks no such epoch (`upgrade commit: node N speaks wire epochs 4..4, not 5 - upgrade it first`).  0.7.5 speaks epoch 4 alone, so it has nothing to commit; the command is for a later release that speaks a newer epoch beside 4.  A lower epoch is committed the same way, which a rollback to an older build needs first; exit 0 committed, 1 refused, 2 usage |
+| `upgrade-revert [force]` | `{"request":"<id>","to":"/opt/perfcached-0.6.6","helper":"enabled"}` | **needs privilege** (`-E`), 0.7.0: asks the helper to switch this node back to the prefix it kept before its last switch (`upgrade_status.previous.from`); refused on a package or local install, with no switch on record, while a request waits, or when this node does not run the build the helper switched to (`force` overrides that and the helper check) |
+| `fleet-status` | a table, not JSON | this node and every member the connection learned, each dialled: node id, `addr:port`, version, the state this handle sees (`this`, `active`, `standby`, `idle`, `down`), the install mode (`package`, `prefix`, `local`) and the versions staged there, newest first.  Exit 1 when a member could not be dialled (0.7.0) |
 | `upgrade_status` | `{"staged":[{"sha256":"…","version":"0.6.5","size":2994718,"signer":"…","staged":N}],"upload":null,"live_prefix":"/opt/perfcached-0.7.0","previous":{"from":"…","to":"…","at":N},"switching":null,…}` | the builds staged on this node, newest first, the upload in progress (`id`, `got`, `size`, `idle_s`) or `null`, `staged_total` and `refused_total` since start, `stage_mb`, `allow_unsigned` |
-| `reload` | `{"applied":true,"message":"reloaded: resp_allow, the HTTP token"}` | **needs privilege** (`-E`), 0.7.1 (DESIGN 12nw): reads this node's config file again and applies what a running daemon can take (`[listen] resp_allow`, `http_allow`; `[secrets] http`, `resp`, `enable`, `client`; `[daemon] log_level`, `slowlog_usec`); refused whole, `applied` false and the message naming every other key that changed; answered when done.  `systemctl reload` and SIGHUP run the same reload |
+| `reload` | `{"applied":true,"message":"reloaded: resp_allow, the HTTP token"}` | **needs privilege** (`-E`), 0.7.1: reads this node's config file again and applies what a running daemon can take (`[listen] resp_allow`, `http_allow`; `[secrets] http`, `resp`, `enable`, `client`; `[daemon] log_level`, `slowlog_usec`); refused whole, `applied` false and the message naming every other key that changed; answered when done.  `systemctl reload` and SIGHUP run the same reload |
 | `mailtest` | `{"sent":true,"reply":"250 2.0.0 queued"}` | **needs privilege** (`-E`): sends one test mail through this node's `[mail]` and answers the SMTP server's reply - `sent` `false` with what the server or the connection said (a wrong password's `535`, no STARTTLS on offer, a timeout) is a result, not an error; refused with the reason when this build has no SMTP client or the node has no `[mail]`; waits for the answer, up to `[mail] timeout_s` + 5 s |
 | `reset-stats` (or `reset_stats`) | `{"reset":true,"at":N}` | zeroes the running totals on **this node only** (the native verb also takes `{"fleet": true}`, 0.7.0 - this node and every live peer as of one moment, what the dashboard's button sends; the daemon's HTTP door takes no POST any more); live gauges (arena size, entry counts) are untouched; the RESP door's `CONFIG RESETSTAT` and the status page's reset button do the same thing |
+| `autoscale <col> <auto\|floor\|warn\|off>` | `{"col":"sessions","autoscale":"warn"}` | **needs privilege** (`-E`), 0.7.2: how the collection's table is sized, on every member - `auto` grows and shrinks it, `floor` grows it but never shrinks it below the size it was configured, created or resized at, `warn` only says what `auto` would do, `off` leaves it alone; refused with `mode is auto, floor, warn or off`, or while a member runs a build before 0.7.2 |
+| `fleetstop [timeout_ms]` | `{"stopping":true,"asked":2,"stopped":[2,3],"still_up":[],"lost":[]}` | **needs privilege** (`-E`): stops EVERY node cleanly, each taking its shutdown snapshot; this node goes last, after waiting up to `timeout_ms` (30000; 1 to 120 s) for its peers - `stopped` said goodbye, `still_up` had not gone, `lost` left without a goodbye.  perfcli never sends it twice: a connection lost after it went out is reported, not redialled into a second stop |
+| `master_prefer <node>`, `master_auto` | `{"handover_to":N}` (`0` from `master_auto`) | **needs privilege** (`-E`), 0.7.4.3, on the master only (elsewhere `ask the master - only it hands mastership over`): hands mastership to that member once it is the synced standby; `master_auto` cancels a handover not yet taken; refused with `not a live, unstalled member other than the master`, or `this node is not clustered` |
 
 Each element of `members`: `addr`, `port` (client port), `node` (id),
 `self`/`master`/`backup` (bool), `role` (`master`/`backup`/`member`),
 `state` (the node's own readiness), `mem_tier`, `free_mb`/`total_mb`,
 `http` (status-page port), `uptime_s`, `entries` (this node's own view -
 what the sender election decides from), `start` (`cold`/`warm`), and,
-gossiped from a build new enough to send it, a `clients` object.
+gossiped from a build new enough to send it, a `clients` object.  Among
+the rest: `version` and `wire_epochs` (the build each member runs and
+the epochs it speaks), `upgrade`, `gone_s`/`held_s`, `reason`,
+`reconciling`, `link_pct`/`link_alert`, `relay`, per-collection
+counters in `collections`, `identity` and `incarnation`.  Beside the
+list, `fleet` (`expect`, `seen_max`) and `routing` (the mode and the
+placement map's epoch).
 
-`probe`'s full reply nests `sync_bs`/`qd`/`seq_bs`/`seq_mb_s`/
-`fsync_p50_us`/`fsync_p99_us`/`sync_iops`/`probed_secs` at the top,
-a `recommend` object (`fsync`, `max_durable_wps`,
-`max_durable_wps_is_upper_bound`, `segment_mb`, and, once there is
-observed traffic to base it on, `wal_total_mb`/`segments`/`basis`), and
-an `observed` object (`fsync_n`, `fsync_avg_us`, `fsync_max_us`,
-`probe_underestimated`) - see the storage design notes this module was
-built against for what each figure is for.
+`probe`'s full reply has `cached` and
+`sync_bs`/`qd`/`seq_bs`/`seq_mb_s`/`fsync_p50_us`/`fsync_p99_us`/
+`sync_iops`/`probed_secs` at the top and a `recommend` object: `fsync`,
+`max_durable_wps`, `max_durable_wps_is_upper_bound`, an `observed`
+object (`fsync_n`, `fsync_avg_us`, `fsync_max_us`,
+`probe_underestimated`), `probe_sync_kb`, `segment_mb`, and, once there
+is observed traffic to base it on, `wal_total_mb`/`segments`/`basis`.
 
 ```
 $ perfcli -p 6479 stats sessions
 {"version":"…","rev":"…","state":"ready", … per-collection and cluster figures … }
-$ perfcli -p 6479 members
-{"members":[{"addr":"192.0.2.10","port":6479,"node":1,"self":true,"master":true,"backup":false,"role":"master","state":"ready","mem_tier":"core","free_mb":15000,"total_mb":16000,"http":8479,"uptime_s":3600,"entries":3,"start":"warm"}]}
+$ perfcli -p 6479 -j '{"method":"members"}'
+{"members":[{"addr":"192.0.2.10","port":6479,"node":1,"self":true,"master":true,"backup":false,"role":"master", … ,"state":"ready", … ,"mem_tier":"thp-advise","free_mb":15000,"total_mb":16000,"http":8479,"uptime_s":3600, … ,"entries":3,"start":"warm", … }, … ],"fleet":{"expect":3,"seen_max":3},"routing":{ … },"version":"…","rev":"…"}
 $ perfcli -p 6479 save
 {"started":true}
 $ perfcli -p 6479 sync
@@ -399,9 +431,10 @@ $ perfcli -E 's3cret' -p 6479 updrain sessions
 
 ## Not perfcli words: `dump` / `restore`, and pub/sub
 
-Two families exist as native methods but have **no perfcli word** -
-`build()` does not dispatch them, so they are reachable only via `-j`
-(or not intended for interactive use at all):
+Besides `members`, `clients` and `sketch` above, these native methods
+have **no perfcli word** - `build()` does not dispatch them, so they
+are reachable only via `-j` (or not intended for interactive use at
+all):
 
 - **`dump`/`restore`** are `perfdump`/`perfload`'s own wire protocol - a
   chunked, cursor-driven bulk transfer shaped for a parallel dumper, not
@@ -409,9 +442,13 @@ Two families exist as native methods but have **no perfcli word** -
   [`perfload`](GUIDE.md#perfload) instead of `-j`-ing these directly;
   the format is documented in
   [doc/perfdump-format.md](doc/perfdump-format.md).
+- **`setnx`, `setxx`, `setifeq`, `setifne`, `delifeq`, `delifne`** -
+  the conditional writes behind the RESP door's `SET ... NX|XX|IFEQ|IFNE`
+  and `DELEX`; **`hcmd`** and **`rlhit`** - the hash commands and
+  `RL.HIT` (see [REDIS-COMMANDS.md](REDIS-COMMANDS.md)); **`conninfo`**.
 - **`subscribe` / `psubscribe` / `unsubscribe` / `punsubscribe` /
-  `publish`** exist on the native door (see the daemon's pub/sub
-  design) but perfcli's REPL has no subscribed mode to receive
+  `publish`** exist on the native door but perfcli's REPL has no
+  subscribed mode to receive
   deliveries in - a `subscribe` from perfcli registers the interest and
   the connection then sits there; messages arrive as unsolicited
   NOTIFY frames perfcli was not written to print specially. Reachable
@@ -421,8 +458,12 @@ Two families exist as native methods but have **no perfcli word** -
   $ perfcli -p 6479 -j '{"method":"subscribe","params":{"channel":"news"}}'
   {"subscribed":1}
   $ perfcli -p 6479 -j '{"method":"publish","params":{"channel":"news","payload":"hello"}}'
-  {"receivers":1}
+  {"receivers":0}
   ```
+
+  The one-shot subscriber's interest ended with its connection, so the
+  publish found nobody; with the `subscribe` typed into a REPL that is
+  still open, the same publish answers `{"receivers":1}`.
 
   A real subscriber should use libperfd (which has a notify hook for
   exactly this) or the RESP door's `SUBSCRIBE`, documented in
@@ -440,7 +481,7 @@ above).
 
 | message | when |
 |---|---|
-| `node is not READY (recovering) - retry, or use another member` | any data command reaches a node still loading its snapshot/WAL |
+| `node is not READY (recovering or connecting) - retry, or use another member` | any data command reaches a node still loading its snapshot/WAL, or (0.7.5) one still `connecting` - admitted at wire epoch 4 and proving its links |
 | `node is FAILED (its WAL is losing acknowledged writes) - reads still served here, send writes to another member` | a write reaches a node that has stopped accepting them after a WAL overrun |
 | `creating and dropping collections is not enabled here - set [daemon] allow_create = yes on this node` | `create`/`drop`/`resize`/`rename` on a node without `[daemon] allow_create` |
 | `a read-through collection and its .nofall companion are not renamed live - their upstream is bound to the name in the config: rename it there and restart every node at once` | `rename` of a collection with an `upstream`, or of its `.nofall` companion |

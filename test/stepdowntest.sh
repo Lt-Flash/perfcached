@@ -1,31 +1,6 @@
 #!/bin/sh
-# stepdowntest.sh — clterm.h rule 3, against the DAEMON: a master that
-# observes a higher term steps down.
-#
-# clustersim proves the rule composes; this proves the daemon runs it.
-# They are different claims and both are needed - the simulator calls
-# pc_term_must_stepdown directly, so it would stay green no matter what
-# cluster.c did with the answer.
-#
-# The fault: isolate the master.  The majority side loses sight of it
-# after MASTER_DEAD_MS (8000) and promotes, claiming a term above
-# everything it has seen.  Heal, and the old master - still master, still
-# sending MASTER_ALIVE - receives a map at the higher term.
-#
-# WHAT IS ASSERTED, and why "one master" is NOT enough.  Run against the
-# unwired build this test passed 5/5 - because cluster.c already had a
-# SECOND cure in handle_master_alive that ranks by member count and then
-# by address.  It does converge the fleet to one master.  It just picks
-# the wrong one: measured, the stale isolated master (10.99.0.13) won on
-# address over the node that had legitimately promoted, and the fleet
-# went BACKWARDS to the lower term.
-#
-# So the discriminating assertion is not "one master" but "the master
-# holding the HIGHER TERM is the one that survived".  That is the whole
-# content of rule 3, and it is the only assertion here that can tell a
-# wired build from an unwired one.
-#
-# Usage: test/stepdowntest.sh [runtime]
+# stepdowntest.sh - a daemon master that observes a higher term steps down: after a partition heals
+# the master holding the higher term survives, not merely one master.  Usage: test/stepdowntest.sh [runtime]
 set -u
 
 RT=${1:-${RUNTIME:-}}       # the argument, else $RUNTIME (CI), else nerdctl or docker
@@ -112,12 +87,8 @@ fi
 	&& ok "the isolated master is still master while cut off (two, as expected)" \
 	|| echo "       note: the isolated node left mastership on its own"
 
-# THE TERMS ON EACH SIDE - this is what the verdict turns on.
-# A node reports role=master the moment it is elected, which is BEFORE
-# it publishes its first map, so map.term still reads the old epoch for
-# a beat.  Sampling immediately caught that beat and reported the
-# promoted node at term 1 while the daemon log said it had claimed 2.
-# Wait for the publication rather than racing it.
+# the terms on each side: a node is master before it publishes its first map, so wait for the
+# publication rather than read the old term
 OLDT=$(mterm $MN)
 i=0
 while [ $i -lt 20 ]; do
@@ -145,10 +116,8 @@ while [ $i -lt 45 ]; do
 	sleep 1; i=$((i + 1))
 done
 M=$(nmasters)
-# S440: the node that stepped down holds the term it yielded to - read at
-# once, before a map from the winner can bring it: it yields on the
-# winner's beacon, and a node that then promoted before a map arrived
-# claimed that same term again (dualclaimtest, GitHub 2026-10-23, twice)
+# the node that stepped down holds the term it yielded to, read at once before a map from the
+# winner can bring it
 ST=$(cterm $MN)
 if [ "$M" = 1 ]; then
 	ok "exactly one master ${i}s after the heal - the step-down fired"
@@ -165,12 +134,8 @@ else
 	     down, so split brain outlives the partition that caused it"
 fi
 
-# ---- and the fleet AGREES on which ---------------------------------
-# within a few beats, not at the instant of the step-down: the node that
-# yielded names itself until it follows the winner's next beacon, and a
-# member follows any master's beacon - the loser's last one, sent before
-# it yielded, included - so for up to a beat (1 Hz) a node may name the
-# loser (v0.7.3-rc3 GitLab: n1=877 n2=877 n3=177 read at 0 s; filed S452)
+# ---- and the fleet agrees on which, within a few beats: for up to a beat (1 Hz) a member may still
+# follow the loser's last beacon
 i=0
 while :; do
 	A=$(master 1); B=$(master 2); Cc=$(master 3)
@@ -184,10 +149,10 @@ else
 	bad "the fleet disagrees about who the master is ${i}s after the step-down: n1=$A n2=$B n3=$Cc"
 fi
 
-# ---- THE assertion: the HIGHER TERM won -----------------------------
-# Everything above is satisfied by the member-count/address cure alone,
-# which converges the fleet while seating whichever node has the higher
-# address.  Only this distinguishes a wired rule 3 from an unwired one.
+# ---- the assertion: the higher term won.  The member-count/address cure alone converges the fleet
+# too, on whichever node has the higher address.
+# node 1 stepped down and is admitted again: the winner's map reaches it once it is back, up to 15 s
+i=0; while [ $i -lt 15 ] && ! [ "$(mterm 1)" -ge "$NEWT" ] 2>/dev/null; do sleep 1; i=$((i + 1)); done
 FT=$(mterm 1)
 if [ "$FT" -ge "$NEWT" ] 2>/dev/null; then
 	ok "the fleet settled at term $FT - at or above the promoted term $NEWT"

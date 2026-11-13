@@ -6,8 +6,8 @@ call one JSON line each way - the engine the CI runners carry (Debian's
 nodejs; GitHub's ubuntu image has it).  js2py (ES5.1, pure python) where
 node is not.  js2py was the only engine the suite knew, and the runners never
 had it: the page's script did not run in CI at all, and a function defined
-out of the fleet table's scope reached a live dashboard (12nx, 2026-10-19,
-'dfull is not defined').
+out of the fleet table's scope reached a live dashboard
+('dfull is not defined').
 
     available()   the engine this host has: "node", "js2py" or None
 """
@@ -17,10 +17,8 @@ import subprocess
 
 NODE = shutil.which("node") or shutil.which("nodejs")
 
-# One line in: {"op": "exec"|"eval", "code": ...}; one line out: {"ok": true,
-# "v": value} or {"ok": false, "e": "Name: message"}.  A value goes back as
-# JSON: undefined as null, and what JSON cannot carry (a cycle, a function)
-# as its String().
+# one line in: {"op": "exec"|"eval", "code": ...}; one line out: {"ok": true, "v": value} or
+# {"ok": false, "e": "Name: message"}; undefined goes back as null, the unencodable as String()
 _DRIVER = r"""
 const vm = require("vm");
 const ctx = vm.createContext({});

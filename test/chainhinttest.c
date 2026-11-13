@@ -1,24 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * chainhinttest.c - S349, OC-6 (DESIGN 12oc): a record in a bucket's chain
- * must be reaped by the expiry sweep when it expires.
- *
- * The sweep skips every bucket whose hint (the earliest expiry in it) is 0
- * or later than now - that is what keeps a sweep of a large table cheap.
- * Since OC a bucket's hint covers its chain: every path that puts a record
- * anywhere in the chain, or gives one a TTL, lowers it.  S349 found the leg
- * drain forgetting to (a record reaped never, in a bucket of records that
- * do not expire); the chains must not repeat it.
- *
- * The shape, in a 16-bucket table: bucket B filled with six fillers, and a
- * seventh key K of B, which goes to B's chain:
- *   1. fillers with no expiry, K with a short one   - K is reaped
- *   2. fillers that expire late, K with a short one - likewise
- *   3. K stored with no TTL, then EXPIRE gives it one - likewise
- * Positive control: K alone in a bucket is reaped by the same sweep.  Every
- * round also checks the chains' shape.
- */
+/* chainhinttest.c - a record in a bucket's chain is reaped by the expiry sweep: every path that
+ * puts one in the chain or gives it a TTL lowers the bucket's hint, which the sweep skips by. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"

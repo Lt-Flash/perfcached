@@ -17,7 +17,7 @@ of three things:
   njwt  <host> <port> <dataset>      how many jwt keys (pcbench -n)
 
 The keyspaces follow the SHAPES of two production Redis instances
-(sampled 2026-10-01): the classes of key, their proportions, their
+as sampled: the classes of key, their proportions, their
 lengths, the share with a TTL, and the KEYS pattern one of them really
 sends.  The names are neutral stand-ins of the same length - no key,
 value or prefix of theirs is in here.  Same seed, same keys, on every

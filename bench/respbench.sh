@@ -1,55 +1,6 @@
 #!/bin/sh
-# respbench.sh — the RESP door (task S33) under REAL Redis clients.
-#
-# resplistener.sh already proves the door works and that 200 clients can
-# hold it open at once.  What it does not answer is what an unmodified
-# Redis client gets for its trouble, so this drives redis-benchmark - the
-# tool those clients' owners will use - against three arms measured
-# identically:
-#
-#   redis   real redis-server, persistence off: the reference
-#   perf1   one perfcached, NO cluster section: the same job, standalone
-#   perf1c  one perfcached as a ONE-NODE CLUSTER: the cluster plane runs
-#           with no peers, so perf1 -> perf1c prices it at rest
-#   perf3-store   three nodes, pull-on-miss: a SET lands locally and is
-#                 pushed NOWHERE
-#   perf3-eager   three nodes, store + the background sweep that pushes
-#                 every record to all peers - the arm that actually
-#                 prices REPLICATION, which store does not
-#   perf3-proxy   three nodes, one placed copy; non-holder writes forward
-#   perf3-shard   three nodes, one COMPUTED owner; non-owner writes
-#                 forward - and a RESP client cannot compute it
-#
-# All the perf3 arms are driven through NODE 1's RESP door, because that
-# is the honest shape of the migration this exists for: a Redis client
-# CANNOT route - no map, no owner hash, no way to learn one - so on proxy
-# and shard every key that does not belong to node 1 is a forward, and
-# that forward is what a migrating deployment actually pays.
-#
-# perf1 -> perf1c prices the cluster plane at rest; perf1c -> perf3-store
-# prices two more peers joining it.  NEITHER prices replication: that is
-# perf3-eager, and it is the only arm whose work continues after the
-# drive returns, so it waits for the sweep to converge before teardown.
-#
-# Client counts run to 1000 because "a lot of Redis clients at once" is
-# the reason the door exists, and a throughput number at c=4 says nothing
-# about c=1000.  Pipelining is measured separately: perfcached parses as
-# many complete commands as one read produced, so -P 16 is a different
-# question from -c 16 and is asked separately.
-#
-# Also checked, because throughput on a cache that lost the data is not a
-# result: a key SET through one node's RESP port is read back through
-# EVERY other node's, and then through a survivor after the node the
-# writer used is killed.
-#
-# CONTAINERISED 2026-09-12.  Nothing runs on the host: the perfcached
-# fleet, redis 8 and both load generators are containers on their own
-# bench network.  The host needs a container runtime and nothing else.
-# The two positional arguments this used to take (a perfcached and a
-# perfcli path) are gone - the binaries come from the image built out of
-# this tree, and the revision is read back OUT of that image.
-#
-# usage: bench/respbench.sh
+# respbench.sh - redis-benchmark through the RESP door against redis, one perfcached (standalone and
+# one-node cluster) and a 3-node fleet per mode, all in containers.  usage: bench/respbench.sh
 set -u
 
 B=$(cd "$(dirname "$0")" && pwd)
@@ -66,54 +17,25 @@ D=${RESPBENCH_DIR:-/var/tmp/respbench}
 N=${N:-100000}
 N_MAX=${N_MAX:-2000000}   # cap on N x pipeline per cell
 VAL=${VAL:-200}
-# one epoll thread per worker, so more workers than CPUs is contention,
-# not parallelism.  Hardcoded at 4 until a 2-vCPU host showed 62% SYSTEM
-# time and a 12.3 ms p99 against redis's 1.7 at the same throughput.
-# Capped at 4 so a >=4-core host still matches the published numbers.
+# one epoll thread per worker: more workers than CPUs is contention, and 4 at most so a
+# bigger host still matches the published numbers
 NCPU=$(nproc 2>/dev/null || echo 2)
 WORKERS=${WORKERS:-$([ "$NCPU" -lt 4 ] && echo "$NCPU" || echo 4)}
 KEYSPACE=${KEYSPACE:-20000}
 CLIENTS=${CLIENTS:-"1 4 16 50 200 500 1000"}
 PIPES=${PIPES:-"1 8 16 64"}
 
-# PIPE_CLIENTS: the client count for the PIPELINED cells.  The depth-1
-# sweep walks $CLIENTS; the pipeline sweep holds clients fixed and walks
-# depth, so each table varies one axis at a time.
-#
-# That fixed count used to be a hardcoded 50, which SILENTLY IGNORED
-# CLIENTS: asking for CLIENTS=500 PIPES=64 measured 50 clients at depth
-# 64.  The column said 50, so it was not hidden - but it was not what
-# was asked for either.
-#
-# Now: if CLIENTS names exactly one value that is plainly the
-# concurrency you meant, so use it.  Otherwise 50, which keeps the
-# default matrix and the figures quoted in the README.
+# client count of the pipelined cells: the one value CLIENTS names, if it names exactly one,
+# else 50 (the default matrix and the README's figures)
 PIPE_CLIENTS=${PIPE_CLIENTS:-$(set -- $CLIENTS; [ $# -eq 1 ] && echo "$1" || echo 50)}
 
-# ---- the shard arm is driven by a CLUSTER-AWARE client -----------------
-#
-# perfcached publishes the Redis topology (CLUSTER INFO/NODES/SLOTS/SHARDS,
-# S44/S49) with a Redis-compatible slot function, hash tags included, so a
-# stock client can route to the owner itself.  Measuring shard mode with a
-# NON-cluster client pointed at one node therefore measured the forwarding
-# hop and nothing else: two thirds of keys landed on a node that did not
-# own them.  Paired on one fleet, 50 clients, pipeline 64, grace expired:
-# 257,301 SET/s unrouted against 2,659,574 routed, x10.3, with fwd_sent
-# EXACTLY ZERO in the routed run.  Unrouted, shard was the slowest arm in
-# the matrix; routed, it is the fastest.
-#
-# THE ARM'S MEANING CHANGED ON 2026-09-12.  Do not compare a routed
-# perf3-shard row against the x0.28 rows in older result files.  Set
-# SHARD_CLUSTER=0 to reproduce those.
+# shard is driven by a cluster-aware client: unrouted, two thirds of the keys forward and the
+# cell measures that hop.  SHARD_CLUSTER=0 gives the unrouted arm.
 SHARD_CLUSTER=${SHARD_CLUSTER:-1}
 RB_CLUSTER=""                      # "--cluster" while a routed arm runs
 CLNODES=3                          # the fleet the mode arms build
 
-# A routed cell needs at least one connection per node: with fewer, a
-# routing client could not be talking to every owner at once, and one
-# benchmark per node would inflate the concurrency the cell claims to
-# measure.  Those cells stay unrouted and say so - a quietly unrouted
-# cell inside a routed arm is the kind of mixed row that gets quoted.
+# a routed cell needs a connection per node; smaller cells stay unrouted and say so
 routed_ok() { # routed_ok <clients>
 	[ -n "$RB_CLUSTER" ] || return 1
 	if [ "$1" -lt "$CLNODES" ]; then
@@ -126,10 +48,7 @@ routed_ok() { # routed_ok <clients>
 SECRET=rb-client-secret
 P1= P2= P3= PR=
 
-# no host-tool checks: redis-benchmark and redis-cli come from the redis
-# image and perfcli from ours, so "installed" is a property of the images
-# rather than of whichever host this happens to run on - which is the
-# whole point of the container route.
+# no host-tool checks: redis-benchmark, redis-cli and perfcli all come from the images
 cl_runtime_pick || exit 1
 
 rm -rf "$D"; mkdir -p "$D"
@@ -144,28 +63,13 @@ trap cleanup EXIT TERM INT
 # the default 1024 is close enough to the ask to trip it
 ulimit -n 8192 2>/dev/null || true
 
-# BUSY-HOST PRE-FLIGHT.  This machine both runs the benchmarks and IS
-# the GitLab CI runner, so a bench started near a push measures the
-# pipeline as well: on 2026-09-12 a clang-tidy job ran straight through
-# the redis, perf1, perf1c and store arms of a full run and every one of
-# those cells had to be binned.  xhostbench has refused a busy server
-# host since it was written; this had no such guard.
-#
-# Match the WORK, never the runner DAEMON: gitlab-runner's own command
-# line contains its builds directory, so a pattern like
-# "gitlab-runner.*build" matches the permanently-idle daemon and can
-# never clear - that mistake cost a 900 s wait before it was spotted.
-# Container processes are host processes, so this sees them too.
+# this host is also a CI runner: refuse to start while CI work runs, or the cells measure it.
+# Match the work, never the runner daemon, whose command line always matches.
 BUSY_CHECK=${BUSY_CHECK:-1}
 host_busy() {
 	hb_n=0
 	for hb_p in /proc/[0-9]*; do
-		# comm, NOT cmdline: comm is the executable's name, so a shell
-		# whose ARGV happens to mention redis-benchmark - the launcher,
-		# an ssh command, this function's own caller - cannot match
-		# itself.  Verified: matching cmdline reported 1 busy process
-		# on a completely idle box, and the one it found was the shell
-		# doing the asking.
+		# comm, not cmdline: a shell whose argv mentions redis-benchmark (this one) must not match
 		read -r hb_c < "$hb_p/comm" 2>/dev/null || continue
 		case "$hb_c" in
 		clang-tidy|cc1|cc1plus|redis-benchmark|natbench|pcbench|perfcached)
@@ -187,27 +91,16 @@ BUSY_CHECK=0 to override." >&2
 	fi
 fi
 
-# PRE-FLIGHT.  The host-port version of this check is gone with the host
-# processes, but the hazard it guarded is not: perfcached listeners use
-# SO_REUSEPORT, so a fleet left by an interrupted run would bind ALONGSIDE
-# this one and the kernel would split traffic between two unrelated
-# fleets - and a leftover redis would answer PING and have the whole
-# reference arm measure somebody else's instance.  In containers each
-# fleet owns its own network namespace, so the equivalent hazard is a
-# container of the same NAME left behind: remove those by name, never by
-# pattern, which would match the shell running the sweep.
+# a fleet or redis left by an interrupted run would answer in this one's place: remove those
+# containers by name, never by pattern (which would match the shell running the sweep)
 cl_rm "$RB_CLI" "$RB_TOOL" "$RCON" rb-n1 rb-n2 rb-n3
 cl_net_up "$NET" "$SUBNET" || exit 1
 cl_image_build "$IMG" "$CONTAINERFILE" || exit 1
 cl_client_up "$RB_CLI" "$NET" || exit 1
 cl_client_up "$RB_TOOL" "$NET" "$IMG" || exit 1
 
-# PROVENANCE, read AFTER the image exists.  The numbers are only worth as
-# much as the build that produced them, so stamp the BINARY's revision -
-# out of the image that will actually run, not the tree, which differs
-# the moment an older image meets a newer checkout - and refuse one that
-# cannot name itself.  An unstamped build is how a page ends up quoting
-# figures nobody can reproduce.
+# stamp the revision read out of the image that will run, not the tree, and refuse an unstamped
+# build: an unstamped figure cannot be reproduced
 BINREV=$(cl_image_rev "$IMG")
 if [ -z "$BINREV" ] || [ "$BINREV" = unknown ]; then
 	echo "RESPBENCH: refusing to measure an unstamped build ($BINREV) - \
@@ -222,10 +115,7 @@ rport() { echo "$((16400 + $1))"; }       # RESP door
 REDIS_IP=10.96.0.10
 REDIS_PORT=6379
 
-# perfcli lives in OUR image, redis-benchmark in the redis one, so the
-# harness keeps one persistent client container of each.  Both are on
-# $NET, so what they measure is the bench network, not a bridge the
-# servers are not on.
+# one persistent client container per image, both on $NET so they measure the bench network
 statj() { cl_exec "$RB_TOOL" perfcli -h "$(addr $1)" -p "$(nport $1)" \
 	-a "$SECRET" -j '{"method":"stats"}' 2>/dev/null; }
 jget() { python3 -c "import json,sys
@@ -237,11 +127,8 @@ except Exception:
 
 start_perf() { # start_perf <nodes> [cluster-mode-lines | "none"]
 	n=$1; MODEBLK=${2:-"mode = store"}; i=1
-	# "none" = NO [cluster] section at all.  A one-node CLUSTER is not
-	# a standalone daemon: it still multicasts heartbeats, runs the
-	# membership tick and keeps peer state, so measuring it as "one
-	# perfcached" prices the cluster plane into the baseline and hides
-	# it.  The two are measured separately instead.
+	# "none" = no [cluster] section: a one-node cluster still runs the cluster plane (heartbeats,
+	# membership tick), so the two are measured separately
 	if [ "$MODEBLK" = none ]; then
 		CLUSTERBLK=""
 	else
@@ -252,9 +139,8 @@ $MODEBLK
 collections = 0"
 	fi
 	while [ $i -le $n ]; do
-		# NOTE: no 'plaintext = loopback' here.  It makes a loopback
-		# listener plaintext-EXCLUSIVE, and perfcli authenticates -
-		# the RESP door is plaintext on its own regardless.
+		# no 'plaintext = loopback': it makes a loopback listener plaintext-only and perfcli
+		# authenticates; the RESP door is plaintext regardless
 		cat > "$D/n$i.conf" <<EOF
 [daemon]
 workers = $WORKERS
@@ -267,21 +153,16 @@ cluster = rb-cluster-secret
 [listen]
 tcp = $(addr $i):$(nport $i)
 resp = $(addr $i):$(rport $i)
-# S33: the RESP dialect has no handshake, so a NON-LOOPBACK listener is
-# REFUSED without an allow-list and the daemon will not start at all.
-# The host-process version of this bench listened on 127.0.42.x, which
-# is loopback and needed none; on a bench network it does.  Scoped to
-# the bench subnet, so the containers are the only things that reach it.
+# a non-loopback RESP listener needs an allow-list (RESP has no handshake);
+# scoped to the bench subnet, which only the containers reach
 resp_allow = $SUBNET
 $CLUSTERBLK
 $([ -n "$CLUSTERBLK" ] && echo "advertise = $(addr $i)")
 [collection 0]
 buckets_log2 = 17
 EOF
-		# --ulimit memlock=-1: a container's default memlock sits
-		# far below the arena, so mlock() fails and the arena runs
-		# UNPINNED and swappable - a property of the container, not
-		# of the daemon, and invisible in the daemon's own log.
+		# a container's default memlock is below the arena: mlock() would fail and the arena would run
+		# swappable, with nothing in the daemon's log
 		CL_RUN_EXTRA="--ulimit memlock=-1"
 		cl_node_up "$(nodec $i)" "$NET" "$(addr $i)" \
 			"$D/n$i.conf" "$IMG" || exit 1
@@ -310,17 +191,8 @@ start_redis() {
 }
 stop_redis() { cl_rm "$RCON"; PR=; sleep 0.3; }
 
-# one redis-benchmark point -> "set_rps get_rps set_p50 get_p50 set_p99 get_p99"
-# NOTE: strip the quotes PER FIELD.  gsub(/"/,"") on $0 makes awk re-split
-# the record with FS, and with FS='","' the unquoted line has nothing left
-# to split on - every field but the first comes back empty and the point
-# prints 0 as though it had measured one.
-# Live ratio against the redis reference.  The redis arm always runs
-# first, so by the time any other arm prints a line its comparison is
-# already known - and a progress line with a bare number is close to
-# useless while a run takes an hour.  The reference is kept in a file
-# because POSIX sh has no associative arrays and the alternative is
-# re-parsing the TSV per row.
+# ref.txt holds the redis cells so every later arm's progress line carries its ratio (POSIX sh
+# has no associative arrays)
 ref_put() { # ref_put <clients> <pipeline> <set> <get>
 	printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >> "$D/ref.txt"
 }
@@ -337,12 +209,7 @@ ref_note() { # ref_note <clients> <pipeline> <set> <get> -> " (x.. / x..)"
 		}' "$D/ref.txt"
 }
 
-# ---- tabular progress -------------------------------------------------
-# One aligned table per arm instead of a stream of sentences: a run
-# prints ~80 measurement lines and comparing them by eye across a
-# scrolling terminal is not reading, it is squinting.  The header
-# reprints whenever the arm changes, so a line always has a column
-# heading above it no matter where you scroll in.
+# one aligned table per arm; the header reprints whenever the arm changes
 TROW_ARM=""
 trow() { # trow <arm> <clients> <pipe> <set> <get> <sp99> <gp99>
 	if [ "$1" != "$TROW_ARM" ]; then
@@ -363,26 +230,11 @@ trow() { # trow <arm> <clients> <pipe> <set> <get> <sp99> <gp99>
 		"$2" "$3" "${4:--}" "${5:--}" "${6:--}" "${7:--}" "$rn" >&2
 }
 
-# Requests per cell scale with the pipeline depth.  redis-benchmark
-# times a run in WHOLE MILLISECONDS and reports N / elapsed, so a
-# 100k-request run at 1.8M ops/s lasts 56 ms and every figure it can
-# print sits on a 2% grid - the same GET/s to the digit, run after run,
-# was that grid and not repeatability.  N x P, capped at N_MAX, keeps
-# every cell above a second without a lone connection at depth 64
-# running for a minute.
+# redis-benchmark times a run in whole milliseconds: N x pipeline (capped at N_MAX) keeps every
+# cell above a second, so its figures are not on a 2% grid
 reqs() { r=$((N * $1)); [ "$r" -gt "$N_MAX" ] && r=$N_MAX; echo "$r"; }
-# Why a redis-benchmark call failed.  point() and point_get() used to send
-# its stderr to /dev/null, so every failure - a refused connection, an error
-# reply, a timeout - collapsed into "produced no result" and the cause was
-# lost.  One run on 2026-09-11 dropped every pipelined cell of the headline
-# arm that way and nobody could say why.  Each call now leaves its exit
-# code, its stderr and its stdout in $D, overwritten per call (the harness
-# runs one call at a time), and every call is also appended to
-# $D/redis-benchmark.log.
-#
-# redis-benchmark ALWAYS prints "WARNING: Could not fetch server CONFIG"
-# against perfcached's RESP door, which has no CONFIG verb.  That line is
-# expected on every call and is never the cause, so it is filtered out.
+# each redis-benchmark call leaves its rc, stderr and stdout in $D and appends to
+# redis-benchmark.log; "Could not fetch server CONFIG" is expected (no CONFIG verb) and filtered
 rb_errs() {
 	awk '!/Could not fetch server CONFIG/ && NF' "$D/rb.err" 2>/dev/null
 }
@@ -424,27 +276,8 @@ point() { # point <host> <port> <clients> <pipeline>
 		}'
 }
 
-# ---- the ROUTED driver, for the shard arm ------------------------------
-#
-# redis-benchmark's own cluster mode CANNOT measure reads.  It spreads
-# writes by randomising the HASH TAG per request - the keys it wrote in
-# one run look like key:{4JO}:0, key:{EU}}:1, key:{49k}:4 - so its GET
-# phase generates fresh tags and asks for keys its SET phase never wrote.
-# No value of -r fixes that; the randomness is in the tag, not the
-# suffix.  Measured: -r 20000 and -r 1000 both give ~43-55k GET/s with
-# ~2 cluster pulls per request, which is the MISS path, not reads.
-#
-# So the routed arm models a cluster-aware client directly: one
-# redis-benchmark per node, pinned to that node, using an explicit
-# command whose key carries a hash tag THAT NODE OWNS, run in parallel
-# and summed.  Every request therefore lands on its owner exactly as a
-# routing client would send it, and the GET phase reads the keys the SET
-# phase just wrote.  Verified: 1,658,374 GET/s on one node with 216
-# pulls out of 2,000,000 requests - 0.01%, i.e. local hits.
-#
-# Sum the rates (that is the fleet's aggregate, which is what a routed
-# client sees) and take the WORST p99 of the three, because a client is
-# as slow as the node it is waiting on.
+# routed driver for the shard arm: redis-benchmark's cluster mode randomises the hash tag, so its
+# GETs miss.  Instead one instance per node, on a tag that node owns; rates summed, worst p99.
 RVAL=""                            # filled once VAL is known
 routed_tags() {                    # find a hash tag each node owns
 	rt_i=1
@@ -504,31 +337,19 @@ point_routed() { # point_routed <clients> <pipeline> -> the six fields
 		}'
 }
 
-# REPS: how many times each cell is measured before it is believed.
-# Default 1 - a single pass is enough for the redis/perf1 headline,
-# where the gap is large.  It is NOT enough to COMPARE ARMS: this rig's
-# run-to-run spread on one unchanged arm is ~11%, and the mode arms
-# differ by 14-20%, so a single pass would be ranking noise - and the
-# REFERENCE arm is no better: redis itself moved 411k -> 571k between two
-# runs of the same cell here, 39%.  Pass REPS=3 (or more) for any run
-# whose numbers will be COMPARED rather than merely reported.
-# Median, not mean: one slow outlier must not drag a cell, and on this
-# box outliers run 35% low when they come.
+# REPS: passes per cell, median taken.  One pass is enough for the redis/perf1 headline, not to
+# compare arms (run-to-run spread ~11% against 14-20% between modes): use REPS=3 for that.
 REPS=${REPS:-1}
 
-# median of whitespace-separated numbers, INTEGER OR DECIMAL - the rates
-# are integers and the latencies are ms with three decimals, and an
-# integer-only filter here silently turned every p50 into 0.
+# median of integers OR decimals: the latencies are ms with three decimals
 med() { tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+)?$' | sort -g | awk '
 	{v[NR]=$1} END {
 		if (NR == 0) { print 0; exit }
 		print (NR % 2) ? v[(NR+1)/2] : (v[NR/2] + v[NR/2+1]) / 2
 	}'; }
 
-# GET-only variants, for the COLD-ENTRY arms.  Reads only, and that is
-# not a shortcut: a SET through a cold node in PROXY mode would place
-# the key THERE, warming the very node whose coldness is the thing being
-# measured.
+# GET-only, for the cold-entry arms: a SET through a cold proxy node would place the key there
+# and warm the node being measured
 point_get() { # point_get <host> <port> <clients> <pipeline>
 	{ cl_bench "$RB_CLI" -h "$1" -p "$2" -t get -n "$(reqs "$4")" -c "$3" -P "$4" \
 		-r "$KEYSPACE" -d "$VAL" --csv 2>"$D/rb.err"; echo $? > "$D/rb.rc"; } \
@@ -549,8 +370,7 @@ row_get() { # row_get <arm> <host> <port> <clients> <pipeline>
 			set -- $rg
 			gr_="$gr_ $1"; g5_="$g5_ $2"; g9_="$g9_ $3"
 		else
-			# a failed rep used to be silent here: the median quietly
-			# came from fewer reps and nothing said so
+			# say so: otherwise the median silently comes from fewer reps
 			echo "RESPBENCH: $ga c=$gc P=$gpl rep $gk produced no" \
 				"result - skipped" >&2
 			rb_why
@@ -622,18 +442,8 @@ for p in $PIPES; do
 done
 stop_redis
 
-# ---- arm 2: one perfcached -------------------------------------------
-# TWO single-node arms, because they are not the same daemon.
-#
-#   perf1    NO [cluster] section at all - the true like-for-like
-#            against redis, one process serving one keyspace.
-#   perf1c   a ONE-NODE CLUSTER: same data path, but the cluster plane
-#            is running - multicast heartbeats, membership ticks, peer
-#            bookkeeping - with nobody to talk to.
-#
-# The gap between them is the cluster plane's BASELINE cost, and it was
-# previously folded into "perf1" and invisible: the harness built one
-# config for both arms, so the single-node number already carried it.
+# ---- arm 2: one perfcached, twice: perf1 has no [cluster] section, perf1c is a one-node
+# cluster; the gap is the cluster plane's baseline cost
 echo "=== perfcached, single node, standalone ===" >&2
 start_perf 1 none
 for c in $CLIENTS; do row perf1 "$(addr 1)" "$(rport 1)" "$c" 1; done
@@ -646,22 +456,8 @@ for c in $CLIENTS; do row perf1c "$(addr 1)" "$(rport 1)" "$c" 1; done
 for p in $PIPES; do [ "$p" = 1 ] || row perf1c "$(addr 1)" "$(rport 1)" "$PIPE_CLIENTS" "$p"; done
 stop_perf
 
-# ---- arms 3-6: three perfcached, ONE ARM PER MODE --------------------
-#
-# All four driven through NODE 1's RESP door, because that is the honest
-# shape of the migration this project exists for: a Redis client CANNOT
-# route: it has no map, no owner hash, and no way to learn one.  So on
-# proxy and shard every key that does not belong to node 1 is a FORWARD,
-# and that forward is the number a migrating deployment actually pays.
-# Comparing the four is therefore comparing what a dumb Redis client
-# costs you per mode - not what a cluster-aware libperfd client would.
-#
-#   perf3-store   pull-on-miss.  A SET lands locally, pushes nowhere.
-#   perf3-eager   store + background sweep pushing every record to all
-#                 peers.  This is the arm that actually prices
-#                 REPLICATION, which store does not.
-#   perf3-proxy   one placed copy; non-holder writes forward.
-#   perf3-shard   one computable owner; non-owner writes forward.
+# ---- arms 3-6: three perfcached, one arm per mode, all through node 1's RESP door: a Redis
+# client cannot route, so on proxy and shard every key node 1 does not own is a forward
 MODEARMS=${MODEARMS:-"store eager proxy shard"}
 for M in $MODEARMS; do
 	case $M in
@@ -687,35 +483,10 @@ for M in $MODEARMS; do
 			"$PIPE_CLIENTS" "$p"
 	done
 
-	# The routed arm's GET is a real read now: point_routed's GET phase
-	# reads the keys its own SET phase just wrote, on the owner, and the
-	# pull counters stay near 0.01% of requests.  Nothing to annotate.
 	RB_CLUSTER=""
 
-	# COLD ENTRY.  Driving every mode through node 1 compares a mode at
-	# a 100% local hit rate against one at 33%, which measures the
-	# PLACEMENT and not the mode.  Measured: proxy read through node 1
-	# does 359,712 GET/s and through a node holding nothing 130,208 -
-	# landing on shard's 125,313, because proxy and shard relay a
-	# non-local key identically and neither caches it at the entry
-	# node.  Proxy's lead was the hit rate, nothing else.
-	#
-	# So: fill through node 1, then read through NODE 2, which holds
-	# nothing in proxy and store, and owns only its computed third in
-	# shard.  That is the number a client pays when it does not land on
-	# the node holding its key - which, with no routing, is most of
-	# them.
-	# WAIT OUT THE RESHARD GRACE FIRST.  For SHARD_GRACE_S (30s) after a
-	# membership change, a shard miss does not answer authoritatively -
-	# it retries ONCE as a BROADCAST, because the data may still sit on
-	# the old owner (proto.c).  Measured inside that window shard issues
-	# 1.15 pulls per request against proxy's 0.79 and looks SLOWER than
-	# proxy; measured after it, shard is 2.1x FASTER with an 8.7x
-	# tighter p99, which is what its computed-owner unicast should give.
-	# Two ad-hoc runs of this comparison disagreed for exactly this
-	# reason before the wait existed.  Do not remove it because "the
-	# earlier arms take long enough" - they do only for a full CLIENTS
-	# list, and a short invocation lands straight inside the window.
+	# cold entry: read through node 2, which holds nothing (or a third in shard), so the mode is
+	# measured and not node 1's hit rate.  Wait out SHARD_GRACE_S first: inside it shard misses broadcast.
 	up=$(( $(date +%s) - FLEET_UP ))
 	if [ "$up" -lt 32 ]; then
 		echo "  (waiting $((32 - up))s for the reshard grace to expire)" >&2
@@ -723,11 +494,8 @@ for M in $MODEARMS; do
 	fi
 	cl_bench "$RB_CLI" -h "$(addr 1)" -p "$(rport 1)" -t set -n "$N" \
 		-c 20 -r "$KEYSPACE" -d "$VAL" --csv >/dev/null 2>&1
-	# The cold arm is deliberately left UNROUTED, shard included: it exists
-	# to measure a read entering through a node that holds none of the
-	# data, and a cluster-aware client has no such case by construction -
-	# it routes to the owner, so "drive node 2" would silently become a
-	# second copy of the hot arm rather than a cold one.
+	# the cold arm stays unrouted, shard included: a routing client never enters through a node
+	# without the data, so routed it would be a copy of the hot arm
 	RB_CLUSTER=""
 	for c in $CLIENTS; do
 		row_get "perf3-$M-cold" "$(addr 2)" "$(rport 2)" "$c" 1
@@ -736,10 +504,8 @@ for M in $MODEARMS; do
 		[ "$p" = 1 ] || row_get "perf3-$M-cold" "$(addr 2)" \
 			"$(rport 2)" "$PIPE_CLIENTS" "$p"
 	done
-	# the eager arm is the only one whose work continues AFTER the
-	# drive returns, so it is the only one that must be let finish
-	# before the fleet is torn down - otherwise the next arm starts
-	# while this one is still sweeping and pays for it.
+	# eager keeps sweeping after the drive returns: let it converge before teardown, or the next arm
+	# pays for it
 	if [ "$M" = eager ]; then
 		t=0
 		while [ $t -lt 60 ]; do
@@ -755,14 +521,8 @@ for M in $MODEARMS; do
 	stop_perf
 done
 
-# ---- the data actually crossed the cluster ---------------------------
-#
-# This section tests PULL-ON-MISS and therefore needs a STORE fleet
-# specifically - it is not mode-agnostic.  It used to inherit whatever
-# was left running, which was store only because store was the only
-# cluster arm; with four arms the last one is shard, where a read from
-# node 2 for a key node 2 OWNS is local and proves nothing about pulls.
-# So it starts its own fleet rather than borrowing one.
+# ---- the data crossed the cluster: pull-on-miss needs its own store fleet (on shard a read
+# from node 2 of a key it owns would be local)
 echo "=== cross-node + failover (store fleet) ===" >&2
 start_perf 3 "mode = store"
 i=1
@@ -770,10 +530,8 @@ while [ $i -le 50 ]; do
 	cl_exec "$RB_CLI" redis-cli -h "$(addr 1)" -p "$(rport 1)" SET "xn$i" "v$i" >/dev/null 2>&1
 	i=$((i + 1))
 done
-# NOT waiting for replication - store mode pushes nothing.  The reads
-# below MISS on nodes 2 and 3 and pull from node 1 on demand, which is
-# the mechanism actually under test here.  The pause only lets the fleet
-# settle enough for a pull to find a peer.
+# store pushes nothing: the reads below miss on nodes 2 and 3 and pull from node 1; the pause
+# only lets the fleet settle
 sleep 3
 XN=""
 for n in 2 3; do
@@ -796,9 +554,8 @@ done
 
 VICTIM=$(nodec 1)
 $RT kill -s KILL "$VICTIM" >/dev/null 2>&1; P1=
-# Poll for the fleet to notice rather than guessing: PEER_PURGE_MS is
-# 6000 and the fixed `sleep 6` this replaces sampled exactly on that
-# boundary, which is enough to make a degraded result flip between runs.
+# poll for the fleet to notice rather than sleeping: a fixed sleep at PEER_PURGE_MS (6 s) flips
+# the result between runs
 DET=""; t=0
 while [ $t -lt 30 ]; do
 	M=$(cl_exec "$RB_TOOL" perfcli -h "$(addr 2)" -p "$(nport 2)" -a "$SECRET" \
@@ -837,9 +594,6 @@ echo
 echo "--- results ($D/results.tsv) ---"
 cat "$D/results.tsv"
 
-# and the comparison table, which is what anyone actually reads: every
-# arm against the redis reference at the same cell, with ratios.  Kept
-# in its own script so a results file can be re-summarised later without
-# re-running anything.
+# the comparison table, in its own script so a results file can be re-summarised later
 SUMDIR=$(dirname "$0")
 [ -x "$SUMDIR/summarize.sh" ] && sh "$SUMDIR/summarize.sh" "$D/results.tsv"

@@ -1,19 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * colname.h - S343: the one collection-name rule.
- *
- * The config file always held names to 1-32 of [A-Za-z0-9_-]; the runtime
- * verbs, the cluster plane and replay took any bytes up to 63.  So
- * `create "<img src=x onerror=...>"` was accepted, replicated to every
- * member and persisted, and every place a name reaches HTML, a log line or
- * a metrics label had to be right forever.  One rule now, for whatever
- * ORIGINATES a name - the config, a client's create/rename, a peer's
- * announce:
- *   1-32 characters of A-Z a-z 0-9 _ -, not starting with '-'.
- * The daemon itself holds one more shape: <name>.nofall, the companion it
- * synthesises for a read-through collection (S331) - never a client's.
- */
+/* colname.h - the one collection-name rule, for whatever originates a name: the config,
+ * a client's create/rename, a peer's announce.  Only the daemon makes <name>.nofall. */
 #ifndef PC_COLNAME_H
 #define PC_COLNAME_H
 
@@ -51,9 +39,8 @@ static inline int pc_col_name_held_ok(const char *s, size_t n)
 		pc_col_name_ok(s, n - k);
 }
 
-/* @s as a log line may carry it: printable ASCII as is, every other byte
- * as \xHH - a name that predates the rule must not write control bytes
- * or a fake line into the log.  Always NUL-terminates @out (@cap > 0). */
+/* @s as a log line may carry it: printable ASCII as is, every other byte as \xHH, so a
+ *  name that predates the rule cannot forge a log line.  NUL-terminates @out (@cap > 0). */
 static inline const char *pc_col_name_print(char *out, size_t cap,
 		const char *s, size_t n)
 {

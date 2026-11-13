@@ -1,24 +1,12 @@
-/*
- * clretain.c - S238: retained tombstones.  See clretain.h.
- *
- * NSHARD shards, each a chained hash plus a doubly linked list in PLANTING
- * order (a re-planted key moves to the tail with the new time), so expiry
- * and the cap both take from the head, and a replay from a time walks
- * forward.  Entries are one malloc each: header + col + '\0' + key.
- * S444: the shard's expiries are also on a second list, in the same
- * order, so the cap takes the oldest EXPIRY first - an expiry never
- * pushes out a delete.
- * 12ny AT-5: a numbered delete is on a third, its space's within the
- * shard (a small per-shard table of spaces, never shrunk: an entry names
- * its slot), in arrival order - what clretain_forget takes from the front.
- */
+/* clretain.c - retained tombstones.  Per shard: a hash, a list in planting order, one
+ * of expiries (the cap's first victims) and one per space of numbered deletes. */
 #include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "clretain.h"
-#include "resident.h"                   /* S265 */
+#include "resident.h"
 
 #define NSHARD 64u
 
@@ -27,22 +15,21 @@ struct ent {
 	struct ent *prev, *next;           /* planting order */
 	uint64_t ver;
 	unsigned int t_s;
-	/* AT-5: 16 bits each (col <= 255, key <= 4096: 4,352 at most), so
-	 * the space's slot fits the padding - 88 bytes a header, not 96 */
+	/* 16 bits each (col <= 255, key <= 4096: 4,352 at most), so the space's slot
+	 * fits the padding - 88 bytes a header, not 96 */
 	unsigned short len;                /* col '\0' key */
 	unsigned short cn;
-	unsigned char local;               /* S405: never replayed to a peer */
-	unsigned char expiry;              /* S443: noted for an expiry - AT-5
-	                                    * (c): 1 on the xlist (may go early),
-	                                    * 2 kept by the time rule */
-	unsigned int spi;                  /* AT-5: its space's slot */
-	struct ent *xprev, *xnext;         /* S444: the shard's expiries */
-	uint64_t nseq;                     /* AT-5: its number, 0 = none */
-	struct ent *sprev, *snext;         /* AT-5: the space's arrival order */
+	unsigned char local;               /* never replayed to a peer */
+	unsigned char expiry;              /* noted for an expiry: 1 on the xlist
+	                                    * (may go early), 2 kept by the time rule */
+	unsigned int spi;                  /* its space's slot */
+	struct ent *xprev, *xnext;         /* the shard's expiries */
+	uint64_t nseq;                     /* its number, 0 = none */
+	struct ent *sprev, *snext;         /* the space's arrival order */
 	char k[];
 };
 
-/* AT-5: one space's entries in a shard */
+/* one space's entries in a shard */
 struct spl {
 	uint64_t oid;
 	uint32_t incarn;
@@ -56,34 +43,32 @@ static struct shard {
 	unsigned int nb;                   /* power of two */
 	unsigned int n, cap;
 	struct ent *head, *tail;
-	struct ent *xhead, *xtail;         /* S444: the expiries alone */
-	struct spl *sp;                    /* AT-5 */
+	struct ent *xhead, *xtail;         /* the expiries alone */
+	struct spl *sp;
 	unsigned int nsp, capsp;
 } sh[NSHARD];
 
-/* AT-5: how far each space was forgotten here */
+/* how far each space was forgotten here */
 static struct { uint64_t oid; uint32_t incarn; uint64_t through; unsigned int at_s;
-	uint64_t lost; } FG[SPL_MAX];      /* AT-8: lost = dropped by time or cap */
+	uint64_t lost; } FG[SPL_MAX];      /* lost = dropped by time or cap */
 static unsigned int nfg;
 static pthread_mutex_t FG_mx = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long long R_forgot, R_forgot_exp;              /* atomic */
-static unsigned int R_num;              /* AT-5: numbered entries (atomic) */
+static unsigned int R_num;              /* numbered entries (atomic) */
 
 static unsigned int R_retain_s, R_max;
 static int R_on;
 static unsigned long long R_bytes, R_dropped_early, R_noted;   /* atomic */
-static unsigned long long R_dropped_early_exp, R_noted_exp;    /* S443 */
-/* S392: the newest planting time of a delete this table LOST before
- * retain_s - evicted by the cap, or never stored for want of memory.
- * Every delete planted after it is still here (atomic, 0 = none lost) */
+static unsigned long long R_dropped_early_exp, R_noted_exp;    /* atomic */
+/* the newest planting time of a delete this table LOST before retain_s (evicted or
+ * never stored); every delete planted after it is still here (atomic, 0 = none) */
 static unsigned int R_lost_upto_s;
-/* 12ny AT-8: when the newest UNNUMBERED entry the time rule took was
- * noted - a member away since before then may lack it, and has no mark to
- * say so (numbered ones are judged by the marks: lost_note) */
+/* when the newest UNNUMBERED entry the time rule took was noted: a member away since
+ * then may lack it (numbered ones are judged by the marks: lost_note) */
 static unsigned int R_time_hi_s;                               /* atomic */
 static unsigned int R_n;                /* entries, all shards (atomic) */
-static unsigned int R_local;            /* S405: of them, local (atomic) */
-static unsigned int R_exp;              /* S443: of them, expiries (atomic) */
+static unsigned int R_local;            /* of them, local (atomic) */
+static unsigned int R_exp;              /* of them, expiries (atomic) */
 
 static unsigned int hash_of(const char *col, size_t cn, const char *key,
 		size_t kn)
@@ -107,10 +92,10 @@ void clretain_init(unsigned int retain_s, unsigned int max)
 	R_max = max;
 	__atomic_store_n(&R_n, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&R_local, 0, __ATOMIC_RELAXED);
-	__atomic_store_n(&R_exp, 0, __ATOMIC_RELAXED);           /* S443 */
-	__atomic_store_n(&R_lost_upto_s, 0, __ATOMIC_RELAXED);   /* S392 */
-	__atomic_store_n(&R_time_hi_s, 0, __ATOMIC_RELAXED);     /* AT-8 */
-	__atomic_store_n(&R_num, 0, __ATOMIC_RELAXED);           /* AT-5 */
+	__atomic_store_n(&R_exp, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&R_lost_upto_s, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&R_time_hi_s, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&R_num, 0, __ATOMIC_RELAXED);
 	pthread_mutex_lock(&FG_mx);
 	nfg = 0;
 	pthread_mutex_unlock(&FG_mx);
@@ -125,13 +110,13 @@ void clretain_init(unsigned int retain_s, unsigned int max)
 			nb <<= 1;
 		pthread_mutex_init(&sh[i].mx, NULL);
 		sh[i].tab = calloc(nb, sizeof *sh[i].tab);
-		pc_touch_pages(sh[i].tab, nb * sizeof *sh[i].tab);   /* S265 */
+		pc_touch_pages(sh[i].tab, nb * sizeof *sh[i].tab);
 		sh[i].nb = sh[i].tab ? nb : 0;
 		sh[i].cap = per;
 		sh[i].n = 0;
 		sh[i].head = sh[i].tail = NULL;
-		sh[i].xhead = sh[i].xtail = NULL;           /* S444 */
-		sh[i].nsp = 0;                              /* AT-5: kept, reused */
+		sh[i].xhead = sh[i].xtail = NULL;
+		sh[i].nsp = 0;                              /* kept, reused */
 		if (!sh[i].tab)
 			R_on = 0;                  /* no memory: stay off, honestly */
 	}
@@ -173,7 +158,7 @@ static void list_append(struct shard *s, struct ent *e)
 	s->tail = e;
 }
 
-/* S444: the same two for the shard's expiry list */
+/* the same two for the shard's expiry list */
 static void xlist_unlink(struct shard *s, struct ent *e)
 {
 	if (e->xprev)
@@ -198,7 +183,7 @@ static void xlist_append(struct shard *s, struct ent *e)
 	s->xtail = e;
 }
 
-/* AT-5: a space's slot in the shard, made when @make; -1 when none (or no
+/* a space's slot in the shard, made when @make; -1 when none (or no
  * room: the entry then stays unnumbered - kept by the time rule) */
 static int spl_slot(struct shard *s, uint64_t oid, uint32_t incarn, int make)
 {
@@ -266,7 +251,7 @@ static void slist_append(struct shard *s, struct ent *e, int spi,
 	__atomic_fetch_add(&R_num, 1, __ATOMIC_RELAXED);
 }
 
-/* AT-5: the entry now stands for the delete noted at (oid, incarn, seq) -
+/* the entry now stands for the delete noted at (oid, incarn, seq) -
  * seq 0 for one without a number */
 static void ent_number(struct shard *s, struct ent *e, uint64_t oid,
 		uint32_t incarn, uint64_t seq)
@@ -279,9 +264,8 @@ static void ent_number(struct shard *s, struct ent *e, uint64_t oid,
 		slist_append(s, e, spi, seq);
 }
 
-/* 12ny AT-8: a numbered entry dropped without anyone's confirmation - the
- * time rule or the cap: the highest such seq, per space.  Under a shard
- * lock; FG_mx nests inside it here and nowhere the other way */
+/* a numbered entry dropped unconfirmed (time rule or cap): the highest such seq per
+ * space.  Under a shard lock; FG_mx nests inside it here and never the other way */
 static void lost_note(const struct shard *s, const struct ent *e)
 {
 	uint64_t oid = s->sp[e->spi].oid;
@@ -320,11 +304,11 @@ static void ent_drop(struct shard *s, struct ent *e, unsigned int h)
 		__atomic_fetch_sub(&R_local, 1, __ATOMIC_RELAXED);
 	if (e->expiry) {
 		if (e->expiry == 1)
-			xlist_unlink(s, e);            /* S444 */
+			xlist_unlink(s, e);
 		__atomic_fetch_sub(&R_exp, 1, __ATOMIC_RELAXED);
 	}
 	if (e->nseq)
-		slist_unlink(s, e);                    /* AT-5 */
+		slist_unlink(s, e);
 	__atomic_fetch_sub(&R_bytes, sizeof *e + e->len, __ATOMIC_RELAXED);
 	free(e);
 }
@@ -334,8 +318,6 @@ static unsigned int ent_hash(const struct ent *e)
 	return hash_of(e->k, e->cn, e->k + e->cn + 1, e->len - e->cn - 1);
 }
 
-/* 12ny AT-8: R_time_hi_s, when the newest unnumbered entry the time rule
- * took was noted */
 static void time_dropped(unsigned int t_s)
 {
 	unsigned int cur = __atomic_load_n(&R_time_hi_s, __ATOMIC_RELAXED);
@@ -374,7 +356,7 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		if (ent_is(e, col, cn, key, kn))
 			break;
 	if (e) {
-		/* AT-5: a newer delete takes the entry over, numbered or not;
+		/* a newer delete takes the entry over, numbered or not;
 		 * the same one again adds a number it lacked */
 		if (ver > e->ver || (ver == e->ver && seq && !e->nseq))
 			ent_number(s, e, oid, incarn, seq);
@@ -387,14 +369,14 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		}
 		if (!expiry && e->expiry) {
 			if (e->expiry == 1)
-				xlist_unlink(s, e);    /* S444 */
-			e->expiry = 0;         /* S443: a delete outranks an expiry */
+				xlist_unlink(s, e);
+			e->expiry = 0;         /* a delete outranks an expiry */
 			__atomic_fetch_sub(&R_exp, 1, __ATOMIC_RELAXED);
 		} else if (e->expiry == 1 && expiry == 2) {
-			xlist_unlink(s, e);    /* AT-5 (c): kept from now on */
+			xlist_unlink(s, e);    /* kept from now on */
 			e->expiry = 2;
 		} else if (e->expiry == 1) {
-			xlist_unlink(s, e);            /* S444: re-planted, to the tail */
+			xlist_unlink(s, e);            /* re-planted, to the tail */
 			xlist_append(s, e);
 		}
 		list_unlink(s, e);
@@ -403,15 +385,8 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		return;
 	}
 	if (__atomic_load_n(&R_n, __ATOMIC_RELAXED) >= R_max && s->head) {
-		/* the cap, counted over the WHOLE table - a per-shard share
-		 * evicted in the busy shards while others had room.  The
-		 * victim is this shard's oldest: close to the oldest overall,
-		 * without a global lock.  Said when it had not expired.
-		 * S444: its oldest EXPIRY first, and an expiry never pushes out
-		 * a delete - a shard with none to give keeps its deletes and
-		 * does not keep this expiry (counted as one dropped early).  A
-		 * 60-s-TTL benchmark's 13 million expiries on 245-247 evicted
-		 * every delete made meanwhile within seconds. */
+		/* the cap counts the WHOLE table; the victim: this shard's oldest EXPIRY, else its
+		 * oldest (near-global, no global lock) - but an expiry never pushes out a delete */
 		struct ent *o = s->xhead ? s->xhead : expiry == 1 ? NULL : s->head;
 
 		if (!o) {
@@ -424,21 +399,21 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		}
 		if (now_s - o->t_s < R_retain_s) {
 			__atomic_fetch_add(&R_dropped_early, 1, __ATOMIC_RELAXED);
-			if (o->expiry)                 /* S443 */
+			if (o->expiry)
 				__atomic_fetch_add(&R_dropped_early_exp, 1,
 					__ATOMIC_RELAXED);
 			lost_at(o->t_s);
 		}
 		if (o->nseq)
-			lost_note(s, o);               /* AT-8 */
+			lost_note(s, o);
 		ent_drop(s, o, ent_hash(o) / NSHARD);
 	}
 	e = malloc(sizeof *e + cn + 1 + kn);
 	if (!e) {
-		/* S392: a delete not kept is a delete lost, as an early
+		/* a delete not kept is a delete lost, as an early
 		 * eviction is - the table cannot vouch past it */
 		__atomic_fetch_add(&R_dropped_early, 1, __ATOMIC_RELAXED);
-		if (expiry)                            /* S443 */
+		if (expiry)
 			__atomic_fetch_add(&R_dropped_early_exp, 1,
 				__ATOMIC_RELAXED);
 		lost_at(now_s);
@@ -450,7 +425,7 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 	e->local = (unsigned char)local;
 	e->expiry = (unsigned char)expiry;
 	e->xprev = e->xnext = NULL;
-	e->nseq = 0;                       /* AT-5: numbered below */
+	e->nseq = 0;                       /* numbered below */
 	e->spi = 0;
 	e->sprev = e->snext = NULL;
 	e->cn = (unsigned short)cn;
@@ -467,11 +442,11 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		__atomic_fetch_add(&R_local, 1, __ATOMIC_RELAXED);
 	if (expiry) {
 		if (expiry == 1)
-			xlist_append(s, e);            /* S444; AT-5 (c): not a kept one */
+			xlist_append(s, e);            /* not a kept one */
 		__atomic_fetch_add(&R_exp, 1, __ATOMIC_RELAXED);
 	}
 	if (seq)
-		ent_number(s, e, oid, incarn, seq);    /* AT-5 */
+		ent_number(s, e, oid, incarn, seq);
 	__atomic_fetch_add(&R_bytes, sizeof *e + e->len, __ATOMIC_RELAXED);
 	pthread_mutex_unlock(&s->mx);
 }
@@ -486,13 +461,13 @@ void clretain_note_n(const char *col, size_t cn, const char *key, size_t kn,
 		uint64_t ver, unsigned int now_s, uint64_t oid, uint32_t incarn,
 		uint64_t seq)
 {
-	note_in(col, cn, key, kn, ver, now_s, 0, 0, oid, incarn, seq);  /* AT-5 */
+	note_in(col, cn, key, kn, ver, now_s, 0, 0, oid, incarn, seq);
 }
 
 void clretain_note_expiry(const char *col, size_t cn, const char *key,
 		size_t kn, uint64_t ver, unsigned int now_s, int keep)
 {
-	note_in(col, cn, key, kn, ver, now_s, 0, keep ? 2 : 1, 0, 0, 0);  /* S443 */
+	note_in(col, cn, key, kn, ver, now_s, 0, keep ? 2 : 1, 0, 0, 0);
 }
 
 void clretain_note_local(const char *col, size_t cn, const char *key,
@@ -553,7 +528,7 @@ int clretain_forgot_each(int (*cb)(uint64_t oid, uint32_t incarn,
 
 	pthread_mutex_lock(&FG_mx);
 	for (i = 0; i < nfg && !rc; i++)
-		if (FG[i].through)             /* AT-8: lost-only rows are not that */
+		if (FG[i].through)             /* rows with only a loss are not forgets */
 			rc = cb(FG[i].oid, FG[i].incarn, FG[i].through, FG[i].at_s,
 				ctx);
 	pthread_mutex_unlock(&FG_mx);
@@ -663,10 +638,10 @@ unsigned int clretain_each(unsigned int since_s, unsigned int upto_s,
 			if (e->t_s > upto_s)
 				break;             /* planting order: the rest are later */
 			if (e->local)
-				continue;          /* S405: this node's own drop */
+				continue;          /* this node's own drop */
 			cb(e->k, e->cn, e->k + e->cn + 1, e->len - e->cn - 1,
-				e->ver, e->expiry,               /* S446: the kind */
-				e->nseq ? sh[i].sp[e->spi].oid : 0,     /* AT-5 */
+				e->ver, e->expiry,               /* the kind */
+				e->nseq ? sh[i].sp[e->spi].oid : 0,
 				e->nseq ? sh[i].sp[e->spi].incarn : 0, e->nseq, ctx);
 			n++;
 		}
@@ -685,9 +660,9 @@ void clretain_expire(unsigned int now_s)
 		pthread_mutex_lock(&sh[i].mx);
 		while (sh[i].head && now_s - sh[i].head->t_s >= R_retain_s) {
 			if (sh[i].head->nseq)
-				lost_note(&sh[i], sh[i].head);      /* AT-8 */
+				lost_note(&sh[i], sh[i].head);
 			else
-				time_dropped(sh[i].head->t_s);      /* AT-8 */
+				time_dropped(sh[i].head->t_s);
 			ent_drop(&sh[i], sh[i].head, ent_hash(sh[i].head) / NSHARD);
 		}
 		pthread_mutex_unlock(&sh[i].mx);
@@ -716,11 +691,11 @@ void clretain_get_stats(struct clretain_stats *out, unsigned int now_s)
 	out->dropped_early = __atomic_load_n(&R_dropped_early, __ATOMIC_RELAXED);
 	out->noted = __atomic_load_n(&R_noted, __ATOMIC_RELAXED);
 	out->local = __atomic_load_n(&R_local, __ATOMIC_RELAXED);
-	out->expiries = __atomic_load_n(&R_exp, __ATOMIC_RELAXED);       /* S443 */
+	out->expiries = __atomic_load_n(&R_exp, __ATOMIC_RELAXED);
 	out->dropped_early_expiries = __atomic_load_n(&R_dropped_early_exp,
 		__ATOMIC_RELAXED);
 	out->noted_expiries = __atomic_load_n(&R_noted_exp, __ATOMIC_RELAXED);
-	out->numbered = __atomic_load_n(&R_num, __ATOMIC_RELAXED);      /* AT-5 */
+	out->numbered = __atomic_load_n(&R_num, __ATOMIC_RELAXED);
 	out->forgotten = __atomic_load_n(&R_forgot, __ATOMIC_RELAXED);
 	out->forgotten_expiries = __atomic_load_n(&R_forgot_exp,
 		__ATOMIC_RELAXED);

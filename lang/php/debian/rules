@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
-# php8.3-perfcached (PE-6): a source package of its own, because perfcached's must
-# build on a host without Sury's PHP.  DEB_BUILD_OPTIONS=nocheck is not needed: CI runs the suites.
+# php8.3-perfcached: its own source package, so perfcached's builds without Sury's PHP;
+# DEB_BUILD_OPTIONS=nocheck is not needed: CI runs the suites.
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 PHPAPI = 20230831
 EXTDIR = $(shell php-config8.3 --extension-dir)

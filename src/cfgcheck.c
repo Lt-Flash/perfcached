@@ -1,14 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * cfgcheck.c - the config's rules, checked once the file is read: the
- * alert thresholds, the collections, the secrets and the two-principal
- * rule, the plaintext doors' allow-lists, the read-through keys and each
- * read-through collection's no-fall companion, the memory bounds, the
- * cluster's discovery and its collection set, [mail].  Moved from
- * config.c's validate unchanged (the 0.7.2 split, wave 1 -
- * doc/MODULARITY.md).
- */
+/* cfgcheck.c - the config's cross-key rules, checked once the whole file is read
+ * (cfg_validate); a refusal names the rule, not a line. */
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,7 +14,7 @@
 #include "config.h"
 #include "configint.h"
 
-/* S382: is @hp ("host:port") one of the upstreams @list names
+/* is @hp ("host:port") one of the upstreams @list names
  * ("redis://[user@]host:port[/db], ...")? */
 static int up_listed(const char *list, const char *hp)
 {
@@ -34,7 +27,8 @@ static int up_listed(const char *list, const char *hp)
 		end = e ? e : p + strlen(p);
 		while (p < end && (*p == ' ' || *p == '\t'))
 			p++;
-		h = end - p > 8 && !strncmp(p, "redis://", 8) ? p + 8 : p;
+		h = end - p > 9 && !strncmp(p, "rediss://", 9) ? p + 9 :
+			end - p > 8 && !strncmp(p, "redis://", 8) ? p + 8 : p;
 		at = memchr(h, '@', (size_t)(end - h));
 		if (at)
 			h = at + 1;
@@ -58,7 +52,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 
 	ps->line = 0;                      /* rule errors are not line errors */
 
-	/* S380: a warning below its critical, or the critical would be raised
+	/* a warning below its critical, or the critical would be raised
 	 * on the way past a warning that can never come first */
 	{
 		const struct pc_alerts_conf *al = &cfg->alerts;
@@ -75,11 +69,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 		}
 	}
 
-	/* n_col may legitimately be 0 here when [cluster] declares the set
-	 * and this node has no local sizing blocks - the set is expanded
-	 * below, and the emptiness check moves after it (S30/S34: a joiner
-	 * whose config never names a clustered collection is exactly the
-	 * supported case) */
+	/* n_col may be 0 when [cluster] declares the set and this node has no local blocks:
+	 * the set is expanded below, and a joiner naming no clustered collection is supported */
 	if (!cfg->n_col && !cfg->n_cl_col) {
 		PERR(ps, "no collections configured\n");
 		return -1;
@@ -91,12 +82,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 			return -1;
 		}
 		if (!cfg->cl_enabled) {
-			/* S158: STANDALONE IGNORES THE FLEET-SHAPED KEYS AND
-			 * SAYS SO.  One config file serves both shapes - a
-			 * single node first, the fleet later - so a collection
-			 * stanza written for the fleet runs unchanged here as
-			 * store, and the warning names what is inert.  Printed
-			 * by -C and again at startup, since both validate. */
+			/* one config serves a single node and, later, the fleet: fleet-shaped keys run as store
+			 * here and the warning names what is inert (said by -C and at startup) */
 			const char *mn = cfg->col[i].eager ? "eager"
 				: cfg->col[i].mode == PC_MODE_PROXY ? "proxy"
 				: cfg->col[i].mode == PC_MODE_SHARD ? "shard"
@@ -144,10 +131,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 		PERR(ps, "no client secret configured\n");
 		return -1;
 	}
-	/* S158: the cluster secret is what the peer plane's PSK is derived
-	 * from, and nothing on a standalone daemon derives it - so it is
-	 * required only where a [cluster] section is.  Present, it must
-	 * still differ from every client secret (the two-principal rule). */
+	/* the cluster secret derives the peer plane's PSK, so only a [cluster] node needs it;
+	 * present, it must still differ from every client secret */
 	if (!cfg->cluster_secret && cfg->cl_enabled) {
 		PERR(ps, "no cluster secret configured\n");
 		return -1;
@@ -157,12 +142,12 @@ int cfg_validate(struct pstate *ps, const char *path,
 			PERR(ps, "empty client secret\n");
 			return -1;
 		}
-		/* THE two-principal rule: structurally different secrets */
+		/* the two-principal rule: structurally different secrets */
 		if (cfg->cluster_secret &&
 		        !strcmp(cfg->client_secret[i], cfg->cluster_secret)) {
 			PERR(ps, "the cluster secret EQUALS client secret #%d - the "
-				"two principals must not share a secret (DESIGN.md "
-				"par 5.1); refusing to start\n", i + 1);
+				"two principals must not share a secret; refusing to "
+				"start\n", i + 1);
 			return -1;
 		}
 		for (j = 0; j < i; j++)
@@ -189,23 +174,14 @@ int cfg_validate(struct pstate *ps, const char *path,
 	for (i = 0; i < cfg->n_enable_secrets; i++)
 		if (strlen(cfg->enable_secret[i]) < 8)
 			LM_WARN("enable secret #%d is under 8 characters\n", i + 1);
-	/* S129 item 4: THE misconfiguration this task exists to prevent.
-	 * allow_create on with no enable secret means the node will
-	 * originate DDL and the only thing standing in front of drop and
-	 * resize is the CLIENT secret, which every application link
-	 * presents.  Said in the same register as the world-readable-config
-	 * warning below, because it is the same class of mistake. */
 	if (cfg->allow_create && cfg->n_enable_secrets == 0)
 		LM_WARN("allow_create is ON and no [secrets] enable is set - "
 			"DDL is refused from the client door entirely "
 			"(fail-closed).  Set an enable secret to allow "
 			"privileged connections, or turn allow_create off\n");
 
-	/* ---- RESP listeners (S33): the network IS the authentication ----
-	 * A RESP listener has no handshake - stock Redis clients cannot
-	 * speak Noise - so everything that would normally be established
-	 * by the handshake has to be established by config, and the daemon
-	 * refuses to start rather than quietly serving the world. */
+	/* ---- RESP listeners: no handshake (stock Redis clients cannot speak Noise), so the
+	 * network is the authentication and the daemon refuses to start rather than serve the world */
 	{
 		int n_resp = 0, n_resp_lan = 0;
 
@@ -229,22 +205,64 @@ int cfg_validate(struct pstate *ps, const char *path,
 				"to start\n");
 			return -1;
 		}
+		{       /* a TLS door needs its pair and a build with OpenSSL; a secret a
+			 * plaintext door carries off loopback is said, not refused (by default) */
+			int ntls = 0, plr = 0, plh = 0, offr = 0, offh = 0;
+
+			for (i = 0; i < cfg->n_listen; i++) {
+				const struct pc_listener *l = &cfg->listen[i];
+
+				ntls += l->tls;
+				plr += !l->tls && !l->loopback && l->resp;
+				plh += !l->tls && !l->loopback && l->http;
+				offr += !l->loopback && l->resp;
+				offh += !l->loopback && l->http;
+			}
+			/* said, not refused - a refusal would stop a live node at its upgrade */
+			if (offr && !cfg->resp_password)
+				LM_WARN("a RESP listener off loopback has no password ([secrets] "
+					"resp): any client resp_allow admits reads and writes\n");
+			if (offh && !cfg->http_token)
+				LM_WARN("an HTTP listener off loopback has no token ([secrets] "
+					"http): any client http_allow admits reads /stats\n");
+#ifndef PC_TLS
+			if (ntls) {
+				PERR(ps, "a listener says tls, but this build has no TLS "
+					"(make PC_TLS=yes, with OpenSSL)\n");
+				return -1;
+			}
+#endif
+			if (ntls && (!cfg->tls_cert || !cfg->tls_key)) {
+				PERR(ps, "a tls listener needs [listen] tls_cert and tls_key\n");
+				return -1;
+			}
+			if (!ntls && (cfg->tls_cert || cfg->tls_key)) {
+				PERR(ps, "tls_cert/tls_key are set but no listener says tls\n");
+				return -1;
+			}
+			if (plr && cfg->resp_password)
+				LM_WARN("the RESP AUTH password travels in the clear on a "
+					"plaintext listener off loopback - give that listener tls "
+					"(resp = <addr:port> tls)\n");
+			if (plh && cfg->http_token)
+				LM_WARN("the HTTP token travels in the clear on a plaintext "
+					"listener off loopback - give that listener tls (http = "
+					"<addr:port> tls)\n");
+		}
 		for (i = 0; i < cfg->n_listen; i++)
 			if (cfg->listen[i].resp)
-				LM_NOTICE("RESP listener on %s:%d - %d allow-list "
+				LM_NOTICE("RESP listener on %s:%d%s - %d allow-list "
 					"entr%s, password %s, collections %s\n",
 					cfg->listen[i].addr, cfg->listen[i].port,
+					cfg->listen[i].tls ? " (tls)" : "",
 					cfg->n_resp_allow,
 					cfg->n_resp_allow == 1 ? "y" : "ies",
 					cfg->resp_password ? "SET" : "none",
 					cfg->resp_collections ?
 						cfg->resp_collections : "all");
 		{
-			/* S46: the metrics listener is plaintext HTTP with no
-			 * handshake and no password - identical exposure to a
-			 * RESP listener, so identical rule.  A scrape target
-			 * that anyone can reach is also a disclosure of the
-			 * fleet's shape. */
+			/* the HTTP door has no handshake and no password: the same exposure as a RESP
+			 * listener, so the same rule (a reachable scrape target also discloses the fleet's shape) */
 			int n_met = 0, n_met_lan = 0;
 
 			for (i = 0; i < cfg->n_listen; i++)
@@ -272,28 +290,16 @@ int cfg_validate(struct pstate *ps, const char *path,
 				if (cfg->listen[i].http)
 					LM_NOTICE("http listener on %s:%d - "
 						"%d allow-list entr%s, token %s "
-						"(GET /, /members, /metrics, "
-						"/health)\n",
+						"(/stats, /members, /clients, "
+						"/metrics, /health)\n",
 						cfg->listen[i].addr,
 						cfg->listen[i].port,
 						cfg->n_http_allow,
 						cfg->n_http_allow == 1 ?
 							"y" : "ies",
 						cfg->http_token ? "SET" : "none");
-			if (n_met_lan && !cfg->http_token)
-				LM_WARN("the http listener is reachable "
-					"off-box with no [secrets] http token: "
-					"the allow-list is the only control, "
-					"and the traffic is UNENCRYPTED - put a "
-					"TLS-terminating proxy in front of it "
-					"rather than exposing it directly\n");
 		}
 
-		if (n_resp_lan && !cfg->resp_password)
-			LM_WARN("RESP listener is reachable off-box with NO "
-				"password ([secrets] resp): the allow-list is the "
-				"only control, and the traffic is UNENCRYPTED - "
-				"Redis clients cannot speak the Noise channel\n");
 		if (cfg->resp_password) {
 			if (!cfg->resp_password[0]) {
 				PERR(ps, "empty resp secret\n");
@@ -322,9 +328,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 		}
 	}
 
-	/* S331: read-through - an upstream with nothing allowed to fall
-	 * through is a mistake, not a configuration: refused, like an empty
-	 * secret.  The allow-list is never implicit. */
+	/* read-through: an upstream with nothing allowed to fall through is a mistake,
+	 * refused like an empty secret - the allow-list is never implicit */
 	for (i = 0; i < cfg->n_col; i++) {
 		const struct pc_collection *cc = &cfg->col[i];
 
@@ -339,7 +344,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 				"said explicitly)\n", cc->name);
 			return -1;
 		}
-		/* S382: the master is the fallback FROM replicas - asked for
+		/* the master is the fallback FROM replicas - asked for
 		 * without them, it would say nothing */
 		if (cc->up_master_fallback && cc->up_role != PC_UP_ROLE_REPLICA) {
 			PERR(ps, "[collection %s] upstream_master_fallback = yes "
@@ -351,7 +356,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 				"upstream_max_lag_ms without an upstream\n", cc->name);
 			return -1;
 		}
-		/* S382: the failover keys say nothing to balance */
+		/* the failover keys say nothing to balance */
 		if (cc->up_mode != PC_UP_MODE_FAILOVER &&
 		    (cc->up_primary || cc->has_up_preempt)) {
 			PERR(ps, "[collection %s] upstream_primary / "
@@ -370,24 +375,45 @@ int cfg_validate(struct pstate *ps, const char *path,
 				cc->name, cc->up_primary);
 			return -1;
 		}
-		if (!cc->upstream && cc->up_allow_pc) {           /* S384 */
+		if (!cc->upstream && cc->up_allow_pc) {
 			PERR(ps, "[collection %s] upstream_allow_perfcached without "
 				"an upstream\n", cc->name);
 			return -1;
 		}
-		if (!cc->upstream && cc->up_password) {           /* S383 */
+		if (!cc->upstream && cc->up_password) {
 			PERR(ps, "[collection %s] upstream_password without an "
 				"upstream\n", cc->name);
 			return -1;
 		}
+		if (!cc->up_tls && (cc->up_tls_ca || cc->up_tls_name || cc->up_tls_cert ||
+		    cc->up_tls_key || cc->up_tls_verify_set)) {
+			PERR(ps, "[collection %s] upstream_tls_* need a rediss:// upstream\n", cc->name);
+			return -1;
+		}
+		if (cc->up_tls) {
+#ifndef PC_TLS
+			PERR(ps, "[collection %s] rediss:// needs a build with TLS (PC_TLS)\n", cc->name);
+			return -1;
+#endif
+			if (!cc->up_tls_cert != !cc->up_tls_key) {
+				PERR(ps, "[collection %s] upstream_tls_cert and upstream_tls_key go "
+					"together\n", cc->name);
+				return -1;
+			}
+			if (cc->up_tls_ca && !cc->up_tls_verify) {
+				PERR(ps, "[collection %s] upstream_tls_ca has no use with "
+					"upstream_tls_verify = no\n", cc->name);
+				return -1;
+			}
+			if (!cc->up_tls_verify)
+				LM_WARN("[collection %s] upstream_tls_verify = no - the upstream's "
+					"certificate is not checked, so anyone on the path can pose as "
+					"it; a self-signed one can be named in upstream_tls_ca instead\n",
+					cc->name);
+		}
 	}
-	/* S331: each read-through collection gets its COMPANION, <name>.nofall
-	 * - the keys this fleet has written or deleted, which must never fall
-	 * through again while the upstream's copy can exist.  A collection
-	 * like any other: created at start (before recovery, so its WAL and
-	 * snapshot come back), replicated with its parent - it joins the
-	 * cluster's set when the parent is in it.  '.' is outside the name
-	 * rule, so no configured collection can collide with it. */
+	/* each read-through collection gets a companion, <name>.nofall: the keys this fleet wrote or
+	 * deleted, never to fall through again; '.' is outside the name rule, so it cannot collide */
 	{
 		int n0 = cfg->n_col;
 
@@ -397,7 +423,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 			struct pc_collection *nf;
 			int in_cl = 0;
 
-			/* S348: only a read-through collection can refuse writes */
+			/* only a read-through collection can refuse writes */
 			if ((pc->up_refuse_writes || pc->up_write_through) &&
 			    !pc->upstream) {
 				PERR(ps, "[collection %s] upstream_writes needs "
@@ -405,9 +431,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 					"collection does with a write\n", pc->name);
 				return -1;
 			}
-			/* S385: unknown commands go to Redis only where Redis has
-			 * every write (through); elsewhere Redis is not complete
-			 * and passing would split the truth */
+			/* unknown commands go to Redis only where Redis has every write (through);
+			 * elsewhere passing would split the truth */
 			if (pc->has_up_unknown && !pc->up_write_through) {
 				PERR(ps, "[collection %s] upstream_unknown needs "
 					"upstream_writes = through - only then does the "
@@ -422,7 +447,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 					"queued for the master\n", pc->name);
 				return -1;
 			}
-			if ((pc->up_wuser || pc->up_wpassword) &&      /* AR7 */
+			if ((pc->up_wuser || pc->up_wpassword) &&
 			    !pc->up_write_through) {
 				PERR(ps, "[collection %s] upstream_write_user and "
 					"upstream_write_password need upstream_writes = "
@@ -437,7 +462,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 			}
 			if (!pc->upstream)
 				continue;
-			/* S348: a collection that refuses writes never owns a key,
+			/* a collection that refuses writes never owns a key,
 			 * so it has no no-fall companion to keep */
 			if (pc->up_refuse_writes)
 				continue;
@@ -452,17 +477,14 @@ int cfg_validate(struct pstate *ps, const char *path,
 			memset(nf, 0, sizeof *nf);
 			nf->name = strdup(nm);
 			nf->buckets_log2 = pc->buckets_log2;
-			/* and the parent's autoscale: an empty companion under
-			 * the default (auto) shrank to 2^12 a minute after the
-			 * start, then had to grow back while a sweep wrote one
-			 * entry per key - the operator sizes the pair with one
-			 * buckets_log2 and one floor */
+			/* and the parent's autoscale: under the default an empty companion shrinks, then grows back
+			 * while a sweep writes one entry per key - the pair is sized together */
 			nf->autoscale = pc->autoscale;
 			nf->has_autoscale = pc->has_autoscale;
 			nf->mode = pc->mode;
 			nf->has_mode = pc->has_mode;
 			nf->eager = pc->eager;
-			/* G5: a cache's marks are a cache's too */
+			/* a cache's marks are a cache's too */
 			nf->nondurable = pc->nondurable;
 			nf->up_negative_ms = 0;
 			for (j = 0; j < cfg->n_cl_col; j++)
@@ -484,9 +506,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 			cfg->arena_mb);
 		return -1;
 	}
-	/* S167: there is no reservation to lock under `backing = heap` - the
-	 * core allocator owns the pages - so the pair can never be honoured
-	 * and saying so at parse time beats a start that looks pinned */
+	/* under `backing = heap` the core allocator owns the pages and there is nothing to lock:
+	 * refused at parse time rather than a start that looks pinned */
 	if (cfg->pin_require && cfg->backing_heap) {
 		PERR(ps, "pin = require needs backing = own: a heap-backed "
 			"daemon has no arena to lock\n");
@@ -497,7 +518,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 			cfg->arena_cap_mb, cfg->arena_mb);
 		return -1;
 	}
-	/* S47: a floor above the ceiling can never be satisfied - the node
+	/* a floor above the ceiling can never be satisfied - the node
 	 * would refuse to release memory it is also refusing to hold */
 	if (cfg->reclaim_floor_mb) {
 		int cap = cfg->arena_cap_mb ? cfg->arena_cap_mb : cfg->arena_mb;
@@ -509,7 +530,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 		}
 	}
 
-	if (cfg->cl_enabled && cfg->cl_unicast) {           /* S36 */
+	if (cfg->cl_enabled && cfg->cl_unicast) {
 		if (cfg->cl_max_dgram && cfg->cl_max_dgram < 576) {
 			PERR(ps, "[cluster] max_datagram is 0 (no lane) or "
 				"576-65000\n");
@@ -538,19 +559,19 @@ int cfg_validate(struct pstate *ps, const char *path,
 			"= unicast with port and seeds)\n");
 		return -1;
 	}
-	if (cfg->wal_segments_max &&               /* S466 step 2 */
+	if (cfg->wal_segments_max &&
 	    cfg->wal_segments_max < cfg->wal_segments) {
 		PERR(ps, "[wal] segments_max %d is below segments (the floor) "
 			"%d\n", cfg->wal_segments_max, cfg->wal_segments);
 		return -1;
 	}
-	if (cfg->cl_ps_rx_threads < 0) {           /* S461: one per sending lane at most */
+	if (cfg->cl_ps_rx_threads < 0) {           /* one per sending lane at most */
 		cfg->cl_ps_rx_threads = (cfg->workers + 1) / 2;
 		if (cfg->cl_ps_rx_threads > CLWIRE_LANES)
 			cfg->cl_ps_rx_threads = CLWIRE_LANES;
 		cfg->cl_ps_rx_auto = 1;
 	}
-	if (cfg->cl_enabled) {                     /* PS11 */
+	if (cfg->cl_enabled) {
 		if (!cfg->cl_ps_port)
 			cfg->cl_ps_port = cfg->cl_port < 65535 ? cfg->cl_port + 1 : 0;
 		if (cfg->cl_ps_rx_threads && cfg->cl_ps_port == cfg->cl_port) {
@@ -565,48 +586,23 @@ int cfg_validate(struct pstate *ps, const char *path,
 			return -1;
 		}
 	}
-	/* ---- S30: the cluster owns the clustered collection set --------
-	 * Declaring `collections` in [cluster] makes the cluster
-	 * description AUTHORITATIVE: one mode for every clustered
-	 * collection, an EXHAUSTIVE set (no private extras on a member),
-	 * and per-collection `mode =` demoted to a hint that must match.
-	 * Without `collections` the legacy per-collection form still
-	 * parses, so existing single-mode deployments keep working - but
-	 * they get the split-brain this task exists to close, so say so. */
+	/* ---- `collections` in [cluster] makes the cluster authoritative: one mode, an exhaustive
+	 * set, a local `mode =` only a hint that must match; the legacy form parses, with a warning */
 	if (cfg->n_cl_col) {
 		if (!cfg->cl_has_mode) {
 			PERR(ps, "[cluster] collections = ... needs mode = "
 				"store|proxy|shard|spread: one cluster, one mode\n");
 			return -1;
 		}
-		/* mode_of() cannot produce this pair; kept as an
-		 * invariant so a future edit cannot reintroduce it
-		 * quietly */
+		/* mode_of() cannot produce this pair; kept as an invariant
+		 * so a future edit cannot reintroduce it quietly */
 		if (cfg->cl_eager && cfg->cl_mode != PC_MODE_STORE) {
 			PERR(ps, "[cluster] internal: eager outside store\n");
 			return -1;
 		}
 
-		/*
-		 * S223: an eager replica does NOT persist the copies it
-		 * receives - apply_rec() WALs only what this node authored,
-		 * because the author persists it and a restarted replica
-		 * resyncs.  That holds while the FLEET survives.  When every
-		 * node goes down together, each one replays only its own
-		 * third of the keyspace, every node then asks its peers
-		 * "does anyone still have this?", the peers answer no
-		 * truthfully, and the keys are dropped and tombstoned.
-		 * Measured 2026-09-22: 600 of 900 keys lost on a simultaneous
-		 * restart, and a node joining one-by-one deleted ALL of its
-		 * own authored records within 15 seconds.
-		 *
-		 * The snapshot is what makes it survivable: the RDB walk does
-		 * not filter passive records, so a node recovers the whole
-		 * table rather than its own share.  With no snapshot rules at
-		 * all there is nothing to recover from and the loss is total,
-		 * so this combination is called out at startup rather than
-		 * discovered after an outage.
-		 */
+		/* an eager replica WALs only what it authored, so a whole-fleet restart loses the copies:
+		 * only a snapshot (the RDB walk keeps passive records) makes that recoverable */
 		if (cfg->cl_eager && cfg->n_rdb_rules == 0) {
 			LM_WARN("[wal] save = off with [cluster] mode = eager "
 				"is a DATA-LOSS configuration: an eager replica "
@@ -621,12 +617,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 				"save = 900 1 / 300 10 / 60 10000.\n");
 		}
 
-		/* ---- S127: the copy factor -------------------------------
-		 * K decides WHICH nodes hold a key, so it is interchange
-		 * state, not local tuning: it is in the digest and a member
-		 * running a different K is refused at the join.  All three
-		 * rules below exist to stop a config that would look like it
-		 * works and quietly place records somewhere else. */
+		/* ---- the copy factor K decides which nodes hold a key: interchange state, in the digest,
+		 * and a member with a different K is refused at the join */
 		if (cfg->cl_mode == PC_MODE_SPREAD && !cfg->cl_replicas) {
 			PERR(ps, "[cluster] mode = spread needs replicas = N "
 				"(how many nodes hold each record).  There is "
@@ -666,10 +658,8 @@ int cfg_validate(struct pstate *ps, const char *path,
 					"block\n", cfg->col[i].name);
 				return -1;
 			}
-			/* eager and store are both PC_MODE_STORE, so the
-			 * enum alone cannot tell them apart - compare the
-			 * eager half too or `mode = eager` under a
-			 * `mode = store` cluster passes silently */
+			/* eager and store are both PC_MODE_STORE: compare the eager half too,
+			 * or `mode = eager` under a `mode = store` cluster passes silently */
 			if (cfg->col[i].has_mode &&
 			        (cfg->col[i].mode != cfg->cl_mode ||
 			         cfg->col[i].eager != cfg->cl_eager)) {
@@ -708,23 +698,16 @@ int cfg_validate(struct pstate *ps, const char *path,
 				"(buckets_log2 = %d)\n", cfg->cl_colname[j],
 				PC_DEFAULT_BUCKETS_LOG2);
 		}
-		/* stamp the cluster's mode onto every collection: from here
-		 * the runtime has one authority, and the local file is
-		 * untouched (a joiner adopting a DIFFERENT mode at join time
-		 * follows the same rule - cluster/adopt path) */
+		/* stamp the cluster's mode onto every collection: from here the runtime has one
+		 * authority, and the local file is untouched */
 		for (i = 0; i < cfg->n_col; i++) {
 			cfg->col[i].mode = cfg->cl_mode;
 			cfg->col[i].has_mode = 1;
 			cfg->col[i].eager = cfg->cl_eager;
 			if (cfg->cl_mode == PC_MODE_STORE)
 				cfg->col[i].pull = 1;
-			/* S127: spread IS eager with a bounded target - the
-			 * same push machinery, aimed at the K holders instead
-			 * of at every peer - so it runs the eager path and
-			 * pulls on a miss like store does.  Without the eager
-			 * flag the push is never reached at all and spread
-			 * silently replicates NOTHING, which is what
-			 * spreadtest caught on its first run. */
+			/* spread is eager with a bounded target (the K holders), so it runs the eager path and
+			 * pulls on a miss; without the eager flag it would replicate nothing */
 			if (cfg->cl_mode == PC_MODE_SPREAD) {
 				cfg->col[i].eager = 1;
 				cfg->col[i].pull = 1;
@@ -748,7 +731,7 @@ int cfg_validate(struct pstate *ps, const char *path,
 		return -1;
 	}
 
-	/* S352: a [mail] section that can actually send */
+	/* a [mail] section that can actually send */
 	if (cfg->mail_on) {
 		if (!cfg->mail.url) {
 			PERR(ps, "[mail] needs smtp = smtp://host:port or "

@@ -1,11 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * cfgops.c - the config sections of operations: [mail], [alerts] and
- * [upgrade].  Moved from config.c's handle_kv, each case body unchanged
- * but for its indent and its last break (the 0.7.2 split, wave 1 -
- * doc/MODULARITY.md).
- */
+/* cfgops.c - the config sections of operations: [mail], [alerts] and [upgrade]. */
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +18,7 @@
 #include "relkey.h"
 #include "configint.h"
 
-/* [mail] - S352 */
+/* [mail] */
 int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 {
 	struct pc_config *cfg = ps->cfg;
@@ -113,7 +108,7 @@ int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 			cfg->mail.level = PC_MAIL_LVL_WARNING;
 		else if (!strcasecmp(val, "critical"))
 			cfg->mail.level = PC_MAIL_LVL_CRITICAL;
-		else if (!strcasecmp(val, "info"))           /* S377 */
+		else if (!strcasecmp(val, "info"))
 			cfg->mail.level = PC_MAIL_LVL_INFO;
 		else {
 			PERR(ps, "level: info|warning|critical\n");
@@ -124,7 +119,7 @@ int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 	return CFG_KV_UNKNOWN;
 }
 
-/* [alerts] - S380 */
+/* [alerts] */
 int cfg_kv_alerts(struct pstate *ps, char *key, char *val)
 {
 	struct pc_config *cfg = ps->cfg;
@@ -151,7 +146,7 @@ int cfg_kv_alerts(struct pstate *ps, char *key, char *val)
 	return CFG_KV_UNKNOWN;
 }
 
-/* [upgrade] - UP6n */
+/* [upgrade] */
 int cfg_kv_upgrade(struct pstate *ps, char *key, char *val)
 {
 	struct pc_config *cfg = ps->cfg;
@@ -201,7 +196,7 @@ int cfg_kv_upgrade(struct pstate *ps, char *key, char *val)
 	}
 	if (!strcasecmp(key, "stage_mb"))
 		return parse_int(ps, val, 16, 4096, &cfg->upgrade.stage_mb);
-	if (!strcasecmp(key, "results_dir")) {         /* UPS */
+	if (!strcasecmp(key, "results_dir")) {
 		if (val[0] != '/' || strlen(val) >= sizeof cfg->upgrade.results_dir) {
 			PERR(ps, "results_dir must be an absolute path, under 256\n");
 			return -1;

@@ -1,21 +1,6 @@
 #!/bin/sh
-# tombsynctest.sh - 12ny AT-12 (c): a member confirms a delete only once its
-# WAL has synced it - so the fleet forgets nothing a device lost.
-#
-# A member that applied a delete but could not make it durable must not
-# confirm it: the origins would forget the delete, the member's next start
-# would not have it, and nobody could give it back.  fsync = everysec;
-# node 3 under test/syncfailshim.c, its WAL's syncs refused on demand (the
-# first refusal FAILS the node - S215 - and it stays a member that cannot
-# make anything durable):
-#   1. node 3's WAL syncs refused, then 100 deletes through node 1: the
-#      shim refused node 3's syncs, and node 1 keeps every one of the 100
-#      for it - node 3 has confirmed none of them
-#   2. node 3 restarted on a healthy device: it replays its WAL, confirms
-#      the 100, node 1 forgets them all, and node 3 holds none of the keys
-# FAIL-FIRST: confirming on apply, node 1 forgets the 100 in step 1 while
-# node 3's WAL has synced none of them.
-# Usage: test/tombsynctest.sh [./perfcached] [./syncfailshim.so]
+# tombsynctest.sh - a member confirms a delete only once its WAL has synced it, so the fleet forgets
+# nothing a device lost: refused syncs confirm none, a healthy restart confirms all.
 set -u
 BIN=${1:-./perfcached}
 SHIM=${2:-./syncfailshim.so}

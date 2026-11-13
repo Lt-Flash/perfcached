@@ -1,45 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * psinterest.h - which relays a peer wants (PS12).  Header-only and pure,
- * like psrelay.h, so the unit test drives exactly what the nodes run.
- *
- * A node set to `[cluster] pubsub_relay = interested` tells its peers what
- * it holds subscriptions for, and a peer relays to it only the publishes
- * that could match.  The RECEIVER opts in: a node on `all`, or a build
- * without this, is sent everything as before, so no node ever stops
- * receiving because of another node's setting.
- *
- * WHAT IS SENT.  Exact channel names go into a Bloom filter - a false
- * positive only costs a relay nobody needed, which is the safe direction,
- * and the whole set travels as one fixed-size datagram however many names
- * it holds.  Patterns travel as strings, because a sender has to run them
- * against the channel.  When a node gains its FIRST subscription to a name
- * it sends an update at once: the filter probes for a channel, the string
- * for a pattern.  Losing the last one sends nothing; the node rebuilds its
- * filter later, and a stale bit only relays a little extra.
- *
- * THE VERSION (the 64 bits the heartbeat carries; 0 = relay me everything):
- *     [ epoch 16 ][ rebuild 16 ][ adds 32 ]
- * epoch   drawn when the process starts, never 0
- * rebuild how many times the filter was rebuilt after removals
- * adds    one per update sent, so a receiver can tell it missed one
- *
- * THE VIEW a sender keeps of a peer: the version of the last full state it
- * applied, and which updates since then arrived.  It may filter only while
- * the peer's heartbeat version is COVERED - same epoch, and every update up
- * to the heartbeat's count applied.  A rebuild the view has not seen does
- * not break coverage: a rebuild only removes names, so the older state is
- * a superset and still safe; the sender just asks for the new one.
- * Anything else - no full state yet, another epoch, an update missing - and
- * the sender relays everything to that peer until a full state arrives.
- */
+/* psinterest.h - which publishes a peer on `pubsub_relay = interested` wants relayed (the receiver
+ * opts in); header-only and pure so the unit test drives exactly what the nodes run */
 #ifndef PC_PSINTEREST_H
 #define PC_PSINTEREST_H
 
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- the filter ---------------------------------------------------------- */
+/* ---- the filter: exact names; a false positive only costs an unneeded relay ---- */
 #define PSB_BITS   (1u << 18)              /* 32 KiB on the wire */
 #define PSB_BYTES  (PSB_BITS / 8)
 #define PSB_K      4
@@ -90,7 +58,7 @@ static inline int psb_test(const uint8_t *bits, uint32_t h1, uint32_t h2)
 	return 1;
 }
 
-/* ---- the version ----------------------------------------------------------- */
+/* ---- the version: [epoch 16, never 0][rebuild 16][adds 32, one per update sent] ---- */
 static inline uint64_t psv_make(uint16_t epoch, uint16_t rebuild, uint32_t adds)
 {
 	return ((uint64_t)epoch << 48) | ((uint64_t)rebuild << 32) | adds;
@@ -100,11 +68,8 @@ static inline uint16_t psv_epoch(uint64_t v) { return (uint16_t)(v >> 48); }
 static inline uint16_t psv_rebuild(uint64_t v) { return (uint16_t)(v >> 32); }
 static inline uint32_t psv_adds(uint64_t v) { return (uint32_t)v; }
 
-/* ---- the full state on the wire ------------------------------------------
- *     [version 8][flags 1][filter PSB_BYTES][npat 2] then per pattern
- *     [len 2][bytes]
- * When the patterns do not fit a datagram beside the filter, none are sent
- * and PSF_EVERYTHING says: relay me everything. */
+/* full state: [version 8][flags 1][filter PSB_BYTES][npat 2] then [len 2][bytes] per pattern;
+ * patterns that do not fit beside the filter are not sent and PSF_EVERYTHING is set */
 #define PSF_EVERYTHING  0x01
 #define PSF_HDR         (8 + 1 + PSB_BYTES + 2)
 #define PSF_PATTERNS_MAX 30000             /* bytes of patterns, with lengths */
@@ -157,7 +122,8 @@ static inline int psv_add(struct psv_view *v, uint64_t ver)
 	return PSV_APPLY;
 }
 
-/* may the sender filter against a peer whose heartbeat says @hb? */
+/* may the sender filter against a peer whose heartbeat says @hb (0 = relay all)?  A rebuild
+ * only removes names, so the older state it covers is a safe superset */
 static inline int psv_covered(const struct psv_view *v, uint64_t hb)
 {
 	return v->full && hb && psv_epoch(hb) == psv_epoch(v->base) &&

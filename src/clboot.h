@@ -1,28 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clboot.h - the S83 bootstrap's DECISION half (M4).
- *
- * A node that joins holding nothing pulls a full walk from a peer before
- * it reports ready.  Which peer, when to re-pick, and when to stop
- * waiting is arithmetic over a clock; the pull itself is transport and
- * stays in the bulk plane (M7).  This module is the arithmetic.
- *
- * TWO CONCURRENCY REGIMES, preserved exactly as the tree has them:
- *   - deadline_ms, pick_ms and rounds are peer-thread only, unguarded
- *   - done is atomic: other threads read it
- *   - pending, ncand, cand[], cand_node[] and round_failed are the
- *     HANDOFF to the bulk thread and are guarded by a mutex
- *
- * That mutex is BORROWED, not owned: in cluster.c it is C.bmx, which
- * also guards the bulk transport and migration, so it belongs to M7.
- * Every handoff entry point therefore takes a pthread_mutex_t *.  When
- * M7 lands and owns the bulk plane, this becomes its lock to hand in.
- *
- * The module never logs and never changes node state: the decision
- * returns an ACTION and cluster.c does both, because the three messages
- * this replaces are what an operator reads when a bootstrap gives up.
- */
+/* clboot.h - the bootstrap decision: a node joining with nothing pulls a full walk
+ * from a peer before it is ready; which peer, when to re-pick, when to stop waiting. */
 #ifndef PC_CLBOOT_H
 #define PC_CLBOOT_H
 
@@ -41,6 +20,8 @@
 #define CLBOOT_EMPTY      3    /* every ready peer holds nothing - ready */
 #define CLBOOT_DEADLINE   4    /* no ready peer in time - ready, rely on push */
 
+/* pending, ncand, cand*, round_failed: under the caller's BORROWED bulk lock;
+ * done: atomic; the rest: peer thread only */
 struct clboot {
 	int pending;                   /* a pull is with the bulk thread */
 	int ncand;
@@ -56,9 +37,8 @@ struct clboot {
 /* arm the two clocks - a joiner, or a founder that holds nothing.  Peer. */
 void clboot_arm(struct clboot *b, long long now);
 
-/* S455: a second bootstrap - a resync after the first one is long done:
- * done, rounds and a stale round failure cleared, the clocks armed.
- * Cluster thread, with no pull pending. */
+/* a second bootstrap, a resync long after the first: done, rounds and a stale round
+ * failure cleared, the clocks armed.  Cluster thread, with no pull pending. */
 void clboot_rearm(struct clboot *b, long long now);
 
 /* `done` is read from several threads.  Any thread. */
@@ -77,10 +57,8 @@ int  clboot_take_cands(struct clboot *b, pthread_mutex_t *mx,
 void clboot_pull_ok(struct clboot *b, pthread_mutex_t *mx);
 void clboot_pull_failed(struct clboot *b, pthread_mutex_t *mx);
 
-/* The decision, in the two halves the tick really has: before the pick
- * (which the caller performs, because it scans the peer table) and after
- * it.  `picked` is the caller's result: 0 nobody qualifies, 1 a pull is
- * away, 2 every ready peer holds nothing.  Peer thread. */
+/* The decision, in two halves around the pick the caller makes (it scans the peers);
+ * `picked`: 0 nobody qualifies, 1 a pull is away, 2 every ready peer holds nothing. */
 int clboot_before_pick(struct clboot *b, long long now, int pending,
 		int failed_round);
 int clboot_after_pick(struct clboot *b, long long now, int failed_round,

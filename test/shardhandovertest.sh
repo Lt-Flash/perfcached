@@ -1,30 +1,6 @@
 #!/bin/sh
-# shardhandovertest.sh — when a node FAILS, its keys must leave it.
-#
-# In shard mode a key has exactly one home, so a node that stops being
-# usable while still holding keys does not degrade the fleet - it takes
-# that slice of the keyspace with it.  The design says a FAILED node is
-# excluded from placement and its reshard tick therefore hands every key
-# it holds to the new owner.  This is that claim, measured.
-#
-# THE FAULT IS REAL, NOT SIMULATED.  Node 1's WAL sits on a device-mapper
-# device; once the fleet holds the keys, the device is switched to the
-# `error` target, so node 1's next WAL write fails with EIO and the
-# daemon marks itself FAILED (wal_storage_failed - terminal, never
-# retried).  Nothing here calls an internal function to fake the state.
-# Until 2026-10-23 the fault was a dm-delay device and a 64 KB ring driven
-# into overflow; since S229 a dropped write HEALS instead (writes refused,
-# a snapshot, back in service by itself) and the node never went FAILED -
-# found when the suite first ran in CI (GitHub 39946018061).
-#
-# ASSERTED, in order:
-#   1. before the fault, node 1 actually HOLDS some of the keyspace
-#      (or nothing below is a test of anything)
-#   2. the fault lands: node 1 reports state = failed
-#   3. every key node 1 held is still READABLE from a survivor
-#   4. node 1 has stopped holding them
-#
-# Usage: test/shardhandovertest.sh [./perfcached]
+# shardhandovertest.sh - a shard node whose WAL device starts failing (device-mapper error target)
+# goes FAILED and hands every key it held to a survivor.  Usage: test/shardhandovertest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -40,10 +16,8 @@ command -v dmsetup >/dev/null 2>&1 && command -v losetup >/dev/null 2>&1 || {
 	echo "shardhandovertest: SKIPPED - needs root (a device-mapper disk)"; exit "${PC_SKIP_FAILS:-0}"; }
 
 D=$(mktemp -d /var/tmp/pcsh.XXXXXX); LOOP=; DM=shdm$$
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line; the
+# name-bound pattern is a fallback
 PIDS=""
 cleanup() {
 	for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill "$p"; done
@@ -108,12 +82,9 @@ while [ $i -lt 200 ]; do
 	sleep 0.1; i=$((i+1))
 done
 [ "${n:-0}" = 3 ] || { echo "shardhandovertest: SKIPPED - fleet did not start"; exit "${PC_SKIP_FAILS:-0}"; }
-sleep 6                                    # let membership and the map settle
 
-# The native door over TCP (pcnative), not perfcli: `plaintext = loopback` makes the
-# listener plaintext-EXCLUSIVE and perfcli authenticates, so every
-# perfcli call here came back empty and the first version of this test
-# reported "node1 holds 0 keys" when it had never managed to ASK.
+# the native door (pcnative), not perfcli: 'plaintext = loopback' makes the listener
+# plaintext-only and perfcli authenticates
 call() { python3 - "$1" "$2" <<'PY2'
 import json, pcnative, socket, sys
 n, req = sys.argv[1], sys.argv[2]
@@ -126,10 +97,15 @@ except Exception:
     pass
 PY2
 }
+# let membership and the map settle: a joiner is CONNECTING until its links answer, so up to
+# 30 s for every node ready and seeing the other two
+st() { call $1 '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1)" != "ready 2" ] || [ "$(st 2)" != "ready 2" ] || [ "$(st 3)" != "ready 2" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
-# every key node <n> holds LOCALLY.  scan's `count` is MAX BUCKETS, not
-# max items, so the cursor has to be drained or this silently reports a
-# slice of the table as the whole of it.
+# every key node <n> holds locally.  scan's `count` is max buckets, not items: drain the cursor.
 local_keys() {
 	cur=0; round=0
 	while [ $round -lt 64 ]; do
@@ -168,10 +144,7 @@ print("  fill: %d of %d refused" % (bad, n))
 PY2
 sleep 2
 
-# Where did the keys actually go?  A distribution of 0/400/0 means the
-# fleet never clustered and node 2 kept everything; 0/0/0 means the fill
-# itself failed.  Both look identical at the assertion below, and the
-# first version of this test could not tell them apart.
+# where the keys went: 0/400/0 (never clustered) and 0/0/0 (fill failed) look alike below
 for n in 1 2 3; do
 	P=$(call $n '{"method":"stats"}' | python3 -c 'import json,sys
 try:
@@ -224,16 +197,10 @@ except Exception: print("?")' 2>/dev/null)
 	     of it: $(grep -E 'wal: .*failed|FAILED' "$D/n1.log" | tail -2 | cut -c1-160)"
 	     echo "shardhandovertest: $pass passed, $fail failed"; exit 1; }
 
-# ---- the handover ----------------------------------------------------
-# Placement excludes a non-READY node, so every key node1 held is now
-# somebody else's; its reshard tick has to deliver them.  Give it room:
-# the tick is ~1 Hz and the device under it is deliberately slow.
+# ---- the handover: placement excludes a non-READY node, so node 1's reshard tick (~1 Hz) must
+# deliver every key it held
 echo "  waiting for the re-shard to move its keys"
-# Count only the keys this test placed.  The first version counted the
-# WHOLE collection, so the hammer's junk - which node1 owned while it was
-# still READY - inflated the total from 121 to 150 and hid the fact that
-# every original key had already gone.  It reported a working handover as
-# broken.
+# count only the keys this test placed: the hammer's junk inflates the collection's total
 MOVED=0
 i=0
 while [ $i -lt 60 ]; do
@@ -244,14 +211,8 @@ while [ $i -lt 60 ]; do
 done
 echo "  node1 holds $A1 of its original $B1 keys after ${i}s"
 
-# THE assertion, and it must be about LOCATION.  Reading through a
-# survivor proves nothing: a shard-mode GET on a non-owner FORWARDS, and
-# a FAILED node still serves reads - so the value comes back whether it
-# moved or not.  The first version of this test asserted exactly that and
-# would have called a broken handover a pass.  Ask the survivors what
-# they physically hold.
-# node1 stubs a key when it queues it, before the ack-gated send (up to
-# 5 s and re-sends) lands it: rc14 GitHub check-asan read 69 of 121 at once
+# the assertion is about location: a shard GET on a non-owner forwards and a FAILED node still
+# serves reads.  node1 stubs a key when it queues it, before the ack-gated send lands it.
 j=0
 while :; do
 	local_keys 2 | sort > "$D/on2"
@@ -275,9 +236,7 @@ fi
 	|| bad "node1 still holds $A1 of its original $B1 keys - the
 	     re-shard did not finish moving them"
 
-# what the nodes said, when the handover did not happen: the suite removes
-# its directory on exit, and v0.7.2-rc4's one failure (GitLab 111808
-# check-asan fault3: 0 of 121 moved in 60 s) left nothing to read
+# what the nodes said when the handover did not happen: the suite removes its directory on exit
 if [ "$MOVED" != 1 ] || [ "$LANDED" != "$B1" ]; then
 	for n in 1 2 3; do
 		echo "  --- node $n: map, placement, reshard, state"

@@ -1,26 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * S153: per-key EVENT logging, selected per collection.
- *
- * The counters say a collection misses N lookups a second and cannot
- * say WHICH keys; only the names settle whether that is correct (an
- * IP-auth style question answered "no") or a gap.  Four events, each
- * one line at NOTICE, chosen by a per-collection mask rather than by
- * the global level - `dbg` would flood every subsystem to watch one
- * collection - with the global level still a ceiling.
- *
- * Cost: OFF is one load of pc_ev_any before anything else; ON is a
- * per-collection, per-kind token bucket refilled once a second by the
- * maintenance thread, which also logs how many lines it suppressed, so
- * a hot miss loop cannot turn the daemon into a log writer and the
- * suppression is itself visible.
- *
- * The hook sits at the DOOR (verbs.c), not in the table: the door
- * knows the origin, it is inherently client-only, and the core library
- * stays free of logging.  Keys are truncated, or hashed on request -
- * collection 0 holds credentials.
- */
+/* events.h - per-key event logging, chosen per collection by a mask and rate-limited per kind;
+ * keys are truncated, or hashed on request (collection 0 holds credentials). */
 #ifndef PC_EVENTS_H
 #define PC_EVENTS_H
 
@@ -40,11 +21,8 @@ int  pc_ev_parse(const char *list, unsigned int *mask);
 
 void pc_ev_set_default(unsigned int mask, int rate_per_s, int hash_keys);
 void pc_ev_configure(int slot, unsigned int mask);   /* PC_EV_INHERIT = default */
-/* PS8: the same kinds published as Redis keyspace notifications - on
- * __keyspace@<collection>__:<key> (payload: the event) and
- * __keyevent@<collection>__:<event> (payload: the key) - to THIS node's
- * subscribers only, never relayed: each node emits for what it applies,
- * as Redis Cluster's primaries do.  Off unless a mask names it. */
+/* the same kinds as Redis keyspace notifications, to this node's subscribers only (never
+ * relayed: each node emits for what it applies); off unless a mask names them */
 void pc_ev_set_notify_default(unsigned int mask);
 void pc_ev_configure_notify(int slot, unsigned int mask);   /* PC_EV_INHERIT = default */
 /* a record applied on this node from a peer - a forwarded write at its
@@ -64,6 +42,6 @@ void pc_ev_tick(void);                             /* maintenance, ~1/s */
 
 /* one load: is ANY collection logging anything?  Hooks test this first. */
 extern unsigned int pc_ev_any;
-extern unsigned int pc_ev_notify_any;   /* PS8: any collection notifying */
+extern unsigned int pc_ev_notify_any;   /* any collection notifying */
 
 #endif

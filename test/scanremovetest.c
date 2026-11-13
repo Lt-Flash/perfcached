@@ -1,17 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * scanremovetest.c - S199: the cursored scan hands over every record in
- * ONE pass while its callback removes each one.
- *
- * pcache_ht_scan_ex is the walk the collection drop removes through.
- * It carried the third copy of the bucket loop, the one S198's guard
- * never reached; S69 had met the skip there first ("17,452 of 20,000
- * removed") and papered over it with passes-until-nothing-moves.  All
- * three walkers now share walk_bucket(), so this is the same assertion
- * as legwalkremovetest against the other entry point: 16 buckets, 400
- * records, one pass, nothing left.
- */
+/* scanremovetest.c - the cursored scan (the collection drop's walk) hands over every record in one
+ * pass while its callback removes each: 16 buckets, 400 records, nothing left. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"

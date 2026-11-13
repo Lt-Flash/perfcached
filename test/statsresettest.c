@@ -1,25 +1,5 @@
-/* statsresettest.c - the stats reset and its schedule (statsreset.c; the
- * 0.7.2 split, wave 1), every plane stubbed and the clock faked: this
- * file's time() is the one statsreset.o calls.
- *
- *   A  a reset: every running total's owner told once, the table's
- *      counters reset on the live slots only; the cluster, proxy and WAL
- *      baselines taken, and since_* subtract them from the counters and
- *      leave the gauges; reset_at is the time given
- *   B  a standalone node takes no cluster or proxy baseline (the WAL's
- *      still); the fleet reset is now, and the same time goes to the peers
- *   C  the schedule in UTC: daily at 01:00 - not due a second early, due
- *      on the second, the reset stamped with the scheduled time rather
- *      than the tick's, the next one a day on, with a NOTICE; 7 days =
- *      the next Monday; 2 and 3 days count from a Monday (day number + 3)
- *      so a fleet agrees on the days; 0 days = none, and a tick resets
- *      nothing
- *   D  the schedule in LOCAL time across a DST start (Melbourne,
- *      2026-10-04 02:00 AEST -> 03:00 AEDT): 01:00 stays 01:00 on the
- *      wall clock, so that day's interval is 23 h
- *   E  two resets at once never overlap (S358: the second would fold the
- *      figures into the table's baseline twice)
- */
+/* statsresettest.c - the stats reset and its schedule, every plane stubbed and the clock faked:
+ * this file's time() is the one statsreset.o calls. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -178,7 +158,7 @@ int main(void)
 
 	zone("UTC0");
 
-	/* A */
+	/* A: a reset tells each owner once, resets live slots, takes the baselines since_* subtracts */
 	memset(&cs, 0, sizeof cs);
 	cs.hb_sent = 7;
 	since_cl(&cs);
@@ -205,7 +185,7 @@ int main(void)
 	since_wal(&ws);
 	CHK(ws.appended == 50 && ws.last_seq == 80, "A: since_wal - appended counts from the reset, the sequence is a gauge");
 
-	/* B */
+	/* B: standalone takes no cluster or proxy baseline; the fleet reset's time goes to peers */
 	cl_on = 0;
 	r0 = cl_gets;
 	cl_hb = 1000;
@@ -223,7 +203,7 @@ int main(void)
 		"B: standalone - no cluster baseline taken, the WAL's still");
 	cl_on = 1;
 
-	/* C */
+	/* C: UTC schedule - due on the second, stamped with its slot; 2 and 3 days count from Monday */
 	fake_now = 1792369800;                     /* Mon 2026-10-19 00:30 UTC */
 	pc_stats_reset_schedule(1, 3600);
 	CHK(next_at() == 1792371600, "C: daily at 01:00 - next is 01:00 the same day");
@@ -252,7 +232,7 @@ int main(void)
 	pc_stats_reset_tick();
 	CHK(next_at() == 0 && doors == r0, "C: 0 days - no schedule, and a tick a week later resets nothing");
 
-	/* D */
+	/* D: local time across a DST start - 01:00 stays 01:00 on the wall clock, that day is 23 h */
 	zone("AEST-10AEDT,M10.1.0,M4.1.0/3");
 	fake_now = 1790951400;                     /* Sat 2026-10-03 00:30 AEST */
 	pc_stats_reset_schedule(1, 3600);
@@ -267,7 +247,7 @@ int main(void)
 	pc_stats_reset_schedule(0, 0);
 	zone("UTC0");
 
-	/* E */
+	/* E: two resets at once never overlap, or the figures fold into the baseline twice */
 	{
 		pthread_t t1, t2;
 

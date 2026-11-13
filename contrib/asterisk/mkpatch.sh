@@ -1,18 +1,6 @@
 #!/bin/sh
-# mkpatch.sh - generate the Asterisk patch that adds func_perfd
-# (PERFD_GET / PERFD_SET / PERFD_EXISTS / PERFD_DELETE).
-#
-#   contrib/asterisk/mkpatch.sh <asterisk-X.Y.Z.tar.gz> [out.patch]
-#       writes the patch (default contrib/asterisk/asterisk-X.Y.Z-func_perfd.patch)
-#   contrib/asterisk/mkpatch.sh --tree <asterisk-X.Y.Z.tar.gz> <dir>
-#       unpacks the release into <dir> (which must not exist) and applies
-#       the same changes there, without writing a patch
-#
-# The patch is generated, never edited by hand: another Asterisk version is a
-# re-run.  configure is NOT in it - run ./bootstrap.sh after applying.
-# libperfd is NOT in it either (perfcached S371): the module links an
-# installed libperfd 0.5.0 or later, found by configure through pkg-config
-# (libperfd-dev, or `make install-lib` in perfcached + PKG_CONFIG_PATH).
+# mkpatch.sh <asterisk-X.Y.Z.tar.gz> [out.patch] | --tree <tarball> <dir> - generate the func_perfd
+# patch for Asterisk; it holds no configure (run ./bootstrap.sh) and links an installed libperfd.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -74,7 +62,7 @@ apply_changes() {
 # func_perfd: links libperfd (configure's PERFD, pkg-config libperfd) and
 # carries only its own RESP2 client - never a copy of the library
 $(if $(wildcard perfd/perfd.c perfd/lib/perfd.c perfd/src/pc_noise.c perfd/pc_noise.c),\
-	$(error func_perfd: a copy of libperfd's source is in funcs/perfd - link the installed library instead (perfcached S371)))
+	$(error func_perfd: a copy of libperfd's source is in funcs/perfd - link the installed library instead))
 $(call MOD_ADD_C,func_perfd,perfd/resp.c)
 EOF
 }

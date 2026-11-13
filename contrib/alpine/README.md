@@ -26,7 +26,7 @@ once, then install and start:
 
 ```
 cp yury@kfi.net.au-6aca2bb6.rsa.pub /etc/apk/keys/
-apk add ./perfcached-0.7.0-r0.apk ./libperfd-0.7.0-r0.apk
+apk add ./perfcached-<version>-r0.apk ./libperfd-<version>-r0.apk
 cp /etc/perfcached/perfcached.conf.example /etc/perfcached/perfcached.conf
 chmod 640 /etc/perfcached/perfcached.conf && chown root:perfcached /etc/perfcached/perfcached.conf
 # set the secrets (client and cluster must differ), then

@@ -1,28 +1,6 @@
 #!/bin/sh
-# walringsizetest.sh - S266: a WAL ring's size follows what its thread
-# writes.
-#
-# Every registered thread had a ring of ring_kb, and since S265 every one
-# is resident: on the test fleet (ring_kb 16384, 4 workers) 10 rings and
-# the stage buffer made 164 MB per node.  Measured over 13 WAL+cluster
-# suites, only the workers, the peer thread and (for non-replica
-# migrations) the bulk thread write; main, maintenance, the WAL pump, RDB
-# and the heartbeat never do.  They now get min(ring_kb, 512 KB) - two
-# maximum records - and the rest keep ring_kb.  Unclustered, the peer and
-# bulk threads do not exist.
-#
-# wal.buffer_bytes is asserted EXACTLY, 2 workers (8 rings):
-#   1. standalone, ring_kb 4096: 2 x 4 MB + 6 x 512 KB + 8 MB stage = 19 MB
-#   2. a 1-node cluster, ring_kb 4096: 4 x 4 MB + 4 x 512 KB + 8 MB = 26 MB
-#   3. a 1-node cluster, ring_kb 256: the small size never exceeds
-#      ring_kb, so 8 x 256 KB + 8 MB = 10 MB
-# (the stage is 4 MB and the pump's write buffer 4 MB more since S466)
-# and in each, a write reaches the WAL and the startup line says it.
-# The standalone EDITION refuses a [cluster] section, so there only case 1
-# runs and 2-3 are SKIPPED, loudly.
-# Fail-first: the build before S266 has 8 x ring_kb in cases 1 and 2
-# (36 MB).
-# Usage: test/walringsizetest.sh [./perfcached]
+# walringsizetest.sh - a WAL ring's size follows what its thread writes: workers, peer and bulk get
+# ring_kb, the rest min(ring_kb, 512 KB); wal.buffer_bytes is asserted exactly, per case.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

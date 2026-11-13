@@ -1,22 +1,5 @@
-/*
- * clloctest.c - the locator and negative caches (M3).
- *
- * Both tables are silent when wrong, which is the reason they are worth
- * a test at all:
- *   - a negative entry that outlives its TTL keeps answering "absent"
- *     for a key that came back
- *   - a negative entry that a set fails to clear does the same thing
- *     permanently: the tombstone pair is plant-on-delete,
- *     clear-on-set, and reversing it is invisible until someone reads
- *   - a locator that evicts on collision sends every evicted key back
- *     through placement, which is what 4-way associativity exists to
- *     stop; direct-mapped lost ~30% of a 200k keyspace that way
- *
- * No clock: `now` is injected, so TTL decay is placed exactly on its
- * boundary rather than slept through.
- *
- * Build: cc -o clloctest test/clloctest.c src/clloc.o
- */
+/* clloctest.c - the locator and negative caches, both silent when wrong: TTL decay on its boundary
+ * (now injected), plant-on-delete/clear-on-set, and a 4-way locator that keeps colliding keys. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,8 +55,8 @@ int main(void)
 	clloc_neg_set(&L, K("c"), K("counted"), now, 500);
 	(void)clloc_neg_hit(&L, K("c"), K("counted"), now);
 	chk(clloc_neg_hits(&L) == c0 + 1, "B5 a hit does");
-	/* S467: the write path skips its clear once neg_until_ms has passed,
-	 * so no entry may outlive it - by either set, and never lowered */
+	/* the write path skips its clear once neg_until_ms has passed, so no entry may outlive
+	 * it - by either set, and never lowered */
 	{
 		long long top = L.neg_until_ms;
 		size_t si;
@@ -92,9 +75,8 @@ int main(void)
 		chk(!over, "B6 no entry outlives neg_until_ms");
 	}
 
-	/* B-S209. a negative entry carries the delete's VERSION, so a copy
-	 * of the record arriving after the tombstone can be told from a
-	 * genuinely newer write; an unversioned plant reads as 0 */
+	/* B-S209. a negative entry carries the delete's version, so a late copy of the record can
+	 * be told from a genuinely newer write; an unversioned plant reads as 0 */
 	{
 		uint64_t v = 7;
 
@@ -129,8 +111,8 @@ int main(void)
 	clloc_clear(&L, K("c"), K("k1"));
 	chk(clloc_get(&L, K("c"), K("k1")) == 0, "C4 clear unplaces it");
 	chk(clloc_loc_clears(&L) == c0 + 1, "C4 and counts the clear");
-	/* S442: a member back from a silence may hold a fork of a key this
-	 * node remembers another holder for - every holder is forgotten */
+	/* a member back from a silence may hold a fork of a key this node remembers another
+	 * holder for - every holder is forgotten */
 	clloc_set(&L, K("c"), K("f1"), 3);
 	clloc_set(&L, K("c"), K("f2"), 4);
 	clloc_neg_set(&L, K("c"), K("fneg"), now, 5000);
@@ -145,9 +127,8 @@ int main(void)
 	/* C5/C6: find LOC_WAYS+1 keys that share a set, then show the set
 	 * holds all four and the fifth evicts exactly one way. */
 	{
-		/* Two passes, because five keys in DIFFERENT sets prove
-		 * nothing: count per set until one reaches LOC_WAYS + 1,
-		 * then collect exactly that set's keys. */
+		/* two passes, since five keys in different sets prove nothing: count per set
+		 * until one reaches LOC_WAYS + 1, then collect that set's keys */
 		static unsigned short cnt[LOC_SLOTS / LOC_WAYS];
 		int target = -1;
 		char kb[32];
@@ -209,7 +190,7 @@ int main(void)
 	chk(!clloc_neg_hit(&L, K("c"), K("tomb"), now),
 		"D1 and a set clears: the resurrected key is visible at once");
 
-	/* ---- E/F. RV-15: a 4-way set, oldest-expiry out, counted --------- */
+	/* ---- E/F. a 4-way set, oldest-expiry out, counted --------------- */
 	{
 		char ks[6][16];
 		uint64_t h0, v = 0;
@@ -261,9 +242,8 @@ int main(void)
 			"E4 a pull miss that evicts a live tombstone counts as a "
 			"tombstone lost");
 
-		/* F: what RV-15 exists for - a FRESH tombstone survives the
-		 * colliding deletes right behind it.  Direct-mapped, the first
-		 * of them overwrote it; now three cannot (four ways) */
+		/* F: a fresh tombstone survives the colliding deletes right behind it;
+		 * direct-mapped, the first of them overwrote it */
 		clloc_neg_set_ver(&L, K("c"), ks[4], strlen(ks[4]), now + 20000, 2000, 99);
 		for (j = 1; j < 4; j++)
 			clloc_neg_set_ver(&L, K("c"), ks[j], strlen(ks[j]), now + 20000 + j, 2000, 60 + j);

@@ -1,3 +1,13 @@
+perfcached (0.7.5-1) unstable; urgency=medium
+
+  * 0.7.5 (libperfd 0.7.6): TLS on the RESP and HTTP doors and rediss://
+    upstreams; Redis Sentinel and ROLE discovery; a Redis Cluster as the
+    upstream; fleets form in order, one founder and an admission queue.
+    The cluster speaks wire epoch 4 alone: from 0.7.4.x stop the whole
+    fleet and start it on 0.7.5, the state kept.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Fri, 13 Nov 2026 10:00:00 +1100
+
 perfcached (0.7.4.4-1) unstable; urgency=medium
 
   * 0.7.4.4 (libperfd 0.7.5): a snapshot taken while a table resized
@@ -833,7 +843,7 @@ perfcached (0.4.0~rc18-1) unstable; urgency=medium
 
   * A native-door jdel at the root removes the key; it answered "bad
     path" and left it, so a de-registered device kept reading as
-    registered through cachedb_perfd.
+    registered through a client module.
   * One bucket walk for every walker, with the callback contract written
     down; the overflow leg honours keys-only; the leg node's layout rule
     is a static assertion.

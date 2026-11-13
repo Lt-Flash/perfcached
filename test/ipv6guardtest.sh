@@ -1,27 +1,6 @@
 #!/bin/sh
-# ipv6guardtest.sh - 12np, IP6-2's first step: the IPv6 guard.  Before any
-# door, tool or the library asks for IPv6, a FUNCTIONAL check says whether
-# this host has it (pc_ipv6_usable: an AF_INET6 socket and a bind to
-# [::1]:0), and every name the daemon resolves asks for IPv4 only when it
-# has not - no AAAA query goes out from an IPv6-less host (the operator,
-# 2026-10-21).
-#
-# Each half runs in its own network and mount namespace (unshare -n -m):
-# a stub resolver on 127.0.0.1:53 logs every query's type, the namespace's
-# /etc/resolv.conf and /etc/nsswitch.conf point at it ("hosts: files dns"),
-# and nscd's socket is hidden (a host's nscd would answer from outside).
-# The node names its native listener and its upstream "pcv6guard.test".
-#  off: disable_ipv6 = 1 in the namespace - -C says "net: IPv6 is not
-#       usable ... no ::1 to bind", the start log says it once, the node
-#       resolves both names with A queries and NO AAAA, a read through the
-#       named upstream answers, and an EXPLICIT IPv6 listener ([::1]:port)
-#       is refused at -C by name, with the reason (IP6-2)
-#  on:  IPv6 as the host has it - -C says "usable", the same start sends
-#       AAAA queries too (the count can see one: the instrument can fail),
-#       and the [::1] listener passes -C
-# Needs root (unshare -n -m, mount, the namespace's sysctl): skipped loudly
-# where that is not possible, and FAILED under GitLab CI, where it must be.
-# Usage: test/ipv6guardtest.sh [./perfcached]
+# ipv6guardtest.sh - the IPv6 guard: a host without usable IPv6 sends no AAAA query and refuses an
+# explicit IPv6 listener at -C; with IPv6 both work.  Needs root (unshare -n -m).
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

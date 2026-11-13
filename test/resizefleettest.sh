@@ -1,23 +1,6 @@
 #!/bin/sh
-# resizefleettest.sh - RV-4g: an online resize reaching a shard, spread or
-# proxy fleet.
-#
-# RV-4's map (DESIGN 12gb): a resize reached the fleet only in store and
-# eager (colresizetest, which exists because a resize was once broadcast
-# as a DROP).  Per mode, three nodes, collection c at 2^12 with
-# autoscale = off (S239 - so nothing but the operator changes its size):
-#   1. 600 keys through node 1;
-#   2. `resize c 14` through node 1 (privileged), and while the tables
-#      move: a000-a099 overwritten through node 2, a100-a149 deleted
-#      through node 3, b000-b199 new through node 1;
-#   3. every node's table reaches 16,384 buckets, the fleet holds exactly
-#      K copies of the 750 live keys, and every name reads as expected
-#      through every node;
-#      (S249: the deletes through node 3 must be ACKNOWLEDGED - under
-#      proxy node 3 holds nothing and must find the holder);
-#   4. `resize c 10` through node 2 - below what 750 keys want, so the
-#      overflow leg takes the rest - and the same holds at 1,024 buckets.
-# Usage: test/resizefleettest.sh [./perfcached]
+# resizefleettest.sh - an online resize up and down reaches a shard, spread or proxy fleet: every table resized,
+# K copies of each live key, writes during the move acknowledged.  Usage: test/resizefleettest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -156,9 +139,8 @@ for i, (m, p) in enumerate([("enable", {"secret": "rz-enable-secret"}), ("resize
 print(last)
 PY
 }
-# what each node says about the resize when one did not land: the table's
-# size and any resize still in flight, then every resize line it logged
-# (rc48 GitHub: a down-resize accepted through node 2 moved no node in 120 s)
+# what each node says about the resize when one did not land: table size, resize in flight, and
+# every resize line it logged
 resize_dump() {
 	for n in 1 2 3; do
 		echo "      node $n: $(st $n '"buckets %s, resizing_to %s" % (c.get("buckets"), c.get("resizing_to"))')"
@@ -167,11 +149,8 @@ resize_dump() {
 }
 settle() { # settle <label> <K> <buckets> <live>: every node at <buckets>, exact copies, all names right
 	i=0; while [ $i -lt 120 ]; do
-		# the size AND no resize still draining: the buckets figure is
-		# the new size from the swap on, and a node still draining
-		# refuses the next resize ("already running").  rc51 GitLab:
-		# the down-resize went out mid-drain, node 2 refused it, and the
-		# old *resiz* match took the refusal for an acceptance
+		# the size and no resize still draining: a node still draining refuses the next resize
+		# ("already running")
 		[ "$(bk 1)$(bk 2)$(bk 3)" = "$3$3$3" ] && [ "$(busy 1)$(busy 2)$(busy 3)" = 000 ] && \
 			[ $(( $(ent 1) + $(ent 2) + $(ent 3) )) = $(( $4 * $2 )) ] && \
 			[ "$(wrong 1 2>/dev/null)$(wrong 2 2>/dev/null)$(wrong 3 2>/dev/null)" = 000 ] && break
@@ -206,9 +185,8 @@ run() { # run <label> <K> <cluster lines> <collection lines>
 	case "$R" in *'"resizing":true'*) ok "$1: resize c 14 accepted through node 1 ($R)";; *) bad "$1: resize refused: $R"; return;; esac
 	# writes while the tables move: the tail the suite reads back
 	T=$(( $(op 2 set a 0 100 v2) + $(op 3 del a 100 150 x) + $(op 1 set b 0 200 v1) ))
-	# S249: the deletes go through node 3, which never saw these keys -
-	# under proxy it holds none, and a delete it cannot locate must still
-	# reach the holder and say so
+	# the deletes go through node 3, which never saw these keys: under proxy it holds none, and a
+	# delete it cannot locate must still reach the holder and say so
 	[ "$T" = 350 ] && ok "$1: all 350 ops during the resize acknowledged - the 50 deletes through node 3 (not the writer) included" \
 		|| bad "$1: $T of 350 ops during the resize acknowledged (S249: a delete through a node that does not know the holder)"
 	settle "$1 up to 2^14" $2 16384 750

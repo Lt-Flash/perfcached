@@ -29,9 +29,11 @@ same => n,Set(PERFD_DELETE(calls,${UNIQUEID})=)
 The protocol is chosen in `perfd.conf`, never per call.
 
 - **`binary`** - perfcached's native door through libperfd, the perfcached C
-  client.  Encrypted off loopback (a client secret), and fleet-aware: it
-  learns the members from the seed it reaches, fails over to a standby when
-  a node dies, and can route each key to the node that owns it.
+  client.  Authenticated off loopback by a client secret (the Noise
+  handshake); the requests after it travel in the clear unless the node's
+  listener has `encrypt = yes`.  Fleet-aware: it learns the members from
+  the seed it reaches, fails over to a standby when a node dies, and can
+  route each key to the node that owns it.
 - **`resp`** - RESP2, to perfcached's RESP door or to a standalone Redis
   (for a replicated pair, the master's VIP).  `AUTH <password>`, or
   `AUTH <user> <password>` when `username` is set (Redis 6+).  After a
@@ -79,9 +81,10 @@ perfcached checkout:
 contrib/asterisk/mkpatch.sh asterisk-X.Y.Z.tar.gz
 ```
 
-It adds the module, its RESP client and the sample config, and inserts the
+It adds the module, its RESP client and the sample config, inserts the
 libperfd check into `configure.ac`, `makeopts.in` and
-`build_tools/menuselect-deps.in`.
+`build_tools/menuselect-deps.in`, and appends the module's build rule to
+`funcs/Makefile`.
 
 ## Configuration
 

@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * walringtest - S226: the pump's two-memcpy ring copy is byte-identical to
- * the byte-at-a-time loop it replaced, for every start offset and every
- * length on rings of several sizes, including a record that straddles the
- * ring's end at every split point and one that fills the ring exactly.
- */
+/* walringtest.c - the pump's two-memcpy ring copy equals a byte-at-a-time copy for every offset and
+ * length, including records straddling the ring's end and one that fills it exactly. */
 #include <stdio.h>
 #include <string.h>
 #include "walring.h"
@@ -25,7 +21,7 @@ int main(void)
 			buf[j] = (unsigned char)(j * 131u + size);
 		for (pos = 0; pos < size; pos++)
 			for (n = 0; n <= size; n++) {
-				for (j = 0; j < n; j++)      /* the old loop */
+				for (j = 0; j < n; j++)      /* the reference copy */
 					want[j] = buf[(pos + j) % size];
 				memset(got, 0xA5, sizeof got);
 				walring_copy(buf, size, pos, got, n);

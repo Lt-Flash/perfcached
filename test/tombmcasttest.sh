@@ -1,22 +1,6 @@
 #!/bin/sh
-# tombmcasttest.sh - 12ny AT-9: on a multicast fleet a delete goes to the
-# group ONCE; a unicast fleet, a long key and data_multicast = off keep one
-# copy a peer.
-#
-# Before: every delete went out one sealed copy a peer, N-1 datagrams, also
-# where the group reaches every member.  With the origin's numbering (AT-2)
-# a copy the group loses is a hole the member asks for (AT-6), so while the
-# fleet confirms (AT-10's gate) the group carries it.  Three eager nodes:
-#   1. multicast: 100 deletes through node 1 cost 100 datagrams, all on the
-#      group; node 1 drops its own copies the group loops back; nodes 2 and
-#      3 hold none of the 100 and all of the 100 kept
-#   2. a 2,000-byte key's delete (past one datagram) goes one copy a peer
-#   3. node 1 restarted with data_multicast = off: 50 deletes, 2 datagrams
-#      each, none on the group, and nodes 2 and 3 still hold none of them
-#   4. a unicast fleet (discovery = unicast): 50 deletes, 2 datagrams each
-# FAIL-FIRST: before AT-9 every delete cost 2 datagrams on three nodes, and
-# cluster.tomb_group / tomb_dgrams do not exist.
-# Usage: test/tombmcasttest.sh [./perfcached]
+# tombmcasttest.sh - on a multicast fleet a delete goes to the group ONCE; a unicast fleet, a key past one
+# datagram and data_multicast = off keep one copy a peer.
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -109,7 +93,10 @@ PY
 }
 gate() { # the fleet confirms: 2 peers up and the acks gate open on node 1
 	k=0; while [ $k -lt 100 ] && { [ "$(st 1 'c.get("peers_up")')" != 2 ] || [ "$(st 1 'c["acks"]["fleet"]["confirming"]')" != True ]; }; do sleep 0.2; k=$((k+1)); done
-	python3 "$T/waitready.py" 127.0.152.1:19481 127.0.152.2:19482 127.0.152.3:19483 || bad "$1: a node is not ready"
+	python3 "$T/waitready.py" 127.0.152.1:19481 127.0.152.2:19482 127.0.152.3:19483 || {
+		bad "$1: a node is not ready"
+		# the admission's own account: why a joiner is held, once it is past CONNECT_MS
+		grep -hE "admission|ONLINE|founded|joined|CONNECTING" "$D"/n?.log | tail -12 | cut -c1-300; }
 	[ "$(st 1 'c["acks"]["fleet"]["confirming"]')" = True ] || bad "$1: the fleet never confirmed (peers $(st 1 'c.get("peers_up")'), waiting for $(st 1 'c["acks"]["fleet"]["waiting_for"]'))"
 }
 ctr() { st 1 "'%d %d %d %d' % (c['tomb_sent'], c['tomb_group'], c['tomb_dgrams'], c['tomb_own'])"; }

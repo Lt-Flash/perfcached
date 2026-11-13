@@ -1,18 +1,6 @@
 #!/bin/sh
-# scalebench.sh — throughput vs worker count, plus a perf profile at
-# the top of the curve (S45).
-#
-# The daemon runs on the host pinned to half the CPUs and memtier runs
-# in a container pinned to the other half, so the driver can neither be
-# the ceiling nor share cachelines with what it measures.  The profile
-# at the highest worker count is the only evidence admitted for "X is
-# the serialization point" claims - this task retired a peaks-at-two
-# "finding" that had survived a week past the build it described, and
-# three contention theories died by reading before one survived by
-# profile (the per-write Lamport tick - see DESIGN S45 for why it is
-# load-bearing and cannot be batched away).
-#
-# Usage: bench/scalebench.sh    (on the build/test host, ~10 min)
+# scalebench.sh - throughput vs worker count with memtier pinned apart from the daemon, plus a perf profile
+# at the top of the curve: the only evidence admitted for a serialization-point claim.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 D=/var/tmp/s45; rm -rf $D; mkdir -p $D

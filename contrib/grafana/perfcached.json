@@ -1465,6 +1465,10 @@
                       "failed": {
                         "color": "#ef6b64",
                         "index": 6
+                      },
+                      "connecting": {
+                        "color": "#e0a84a",
+                        "index": 7
                       }
                     }
                   }
@@ -2915,7 +2919,7 @@
       "id": 35,
       "type": "state-timeline",
       "title": "Node state",
-      "description": "`perfcached_node_state` - the node's lifecycle state: 1 for the current one\n\nGreen is READY. Amber is a transient state - HEALING (S229), STALLED, RECOVERING, STARTING, DRAINING. Red is FAILED.",
+      "description": "`perfcached_node_state` - the node's lifecycle state: 1 for the current one\n\nGreen is READY. Amber is a transient state - HEALING (S229), STALLED, RECOVERING, CONNECTING (0.7.5), STARTING, DRAINING. Red is FAILED.",
       "datasource": {
         "type": "prometheus",
         "uid": "${ds}"
@@ -2953,7 +2957,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": ".* (healing|stalled|recovering|starting|draining)$"
+              "options": ".* (healing|stalled|recovering|connecting|starting|draining)$"
             },
             "properties": [
               {

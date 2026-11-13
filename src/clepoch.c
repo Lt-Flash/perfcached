@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clepoch.c - the cluster wire epoch (clepoch.h): owns the committed
- * epoch and the newest this build speaks.  Moved from cluster.c with
- * accessor substitutions only - the state dir, the role, the master, the
- * peer table and the commit counter through clstate.h (the 0.7.2 split,
- * wave 1 - doc/MODULARITY.md); test/clepochtest.c.
- */
+/* clepoch.c - the cluster wire epoch (clepoch.h): owns the committed epoch and the newest this
+ * build speaks.  test/clepochtest.c. */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -16,33 +11,18 @@
 #include "clpeers.h"
 #include "clstate.h"
 #include "clepoch.h"
-#include "logrl.h"                     /* CH-17 */
+#include "logrl.h"
 
-/* 12nu: the epoch this node speaks (the fleet's committed one) and the newest
- * it can; PC_CL_EPOCH_MIN is the oldest.  The committed epoch is adopted
- * from the master's keepalive, raised by pc_cluster_epoch_commit on the
- * master, and persisted beside the term (node-epoch) so a new master
- * continues with it. */
+/* the epoch this node speaks (the fleet's committed one, from the master's keepalive, persisted
+ * as node-epoch so a new master continues with it) and the newest it can */
 static int cl_committed = PC_CL_EPOCH;
 static int cl_epoch_max = PC_CL_EPOCH_MAX;
 
-/*
- * S221: may we talk to a peer announcing @theirs?
- *
- * Same shape as the interchange-digest refusal beside it - loud, by
- * name, and the peer is not joined - with one difference: this one is
- * about what the BYTES mean, so it is checked first and no amount of
- * config agreement rescues it.
- *
- * A peer that sends no epoch at all reads as 0 and is refused like any
- * other mismatch.  Epoch 1 admitted it under a grandfather rule - rc22
- * to rc28 spoke epoch 1's plaintext without saying so - which was a
- * statement about two known releases, written to expire at the first
- * bump; S317's bump to 2 expired it.
- */
+/* may we talk to a peer announcing @theirs?  About what the BYTES mean, so checked before the
+ * config digest and nothing rescues it; a peer sending no epoch reads as 0 and is refused */
 int epoch_ok(int theirs, const pc_addr *from, const char *what)
 {
-	/* 12nu: any epoch this build carries a codec for is read; what this
+	/* any epoch this build carries a codec for is read; what this
 	 * node SPEAKS is the committed one (cl_committed) */
 	if (theirs >= PC_CL_EPOCH_MIN && theirs <= cl_epoch_max)
 		return 1;
@@ -53,16 +33,16 @@ int epoch_ok(int theirs, const pc_addr *from, const char *what)
 		LM_ERR("cluster: REFUSING %s from %s - it speaks cluster wire epoch "
 			"%d and we speak %d..%d.  The epoch changes only when a frame "
 			"means something an older build would MIS-EXECUTE rather than "
-			"ignore, so these two daemons cannot safely share a cluster: "
-			"upgrade the fleet (a build speaks the old epoch for one minor), "
-			"then commit the new epoch.  Neither node is harmed by this "
-			"refusal.\n",
+			"ignore, so these two daemons cannot safely share a cluster: run "
+			"one release on every node (one that also speaks the old epoch "
+			"rolls, then commits the new; one that does not moves the whole "
+			"fleet at once).  Neither node is harmed by this refusal.\n",
 			what, pc_addr_str(from), theirs, PC_CL_EPOCH_MIN,
 			cl_epoch_max);
 	return 0;
 }
 
-/* 12nu: a peer's fact from the settings its keepalive carried (AR11/UP1) */
+/* a peer's fact from the settings its keepalive carried */
 int peer_fact(const struct peer *p, uint32_t key, uint32_t *val)
 {
 	int i;
@@ -75,8 +55,8 @@ int peer_fact(const struct peer *p, uint32_t key, uint32_t *val)
 	return 0;
 }
 
-/* 12nu: can @p speak @epoch?  1 yes, 0 no (its range is known and excludes
- * it), -1 unknown (a build before 0.6.5 says nothing) */
+/* can @p speak @epoch?  1 yes, 0 no (its range is known and excludes it), -1 unknown (an older
+ * build says nothing) */
 int peer_speaks(const struct peer *p, int epoch, int *lo, int *hi)
 {
 	uint32_t fv;
@@ -109,7 +89,7 @@ void epoch_load(void)
 {
 	char path[600];
 	FILE *f;
-	int e = 0;
+	int e = 0, older = 0;
 
 	if (!cl_state_dir()[0])
 		return;
@@ -119,12 +99,20 @@ void epoch_load(void)
 		return;
 	if (fscanf(f, "%d", &e) == 1 && e >= PC_CL_EPOCH_MIN && e <= cl_epoch_max)
 		cl_committed = e;
-	else if (e)
+	else if (e > cl_epoch_max)
 		LM_ERR("cluster: %s says the fleet is committed to wire epoch %d, "
 			"which this build does not speak (%d..%d) - it cannot join "
 			"that fleet; it starts speaking %d\n", path, e,
 			PC_CL_EPOCH_MIN, cl_epoch_max, cl_committed);
+	else if (e) {                      /* an earlier release's fleet: the whole fleet moves */
+		LM_NOTICE("cluster: %s names wire epoch %d, an earlier release's; this build "
+			"speaks %d..%d, so every node of the fleet must run it\n", path, e,
+			PC_CL_EPOCH_MIN, cl_epoch_max);
+		older = 1;
+	}
 	fclose(f);
+	if (older)
+		epoch_save();                  /* the notice is said once */
 }
 
 int pc_cluster_epoch(void)

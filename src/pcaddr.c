@@ -3,9 +3,7 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * pcaddr.c - IP6-1 (DESIGN 12np): the address type.  See pcaddr.h.
- */
+/* pcaddr.c - the address type.  See pcaddr.h. */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,7 +190,7 @@ const char *pc_addr_ntop(const pc_addr *a, char *buf, size_t cap)
 
 const char *pc_addr_ntop_port(const pc_addr *a, char *buf, size_t cap)
 {
-	char h[PC_ADDR_STRLEN];
+	char h[PC_ADDR_HOSTLEN];
 
 	pc_addr_ntop(a, h, sizeof h);
 	if (pc_addr_family(a) == AF_INET6)
@@ -310,7 +308,7 @@ int pc_hostport_split(const char *s, char *host, size_t hcap, int *port)
 	return 0;
 }
 
-/* 12np: 0 not looked yet, 1 usable, 2 not - the first answer is kept (two
+/* 0 not looked yet, 1 usable, 2 not - the first answer is kept (two
  * threads asking at once both look, and agree) */
 static int v6_state;
 static const char *v6_why = "";

@@ -1,11 +1,6 @@
 #!/bin/sh
-# failovertest.sh — harness for the cluster-aware client (task S34).
-# Runs a three-node store cluster, lets failovertest connect with
-# pre-warmed standbys, KILLS the node it is using on cue, and checks
-# the client rode it out.  Then two policy legs the C program cannot do
-# alone: independent clients must not all land on one node, and a
-# non-idempotent verb must not be silently replayed.
-# Usage: test/failovertest.sh [./perfcached] [./failovertest]
+# failovertest.sh - the cluster-aware client rides out killed, restarted and expelled nodes, spreads
+# independent clients and routes per key.  Usage: test/failovertest.sh [./perfcached] [./failovertest]
 set -u
 
 BIN=${1:-./perfcached}
@@ -58,18 +53,27 @@ node 3 17503
 start 1 P1
 start 2 P2
 start 3 P3
-sleep 4
-
-# node id -> pid, learned from each daemon's own view
-# (node ids are not queryable here - the daemons are encrypted and the
-# harness speaks no Noise; the client names the PORT it is using, which
-# it knows from the member list)
+# a joiner is CONNECTING until its links answer: wait for every node ready and seeing the others
+st() { # st <n> -> "state peers_up" (nodes 1-3 on 127.0.9, 4-7 on 127.0.10)
+	h=127.0.9.$1; [ $1 -ge 4 ] && h=127.0.10.$1
+	./perfcli -h $h -p 1750$1 -a "$SECRET" -q -j '{"method":"stats"}' 2>/dev/null \
+		| python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+formed() { # formed <n>...: up to 30 s
+	i=0
+	while [ $i -lt 300 ]; do
+		f=0; for n in "$@"; do [ "$(st $n)" = "ready $(($# - 1))" ] || f=1; done
+		[ $f = 0 ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
+formed 1 2 3
 
 # ---- the main leg: run the client, kill the node it names ----------
 "$FT" 127.0.9.1 17501 17502 17503 "$SECRET" > "$D/ft.out" 2>&1 &
 FTPID=$!
-# S104: first cue - the client names a STANDBY's port; kill that node.
-# The client then proves the idle ping finds it while the active serves.
+# first cue: the client names a standby's port; kill that node.  The client then proves the idle
+# ping finds it while the active serves.
 i=0
 SKILLED=
 while [ $i -lt 100 ]; do
@@ -111,14 +115,8 @@ case "$N_BAD" in ''|*[!0-9]*) N_BAD=0;; esac
 pass=$((pass + N_OK)); fail=$((fail + N_BAD))
 [ "$FTRC" = "0" ] || echo "  (failovertest exit $FTRC)"
 
-# ---- a second, healthy fleet for the legs below ----------------------
-# The main leg has just killed TWO of its three nodes (the active on
-# KILL-PORT, a standby on KILL-SPARE-PORT), so it cannot host a spread
-# test: round-robin over one usable member puts every client on it -
-# which is exactly what rc15's check job reported once the second kill
-# existed.  Nodes 4-6 are the routing leg's shard fleet; started here so
-# the spread leg has three live members to spread over, and the 4 s
-# lets them form a cluster before anyone asks for its member list.
+# ---- a second, healthy fleet (nodes 4-6) for the legs below: the main leg killed two of its
+# three nodes, and round-robin over one usable member puts every client on it
 node 4 17504
 node 5 17505
 node 6 17506
@@ -128,11 +126,10 @@ sed -i 's/^advertise = 127.0.9./advertise = 127.0.10./' "$D/n4.conf" "$D/n5.conf
 sed -i 's/^tcp = 127.0.9./tcp = 127.0.10./' "$D/n4.conf" "$D/n5.conf" "$D/n6.conf"
 S1= S2= S3=
 start 4 S1; start 5 S2; start 6 S3
-sleep 4
+formed 4 5 6
 
-# ---- policy leg: independent clients must not all pick one node ----
-# round-robin picks a random start per client, so over many clients the
-# active node should not be constant
+# ---- policy leg: independent clients must not all pick one node (round-robin starts at random
+# per client)
 cat > "$D/spread.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,18 +158,8 @@ int main(int argc, char **argv)
 	return 0;
 }
 EOF
-# $SAN, or this leg cannot link under check-asan.  libperfd.a is built
-# with the sanitizer when SAN is set, so a plain cc leaves every ASan
-# runtime symbol undefined and the link dies - which this used to
-# swallow as a "skipped" line.  It ran green in CI for exactly as long
-# as nobody read the log: the leg was never executing under ASan, which
-# is the configuration most likely to catch a client-side bug.  make
-# exports a command-line SAN into recipe shells, so it is simply here
-# for the taking.
-#
-# And a compile failure is now a FAILURE, not a skip.  Only a genuinely
-# absent compiler is a legitimate reason to not run this - anything else
-# is a broken leg reporting success by not looking.
+# $SAN, or the link fails against a sanitized libperfd.a (make exports a command-line SAN).
+# A compile failure is a failure, not a skip: only an absent compiler skips.
 if ! command -v cc >/dev/null 2>&1; then
 	echo "  (spread leg skipped: no cc on this host)"
 elif cc ${SAN:-} -O1 -Ilib -o "$D/spread" "$D/spread.c" libperfd.a \
@@ -185,41 +172,23 @@ else
 	     untested: $(tail -1 "$D/cc.log")"
 fi
 
-# ---- S35: per-key routing removes the forward hop -------------------
-# The proof is the DAEMONS' counters, not the client's opinion: on a
-# shard cluster a routed client should make the fleet forward (almost)
-# nothing, and the same load with routing OFF should make it forward a
-# lot.  The measurement must be able to show the difference, or it is
-# not a measurement.  (Nodes 4-6 were started above, for the spread leg.)
-# the client library is the only thing here that speaks Noise, so the
-# counters are read through it: perfcli reports stats as JSON
-# A node that cannot be READ must not read as a node that forwarded
-# NOTHING.  Measured 2026-09-02: a tree built with `make perfcached
-# failovertest` and no perfcli made every one of these return empty,
-# ${V:-0} turned that into 0, and the control leg reported "forwarded
-# only 0 - the counter cannot show the difference".  That looks exactly
-# like a routing defect and is a missing binary.  Same family as the
-# spread leg above: an instrument that reports a value by not looking.
+# ---- per-key routing removes the forward hop, proved by the daemons' fwd_sent: routed near zero,
+# the same load unrouted a lot.  Read through perfcli, the only thing here that speaks Noise.
 fleet_fwd() {
 	F=0
 	for hp in "127.0.10.4 17504" "127.0.10.5 17505" "127.0.10.6 17506"; do
 		set -- $hp
 		V=$(./perfcli -h "$1" -p "$2" -a "$SECRET" stats 2>/dev/null \
 			| tr -d ' \n' | sed -n 's/.*"fwd_sent":\([0-9]*\).*/\1/p')
-		# NOT ${V:-0}: a node that did not answer has not told us it
-		# forwarded nothing.  `exit` here would only leave the command
-		# substitution, so record it and let the caller decide.
+		# not ${V:-0}: an unanswered node has not said it forwarded nothing.  `exit` would only leave
+		# the command substitution, so record it for the caller.
 		[ -z "$V" ] && { echo "$1:$2" >> "$D/fwd.unreadable"; continue; }
 		F=$((F + V))
 	done
 	echo "$F"
 }
-# CONTROL first: the same load with routing OFF must make the counter
-# climb, or "0 forwards" later proves nothing about routing
-# The tool check goes HERE, not inside fleet_fwd: there it sits in a
-# command substitution, where `exit` leaves only the subshell and the
-# suite carries on with a fabricated 0 - which is exactly how a missing
-# perfcli spent an afternoon looking like a routing defect.
+# control first: unrouted load must make the counter climb.  The tool check goes here, not in
+# fleet_fwd, where `exit` only leaves the subshell.
 rm -f "$D/fwd.unreadable"
 if [ ! -x ./perfcli ]; then
 	bad "./perfcli is missing, so the S35 forward counters cannot be read
@@ -268,13 +237,8 @@ MISSED=$(sed -n 's/^ROUTE-MISSED //p' "$D/rt.out")
 [ "${MISSED:-0}" -eq 0 ] && ok || bad "routing missed ${MISSED} owners"
 
 
-# ---- S104: the whole fleet restarts under a handle; the seed stays down
-# The client (mode "restart") holds nodes 4-6 and names three cues:
-# RESTART-ALL (kill and restart all three), KILL-ALL (kill all three),
-# START-OTHERS (start 5 and 6 only - 4, the seed, stays down).  What it
-# asserts: the second operation after the restart succeeds, the handle
-# fails fast with the fleet gone, and perfd_redial reaches the fleet
-# through a learned member.
+# ---- the whole fleet restarts under a handle; the seed stays down.  Cues RESTART-ALL, KILL-ALL,
+# START-OTHERS; perfd_redial must reach the fleet through a learned member.
 cue() { # cue <file> <word> <secs>: wait for a cue line
 	i=0
 	while [ $i -lt $(( $3 * 10 )) ]; do
@@ -315,14 +279,10 @@ case "$X_OK" in ''|*[!0-9]*) X_OK=0;; esac
 case "$X_BAD" in ''|*[!0-9]*) X_BAD=0;; esac
 pass=$((pass + X_OK)); fail=$((fail + X_BAD))
 
-# ---- S107: a member bounced, a node added, a node expelled ------------
-# The restart leg left node 4 down: bring it back so the client holds a
-# whole fleet.  Cues: BOUNCE-PORT (kill -9 and restart at once - inside
-# the purge window, so the fleet keeps it as a member and the client
-# must recover it in the background), ADD-NODE (node 7 joins the shard
-# fleet), EXPEL-PORT (a clean stop: GOODBYE, expelled at once).
+# ---- a member bounced inside the purge window, a node added, a node expelled; the restart leg
+# left node 4 down, so bring it back first
 start 4 S1
-sleep 3
+formed 4 5 6
 node 7 17507
 sed -i 's/^mode = store$/mode = shard/' "$D/n7.conf"
 sed -i 's/239.255.77.76:17176/239.255.77.77:17178/' "$D/n7.conf"
@@ -363,10 +323,8 @@ case "$M_OK" in ''|*[!0-9]*) M_OK=0;; esac
 case "$M_BAD" in ''|*[!0-9]*) M_BAD=0;; esac
 pass=$((pass + M_OK)); fail=$((fail + M_BAD))
 if [ "$M_BAD" -gt 0 ]; then
-	# a red member leg said only the handle's side: the members it saw
-	# at its first failed write, each node's refused senders, and the
-	# fleet's own account of the bounce (node 6's log is the restarted
-	# process's - start truncates it)
+	# a red member leg prints what the handle saw at its first failed write, each node's refused
+	# senders and the fleet's own account of the bounce
 	grep "^  at the first failed write: " "$D/mb.out"
 	for n in 4 5 6; do
 		./perfcli -h 127.0.10.$n -p 1750$n -a "$SECRET" stats 2>/dev/null | python3 -c '

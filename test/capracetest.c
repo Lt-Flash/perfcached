@@ -1,21 +1,5 @@
-/* capracetest.c - RV-1: the arena's ceiling is a reservation, not a check.
- *
- * A region carve past the huge-page reservation tested the ceiling with
- * a relaxed read OUTSIDE the arena lock, then shm_malloc'd, then took
- * the lock and added its bytes.  Two carves near the cap - a `create`
- * on a worker and the splitter on the maintenance thread - could both
- * pass the test and both land, putting the node past the arena_cap_mb
- * its operator reads as a bound.  The record-chunk carve always did its
- * accounting under the lock; only regions had the window.
- *
- * The shape that makes it show every time: leave room under the ceiling
- * for EXACTLY ONE more region, release N threads at a barrier to carve
- * one region each, and look at what landed.  One may succeed; the held
- * bytes may never pass the ceiling.  Repeated for ROUNDS ceilings, so a
- * carve that only tests is caught within a handful of rounds and a
- * carve that reserves passes all of them by construction.  The positive
- * control is the success count: exactly one per round, so "never over"
- * cannot mean "everything was refused".  Milliseconds. */
+/* capracetest.c - the arena ceiling is a reservation, not a check: threads racing into room for one
+ * region land exactly one per round, and the held bytes never pass the ceiling. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,9 +14,8 @@ void pcache_mem_probe(void);
 
 #define THREADS 8
 #define ROUNDS  300
-#define RSIZE   (100UL << 10)          /* well under a slot: the fallback
-                                        * charges size + its header, the
-                                        * reservation charges a whole slot */
+#define RSIZE   (100UL << 10)          /* well under a slot: the fallback charges size + its
+                                        * header, the reservation charges a whole slot */
 
 static pthread_barrier_t go, done;
 static int succ;                       /* carves that landed this round */

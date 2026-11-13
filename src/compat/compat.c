@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * compat.c — implementation half of the OpenSIPS compatibility shim:
- * logging, the futex mutex slow paths, the ticks clock, the broadcast
- * hook, and the per-thread identity registry.
- */
+/* compat.c - compatibility shim for the vendored core: logging, futex mutex slow
+ * paths, the ticks clock, the broadcast hook and the per-thread identity */
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -55,8 +52,7 @@ void compat_log(int level, const char *tag, const char *fmt, ...)
 	off += (size_t)snprintf(line + off, sizeof line - off, "[%d] %s: ",
 		process_no, tag);
 	va_start(ap, fmt);
-	/* textbook va_start/vsnprintf/va_end; the checker misfires on the
-	 * ternary in the size argument */
+	/* the analyzer misfires on the ternary in the size argument */
 	/* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
 	off += (size_t)vsnprintf(line + off, off < sizeof line ?
 		sizeof line - off : 0, fmt, ap);
@@ -105,53 +101,17 @@ static void pc_t0_init(void)
 	__atomic_store_n(&pc_t0_ready, 1, __ATOMIC_RELEASE);
 }
 
-/* S231: the write clock alone on its lines.  Every write increments it;
- * the statics declared beside it (pc_t0, pc_t0_ready) are read by
- * compat_ticks() several times a request, and sharing its line they
- * missed on every write another worker made - compat_ticks was 23-28% of
- * a saturated SET at 8-12 workers, doing nothing but a vDSO call
- * (DESIGN 12ga).  128 bytes, 64-aligned: two whole lines, so nothing
- * shares either, nor the adjacent-line prefetch pair. */
+/* the write clock alone in a 128-aligned line pair: clock statics read on every
+ * request must not miss on each write, nor share its adjacent-line prefetch */
 static struct {
 	unsigned long long v;
 	char pad[128 - sizeof(unsigned long long)];
 } pc_lamport_line __attribute__((aligned(128)));
-/* S251: 128, not 64.  "Two whole lines" only keeps the adjacent-line
- * prefetch pair to itself when the PAIR is aligned: at 64 the standalone
- * link put the counter's first line in the same 128-byte pair as
- * compat_ticks_offset, which every request reads - the write on every SET
- * then cost every clock read, 8.4% of a SET at 8 workers
- * (compat_ticks, 95.7% of it on that one load) against under 1.2% in the
- * clustered link, where the same object happened to land on a 128
- * boundary.  Measured on 223, both editions, same tree (DESIGN 12gj). */
 #define pc_lamport (pc_lamport_line.v)
 
 #ifdef PC_EDITION_STANDALONE
-/*
- * S252: THE STANDALONE CLOCK IS PER THREAD, AND READS THE SHARED ONE.
- *
- * One atomic add per write on one line shared by every worker was 5-7% of
- * a saturated SET at 8-12 workers even with the line isolated (S231,
- * S251).  A standalone node needs a key's versions to rise with time - the
- * WAL is replayed BY VERSION (S240) - and nothing more: no peer compares
- * them.  While the key's record exists the store floors the version at the
- * old one + 1 under the bucket lock (S234).  What the floor cannot see is a
- * key DELETED and written again: there is no old record.  So:
- *
- *   tick     = max(this thread's clock, the shared one) + 1   - a READ of
- *              the shared line, which only deletes write
- *   publish  = a delete raises the shared clock to its own version
- *              BEFORE its bucket lock is released (pcache_ht remove path),
- *              so a later write of that key - under the same lock, on any
- *              thread - reads it and stamps above the delete
- *
- * The first cut handed out blocks of 1,024 from the shared counter
- * instead, and walordertest caught it: 192 of 120,000 keys replayed OLDER
- * than they had served - deleted on one thread, written again on another
- * whose block was lower.
- *
- * NOT for the clustered build: there a version must also beat what this
- * node has observed from a peer, which the RMW does by construction. */
+/* per-thread clock floored by the shared one (WAL replay needs rising versions);
+ * a delete publishes its version before unlocking, so a rewrite stamps above it */
 static __thread unsigned long long lt_clock;
 
 unsigned long long pc_lamport_tick(void)
@@ -197,25 +157,14 @@ unsigned long long pc_lamport_now(void)
 	return __atomic_load_n(&pc_lamport, __ATOMIC_ACQUIRE);
 }
 
-/* How far ahead of us a peer may legitimately be.  The fleet converges
- * over a 1 Hz heartbeat, so a peer can only have out-run us by roughly
- * (its write rate x the gap since we last heard it) - about 2M per
- * second at the measured peak.  A billion is orders of magnitude beyond
- * any real gap while still leaving a 64-bit counter unreachable.
- *
- * This is the bound that matters, not wrap.  Counting writes to 2^64
- * takes ~300,000 years at peak, but observe() accepting whatever a peer
- * advertises would let ONE bad heartbeat - a bug, a corrupted field,
- * uninitialised memory, a hostile peer inside the cluster PSK - jump
- * every node to an absurd value in a single round, permanently.  A
- * refused jump is counted, never silent: a real one means a defect. */
+/* far beyond a real peer lead (~2M/s over a 1 Hz heartbeat), so one bad heartbeat
+ * cannot jump every node's clock for good; refused jumps are counted */
 #define PC_LAMPORT_MAX_JUMP 1000000000ULL
 
 unsigned long long pc_lamport_rejected;
 
-/* fold in a value seen from a peer: the clock only ever moves forward,
- * and a CAS loop rather than a plain store so two workers observing
- * different peers cannot lose the larger one */
+/* forward only, and a CAS loop so two workers observing different peers cannot
+ * lose the larger value */
 void pc_lamport_restore(unsigned long long high)
 {
 	unsigned long long cur = __atomic_load_n(&pc_lamport, __ATOMIC_ACQUIRE);
@@ -223,7 +172,7 @@ void pc_lamport_restore(unsigned long long high)
 	while (high > cur) {
 		if (__atomic_compare_exchange_n(&pc_lamport, &cur, high, 0,
 		        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-			lamport_moved();       /* S252: blocks below it are void */
+			lamport_moved();
 			return;
 		}
 	}
@@ -241,7 +190,7 @@ void pc_lamport_observe(unsigned long long seen)
 	while (seen > cur) {
 		if (__atomic_compare_exchange_n(&pc_lamport, &cur, seen, 0,
 		        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-			lamport_moved();       /* S252 */
+			lamport_moved();
 			return;
 		}
 		/* cur was reloaded with the current value; retry */
@@ -252,9 +201,8 @@ unsigned int compat_ticks(void)
 {
 	struct timespec now;
 
-	/* the write path reads the clock several times a request, and a
-	 * pthread_once call on each was 8% of a SET's worker CPU (measured
-	 * with perf at 1.65M SET/s): the once only for the first call */
+	/* read several times a request, and pthread_once on each read was 8% of a
+	 * SET's worker CPU: only the first call takes it */
 	if (!__atomic_load_n(&pc_t0_ready, __ATOMIC_ACQUIRE))
 		pthread_once(&pc_t0_once, pc_t0_init);
 	clock_gettime(CLOCK_MONOTONIC_COARSE, &now);

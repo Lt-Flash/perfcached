@@ -1,17 +1,6 @@
 #!/bin/sh
-# waloverruntest.sh - a segment overrun takes the node out of write
-# service, and (S229) it heals itself.
-#
-# A ring drop and a segment overrun are the same event: an acknowledged
-# write the LOG no longer holds.  The overrun used to overwrite the
-# records, count them, and leave the node in service; then it FAILED the
-# node until a restart, and the overwritten records were gone after it.
-# Since S229 the node goes HEALING (writes refused, reads served) and takes
-# a snapshot: the records are still in memory - every write stores to the
-# table before the WAL - so the snapshot makes them durable again, and the
-# node returns to READY by itself.  This drives a real overrun and asserts
-# all of that, and then that every acknowledged write survives a kill -9.
-# Usage: test/waloverruntest.sh [./perfcached]
+# waloverruntest.sh - a WAL segment overrun takes the node out of write service (HEALING) until a
+# snapshot makes the records durable again, and every acknowledged write survives a kill -9.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -40,9 +29,8 @@ client = $SEC
 cluster = ovr-cluster-secret
 [listen]
 tcp = 127.0.54.4:17994
-# loopback plaintext: perfcli's authenticated path is exclusive with it,
-# so this test speaks the native protocol on the socket (test/pcnative.py)
-# rather than through the CLI
+# loopback plaintext excludes perfcli's authenticated path, so this test speaks the
+# native protocol on the socket (test/pcnative.py)
 plaintext = loopback
 [cluster]
 multicast = 239.255.77.184:17284
@@ -53,30 +41,18 @@ collections = th
 dir = $D/wal
 probe = no
 fsync = everysec
-# The smallest ring the config allows, and no automatic snapshots: the
-# marker never advances, so nothing is ever free and a few MB of writes
-# must wrap it.  This is the fault being reproduced, not a suggestion.
+# the smallest ring the config allows and no automatic snapshots: nothing is ever
+# freed, so a few MB of writes must wrap it (the fault under test)
 segment_mb = 1
 segments = 4
 save = off
-# S466: the default waits rather than lose a record; this test is about the heal
+# the default waits rather than lose a record; this test is about the heal
 on_full = heal
-# save = off stops the RULES, not the pressure trigger (S224): the
-# rotation that leaves one segment free asks for a snapshot, and if that
-# snapshot lands before the pump fills the last segment, its marker frees
-# the oldest one and the ring never overruns at all.  Unthrottled it
-# takes ~80 ms, and on a CI runner whose disk is busy the pump's rotation
-# fsync can take longer (GitLab 109662 v0.5.1 and 109714 v0.5.5, under
-# ASan: "the ring never wrapped", no HEALING, all 8000 acknowledged - a
-# longer wait cannot help, nothing is coming).  At 1 MB/s the snapshot of
-# a ~5 MB table takes seconds, so the pump wraps the ring first; the heal
-# snapshot takes as long, well inside the wait below.
+# save = off stops the rules, not the pressure trigger: at 1 MB/s that snapshot takes
+# seconds, so the pump wraps the ring before its marker can free a segment
 rdb_mb_s = 1
-# A ring big enough that it CANNOT drop: this test is about segments
-# filling faster than snapshots free them, and a ring drop already
-# FAILS the node by a different route.  The assertion below on
-# dropped == 0 is what keeps the two apart - without it this test
-# passes on a binary that never learned to shed an overrun at all.
+# a ring big enough that it CANNOT drop: a drop fails the node by another route, and
+# the dropped == 0 check below keeps the two apart
 ring_kb = 16384
 [collection th]
 buckets_log2 = 14
@@ -146,10 +122,8 @@ print("DROVE", n)
 print("ACKED", len(acked))
 open("ACKED_FILE", "w").write("\n".join(acked))
 
-# the overrun, the HEALING and the heal: two throttled snapshots (the one
-# the pressure trigger asked for, then the one that began after the
-# loss) at 1 MB/s, slower under ASan beside a CI runner's other jobs.  Up
-# to 180 s; a healthy run leaves the moment it has healed.
+# the overrun, the HEALING and the heal: two throttled snapshots at 1 MB/s; up to
+# 180 s, and a healthy run leaves the moment it has healed
 for _ in range(720):
     st = call(f, "stats").get("result", {})
     if st.get("state") == "ready" and st.get("wal", {}).get("heals", 0) >= 1:
@@ -181,12 +155,8 @@ grep -q "^DROPPED 0" "$D/out" \
 	|| bad "$(grep DROPPED "$D/out") - ring drops would FAIL the node by \
 the other route, so this run proves nothing about the overrun"
 
-# S229: out of write service, and back by itself.  The transition is in
-# the node's log: every state change is a NOTICE line carrying its reason.
-# The watcher samples /stats every 20 ms and a heal can be quicker than
-# that (GitHub, d7973be: "healed after 20 ms", the watcher saw only
-# ready) - the log line cannot be missed, and the sampled state and
-# reason are reported beside it when the watcher did catch them.
+# out of write service, and back by itself: a heal can beat the 20 ms /stats watcher, so the log's
+# NOTICE line is the evidence and the sampled state is reported beside it
 HLINE=$(grep -m1 "node state ready -> healing" "$D/log")
 SEEN=$(sed -n 's/^SEEN //p' "$D/out")
 if [ -n "$HLINE" ]; then
@@ -219,11 +189,7 @@ case "$(grep '^READ_AFTER ' "$D/out")" in
 *)		ok "reads answered" ;;
 esac
 
-# what it acknowledged survives - the overwritten records too.  Not a
-# fail-first for S229: a build before it also kept them, because the
-# overrun path has always requested a snapshot (it only never came back
-# to service).  The ring-DROP path is where acknowledged writes were
-# really lost before S229 - healtest shows that one (6,192 of them).
+# what it acknowledged survives - the overwritten records too (healtest covers the ring-drop path)
 kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null; PID=
 "$BIN" -f "$D/c.conf" > "$D/log2" 2>&1 &
 PID=$!

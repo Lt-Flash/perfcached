@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clrp.c - S461: eager replication pushes on the relay port.  See clrp.h.
- */
+/* clrp.c - eager replication pushes on the relay port (clrp.h). */
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
@@ -10,7 +8,7 @@
 #include <sodium.h>
 
 #include "clrp.h"
-#include "clrpt.h"                     /* S469 */
+#include "clrpt.h"
 #include "clps.h"
 #include "clstate.h"
 #include "clpeers.h"
@@ -28,7 +26,7 @@ extern void cl_repl_apply_group(const unsigned char *pt, size_t n,
 static __thread int rp_send_fd = -1;
 static unsigned long long rp_sent_direct, rp_sent_cluster, rp_rx_groups,
 	rp_rx_refused, rp_sent_tcp;
-static size_t rp_tcp_min = 1232;       /* S469: max_datagram - above it, TCP */
+static size_t rp_tcp_min = 1232;       /* max_datagram - above it, TCP */
 
 void clrp_set_tcp_min(size_t n)
 {
@@ -61,7 +59,7 @@ static int rp_socket(int family)
 		close(fd);
 		return -2;                     /* this thread keeps the cluster path */
 	}
-	fcntl(fd, F_SETFL, O_NONBLOCK);    /* OM2-13: a full buffer falls back, never blocks */
+	fcntl(fd, F_SETFL, O_NONBLOCK);    /* a full buffer falls back, never blocks */
 	return fd;
 }
 
@@ -123,7 +121,7 @@ int clrp_host_ok(const pc_addr *from)
 void clrp_rx(const unsigned char *pt, size_t n, const pc_addr *from)
 {
 	/* only fire-and-forget groups ride here: an acked one's ack and window
-	 * are the cluster thread's (S253, clpush) */
+	 * are the cluster thread's (clpush) */
 	if (n < CLMIG_GHDR || clmig_group_req(pt) ||
 	    !clpeers_by_id_from(cl_peers(), clmig_group_node(pt), from)) {
 		__atomic_add_fetch(&rp_rx_refused, 1, __ATOMIC_RELAXED);

@@ -1,12 +1,6 @@
 #!/bin/sh
-# heldtest.sh - S109: a collection reports the bytes it HOLDS, on every
-# node, whatever path stored the record.  Two eager nodes; every record is
-# written at node 1 and reaches node 2 by the write-path push, so node 2's
-# figure comes from records it never took from a client - the case the
-# page used to show as a dash.  The figure comes from the maintenance
-# thread's paced walk (at least every 5 s here), so every read is an
-# await.  Fail-first: a daemon without held_bytes answers MISSING and
-# every assertion here fails.
+# heldtest.sh - a collection reports the bytes it HOLDS on every node, whatever path stored the record
+# (node 2's come by push); the figure is from a paced walk, so every read is an await.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -51,18 +45,8 @@ start() { # start <id>
 	done
 	echo "node $1 did not start"; cat "$D/n$1.log"; exit 1
 }
-# drive <port> <op> [args]: one connection per call; ops print one value.
-#   fill <n> <vlen> [ttl]   -> "sets=<n> requests=<count on this connection>"
-#   del <n>                 -> "dels=<n>"
-#   held                    -> held_bytes of collection hd, or MISSING
-#   entries                 -> entries of hd
-#   hist                    -> held_hist of hd as "a,b,c,d,e,f,g,h", or MISSING (S116)
-#   cells / index           -> held_cells / index_bytes of hd, or MISSING (S120)
-#   live / regions          -> stats.memory.arena_live / arena_regions
-#   budget                  -> "index records" from stats.budget, or MISSING
-#   hp                      -> this node's own stats headroom_pct (S117)
-#   peer_hp                 -> the OTHER member's headroom as this node's
-#                              members verb reports it from the beat, in %
+# drive <port> <op> [args]: one connection, one value printed (MISSING when absent); ops: fill <n> <vlen>
+# [ttl], del <n>, held, entries, hist, cells, index, live, regions, budget, hp, peer_hp (beat-fed, in %)
 drive() {
 	python3 - "$@" <<'PYEOF'
 import json, pcnative, socket, sys
@@ -138,9 +122,7 @@ await() { # await <port> <op> <want> <secs>
 }
 node 1 17621; node 2 17622
 start 1; start 2
-# both READY before the first write: a node still pulling its bootstrap
-# (S83) refuses client writes, and the first fill here once landed in that
-# window and stored nothing
+# both READY before the first write: a node still pulling its bootstrap refuses client writes
 for n in 1 2; do
 	i=0
 	while [ $i -lt 300 ]; do
@@ -161,23 +143,15 @@ await 17621 21200 held 20 && ok "node 1 holds 21200 bytes: 200 x (6 + 100)" \
 await 17622 21200 held 30 && ok "node 2 holds 21200 bytes too - records it never took from a client" \
 	|| bad "node 2 held_bytes $(drive 17622 held), want 21200 (the S109 case)"
 
-# S116: the SIZES held come from the same walk as held, so the push-fed
-# node shows them too - 200 values of 100 bytes are 200 records in the
-# second class (65..256 B).  A daemon whose histogram counts only this
-# node's client writes has nothing for node 2; one without held_hist
-# answers MISSING.
+# the SIZES held come from the same walk, so the push-fed node shows them too: 200 values of 100 B are
+# 200 records in the second class (65..256 B)
 await 17621 "0,200,0,0,0,0,0,0" hist 20 && ok "node 1's sizes held: 200 records in the 65..256 B class (S116)" \
 	|| bad "node 1 held_hist $(drive 17621 hist), want 0,200,0,0,0,0,0,0 (S116)"
 await 17622 "0,200,0,0,0,0,0,0" hist 30 && ok "node 2's sizes held match - records it never took from a client (S116)" \
 	|| bad "node 2 held_hist $(drive 17622 hist), want 0,200,0,0,0,0,0,0 (S116: sizes counted client writes only)"
 
-# S120: the budget's parts are exact.  The records a collection holds are
-# reported as the cells they occupy - the class rounding every record pays -
-# and with nothing but walked records in the table that is the arena's own
-# live figure, byte for byte (200 x (28 + 6 + 100) = 134 B -> 192 B cells =
-# 38400); the index is the regions the table was carved, which on a
-# one-collection node is every region there is.  A daemon before S120
-# answers MISSING for both.
+# the budget's parts are exact: records as the cells they occupy, here the arena's live figure byte for
+# byte (200 x (28+6+100) = 134 B -> 192 B cells = 38400); the index is every region carved
 L=$(drive 17621 live)
 await 17621 "$L" cells 20 && ok "node 1's records as cells equal the arena's live figure: $L bytes (S120)" \
 	|| bad "node 1 held_cells $(drive 17621 cells) != arena_live $L (S120)"
@@ -188,13 +162,8 @@ B=$(drive 17621 budget)
 [ "$B" = "$(drive 17621 regions) $(drive 17621 cells)" ] && ok "the budget block sums them: $B (S120)" \
 	|| bad "budget '$B' != regions + cells (S120)"
 
-# S117: the headroom a member advertises in its beat - what the other
-# node's members verb and the fleet cards show - is the CEILING's, the same
-# figure the node reports for itself in stats.  Under this elastic shape
-# (16 MB reservation under a 64 MB ceiling) the pool's free share and the
-# ceiling's headroom differ by tens of points, so a daemon that still
-# advertises the pool fails here.  One point of rounding is allowed: the
-# beat carries whole MB, stats divides bytes.
+# the headroom a member advertises in its beat is the CEILING's, as in its own stats (the pool's share
+# differs by tens of points here); one point of rounding allowed: the beat carries whole MB
 hp_agrees() { # hp_agrees <node> <own-port> <other-port>
 	own=$(drive $2 hp); seen=$(drive $3 peer_hp)
 	[ "$own" != MISSING ] && [ "$seen" != MISSING ] \
@@ -223,9 +192,8 @@ await 17621 10600 held 20 && ok "a delete removes the record's bytes (10600)" \
 await 17622 10600 held 30 && ok "node 2 follows the delete (10600)" \
 	|| bad "node 2 held_bytes $(drive 17622 held) after delete, want 10600"
 
-# 4. 30 short-lived records: +3180, then the sweep takes them back.  They
-# must outlive a walk (paced at 5 s here): a 1 s life was swept before
-# any walk could count it, and the figure went 10600 -> 10600.
+# 4. 30 short-lived records: +3180, then the sweep takes them back; they must outlive a walk (paced
+# at 5 s here) to be counted
 R=$(drive 17621 fill 30 100 12)
 [ "$R" = "sets=30 requests=30" ] || bad "ttl fill at node 1: $R"
 await 17621 13780 held 20 && ok "30 records with a TTL add 3180 (13780)" \

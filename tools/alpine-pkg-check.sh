@@ -1,25 +1,6 @@
 #!/bin/sh
-# alpine-pkg-check.sh - PD-11: the Alpine packages, built and proven the way
-# alpine-check.sh proves the build - inside an alpine container, with
-# podman or docker; a host with neither SKIPS loudly.
-#
-# What it gates, from the COMMITTED tree (git archive HEAD):
-#   - abuild builds the six packages from contrib/alpine/APKBUILD
-#   - apk installs perfcached, libperfd, perfcached-dashboard, perfcached-doc:
-#     the binaries answer -V, INSTALL-MODE says package, both accounts exist
-#   - rc-service perfcached start runs the daemon as perfcached and it says
-#     ready; stop stops it (OpenRC needs its runlevel initialised once in a
-#     bare container: rc_sys=docker, a softlevel, `openrc`)
-#   - apk del perfcached + apk add perfcached-standalone: the standalone
-#     edition under the same service, ready
-#   - rc-service perfcached-dashboard start: its own account, /health 503
-#     while no member is up (the designed answer)
-# The container cannot raise rlimits or make cgroups: those warnings of
-# OpenRC are filtered, not failures.
-#
-#   tools/alpine-pkg-check.sh             on the host
-#   tools/alpine-pkg-check.sh --build     inside: abuild
-#   tools/alpine-pkg-check.sh --install <version> <libperfd version>   inside: install, start, swap
+# alpine-pkg-check.sh - the Alpine packages from the committed tree, built, installed and started
+# under OpenRC in an alpine container (podman or docker, SKIPs without); --build/--install run inside
 set -u
 ALPINE=${ALPINE:-3.21}
 VER=$(sed -n 's/.*PC_VERSION[^"]*"\([^"]*\)".*/\1/p' "$(dirname "$0")/../src/version.h" 2>/dev/null || true)
@@ -44,7 +25,7 @@ if [ "${1:-}" = --install ]; then
 	apk update > /dev/null 2>&1 && apk add openrc > /dev/null 2>&1 || fail "apk add openrc"
 	apk add --allow-untrusted $P/perfcached-$V-r0.apk $P/libperfd-$V-r0.apk $P/perfcached-dashboard-$V-r0.apk $P/perfcached-doc-$V-r0.apk > /dev/null 2>&1 || fail "apk add"
 	perfcached -V | head -1 | grep -q "perfcached $V" || fail "perfcached -V: $(perfcached -V | head -1)"
-	# the dashboard's version is libperfd's, which may run ahead of the daemon's (0.7.4.4-rc9)
+	# the dashboard's version is libperfd's, which may run ahead of the daemon's
 	perfcached-dashboard -V | grep -q "perfcached-dashboard $LV " || fail "dashboard -V: $(perfcached-dashboard -V | head -1)"
 	[ "$(cat /usr/share/perfcached/INSTALL-MODE)" = package ] || fail "INSTALL-MODE"
 	id perfcached > /dev/null 2>&1 && id perfcached-dashboard > /dev/null 2>&1 || fail "the accounts"

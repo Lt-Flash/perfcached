@@ -1,17 +1,5 @@
-/* resppubsubtest.c - the RESP door's pub/sub (resppubsub.c; the 0.7.2
- * split, wave 1), the engine stubbed: every reply byte for byte.
- *
- *   A  SUBSCRIBE: one confirmation per channel with the running count; no
- *      channel, or a name the engine refuses, is an error
- *   B  PSUBSCRIBE: channels and patterns counted together, as Redis does
- *   C  UNSUBSCRIBE by name; with no name every channel goes, one
- *      confirmation each with what is left; PUNSUBSCRIBE likewise for
- *      patterns, and a bare nil confirmation when there is none
- *   D  PUBLISH: the receivers counted, the reserved __pc. prefix refused,
- *      the arity checked
- *   E  PUBSUB CHANNELS / NUMSUB / NUMPAT, and an unknown subcommand counted
- *      (S165) and refused
- */
+/* resppubsubtest.c - the RESP door's pub/sub (resppubsub.c) with the engine stubbed: every reply
+ * checked byte for byte. */
 #include <stdio.h>
 #include <string.h>
 #include "json.h"
@@ -23,7 +11,7 @@ static int fails;
 #define CHK(c, ...) do { if (c) printf("  ok   " __VA_ARGS__); \
 	else { printf("  FAIL " __VA_ARGS__); fails++; } printf("\n"); } while (0)
 
-/* ---- the stubs: the engine, a worker, the S165 counter ------------------ */
+/* ---- the stubs: the engine, a worker, the unknown-subcommand counter -------- */
 static struct { char name[64]; size_t len; int pattern; } subs[16];
 static int nsubs, unk_calls;
 static char pub_chan[64], pub_data[64];
@@ -136,7 +124,7 @@ int main(void)
 {
 	char longname[80];
 
-	/* A */
+	/* A: SUBSCRIBE - a confirmation per channel with the running count; refusals are errors */
 	run(rh_subscribe, "SUBSCRIBE", "a", "b", NULL);
 	CHK(is("*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n"
 		"*3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n"),
@@ -150,12 +138,12 @@ int main(void)
 	CHK(is("-ERR cannot subscribe (out of memory or the name is too long)\r\n"),
 		"A: a name the engine refuses is an error");
 
-	/* B */
+	/* B: PSUBSCRIBE - channels and patterns counted together, as Redis does */
 	run(rh_psubscribe, "PSUBSCRIBE", "n.*", NULL, NULL);
 	CHK(is("*3\r\n$10\r\npsubscribe\r\n$3\r\nn.*\r\n:3\r\n"),
 		"B: PSUBSCRIBE - channels and patterns counted together");
 
-	/* C */
+	/* C: UNSUBSCRIBE / PUNSUBSCRIBE by name and bare, a nil confirmation when none is left */
 	run(rh_unsubscribe, "UNSUBSCRIBE", "a", NULL, NULL);
 	CHK(is("*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:2\r\n"), "C: UNSUBSCRIBE a");
 	run(rh_unsubscribe, "UNSUBSCRIBE", NULL, NULL, NULL);
@@ -168,7 +156,7 @@ int main(void)
 	CHK(is("*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:0\r\n"),
 		"C: and with none left, a bare nil confirmation");
 
-	/* D */
+	/* D: PUBLISH - receivers counted, the reserved __pc. prefix refused, the arity checked */
 	run(rh_publish, "PUBLISH", "ch", "msg", NULL);
 	CHK(is(":2\r\n") && !strcmp(pub_chan, "ch") && !strcmp(pub_data, "msg"),
 		"D: PUBLISH - the receivers counted, channel and message passed");
@@ -179,7 +167,7 @@ int main(void)
 	CHK(is("-ERR wrong number of arguments for 'publish' command\r\n"),
 		"D: PUBLISH without a message refused");
 
-	/* E */
+	/* E: PUBSUB CHANNELS / NUMSUB / NUMPAT, and an unknown subcommand counted and refused */
 	run(rh_pubsub, "PUBSUB", "CHANNELS", NULL, NULL);
 	CHK(is("*2\r\n$4\r\nnews\r\n$6\r\nsports\r\n"), "E: PUBSUB CHANNELS");
 	run(rh_pubsub, "PUBSUB", "NUMSUB", "news", "x");

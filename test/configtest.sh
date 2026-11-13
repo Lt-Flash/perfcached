@@ -1,7 +1,6 @@
 #!/bin/sh
-# configtest.sh — S5 verification: every validation rule proven to REJECT
-# (red fixtures) and a full valid config proven to load (green), plus the
-# secrets-never-printed check on -E.  Usage: test/configtest.sh [./perfcached]
+# configtest.sh - every validation rule proven to REJECT (red fixtures), a full valid config proven
+# to load (green), and secrets never printed by -E.
 set -u
 
 BIN=${1:-./perfcached}
@@ -76,9 +75,8 @@ red() { # red <name> <sed-expr applied to good.conf>  OR heredoc via stdin
 
 red "cluster secret equals a client secret" \
 	's/^cluster = .*/cluster = second-app-secret/'
-# S158 (0.3.8): standalone, the fleet-shaped keys are ACCEPTED, run as
-# store, and named once at WARNING - so a fleet's stanza runs unchanged on
-# a single node.  Green with the warning, where these used to be red.
+# standalone, the fleet-shaped keys are accepted, run as store and named once at WARNING, so a
+# fleet's stanza runs unchanged on a single node
 warned() { # warned <name> <sed-expr applied to good.conf> <warning pattern>
 	sed "$2" "$D/good.conf" > "$D/warn.conf"
 	expect 0 "$1" "$D/warn.conf"
@@ -115,8 +113,8 @@ red "relative unix path" \
 	's|^unix = /run/perfcached.sock|unix = run/perfcached.sock|'
 red "unterminated quote" \
 	's/^client = "app secret with spaces and a # inside"/client = "unterminated/'
-# S158: the cluster secret is optional without a [cluster] section (nothing
-# standalone derives from it) and still required with one
+# the cluster secret is optional without a [cluster] section (nothing standalone derives from it)
+# and still required with one
 sed 's/^cluster = .*//' "$D/good.conf" > "$D/nocs.conf"
 expect 0 "no cluster secret is fine standalone (S158)" "$D/nocs.conf"
 red "no cluster secret with a [cluster] section" <<'EOF'
@@ -139,11 +137,8 @@ red "key outside any section" <<'EOF'
 workers = 4
 EOF
 
-# ---- S99: arena_profile is REFUSED, and the refusal names the key ---------
-# The vendored arena carries a profile global for the HG_MALLOC facade,
-# which this build does not have.  The daemon must not accept the key and
-# silently do nothing with it: an unknown key is an error here, and this
-# pins that arena_profile stays one.
+# ---- arena_profile is REFUSED, and the refusal names the key ---------
+# the vendored arena's profile global serves a facade this build lacks: the key must not be a no-op
 sed 's/^arena_mb = 64/arena_mb = 64\narena_profile = burst/' "$D/good.conf" > "$D/profile.conf"
 "$BIN" -C -f "$D/profile.conf" >"$D/out" 2>&1; rc=$?
 if [ $rc -ne 0 ] && grep -q "arena_profile" "$D/out"; then

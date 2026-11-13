@@ -1,24 +1,5 @@
 #!/bin/sh
-# walfulltest.sh - S466: a WAL that cannot take a write makes the writer
-# wait; it neither loses the record nor refuses writes - and /stats answers
-# meanwhile.
-#
-# Before S466 a full log was a loss: a segment no snapshot had covered was
-# overwritten (wal: FULL) and the node healed (S229), refusing writes until
-# a snapshot landed - measured on 207 with 4 x 1 MB segments: 3,894 of a
-# 40,000-key fill stored, the rest refused.  Under on_full = wait (the
-# default) the pump drains only what the active segment holds and waits for
-# the snapshot it asks for; the rings fill, and a connection that writes is
-# held unread (writer_pauses) while the worker serves its others.
-#   1. on_full = wait, 4 x 1 MB segments, save = off, 40,000 x 1 KB: no
-#      overwrite, no heal, the full-log wait counted, every key stored and
-#      every key back after kill -9 and a restart;
-#   2. the control - the same with on_full = heal - must overwrite, or arm 1
-#      proved nothing;
-#   3. the device slowed (syncfailshim walslow), 4,000 x 4 KB: nothing
-#      dropped, writers held, and /stats on another connection answers in
-#      under a second throughout (207: 8 ms at most; 2.0 s when a waiting
-#      write held the worker, before the pause).
+# walfulltest.sh - a full WAL under on_full = wait holds the writer, loses nothing across kill -9, /stats answers.
 # usage: test/walfulltest.sh [./perfcached] [./pcbench] [./perfcli] [./syncfailshim.so]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -119,7 +100,7 @@ start || exit 1
 sleep 2
 set -- $(wal)
 echo "  heal:     appended=$1 overruns=$3 heals=$4 entries=$7"
-# overwrote, or healed first (GitHub durability, 41297001399: heals 1, overruns 0)
+# overwrote, or healed first
 { [ "$3" -gt 0 ] 2>/dev/null || [ "$4" -gt 0 ] 2>/dev/null; } && grep -qE "wal: (FULL|DROPPED|dropped|healed)" "$D/n.log" \
 	&& ok "2. the control filled the log ($3 overrun(s), $4 heal(s)) - the load fills this log" \
 	|| bad "2. the control never filled the log (overruns $3, heals $4) - arm 1's wait proves nothing on this runner"

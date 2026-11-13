@@ -1,18 +1,6 @@
 #!/bin/sh
-# refusedlogtest.sh - S256: a full arena refuses writes without logging each.
-#
-# carve_chunk() logged "no more memory for a chunk" for EVERY allocation a
-# full arena refused - every refused write - with the arena lock held.  On
-# 223 at 12 workers that serialised the node at 47k refused writes/s, 10 us
-# each (stored writes: 4M/s at 2 us), 38% of the CPU in write() and the
-# futex queue behind the log.  The ceiling is already reported by
-# slot_take(), rate-limited; the carve's line now is too.
-#   - a 16 MB arena filled with 1 KB values until writes are refused
-#   - 20,000 more writes of NEW keys on one connection: every one answered
-#     `cache full`, and the node logs at most 20 chunk-refusal lines for them
-#   - and it still serves a read afterwards
-# Fail-first: rc50 logs one line per refused write (20,000).
-# Usage: test/refusedlogtest.sh [./perfcached]
+# refusedlogtest.sh - a full arena refuses writes without logging each (a per-write line under the arena
+# lock serialised the node): 20,000 refused writes, at most 20 lines, and reads still served.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcrefusedlog.XXXXXX); P1=

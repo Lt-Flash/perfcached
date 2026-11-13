@@ -1,8 +1,6 @@
 #!/bin/sh
-# perfcached-dashboard.service runs User=perfcached-dashboard (12no: its
-# own account, so the client secret in its config is readable by the
-# dashboard alone).  systemd processes /usr/lib/sysusers.d at boot; this
-# creates the account at install time so the unit can be enabled at once.
+# perfcached-dashboard.service runs as its own account, so the client secret in its config is
+# readable by the dashboard alone; create it now so the unit can be enabled at once.
 set -e
 
 case "$1" in

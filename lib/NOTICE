@@ -5,8 +5,9 @@ export uses one third-party library, and a copy or a statically linked
 binary that embodies it must carry this notice with it:
 
 libsodium - https://libsodium.org - used by pc_noise.c for the Noise
-handshake and the channel ciphers.  libsodium is distributed under the
-ISC License.  It is NOT MIT and NOT GPL.
+handshake and the channel ciphers, and by perfd.c to open the pub/sub
+datagrams and to hash and encode a staged upgrade.  libsodium is
+distributed under the ISC License.  It is NOT MIT and NOT GPL.
 
     ISC License
 

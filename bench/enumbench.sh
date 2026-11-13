@@ -1,41 +1,10 @@
 #!/bin/sh
-# enumbench.sh — what enumeration costs, and what it costs EVERYONE ELSE.
-#
-# KEYS and SCAN are the operations S40 exists for: enumeration holds one
-# worker, and the recorded finding (2026-08-30) is that a KEYS pass runs
-# 4.3x slower wall-clock than the same walk offline - latency-only, no
-# corruption.  No benchmark measured it, so the number could not move.
-#
-# This is a SEPARATE bench, not a containerbench arm, on purpose: the
-# matrix there is throughput shapes across four cluster modes and takes
-# the better part of an hour; enumeration is node-local and its
-# interesting number is not throughput but COLLATERAL LATENCY - what
-# happens to ordinary GETs while an enumeration runs.  One node per
-# engine, minutes not hours, same image/network conventions as
-# capacitybench.
-#
-# Three questions, per engine:
-#   1. what does a full KEYS cost, wall-clock?
-#   2. what does a full SCAN sweep cost, at the default COUNT and a
-#      batched one?  (SCAN is the cooperative alternative KEYS is not.)
-#   3. what happens to GET latency while each of those runs in a loop?
-#
-# THE HEADLINE IS EACH ENGINE AGAINST ITSELF - the degradation ratio,
-# baseline GET vs GET-under-enumeration.  Redis is single-threaded and
-# perfcached is not, so absolute cross-engine numbers mix threading
-# models; the ratio does not.
-#
-# Usage:
-#   bench/enumbench.sh
-#   NKEYS=500000 bench/enumbench.sh        # a bigger dataset
-#   ENGINES="perfcached" bench/enumbench.sh
+# enumbench.sh - what KEYS and SCAN cost and what they do to concurrent GET latency, per engine; the
+# headline is each engine against itself (baseline GET vs GET under enumeration), not across engines.
 set -u
 
-# Runtime: RUNTIME=docker|podman|nerdctl, else autodetect.  The same
-# scheme containerbench uses, for the same reason: defaulting to podman
-# on a docker-only host died with "podman: not found" AFTER printing an
-# unrelated build error.  Detection failures must be instant and name
-# the fix.
+# Runtime: RUNTIME=docker|podman|nerdctl, else autodetect, as containerbench does: a detection
+# failure must be instant and name the fix
 RT=${RUNTIME:-}
 if [ -n "$RT" ]; then
 	command -v "$RT" >/dev/null 2>&1 || {
@@ -71,35 +40,22 @@ KEYS_REPS=${KEYS_REPS:-5}
 SCAN_REPS=${SCAN_REPS:-3}
 GET_N=${GET_N:-300000}                 # per GET arm; ~10-15s at P1
 GET_CONNS=${GET_CONNS:-16}
-# Table size for the perfcached collection.  17 gives 131072 buckets -
-# the same density for 100k keys as redis's auto-resized dict, so SCAN
-# sweeps compare like for like.  SCAN's COUNT is BUCKETS VISITED on
-# both engines, so keys-per-call is COUNT x density: an oversized table
-# (the old hardcoded 18) made every sweep pay 2x the round trips and
-# read as "SCAN is 2x slower" when per-call cost was at parity.
+# 2^17 buckets: redis's auto-resized dict density for 100k keys.  SCAN's COUNT is buckets visited on
+# both engines, so an oversized table pays more round trips per sweep.
 BUCKETS_LOG2=${BUCKETS_LOG2:-17}
-# GET arms run this many times; the MEDIAN is reported and the spread
-# printed.  A single 12s sample declared "winners" inside its own noise
-# - four back-to-back runs on one host crowned different engines on
-# the near-parity rows.
+# GET arms run this many times and report the median: a single sample crowned different engines
+# inside its own noise
 GET_REPS=${GET_REPS:-3}
-# NUMA pinning, applied to server, client and load containers alike.
-# On a 2-node host an UNPINNED server lands its arena on whichever node
-# the scheduler fancies, and the client lands near or far by draw - a
-# per-run lottery measured as a monotonic-looking baseline drift.  Pin
-# everything to one node for run-to-run comparability:
-#   CPUSET_CPUS=0-3 CPUSET_MEMS=0 bench/enumbench.sh
+# NUMA pinning for server, client and load containers alike, so the arena and the client do not land
+# near or far by draw: CPUSET_CPUS=0-3 CPUSET_MEMS=0 bench/enumbench.sh
 CPUSET_CPUS=${CPUSET_CPUS:-}
 CPUSET_MEMS=${CPUSET_MEMS:-}
 PIN=""
 [ -n "$CPUSET_CPUS" ] && PIN="$PIN --cpuset-cpus=$CPUSET_CPUS"
 [ -n "$CPUSET_MEMS" ] && PIN="$PIN --cpuset-mems=$CPUSET_MEMS"
 NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-# Two workers is the COMPARISON default, not deployment advice: S45
-# re-measured scaling at 5.8x by eight workers, so deploy to cores.
-# Here W=2 keeps the engine-vs-itself degradation story conservative -
-# with many workers a parked walk barely dents the aggregate and the
-# stall ratio would flatter us.
+# two workers is the comparison default, not deployment advice: with many workers a parked walk
+# barely dents the aggregate and the stall ratio would flatter us
 WORKERS=${WORKERS:-2}
 D=${D:-/var/tmp/enumbench}
 
@@ -121,8 +77,7 @@ build_img -f bench/Containerfile.debian \
 	say "image build FAILED ($RT) - see $D/build.log"
 	tail -8 "$D/build.log" >&2; exit 1; }
 cleanup
-# docker's mtu option has a different name, and its --opt mtu= is
-# SILENTLY IGNORED - containerbench found that out the hard way
+# docker's mtu option has a different name, and its --opt mtu= is SILENTLY IGNORED
 case "$RT" in
 docker) MTUOPT="com.docker.network.driver.mtu=9000" ;;
 *)      MTUOPT="mtu=9000" ;;
@@ -214,8 +169,7 @@ log_level = notice
 arena_mb = 512
 [secrets]
 client = $SECRET
-# required even with no [cluster] section - the daemon refuses to start
-# without one.  Third harness bitten by this; see clustermaptest.
+# required even with no [cluster] section - the daemon refuses to start without one
 cluster = enum-cluster-secret
 [listen]
 tcp = 0.0.0.0:6479
@@ -275,11 +229,8 @@ CFG
 		say "  not comparable; see $D/$eng.fill"
 	fi
 
-	# ---- 0. INTEGRITY, before any clock runs.  Every historical
-	# keys_full row - months of x2-3 "wins" - timed a "-ERR reply too
-	# large" TRUNCATION, not an answer: the timer never looked at what
-	# came back.  An arm that cannot verify its reply must not report
-	# a number (the instruments-false-green lesson, again).
+	# ---- 0. INTEGRITY, before any clock runs: an arm that cannot verify its reply reports no number
+	# (a "-ERR reply too large" truncation is not a KEYS pass)
 	kfirst=$(rcli KEYS "*" 2>&1 | head -1 | cut -c1-40)
 	kcount=$(rcli KEYS "*" 2>/dev/null | grep -c "key:")
 	if [ "${kcount:-0}" -ne "$NKEYS" ]; then
@@ -339,9 +290,7 @@ say "=== results ($OUT) ==="
 cat "$OUT"
 
 # ---- the ratio table: milliseconds do not read, multipliers do -------
-# One direction throughout: >1.0 means perfcached is better, for the
-# latency rows as much as the throughput rows.  Only printed when both
-# engines produced rows - a single-engine run has nothing to compare.
+# >1.0 means perfcached is better on every row; printed only when both engines produced rows
 awk -F"\t" '
 NR > 2 && NF >= 3 { v[$1 "." $2] = $3 }
 function have(m) { return ("perfcached." m in v) && ("redis." m in v) }

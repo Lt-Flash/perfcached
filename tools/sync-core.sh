@@ -1,25 +1,6 @@
 #!/bin/sh
-# sync-core.sh — vendored-core provenance and drift tool.
-#
-# The htable/arena/mem core in src/core/ is vendored from the OpenSIPS
-# cachedb_perf module tree, which remains the upstream truth until this
-# project truly forks. Local modifications to vendored files ARE expected
-# (compat-shim rewiring); this tool exists so upstream fixes are NOTICED,
-# never auto-merged.
-#
-# usage:
-#   tools/sync-core.sh pull     copy manifest files from upstream HEAD,
-#                               stamping a provenance header (initial
-#                               vendoring / deliberate re-sync)
-#   tools/sync-core.sh status   per file: OK (upstream unchanged since the
-#                               recorded commit) or DRIFT
-#   tools/sync-core.sh diff     show the upstream delta (recorded..HEAD)
-#                               for every drifted file
-#
-# environment:
-#   PERFCACHED_UPSTREAM  upstream git worktree
-#                        (default /dn/wt-pullshare-hg)
-#   VENDOR_DIR           vendored-file directory (default src/core)
+# sync-core.sh - provenance and drift of the vendored core in src/core/: upstream fixes are noticed,
+# never auto-merged.  pull = copy from upstream HEAD with a provenance header, status = OK|DRIFT, diff.
 
 set -eu
 

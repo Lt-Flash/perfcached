@@ -1,33 +1,21 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clpend.c - parked requests and the completion queues (M2).  See
- * clpend.h.
- *
- * Every body here came out of cluster.c unchanged; what differs is only
- * how the state is reached (a pointer, not C) and where the clock and
- * the worker id come from (parameters).  Two things the originals did
- * besides touching the table belong to the caller now: the rate-limited
- * shout when the table is full, and adding a timeout to the cluster's
- * pull_timeouts counter.  That is what keeps this file free of LM_* and
- * lets clpendtest link it alone.
- */
+/* clpend.c - parked requests and the completion queues.  See clpend.h.
+ * Logging stays with the caller, so clpendtest links this file alone. */
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "clpend.h"
-#include "compat/timer.h"                /* S351: get_ticks */
-#include "resident.h"                   /* S265 */
+#include "compat/timer.h"                /* get_ticks */
+#include "resident.h"
 
 int clpend_init(struct clpend *p, int cap)
 {
 	int i;
 
-	/* Clamped, not rejected: the ceiling is structural (the slot index
-	 * rides in the request id) and a config that asks for more should
-	 * still start.  The CALLER compares the returned cap with what it
-	 * asked for and says so - this does not log. */
+	/* clamped, not rejected: the ceiling is structural (the slot index rides in the
+	 * request id); the caller compares the returned cap and says so */
 	if (cap <= 0)
 		cap = PEND_DEFAULT;
 	if (cap > PEND_LIMIT)
@@ -38,15 +26,15 @@ int clpend_init(struct clpend *p, int cap)
 	p->pend = calloc((size_t)cap, sizeof *p->pend);
 	if (!p->pend)
 		return 0;
-	/* S265: resident now - slots are taken in turn, so the table was
-	 * faulted in a page at a time as requests walked through it */
+	/* fault it in now: slots are taken in turn, so it would otherwise fault a page
+	 * at a time as requests walk through it */
 	pc_touch_pages(p->pend, (size_t)cap * sizeof *p->pend);
 	p->cap = cap;
 	p->used = 0;
 	p->peak = 0;
 	p->exhausted = 0;
 	p->reconcile_expired = 0;
-	memset(p->used_kind, 0, sizeof p->used_kind);   /* S212 */
+	memset(p->used_kind, 0, sizeof p->used_kind);
 	pthread_mutex_init(&p->mx, NULL);
 	for (i = 0; i < WORKERS_MAX; i++)
 		pthread_mutex_init(&p->cq[i].mx, NULL);
@@ -71,13 +59,8 @@ void clpend_fini(struct clpend *p)
 void clpend_lock(struct clpend *p)   { pthread_mutex_lock(&p->mx); }
 void clpend_unlock(struct clpend *p) { pthread_mutex_unlock(&p->mx); }
 
-/* Free a parked slot.  The ONLY way one is released, so that occupancy
- * is exact: nine sites used to write `req = 0` by hand, and a count
- * maintained across nine sites is a count that drifts.  Idempotent, so
- * releasing an already-free slot cannot double-count - one caller does
- * exactly that ("answered earlier: just free").
- *
- * the lock must be held. */
+/* the ONLY way a slot is released, so occupancy stays exact; idempotent (a
+ * caller frees an answered slot again).  Caller holds the lock. */
 void clpend_release_locked(struct clpend *p, struct pending *slot)
 {
 	if (!slot->req)
@@ -136,17 +119,12 @@ uint32_t clpend_alloc(struct clpend *p, int kind, int expect, int extra_ms,
 		*reason = PC_CLFAIL_BUSY;
 		return 0;
 	}
-	/* Exact occupancy, now that release is the only way out.  This used
-	 * to be the FIRST-FREE INDEX - a lower bound that topped out at
-	 * cap-1, so "peak == max" was unreachable and exhaustion had to
-	 * special-case the number to say "full" at all.  A knob sized from a
-	 * measured peak needs a peak that can be reached. */
+	/* exact occupancy, so the peak can reach cap (a knob is sized from it) */
 	if (++p->used > p->peak)
 		p->peak = p->used;
 	pc_winmax_note(&p->wpeak, get_ticks(), (unsigned long long)p->used);
-	/* Mint the handle from the slot we just took.  The generation is
-	 * the ONLY field that has to survive the memset: it is what makes
-	 * this id different from the last one this slot carried. */
+	/* the generation is the only field that must survive the memset: it makes
+	 * this id differ from the last one this slot carried */
 	gen = (slot->gen + 1) & (PEND_GEN_MASK >> PEND_GEN_SHIFT);
 	if (!gen)
 		gen = 1;
@@ -186,7 +164,7 @@ void clpend_cq_register(struct clpend *p, int worker, int efd)
 	{
 		p->cq[worker].q = calloc((size_t)p->cap,
 			sizeof *p->cq[worker].q);
-		pc_touch_pages(p->cq[worker].q,             /* S265 */
+		pc_touch_pages(p->cq[worker].q,
 			(size_t)p->cap * sizeof *p->cq[worker].q);
 	}
 	p->cq[worker].efd = efd;
@@ -286,14 +264,8 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 	}
 
 	if (s->probe_op && positive) {
-		/* probe-before-place hit: the responsible holder answered -
-		 * TRANSFORM the park into a forward to it.  The same req
-		 * rides the FWD datagram, so the holder's ack completes the
-		 * client's park as FWD_SET/FWD_ADD; answered stays 0 (the
-		 * ack path and the expiry refusal both key on it),
-		 * probe_fwd routes any stray second positive to the
-		 * demoter, and the huge expect keeps stray negatives from
-		 * freeing the slot under the ack. */
+		/* probe hit: the park becomes a FWD to the holder (same req); answered
+		 * stays 0 and expect is huge, so only the holder's ack frees the slot */
 		out->probe_op = s->probe_op;
 		out->stash = s->stash;
 		out->stash_len = s->stash_len;
@@ -306,21 +278,17 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 		out->klen = s->klen;
 
 		if (s->kind >= 0 && s->kind < 16 && p->used_kind[s->kind] > 0)
-			p->used_kind[s->kind]--;          /* S212: the gauge follows */
+			p->used_kind[s->kind]--;          /* the gauge follows */
 		s->kind = s->probe_op == 2 ? PC_DONE_FWD_ADD
 			: s->probe_op == 3 ? PC_DONE_FWD_TOUCH
 			: s->probe_op == 4 ? PC_DONE_FWD_DEL : PC_DONE_FWD_SET;
 		p->used_kind[s->kind]++;
 		out->kind = s->kind;
 		s->first_node = from_node;
-		/* RV-11: and at WHICH version, so a second holder answering
-		 * with the same record reads as SAME below.  Without it every
-		 * later positive fell into the conflict arm - harmless while
-		 * only proxy probed (one holder), a demote of a healthy
-		 * replica once eager does, where every node answering yes is
-		 * the normal state. */
+		/* and at which version, so a second holder of the same record reads
+		 * as SAME below, not as a conflict that demotes a healthy replica */
 		s->first_ver = ver;
-		s->first_sum = vsum;               /* S439 */
+		s->first_sum = vsum;
 		s->probe_op = 0;
 		s->probe_fwd = 1;
 		s->stash = NULL;
@@ -340,24 +308,10 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 			s->answered = 1;
 			s->first_node = from_node;
 			s->first_ver = ver;
-			s->first_sum = vsum;           /* S439 */
+			s->first_sum = vsum;
 			if (s->kind == PC_DONE_POSSESS) {
-				/*
-				 * S146.  A holder says it HAS the record.
-				 * That is the only fact that may authorise
-				 * dropping our surplus copy: liveness of the
-				 * K-set says the holders are reachable, never
-				 * that they were actually sent this record,
-				 * and reclaim was losing last copies on
-				 * exactly that gap.
-				 *
-				 * One yes is enough.  It proves the record
-				 * survives our delete; it does not prove the
-				 * fleet is back at K, and it does not need to
-				 * - repair is what restores K and runs
-				 * anyway.  Waiting for K-1 answers would
-				 * block the common case on the slowest peer.
-				 */
+				/* only a holder that HAS the record may authorise dropping our
+				 * copy (liveness proves nothing); one yes is enough, repair restores K */
 				memcpy(out->col, s->col, s->collen);
 				out->collen = s->collen;
 				memcpy(out->key, s->key, s->klen);
@@ -365,8 +319,7 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 				clpend_release_locked(p, s);
 				r = CLPEND_ANS_POSSESS;
 			} else {
-				/* S238: the key, so the receiver can check it
-				 * against a retained tombstone */
+				/* the key, for the receiver's retained-tombstone check */
 				memcpy(out->col, s->col, s->collen);
 				out->collen = s->collen;
 				memcpy(out->key, s->key, s->klen);
@@ -377,59 +330,22 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 			}
 		} else if (ver && s->first_ver && ver == s->first_ver &&
 		           (!vsum || !s->first_sum || vsum == s->first_sum)) {
-			/*
-			 * SAME RECORD, NOT A RACE.
-			 *
-			 * Two holders answering is the NORMAL state in eager
-			 * mode - every key is on every node by design - so
-			 * "a second positive arrived" cannot by itself mean
-			 * the two nodes disagree.  Demoting on that alone
-			 * destroys redundancy exactly when a fleet needs it:
-			 * after a simultaneous cold restart every node
-			 * recovers the same keyspace from its own RDB, every
-			 * reconcile probe draws two positives, and all but
-			 * one node sheds its copy.  Measured on 245-247 on
-			 * 2026-09-14 upgrading 0.3.5 -> 0.3.7-rc4: two of
-			 * three nodes went from 1988 records to ~425, and it
-			 * did NOT heal, because the eager sweep re-sends only
-			 * what a node AUTHORED.
-			 *
-			 * Equal versions mean the same write - when the bytes
-			 * agree too (S439).  A version is a Lamport count
-			 * with no writer in it: two nodes cut from each other
-			 * write from the same clock and can stamp DIFFERENT
-			 * writes with one version.  Taken for the same write,
-			 * that fork was never detected and never healed
-			 * (splitbraintest, its first CI run, 2026-10-23; it
-			 * last passed 2026-09-02, before this rule).  An
-			 * answer without the value (vsum 0) proves nothing
-			 * either way and keeps the old reading.
-			 */
+			/* same record, not a race (eager: every key on every node); equal
+			 * versions are one write only if the bytes agree too, vsum 0 cannot tell */
 			if (--s->expect <= 0)
 				clpend_release_locked(p, s);
 			r = CLPEND_ANS_SAME;
 		} else {
-			/*
-			 * A GENUINE conflict: two holders at DIFFERENT
-			 * versions, or a peer too old to tell us its version.
-			 * The NEWER version wins - it is the later write, and
-			 * that is a property of the data rather than of which
-			 * node id happens to be smaller.  Ties, and the
-			 * unknown-version case, fall back to the lower id so
-			 * every node still reaches the same answer.  S439: an
-			 * equal version (different bytes) IS a tie - it used to
-			 * read "first not older", so the winner was whichever
-			 * answer came first, and two askers could demote
-			 * different copies.
-			 */
+			/* a conflict: the newer version (the later write) wins; a tie (same
+			 * version, other bytes) or an unknown version goes to the lower id */
 			int older_first = ver && s->first_ver && ver != s->first_ver
 				? s->first_ver < ver
 				: s->first_node > from_node;
 
 			out->winner = older_first ? from_node : s->first_node;
 			out->loser  = older_first ? s->first_node : from_node;
-			/* CH-16: the copy the demote is for - unknown (0)
-			 * unless both answers said their version */
+			/* the copy the demote is for - unknown (0) unless both answers said
+			 * their version */
 			out->loser_ver = ver && s->first_ver
 				? (older_first ? s->first_ver : ver) : 0;
 			memcpy(out->col, s->col, s->collen);
@@ -457,9 +373,8 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 			s->stash = NULL;
 			r = CLPEND_ANS_RESUME;
 		} else if (s->kind == PC_DONE_RECONCILE) {
-			/* nobody in the fleet has this key, and in eager mode
-			 * everyone holds everything - so it was DELETED while
-			 * this node was down and replay brought it back. */
+			/* nobody has the key, and eager mode puts every key everywhere: it was
+			 * DELETED while this node was down and replay brought it back */
 			memcpy(out->col, s->col, s->collen);
 			out->collen = s->collen;
 			memcpy(out->key, s->key, s->klen);

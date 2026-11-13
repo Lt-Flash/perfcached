@@ -1,15 +1,5 @@
-/*
- * keysnative — time the `keys` verb over the NATIVE dialect.
- *
- * Every enumeration figure so far came through the RESP door, where
- * reply encoding is a large share of the storm and dilutes whatever the
- * table walk costs.  libperfd is the client this project actually
- * promotes, so the walk's share - and therefore what a walk optimisation
- * is worth - has to be measured here too: perfd_keys rides the CMD
- * `keys` method, a tree of bulks back (S317).
- *
- * usage: keysnative <host> <port> <secret|-> <col> <limit> <reps>
- */
+/* keysnative - time the `keys` verb over the native dialect (no RESP encoding to
+ * dilute the walk).  usage: keysnative <host> <port> <secret|-> <col> <limit> <reps> */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,8 +1,6 @@
 #!/bin/sh
-# daemontest.sh — S6 verification: the daemon starts, accepts on TCP and
-# UNIX listeners from every worker, spawns the expected thread set,
-# refuses a second instance, and shuts down cleanly on SIGTERM.
-# Red checks prove the probes are not vacuous. Usage: test/daemontest.sh [./perfcached]
+# daemontest.sh - the daemon starts, accepts on TCP and UNIX from every worker, spawns the expected
+# threads, refuses a second instance and stops cleanly on SIGTERM; red checks prove the probes real.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -45,7 +43,7 @@ done
 if grep -q "perfcached ready" "$D/log"; then ok; else
 	bad "daemon never became ready"; cat "$D/log"; exit 1; fi
 
-# TCP accept + a live ping round-trip (S7 contract: connections persist)
+# TCP accept + a live ping round-trip (connections persist)
 if python3 - <<'EOF'
 import json, socket, sys
 import pcnative
@@ -57,9 +55,7 @@ sys.exit(0 if r["result"]["pong"] is True else 1)
 EOF
 then ok; else bad "tcp ping on 16479"; fi
 
-# S111: the close line counts a native connection's requests - CMD
-# frames included (it counted RESP commands only, so every driver link
-# closed with "0 requests")
+# the close line counts a native connection's requests, CMD frames included
 python3 - <<'EOF'
 import json, socket
 import pcnative
@@ -103,12 +99,8 @@ else
 	else bad "second instance failed for the wrong reason"; cat "$D/log2"; fi
 fi
 
-# RED: a second instance sharing only the TCP PORT must also refuse.
-# The check above probes the unix socket, so it sees nothing when the
-# two differ - and TCP listeners set SO_REUSEPORT, so the kernel does
-# not refuse either: the second daemon would silently join the port and
-# answer a share of the connections with its own data and its own
-# cluster view.  This is the door that catches that.
+# RED: a second instance sharing only the TCP PORT must refuse too: the unix-socket probe misses it,
+# and SO_REUSEPORT would let it silently join the port with its own data
 cat > "$D/samesock.conf" <<EOF
 [daemon]
 workers = 1
@@ -125,9 +117,8 @@ plaintext = loopback
 [collection th]
 buckets_log2 = 10
 EOF
-# under `timeout`: if the check ever regresses, the second daemon STARTS
-# and runs forever, and a foreground run would hang the suite instead of
-# failing it.  timeout turns that into a non-zero exit and a red test.
+# under `timeout`: a regressed check lets the second daemon run forever, which must be a red test,
+# not a hang
 if timeout 10 "$BIN" -f "$D/samesock.conf" > "$D/log3" 2>&1; then
 	bad "a second daemon on the same TCP port exited 0 instead of refusing"
 elif grep -q "perfcached ready" "$D/log3"; then

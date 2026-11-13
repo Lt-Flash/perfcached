@@ -1,28 +1,11 @@
 #!/bin/sh
-# pagejstest.sh - S196: RUN the status page's script, do not grep it.
-#
-# S194 defined wq()/wcalls() inside drawCmds() while wmax()/wspan() - both
-# top level - call wq().  Every render then died on
-# `ReferenceError: wq is not defined` in the row loop, before the table was
-# written.  get() wraps the WHOLE callback in try/catch and reports a failed
-# callback as a failed fetch, so the page said "this node did not answer" and
-# nobody saw the real error for a day.  Every page assertion in this suite
-# until now was a grep for a substring, and a substring cannot tell you a
-# function is out of scope.
-#
-# This drives the real page against the daemon's own /stats with a stub DOM,
-# and asserts what a browser would see.  The engine (S426, 0.7.1): node's vm
-# (test/jsctx.py) - the runners' nodejs - or js2py where node is not.  Until
-# 0.7.1 it was js2py only, the runners had none, and the suite skipped in
-# every pipeline; on a CI runner a missing engine now FAILS it.
-# Usage: test/pagejstest.sh [./perfcached]
+# pagejstest.sh - runs the status page's script against the daemon's /stats with a stub DOM (node's
+# vm or js2py, test/jsctx.py) and asserts what a browser would see.  Usage: test/pagejstest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
-# S426: node (the runners' nodejs) or js2py - test/jsctx.py.  On a CI runner
-# (CI set, as GitLab and GitHub set it) no engine is a FAILURE: a skip there
-# is how the page's script went unexecuted in every pipeline until 0.7.1.
+# on a CI runner (CI set) no engine is a failure: a skip there leaves the page's script unexecuted
 ENGINE=$(python3 -c "import jsctx; print(jsctx.available() or '')" 2>/dev/null)
 if [ -z "$ENGINE" ]; then
 	if [ -n "${CI:-}" ]; then
@@ -100,7 +83,7 @@ def jreq(method, params, rid=[0]):
     return json.loads(jf.readline())
 for i in range(12): jreq("get", {"col": "0", "key": "k%d" % i})
 
-# S407 part 3: the daemon serves no page; its bytes come from ./pagedump (the dashboard's object)
+# the daemon serves no page; its bytes come from ./pagedump (the dashboard's object)
 import subprocess
 page = subprocess.check_output([os.environ.get("PAGEDUMP", "./pagedump")]).decode("utf-8", "replace")
 stats = urllib.request.urlopen("http://127.0.0.1:17805/stats", timeout=10).read().decode()
@@ -148,9 +131,8 @@ except Exception as e:
     loaded = str(e)[:200]
 (ok if loaded is None else bad)("the page's script loads without throwing (%s)" % (loaded or "clean"))
 
-# The renderer is called DIRECTLY: get() catches everything the callback
-# throws and turns it into "this node did not answer", so a render error is
-# invisible through the polling path.  That is the bug this suite exists for.
+# the renderer is called DIRECTLY: get() turns anything the callback throws into
+# "this node did not answer", hiding a render error from the polling path
 ctx.execute("__touched=[]; var __e=null;"
             "try{ drawStats(JSON.parse(__DATA['stats'])); }"
             "catch(e){ __e=(e&&e.name?e.name+': ':'')+(e&&e.message?e.message:String(e)); }")
@@ -160,13 +142,8 @@ err = ctx.eval("__e")
 if err:
     print("       last elements touched: %s" % ctx.eval("__touched.slice(-6).join(',')"))
 
-# S426 (0.7.1): the page UNDER THE DASHBOARD.  The tool sets TOOL from
-# /session and draws the fleet table from /fleet; what the fleet table calls
-# must be in its scope.  12nx defined dfull() beside entc() - inside the
-# collections' scope - and drawFleetTab (top level) threw 'dfull is not
-# defined' on every redraw of a live dashboard (245, 2026-10-19); no grep
-# of the page could see it.  /fleet's shape, from this node's own figures,
-# with a store-mode estimate for every collection.
+# the page under the dashboard: TOOL comes from /session and the fleet table from /fleet,
+# so what the fleet table calls must be in its scope; /fleet built from this node's figures
 sd = json.loads(stats); md = json.loads(members)
 cols = [{"name": c["name"], "entries": c.get("entries", 0)} for c in sd.get("collections", [])]
 mlist = md.get("members", []) or [{"node": 1, "addr": "127.0.0.1", "port": 17806}]
@@ -191,11 +168,8 @@ cl = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
     % (err or "clean", "drawn" if "class=mtog" in cl else "MISSING"))
 ctx.execute("TOOL=null; FLM=null; FLD=null;")    # the daemon's own page for what follows
 
-# The header alarm: an operator must see a host in trouble without
-# scrolling to the fleet.  This node's state blinks as its card would, and
-# a chip beside it names the OTHER hosts in trouble, worst first, at the
-# cards' colours (failed red, any other state but ready amber, a member
-# that went silent amber, one that said goodbye calm).
+# the header alarm: this node's state blinks as its card would, and a chip names the
+# OTHER hosts in trouble, worst first, in the cards' colours
 def hal(members):
     ctx.execute("__e=null; try{ drawFleet(%s); }catch(e){ __e=String(e); }" % json.dumps(members))
     return (ctx.eval("__els['hal']?__els['hal'].hidden:null"),
@@ -221,9 +195,8 @@ h = hal([mem(1, "failed", True), mem(2, "ready")])
 h = hal([mem(1, "ready", True), mem(2, "gone", gr="goodbye"), mem(3, "gone", gr="silent")])
 (ok if not h[0] and h[1] == "hal amber" and "node 3 silent" in h[2] and "node 2" not in h[2] else bad)(
     "a member that said goodbye is calm, one that went silent is amber (%s)" % (h,))
-# S428 (0.7.1; PROD 2026-10-20: "node cards not blinking again while at the
-# top warning blinking fine"): a member holding a fleet setting differently
-# from this node blinks amber, as an older build does - not only its foot text
+# a member holding a fleet setting differently from this node blinks amber, as an
+# older build does - not only its foot text
 cfm = dict(mem(2, "ready")); cfm["config_differs"] = ["tombstone_retain_s / _max"]
 ctx.execute("__e=null; try{ drawFleet(%s); }catch(e){ __e=String(e); }" % json.dumps([mem(1, "ready", True), cfm, mem(3, "ready")]))
 fh = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
@@ -234,10 +207,8 @@ c2 = re.search(r'class="node ready([^"]*)" title="node 2 ', fh); c3 = re.search(
     % (c2.group(1) if c2 else None, c3.group(1) if c3 else None))
 h = hal([mem(1, "ready", True)] + [mem(n, "failed") for n in range(2, 8)])
 (ok if not h[0] and "+3 more" in h[2] else bad)("six in trouble: three named, '+3 more' (%s)" % (h[2],))
-# S341: the fleet COUNT beside the chip - members ready of the fleet's
-# size.  PROD 2026-10-07: "this status never changes when some of the nodes
-# are missing or recovering" - a member that left is calm in the S335 chip
-# and one missing from the list is in no chip at all.
+# the fleet COUNT beside the chip - members ready of the fleet's size: a member that left
+# is calm in the chip, and one missing from the list is in no chip at all
 def hfl(members, fl=None):
     ctx.execute("FLINFO=%s; __e=null; try{ drawFleet(%s); }catch(e){ __e=String(e); }"
                 % (json.dumps(fl), json.dumps(members)))
@@ -282,7 +253,7 @@ def state_cls(state):
     "this node healing: the header state blinks amber (%s)" % (state_cls("healing"),))
 (ok if state_cls("ready") == ("hstate", None) else bad)(
     "this node ready: the header state is calm (%s)" % (state_cls("ready"),))
-# S357: a debug or sanitizer build is marked beside the version; a release
+# a debug or sanitizer build is marked beside the version; a release
 # build (the live /stats here) carries no mark
 def flav(build):
     st = json.loads(stats); pr = dict(st.get("process") or {})
@@ -294,7 +265,7 @@ def flav(build):
     mm = re.search(r'<span class="bflav"[^>]*>build <b>([^<]*)</b></span>', h)
     return (mm.group(1) if mm else None), ctx.eval("__e")
 # the flavor this binary was built as - its -V names a debug or asan build,
-# a release one names none (S357) - so check-asan's run expects "asan"
+# a release one names none - so check-asan's run expects "asan"
 _v = os.environ.get("PCJS_V", "")
 built = "asan" if "asan" in _v else "debug" if "debug" in _v else "release"
 (ok if json.loads(stats).get("process", {}).get("build") == built and flav("release") == (None, None) else bad)(
@@ -304,9 +275,8 @@ built = "asan" if "asan" in _v else "debug" if "debug" in _v else "release"
     "S357: an asan or debug build is marked 'build asan' / 'build debug' beside the version (%s, %s)" % (flav("asan"), flav("debug")))
 (ok if flav(None) == (None, None) else bad)(
     "S357: an older daemon without process.build: no mark (%s)" % (flav(None),))
-# S352c: where this node's alerts go by mail, in the header's node bits -
-# "this node", "via node N" (relayed to the elected mailer), "none"; nothing
-# from a daemon without alerts
+# where this node's alerts go by mail, in the header's node bits: "this node", "via
+# node N" (relayed to the elected mailer) or "none"; nothing from a daemon without alerts
 def mailbit(mailer):
     st = json.loads(stats)
     if mailer is None: st.pop("alerts", None)
@@ -321,10 +291,8 @@ def mailbit(mailer):
 (ok if mailbit(None) == (None, None) else bad)("S352c: a daemon without alerts: no mail bit (%s)" % (mailbit(None),))
 (ok if json.loads(stats).get("alerts", {}).get("mailer") == "none" and mailbit(json.loads(stats)["alerts"]["mailer"])[0] == "none" else bad)(
     "S352c: the live daemon, no [mail] and no fleet: mail none (%s)" % (json.loads(stats).get("alerts", {}).get("mailer"),))
-# 0.5.7.1: this node's reconcile beside its state - RED while it has no live
-# witness (restart THIS node), AMBER while a peer's reconcile has this node as
-# its last witness (do not restart it); and another member with no witness
-# in the fleet chip, amber
+# this node's reconcile beside its state: red with no live witness, amber while it is a
+# peer's last witness; another member with no witness goes in the fleet chip, amber
 def rec_chip(cl):
     st = json.loads(stats); c0 = dict(st.get("cluster") or {}); c0.update(cl); st["cluster"] = c0; st["state"] = "ready"
     ctx.execute("__e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(st))
@@ -343,24 +311,22 @@ m3 = mem(3, "ready"); m3["reconciling"] = True; m3["sole_witness"] = 1
 h = hal([mem(1, "ready", True), m2, m3])
 (ok if not h[0] and h[1] == "hal amber" and "node 2 reconcile has no witness" in h[2] and "node 3" not in h[2] else bad)(
     "0.5.7.1: a member whose reconcile has no witness is named in the fleet chip, amber; one with a witness is not (%s)" % (h,))
-# S388: and its CARD blinks red and says why (PROD 2026-10-13: the header and the chip said it, the card
-# read READY / BACKUP); one reconciling with a witness says so, calmly
+# and its CARD blinks red and says why; one reconciling with a witness says so, calmly
 fh = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
 c2 = re.search(r'class="node ready nowit"[^>]*>(.*?)</a>', fh, re.S)
 c3 = re.search(r'title="node 3[^"]*"[^>]*>(.*?)</a>', fh, re.S)
 (ok if c2 and "reconcile has no witness" in c2.group(1) and c3 and "reconciling after its restart" in c3.group(1)
     and "nowit" not in (c3.group(0)[:200] if c3 else "") else bad)(
     "S388: the card of a member whose reconcile has no witness blinks (nowit) and says to restart it; one with a witness says reconciling")
-# S390 (PROD 2026-10-13: "then that node's card should blink amber"): the one reconciling WITH a witness
-# blinks amber (attn) - not red, not twice; a ready member with no pass open stays calm
+# the one reconciling WITH a witness blinks amber (attn) - not red, not twice; a ready
+# member with no pass open stays calm
 (ok if 'class="node ready attn"' in fh and fh.count(' attn') == 1 and 'class="node ready nowit"' in fh
     and not re.search(r'class="node ready attn"[^>]*title="node 2', fh)
     and re.search(r'class="node ready attn"[^>]*title="node 3', fh) else bad)(
     "S390: the member reconciling with a witness blinks amber (attn); the one with no witness red only; the rest calm (%s)"
     % re.findall(r'class="(node [^"]*)"[^>]*title="(node \d+)', fh))
-# UP1 (the operator, 2026-10-15, a roll on 245-247: the header blinks on mixed versions "but node cards are
-# not"): a member on an OLDER build than the fleet's newest blinks amber and says which build it runs;
-# the newest and a member without a version (before 0.6.5) stay calm; the compare is numeric (0.6.10 > 0.6.9)
+# a member on an OLDER build than the fleet's newest blinks amber and names its build; the
+# newest and a member without a version stay calm; the compare is numeric (0.6.10 > 0.6.9)
 def vm(n, v, me=False):
     d = mem(n, "ready", me); d["version"] = v; return d
 h = hal([vm(1, "0.6.6", True), vm(2, "0.6.5"), vm(3, "0.6.6")])
@@ -377,7 +343,7 @@ hal([vm(1, "0.6.10", True), vm(2, "0.6.9")])
 fh = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
 (ok if re.search(r'class="node ready attn"[^>]*title="node 2', fh) and "newest in the fleet is v0.6.10" in fh else bad)(
     "UP1: 0.6.10 is newer than 0.6.9 - the compare is numeric, not textual")
-# S395: this node's own card says how far its walk has got; the reconcile row says it too, open,
+# this node's own card says how far its walk has got; the reconcile row says it too, open,
 # and after a fast path what the witness replayed
 def all_html():
     return ctx.eval("Object.keys(__els).map(function(k){return __els[k].innerHTML||'';}).join(' ')") or ""
@@ -402,7 +368,7 @@ h6 = all_html()
 (ok if not ctx.eval("__e") and "2.3 s \N{MIDDLE DOT} fast path: 4812 deletes and expiries replayed by a witness" in h6 else bad)(
     "S392: after a fast path the reconcile row says how long and what the witness replayed")
 
-# UP1: the card names each member's build; more than one build among the live members is an amber
+# the card names each member's build; more than one build among the live members is an amber
 # header chip naming them (an upgrade in progress)
 v1 = mem(1, "ready", True); v1["version"] = "0.6.5"; v1["wire_epochs"] = [2, 2]
 v2 = mem(2, "ready"); v2["version"] = "0.6.5"; v2["wire_epochs"] = [2, 2]
@@ -416,10 +382,8 @@ v3["version"] = "0.6.5"
 h = hal([v1, v2, v3])
 (ok if "mixed versions" not in (h[2] or "") else bad)("UP1: one build - no versions chip (%s)" % (h,))
 
-# S264: the clients card.  Its chips add up to the open figure, and the
-# connection limit - derived from the descriptor limit, 524,165 on the
-# test fleet - is not a chip beside the dialects ("max 524,165" read as a
-# peak) unless it matters.
+# the clients card: its chips add up to the open figure, and the connection limit is
+# not a chip beside the dialects (it would read as a peak) unless it matters
 def clients_card(st):
     ctx.execute("__e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(st))
     mh = ctx.eval("__els['metrics']?__els['metrics'].innerHTML:''") or ""
@@ -441,10 +405,8 @@ chips, e = clients_card(held)
     "three connections with no request yet read 'idle 3', and the chips still add up (%s)" % re.sub(r"<[^>]*>", " ", chips).strip())
 (ok if re.search(r"var\(--bad\)[^>]*>limit ", chips) else bad)(
     "at the limit, the limit is on the card in the colour of trouble")
-# S366: refusals at the memory floor are inside clients.refused.  The floor
-# gets its own chip - in the colour of trouble, its figures in the hover -
-# and the limit chip counts only the limit's own refusals, so a node far
-# from max_clients does not read "limit 136,696 - 7 refused".
+# refusals at the memory floor are inside clients.refused: the floor gets its own chip
+# (trouble colour, figures in the hover) and the limit chip counts only its own refusals
 mg = json.loads(stats)
 mg["clients"]["refused"] = 7; mg["clients"]["win_refused"] = 7
 mg["clients"]["memory"] = {"guard": True, "refusing": True, "refused": 7, "win_refused": 7,
@@ -463,7 +425,7 @@ chips, e = clients_card(mg)
 
 html = ctx.eval("__els['cmds']?__els['cmds'].innerHTML:''") or ""
 rows = html.count("<tr")
-# S197: the rows are the verbs the WINDOW saw - the daemon is seconds
+# the rows are the verbs the WINDOW saw - the daemon is seconds
 # old here, so that is every verb called - and nothing else
 live = [c for c in json.loads(stats).get("commands", []) if c.get("win_calls", 0) > 0]
 (ok if rows == len(live) and rows > 1 else bad)(
@@ -473,12 +435,11 @@ live = [c for c in json.loads(stats).get("commands", []) if c.get("win_calls", 0
 (ok if re.search(r"get</td>|>get<", html) or "get" in html else bad)(
     "the RESP get is among them")
 
-# S189's convention, on every surface that names a command: a CMD request
-# is the row cmd:<method>, drawn as "get (cmd)" (S317); a RESP name is bare
+# on every surface that names a command, a CMD request is the row cmd:<method>, drawn
+# as "get (cmd)"; a RESP name is bare
 plane = ctx.eval("__els['plane']?__els['plane'].innerHTML:''") or ""
-# 0.6.2: "commands - by calls" left the plane - the commands table sorts by
-# calls on a click of its header, names each verb with its dialect as it
-# always has, and folds to the busiest verb then
+# the commands table sorts by calls on a click of its header, names each verb with its
+# dialect, and folds to the busiest verb then
 cm_live = [c for c in json.loads(stats).get("commands", []) if c.get("win_calls", 0) > 0]
 try:
     ctx.execute("CMDSORT='calls'; cmdshow();")
@@ -504,11 +465,8 @@ def slow_sec(sl):
     st = json.loads(stats); st["slowlog"] = sl
     ctx.execute("__els['slow']&&(__els['slow'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(st))
     return (ctx.eval("__els['slow']?__els['slow'].innerHTML:''") or "", ctx.eval("__els['sltog'].textContent") or "", ctx.eval("__e"))
-# the page says "ago" from Date.now(), the clock at drawing time - not the
-# stats document's "time", which is as old as the document: on a slow
-# runner the entry stamped 30 s before that no longer read "30s ago"
-# (GitHub 39901305198 check-standalone).  Stamped from the clock now, and
-# 30-32 s allowed for the drawing itself
+# the page says "ago" from Date.now() at drawing time, not the stats document's "time":
+# stamped from the clock now, with 30-32 s allowed for the drawing itself
 _now = int(__import__("time").time())
 sh, sll, se = slow_sec([{"ts": _now - 30, "usec": 12500, "argv": ["SET", "k<b>1</b>", "v"], "addr": "10.1.1.1:5000", "name": "app"},
                         {"ts": _now - 90, "usec": 2100, "argv": ["GET", "k2"], "addr": "10.1.1.2:5001"},
@@ -527,12 +485,8 @@ sh, sll, se = slow_sec([])
 (ok if re.search(r'<div class="stk"><div class="pc"><h3>memory</h3>.*?</div></div>'
                  r'<div class="pc"><h3>backpressure</h3>', plane, re.S) else bad)(
     "memory and backpressure share one stacked cell")
-# ... and so do the rest of the short cards, from the GROUPS table: every
-# group is ONE cell holding its cards in the table's order, and no card was
-# lost or doubled by the regrouping.  The cells are read off the page's own
-# table, not written down here: S317 took 'native - json' off the page and
-# with it the table's one trio, and a test that still wanted a trio failed
-# on every page since (the DOM half only runs where js2py is, never in CI)
+# ... and so do the rest of the short cards, from the GROUPS table read off the page:
+# every group is ONE cell holding its cards in order, none lost or doubled
 titles = re.findall(r"<h3>(.*?)</h3>", plane)
 (ok if len(titles) >= 18 and len(set(titles)) == len(titles) else bad)(
     "every card is on the plane exactly once after the regrouping (%d cards, %d distinct)"
@@ -551,9 +505,8 @@ missing = sorted(set(t for g in groups for t in g) - set(titles))
     % (len(got), [len(c) for c in got], len(groups),
        "; not on the plane: %s" % missing if missing else
        "" if got == want else "; got %s" % got))
-# the table has no trio today, so the page is run again with one: a trio
-# is one cell of three, a title that is not on the plane is skipped, a
-# group left with one card draws it bare, and every card is still there once
+# the page again with a trio: one cell of three, a title not on the plane skipped,
+# a group left with one card drawn bare, and every card still there once
 p3, e3 = "", "no GROUPS table in the script"
 if gm:
     c3 = js2py.EvalJs()
@@ -596,17 +549,13 @@ label2 = ctx.eval("__els['cmdtog'].textContent") or ""
     "an empty window renders one placeholder row that says so (%s)" % (err2 or html2[:60]))
 (ok if label2 == "nothing in the last 5 min" else bad)(
     "and the fold label agrees (%r)" % label2)
-# S340: a read-through collection gets its own line under its row - what the
-# upstream answered (fetched found/absent, from fetched copies, absent from
-# the negative cache, copies held), which the row's counters cannot say.
-# PROD 2026-10-07: prod-redis read 0 hits while the SBC blocked devices
-# from keys it had read through.  A plain collection gets no such line, and
-# the upstream's host is text, never markup.
+# a read-through collection gets its own line under its row - what the upstream answered;
+# a plain collection gets none, and the upstream's host is text, never markup
 rt = json.loads(stats)
 cs = rt.get("collections", [])
 (ok if cs else bad)("the live /stats has a collection to dress as read-through (%d)" % len(cs))
 if cs:
-    # S351: the line is the last five minutes - the daemon's win_ figures,
+    # the line is the last five minutes - the daemon's win_ figures,
     # set apart from the lifetime totals so the test can tell which it read
     cs[0]["upstream"] = {"host": "10.9.9.13<img src=x onerror=x()>", "port": 6379, "tracking": True,
                          "fetches": 91000, "absent": 90990, "fill_string": 10, "fill_hash": 0, "fill_json": 0,
@@ -631,7 +580,7 @@ if cs:
     (ok if u and not miss else bad)("the line adds up: 25 with a value + 4,000 absent = 4,025 lookups, 1,000 of them fetched (missing: %s)"
                                     % (miss or "none"))
     (ok if u and "<img" not in u and "&lt;img" in u else bad)("the upstream host is escaped, not markup (%s)" % u[:120])
-    # ST2: EXISTS / TTL / TYPE answered by a PRESENT mark are lookups too,
+    # EXISTS / TTL / TYPE answered by a PRESENT mark are lookups too,
     # and a key found present (no value read) is found
     cs[0]["upstream"]["win_present_hits"] = 300; cs[0]["upstream"]["win_fill_present"] = 5
     ctx.execute("__els['cols']&&(__els['cols'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(rt))
@@ -640,20 +589,18 @@ if cs:
     miss3 = [w for w in want3 if w not in u3]
     (ok if u3 and not miss3 else bad)("ST2: 25 + 300 present + 4,000 absent = 4,325 lookups; 15 found counts the 5 found present (missing: %s)" % (miss3 or "none"))
     del cs[0]["upstream"]["win_present_hits"]; del cs[0]["upstream"]["win_fill_present"]
-    # S348: a collection that refuses writes says so on its line, with what
+    # a collection that refuses writes says so on its line, with what
     # it refused in the window
     cs[0]["upstream"]["writes"] = "refuse"; cs[0]["upstream"]["win_writes_refused"] = 14
     ctx.execute("__els['cols']&&(__els['cols'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(rt))
     u2 = (re.findall(r"<tr class=up>.*?</tr>", ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or "") or [""])[0]
     (ok if "<b>read-only</b> (14 writes refused)" in u2 else bad)("a read-only read-through says so: read-only (14 writes refused) (%s)" % u2[:160])
-# S347: the headline hit rate is the CACHES' rate; a read-through
-# collection - mostly lookups of keys the upstream does not have - gets its
-# own figure, the share answered here without the upstream.  PROD 10-07/08:
-# the card read 6-12% beside th at 100.0% and prod-redis at 0.1%.
+# the headline hit rate is the caches' rate; a read-through collection gets its own
+# figure, the share answered here without the upstream
 def coll(base, name, h, m, up=None):
     c = json.loads(json.dumps(base)); c["name"] = name
     c["hits_client"] = h; c["misses_client"] = m; c["hits"] = h; c["misses"] = m
-    # S351: the card's 5-minute line reads the daemon's windows; here they
+    # the card's 5-minute line reads the daemon's windows; here they
     # are what the second render adds, as a window would be
     c["win_hits_client"] = c.get("_wh", 0); c["win_misses_client"] = c.get("_wm", 0)
     c.pop("fleet", None); c.pop("upstream", None)
@@ -690,10 +637,8 @@ s3 = json.loads(json.dumps(s2)); s3["collections"] = [win(coll(base, "pr", 11, 5
 c3, _ = card(s3)
 (ok if c3 and "all collections" in c3[2] and "answered here" not in c3[2] else bad)(
     "only read-through collections: the card falls back to all of them (%s)" % (c3[2] if c3 else None,))
-# S351 (12js reverted): the headings say "last 5 min" and the figures under
-# them are the daemon's five-minute windows - a fleet-shaped row whose
-# lifetime totals are in the millions shows its window, and a counter the
-# daemon has no window for yet shows a dash, never a total.
+# the headings say "last 5 min" and the figures are the daemon's five-minute windows;
+# a counter with no window yet shows a dash, never a total
 sw = json.loads(stats); sw["since"] = {"reset_at": 0, "s": 99999, "win_s": 300}
 for x in sw.get("collections", []):
     x["hits_client"] = 4567890; x["misses_client"] = 1234567; x["stores_client"] = 7654321; x["expired"] = 3333333
@@ -713,10 +658,7 @@ cells = re.findall(r'<span class=hv><span class=n>([^<]*)</span><span class=hl>(
     "the collections and cluster-plane headings both say counters: last 5 min")
 (ok if "since start" not in re.sub(r"/\\*.*?\\*/", "", script, flags=re.S) else bad)(
     "no 'since start' label is left anywhere in the page's script")
-# S350: the WAL card's times in the unit a reader thinks in.  PROD
-# 2026-10-08 during a backup: "fsync now 104,010 us", "since start
-# 12,827 / 1,488,827 us", "probe 3,357 / 5,016 us" - the operator had to ask
-# which unit, and whether the max was over a million of them.
+# the WAL card's times in the unit a reader thinks in (us / ms / s)
 wt = json.loads(stats)
 wt["wal"] = {"fsync": "everysec", "appended": 10, "bytes": 1000, "dropped": 0, "late": 0,
              "overruns": 0, "heals": 0, "heals_recent": 0, "free_segments": 8, "staged": 0, "unsynced": 89,
@@ -736,9 +678,8 @@ want = {"fsync now (ewma)": "104 ms", "fsync (avg / max)": "12.8 ms / 1.5 s",
         "probe p50/p99": "3.4 ms / 5.0 ms, 274 MB/s"}
 got = dict((k, rows.get(k)) for k in want)
 (ok if not e4 and got == want else bad)("the WAL card shows its times in us / ms / s (%s; got %s)" % (e4 or "clean", got))
-# S437: the ring's shape, its use and how fast it fills against the
-# snapshots that free it.  amber: the free space lasts under twice a
-# snapshot; red: the whole log fills faster than one snapshot takes
+# the ring's shape and use, and how fast it fills against the snapshots that free it: amber
+# when the free space lasts under twice a snapshot, red when the log fills faster than one
 def wal_rows(wal, rdb):
     st = json.loads(stats); st["wal"] = wal; st["rdb"] = rdb
     ctx.execute("__els['plane']&&(__els['plane'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(st))
@@ -765,9 +706,8 @@ w7 = dict(wt["wal"])                       # an older daemon: no shape, no rates
 r7, e7b = wal_rows(w7, {"saves": 0, "running": False})
 (ok if not e7b and r7.get("segments") == ("", "8 free") and r7.get("filling") == ("", "\u2014") else bad)(
     "S437: an older daemon's card still reads (%s; got %s %s)" % (e7b or "clean", r7.get("segments"), r7.get("filling")))
-# S443: the negative cache card says expiries apart from deletes, and shows
-# the drops over the plane's 5 minutes (it showed the total since start
-# beside 5-minute figures: "0 sent, 0 applied, 12,356,837 dropped")
+# the negative cache card says expiries apart from deletes, and shows the drops over
+# the plane's 5 minutes
 def neg_rows(tr, acks=None):
     st = json.loads(stats); c0 = dict(st.get("cluster") or {}); c0["tombstones_retained"] = tr
     if acks is not None:
@@ -791,7 +731,7 @@ t9 = {"entries": 124, "max": 1000000, "retain_s": 900, "dropped_early": 12356837
 r9, e9 = neg_rows(t9)
 (ok if not e9 and r9.get("dropped before that") == ("", "-") else bad)(
     "S443: an older daemon publishes no window - a dash, never its total (%s; got %s)" % (e9 or "clean", r9))
-# 12ny AT-11: the deletes waiting for members, which member they wait for,
+# the deletes waiting for members, which member they wait for,
 # and the stuck one; an older daemon (no numbered, no held_by) says neither
 t10 = dict(t8, numbered=40)
 a10 = {"held_by": [{"origin": "00000000000000aa", "incarn": 1, "through": 10, "head": 50, "waiting": 40,
@@ -807,12 +747,8 @@ got10 = dict((k, r10.get(k)) for k in want10)
     "AT-11: the card says what waits for members, for whom, and the stuck one (%s; got %s)" % (e10 or "clean", got10))
 (ok if not e8 and "waiting for" not in r8 and "deletes awaiting members" not in r8 else bad)(
     "AT-11: a daemon without the marks shows neither row (%s; got %s)" % (e8 or "clean", sorted(r8)))
-# S365: connects per second on the clients card.  The clients figure is a
-# gauge - open at the poll - and a storm of one-millisecond connections
-# (5,000 a second on 245, 10-09) moved it from 75 to 94 at most.  The rate
-# differences both doors' accept counters between polls; the average is
-# the daemon's five-minute windows.  The door cards say what their figure
-# counts: "connects (5 min)", not "connections" / "clients".
+# connects per second on the clients card, from both doors' accept counters between polls
+# (the average from the five-minute windows); the door cards say "connects (5 min)"
 ctx.execute("var __now=1000000; Date.now=function(){return __now;};")
 cs = json.loads(stats); cs["since"] = {"reset_at": 4242, "s": 1000, "win_s": 300}
 cs.setdefault("resp", {}); cs.setdefault("native", {})
@@ -843,10 +779,8 @@ cs3 = json.loads(json.dumps(cs2)); cs3["since"]["reset_at"] = 4343; cs3["resp"][
 l3, e9 = conn_line(cs3)
 (ok if not e9 and l3 and l3.startswith("—") else bad)(
     "after a stats reset the counters fall: no negative rate, a dash until the next sample (%s)" % (l3,))
-# S352b: the alerts card - what is raised now, then the newest entries of the
-# ring, each with what became of it by mail; times in the VIEWER's local time
-# (the date too when it is not today); always 12 rows tall (S214), whatever
-# the ring holds; every string escaped; no card for a daemon without alerts.
+# the alerts card: each ring entry with what became of it by mail, in the viewer's local
+# time; always 12 rows tall, every string escaped, no card for a daemon without alerts
 import time as _t
 NOW = int(_t.mktime(_t.strptime("2026-10-11 12:00:00", "%Y-%m-%d %H:%M:%S"))) * 1000
 ctx.execute("var __dnow=Date.now; Date.now=function(){return %d;};" % NOW)
@@ -875,9 +809,8 @@ al = {"mailer": "none",
                  {"ts_ms": T3, "level": "warning", "key": "upstream.0", "event": "cleared",
                   "text": "the read-through upstream came back", "mail": "below level"}]}
 rows, summ, hid, e, body = alerts_sec(al)
-# 0.6.2: the alerts are a section that folds like the commands table, not
-# a card: the summary beside its heading, a row per active alert, then the
-# ring newest first
+# the alerts are a section that folds like the commands table: the summary beside its
+# heading, a row per active alert, then the ring newest first
 (ok if not e and hid is False and len(rows) == 5 else bad)(
     "S352b: the alerts section is drawn - 2 active, then the ring's 3 (%s)" % ((e or (hid, len(rows))),))
 (ok if '<span style="color:var(--bad)">active: 2 · 1 critical</span>' in summ else bad)(
@@ -919,18 +852,18 @@ rows, summ, hid, e, body = alerts_sec({"mailer": "none", "active": [], "recent":
 rows, summ, hid, e, body = alerts_sec(None)
 (ok if not e and hid is True and ctx.eval("__els['alwrap'].hidden") is True else bad)(
     "S352b: a daemon without alerts: no alerts section (%s)" % (e or hid))
-# S377: an info entry (a clean start) is routine: the second ink, not the warn colour
+# an info entry (a clean start) is routine: the second ink, not the warn colour
 rows, summ, hid, e, body = alerts_sec({"mailer": "none", "active": [], "recent": [{"ts_ms": T1, "level": "info", "key": "node.start",
                                        "event": "raised", "text": "started (perfcached 0.6.1)", "mail": "below level"}]})
 (ok if not e and len(rows) == 2 and 'color:var(--ink2)">info</span>' in rows[1][1][1][1] and "var(--warn)" not in body else bad)(
     "S377: an info entry in the ring reads 'info' in the second ink (%s)" % (e or (rows[1][1][1][1] if len(rows) > 1 else body[:100])))
-# S389 (PROD 2026-10-13: "If 'active: none' - the alerts list is expected to be empty"): nothing active,
-# one entry in the ring - the folded table says "no active alerts" and the entry waits behind the fold
+# nothing active, one entry in the ring: the folded table says "no active alerts" and
+# the entry waits behind the fold
 (ok if not e and [r[0] for r in rows] == ["class=none", "class=cx"] and "no active alerts" in body
     and ctx.eval("__els['altog'].textContent") == "one entry - click to show" else bad)(
     "S389: 'active: none' - folded, the table says 'no active alerts'; the one entry is behind the fold (%s)"
     % (([r[0] for r in rows], ctx.eval("__els['altog'].textContent")),))
-# S352c: the relay figures - in / out of the daemon's windows, lost in the
+# the relay figures - in / out of the daemon's windows, lost in the
 # warn colour - where relays pass
 rows, summ, hid, e, body = alerts_sec(dict(al, fleet_mailer=1, mailer="node 1"),
                                       {"built": True, "ready": False, "sent": 0, "win_sent": 0, "failed": 0, "win_failed": 0,
@@ -953,15 +886,12 @@ for _i in range(50):
     _t.sleep(0.1)
 rows, summ, hid, e, body = alerts_sec(live_al)
 lr = [tuple(txt(c[1]) for c in r[1]) for r in rows]
-# S377: a clean start is info, under the default mail level - kept as "below level"
+# a clean start is info, under the default mail level - kept as "below level"
 (ok if not e and any(len(r) == 5 and r[1] == "info" and r[2] == "raised" and r[3].startswith("started (perfcached") and r[4] == "below level" for r in lr) else bad)(
     "S352b, S377: the live /stats alerts render: the node's start, info, raised, 'below level' (%s)" % (e or lr[:3]))
 
-# S381 (0.6.0.1): "daemon cpu" was CPU time over wall time - a share of ONE
-# core, as top shows it - with the daemon's thread count under it, which
-# read as the denominator ("is it total for 16 CPUs or just for one").  With
-# process.cpus the card is a share of those CPUs, the one-core figure beside
-# it, the threads in the hover; a daemon without process.cpus keeps 0.6.0's card.
+# with process.cpus the cpu card is a share of those CPUs, the one-core figure beside it
+# and the threads in the hover; a daemon without process.cpus keeps the one-core card
 def cpu_card(st, cpu_ms_step, gap):
     a = json.loads(json.dumps(st)); b = json.loads(json.dumps(st))
     b["process"]["cpu_user_ms"] = a["process"]["cpu_user_ms"] + cpu_ms_step
@@ -992,11 +922,8 @@ old = json.loads(stats); old["process"].pop("cpus", None); old["process"]["threa
 mm, mo, e = cpu_card(old, 500, 0.5)
 (ok if mo and not e and "16 threads" in txt(mo.group(2)) else bad)(
     "S381: a daemon without process.cpus keeps 0.6.0's card (%s)" % (e or (txt(mo.group(2)) if mo else "no match")))
-# 0.6.1: the hit-rate bar must not move with its caption.  The caption is
-# held to the width the stylesheet keeps for it (".hit .hl{min-width:Nch"),
-# right-aligned inside it; "no reads in 5 min" (17) outgrew the 11ch kept
-# for "life 100.0%" and put that row's bar left of the others (the operator,
-# screenshot, 2026-10-12).  Every caption the cell can say, against N.
+# the hit-rate bar must not move with its caption: every caption the cell can say fits
+# the width the stylesheet keeps for it (".hit .hl{min-width:Nch")
 hm = re.search(r"\.hit \.hl\{min-width:(\d+)ch", page)
 hw = int(hm.group(1)) if hm else 0
 cs = json.loads(stats)
@@ -1018,12 +945,8 @@ if base:
 else:
     bad("0.6.1: no collection 0 in the live /stats to build the caption rows from")
 
-# S382 part 2 (0.6.1), the approved look: lb / f-o beside the autoscale
-# chip; a link per upstream - the active one raised (act), a standby dashed
-# (sby), a broken one blinking like a failed node card (bad), a listed
-# master grey (mst), amber while it serves as the fallback (emg).  S384: a
-# refused perfcached blinks with its reason, an allowed one is tagged as a
-# daisy-chain hop, and a node read through by another perfcached says so.
+# lb / f-o beside the autoscale chip; a link per upstream: active raised (act), standby
+# dashed (sby), broken blinking (bad), master grey (mst), amber as the fallback (emg)
 def up_variant(ups, mode="balance", **kw):
     st = json.loads(stats)
     c0 = [c for c in st.get("collections", []) if c.get("name") == "0"]
@@ -1094,10 +1017,8 @@ h, rows, e = up_variant([lnk(A)], role_required="any", chained_reads=9, win_chai
     and "tr.up .upl.bad{animation:none;" in page else bad)(
     "S382: the raised look has a light and a dark shade (--emb twice); a broken link blinks with the cards' alarm, steady under reduced motion")
 
-# S378 (0.6.1): the io card - what runs and how, a fallback or a ring some
-# workers lack in amber with the reason in the hover; S379: the busiest
-# worker's share of the last 5 min, amber on epoll at the epoll-busy
-# alert's threshold; under io = epoll, whether io_uring would run here.
+# the io card: what runs and how, a fallback or a missing ring in amber with the reason in
+# the hover, and the busiest worker's 5-minute share, amber at the epoll-busy threshold
 def io_card(st):
     ctx.execute("__e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(st))
     mh = ctx.eval("__els['metrics']?__els['metrics'].innerHTML:''") or ""
@@ -1149,12 +1070,8 @@ g, has, e = io_card(io_st("io_uring", "io_uring", bp=50))
 old = json.loads(stats); old.pop("io", None)
 g, has, e = io_card(old)
 (ok if not has and not e else bad)("S378: a daemon without io: no card (%s)" % (e or has))
-# 0.6.1 re-cut 3 (the operator, 245-247): three things the collections
-# table got wrong for a read-through collection.
-# 1. "now" was one poll (3 s): a collection read once every few seconds
-#    flipped between "no reads" and "0.0%" on every poll.  It is the last
-#    30 s of the page's own polls - here: one miss at t=3 s, nothing since,
-#    still 0.0% at t=9 s (the old page: "no reads").
+# the collections table for a read-through collection: 1. "now" is the last 30 s of the
+# page's own polls - one miss at t=3 s, nothing since, still 0.0% at t=9 s
 cbase = (json.loads(stats).get("collections") or [{}])[0]
 ctx.execute("var __n30=5000000; var __d30=Date.now; Date.now=function(){return __n30;};")
 def rate_cell(st, name):
@@ -1180,14 +1097,8 @@ quiet45 = rate_cell(q, "quiet")
 (ok if "hit rate <span class=s>(30 s)</span>" in page and "hit rate <span class=s>(now)</span>" not in page else bad)(
     "the column says what it is: hit rate (30 s)")
 ctx.execute("Date.now=__d30;")
-# 2. a read-through collection's entries cell: its RECORDS, and the copies
-#    it fetched (the daemon's shadow_entries gauge) on a line of their own -
-#    12nx (0.7.1; the operator, "records and Redis copies separately"):
-#    10, then "+48 Redis copies here".  Before 12nx one figure, 58 - this
-#    assertion said so, unexecuted in CI, until S426 ran the page there.
-# 3. its <name>.nofall companion is no row of its own: its markers are
-#    named on the parent's read-through line; a .nofall with no
-#    read-through parent stays a row.
+# 2. the entries cell: records, then the fetched copies on their own line; 3. a .nofall
+# companion is named on its parent's read-through line, not a row (unless orphaned)
 rq = json.loads(stats); rq["since"] = {"reset_at": 40404, "s": 100, "win_s": 300}
 pc_ = json.loads(json.dumps(cbase)); pc_["name"] = "rt"; pc_["entries"] = 10; pc_.pop("fleet", None)
 pc_["upstream"] = {"host": "10.9.9.13", "port": 6379, "tracking": True, "fetches": 5, "absent": 1, "fill_string": 4,
@@ -1211,7 +1122,7 @@ m9 = ctx.eval("__els['metrics']?__els['metrics'].innerHTML:''") or ""
 em = re.search(r"<div class=k>entries</div><div class=v>([^<]*)</div><div class=s>across ([0-9]+) collection", m9)
 (ok if em and em.groups() == ("63", "2") else bad)(
     "the entries card: 10 + 48 copies + plain.nofall's 5 = 63 across 2 collections - the companion is not one (%s)" % (em.groups() if em else None,))
-# S385 (0.6.2): a write-through collection's line says where the writes go
+# a write-through collection's line says where the writes go
 # and the last 5 min of them; the master's link row says "writes".
 wq = json.loads(stats); wq["since"] = {"reset_at": 50505, "s": 100, "win_s": 300}
 wc = json.loads(json.dumps(cbase)); wc["name"] = "wtc"; wc.pop("fleet", None)
@@ -1234,13 +1145,21 @@ mr = re.search(r'<span class="upl"[^>]*><span class=ic><svg [^>]*>.*?</svg></spa
     "S385: the master's row is the write target, not 'not read' (%s)" % (bool(mr),))
 (ok if 'title="10.9.9.3:6379 \u00b7 master \u00b7 writes go here, not read (replicas only)"' in hw and "not used (a master)" not in hw else bad)(
     "the write target's tooltip says writes go here, not that it is not used")
+# with upstream_master_fallback the write target may be read
+# while no replica serves - its row says so, not "reads never"
+wc["upstream"]["upstreams"][1].update({"state": "master fallback", "why": ""})
+ctx.execute("__els['cols']&&(__els['cols'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(wq))
+hwf = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
+(ok if "the master: writes go here, reads only as the fallback" in hwf and "reads never" not in hwf else bad)(
+    "S484: a write target usable as the master fallback reads 'reads only as the fallback'")
+wc["upstream"]["upstreams"][1].update({"state": "not used", "why": "a master"})
 wc["upstream"]["write_through"].update({"target": None, "state": "no master", "json": "no"})
 ctx.execute("__els['cols']&&(__els['cols'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(wq))
 hw2 = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
 (ok if "no master (no master) - writes refused" in hw2 and "var(--bad)" in hw2 else bad)(
     "S385: no target - 'no master ... writes refused', in red")
 (ok if "the master has no RedisJSON - JSON writes refused" in hw2 else bad)("S385: no RedisJSON - said on the line")
-# 0.6.2: the writes block - by outcome, by command (5 min), the last errors
+# the writes block - by outcome, by command (5 min), the last errors
 wc["upstream"]["write_through"].update({"target": "10.9.9.3:6379", "state": "ok", "json": "yes",
     "win_applied": 10, "win_not_applied": 2, "win_redis_errors": 3, "win_failed": 0, "win_refused": 1,
     "win_read_back_values": 9, "win_read_back_gone": 1, "win_read_back_released": 0, "win_max_us": 2500, "queued": 0,
@@ -1257,7 +1176,7 @@ ew3 = ctx.eval("__e"); hw3 = ctx.eval("__els['cols']?__els['cols'].innerHTML:''"
 (ok if not ew3 and "to the master, 5 min: <b>10</b> applied" in hw3 and "2 not applied" in hw3
     and "3 Redis errors</span>" in hw3 and "1 refused here" in hw3 and "slowest 2.5 ms" in hw3 else bad)(
     "0.6.2: the writes line - 10 applied, 2 not, 3 Redis errors, 1 refused, slowest 2.5 ms (%s)" % (ew3 or "clean"))
-# S403: the writer thread's busy share of five minutes - plain below 75%, amber from it, absent
+# the writer thread's busy share of five minutes - plain below 75%, amber from it, absent
 # while there is no window yet
 wc["upstream"]["write_through"]["writer_busy_pct"] = 12.5
 ctx.execute("__els['cols']&&(__els['cols'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(wq))
@@ -1274,8 +1193,8 @@ i1, i2 = hw3.find("<b>set</b>"), hw3.find("<b>json.set</b>")
     "0.6.2: by command - busiest first (set 11, json.set 4), a command idle for 5 min left out, set's avg 500 us")
 (ok if "1m 5s ago · Redis error · <b>json.set</b> u1_device_info — ERR new objects must be created at the root" in hw3
     and "refused here · <b>cmd:add</b>" in hw3 else bad)("0.6.2: the last errors - when, what, the key and Redis's own words")
-# 0.6.2: the collection's rows are one group, and each tag names it - read
-# as a footer, the replicas and the writes looked like the whole node's
+# the collection's rows are one group and each tag names it, so the replicas and the
+# writes do not read as the whole node's
 (ok if re.search(r"<tr class=grp><td><span class=nm>wtc</span>", hw3) and "<span class=uk>wtc · read/write-through</span>" in hw3
     and "<span class=uk>wtc · writes</span>to the master" in hw3 else bad)(
     "0.6.2: a write-through collection's row starts a group, and its read/write-through and writes rows name it")
@@ -1285,14 +1204,14 @@ wc["upstream"]["write_through"]["last_errors"] = []
 ctx.execute("__els['cols']&&(__els['cols'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(wq))
 hw4 = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
 (ok if "no writes in 5 min" in hw4 and "the last errors" not in hw4 else bad)("0.6.2: quiet - 'no writes in 5 min', no error list")
-# AR1: a node that does not follow other clients' changes in Redis says so, in the colour of trouble
+# a node that does not follow other clients' changes in Redis says so, in the colour of trouble
 wc["upstream"]["write_through"]["bcast"] = "refused"
 ctx.execute("__els['cols']&&(__els['cols'].innerHTML=''); __e=null; try{ drawStats(%s); }catch(e){ __e=String(e); }" % json.dumps(wq))
 hw5 = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
 (ok if "not followed (broadcast tracking refused)" in hw5 and 'color:var(--bad)' in hw5 else bad)(
     "AR1: broadcast tracking refused - the writes row says other clients' changes are not followed")
 wc["upstream"]["write_through"]["bcast"] = "on"
-# AR4: the keys the fleet owned before write-through, and an upfill running
+# the keys the fleet owned before write-through, and an upfill running
 wc["upstream"]["write_through"]["fleet_owned"] = 7
 wc["upstream"]["write_through"]["upfill"] = {"state": "running", "started": 1, "finished": 0, "found": 9,
                                              "written": 3, "redis_had": 1, "skipped": 0, "gone": 0, "errors": 0}
@@ -1302,10 +1221,8 @@ hw6 = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
     "AR4: the writes row counts the fleet's own keys and the running upfill")
 wc["upstream"]["write_through"]["fleet_owned"] = 0
 wc["upstream"]["write_through"]["upfill"]["state"] = "done"
-# S432: the RESP DB index each collection answers on.  The live daemon has
-# no resp_collections, so its one row is the open door's db 0 -> "0" - and
-# not the 63 other indexes, whose collections do not exist.  A runtime map
-# is starred, and under the tool it carries its unmap and every row a map.
+# the RESP DB index each collection answers on: the live daemon's one row is db 0;
+# a runtime map is starred, and under the tool it carries its unmap and every row a map
 rl = json.loads(stats)
 (ok if rl.get("resp", {}).get("map") == [{"index": 0, "col": "0", "source": "open", "exists": True}]
     and rl["resp"].get("map_overrides") == 0 else bad)(

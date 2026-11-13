@@ -1,15 +1,15 @@
-# perfcached-dashboard.conf.example - the dashboard's settings (DESIGN
-# 12no, 0.6.6).  Copy to /etc/perfcached/perfcached-dashboard.conf, make
+# perfcached-dashboard.conf.example - the dashboard's settings
+# (0.6.6).  Copy to /etc/perfcached/perfcached-dashboard.conf, make
 # it readable by the perfcached-dashboard user only (chown
 # perfcached-dashboard, chmod 600) and set the secret.
 #
 # The dashboard is a client of the fleet's native door through libperfd,
 # with the same client secret perfcli uses; the page it serves is the
-# daemon's status page, read from whichever member is selected.  Nothing
-# in it is sent to a daemon's HTTP door, and no daemon is changed by it.
-# Privileged actions (check, upfill, stop, reset stats) ask the operator
-# for the fleet's ENABLE secret once per browser page; it is never in this
-# file.
+# status page, its figures read from whichever member is selected.
+# Nothing in it is sent to a daemon's HTTP door, and no daemon is changed
+# by it.  Privileged actions (the sweeps, the DDL, staging a build, reset
+# stats) ask the operator for the fleet's ENABLE secret once per browser
+# page; it is never in this file.
 
 [dashboard]
 # where the page is served.  Loopback by default: TLS, HTTP/2 and a
@@ -51,14 +51,14 @@ secret = change-me
 # page then asks for the enable secret again
 #session_s = 1800
 
-# several dashboards behind one load balancer (S415): instances sharing
+# several dashboards behind one load balancer: instances sharing
 # this key accept each other's session tokens, so no stickiness is needed
 # - the token carries the session (encrypted under this key), the servers
 # hold nothing.  32 random bytes as 64 hex characters:
 #     head -c 32 /dev/urandom | xxd -p -c 32
 # Unset, an instance uses a random key from its start: a single dashboard
 # needs nothing here.
-#session_key =
+#session_key = <64 hex characters>
 
 # connections held at once, and from one address
 #connections = 64
@@ -71,12 +71,14 @@ secret = change-me
 # saw - instead of the proxy's own; any other peer's header is ignored.
 #trusted_proxy =
 
-# TLS in the tool itself (S414), for a bare install with no proxy in front:
+# TLS in the tool itself, for a bare install with no proxy in front:
 # a certificate and its key, PEM.  libmicrohttpd's own TLS (GnuTLS) - the
 # tool refuses to start when its library was built without it.  The
 # proxy pattern (contrib/haproxy-perfcached-dashboard.cfg, nginx-...) is
-# the default; this is for the host that has no proxy at all.  Without
-# either, the session prompt's enable secret is taken only from this host
-# (0.7.4): plain HTTP from another host is refused.
+# the default; this is for the host that has no proxy at all.  The
+# session prompt's enable secret is taken only over this TLS or from this
+# host (0.7.4): plain HTTP from another host is refused, so a proxy on
+# another host must reach the tool over TLS too, as
+# contrib/haproxy-perfcached-dashboard.cfg does.
 #tls_cert = /etc/perfcached/dashboard.crt
 #tls_key = /etc/perfcached/dashboard.key

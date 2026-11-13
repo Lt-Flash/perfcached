@@ -1,28 +1,6 @@
 #!/bin/sh
-# functest.sh - func_perfd inside a live Asterisk, from the dialplan only.
-#
-#   contrib/asterisk/test/functest.sh <func_perfd.so> [phase ...]
-#
-# Phases (default: all, in this order):
-#   basic-binary basic-resp sizes refuse failover-binary failover-resp
-#   stall-binary stall-resp pool reload redis swap buildopts
-#
-# Environment:
-#   ASTERISK_PREFIX  installed Asterisk the module was built for
-#                    (default /opt/asterisk-22.10.1-flh-fix3); only its binary
-#                    and modules are used, never its configuration
-#   ASTERISK_DOC     documentation XML (default: the installed build's; Asterisk's
-#                    core will not start without one).  The patched tree's
-#                    doc/core-en_US.xml adds the PERFD_* documentation check.
-#   PERFCACHED PERFCLI  daemon and CLI (default ./perfcached ./perfcli)
-#   REDIS_SERVER     default redis-server
-#   ASTERISK_ENV     VAR=value words for the Asterisk server process only,
-#                    e.g. a sanitizer runtime in LD_PRELOAD and its options
-#
-# LOCAL ONLY: the perfcached fleet listens on 127.0.9.x, every Redis is
-# started here on 127.0.0.1 with no persistence, Asterisk opens no network
-# listener, and every process is tracked by pid and killed on exit.  A RESP
-# server line that is not loopback is refused before it is written.
+# functest.sh <func_perfd.so> [phase ...] - func_perfd in a live Asterisk, from the dialplan only.
+# Local only: loopback fleet and Redis, no Asterisk listener, every process killed by pid on exit.
 set -u
 
 MOD=${1:?usage: functest.sh <func_perfd.so> [phase ...]}

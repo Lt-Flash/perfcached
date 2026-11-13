@@ -1,56 +1,6 @@
 #!/bin/sh
-# outagetest.sh - S223: a whole-fleet outage must not make the fleet
-# delete its own data.
-#
-# THE DEFECT, measured on 222 on 2026-09-22 before this existed: three
-# eager nodes, 900 keys with each node authoring 300, killed together
-# with no snapshot.  Restarted together, 600 of 900 keys were GONE.
-# Restarted one by one it was worse and read as correct behaviour all
-# the way down: node 1 came back alone and recovered its 300; node 2
-# joined with its own durable 300 and DELETED 256 of them within 5
-# seconds, all 300 within 15.
-#
-# Every step of that was working as designed.  An eager replica does not
-# persist the copies it receives, so each node's WAL holds only what it
-# AUTHORED and a whole-fleet outage leaves every node with a different
-# third.  Each then runs B4's reconcile - "does anyone still have this?"
-# - and each peer answers no, truthfully, because it never persisted
-# that copy and has not yet been re-sent it.  The reconcile probes at 64
-# keys a second from about a second after READY; the repair sweep that
-# would re-send them runs every 10 s.  The reconcile wins the race and
-# the delete is TOMBSTONED, so it survives every later restart.
-#
-# THE FIX (S223): the pass needs a WITNESS - a live peer that booted
-# before this node died, and so saw anything deleted meanwhile.  Every
-# peer's boot time comes from the uptime in its ALIVE; this node's death
-# is the newest write in its storage directory or its alive stamp.  A
-# fleet that came back together has no witness, and the pass is skipped.
-# (The filed design - a purpose on the probe, "not authoritative"
-# answers, re-share before asking - was built and measured wrong three
-# ways, the last being that re-sharing first RESURRECTS a deleted key.)
-#
-# Asserted, over the three scenarios of the filing (scaled to 300 keys,
-# 100 per node - the mechanism does not need volume):
-#   1. killed together, restarted together, NO snapshot: every key still
-#      there, on every node, and nothing reconcile-dropped;
-#   2. killed together, restarted ONE BY ONE with a gap wide enough for
-#      the measured loss (it happened inside 5 s): same;
-#   3. the same outage WITH `save = 5 1`: same - the configuration that
-#      already worked must keep working;
-#   4. a STAGGERED failure: node 1 dies and reboots while 2 and 3 are
-#      still up, and they die ten seconds later.  Node 1 booted before
-#      they died but had not been re-sent their records: the 30 s grace
-#      must refuse it as a witness.  Node 1's OWN pass, witnessed by 2 and
-#      3 while they were up and complete, must still run.
-# In each, every node must report reconcile_skipped - the pass was
-# armed, evaluated, and deliberately not run.  Without that, "nothing
-# was dropped" could be a pass that never got as far as deciding.
-#
-# FAIL-FIRST, and it is a step of this run: the same scenarios against a
-# build whose pass never asks for a witness - one sed, and it is the
-# whole of S223 - which must LOSE keys.  Without it a green run here
-# says only that the fleet was healthy.
-# Usage: test/outagetest.sh [./perfcached]
+# outagetest.sh - a whole-fleet outage must not make the fleet delete its own data: the reconcile
+# runs only with a witness peer, and a build that skips the witness check must lose keys.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -66,16 +16,13 @@ MP=17183
 PER=100                                 # keys each node authors
 TOT=$((PER * 3))
 
-# ---- the pre-S223 build, for the fail-first -------------------------
+# ---- the witness-less build, for the fail-first ------------------------
 echo "--- building the pre-S223 variant for the fail-first"
 mkdir -p "$D/t"
 tar -cf - --exclude=./.git --exclude='*.o' --exclude='*.a' . 2>/dev/null |
 	(cd "$D/t" && tar -xf -) || { echo "cannot copy the tree"; exit 1; }
-# ONE line: with the grace hugely negative, every peer this node has heard
-# from counts as a witness, so the pass always runs - which is what the
-# daemon did before S223.  The constant rather than the call site, so the
-# variant still compiles cleanly (nothing goes unused under -Werror) and
-# the per-tick and drop-time re-checks are disabled by the same edit.
+# ONE line: a hugely negative grace makes every peer a witness, so the pass always runs; the
+# constant, not the call site, so the variant compiles under -Werror and the re-checks go too
 sed -i 's/^#define WITNESS_GRACE_MS   (3LL \* REPL_SWEEP_BEATS \* 1000)$/#define WITNESS_GRACE_MS   (-(1LL << 60))/' \
 	"$D/t/src/cluster.c"
 grep -q "define WITNESS_GRACE_MS   (-(1LL << 60))" "$D/t/src/cluster.c" ||
@@ -208,25 +155,15 @@ load_fleet() { # load_fleet <binary> <save>
 	rm -rf "$D"/wal1 "$D"/wal2 "$D"/wal3 "$D"/n1.log "$D"/n2.log "$D"/n3.log
 	conf 1 "$1"; conf 2 "$1"; conf 3 "$1"
 	start 1 "$2" && start 2 "$2" && start 3 "$2" || return 1
-	# ready and meshed before a single write: a node still booting refuses
-	# writes as not ready, and the fill used to throw that count away -
-	# rc48 GitLab check read "fleet did not load", 200/200/200 of 300,
-	# dropped 0, probed 0: one third never written anywhere
+	# ready and meshed before a single write: a node still booting refuses writes as not ready
 	fleet_ready 60 || { echo "    fleet not ready and meshed after 60 s"; return 1; }
 	for pp in 17351:a 17352:b 17353:c; do
 		R=$(fill ${pp%:*} ${pp#*:} $PER)
 		[ "$R" = 0 ] || { echo "    the fill through :${pp%:*} had $R of $PER writes refused"; return 1; }
 	done
 	converged $TOT 30 || return 1
-	# every node's OWN writes in its WAL before any kill -9: a write is
-	# acknowledged at the producer ring, and a kill takes what the pump
-	# has not drained yet - fsync = always does not change that (only
-	# power loss cares).  Converged says the copies replicated, not that
-	# the authors' records left their rings: v0.5.6 GitHub check-asan
-	# repl1, the one-by-one restart came back 152/152/152 of 300 with
-	# nothing dropped, probed or reconciled - the rest never reached a
-	# WAL.  This suite is about what the restart does with what was
-	# durable, so make it durable first (walordertest's barrier).
+	# every node's own writes in its WAL before any kill -9: a write is acknowledged at the producer
+	# ring and a kill takes what the pump has not drained (walordertest's barrier)
 	for p in 17351 17352 17353; do
 		[ "$(call $p '{"method":"sync","params":{"timeout_ms":10000}}' | python3 -c \
 			'import json,sys
@@ -296,11 +233,7 @@ sc_staggered() { # <binary>: node 1 dies and reboots while 2 and 3 are
 	load_fleet off "$1" || { echo "    fleet did not load"; return 1; }
 	sleep 46                          # 2 and 3 are up past the grace:
 	                                  # they can witness for node 1.
-	# 46, not 35: node 1's death estimate is its last `alive` stamp,
-	# touched every 10 beats, so it can read up to 10 s early and the
-	# grace a survivor must clear is up to 40 s.  35 passed on a quiet
-	# box and failed rc33's check-asan on GitHub (witness 0) - the same
-	# trap sweepclocktest and tombstonetest fell into on rc30.
+	# 46, not 35: the death estimate (last `alive` stamp) can read 10 s early; the grace is up to 40 s
 	kill -9 "$(cat "$D/n1.pid")" 2>/dev/null; rm -f "$D/n1.pid"; sleep 1
 	start 1 "$1" || return 1          # node 1 back among complete peers
 	sleep 10                          # up 10 s: LESS than the grace
@@ -349,7 +282,7 @@ case "$W1" in ''|0|'?') bad "node 1 found no witness - 2 and 3 were up 46 s befo
 	*) ok "and node 1 DID run its pass, witnessed by node $W1 - which was up throughout, and complete";; esac
 killall3
 
-# ---- 5. the fail-first: the same runs without S223 -------------------
+# ---- 5. the fail-first: the same runs without the witness check ------
 echo "--- 5. fail-first: the same two scenarios on a build with S223 compiled out"
 sc_together "$D/perfcached.pre" off; report "pre-S223 together"
 lost && ok "it loses keys: $P1/$P2/$P3 of $TOT, $R1/$R2/$R3 reconcile-dropped - which is the defect, and the proof that the three runs above were the fix acting" \

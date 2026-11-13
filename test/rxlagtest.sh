@@ -1,20 +1,6 @@
 #!/bin/sh
-# rxlagtest.sh - S125: a node that cannot keep up with inbound replicas
-# says so.
-#
-# The sending side is every worker in the fleet; the applying side is one
-# thread per node.  A receiver that falls behind keeps heartbeating, stays
-# a member and answers its own client door quickly, so nothing on the
-# status page moved and no counter anywhere was a rate: the only symptom
-# was a read of a key that existed on that node solely as a copy it had
-# not applied yet.  These are the figures that make it visible.
-#
-# Two nodes in eager mode.  Node 1 is driven; node 2 is read.  The rates
-# are sampled WHILE the drive runs, not after it - a receive rate sampled
-# from an idle system is zero and proves nothing.
-#
-# Fail-first on a build before S125: every rx_ field answers MISSING, the
-# metrics have no rx gauge and the page has no replica-intake card.
+# rxlagtest.sh - a node that cannot keep up with inbound replicas says so: its rx_ figures, sampled
+# while node 1 is driven, in stats, metrics and the page.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -74,11 +60,8 @@ print("MISSING" if v is None else v)
 PY
 }
 
-# Both nodes must see each other BEFORE the drive: an eager push goes to
-# live peers only, so writes made while node 2 is still joining are left
-# to the repair sweep and never reach repl_pushed.  A run that drove
-# 180,000 records and pushed 22,742 of them passed every assertion below
-# and proved much less than it looked like proving.
+# both nodes must see each other before the drive: an eager push goes to live peers only, and
+# writes made while node 2 joins are left to the repair sweep
 i=0; seen=0
 while [ $i -lt 300 ]; do
 	if [ "$(rx 17911 peers_up)" = 1 ] && [ "$(rx 17921 peers_up)" = 1 ]; then
@@ -92,11 +75,17 @@ done
 [ $seen -ge 3 ] \
 	&& ok "both nodes see each other before the drive" \
 	|| { echo "the pair never formed (peers_up $(rx 17911 peers_up) / $(rx 17921 peers_up))"; exit 1; }
-# and SETTLED.  peers_up flips as soon as one beat lands, while the pair is
-# still finishing its bootstrap and its map epoch; a drive started at that
-# instant had 25,239 of 180,000 records pushed and the rest left to the
-# repair sweep, which passed every assertion below while proving nothing.
-sleep 2
+# and SETTLED: peers_up flips on the first beat, while the joiner still connects and bootstraps -
+# until both are ready (up to 30 s), or a drive started then leaves most records to the repair sweep
+rdy() {
+	python3 - "$1" <<'PY'
+import json,pcnative,socket,sys
+s=socket.create_connection(("127.0.0.1",int(sys.argv[1])),timeout=20);f=pcnative.wrap(s)
+f.write((json.dumps({"jsonrpc":"2.0","id":1,"method":"stats"})+"\n").encode());f.flush()
+print(json.loads(f.readline()).get("result",{}).get("state"))
+PY
+}
+i=0; while [ $i -lt 150 ] && [ "$(rdy 17911 2>/dev/null)$(rdy 17921 2>/dev/null)" != readyready ]; do sleep 0.2; i=$((i+1)); done
 
 # 1. the figures exist at all, and the buffer is the one the daemon read
 #    back from the kernel rather than the one it asked for
@@ -111,9 +100,8 @@ A0=$(rx 17921 rx_applied)
 [ "$A0" = 0 ] && ok "nothing applied yet on the quiet node" || bad "rx_applied starts at $A0"
 [ "$A0" = MISSING ] && A0=-1        # so the climb check below can still run
 
-# 2. drive node 1 and sample node 2 WHILE it runs.  The sampler writes
-#    every reading to a file so the peak is read from the whole window,
-#    not from whatever the last call happened to catch.
+# 2. drive node 1 and sample node 2 WHILE it runs; every reading goes to a file so the peak is
+#    read from the whole window
 : > "$D/samples"
 ( i=0; while [ $i -lt 400 ] && [ ! -f "$D/done" ]; do
 	echo "$(rx 17921 rx_applied_ps) $(rx 17921 rx_queue) $(rx 17921 rx_drops)" >> "$D/samples"
@@ -181,12 +169,8 @@ done
 	&& ok "the rate returns to 0 once the fleet is quiet" \
 	|| bad "applied/s stuck at $(rx 17921 rx_applied_ps) with nothing being written"
 
-# 5. the sampler runs on the MAINTENANCE thread, not the cluster thread.
-#    Proven from the outside by the one thing that distinguishes them: the
-#    figures keep updating while the cluster thread is heads-down.  What is
-#    asserted here is the weaker, checkable part - the rate moved during a
-#    drive that had the cluster thread fully occupied (item 2 above), and
-#    the totals agree with the sender's (item 3).
+# 5. the sampler runs on the maintenance thread, not the cluster thread: the rate moved during
+#    a drive that kept the cluster thread fully occupied (item 2), and the totals agree (item 3)
 
 # 6. the metrics carry the same figures
 M=$(python3 - <<'PY'
@@ -198,11 +182,8 @@ for g in rx_applied_total rx_applied_per_second rx_older_per_second rx_drops_tot
 	echo "$M" | grep -q "perfcached_cluster_$g " || bad "metrics have no perfcached_cluster_$g"
 done
 echo "$M" | grep -q "perfcached_cluster_rx_applied_total " && ok "the metrics carry the replica-intake gauges"
-# the same total off both, read at ONE moment: the applied count can still
-# move after item 3 - the sweep repairs what the fire-and-forget push
-# missed (GitHub, d408a0c: stats 179,920 at item 3, metrics 180,000 here,
-# the 80 the sweep carried in between).  A metrics read bracketed by two
-# equal stats reads is a like-for-like comparison.
+# the same total off both, read at ONE moment: the sweep can still move the applied count after
+# item 3, so a metrics read bracketed by two equal stats reads compares like for like
 i=0
 while [ $i -lt 20 ]; do
 	S1=$(rx 17921 rx_applied)
@@ -215,9 +196,8 @@ done
 [ "$S1" = "$S2" ] && [ "$V" = "$S1" ] && ok "the metric and the stats agree on the applied total ($V)" \
 	|| bad "metrics say $V, stats say $S1 then $S2"
 
-# 7. the page has the card
-# S407 part 3: the daemon serves no page (GET / is 410); its bytes come from
-# pagedump, the dashboard's object
+# 7. the page has the card; the daemon serves no page (GET / is 410), its bytes come from
+#    pagedump, the dashboard's object
 PG=$("${PAGEDUMP:-./pagedump}")
 echo "$PG" | grep -q "replica intake" && ok "the status page has the replica-intake card" \
 	|| bad "the page has no replica-intake card"

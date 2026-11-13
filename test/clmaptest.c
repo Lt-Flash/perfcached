@@ -1,14 +1,5 @@
-/*
- * clmaptest.c — the cluster map format (control plane, step 1).
- *
- * The map is the only thing placement may be computed from, so a map
- * that decodes differently on two nodes splits ownership and puts a key
- * in two places.  Everything here is about refusing input rather than
- * accepting it: a map that cannot be read identically twice is not a
- * map, and half-reading one is worse than having none.
- *
- * Build: cc -o clmaptest test/clmaptest.c src/clmap.o
- */
+/* clmaptest.c - the cluster map format: a map that decodes differently on two nodes puts a key in
+ * two places, so anything that cannot be read identically twice is refused. */
 #include <stdio.h>
 #include <string.h>
 
@@ -170,8 +161,8 @@ int main(void)
 			"a zero-weight node is still placeable - the drain "
 			"primitive does not drain");
 
-		/* THE case a multiplier could not express: capacity says this
-		 * node is nearly full, the operator says load it anyway */
+		/* THE case a multiplier could not express: capacity says this node is nearly full,
+		 * the weight says load it anyway */
 		w.cap_weight = 10;
 		w.admin_weight = 4 * PC_CLMAP_W_NOMINAL;
 		CHK(pc_clmap_weight(&w) == 4 * PC_CLMAP_W_NOMINAL,

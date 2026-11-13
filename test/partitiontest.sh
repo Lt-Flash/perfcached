@@ -1,21 +1,6 @@
 #!/bin/sh
-# partitiontest.sh — S42a: prove the partition primitive actually
-# partitions, and that healing actually heals.
-#
-# This asserts the TOOL, not the cluster's behaviour under partition -
-# that is S42b onwards.  It exists because every later fault-injection
-# test is worthless if `cut` silently does nothing: a suite that cut
-# nothing and then observed "no split brain" would be the most
-# convincing wrong answer available.
-#
-# Assertions, in order:
-#   1. a healthy fleet sees all three members      (the fail-first
-#      baseline: run before any rule exists)
-#   2. cutting 1<->2 is visible in the netns rules (the mechanism)
-#   3. the two cut nodes stop seeing each other    (the effect)
-#   4. healing restores the rules AND the membership
-#
-# Usage: test/partitiontest.sh [runtime]
+# partitiontest.sh - the partition TOOL partitions and heals (rules and membership): a later suite that
+# cut nothing would see "no split brain" for the wrong reason.
 set -u
 
 RT=${1:-${RUNTIME:-}}       # the argument, else $RUNTIME (CI), else nerdctl or docker

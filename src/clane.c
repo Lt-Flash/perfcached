@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clane.c - S36 step b: the TCP frame lane.  See clane.h.
- */
+/* The TCP frame lane (see clane.h). */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -22,15 +20,8 @@
 
 #define FRAME_MAX  (HDR_LEN + MAX_DGRAM + 64)
 #define MAX_PEERS  512
-/* CH-18: what an inbound connection may hold, and for how long, before
- * it has shown it is a lane.  The hello proves only that the sender owns
- * its own address - anyone who can reach the port can send one - so a
- * connection is bounded three ways: its hello within LIN_HELLO_MS of the
- * accept, a whole frame at least every LIN_IDLE_MS after it (a forced
- * lane carries the 1 Hz heartbeats; any other reconnects on demand), and
- * LIN_PER_ADDR at once from one address (a peer holds one; a reconnect
- * overlaps its predecessor briefly).  The frame buffer is allocated only
- * once the hello is good. */
+/* Anyone who reaches the port can send a hello, so an inbound connection is bounded: hello
+ * within LIN_HELLO_MS, a frame every LIN_IDLE_MS, LIN_PER_ADDR at once per address. */
 #define LIN_HELLO_MS  3000
 #define LIN_IDLE_MS   120000
 #define LIN_PER_ADDR  4
@@ -55,7 +46,7 @@ struct lpeer {
 	long long next_try_ms;
 	int backoff_ms;
 	int said_down;
-	int forced;                        /* S36 e2: everything by TCP */
+	int forced;                        /* everything by TCP */
 	int probe;                         /* connect even with nothing queued */
 	long long conn_start_ms;           /* the connect in flight began */
 };
@@ -63,14 +54,14 @@ struct lpeer {
 struct lin {
 	int fd;
 	pc_addr from;           /* from the hello */
-	pc_addr peer;           /* CH-18: the connection's source */
+	pc_addr peer;           /* the connection's source */
 	int hello_ok;
 	unsigned char *buf;     /* the hello's bytes, then FRAME_MAX + 4 */
 	size_t have;
-	long long since_ms;     /* CH-18: the accept, the hello, the last frame */
+	long long since_ms;     /* the accept, the hello, the last frame */
 };
 
-static int forced_any;                 /* S36 e2: fast path for clane_forced */
+static int forced_any;                 /* fast path for clane_forced */
 
 static struct {
 	pthread_mutex_t mx;
@@ -317,7 +308,7 @@ static void rx_queue(const pc_addr *from, const unsigned char *d,
 static void peer_close(struct lpeer *p, long long now)
 {
 	if (p->probe && !p->connected) {
-		p->probe = 0;                  /* S36 e2: the probe's answer is no */
+		p->probe = 0;                  /* the probe's answer is no */
 		p->conn_start_ms = 0;
 	}
 	if (p->fd >= 0)
@@ -346,10 +337,8 @@ static void peer_connect(struct lpeer *p, long long now)
 		return;
 	}
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-	/* from the advertise address, as the datagrams are: the receiver
-	 * checks the hello against the connection's source, and an unbound
-	 * socket leaves by whatever address the route picks (127.0.0.1 on
-	 * loopback, another interface on a multi-homed host) */
+	/* from the advertise address: the receiver checks the hello against the source,
+	 * and an unbound socket leaves by whatever address the route picks */
 	{
 		pc_addr src = L.self;
 
@@ -363,8 +352,7 @@ static void peer_connect(struct lpeer *p, long long now)
 	p->fd = fd;
 	p->connected = 0;
 	memcpy(p->hello, "PCL1", 4);
-	/* the wire: IPv4's four raw bytes and the port, network order (IP6-3
-	 * gives the hello an IPv6 form) */
+	/* the wire: IPv4's four raw bytes and the port, network order */
 	memcpy(p->hello + 4, &L.self.in4.sin_addr.s_addr, 4);
 	memcpy(p->hello + 8, &L.self.in4.sin_port, 2);
 	p->hoff = 0;
@@ -404,7 +392,7 @@ static int peer_write(struct lpeer *p, long long now)
 		}
 		p->connected = 1;
 		p->backoff_ms = 0;
-		p->probe = 0;                  /* S36 e2: answered */
+		p->probe = 0;                  /* answered */
 		p->conn_start_ms = 0;
 		if (p->said_down) {
 			char ab[PC_ADDR_STRLEN];
@@ -516,7 +504,7 @@ static int lin_read(struct lin *c)
 			if ((rc = lin_fill(c, LIN_HELLO_LEN)) <= 0)
 				return rc;
 			/* the hello's four raw bytes against the connection's
-			 * IPv4 source (the wire; IP6-3 adds the IPv6 form) */
+			 * IPv4 source */
 			memcpy(&a4, c->buf + 4, 4);
 			memcpy(&p2, c->buf + 8, 2);
 			if (memcmp(c->buf, "PCL1", 4) != 0 ||
@@ -553,7 +541,7 @@ static int lin_read(struct lin *c)
 	}
 }
 
-/* CH-18: inbound connections now held from @a's address */
+/* inbound connections now held from @a's address */
 static int lin_from(const struct lin *in, int nin, const pc_addr *a)
 {
 	int i, k = 0;
@@ -680,7 +668,7 @@ static void *lane_main(void *arg)
 				in[i] = in[--nin];
 			}
 		}
-		/* CH-18: a hello late, or a lane silent too long - backwards,
+		/* a hello late, or a lane silent too long - backwards,
 		 * for the same reason as above */
 		for (i = nin - 1; i >= 0; i--)
 			if (now - in[i].since_ms >
@@ -692,6 +680,11 @@ static void *lane_main(void *arg)
 			}
 	}
 	return NULL;
+}
+
+int clane_off(void)
+{
+	return L.lane_off;
 }
 
 int clane_start(const pc_addr *self_cluster, int lane_off)

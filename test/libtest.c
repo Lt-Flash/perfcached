@@ -1,14 +1,5 @@
-/*
- * libtest.c — libperfd end to end against live daemons (booted by
- * test/libtest.sh): every typed verb round-trips on the one binary
- * wire (S317: the data verbs on their fixed-layout frames, everything
- * else as CMD trees), values are byte-exact - NULs, 0x9E, newlines and
- * bytes that are not UTF-8 included - errors surface with messages,
- * the JSON edge (perfd_command, the pipeline) renders maps, bools and
- * strings as the text door used to, the pipeline delivers in request
- * order, and the secret LIST tries in order (rotation).
- * Usage: libtest <pt-port> <nx-port> <secret>
- */
+/* libtest.c - libperfd end to end against live daemons: every typed verb round-trips byte-exact,
+ * errors carry messages, the JSON edge renders right, the pipeline keeps order, secrets rotate. */
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,12 +13,8 @@
 
 static int pass, fail;
 
-/* S441: perfd_connect honours connect_timeout_ms.  A listener with a
- * backlog of 0 that never accepts takes one handshake into its queue;
- * after that the kernel DROPS every SYN, as a member gone dark does, and a
- * blocking connect waits out the SYN retries (~127 s - perfcli's first
- * stats beside a partitioned master took 134 s).  No daemon needed.
- * FAIL-FIRST: the build before ignores the bound - the alarm ends it. */
+/* perfd_connect honours connect_timeout_ms against a listener whose full backlog makes the
+ * kernel drop every SYN, as a member gone dark does; no daemon needed, the alarm ends a hang */
 #include <fcntl.h>
 #include <signal.h>
 #include <netinet/in.h>
@@ -105,7 +92,7 @@ static void s441_connect_timeout(void)
 	close(lf);
 }
 
-/* S354: this process's CPU time, seconds */
+/* this process's CPU time, seconds */
 static double cpu_s(void)
 {
 	struct timespec ts;
@@ -114,7 +101,7 @@ static double cpu_s(void)
 	return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-/* ---- S355 - run in children forked while nothing is cached -------------- */
+/* ---- the key cache, run in children forked while nothing is cached ------- */
 static int s355_port;
 static const char *s355_secret;
 
@@ -144,15 +131,8 @@ static void *s355_conn(void *arg)
 	return NULL;
 }
 
-/* 8 threads connect at once, the cache cold: one derives, the rest wait for
- * its key - the 8 together cost about one derive, not eight */
-/* 8 threads connecting at once: their CPU is read twice - cold (the keys
- * not derived yet) and warm (cached by the first round) - so what the
- * derivations cost is the DIFFERENCE, and the handshakes' own cost, which
- * a sanitizer multiplies far more than Argon2's memory-bound loop, falls
- * out.  A bound on the cold round alone (2.5 derivations) failed under
- * ASan on a busy runner with one derivation and 3.6 of overhead
- * (v0.6.4-rc10, GitLab 110659). */
+/* 8 threads connect at once, read cold then warm: the derivations cost the DIFFERENCE, so the
+ * handshakes' own cost, which a sanitizer multiplies, falls out */
 static double s355_round(int *ok)
 {
 	pthread_t th[8];
@@ -175,11 +155,8 @@ static int s355_threads(void)
 
 	cold = s355_round(&ok);
 	warm = s355_round(&ok);
-	/* the derive is memory-hard: its CPU time moves with the host's load,
-	 * and one measured alone said 97 ms while the cold round's cost 190
-	 * on a busy GitLab ASan runner (v0.7.2-rc6) - so it is measured on
-	 * both sides of the rounds, and the bound is 2.5 derives: what S355
-	 * stops is every thread deriving, 8 of them */
+	/* the memory-hard derive's CPU time moves with the host's load, so it is measured on
+	 * both sides of the rounds; 2.5 derives bounds one thread deriving, not all 8 */
 	d2 = derive_cost();
 	if (d2 > d)
 		d = d2;
@@ -189,13 +166,8 @@ static int s355_threads(void)
 	return ok && cold - warm < 2.5 * d ? 0 : 1;
 }
 
-/* S369: libperfd on a SMALL thread stack.  musl gives a pthread 128 KB by
- * default and noise_handshake's frame alone was 131,440 bytes (two 64 KB
- * buffers for a handshake message the daemon caps at 2 KB), send_bytes and
- * fill 64 KB each: the first connect from a thread on Alpine overflowed
- * (GitLab 110084 alpine, S355's threads).  Four threads with 128 KB stacks,
- * on glibc too: connect, a 100 KB value set and read back (more than one
- * 64 KB transport record each way), ping. */
+/* libperfd on musl's default 128 KB thread stack: four threads connect, set and read back
+ * 100 KB (over one 64 KB transport record each way) and ping */
 static void *s369_conn(void *arg)
 {
 	const char *only[] = { s355_secret, NULL };
@@ -253,7 +225,7 @@ static int s355_fork(void)
 	if (perfd_psk_prepare(only) != 0)
 		return 1;
 #else
-	{                                      /* 0.5.6.4: a connect is all there is */
+	{                                      /* an older library: a connect is all there is */
 		perfd_opts o = { .secrets = only };
 		perfd_t *p = perfd_connect("127.0.0.1", s355_port, &o);
 
@@ -286,12 +258,8 @@ static int s355_fork(void)
 }
 
 /* fork @fn into a child of its own; its exit status is the verdict */
-/* ---- S370 - the options carry their size ------------------------------
- * A program built against an older header passes a SHORTER perfd_opts; the
- * library must read only the bytes it has.  The struct here is cut right
- * after `size`, and everything past it is 0x7F garbage - secrets included.
- * Honoured, the connect is plaintext and pings; ignored, the library follows
- * a garbage secrets pointer (the child dies, the parent reports it). */
+/* ---- the options carry their size: a perfd_opts cut after `size`, 0x7F garbage past it, must
+ * connect plaintext and ping; a library reading past it follows a garbage secrets pointer ---- */
 static int s370_port;
 
 static int s370_short_opts(void)
@@ -333,7 +301,7 @@ static int in_child(int (*fn)(void))
 } while (0)
 
 
-/* S313: perfd_hgetall's callback - counts pairs, remembers "f2"'s value */
+/* perfd_hgetall's callback - counts pairs, remembers "f2"'s value */
 struct hga { int n; char f2[16]; };
 static int hga_cb(void *ctx, const char *f, size_t fl, const void *v, size_t vl)
 {
@@ -347,7 +315,7 @@ static int hga_cb(void *ctx, const char *f, size_t fl, const void *v, size_t vl)
 	return 0;
 }
 
-/* ---- S353 - the reads that allocate nothing ---------------------------- */
+/* ---- the reads that allocate nothing ----------------------------------- */
 static void s353_checks(perfd_t *p)
 {
 	/* the largest field a hash command carries: its arguments are capped
@@ -462,7 +430,7 @@ int main(int argc, char **argv)
 	int ptport = argc > 1 ? atoi(argv[1]) : 6479;
 	int nxport = argc > 2 ? atoi(argv[2]) : 0;
 	const char *secret = argc > 3 ? argv[3] : NULL;
-	const char *enable = argc > 4 ? argv[4] : NULL;   /* 0.6.6 */
+	const char *enable = argc > 4 ? argv[4] : NULL;
 	perfd_t *p;
 	void *val;
 	size_t vlen;
@@ -486,9 +454,9 @@ int main(int argc, char **argv)
 	OK(rc == 1 && vlen == 5 && !memcmp(val, "hello", 5), "get value");
 	OK(ttl > 400 && ttl <= 500, "get ttl");
 	if (rc == 1)
-		perfd_free_value(val);         /* S370: the library's release */
+		perfd_free_value(val);         /* the library's release */
 
-	/* S370: errors carry a kind; the options carry their size */
+	/* errors carry a kind; the options carry their size */
 	{
 		char big[5000];
 		perfd_opts io = PERFD_OPTS_INIT;
@@ -514,9 +482,9 @@ int main(int argc, char **argv)
 			"library reads only the bytes the caller has");
 	}
 
-	s353_checks(p);                        /* S353: the _buf reads */
+	s353_checks(p);                        /* the _buf reads */
 
-	/* S279b: conditional set */
+	/* conditional set */
 	OK(perfd_set_cond(p, "c", "snx1", "a", 1, 60, PERFD_NX) == 1,
 		"set_cond NX on absent: stored");
 	OK(perfd_set_cond(p, "c", "snx1", "b", 1, 0, PERFD_NX) == 0,
@@ -534,7 +502,7 @@ int main(int argc, char **argv)
 	OK(perfd_set_cond(p, "c", "snx1", "c", 1, 0, 3) == -1,
 		"set_cond with a bad cond errs");
 
-	/* S297: compare-and-set / compare-and-delete - the token lock */
+	/* compare-and-set / compare-and-delete - the token lock */
 	OK(perfd_set_cond(p, "c", "lk", "tokA", 4, 60, PERFD_NX) == 1,
 		"lock: acquired with NX");
 	OK(perfd_set_if(p, "c", "lk", "tokB", 4, 60, "tokX", 4, 0) == 0,
@@ -562,9 +530,9 @@ int main(int argc, char **argv)
 	OK(perfd_del_if(p, "c", "lk3", "v", 1, 1) == 0,
 		"del_if IFNE on an absent key: nothing to delete");
 
-	hash_checks(p);                                /* S313 */
+	hash_checks(p);
 
-	/* S314: rate-limit hits */
+	/* rate-limit hits */
 	{
 		long long cnt = 0;
 
@@ -663,7 +631,7 @@ int main(int argc, char **argv)
 		free(vals[2]);
 	}
 	{
-		/* G8: the same with each key's outcome */
+		/* the same with each key's outcome */
 		const char *const ks[] = { "m1", "gone", "m2" };
 		void *vals[3];
 		size_t lens[3];
@@ -708,8 +676,7 @@ int main(int argc, char **argv)
 	r = perfd_command(p, "stats", NULL);
 	OK(r && strstr(r, "\"arena_total\""), "command stats");
 	OK(r && strstr(r, "\"hits\""), "stats carries hits");
-	/* S76 as 0.4.5 counts it (D10): this connection is a binary one
-	 * and has carried every request above as a frame */
+	/* this connection is a binary one and has carried every request above as a frame */
 	{
 		const char *b = r ? strstr(r, "\"binary\":{\"conns\":") : NULL;
 		const char *q = b ? strstr(b, "\"requests\":") : NULL;
@@ -799,7 +766,7 @@ int main(int argc, char **argv)
 	free(r);
 	OK(perfd_set(p, "c", "bk2", "x", 1, 0) == 0, "set after the pipeline");
 	OK(perfd_del(p, "c", "bk2") == 1, "del after the pipeline");
-	/* ---- 0.6.6: the admin verbs (DESIGN 12no) ----------------------- */
+	/* ---- the admin verbs ------------------------------------------------ */
 	r = perfd_stats(p, NULL);
 	OK(r && strstr(r, "\"collections\""), "stats: the tree as JSON");
 	perfd_free_value(r);
@@ -826,7 +793,7 @@ int main(int argc, char **argv)
 		r = perfd_updrain(p, "c", PERFD_SWEEP_RUN);
 		OK(r == NULL && strstr(perfd_error(p), "no upstream"),
 			"updrain, privileged: the same");
-		/* 0.7.0 (S408 part 2): the DDL, typed - a round trip */
+		/* the DDL, typed - a round trip */
 		r = perfd_create(p, "lt-ddl", 8);
 		OK(r && strstr(r, "\"created\":true") && strstr(r, "\"buckets\":256"),
 			"create lt-ddl 8: created, 256 buckets");
@@ -838,7 +805,7 @@ int main(int argc, char **argv)
 		r = perfd_rename(p, "lt-ddl", "lt-ddl2");
 		OK(r && strstr(r, "\"renamed\":true"), "rename lt-ddl -> lt-ddl2");
 		perfd_free_value(r);
-		/* 0.7.1 (S432): the RESP DB-index map, typed - a round trip */
+		/* the RESP DB-index map, typed - a round trip */
 		r = perfd_map(p, 7, "lt-ddl2");
 		OK(r && strstr(r, "\"mapped\":true") && strstr(r, "\"col\":\"lt-ddl2\""),
 			"map 7 lt-ddl2: mapped");
@@ -885,16 +852,15 @@ int main(int argc, char **argv)
 		r = perfd_reset_stats(p);
 		OK(r && strstr(r, "\"reset\":true"), "reset_stats: this node's totals");
 		perfd_free_value(r);
-		r = perfd_reset_stats_fleet(p);       /* S407 part 3: the fleet form */
+		r = perfd_reset_stats_fleet(p);       /* the fleet form */
 		OK(r && strstr(r, "\"reset\":true"), "reset_stats_fleet: this node and its live peers");
 		perfd_free_value(r);
 		r = perfd_save(p);
 		OK((r && strstr(r, "\"started\"")) || (!r && strstr(perfd_error(p), "persistence")),
 			"save: started, or the daemon's 'persistence is not configured'");
 		perfd_free_value(r);
-		/* 0.7.0 (S411 part 1): the staging call - the arguments are checked
-		 * here, the bytes reach the node, and the node's own refusal comes
-		 * back (unsigned, or no state directory, or a package install) */
+		/* the staging call: the arguments are checked here, the bytes reach the node,
+		 * and its refusal comes back (unsigned, no state directory, or a package install) */
 		r = perfd_upgrade_stage(p, "x", 1, "bad version!", NULL, NULL, NULL);
 		OK(r == NULL && perfd_error_kind(p) == PERFD_E_ARG,
 			"upgrade_stage with a bad version: PERFD_E_ARG, nothing sent");
@@ -923,7 +889,7 @@ int main(int argc, char **argv)
 		const char *wrong_only[] = { "not-the-secret", NULL };
 		perfd_opts o = { .secrets = wrong_then_right };
 
-		/* S370: a wrong secret is PERFD_E_AUTH */
+		/* a wrong secret is PERFD_E_AUTH */
 		{
 			perfd_opts wo = { .secrets = wrong_only };
 
@@ -931,8 +897,7 @@ int main(int argc, char **argv)
 				perfd_error_kind(NULL) == PERFD_E_AUTH,
 				"S370: a wrong secret is PERFD_E_AUTH");
 		}
-		/* S355 - forked while this process has derived nothing, so each
-		 * child starts with a cold cache */
+		/* forked while this process has derived nothing: each child's cache is cold */
 		s355_port = nxport;
 		s355_secret = secret;
 		OK(in_child(s355_threads), "S355: 8 threads connecting at once "
@@ -942,12 +907,8 @@ int main(int argc, char **argv)
 		OK(in_child(s369_small_stacks), "S369: four threads on 128 KB stacks "
 			"(musl's default) connect, set and get 100 KB, ping");
 
-		/* S354 - FIRST in the Noise leg, while the process has derived
-		 * nothing yet.  A blocking connect takes the PSK from the
-		 * process-wide cache, so only the first connect with a secret
-		 * pays Argon2id (~100 ms of CPU and a 64 MiB mapping): the next
-		 * 19 together cost less than the first.  Before, every blocking
-		 * connect derived - about 19 times the first. */
+		/* FIRST in the Noise leg: only the first connect pays Argon2id (~100 ms of CPU,
+		 * 64 MiB); the process-wide cache makes the next 19 together cost less */
 		{
 			const char *only[] = { secret, NULL };
 			perfd_opts so = { .secrets = only };

@@ -1,29 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clbulk.h - the bulk TCP plane's framed record stream and the batch
- * handoff (M7).
- *
- * Records above the datagram ceiling travel over a cluster-principal
- * Noise session on advertise:port/TCP.  This module owns the two things
- * that are the same for every consumer of that session: the framing -
- * [len u16][ciphertext] chunks carrying a plaintext byte stream - and
- * the queue by which the peer thread hands a batch to the bulk thread.
- *
- * What is deliberately NOT here: connecting, the handshake, and
- * applying records.  bulk_pull_from, bulk_tx, bulk_rx and
- * bulk_serve_boot each open a socket, drive pc_hs_*, and write into the
- * store and the WAL; under rule 4 none of that can live in a module
- * that links alone for its test.  They keep the framing calls and stay
- * in cluster.c as orchestration.  That makes M7 smaller than
- * doc/MODULARITY.md sketches - about 110 lines rather than 480 - and
- * the residue is orchestration, not unfinished work.
- *
- * The lock here IS the bulk plane's: C.bmx guarded this handoff and the
- * migration producer alike, so clbulk owns it and lends it out.  clboot
- * borrowed it as an unowned pointer in M4; it now borrows it from here,
- * and clmig will do the same in wave 3.
- */
+/* clbulk.h - the bulk TCP plane's framed record stream and batch handoff;
+ * connecting, the handshake and applying records stay in cluster.c. */
 #ifndef PC_CLBULK_H
 #define PC_CLBULK_H
 
@@ -34,23 +12,8 @@
 #include "pc_noise.h"                  /* struct pc_cipherstate */
 #include "pcaddr.h"
 
-/* The batch handoff: the peer thread OFFERS a stubbed batch, the bulk
- * thread TAKES it, sends it, and says DONE.  One batch in flight. */
-/* S178: a SLOT PER BATCH, not one batch.
- *
- * It held exactly one, and clbulk_offer() refused while the bulk thread
- * was still sending it.  That is fine for a placement move, which is
- * one peer at a time - but S174 put eager replication on this plane,
- * and a sweep offers a batch PER PEER in the same tick.  On a fleet of
- * three, one of the two offers was refused every time there were
- * oversized records, and the caller treated that as a cycle that had
- * not delivered.  Measured live 2026-09-20: it pinned every sweep mark
- * on the fleet and the nodes re-sent the whole 64,000-record keyspace
- * to each other for ever, ~1,900 records/s apiece, all refused as older.
- *
- * Four slots, taken oldest first: enough for a peer each on a small
- * fleet and a spare, small enough that a bulk thread falling behind
- * still applies back-pressure rather than queueing without bound. */
+/* a slot per batch: a sweep offers one per peer in the same tick; small
+ * enough that a lagging bulk thread still applies back-pressure */
 #define CLBULK_SLOTS  4
 
 struct clbulk_batch {
@@ -69,77 +32,53 @@ struct clbulk {
 	struct clbulk_batch cur;       /* the one the bulk thread holds */
 };
 
-/* S174: what a batch MEANS to the receiver.  A placement move makes the
- * receiver the record's owner - it persists it and clears the locator;
- * an eager replica is a copy, stored PASSIVE and off the WAL, exactly
- * as the same record would be if it had fitted in a datagram.  The kind
- * rides as a second byte of the handshake payload, after the client
- * version: a peer on an older build reads the first byte, ignores the
- * rest and treats the batch as a move, which is what it always was. */
+/* a move makes the receiver the owner; a replica is stored PASSIVE, off the
+ * WAL.  An older peer reads only the version byte and treats it as a move. */
 #define CLBULK_KIND_MIGRATE  0
 #define CLBULK_KIND_REPLICA  1
-/* UP6n: a staged build, not records.  An older receiver takes the kind
- * for a move - but the count word that follows is CLBULK_STAGE_MAGIC,
- * past any batch it accepts, so it closes the connection: it refuses,
- * it never applies (cluster.c bulk_rx).  Senders offer it only to a
- * member advertising CLMEMB_FEAT_STAGE all the same. */
+/* a staged build: an older receiver refuses CLBULK_STAGE_MAGIC as a count
+ * and closes; offered only to a member advertising CLMEMB_FEAT_STAGE */
 #define CLBULK_KIND_STAGE    2
 #define CLBULK_STAGE_MAGIC   0xFFFFFFFEu
 
 void clbulk_init(struct clbulk *b);
 void clbulk_fini(struct clbulk *b);
 
-/* The lock, for the planes that share it - clboot's handoff today,
- * clmig's producer in wave 3.  Owning it here is what lets those stop
- * passing an unowned mutex around. */
+/* the bulk plane's lock, lent to the planes that share it */
 pthread_mutex_t *clbulk_lock(struct clbulk *b);
 
-/* Offer a batch.  1 = queued and OWNED by the queue from now on; 0 =
- * every slot is full, so the caller keeps its buffer and must treat the
- * cycle as one that did not deliver.  Peer thread. */
+/* 1 = queued and OWNED by the queue; 0 = every slot full, the caller keeps
+ * its buffer and the cycle did not deliver.  Peer thread. */
 int clbulk_offer(struct clbulk *b, unsigned char *buf, size_t len,
 		unsigned int recs, int kind, const pc_addr *to);
 
-/* Is a batch waiting?  Any thread. */
+/* Any thread. */
 int clbulk_pending(struct clbulk *b);
 
-/* Take the queued batch; 0 when there is none.  The caller frees the
- * buffer and then calls clbulk_done().  Bulk thread. */
+/* 0 when there is none; the caller frees the buffer, then calls
+ * clbulk_done().  Bulk thread. */
 int clbulk_take(struct clbulk *b, unsigned char **buf, size_t *len,
 		unsigned int *recs, int *kind, pc_addr *to);
 void clbulk_done(struct clbulk *b);
 
-/* ---- the framed record stream ---------------------------------------
- * Every entry point works on an fd and a cipherstate the caller has
- * already handshaked; nothing here opens or closes a socket. */
+/* the framed record stream: fd and cipherstate already handshaked by the
+ * caller; nothing here opens or closes a socket */
 
 /* read or write exactly n bytes, retrying a short transfer.  0 or -1. */
 int clbulk_io(int fd, int wr, void *buf, size_t n);
 
-/* Send a plaintext byte stream as [len u16][ciphertext] chunks, each at
- * most PC_NOISE_MAXPT of plaintext.  0 or -1. */
+/* [len u16][ciphertext] chunks, each at most PC_NOISE_MAXPT of plaintext.
+ * 0 or -1. */
 int clbulk_send(int fd, struct pc_cipherstate *cs, const unsigned char *p,
 		size_t n);
 
-/* Read exactly `want` plaintext bytes out of the chunk stream, carrying
- * the remainder in `stash` for the next call.  A chunk whose declared
- * length is short of the tag, longer than a Noise message, or would
- * overrun the stash is refused - this is the "truncated batch refused
- * by exact length" the specification asks for.  0 or -1. */
+/* the remainder carries in `stash`; a chunk short of the tag, over a Noise
+ * message or the stash is refused (truncated batch by exact length) */
 int clbulk_recv_exact(int fd, struct pc_cipherstate *cs, unsigned char *stash,
 		size_t *slen, size_t scap, unsigned char *out, size_t want);
 
-/* ---- the boot request -----------------------------------------------
- *
- * The first frame over an established bulk channel: which kind of
- * transfer, and who is asking.
- *
- *     [kind1][node2][pad1]
- *
- * Four bytes, built at one end of cluster.c and read at the other, with
- * the node's offset written out in both.  The pad byte is sent as 0 and
- * not read; it is kept because a peer on an older build sends four.
- */
+/* boot request, the first bulk frame: [kind1][node2][pad1]; pad sent as 0,
+ * not read, kept because an older peer sends four bytes */
 #define CLBULK_BOOTREQ_LEN  4
 
 size_t clbulk_bootreq_write(unsigned char *buf, size_t cap, int kind,
@@ -148,32 +87,14 @@ size_t clbulk_bootreq_write(unsigned char *buf, size_t cap, int kind,
 int clbulk_bootreq_parse(const unsigned char *p, size_t n, int *kind,
 		int *node);
 
-/* ---- the handshake framing -------------------------------------------
- *
- * Before the cipher is up, the bulk channel frames each handshake
- * message with a 2-byte little-endian length.  The INITIATOR's first
- * message also carries a principal byte, and the length COVERS it:
- *
- *     msg1   [len2][principal1][noise msg1]     len = 1 + noise length
- *     msg2   [len2][noise msg2]                 len = noise length
- *
- * The noise library writes its payload in place, so these reserve the
- * prefix and patch the length afterwards - the same shape as clsync's
- * envelope, and the reason this is offsets-and-lengths rather than a
- * cursor walk.
- *
- * It was spelled out three times - bulk_pull_from, bulk_tx and bulk_rx -
- * and the difference between the two shapes (whether the principal is
- * inside the length) is exactly the sort of thing that survives being
- * copied and then diverges.
- */
+/* handshake frames: msg1 [len2][principal1][noise], len = 1 + noise length;
+ * msg2 [len2][noise].  Payload written in place, length patched after. */
 #define CLBULK_LEN_PREFIX  2       /* the LE length itself */
 #define CLBULK_HS1_AT      3       /* msg1's payload: after len + principal */
 #define CLBULK_HS2_AT      2       /* msg2's payload: after len */
 
-/* Patch the prefix once the payload of @paylen bytes is in place at
- * CLBULK_HS1_AT / CLBULK_HS2_AT.  Both return the whole frame's length,
- * which is what goes on the wire. */
+/* patch the prefix once @paylen bytes sit at CLBULK_HS1_AT / CLBULK_HS2_AT;
+ * both return the whole frame's length */
 size_t clbulk_hs1_frame(unsigned char *buf, size_t cap, int principal,
 		size_t paylen);
 size_t clbulk_hs2_frame(unsigned char *buf, size_t cap, size_t paylen);

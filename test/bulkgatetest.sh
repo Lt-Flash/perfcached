@@ -1,16 +1,6 @@
 #!/bin/sh
-# bulkgatetest.sh - CH-11: the bulk plane serves one connection at a time,
-# so it reads only from a member's host and wants the opening message
-# within a second.
-#  - control: a joiner on another loopback address gets a 60,000-byte
-#    record, which only the bulk plane carries (its client binds its own
-#    host, which the gate expects);
-#  - a connection from 127.0.0.1, no member's host, is closed at once and
-#    the log says so;
-#  - an idle connection from a member's host is closed within ~1 s, not
-#    held for the 5 s receive timeout with the plane queued behind it.
-# Fail-first: before CH-11 both connections are held about 5 s.
-# Usage: test/bulkgatetest.sh [./perfcached] [./perfcli]
+# bulkgatetest.sh - the bulk plane serves one connection at a time, so it reads only from a member's
+# host and closes a connection without its opening message within ~1 s.
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}

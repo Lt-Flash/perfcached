@@ -1,43 +1,5 @@
-/* evactest.c - S190: the survivors of a mass expiry are moved out of the
- * chunks they pin, and the chunks retire.
- *
- * The soak: 62,000 records with one TTL, all gone at once, 2,000
- * long-lived records left behind spread across the ~90 chunks that held
- * them, ~22 per chunk.  A chunk retires only when every cell in it is
- * free, so not one could - 57.5 MB held for 2.2 MB live, indefinitely.
- *
- * The shape here: one class, N records stored, every 40th one kept, the
- * rest removed - the survivors land in every chunk.  Then the reclaim
- * tick (the arena's verdict on which chunks are SPARSE) and the
- * evacuator (the table's walk) run as the maintenance thread would.
- * Asserted:
- *  - before: the chunk count is what the whole load needed, and stays
- *    there across reclaim ticks alone - the pin is real;
- *  - the reclaim tick marks the chunks sparse;
- *  - the evacuator moves the survivors that are in a sparse chunk, and
- *    settles - it does not shuffle records between sparse chunks for
- *    ever, which would be worse than the hold it fixes;
- *  - every survivor still reads back with its value afterwards;
- *  - the next reclaim ticks retire the emptied chunks: the class holds
- *    about what the survivors need, not what the load did;
- *  - a table with nothing sparse moves nothing (the ordinary case costs
- *    nothing but the walk);
- *  - and the one that matters at runtime: with READERS hammering the
- *    survivors throughout a second round, not one read misses a record
- *    that exists or returns a torn value.  The move swaps the slot under
- *    the bucket lock with the version bumped around it, so a reader
- *    copying from the old cell sees the version move and retries - the
- *    contract a replacing store already relies on;
- *  - a class's last few survivors - an eighth of a chunk or less - are
- *    consolidated once and then stay put: the chunk they share is still
- *    sparse, and the only other chunks are their own and the empty one
- *    the reclaim tick keeps, neither of which frees anything as a target;
- *  - the census (RV-3 ledger, debug build only) holds throughout.
- * Fail-first: with the evacuator compiled to a no-op the chunk count
- * never comes down; with the empty chunk and the source allowed as
- * targets (alloc_dense before the fix) the few survivors bounce between
- * their chunk and the kept empty one every other tick, for ever.
- */
+/* evactest.c - a mass expiry's survivors are moved out of the sparse chunks they pin and the chunks
+ * retire; the evacuator settles, and concurrent readers never miss a record or see a torn value. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -175,9 +137,8 @@ int main(void)
 			pcache_arena_reclaim_tick();
 			if (!ticks_to_retire && chunks() < before / 4)
 				ticks_to_retire = t + 1;
-			/* CONVERGENCE, not a fixed count: a background task that
-			 * shuffled records between sparse chunks for ever would
-			 * be worse than the hold it fixes */
+			/* CONVERGENCE, not a fixed count: shuffling records between sparse
+			 * chunks for ever would be worse than the hold it fixes */
 			quiet = m ? 0 : quiet + 1;
 			last = m;
 		}
@@ -227,8 +188,7 @@ int main(void)
 		unsigned int m2 = 0, b2;
 
 		/* a keyspace of its OWN: the first round's survivors are
-		 * consolidated already, so re-loading theirs would leave
-		 * nothing sparse to move */
+		 * consolidated already and would leave nothing sparse */
 		for (i = 0; i < N; i++) {
 			key.len = snprintf(kb, sizeof kb, "j%06u", i);
 			key.s = kb;

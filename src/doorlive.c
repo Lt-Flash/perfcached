@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * doorlive.c - the doors' live settings (12nw): the snapshot a reload
- * swaps whole - both allow-lists, the HTTP token, the RESP password, the
- * enable secrets - its retirement, and the checks the doors make against
- * it.  Moved from daemon.c unchanged (the 0.7.2 split, wave 1 -
- * doc/MODULARITY.md); the PSK table and the reload itself stay there.
- */
+/* doorlive.c - the doors' live settings: the snapshot a reload swaps whole (allow-lists,
+ * HTTP token, RESP password, enable secrets), its retirement, and the checks against it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,12 +14,8 @@
 #include "reload.h"
 #include "doorlive.h"
 
-/* ---- 12nw: what a config reload may change, swapped whole ---------------
- * The doors read the allow-lists and the secrets through the accessors
- * below, and those read LIVE: an immutable snapshot that a reload replaces
- * with one store.  A reader holds the pointer for one check, never past
- * it, so the snapshot a reload replaced is wiped and freed RETIRE_S later
- * (pc_live_retire_tick, the maintenance thread). */
+/* Readers hold the LIVE pointer for one check, never past it, so a replaced snapshot
+ * is wiped and freed LIVE_RETIRE_S later by pc_live_retire_tick. */
 #define LIVE_RETIRE_S 10
 #define LIVE_RETIRED  8
 struct pc_live *LIVE;
@@ -74,7 +65,15 @@ struct pc_live *live_from(const struct pc_config *c)
 	l->n_enable_secrets = c->n_enable_secrets;
 	for (i = 0; i < c->n_enable_secrets; i++)
 		l->enable_secret[i] = live_dup(c->enable_secret[i]);
+	l->auth_needs_tls = c->auth_needs_tls;
 	return l;
+}
+
+int pc_auth_needs_tls(void)
+{
+	const struct pc_live *L = live();
+
+	return L && L->auth_needs_tls;
 }
 
 static long long live_now_s(void)
@@ -131,11 +130,7 @@ void live_install(struct pc_live *nl)
 	live_retired[slot].at = live_now_s();
 }
 
-/* ---- RESP listener guards (task S33) ------------------------------------
- * A RESP listener has no handshake - stock Redis clients cannot speak
- * Noise - so its access control is entirely config: an allow-list
- * checked at accept, and an optional Redis AUTH password checked before
- * any data command.  Both live here because CFG does. */
+/* ---- RESP listener guards: no handshake, so access control is all config ---- */
 
 int pc_resp_password_set(void)
 {
@@ -163,15 +158,8 @@ int pc_resp_password_ok(const char *p, size_t n)
 	return diff == 0;
 }
 
-/* S129: does @p match ANY configured enable secret?  Constant time per
- * candidate, for the same reason the RESP password is: a privilege
- * secret must not leak its prefix through timing.  Every candidate is
- * compared even after a match, so the answer costs the same whichever
- * entry of a rotation list matched - or none did.
- *
- * FAIL-CLOSED: no secret configured returns 0, so `enable` cannot
- * succeed and the privileged verbs stay unreachable from the client
- * door however `allow_create` is set. */
+/* constant time per candidate, and every candidate compared even after a match.
+ * Fail-closed: no secret configured returns 0, so `enable` cannot succeed. */
 int pc_enable_secret_ok(const char *p, size_t n)
 {
 	const struct pc_live *L = live();
@@ -215,14 +203,12 @@ int pc_resp_peer_allowed(const pc_addr *sa, unsigned int len)
 		                        * already refused at config validate */
 	if (len < sizeof sa->in4)
 		return 0;              /* not an address: not on the list */
-	for (i = 0; i < L->n_resp_allow; i++)  /* IP6-2: either family */
+	for (i = 0; i < L->n_resp_allow; i++)
 		if (pc_addr_in_prefix(sa, L->resp_allow[i].family,
 		        L->resp_allow[i].net, L->resp_allow[i].bits))
 			return 1;
-	/* A turned-away client is invisible to it (we close before a byte
-	 * is read), so it has to be visible HERE or an operator debugging
-	 * "my Redis client just hangs up" has nothing to go on.  Rate-
-	 * limited: a port scan must not become a log flood. */
+	/* the client sees only a close, so the refusal is logged here;
+	 * rate-limited so a port scan is not a log flood */
 	{
 		static __thread unsigned int shouted;
 
@@ -236,9 +222,8 @@ int pc_resp_peer_allowed(const pc_addr *sa, unsigned int len)
 	return 0;
 }
 
-/* S46: the same check for the metrics listener.  Separate list, same
- * reasoning - and separate so an operator can let a scraper in without
- * widening the RESP door, which reads and WRITES data. */
+/* separate from resp_allow so a scraper can be let in without
+ * widening the RESP door, which reads and writes data */
 int pc_http_peer_allowed(const pc_addr *sa, unsigned int len)
 {
 	const struct pc_live *L = live();
@@ -249,7 +234,7 @@ int pc_http_peer_allowed(const pc_addr *sa, unsigned int len)
 		                        * at config validate */
 	if (len < sizeof sa->in4)
 		return 0;
-	for (i = 0; i < L->n_http_allow; i++)  /* IP6-2: either family */
+	for (i = 0; i < L->n_http_allow; i++)
 		if (pc_addr_in_prefix(sa, L->http_allow[i].family,
 		        L->http_allow[i].net, L->http_allow[i].bits))
 			return 1;
@@ -266,10 +251,7 @@ int pc_http_peer_allowed(const pc_addr *sa, unsigned int len)
 	return 0;
 }
 
-/* S37: the HTTP door's token.  Compared in constant time by the
- * caller for the same reason the RESP password is - it crosses the
- * wire in the clear, which is no reason to leak its prefix through
- * timing as well. */
+/* compared in constant time by the caller: it crosses the wire in the clear */
 const char *pc_http_token(void)
 {
 	const struct pc_live *L = live();

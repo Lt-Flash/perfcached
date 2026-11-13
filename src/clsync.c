@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clsync.c — the staging state machine.
- *
- * Small on purpose: this is where "the backup is never behind" is
- * either true or not, so it is kept exercisable without two daemons.
- */
+/* clsync.c - the staging state machine, kept small so "the backup is never behind" can be
+ * exercised without two daemons. */
 #include <string.h>
 
 #include "clsync.h"
@@ -26,11 +22,8 @@ void pc_clsync_set_backup(struct pc_clsync *s, int have_backup)
 {
 	if (!s)
 		return;
-	/* Deliberately does NOT touch a change in flight.  A backup that
-	 * goes quiet may already have acked, with the ack still on the
-	 * wire; abandoning the change here would burn its sequence and
-	 * risk publishing different content at an epoch the backup has
-	 * already committed to. */
+	/* a change in flight is NOT touched: its ack may still be on the wire, and abandoning it
+	 * risks different content at an epoch the backup already committed to */
 	s->have_backup = have_backup ? 1 : 0;
 }
 
@@ -111,9 +104,8 @@ void pc_clsync_saw(struct pc_clsync *s, uint32_t term, uint32_t seq)
 {
 	if (!s || !s->hold_pending)
 		return;
-	/* the fleet has reached it (or past it) - nothing owed.  Compared
-	 * as an epoch, term first: a LATER term supersedes whatever we were
-	 * holding for a master that no longer exists. */
+	/* reached or passed: compared as an epoch, term first, so a later term supersedes a hold
+	 * for a master that no longer exists */
 	if (term > s->hold_term ||
 	        (term == s->hold_term && seq >= s->hold_seq))
 		s->hold_pending = 0;

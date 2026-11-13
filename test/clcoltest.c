@@ -1,19 +1,5 @@
-/*
- * clcoltest.c - the collection-announce frame (M_COL_SET).
- *
- * DIFFERENTIAL against the three builders it replaces.  ref_one() and
- * ref_rename() are the byte writes copied verbatim from
- * pc_cluster_col_announce, col_sync_peer and pc_cluster_col_announce2 -
- * three near-identical builders differing only in the op byte, which is
- * the shape that drifts.
- *
- * `gen` is a Lamport value and orders competing announcements.  Read it
- * wrong and a create and a drop reorder: a collection comes back after
- * being deleted, or does not come back at all.  Nothing about that
- * looks like a parse error at the time.
- *
- * Build: cc -o clcoltest test/clcoltest.c src/clcol.o
- */
+/* clcoltest.c - the collection-announce frame (M_COL_SET), byte for byte against the three builders
+ * it replaced; `gen` is a Lamport value, and a misread one reorders a create and a drop. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

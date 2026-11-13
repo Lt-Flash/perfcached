@@ -3,36 +3,10 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-call.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds the blocking call path: the pipeline, the data-verb round trip with its
- * failover, the method round trips and perfd_command.
- */
-/*
- * S72: a one-shot call refuses to start unless the pipeline is empty
- * (the guard in each of the two functions below), so anything queued
- * DURING one belongs to that call.  When it fails, drop it.
- *
- * Leaving it behind is not a cosmetic leak: the id was never collected
- * and nothing else will ever collect it, so every LATER call fails the
- * same guard with "pipeline in progress" - on a handle whose caller
- * never pipelined anything.  Worse, that refusal happens before the
- * socket is touched, so `poisoned` is never set and the failover that
- * would have rescued the handle is never reached.  The handle stays
- * dead for the life of the process, and the message sends the reader
- * looking for a pipeline that does not exist.
- *
- * Confirmed in production 2026-09-04 by restarting a perfcached under
- * a live OpenSIPS fleet: one EOF, then "pipeline in progress" forever,
- * on every worker, until OpenSIPS itself was restarted.
- *
- * This does NOT reconnect - that stays the caller's decision, made
- * through perfd_state()/PERFD_ST_FAILED - it only ensures the handle
- * tells the truth about itself afterwards.
- */
+/* perfd-call.inc - part of perfd.c, #included in order (one translation unit, statics file-local):
+ * the blocking call path: the pipeline, the data-verb round trip and failover, perfd_command. */
+/* a one-shot call starts only on an empty pipeline, so anything queued during one is that call's:
+ * dropped on failure, or every later call fails "pipeline in progress" and never fails over */
 static void pipeline_drop(perfd_t *p)
 {
 	p->nids = p->idhead = 0;
@@ -59,21 +33,16 @@ static int bin_roundtrip_once(perfd_t *p, int verb, const char *col,
 	return 0;
 }
 
-/* 0.7.0 (12ne's UP10, found by upgradeloadtest): a member that is back up
- * but not READY yet refuses every request with "node is not READY
- * (recovering) - retry, or use another member".  Nothing was applied, so
- * the request goes to another member - any verb, a counter update too -
- * and the refusing member is marked down until the next refresh sees it
- * ready.  Measured before this: 125,543 of 8.7 M requests failed during a
- * three-node roll, every one of them this refusal on a node the library
- * had just reconnected to. */
+/* a member not READY yet, or a FAILED or HEALING one refusing a write, applied nothing: the request
+ * (any verb) moves to another member, the refuser marked down until a refresh sees it ready */
 static int not_ready_refusal(const perfd_t *t)
 {
 	return t->err_kind == PERFD_E_REFUSED && t->err[0] &&
-		strstr(t->err, "not READY") != NULL;
+		(strstr(t->err, "not READY") || strstr(t->err, "node is FAILED") ||
+		 strstr(t->err, "node is HEALING"));
 }
 
-/* S474: between calls, so nothing is in flight and no reply is lent out.  The standby must be
+/* between calls, so nothing is in flight and no reply is lent out.  The standby must be
  * alive and say itself it is ready: a door opens long before that.  If not, again in a second */
 static void spread_apply(perfd_t *p)
 {
@@ -122,25 +91,89 @@ static void spread_apply(perfd_t *p)
 	p->next_refresh_ms = 0;        /* the old node's standby, at this call's maintenance */
 }
 
-/* the data verbs' half of the S34 failover; same rule - a dead
- * connection retries once on a standby, a non-idempotent verb does not -
- * and a "not READY" refusal (nothing applied) moves to another member */
+static void relink(perfd_t *p);
+
+/* the active link, looked at first if it has been quiet; a closed one is
+ * replaced before anything is sent on it */
+static int keep_live(perfd_t *p)
+{
+	if (p->is_child || !p->nmem || !link_closed(p))
+		return 0;
+	if (p->pin)
+		return errk(p, PERFD_E_TRANSPORT, "the link to node %d closed while idle - "
+			"nothing was sent, and a pinned handle does not move", p->active_node);
+	if (failover(p) == 0) {
+		relink(p);                     /* named and raised as the closed one was */
+		return 0;
+	}
+	return errk(p, PERFD_E_TRANSPORT, "the link closed while idle and no member "
+		"answered - nothing was sent");
+}
+
+/* the first member's answer, kept across a move - a re-send that fails too
+ * reports both, the first's first, and a move that found nobody leaves it standing */
+struct pd_first {
+	char err[sizeof ((perfd_t *)0)->err];
+	int kind, node;
+};
+
+static void first_keep(const perfd_t *p, struct pd_first *f)
+{
+	memcpy(f->err, p->err, sizeof f->err);
+	f->kind = p->err_kind;
+	f->node = p->active_node;
+}
+
+static int first_report(perfd_t *p, const struct pd_first *f, int moved)
+{
+	char second[sizeof f->err];
+
+	if (!moved) {
+		memcpy(p->err, f->err, sizeof p->err);
+		p->err_kind = f->kind;
+		return -1;
+	}
+	memcpy(second, p->err, sizeof second);
+	return errk(p, p->err_kind, "node %d: %s; then node %d: %s", f->node, f->err,
+		p->active_node, second);
+}
+
+/* the same for the key's standby, whose place the handle takes */
+static perfd_t *pick_live(perfd_t *p, const char *col, const char *key)
+{
+	perfd_t *t = route_pick(p, col, key);
+
+	if (t != p && link_closed(t)) {
+		route_retire(p, t);
+		p->hinted = 0;
+		p->hh_got = 0;
+		t = p;
+	}
+	return t;
+}
+
+/* the data verbs' failover: a dead connection retries once on a standby, a non-idempotent verb
+ * does not, and a "not READY" refusal (nothing applied) moves to another member */
 static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 		const char *key, const void *val, size_t vlen,
 		long long by, long long ttl, char **out, size_t *outlen)
 {
 	perfd_t *t;
-	int rc;
+	struct pd_first f;
+	int rc, died;
 
 	if (p->active_stale && !p->is_child) {
 		p->active_stale = 0;
-		failover(p);                   /* S107: it was expelled */
+		if (failover(p) == 0)          /* it was expelled */
+			relink(p);
 	}
 	if (p->spread_due && !p->is_child)
 		spread_apply(p);
-	t = route_pick(p, col, key);       /* S35 (S295: or a hint) */
+	t = pick_live(p, col, key);
+	if (t == p && keep_live(p) != 0)
+		return -1;
 	if (p->route_hints) {
-		t->want_hh = 1;                /* S295: ask where it is */
+		t->want_hh = 1;                /* ask where it is */
 		t->hh_got = 0;
 	}
 	if (t != p) {
@@ -152,13 +185,8 @@ static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 			if (p->route_hints)
 				hint_after(p, t, verb, col, key, ttl, *out,
 					*outlen);
-			/* S284: *out is BORROWED from t's buffer, and the
-			 * maintenance below can free t - an "expelled" push
-			 * drained there, or a failed idle ping, retires the
-			 * standby (DESIGN 12iq).  The reply moves into this
-			 * handle's own buffer first: nothing in after_routed
-			 * collects into it (pings and recovery talk on the
-			 * standbys, the members refresh takes an owned copy). */
+			/* *out is BORROWED from t, which the maintenance below can retire: it moves
+			 * into this handle's buffer first */
 			if (hand_reply(p, *out, *outlen, out) != 0)
 				return -1;
 			after_routed(p, t);
@@ -166,11 +194,19 @@ static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 		}
 		if (!t->poisoned && !not_ready_refusal(t))
 			return errk(p, perfd_error_kind(t), "%s", perfd_error(t));
-		if (!t->poisoned)              /* not READY: this node answers */
-			member_down(p, t->active_node, "", "not READY (recovering)");
+		died = t->poisoned;
+		if (!died)                     /* not READY: this node answers */
+			member_down(p, t->active_node, "", perfd_error(t));
 		route_retire(p, t);    /* dead standby: fall through to us */
 		p->hinted = 0;
 		p->hh_got = 0;
+		if (died && !bin_verb_idempotent(verb))
+			/* the standby may have applied it before it died */
+			return errk(p, PERFD_E_TRANSPORT, "connection lost during a counter update on the key's "
+				"node - NOT replayed (add/sub are not idempotent); retry if a double "
+				"increment is acceptable");
+		if (keep_live(p) != 0)         /* routed calls left the active link unwatched */
+			return -1;
 	}
 	rc = bin_roundtrip_once(p, verb, col, key, val, vlen, by, ttl,
 		out, outlen);
@@ -181,14 +217,18 @@ static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 		after_success(p);
 		return 0;
 	}
-	if (!p->is_child && p->nmem && !p->poisoned && not_ready_refusal(p)) {
-		/* refused, not applied: another member, whatever the verb */
+	if (!p->is_child && p->nmem && !p->poisoned && !p->ps_subs && not_ready_refusal(p)) {
+		/* refused, not applied: another member, whatever the verb - not with
+		 * subscriptions on this connection, which a move would end unsaid */
+		first_keep(p, &f);
 		if (failover(p) != 0)
-			return rc;
+			return first_report(p, &f, 0);
 		rc = bin_roundtrip_once(p, verb, col, key, val, vlen, by, ttl,
 			out, outlen);
 		if (rc == 0)
 			after_success(p);
+		else
+			first_report(p, &f, 1);
 		return rc;
 	}
 	if (!p->poisoned || p->is_child || !p->nmem)
@@ -197,12 +237,15 @@ static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 		return errk(p, PERFD_E_TRANSPORT, "connection lost during a counter update - NOT "
 			"replayed (add/sub are not idempotent); retry if a double "
 			"increment is acceptable");
+	first_keep(p, &f);
 	if (failover(p) != 0)
-		return rc;
+		return first_report(p, &f, 0);
 	rc = bin_roundtrip_once(p, verb, col, key, val, vlen, by, ttl,
 		out, outlen);
 	if (rc == 0)
 		after_success(p);
+	else
+		first_report(p, &f, 1);
 	return rc;
 }
 
@@ -249,7 +292,7 @@ unsigned char *perfd_next_reply_tree(perfd_t *p, size_t *outlen)
 		return NULL;
 	if (outlen)
 		*outlen = n;
-	/* the API hands the caller a buffer it frees (S284: r is borrowed) */
+	/* the API hands the caller a buffer it frees (r is borrowed) */
 	return (unsigned char *)dup_reply(p, r, n);
 }
 
@@ -297,76 +340,87 @@ static int roundtrip(perfd_t *p, const char *method,
 		const unsigned char *tree, size_t tlen, char **out,
 		size_t *outlen);
 
-/* S35: the same request, but on the handle that owns the key.  Used by
- * the typed verbs, which know their collection and key; perfd_command()
- * and the pipeline API stay on the caller's handle, because only the
- * caller knows what an opaque params tree addresses.
- *
- * EVERY verb that names one key comes through here; roundtrip() is for
- * the keyless ones (ping, stats, members, keys, mget, publish).  S211:
- * jdel and jincr took roundtrip() while jset took this, so on an eager
- * fleet a jset landed on the key's owner and the jdel behind it on the
- * primary, where the owner's push had not arrived yet - it deleted
- * nothing and the document survived on every member.  Two operations
- * on one key from one client are ordered only when both take the same
- * road: routing is not load-bearing, uniformity is. */
+/* the same request on the handle that owns the key: EVERY typed verb naming one key comes here, as
+ * two operations on one key from one client are ordered only when both take the same road */
 static int roundtrip_key(perfd_t *p, const char *method,
 		const unsigned char *tree, size_t tlen, const char *col,
 		const char *key, char **out, size_t *outlen)
 {
-	perfd_t *t = route_pick(p, col, key);
+	perfd_t *t = pick_live(p, col, key);
 
 	if (t == p)
 		return roundtrip(p, method, tree, tlen, out, outlen);
 	if (roundtrip_once(t, method, tree, tlen, out, outlen) == 0) {
-		/* S284: as bin_roundtrip - out of t's buffer before the
-		 * maintenance that may free t (DESIGN 12iq) */
+		/* as bin_roundtrip: out of t's buffer before the maintenance that may free t */
 		if (hand_reply(p, *out, *outlen, out) != 0)
 			return -1;
 		after_routed(p, t);
 		return 0;
 	}
-	if (!t->poisoned)
+	if (!t->poisoned && !not_ready_refusal(t))
 		return errk(p, perfd_error_kind(t), "%s", perfd_error(t));
+	if (!t->poisoned) {            /* refused, not applied - the active link carries it */
+		member_down(p, t->active_node, "", perfd_error(t));
+		route_retire(p, t);
+		p->hinted = 0;
+		p->hh_got = 0;
+		return roundtrip(p, method, tree, tlen, out, outlen);
+	}
 	route_retire(p, t);            /* dead standby: we carry it */
 	if (!method_idempotent(method))
-		/* S211: the standby may have applied it before it died and
-		 * the primary would apply it again - the same rule as the
-		 * primary's own failover in roundtrip() */
+		/* the standby may have applied it before it died and the primary would apply it
+		 * again - the rule of the primary's own failover in roundtrip() */
 		return errk(p, PERFD_E_TRANSPORT, "connection lost during '%s' on the key's node - "
 			"NOT replayed (the verb is not idempotent); retry if the "
 			"operation is safe to repeat", method);
 	return roundtrip(p, method, tree, tlen, out, outlen);
 }
 
-/* S34: one retry on a pre-warmed standby when the CONNECTION died.  A
- * verb-level error (bad params, no such collection) is not a failover
- * and is never retried; nor is a non-idempotent verb, which would risk
- * applying twice - the caller sees the error and decides. */
+static void name_replay(perfd_t *p);
+static void enable_replay(perfd_t *p);
+
+/* the adopted link is named and raised as the old one was, before the re-send */
+static void relink(perfd_t *p)
+{
+	name_replay(p);
+	enable_replay(p);
+}
+
+/* one retry on a pre-warmed standby when the CONNECTION died; a verb-level error is never retried,
+ * nor a non-idempotent verb, which could apply twice - the caller sees the error and decides */
 static int roundtrip(perfd_t *p, const char *method,
 		const unsigned char *tree, size_t tlen, char **out,
 		size_t *outlen)
 {
+	struct pd_first f;
 	int rc;
 
 	if (p->active_stale && !p->is_child) {
 		p->active_stale = 0;
-		failover(p);                   /* S107: it was expelled */
+		if (failover(p) == 0)          /* it was expelled */
+			relink(p);
 	}
 	if (p->spread_due && !p->is_child)
 		spread_apply(p);
+	if (keep_live(p) != 0)
+		return -1;
 	rc = roundtrip_once(p, method, tree, tlen, out, outlen);
 	if (rc == 0) {
 		after_success(p);
 		return 0;
 	}
-	if (!p->is_child && p->nmem && !p->poisoned && not_ready_refusal(p)) {
-		/* refused, not applied: another member, whatever the verb */
+	if (!p->is_child && p->nmem && !p->poisoned && !p->ps_subs && not_ready_refusal(p)) {
+		/* refused, not applied: another member, whatever the verb (not with
+		 * subscriptions here, as above) */
+		first_keep(p, &f);
 		if (failover(p) != 0)
-			return rc;
+			return first_report(p, &f, 0);
+		relink(p);
 		rc = roundtrip_once(p, method, tree, tlen, out, outlen);
 		if (rc == 0)
 			after_success(p);
+		else
+			first_report(p, &f, 1);
 		return rc;
 	}
 	if (!p->poisoned || p->is_child || !p->nmem)
@@ -375,22 +429,22 @@ static int roundtrip(perfd_t *p, const char *method,
 		return errk(p, PERFD_E_TRANSPORT, "connection lost during '%s' - NOT replayed (the "
 			"verb is not idempotent); retry if the operation is safe "
 			"to repeat", method);
+	first_keep(p, &f);
 	if (failover(p) != 0)
-		return rc;
+		return first_report(p, &f, 0);
+	relink(p);
 	rc = roundtrip_once(p, method, tree, tlen, out, outlen);
 	if (rc == 0)
 		after_success(p);
+	else
+		first_report(p, &f, 1);
 	return rc;
 }
 
-/* 0.6.6: a handle that raised privilege raises it again on the connection
- * it adopted - once, before its next call, never from inside that raise.
- * A refusal is not reported here (the next privileged call gets the
- * daemon's answer); perfd_enable's error text may be overwritten by the
- * call that follows, which is the one the caller sees. */
+/* a handle that raised privilege raises it again on the connection it adopted, once, before its
+ * next call; a refusal is not reported here (the next privileged call gets the daemon's answer) */
 static char *admin_call(perfd_t *p, const char *method, const char *col,
 		const char *flag, const char *secret);
-static void name_replay(perfd_t *p);
 static void enable_replay(perfd_t *p)
 {
 	char *r;
@@ -404,24 +458,55 @@ static void enable_replay(perfd_t *p)
 	p->in_replay = 0;
 }
 
+/* an enable that succeeded keeps its secret, however it was sent, and a disable drops it -
+ * so a link the handle moves to is raised, or not, as the caller left the one it had */
+static void priv_keep(perfd_t *p, const char *method, const unsigned char *params, size_t plen)
+{
+	struct pc_tv v;
+	char sec[256], *keep;
+	int sl;
+
+	if (!strcmp(method, "disable")) {
+		free(p->enable_sec);
+		p->enable_sec = NULL;
+		p->enable_due = 0;
+		return;
+	}
+	if (strcmp(method, "enable") || !params || !plen || tv_root(p, &v, params, plen, method) != 0)
+		return;
+	sl = pc_tv_get_str(&v, 0, "secret", sec, sizeof sec - 1);
+	tv_put(p, &v);
+	if (sl <= 0)
+		return;
+	sec[sl] = 0;
+	keep = strdup(sec);
+	if (keep) {
+		free(p->enable_sec);
+		p->enable_sec = keep;
+	}
+	p->enable_due = 0;
+}
+
 unsigned char *perfd_command_tree(perfd_t *p, const char *method,
 		const unsigned char *params, size_t plen, size_t *outlen)
 {
 	char *r;
 	size_t n;
 
-	name_replay(p);                /* 0.7.0: before enable, so its log line is named */
+	name_replay(p);                /* before enable, so its log line is named */
 	enable_replay(p);
 	if (roundtrip(p, method, params, plen, &r, &n) != 0)
 		return NULL;
+	if (!p->in_replay)
+		priv_keep(p, method, params, plen);
 	if (outlen)
 		*outlen = n;
-	/* the API hands the caller a buffer it frees (S284: r is borrowed) */
+	/* the API hands the caller a buffer it frees (r is borrowed) */
 	return (unsigned char *)dup_reply(p, r, n);
 }
 
 /* the JSON edge: params text -> tree, reply tree -> text.  A convenience
- * for the tools, not a wire (DESIGN 12if). */
+ * for the tools, not a wire. */
 char *perfd_command(perfd_t *p, const char *method,
 		const char *params_json)
 {

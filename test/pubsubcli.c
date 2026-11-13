@@ -1,8 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- * pubsubcli.c - PS4 through libperfd: one handle subscribes, another
- * publishes, the first handle's notify hook receives the message on its
- * next read, as the NOTIFY tree rendered to JSON (S317).
- * Usage: pubsubcli <port>   (a plaintext loopback door) */
+ * pubsubcli.c - pub/sub through libperfd: the notify hook gets the message as JSON; arg: a port */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,9 +9,8 @@
 static int got, pgot;
 static char last[512];
 
-/* the hook gets (json, len): the bytes are NOT NUL-terminated at len -
- * the library's render buffer is reused - so every look at them is
- * bounded by the copy */
+/* the hook's bytes are NOT NUL-terminated at len (the render buffer is reused), so every look
+ * at them is bounded by the copy */
 static void on_notify(const char *json, size_t len, void *ctx)
 {
 	size_t n = len < sizeof last - 1 ? len : sizeof last - 1;
@@ -53,11 +49,8 @@ int main(int argc, char **argv)
 	OK(n == 2, "perfd_psubscribe answers 2");
 	n = perfd_publish(p, "cli", "hello", 5);
 	OK(n == 2, "perfd_publish from another handle answers the receivers (2: channel + pattern)");
-	/* the subscriber's handle reads its socket on its next call: a get on a
-	 * multiplexed connection keeps waiting for its own id while the
-	 * notifications are dispatched to the hook.  A publish returns once
-	 * the message is QUEUED to the subscriber's worker, so the delivery
-	 * can land after this handle's next reply - poll, bounded. */
+	/* a publish returns once the message is queued to the subscriber's worker, so delivery
+	 * can land after this handle's next reply: poll, bounded */
 	n = perfd_get(s, "0", "nokey", &val, &vlen, &ttl);
 	free(val);
 	OK(n == 0, "a data call on the subscribed handle still works (get miss)");
@@ -83,8 +76,8 @@ int main(int argc, char **argv)
 			n = perfd_get(s, "0", "nokey", &val, &vlen, &ttl);
 			free(val);
 		}
-		/* bytes on the wire; the hook's JSON shows a NUL escaped and a
-		 * byte that is not UTF-8 as U+FFFD (D4: lossy at the edge) */
+		/* bytes on the wire; the hook's JSON shows a NUL escaped and a non-UTF-8 byte as U+FFFD
+		 * (lossy at the edge) */
 		OK(strstr(last, "\"payload\":\"\\u0000\\ufffdx\"") != NULL,
 			"a payload that is not UTF-8 renders as \\u0000\\ufffd in the hook's text");
 	}

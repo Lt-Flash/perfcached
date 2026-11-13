@@ -1,9 +1,6 @@
 #!/bin/sh
-# pubsubrelaytest.sh - PS3: a publish on one node reaches the subscribers
-# on every node of the fleet over the sealed unicast plane; PUBLISH still
-# answers the LOCAL count; a relayed message is never relayed again and a
-# sender never receives its own; the receiver counts sequence gaps; a
-# payload over the datagram stays local.  Usage: test/pubsubrelaytest.sh [./perfcached]
+# pubsubrelaytest.sh - a publish reaches subscribers on every node over the sealed unicast plane; PUBLISH
+# answers the LOCAL count, relays never loop, gaps are counted, an oversized payload stays local.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcpsrelay.XXXXXX); P1= P2=
@@ -112,10 +109,8 @@ s2 = stats(18482)
 ok(s2.get("relay_dropped") == 1, "and node 2 counts it as a relay dropped for size (got %r)" % s2.get("relay_dropped"))
 m = urllib.request.urlopen("http://127.0.0.1:18482/metrics", timeout=5).read().decode()
 ok("perfcached_pubsub_relay_sent_total 32" in m, "/metrics on node 2 carries relay_sent 32")
-# PS7: publishers on several workers at once.  The relay used to stamp one
-# global counter from whichever worker published, so two workers sent N+1
-# before N and node 1 counted a loss that never happened.  Every message must
-# arrive, and node 1 must report nothing lost and nothing duplicated.
+# publishers on several workers at once: every message must arrive, and node 1
+# must report nothing lost and nothing duplicated
 import threading
 S1.cmd("UNSUBSCRIBE", "x"); S2.cmd("UNSUBSCRIBE", "x")
 b1, b2 = stats(18481), stats(18482)

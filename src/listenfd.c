@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * listenfd.c - the listener sockets: the probe for a listener already
- * there (SO_REUSEPORT would hide it), a worker's TCP socket, the unix
- * socket with its live-or-stale check.  Moved from daemon.c unchanged
- * (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* listenfd.c - the listener sockets: the probe for a listener already there (SO_REUSEPORT would
+ * hide it), a worker's TCP socket, the unix socket with its live-or-stale check. */
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -22,28 +18,8 @@
 
 /* ---- listeners --------------------------------------------------------- */
 
-/* Is something ALREADY listening on this address:port?
- *
- * Every TCP listener sets SO_REUSEPORT, because each worker binds its
- * own socket and lets the kernel balance accepts across them.  The
- * consequence is that a second perfcached on the same address:port does
- * NOT get EADDRINUSE - it silently joins the load-balancing group and
- * answers a share of the connections, with its own dataset and its own
- * view of the cluster.  The symptom is intermittent wrong answers, or a
- * fleet that reports one member when it has four, and it is invisible
- * in the logs of either process.
- *
- * The only way to see an existing listener is to bind WITHOUT
- * SO_REUSEPORT once, before the workers start.  This socket is closed
- * immediately; the workers then bind normally.
- *
- * Only EADDRINUSE means "someone is already there".  EADDRNOTAVAIL
- * means the address is not on this host - a VIP with
- * net.ipv4.ip_nonlocal_bind=0 - which is a different fault with its own
- * message, so everything but EADDRINUSE is left to the generic probe.
- * (Checked both ways: ip_nonlocal_bind changes whether an absent
- * address binds at all, and changes nothing about EADDRINUSE.)
- */
+/* is something ALREADY listening on address:port?  Under SO_REUSEPORT a second daemon silently
+ * shares the accepts, so bind once without it; only EADDRINUSE counts, the rest: generic probe */
 int tcp_port_taken(const struct pc_listener *l)
 {
 	struct addrinfo hints, *res = NULL, *ai;
@@ -51,7 +27,7 @@ int tcp_port_taken(const struct pc_listener *l)
 	int taken = 0;
 
 	memset(&hints, 0, sizeof hints);
-	hints.ai_family = pc_resolve_family();     /* 12np: no AAAA without IPv6 */
+	hints.ai_family = pc_resolve_family();     /* no AAAA without IPv6 */
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
 	snprintf(port, sizeof port, "%d", l->port);
@@ -84,7 +60,7 @@ int tcp_listener_fd(const struct pc_listener *l)
 	int fd = -1, one = 1;
 
 	memset(&hints, 0, sizeof hints);
-	hints.ai_family = pc_resolve_family();     /* 12np: no AAAA without IPv6 */
+	hints.ai_family = pc_resolve_family();     /* no AAAA without IPv6 */
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
 	snprintf(port, sizeof port, "%d", l->port);
@@ -101,9 +77,8 @@ int tcp_listener_fd(const struct pc_listener *l)
 		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
 		if (ai->ai_family == AF_INET6) {
-			/* IP6-2: [::]:port takes IPv4 clients too (as
-			 * ::ffff:a.b.c.d) - dual-stack whatever the host's
-			 * bindv6only says, where the host allows it */
+			/* [::]:port takes IPv4 clients too (as ::ffff:a.b.c.d), whatever the
+			 * host's bindv6only says, where the host allows it */
 			int off = 0;
 
 			setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);

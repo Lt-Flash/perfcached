@@ -1,26 +1,6 @@
 #!/bin/sh
-# upthroughspreadtest.sh - DESIGN 12nt, TC-3 (0.7.1): a through collection in
-# SPREAD mode (K holders of P nodes) fetches and holds at the key's holders.
-#   - four spread members (replicas = 2), collection 0 read-through +
-#     write-through on the fakes (M, R1, R2 of upwritethroughtest), 30 keys
-#     seeded straight into the master;
-#   - every key reads through node 1 with its value: a key node 1 does not
-#     hold is pulled from a holder, which fetches it and keeps the copy -
-#     30 fetches in all, every copy on the node that fetched it, no node
-#     holding them all;
-#   - the same keys through node 4: found; a holder asked for the first time
-#     fetches once more at most (K copies at most, never P);
-#   - a change on the master reaches the holders' copies (tracking);
-#   - an absent key: one fetch walk per holder asked, the holder's negative
-#     marker answers the next pull;
-#   - a write through node 1 goes to the master once and its read-back is
-#     pushed to the K holders (marked copies; the write's own invalidation
-#     drops them again, S404); SET NX twice through node 2: stored once,
-#     refused once; a change on the master reads back everywhere;
-#   - a node restarted comes back ready and reads every key; a change on
-#     the master still reaches every node;
-#   - the drain sweep on every node takes over its holder share only (TC-4).
-# Usage: test/upthroughspreadtest.sh [./perfcached]
+# upthroughspreadtest.sh - a through collection in SPREAD mode (K holders of P nodes) fetches and
+# holds at the key's holders: K copies at most, writes pushed to them, the drain takes only its share.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -168,9 +148,7 @@ d1=$(( $(sum4 "$XF4") - $(sum4 "$XF3") )); d2=$(( $(sum4 "$XF5") - $(sum4 "$XF4"
 [ $d1 -ge 1 ] && [ $d1 -le 3 ] && [ $d2 -le 3 ] && ok "4. the absent key cost one fetch walk per holder asked ($d1 then $d2 fetches), never one per read everywhere" || bad "4. fetches for the absent key: $d1 then $d2 ($F3 -> $F4 -> $F5)"
 
 # ---- 5. a write through node 1 goes to the master and its read-back to the K holders -------
-# The record Redis confirms is pushed to the K holders (each marks it a copy: copies_marked)
-# and dropped again at once by the invalidation Redis sends for the write (S404) - so what
-# stays observable is the push, the master's state and the reads, not the entries.
+# the write's own invalidation drops the pushed copies at once: check the push, not the entries
 nset() { # nset <n> <verb> <key> <value> [ttl]
 	python3 - "$@" <<'PY' 2>&1
 import json, socket, sys
@@ -194,7 +172,7 @@ o = []
 for n in (1, 2, 3, 4):
     s = json.load(urllib.request.urlopen("http://127.0.0.1:1996%d/stats" % n, timeout=5))
     w = [c for c in s["collections"] if c["name"] == "0"][0]["upstream"]["write_through"]
-    # marked on arrival, or found marked by the author's newer mark that came first (S418)
+    # marked on arrival, or found marked by the author's newer mark that came first
     o.append(str(w["copies_marked"] + w.get("copies_premarked", 0)))
 print(" ".join(o))
 PY

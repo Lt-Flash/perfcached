@@ -1,24 +1,6 @@
 #!/bin/sh
-# hotkeytest.sh - S397 (DESIGN 12ng): hot keys, always on.  One request in
-# 64 is sampled into a space-saving sketch per collection, counted where it
-# enters the node's data-verb cores - so every door is one hook - and
-# shown in /stats collections[].hot_keys {rate, sampled, sampled_total,
-# busy, top[{key, key_len, cut, est, err, share_pm}]}.  Cases:
-#   A. CMD door: a key at half the traffic and one at a quarter are the
-#      top two, at plausible shares; the sampled count is about 1 in 64
-#   B. the fixed-layout door: a 100-byte key is kept as its first 64 bytes,
-#      cut = true, key_len = 100
-#   C. the RESP door: GET, each key of an MGET, and a hash command (HSET's
-#      key, argv[1]) are counted
-#   D. the counts halve on the tick: a second daemon at
-#      PERFCACHED_TEST_HOT_HALF_S=2 (60 s in a fleet); the first holds its
-#      counts for the suite (3600) so A-C read them whole
-#   E. reset-stats empties the sketch
-# The sample is random (a per-thread xorshift, so a client cycling through
-# 64 keys is not aliased onto one), so the bounds are wide: a binomial at
-# these counts sits well inside them.
-# Fail-first: before S397 /stats has no hot_keys.
-# Usage: test/hotkeytest.sh [./perfcached]
+# hotkeytest.sh - hot keys: one request in 64 sampled per collection on every door into /stats
+# hot_keys, halved on the tick, emptied by reset-stats.  Usage: test/hotkeytest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -178,7 +160,8 @@ for i in range(6400): B.req("get", {"col": "0", "key": "hot"})
 h = hot(B); s0 = h["sampled"]; e0 = {t["key"]: t["est"] for t in h["top"]}
 time.sleep(4.5)
 h = hot(B)
-check(s0 >= 40 and h["sampled"] <= s0 // 2 and h["sampled_total"] >= s0,
+# 16: on a loaded runner the 6400 can outlast a half-life, leaving 38 of the 100 sampled
+check(s0 >= 16 and h["sampled"] <= s0 // 2 and h["sampled_total"] >= s0,
       "D. after two half-lives the sampled count fell from %d to %d; the total kept %d" % (s0, h["sampled"], h["sampled_total"]))
 e1 = {t["key"]: t["est"] for t in h["top"]}
 check(e1.get("hot", 0) <= e0.get("hot", 0) // 2 and e1.get("hot", 0) >= 2,
@@ -191,6 +174,7 @@ check(h["sampled"] == 0 and h["sampled_total"] == 0 and h["top"] == [],
       "E. reset-stats empties the sketch (%r)" % ({k: h[k] for k in ("sampled", "sampled_total")},))
 A.f.close(); B.f.close()
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while read -r st name; do
 	[ "$st" = P ] && ok "$name" || bad "$name"
 done < "$RES"

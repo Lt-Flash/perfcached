@@ -1,14 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * httpdoor.c - the metrics door (S46): the HTTP/1.0 responder behind GET
- * /metrics, /stats, /members, /clients and /health - read-only since
- * 0.7.0, its / and any POST answering where those went - with the request
- * head, the Bearer token, the cached /stats and /metrics bodies (0.6.2),
- * and the per-address rate limit.  Moved from proto.c unchanged (the 0.7.2
- * split, wave 1 - doc/MODULARITY.md); it answers through proto.c's reply
- * staging (protoint.h).
- */
+/* httpdoor.c - the metrics door: a read-only HTTP/1.0 responder for /metrics, /stats,
+ * /members, /clients and /health, with its token check, body cache and per-address rate limit. */
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -24,36 +17,18 @@
 #include "json.h"
 #include "ptree.h"
 #include "metrics.h"
-#include "verbs.h"                      /* pc_stats_tree, pc_members_tree */
-#include "obs.h"                        /* pc_obs_clients_tree */
-#include "daemon.h"                     /* the token, the rate, the cache */
+#include "verbs.h"
+#include "obs.h"
+#include "daemon.h"
 #include "pcaddr.h"
 #include "proto.h"
 #include "protoint.h"
 
-/* ---- the metrics door (S46) --------------------------------------------
- *
- * A deliberately minimal HTTP/1.0 responder, NOT a web server: read a
- * request head bounded by PC_HTTP_MAX, take the method and path from
- * the request line, ignore every header, answer, close.  No keep-alive,
- * no request body, no state carried between requests - which is what
- * keeps this small enough to reason about on a plaintext port.
- *
- * The alternative was libmicrohttpd (what OpenSIPS' httpd module uses).
- * Rejected on purpose: the daemon's dependency set is libc + pthreads +
- * libsodium and that is a published promise (README), the library wants
- * its own threads or its own event loop where every worker here already
- * owns an epoll, and a full server - POST, chunked bodies, digest auth,
- * TLS - is far more surface than two read-only GET routes need.  If the
- * status page ever grows forms or auth, take the dependency then rather
- * than growing this into a server.
- */
+/* A minimal HTTP/1.0 responder, not a web server: one bounded head, headers ignored, answer,
+ * close.  No libmicrohttpd: the dependency set (libc, pthreads, libsodium) is a published promise. */
 #define PC_HTTP_MAX 8192               /* a request head we will read */
 
-/* memmem() is a GNU extension: it needs _GNU_SOURCE, and it compiled on
- * the Debian 13 build host while failing on Ubuntu 20.04 - a portability
- * split for a search over at most 8 KB.  A plain scan costs nothing at
- * this size and keeps the file free of feature-test macros. */
+/* not memmem(): it needs _GNU_SOURCE, and this file stays free of feature-test macros */
 static char *find_bytes(char *hay, size_t hn, const char *needle, size_t nn)
 {
 	size_t i;
@@ -65,16 +40,12 @@ static char *find_bytes(char *hay, size_t hn, const char *needle, size_t nn)
 			return hay + i;
 	return NULL;
 }
-/* the exposition is bounded by the collection count, and 64 collections
- * of three series each plus the fixed block fits comfortably; the
- * renderer truncates rather than overruns if that ever stops being
- * true, and a truncated scrape is a visible bug, not a crash */
+/* 64 collections of three series each fit; the renderer truncates rather than overruns */
 #define PC_METRICS_MAX ((size_t)256 * 1024)
 
 
-/* Authorization: Bearer <token>, compared in constant time.  Header
- * only - never a query parameter, which would land the token in every
- * proxy log and browser history along the way. */
+/* Authorization: Bearer <token>, constant time.  Header only: a query parameter would
+ * land the token in every proxy log and browser history. */
 static int http_token_ok(const char *head, size_t hlen, const char *want)
 {
 	const char *p = head, *end = head + hlen, *v;
@@ -102,12 +73,8 @@ static int http_token_ok(const char *head, size_t hlen, const char *want)
 					diff |= (unsigned char)(v[i] ^ want[i]);
 				return diff == 0;
 			}
-			/* 0.6.2: Basic too - the browser's own login (any user,
-			 * the token as the password).  A browser cannot add a
-			 * Bearer header to a page it is asked to open, so a
-			 * tokened node locked the page out; with Basic, the 401's
-			 * WWW-Authenticate makes it ask once and send it on every
-			 * request of the page */
+			/* Basic too (any user, the token as the password): a browser cannot add a Bearer
+			 * header to a page it opens; the 401's WWW-Authenticate makes it ask once */
 			if ((size_t)(p + ll - v) > 6 &&
 			    !strncasecmp(v, "Basic ", 6)) {
 				unsigned char dec[512];
@@ -141,9 +108,7 @@ static int http_token_ok(const char *head, size_t hlen, const char *want)
 	return 0;
 }
 
-/* @extra: further header lines, each CRLF-terminated, or NULL.  Every
- * response carries the three hardening headers: no MIME sniffing, no
- * referrer, no framing. */
+/* @extra: further header lines, each CRLF-terminated, or NULL */
 static int http_send_ex(struct pc_conn *c, const char *status,
 		const char *ctype, const char *extra, const char *body, size_t blen)
 {
@@ -165,11 +130,8 @@ static int http_send_ex(struct pc_conn *c, const char *status,
 		return -1;
 	if (blen && out_append(c, body, blen) != 0)
 		return -1;
-	/* the header says Connection: close, so CLOSE - without this the
-	 * socket stays open, every client that reads to EOF (curl and
-	 * Prometheus both do) hangs until its own timeout, and the
-	 * response looks lost rather than late.  close_after fires once
-	 * the staged bytes have actually reached the wire. */
+	/* Connection: close means close - a client reading to EOF (curl, Prometheus) hangs
+	 * otherwise; close_after fires once the staged bytes have reached the wire */
 	c->close_after = 1;
 	return 0;
 }
@@ -180,23 +142,8 @@ static int http_send(struct pc_conn *c, const char *status,
 	return http_send_ex(c, status, ctype, NULL, body, blen);
 }
 
-/* 0.6.2: the HTTP door's own limits.  Building /stats costs a worker
- * ~0.6 ms and /metrics ~0.3-0.5 (245), and nothing bounded how often an
- * allow-listed address could ask.
- *
- * http_rate (http_rate_ok, at accept): requests a second per client
- * address, a bucket of twice that.  This door answers one request per
- * connection, so a peer over it is answered 429 at accept, unread, and
- * parked for its drain like a refused one.
- *
- * http_cache_ms (here): /stats and /metrics are built at most once in
- * that long and the copy is served in between - any number of open pages
- * cost one build a second.  A stats reset drops the copies.
- *
- * Loopback - an on-box scraper, a tool, an SSH tunnel to the page, every
- * test suite - is neither limited nor served a copy: what it reads is
- * this instant's, as before.  PERFCACHED_HTTP_LIMIT_LOOPBACK applies both
- * to it too, for the tests of the limits themselves. */
+/* http_rate: requests a second per client address, a bucket of twice that, 429 at accept.
+ * http_cache_ms: /stats and /metrics built at most once that long.  Loopback is exempt from both. */
 static unsigned long long hr_limited, hc_hits, hc_builds;
 static int hr_loop = -1;
 
@@ -277,11 +224,8 @@ static void hc_put(struct hcache *h, const char *body, size_t len)
 	pthread_mutex_unlock(&h->mx);
 }
 
-/* S317: /stats, /members and /clients answer the TREE the native method
- * answers, rendered as JSON here - one writer per surface, so the page
- * and a native client cannot read different numbers.  @t is consumed
- * (freed) whatever happens; @jcap is the JSON writer's first size, and it
- * grows to JW_HEAP_MAX. */
+/* the native method's tree as JSON - one writer, so the page and a native client agree.
+ * @t is consumed whatever happens; @jcap is the writer's first size, grown to JW_HEAP_MAX. */
 static int http_send_tree_c(struct pc_conn *c, struct pc_tw *t, size_t jcap,
 		struct hcache *hc)
 {
@@ -345,9 +289,7 @@ int http_one(struct pc_conn *c, size_t off)
 		return 0;                      /* incomplete; wait for more */
 	}
 
-	/* "GET /path HTTP/1.x" - and, S123, "POST /reset-stats", the one
-	 * mutating route, body-less by contract; anything else is refused
-	 * unread */
+	/* "GET /path HTTP/1.x"; a POST is parsed only to be refused below, anything else unread */
 	int post = 0;
 
 	sp1 = memchr(base, ' ', hlen);
@@ -376,14 +318,17 @@ int http_one(struct pc_conn *c, size_t off)
 			*q = 0;
 	}
 
-	/* S37: the shared token, when one is configured, guards EVERY
-	 * route - /metrics discloses the fleet's shape as surely as
-	 * /members does, so exempting it would be a hole with a tidy
-	 * name.  Constant-time compare: it crosses the wire in the
-	 * clear, which is no reason to leak its prefix by timing too. */
+	/* the token guards EVERY route: /metrics discloses the fleet's shape as surely as /members */
 	{
 		const char *want = pc_http_token();
 
+		if (want && pc_auth_needs_tls() && !pc_conn_secure(c)) {
+			static const char m403[] = "the token needs TLS here "
+				"(auth_needs_tls = yes) - use the TLS HTTP door\n";
+
+			http_send_ex(c, "403 Forbidden", "text/plain", "", m403, sizeof m403 - 1);
+			return (int)hlen;
+		}
 		if (want && !http_token_ok(base, hlen, want)) {
 			static const char m401[] = "a token is required: "
 				"Authorization: Bearer <token>, or the browser's "
@@ -397,9 +342,6 @@ int http_one(struct pc_conn *c, size_t off)
 	}
 
 	if (post) {
-		/* S407 part 3 (0.7.0): this door is read-only.  The reset is the
-		 * native door's reset_stats verb (perfcli reset-stats, the
-		 * dashboard's button); the page's POST went with the page. */
 		static const char ro[] = "this door is read-only since 0.7.0: "
 			"reset-stats is a native-door verb (perfcli -E <enable> "
 			"reset-stats, or the dashboard's button)\n";
@@ -409,13 +351,12 @@ int http_one(struct pc_conn *c, size_t off)
 		return (int)hlen;
 	}
 	if (!strcmp(path, "/")) {
-		/* S407 part 3 (0.7.0): the page left the daemon - it is served by
-		 * perfcached-dashboard over the native door, so a dashboard under
-		 * attack costs the daemon nothing.  410, with the pointer. */
+		/* the page is served by perfcached-dashboard over the native door, so a dashboard
+		 * under attack costs the daemon nothing */
 		static const char gone[] = "the status page is served by "
 			"perfcached-dashboard since 0.7.0 - this door keeps /stats, "
 			"/members, /clients, /metrics and /health (GUIDE.md, "
-			"\"The dashboard\")\n";
+			"\"perfcached-dashboard\")\n";
 
 		http_send(c, "410 Gone", "text/plain", gone, sizeof gone - 1);
 	} else if (!strcmp(path, "/members")) {
@@ -425,26 +366,19 @@ int http_one(struct pc_conn *c, size_t off)
 		pc_members_tree(&t);
 		http_send_tree(c, &t, (size_t)16 * 1024);
 	} else if (!strcmp(path, "/clients")) {
-		/* S160: this node's connections - the walk CLIENT LIST makes,
-		 * with the door, protocol, wire, pending bytes and
-		 * subscriptions the RESP line has no field for.  Read-only, and
-		 * behind the same allow-list and token as its four siblings. */
+		/* this node's connections, with the door, protocol, wire, pending bytes and
+		 * subscriptions the RESP CLIENT LIST line has no field for */
 		struct pc_tw t;
 
 		pc_tw_init(&t, NULL, 0);
 		pc_obs_clients_tree(&t, get_ticks(), 200);
 		http_send_tree(c, &t, (size_t)128 * 1024);
 	} else if (!strcmp(path, "/stats")) {
-		/* S67: the same body the `stats` method returns.  The
-		 * dashboard needs collections, both doors' connection
-		 * counts and the cluster counters, none of which /members
-		 * carries - and a page that cannot see them is how the
-		 * HEADROOM column stayed empty and the native clients
-		 * stayed invisible. */
+		/* the body the `stats` method returns */
 		struct pc_tw t;
 
 		if (hc_send(c, &hc_stats, "application/json"))
-			return (int)hlen;          /* 0.6.2: built < http_cache_ms ago */
+			return (int)hlen;          /* built < http_cache_ms ago */
 		pc_tw_init(&t, NULL, 0);
 		pc_stats_tree(&t, NULL);
 		http_send_tree_c(c, &t, (size_t)64 * 1024, &hc_stats);
@@ -465,11 +399,8 @@ int http_one(struct pc_conn *c, size_t off)
 		hc_put(&hc_metrics, body, blen);
 		free(body);
 	} else if (!strcmp(path, "/health")) {
-		/* liveness only: this answers whenever the daemon can run a
-		 * worker.  Readiness - whether the node has joined and is
-		 * serving - is pc_node_state()'s business and rides
-		 * /metrics, because conflating them makes an orchestrator
-		 * restart a node that is merely still syncing. */
+		/* liveness only; readiness rides /metrics - conflating them makes an orchestrator
+		 * restart a node that is merely still syncing */
 		http_send(c, "200 OK", "text/plain", "ok\n", 3);
 	} else {
 		static const char m404[] = "try /stats, /members, /clients, "
@@ -480,12 +411,11 @@ int http_one(struct pc_conn *c, size_t off)
 	return (int)hlen;
 }
 
-/* 0.6.2: http_rate - see the comment over hc_send */
+/* http_rate: a token bucket per client address */
 #define HR_SLOTS 1024                  /* addresses tracked; power of two */
 #define HR_PROBE 8
 /* the key: an IPv4 address (a dual-stack listener's ::ffff:a.b.c.d too), or
- * an IPv6 client's /64 with the top bit set - one host usually holds a
- * whole /64, so its addresses are one client here (12np IP6-2) */
+ * an IPv6 client's /64 with the top bit set - one host usually holds a whole /64 */
 static struct { uint64_t ip; long long t; long long tok; } hr_tab[HR_SLOTS];
 
 static uint64_t hr_key(const pc_addr *sa)

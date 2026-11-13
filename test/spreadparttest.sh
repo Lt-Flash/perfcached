@@ -1,25 +1,6 @@
 #!/bin/sh
-# spreadparttest.sh - RV-4f: a SPREAD fleet (replicas = 2) split by a
-# partition, with writes on both sides, healed, stopped and restarted.
-#
-# RV-4's map (DESIGN 12gb): partition with data flowing was never
-# exercised under spread.  spreadparttest's scenario and shim, with
-# spread's invariants: while cut, node 3 alone holds everything written
-# to it and nodes 1+2 keep two copies between them; after the heal the
-# fleet re-places to K = 2 and reclaims the surplus.  Asserted, per cut
-# mode (eperm, silent):
-#   1. 320 base keys a000-a299 + n000-n019, TWO copies each (640 held);
-#   2. the cut is real (the shim's counters) and neither side holds the
-#      other's writes;
-#   3. after the heal, with NO reads: the fleet settles at exactly 2 x 570
-#      copies - both sides' writes, the 50 deletes applied everywhere;
-#   4. every node answers every key the same: m and i written, the
-#      untouched base keys, 50 deletes gone (S238 under spread), one value
-#      for each of the 50 doubly-written keys, and the isolated side's
-#      NEWER writes of the 20 keys the majority deleted;
-#   5. one master, one map term; fleetstop through the master stops all
-#      three, and a restart from their snapshots + WAL holds the same.
-# Usage: test/spreadparttest.sh [./perfcached] [./netcutshim.so]
+# spreadparttest.sh - a SPREAD fleet (replicas = 2) cut by netcutshim.so, written on both sides,
+# healed, stopped, restarted: it settles at exactly K = 2 copies and every node answers alike.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -33,10 +14,8 @@ bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 MC=239.255.77.98
 MP=18755
 [ -f "$SHIM" ] || { echo "spreadparttest: no shim at $SHIM"; exit 1; }
-# a dynamic sanitizer runtime (gcc's check-asan) must come FIRST in the
-# preload list, the shim after it - as healtest and syncfailtest do.
-# rc42's check-asan: "ASan runtime does not come first in initial library
-# list", and no node started.
+# a dynamic sanitizer runtime (gcc's check-asan) must come FIRST in the preload list, the shim after
+# it, as healtest and syncfailtest do
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 PRELOAD="${SANRT:+$SANRT }$SHIM"
 
@@ -88,12 +67,8 @@ start() { # start <n>
 	echo "node $1 did not start: $(tail -2 "$D/n$1.log" | tr '\n' ' ')"; return 1
 }
 stop_kill() { kill -9 "$(cat "$D/n$1.pid" 2>/dev/null)" 2>/dev/null; rm -f "$D/n$1.pid"; }
-# reap: the previous fleet must be GONE before the next one binds.  Every
-# listener is SO_REUSEPORT (TCP doors and the cluster socket), so a start
-# beside a dying daemon binds silently and the kernel splits new
-# connections and datagrams between the two - a client write can land on
-# the corpse and a JOIN be answered by the old master (10-04: an ASan arm
-# of this suite read 0/3 base copies with nothing in the log to say why).
+# reap: the previous fleet must be GONE before the next binds - every listener is SO_REUSEPORT, so a
+# start beside a dying daemon splits connections and datagrams with the corpse
 reap() { # reap <old pids>
 	i=0; while [ $i -lt 150 ]; do
 		busy=0
@@ -109,6 +84,9 @@ reap() { # reap <old pids>
 alive() { p=$(cat "$D/n$1.pid" 2>/dev/null) || return 1
 	s=$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null) || return 1
 	[ -n "$s" ] && [ "$s" != Z ]; }
+# a node's entries as a number, 0 when its stats did not answer (the loops ask again), so a timed-out
+# "?" cannot stop the suite in its arithmetic
+nent() { v=$(st "$1" | cut -d' ' -f4); case "$v" in ''|*[!0-9]*) echo 0;; *) echo "$v";; esac; }
 st() { # st <n>: "role peers mapterm entries state"
 	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"stats"}' | timeout 10 python3 -c '
 import json, socket, sys, pcnative
@@ -128,9 +106,8 @@ for j, l in enumerate(reqs):
     r = json.loads(l); r["jsonrpc"] = "2.0"; r["id"] = j
     f.write((json.dumps(r) + "\n").encode())
 f.flush()
-# pair each reply with its request by ID: a request parked on a forward
-# is answered after the ones behind it, so reading replies in order
-# credited one delete reply to another request
+# pair each reply with its request by ID: a request parked on a forward is answered
+# after the ones behind it
 res = {}; errs = []
 for _ in reqs:
     m = next(_m for _m in iter(lambda: json.loads(f.readline()), None) if "id" in _m)
@@ -142,9 +119,8 @@ with open(sys.argv[2], "a") as out:
         a = res.get(j, {})
         q = json.loads(r); p = q["params"]
         ok = a.get("stored") or a.get("deleted") or a.get("removed")
-        # an op that was NOT acknowledged has an unknown outcome - a
-        # timed-out forward may still have landed - so it is recorded
-        # too, as "maybe"
+        # an op that was NOT acknowledged may still have landed (a timed-out forward), so it
+        # is recorded too, as "maybe"
         out.write(json.dumps([sys.argv[1], q["method"], p["key"], p.get("value")] + ([] if ok else ["maybe"])) + "\n")' "1875$1" "$D/acked"; }
 sets() { # sets <prefix> <from> <to> <value-prefix>
 	python3 -c '
@@ -179,9 +155,8 @@ okdbl = sum(v in ("Ma%03d" % i, "Ia%03d" % i) for i, v in enumerate(dbl))
 dig = hashlib.sha1(json.dumps(dbl).encode()).hexdigest()[:10]
 nw = sum(val["n%03d" % i] == "In%03d" % i for i in range(20))
 print("m=%d i=%d base=%d gone=%d dbl=%d/%s nw=%d" % (m, i_, base, gone, okdbl, dig, nw))' "1875$1" 2>/dev/null || echo "m=? i=? base=? gone=? dbl=?"; }
-# check <n1> [n2 n3]: reads all 620 names through each node and compares
-# them with what was ACKNOWLEDGED (spread refuses writes whose holders are
-# across the cut): prints "agree=<0|1> wrong=<n> live=<expected live keys>"
+# check <n1> [n2 n3]: reads all 620 names through each node against what was ACKNOWLEDGED (spread
+# refuses writes across the cut); prints "agree=<0|1> wrong=<n> live=<expected live keys>"
 check() { timeout 120 python3 - "$D/acked" "$@" <<'CPY'
 import json, socket, sys, pcnative
 acked = [json.loads(l) for l in open(sys.argv[1])]
@@ -235,7 +210,7 @@ if not agree:
 CPY
 }
 field() { echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
-cutcount() { cat "$D/cutlog$1" 2>/dev/null | awk '{print $2 + $4 + $6}'; }
+cutcount() { cat "$D/cutlog$1" 2>/dev/null | awk '{print $2 + $4 + $6 + $8}'; }
 
 run() { # run <eperm|silent>
 	mode=$1; fl=""; [ "$mode" = eperm ] && fl=eperm
@@ -246,14 +221,8 @@ run() { # run <eperm|silent>
 	rm -rf "$D"/wal? "$D"/cut? "$D"/cutlog? "$D"/n?.log "$D"/acked
 	for n in 1 2 3; do conf $n; : > "$D/cut$n"; done
 	start 1 && sleep 1 && start 2 && start 3 || { bad "$mode: the fleet did not start"; return; }
-	# wait for the three to see each other before writing: a fixed 4 s was
-	# enough on an idle box and not under six CI jobs at once (10-04: one arm
-	# of this suite found 0 copies on every node because the fleet was still
-	# forming - st read "?" for the map term the whole window)
-	# ... and READY: a node that sees both peers is still RECOVERING (its
-	# boot pull) for a while, and every write it is handed meanwhile is
-	# refused "node is not READY" - 10-04 GitHub repl1: both arms 0/3 with
-	# all 320 base writes refused that way, peers_up 2 on all three
+	# wait for the three to see each other AND be READY (a node seeing both peers can still be
+	# RECOVERING and refuse writes); a fixed sleep was not enough under concurrent CI jobs
 	FW=120; [ -n "${SANRT:-}" ] && FW=360
 	i=0; while [ $i -lt $FW ]; do
 		p=0; for n in 1 2 3; do s=$(st $n); [ "$(echo "$s" | cut -d' ' -f2)" = 2 ] && [ "$(echo "$s" | cut -d' ' -f5)" = ready ] && p=$((p+1)); done
@@ -261,13 +230,13 @@ run() { # run <eperm|silent>
 	[ $p = 3 ] || echo "    note: the fleet was not READY on all three in $((FW / 2)) s ($(st 1) / $(st 2) / $(st 3))"
 	{ sets a 0 300 B; sets n 0 20 B; } | ops 1 || echo "    note: the base write to node 1 did not complete (ops exit $?)"
 	i=0; while [ $i -lt 120 ]; do
-		c=$(( $(st 1 | cut -d' ' -f4) + $(st 2 | cut -d' ' -f4) + $(st 3 | cut -d' ' -f4) ))
+		c=$(( $(nent 1) + $(nent 2) + $(nent 3) ))
 		[ $c = 640 ] && break; sleep 0.5; i=$((i+1)); done
 	[ $c = 640 ] && ok "$mode: 320 base keys, two copies each (640 held)" || { bad "$mode: base copies did not converge ($c of 640)"; return; }
 
 	# ---- cut ----
-	echo "cut 127.0.18.1 127.0.18.2 mcast $fl" > "$D/cut3"
-	echo "cut 127.0.18.3 $fl" > "$D/cut1"; echo "cut 127.0.18.3 $fl" > "$D/cut2"
+	echo "cut 127.0.18.1 127.0.18.2 mcast $fl rst" > "$D/cut3"
+	echo "cut 127.0.18.3 $fl rst" > "$D/cut1"; echo "cut 127.0.18.3 $fl rst" > "$D/cut2"
 	i=0; while [ $i -lt 60 ]; do
 		s3=$(st 3); s1=$(st 1)
 		case "$s3 / $s1" in "master 0 "*" / "*" 1 "*) break;; esac
@@ -291,19 +260,16 @@ run() { # run <eperm|silent>
 	for n in 1 2 3; do : > "$D/cut$n"; done
 	R=$(check 0); LO=${R% *}; HI=${R#* }
 	echo "   acknowledged: $(grep -c '"18751"' "$D/acked") ops through node 1, $(grep -c '"18753"' "$D/acked") through node 3, $(grep -c maybe "$D/acked") unacknowledged - $LO to $HI keys should be live"
-	# no reads first: the repair and the reclaim alone must reach exactly
-	# K copies of each live key - which keys the unacknowledged ops left
-	# live is read afterwards, so here the total must be even and within
-	# 2 x [LO, HI], and settled
+	# no reads first: repair and reclaim alone must reach K copies per live key, so the total must be
+	# even, within 2 x [LO, HI], and settled
 	t0=$(date +%s); i=0; prev=
 	while [ $i -lt 180 ]; do
-		e1=$(st 1 | cut -d' ' -f4); e2=$(st 2 | cut -d' ' -f4); e3=$(st 3 | cut -d' ' -f4)
+		e1=$(nent 1); e2=$(nent 2); e3=$(nent 3)
 		T=$((e1 + e2 + e3))
 		[ $((T % 2)) = 0 ] && [ $T -ge $((2 * LO)) ] && [ $T -le $((2 * HI)) ] && [ "$T" = "$prev" ] && break
 		prev=$T; sleep 2; i=$((i+2))
 	done
-	# the count can sit even and in range at the heal, before any repair (GitLab
-	# 112574, 112703: 77 s in, repair takes 128 s): so the reads wait out the repair
+	# the count can sit even and in range at the heal, before any repair: the reads wait out the repair
 	i=0
 	while [ $i -lt 200 ]; do
 		C=$(check 1 2 3 2>/dev/null)
@@ -315,7 +281,7 @@ run() { # run <eperm|silent>
 		ok "$mode: every node answers every key the same, and as acknowledged - both sides' writes, the acked deletes gone, newer writes over older deletes ($C)";;
 		*) bad "$mode: after the heal: $C (want agree=1 wrong=0, live $LO..$HI)";; esac
 	i=0; while [ $i -lt 60 ]; do
-		T=$(( $(st 1 | cut -d' ' -f4) + $(st 2 | cut -d' ' -f4) + $(st 3 | cut -d' ' -f4) ))
+		T=$(( $(nent 1) + $(nent 2) + $(nent 3) ))
 		[ "$T" = $((2 * EXP)) ] 2>/dev/null && break
 		sleep 2; i=$((i+1))
 	done

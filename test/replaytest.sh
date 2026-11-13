@@ -1,18 +1,6 @@
 #!/bin/sh
-# replaytest.sh - CH-1: a sealed cluster frame is taken once.
-#
-# A forwarded write carries no request record at the holder, so a datagram
-# the network doubled - or one captured and sent again - applied twice: an
-# INCR counted twice.  Every frame now names its sender, the sealing
-# thread's stream and its place in it, inside the authenticated header.
-# One node; clinject plays a member (its ALIVE first, CH-12) and sends ONE
-# sealed forwarded INCR twice:
-#  - the counter moves once, and /stats cluster.replay.dup counts the copy;
-#  - the same INCR sealed again by a new process (a new incarnation, its
-#    sequence from 1) is a new frame and is applied - nothing keys on the
-#    content.
-# Fail-first: before CH-1 the copy is applied, the counter moves twice.
-# Usage: test/replaytest.sh [./perfcached] [./clinject]
+# replaytest.sh - a sealed cluster frame is taken once: a doubled forwarded INCR moves the counter
+# once (cluster.replay.dup counts the copy), while the same INCR from a new incarnation applies.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

@@ -1,12 +1,6 @@
 #!/bin/sh
-# cluster-up.sh — the containerised comparison deployment: 3 perfcached nodes +
-# redis:7 in containers (nerdctl, CNI bridge, multicast membership).
-# Build the image first (from the repo root, binaries built):
-#   mkdir -p /var/tmp/pcimg && cp perfcached perfcli bench/pcbench /var/tmp/pcimg/
-#   (Containerfile: debian:trixie-slim + libsodium23 python3-minimal + the
-#    three binaries; build amd64 EXPLICITLY - a poisoned multi-arch cache
-#    once produced an arm/v7 image with x86 binaries inside)
-# Usage: bench/cluster-up.sh [arena_mb]
+# cluster-up.sh [arena_mb] - the containerised comparison deployment: 3 perfcached nodes + redis:7 (nerdctl,
+# CNI bridge, multicast); build its image amd64 EXPLICITLY - a multi-arch cache can serve an arm/v7 one.
 set -eu
 ARENA=${1:-128}
 nerdctl network inspect pcnet >/dev/null 2>&1 || \

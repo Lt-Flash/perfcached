@@ -1,20 +1,6 @@
 #!/bin/sh
-# resptest.sh — the RESP compatibility dialect (task S29, cut 1).
-# Asserted:
-#  - RESP2 multibulk framing end to end: PING/ECHO/SET/GET/DEL/EXISTS/
-#    EXPIRE/TTL/INCR family/KEYS/SCAN/MGET/TYPE/DBSIZE/SELECT, binary-
-#    safe values, pipelining;
-#  - honest refusals: unknown commands, unsupported SET options, AUTH
-#    without a password plane, HELLO 3, FLUSHDB;
-#  - inline commands (the netcat leg);
-#  - dialect isolation: RESP and binary frames interleave on ONE connection;
-#  - cluster: a RESP GET on node2 of a key written via node1 parks on
-#    the pull and completes as a RESP bulk (store mode), and a fleet
-#    miss completes as $-1;
-#  - QUIT answers +OK and closes;
-#  - S86: RedisJSON's JSON.SET/GET/DEL/NUMINCRBY/ARRAPPEND/DEBUG over the
-#    native path operations, both path spellings, EX, NX/XX, the probe.
-# Usage: test/resptest.sh [./perfcached]
+# resptest.sh - the RESP dialect: RESP2 framing, inline commands, honest refusals, RESP and binary
+# frames on one connection, pull parking in a cluster, RedisJSON verbs.  Usage: test/resptest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -67,11 +53,8 @@ start() {
 	echo "node $1 did not start"; cat "$D/n$1.log"; exit 1
 }
 
-# a tiny RESP2 client: encodes argv lines to multibulk, decodes replies.
-# stdin: one command per line, args separated by \x1f (unit separator) so
-# values may contain spaces; a line "RAWJSON <json>" sends that request
-# as a binary CMD frame (pcnative) over the SAME socket (the
-# dialect-mixing leg).
+# a tiny RESP2 client.  stdin: one command per line, args split by \x1f so values may hold spaces;
+# "RAWJSON <json>" sends a binary CMD frame (pcnative) over the same socket
 RC="$D/respc.py"
 cat > "$RC" <<'EOF'
 import pcnative, socket, sys
@@ -124,7 +107,13 @@ node 1 17091
 node 2 17092
 start 1
 start 2
-sleep 3.5
+# a joiner is CONNECTING until its links answer: wait for both ready and seeing each other
+st() { rcall $1 'RAWJSON {"jsonrpc":"2.0","id":1,"method":"stats"}' | sed -n 's/^json://p' \
+	| python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 17091)" != "ready 1" ] || [ "$(st 17092)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
 # ---- the command battery on node1 --------------------------------------
 OUT=$(python3 "$RC" 17091 <<EOF
@@ -227,7 +216,7 @@ case "$L" in 'json:{"jsonrpc":"2.0","id":7,"result":{"pong":true}}') ok;; \
 	*) bad "mixed-dialect json: $L";; esac
 expect 41 "bulk:v2"
 
-# ---- S48: TIME / EXPIREAT / PEXPIREAT / MEMORY USAGE -------------------
+# ---- TIME / EXPIREAT / PEXPIREAT / MEMORY USAGE -----------------------------
 NOW=$(date +%s)
 O48=$(python3 "$RC" 17091 <<EOF
 TIME
@@ -255,9 +244,7 @@ TS=$(printf '%s\n' "$O48" | sed -n 1p | sed 's/arr:\[bulk:\([0-9]*\).*/\1/')
 	&& ok || bad "TIME seconds: '$TS' vs shell $NOW"
 e48 1 "arr:?bulk:[0-9]*" "TIME shape"
 e48 3 "int:1" "EXPIREAT set"
-# alternation must be literal in a case PATTERN - through a variable
-# the | is just a character (the first run failed on its own correct
-# answers here)
+# alternation must be literal in a case pattern: through a variable the | is just a character
 L=$(printf '%s\n' "$O48" | sed -n 4p)
 case "$L" in int:29[0-9]|int:300) ok;; *) bad "TTL after EXPIREAT: got '$L'";; esac
 e48 5 "int:1" "PEXPIREAT overrides"
@@ -293,9 +280,7 @@ EOF
 )
 [ "$R" = "BINOK" ] && ok || bad "binary value roundtrip: $R"
 
-# ---- INFO carries a replication role (rtpengine REFUSES to start
-# without one: "Asking Redis whether it's master or slave... Failed to
-# connect" - found by pointing a real rtpengine at the daemon) --------
+# ---- INFO carries a replication role: rtpengine refuses to start without one ----------
 R=$(timeout 5 python3 - <<'EOF'
 import socket
 s = socket.create_connection(("127.0.0.1", 17091), timeout=5)
@@ -374,11 +359,8 @@ EOF
 )
 [ "$R" = "+OK closed" ] && ok || bad "quit: $R"
 
-# ---- S86: RedisJSON on the RESP door -----------------------------------
-# JSON.SET/GET/DEL/NUMINCRBY/ARRAPPEND mapped onto the native path ops;
-# a `$` path answers v2 style (an array of matches), a legacy `.path`
-# the bare value; EX on JSON.SET; NX/XX answer nil; the probe OpenSIPS
-# sends at connect (JSON.DEBUG HELP) is answered like RedisJSON's.
+# ---- RedisJSON on the RESP door: a `$` path answers v2 style (an array of matches), a legacy
+# `.path` the bare value; JSON.DEBUG HELP, the probe clients send at connect, as RedisJSON answers it
 OJ=$(python3 "$RC" 17091 <<EOF
 JSON.SET${US}doc${US}\$${US}{"status":"Unreachable","n":1,"arr":[1]}
 JSON.GET${US}doc
@@ -433,7 +415,7 @@ jexpect 13 "int:3"
 jexpect 14 "bulk:[[1,2,3]]"
 jexpect 15 "bulk:[]"
 L=$(printf '%s\n' "$OJ" | sed -n 16p); case "$L" in ERR*path*) ok;; *) bad "S86 line 16: legacy path miss must be an error, got '$L'";; esac
-# S280: Redis 8's own words for a JSON verb on a string (no error code)
+# Redis 8's own words for a JSON verb on a string (no error code)
 L=$(printf '%s\n' "$OJ" | sed -n 17p); case "$L" in "Existing key has wrong Redis type") ok;; *) bad "S86 line 17: a plain value must answer RedisJSON's wrong-type error, got '$L'";; esac
 L=$(printf '%s\n' "$OJ" | sed -n 18p); case "$L" in ERR*) ok;; *) bad "S86 line 18: a path on a missing key must be an error, got '$L'";; esac
 L=$(printf '%s\n' "$OJ" | sed -n 19p); case "$L" in ERR*) ok;; *) bad "S86 line 19: a non-JSON document must be refused, got '$L'";; esac
@@ -476,9 +458,8 @@ case "$L" in int:29[0-9]|int:300) ok;; *) bad "INCR lost the ttl: $L";; esac
 L=$(printf '%s\n' "$OUT3" | sed -n 5p)
 [ "$L" = "int:-1" ] && ok || bad "fresh counter not immortal: $L"
 
-# ---- and through the forward plane (proxy col, sentinel on the wire) ---
-# node1 places the key locally (self-preference); node2's INCR forwards
-# with the preserve sentinel; node1 reads the surviving TTL as holder
+# ---- and through the forward plane: node2's INCR forwards with the preserve sentinel; node1,
+# the holder, reads the surviving TTL
 rcall 17091 "SELECT${US}2" > /dev/null
 OUT4=$(python3 "$RC" 17091 <<EOF
 SELECT${US}2

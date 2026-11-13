@@ -1,42 +1,6 @@
 #!/bin/sh
-# eagerparttest.sh - RV-4a: an eager fleet split by a partition, with
-# writes on BOTH sides, healed, stopped and restarted.
-#
-# RV-4's map (DESIGN 12gb): eager x partition had no suite.  It is what
-# 245-247 run, and the one time it was exercised - RV-5's fault run, F3,
-# by hand with nft - it found S233.  Here three local eager nodes (WAL)
-# run under netcutshim.so, which cuts node 3 off from nodes 1 and 2 in
-# both directions, UDP and TCP, without root.
-#
-# Twice, once per way a cut looks to the node:
-#   eperm   a cut send fails, as a local firewall's OUTPUT drop does (F3):
-#           the isolated master cannot publish, so its map keeps the old
-#           term while its claim moves on
-#   silent  a cut send "succeeds" and is lost, as on a network cut further
-#           away: the isolated master publishes its map under its own term
-# Each run:
-#   1. 300 base keys a000-a299 on every node;
-#   2. cut node 3 (the shim's counters must show it DELIVERED): node 3 is
-#      alone, nodes 1+2 see one peer;
-#   3. writes on both sides - m000-m199 through node 1, i000-i099 through
-#      node 3; a000-a049 overwritten differently on each side; a100-a124
-#      deleted through node 1, a150-a174 through node 3; while cut, each
-#      side must NOT hold the other's new keys (the cut is real);
-#   4. heal: within 60 s every node holds every new key, the base keys
-#      nobody touched and the SAME value for each doubly-written key; one
-#      master, one map term;
-#   4b. S238: none of the 50 deletes made while cut comes back - not by
-#      the repair sweep (checked with NO reads: every node settles at the
-#      same count before anything is read) and not by pull-on-miss (the
-#      reads that follow).  Each side remembers its deletes past the 2 s
-#      crossing window and replays them to the peer that missed them.
-#   4c. a NEWER write beats an older delete across the split: n000-n019
-#      are deleted by the majority first thing, and written again by the
-#      isolated side after 175 writes of its own - a higher version - so
-#      the write survives on every node.
-#   5. fleetstop through the master stops all three (S233), and a restart
-#      of all three from the stop's snapshots + WAL holds the same.
-# Usage: test/eagerparttest.sh [./perfcached] [./netcutshim.so]
+# eagerparttest.sh - an eager fleet cut by netcutshim.so (eperm and silent), written on both sides,
+# healed, stopped, restarted: one value per key, no delete comes back, a newer write beats a delete.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -50,10 +14,8 @@ bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 MC=239.255.77.91
 MP=17191
 [ -f "$SHIM" ] || { echo "eagerparttest: no shim at $SHIM"; exit 1; }
-# a dynamic sanitizer runtime (gcc's check-asan) must come FIRST in the
-# preload list, the shim after it - as healtest and syncfailtest do.
-# rc42's check-asan: "ASan runtime does not come first in initial library
-# list", and no node started.
+# a dynamic sanitizer runtime (gcc's check-asan) must come FIRST in the preload list, the shim after
+# it, as healtest and syncfailtest do
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 PRELOAD="${SANRT:+$SANRT }$SHIM"
 
@@ -104,12 +66,8 @@ start() { # start <n>
 	echo "node $1 did not start: $(tail -2 "$D/n$1.log" | tr '\n' ' ')"; return 1
 }
 stop_kill() { kill -9 "$(cat "$D/n$1.pid" 2>/dev/null)" 2>/dev/null; rm -f "$D/n$1.pid"; }
-# reap: the previous fleet must be GONE before the next one binds.  Every
-# listener is SO_REUSEPORT (TCP doors and the cluster socket), so a start
-# beside a dying daemon binds silently and the kernel splits new
-# connections and datagrams between the two - a client write can land on
-# the corpse and a JOIN be answered by the old master (10-04: an ASan arm
-# of this suite read 0/3 base copies with nothing in the log to say why).
+# reap: the previous fleet must be GONE before the next binds - every listener is SO_REUSEPORT, so a
+# start beside a dying daemon splits connections and datagrams with the corpse
 reap() { # reap <old pids>
 	i=0; while [ $i -lt 150 ]; do
 		busy=0
@@ -180,7 +138,7 @@ dig = hashlib.sha1(json.dumps(dbl).encode()).hexdigest()[:10]
 nw = sum(val["n%03d" % i] == "In%03d" % i for i in range(20))
 print("m=%d i=%d base=%d gone=%d dbl=%d/%s nw=%d" % (m, i_, base, gone, okdbl, dig, nw))' "1735$1" 2>/dev/null || echo "m=? i=? base=? gone=? dbl=?"; }
 field() { echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
-cutcount() { cat "$D/cutlog$1" 2>/dev/null | awk '{print $2 + $4 + $6}'; }
+cutcount() { cat "$D/cutlog$1" 2>/dev/null | awk '{print $2 + $4 + $6 + $8}'; }
 
 run() { # run <eperm|silent>
 	mode=$1; fl=""; [ "$mode" = eperm ] && fl=eperm
@@ -191,14 +149,8 @@ run() { # run <eperm|silent>
 	rm -rf "$D"/wal? "$D"/cut? "$D"/cutlog? "$D"/n?.log
 	for n in 1 2 3; do conf $n; : > "$D/cut$n"; done
 	start 1 && sleep 1 && start 2 && start 3 || { bad "$mode: the fleet did not start"; return; }
-	# wait for the three to see each other before writing: a fixed 4 s was
-	# enough on an idle box and not under six CI jobs at once (10-04: one arm
-	# of this suite found 0 copies on every node because the fleet was still
-	# forming - st read "?" for the map term the whole window)
-	# ... and READY: a node that sees both peers is still RECOVERING (its
-	# boot pull) for a while, and every write it is handed meanwhile is
-	# refused "node is not READY" - 10-04 GitHub repl1: both arms 0/3 with
-	# all 320 base writes refused that way, peers_up 2 on all three
+	# wait for the three to see each other AND be READY (a node seeing both peers can still be
+	# RECOVERING and refuse writes); a fixed sleep was not enough under concurrent CI jobs
 	FW=120; [ -n "${SANRT:-}" ] && FW=360
 	i=0; while [ $i -lt $FW ]; do
 		p=0; for n in 1 2 3; do s=$(st $n); [ "$(echo "$s" | cut -d' ' -f2)" = 2 ] && [ "$(echo "$s" | cut -d' ' -f5)" = ready ] && p=$((p+1)); done
@@ -216,8 +168,8 @@ run() { # run <eperm|silent>
 		return; }
 
 	# ---- cut ----
-	echo "cut 127.0.13.1 127.0.13.2 mcast $fl" > "$D/cut3"
-	echo "cut 127.0.13.3 $fl" > "$D/cut1"; echo "cut 127.0.13.3 $fl" > "$D/cut2"
+	echo "cut 127.0.13.1 127.0.13.2 mcast $fl rst" > "$D/cut3"
+	echo "cut 127.0.13.3 $fl rst" > "$D/cut1"; echo "cut 127.0.13.3 $fl rst" > "$D/cut2"
 	i=0; while [ $i -lt 60 ]; do
 		s3=$(st 3); s1=$(st 1)
 		case "$s3 / $s1" in "master 0 "*" / "*" 1 "*) break;; esac
@@ -239,9 +191,8 @@ run() { # run <eperm|silent>
 
 	# ---- heal ----
 	for n in 1 2 3; do : > "$D/cut$n"; done
-	# S238's first vehicle was the repair sweep, which needs no read:
-	# before anything is read, every node must settle at the same count -
-	# 300 + 20 + 200 + 100, less the 50 deleted
+	# the repair sweep needs no read: before anything is read every node must settle at the same
+	# count, 300 + 20 + 200 + 100 less the 50 deleted
 	t0=$(date +%s); i=0
 	while [ $i -lt 60 ]; do
 		e1=$(st 1 | cut -d' ' -f4); e2=$(st 2 | cut -d' ' -f4); e3=$(st 3 | cut -d' ' -f4)
@@ -294,7 +245,8 @@ print(last)' "1735$M" 2>/dev/null)
 	S=0; for n in 1 2 3; do grep -q "taking the shutdown snapshot" "$D/n$n.log" && S=$((S+1)); done
 	for n in 1 2 3; do rm -f "$D/n$n.pid"; done
 	start 1 && start 2 && start 3 || { bad "$mode: the fleet did not restart"; return; }
-	sleep 5
+	# a restarted fleet settles, founds and admits before it serves: every node ready, up to 30 s
+	python3 "$(dirname "$0")/waitready.py" -t 30 127.0.0.1:17351 127.0.0.1:17352 127.0.0.1:17353 || true
 	v1=$(view 1); v2=$(view 2); v3=$(view 3)
 	[ "$v1" = "$v2" ] && [ "$v1" = "$v3" ] && case "$v1" in "m=200 i=100 base=200 gone=$G dbl=50/"*" nw=$NW") true;; *) false;; esac \
 		&& ok "$mode: restarted from $S shutdown snapshots + WAL, all three hold what they held before the stop ($v1)" \

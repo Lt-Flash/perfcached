@@ -1,20 +1,6 @@
 #!/bin/sh
-# uprenametest.sh - S448: a read-through collection is not renamed live.
-#
-# An upstream binds a collection, and its .nofall companion, by the name in
-# the config.  `rename` moved the store's name only: the collection stopped
-# reading and writing through, silently, and the binding stayed on a name
-# no table answers.  One node, collection 0 reading through from
-# test/fakeupstream.py, and a plain collection beside it; privileged native
-# calls (allow_create, enable):
-#   1  rename of the read-through collection is refused, by name - and it
-#      still reads through afterwards
-#   2  rename of its .nofall companion is refused
-#   3  rename of another collection INTO the bound name is refused, by name
-#   4  a plain collection still renames, and answers under the new name
-# FAIL-FIRST: before S448, 1 answers renamed and collection 0 is gone - a
-# read of it then says "no such collection".
-# Usage: test/uprenametest.sh [./perfcached]
+# uprenametest.sh - a read-through collection, its .nofall companion and its bound name are not
+# renamed live (the binding would stay on a name no table answers); a plain collection still is.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=$(readlink -f "${1:-./perfcached}")
@@ -125,8 +111,8 @@ V=$(got plain2 k)
 	&& ok "4. a plain collection renames (plain -> plain2) and answers under the new name" \
 	|| bad "4. plain rename: $R; plain2/k = $V"
 C=$(cols)
-# each name on its own: one pattern " 0 "*" 0.nofall " needs the space
-# between them twice, and the list names them side by side (rc8)
+# each name on its own: one pattern " 0 "*" 0.nofall " needs the space between them twice, and
+# the list names them side by side
 P=0
 case " $C " in *" 0 "*) case " $C " in *" 0.nofall "*) P=1 ;; esac ;; esac
 [ $P = 1 ] && ok "the read-through pair is still there: $C" ||

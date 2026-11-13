@@ -1,18 +1,5 @@
-/* clanetest.c - the frame lane's inbound side (clane.c), CH-18: what a
- * connection may hold before it has shown it is a lane.  The real lane
- * thread on 127.0.0.1 at a port the kernel picked; clients from
- * 127.0.0.1, .2 and .3, so the per-address limit can be met on one and
- * not the others.  About ten seconds: the hello's deadline is real time.
- *
- *   A  four connections from one address are held; a fifth is closed at
- *      once, counted as refused
- *   B  a lane from another address - a good hello, then a frame: the
- *      frame reaches the cluster thread's queue with the sender's cluster
- *      address from the hello
- *   C  the four that never sent a hello are closed once the deadline
- *      (3 s) passes, counted as timeouts; the lane that did is still open
- *   D  a hello with the wrong magic is closed, counted as refused
- */
+/* clanetest.c - what a frame-lane connection may hold before it shows it is a lane: the real lane
+ * thread on loopback, clients from 127.0.0.1-3 for the per-address limit; a real hello deadline. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,7 +113,7 @@ int main(void)
 	if (pc_addr_parse("127.0.0.1", (uint16_t)port, &self) != 0 || clane_start(&self, 0) != 0)
 		return 2;
 
-	/* A */
+	/* A: four connections from one address held; a fifth closed at once, counted as refused */
 	for (n = 0, i = 0; i < 4; i++)
 		n += (a[i] = dial(1)) >= 0;
 	usleep(300 * 1000);
@@ -137,7 +124,7 @@ int main(void)
 	CHK(fd5 >= 0 && closed_within(fd5, 2000) && figs().refused == 1,
 		"A: a fifth from the same address - closed, refused (%llu)", figs().refused);
 
-	/* B */
+	/* B: another address's hello then frame reaches the queue with the hello's cluster address */
 	lane = dial(2);
 	n = lane >= 0 && hello(lane, 2, 7777, "PCL1") == 0;
 	{
@@ -155,14 +142,14 @@ int main(void)
 			"B: a lane from 127.0.0.2 - its frame queued, from cluster port %d", pc_addr_port(&from));
 	}
 
-	/* C */
+	/* C: the four with no hello are closed after the 3 s deadline, counted; the lane stays open */
 	for (n = 0, i = 0; i < 4; i++)
 		n += closed_within(a[i], 6000);
 	CHK(n == 4 && figs().inbound_timeouts == 4,
 		"C: the four with no hello - closed at the deadline, timed out (%llu)", figs().inbound_timeouts);
 	CHK(!closed_within(lane, 0), "C: the lane with a good hello - still open past it");
 
-	/* D */
+	/* D: a hello with the wrong magic is closed, counted as refused */
 	bad = dial(3);
 	CHK(bad >= 0 && hello(bad, 3, 7777, "XCL1") == 0 && closed_within(bad, 2000) && figs().refused == 2,
 		"D: a hello with the wrong magic - closed, refused (%llu)", figs().refused);

@@ -20,14 +20,16 @@ Two listeners speak RESP:
 - **`resp = <addr:port>`** under `[listen]` - the dedicated Redis door.
   RESP2 only; the native protocol and the admin verbs are refused on it.
   A Redis client cannot speak the Noise channel, so this listener is
-  plaintext and guarded instead: off loopback `resp_allow = <cidr>[,…]`
+  plaintext unless it says `tls` (`resp = <addr:port> tls`, 0.7.5, a
+  build with OpenSSL: `redis-cli --tls`, `rediss://` URLs), and guarded
+  either way: off loopback `resp_allow = <cidr>[,…]`
   is required or the daemon refuses to start, `[secrets] resp` adds a
   Redis `AUTH` password, and `resp_collections` bounds which collections
   the door can see.
 - **the native `tcp` listener**, which tells binary frames and RESP
   apart by the first byte of each message - a RESP client is served
   there too, but only where plaintext is
-  allowed (`plaintext = loopback`: 127.0.0.1 and the unix socket).
+  allowed (`plaintext = loopback`: 127.0.0.0/8, ::1 and the unix socket).
 
 **Collections are Redis databases.**  A connection starts on the
 collection named `0`.  `SELECT n` moves it to the collection named `n`,
@@ -37,17 +39,21 @@ in that list is reachable by name.  A collection that is not declared
 must be *named* `0`, `1`, … to be reachable at all.  The map can also be
 changed while the fleet serves (`perfcli map <index> <collection>`,
 0.7.1): a connection sees it on its next command, without reconnecting
-or a new `SELECT`; a `MULTI` block or a pipeline that straddles the
-change runs its earlier commands under the old map and the later ones
-under the new.  `INFO keyspace` follows the map.
+or a new `SELECT`; a pipeline that straddles the change runs its
+earlier commands under the old map and the later ones under the new.
+`INFO keyspace` follows the map.
 
 **Authentication.**  With `[secrets] resp` set, every command but
 `AUTH`, `HELLO` and `QUIT` answers `-NOAUTH Authentication required.`
 until `AUTH` succeeds.  Without it, `AUTH` answers `-ERR Client sent
-AUTH, but no password is set`, as Redis does.
+AUTH, but no password is set`, as Redis does.  With `auth_needs_tls =
+yes` (0.7.5) `AUTH` on a plaintext connection off loopback answers
+`-ERR AUTH needs TLS here (auth_needs_tls = yes) - use the TLS RESP
+door` and counts as a failed authentication.
 
-**A node that is not ready** - still recovering its data - answers
-every data command with `-LOADING node is not READY (recovering) …`,
+**A node that is not ready** - still recovering its data, or (0.7.5)
+`connecting` after its admission to a fleet - answers
+every data command with `-LOADING node is not READY (recovering or connecting) …`,
 Redis's own code for the condition; connection and cluster commands
 still work, so a client can find another node.
 
@@ -63,6 +69,10 @@ There are no `ASK` redirects.  A forward that cannot be parked answers
 **Limits.**  Keys up to 4,096 bytes (`-ERR key too long`).  A record -
 key, value and a 28-byte header - up to 262,080 bytes, so a value of
 just under 256 KB (`-ERR value too large`); a JSON document up to 64 KB.
+On a fleet, a write this node forwards to the key's owner or holder
+carries at most 58,000 bytes of value - past that it is `-ERR value too
+large` here, though the owner itself takes the full size (a
+cluster-aware client sends the key to its owner).
 A pattern for `KEYS`/`SCAN MATCH` up to
 255 bytes.  Expiry granularity is one second: `PX`, `PEXPIRE` and
 `PEXPIREAT` round *up* to the next second, `PTTL` is seconds × 1000.
@@ -75,12 +85,12 @@ A key holds a string (counters are strings) or a JSON document.
 | `PING [message]` | `+PONG`, or the message as a bulk | |
 | `ECHO message` | the message | |
 | `QUIT` | `+OK`, then the connection closes | |
-| `AUTH password` / `AUTH username password` | `+OK` | the username is accepted and ignored; a wrong password is `-WRONGPASS invalid username-password pair or user is disabled.` and is counted in `stats.resp.auth_fails` |
+| `AUTH password` / `AUTH username password` | `+OK` | the username is accepted and ignored; a wrong password is `-WRONGPASS invalid username-password pair or user is disabled.` and is counted in `stats.resp.authfail` |
 | `HELLO [protover]` | a 14-element map: `server perfcached`, `version`, `proto 2`, `id 0`, `mode standalone`, `role master`, `modules []` | protocol 2 only; `HELLO 3` is `-NOPROTO unsupported protocol version`.  `mode` and `role` are fixed strings for client compatibility; the truth is in `INFO cluster` and `CLUSTER INFO` |
 | `SELECT index` | `+OK` | the collection named or mapped by `index`; `-ERR DB index is out of range` when no such collection is declared or the door may not see it |
-| `DBSIZE` | integer | the number of records in the selected collection |
+| `DBSIZE` | integer | the number of records in the selected collection on this node (on a shard or proxy fleet, this node's share) |
 | `TIME` | `[seconds, microseconds]` | |
-| `INFO [section]` | bulk, Redis's `# Section` format | sections: `server` (reports `redis_version:7.0.0` for tooling, `redis_mode`, `perfcached_version`, `perfcached_dialect:resp2-compat`), `replication` (`role:master`, no replicas), `cluster` (`cluster_enabled`), `clients`, `memory` (`used_memory` = the arena's held bytes), `stats` (`keyspace_hits`/`misses` summed over collections, and more), `keyspace` (one `dbN:keys=…` line per collection), `commandstats` (every door: RESP commands under their Redis names, the native door as `cmd:<method>` and `bin:<verb>`), `latencystats` (`latencystat_<cmd>:p50=,p99=,p99.9=` in ms, Redis 7's shape - each figure the log2 bucket bound the percentile falls under, 1 us to 32.768 ms; 32.768 means above the last bucket).  `all` or `everything` returns every section; a bare `INFO` returns the default set, which leaves out `commandstats` and `latencystats` as Redis does |
+| `INFO [section]` | bulk, Redis's `# Section` format | sections: `server` (reports `redis_version:7.0.0` for tooling, `redis_mode`, `perfcached_version`, `perfcached_dialect:resp2-compat`), `replication` (`role:master`, no replicas), `cluster` (`cluster_enabled`), `clients`, `memory` (`used_memory` = the arena's held bytes), `stats` (`keyspace_hits`/`misses` summed over collections, and more), `keyspace` (one `dbN:keys=…` line per DB index the door maps to a collection that holds keys), `commandstats` (every door: RESP commands under their Redis names, the native door as `cmd:<method>` and `bin:<verb>`), `latencystats` (`latencystat_<cmd>:p50=,p99=,p99.9=` in ms, Redis 7's shape - each figure the log2 bucket bound the percentile falls under, 1 us to 32.768 ms; 32.768 means above the last bucket).  `all` or `everything` returns every section; a bare `INFO` returns the default set, which leaves out `commandstats` and `latencystats` as Redis does |
 | `CLIENT LIST` | bulk, one line per connection | `CLIENT SETNAME name` is `+OK`; `CLIENT GETNAME` answers an empty string; other subcommands are `-ERR unsupported CLIENT subcommand` |
 | `CONFIG GET pattern` | an empty array | nothing is exposed; `CONFIG RESETSTAT` resets the running totals (`+OK`); `CONFIG SET` is `-ERR unsupported CONFIG subcommand` |
 | `SLOWLOG GET [count]` | Redis's slowlog entry array | entries slower than `[daemon] slowlog_usec`, from every door - a native entry's argv is `cmd:<method>` or `bin:<verb>`, collection, key; `count` defaults to 10, `-1` gives up to 512; `SLOWLOG LEN`, `SLOWLOG RESET`; the newest 32 are `slowlog` on `/stats` |
@@ -112,10 +122,12 @@ subscription lives on the connection that made it and dies with it.
 `all`) a mutation publishes `__keyspace@<collection>__:<key>` with the
 event as payload and `__keyevent@<collection>__:<event>` with the key,
 events `set`, `del`, `expired` and `keymiss`, so `PSUBSCRIBE
-__keyevent@0__:*` works as on Redis.  They are emitted by the node that
-applies the change and never relayed: attach to one node for that
-node's stream, to every node for the fleet's, as with Redis Cluster's
-primaries.
+__keyevent@0__:*` works as on Redis for the collection named `0`.  The
+channel names the collection, not the DB index: with `resp_collections
+= 0:sessions` it is `__keyevent@sessions__:*`.  They are emitted by the
+node that applies the change and never relayed: attach to one node for
+that node's stream, to every node for the fleet's, as with Redis
+Cluster's primaries.
 
 **Subscribed mode** is exactly Redis's: once a connection holds a
 subscription, only `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`,
@@ -139,7 +151,7 @@ never closes an idle connection.
 | `DEL key [key …]`, `UNLINK key [key …]` | integer: keys removed | a key over 4,096 bytes in a multi-key call is skipped, not an error |
 | `DELEX key [IFEQ cmp \| IFNE cmp]` | integer: 1 deleted, 0 not | Redis 8.4's conditional delete: `IFEQ` deletes only if the key holds a string equal to `cmp`, `IFNE` only if it holds a different one (an absent key is 0 either way). Without a condition it is `DEL` of one key, of any type. A condition on a key that is not a string is `-ERR Key should be of string type if conditions are specified`. `IFDEQ`/`IFDNE` are refused (no `DIGEST`). Decided on the key's slot owner in a cluster, as `SET NX` is |
 | `EXISTS key [key …]` | integer: how many exist | |
-| `TYPE key` | `+string`, `+ReJSON-RL` or `+none` | `ReJSON-RL` for a key a JSON command wrote, whichever `redis_types` |
+| `TYPE key` | `+string`, `+ReJSON-RL`, `+hash`, `+ratelimit`, `+zset` or `+none` | `ReJSON-RL` for a key a JSON command wrote, whichever `redis_types`; `ratelimit` for an `RL.HIT` key, `zset` for a Symfony lock (below) |
 | `TTL key`, `PTTL key` | integer | `-2` no such key, `-1` no expiry, else the remaining seconds (`PTTL`: × 1000) |
 | `EXPIRE key seconds`, `PEXPIRE key ms` | `1` set, `0` no such key | a value ≤ 0 deletes the key (`1` if it existed); `NX`/`XX`/`GT`/`LT` are not accepted |
 | `EXPIREAT key unix-seconds`, `PEXPIREAT key unix-ms` | as above | converted against the node's clock |
@@ -178,10 +190,10 @@ collection (default `[daemon] redis_types`, default `strict`):
 | `JSON.SET key path value [NX \| XX] [EX seconds]` | `+OK`, or nil when `NX`/`XX` declined | `EX` is an extension: the store sets a TTL in the same call; without it a field update keeps the key's expiry.  Other options are `-ERR unsupported JSON.SET option` |
 | `JSON.GET key [path]` | bulk JSON, or nil | no path = the whole document; a string under `strict` is `-Existing key has wrong Redis type` |
 | `JSON.DEL key [path]` | integer: 1 deleted, 0 not found | no path = the whole key |
-| `JSON.NUMINCRBY key path number` | bulk: the new number | `-ERR value is not an integer (…)` when the target is not numeric |
+| `JSON.NUMINCRBY key path number` | bulk: the new number | integers only: a `number` that is not one is `-ERR value is not an integer (JSON.NUMINCRBY is integer-only here)`, a target that is not one `-ERR path value is not an integer` |
 | `JSON.ARRAPPEND key path value [value …]` | integer: the array's new length | |
 | `JSON.DEBUG HELP` | the two lines below | the capability probe RedisJSON-aware clients send at connect |
-| `JSON.DEBUG MEMORY key [path]` | integer: bytes of the fragment | `-WRONGTYPE …` on a key that is not a JSON document |
+| `JSON.DEBUG MEMORY key [path]` | integer: bytes of the fragment | the path must start with `$`; `0` for an absent key; a string is `-ERR Existing key has wrong Redis type` under `strict` |
 
 A JSON command on a key that another node holds (proxy and shard
 placement) is `-ERR JSON on a key another node holds is not served on
@@ -278,8 +290,9 @@ or answers `-MOVED` with `resp_redirect = moved` (above).
 |---|---|
 | `-NOAUTH Authentication required.` | a password is set and the connection has not authenticated |
 | `-WRONGPASS …` | `AUTH` with the wrong password |
+| `-ERR AUTH needs TLS here (auth_needs_tls = yes) - use the TLS RESP door` | `AUTH` in the clear off loopback under `auth_needs_tls = yes` (0.7.5) |
 | `-NOPROTO unsupported protocol version` | `HELLO 3` |
-| `-LOADING node is not READY (recovering) …` | a data command on a node still recovering; retry, or use another node |
+| `-LOADING node is not READY (recovering or connecting) …` | a data command on a node still recovering, or (0.7.5) still `connecting` after its admission; retry, or use another node |
 | `-TRYAGAIN cluster busy, retry` | a write that had to be forwarded and could not be parked (`[cluster] max_pending`); the request has not happened and a retry is correct |
 | `-ERR holder timed out` | a forwarded request whose answer missed its deadline; **not** retryable for `INCR` - the holder may have applied it |
 | `-ERR forward failed` | the owner could not be reached |

@@ -1,14 +1,5 @@
-/*
- * clseltest.c — client-side node selection (step 5).
- *
- * The spread property here is the one failovertest tries to check
- * against a live fleet, where it races a node it just killed and
- * intermittently reports every client on one node.  The same property
- * is decidable without a fleet, deterministically, which is what this
- * does.
- *
- * Build: cc -o clseltest test/clseltest.c src/clsel.o src/clmap.o
- */
+/* clseltest.c - client-side node selection: the spread property failovertest can only race for on
+ * a live fleet, decided here deterministically without one. */
 #include <stdio.h>
 #include <string.h>
 
@@ -75,10 +66,8 @@ int main(void)
 		if (cnt[i] < 300 / 5 / 2 || cnt[i] > 300 / 5 * 2) break;
 	CHK(i == 5, "round-robin is lumpy: node %d took %d of 300", i, cnt[i]);
 
-	/* a client's seed must matter.  Stated over a SET of seeds rather
-	 * than two pairs: with 5 nodes, two arbitrary pairs colliding is a
-	 * 4%% coincidence, and a test that fails 4%% of the time teaches
-	 * nobody anything. */
+	/* a client's seed must matter, stated over a SET of seeds: on 5 nodes two arbitrary pairs
+	 * collide by a 4% coincidence */
 	{
 		int seen[64];
 		int d = 0;

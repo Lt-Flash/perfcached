@@ -1,40 +1,6 @@
 #!/bin/sh
-# reconcileresizetest.sh - S275: a resize in the middle of the post-restart
-# reconcile does not make the pass skip keys.
-#
-# The reconcile walked its table with pcache_ht_scan, whose cursor is a
-# bucket index into the table it was given.  Since S69 a resize builds a
-# new table and SWAPS: the next tick handed the old cursor to the new
-# table.  After a SHRINK the cursor pointed past the new table's end, the
-# walk read "complete", and every key not yet asked about was kept -
-# including keys deleted on the fleet while this node was down.  The walk
-# now goes through pc_store_scan, whose cursor carries the table's
-# generation and restarts across a swap (a key may be asked twice, never
-# not asked).
-#
-# Three eager nodes with a WAL, tombstone retention OFF (so only the
-# reconcile can remove a key deleted during the outage), 3000 keys:
-#   1. node 3 stops once a restart of it would be witnessed (S274)
-#   2. 1500 keys are deleted through node 1 while it is down
-#   3. node 3 comes back (2^14 buckets) and, once its reconcile has begun
-#      asking, is shrunk to 2^12 - the resize lands MID-pass (2^12: room
-#      for every record in the buckets; a smaller table puts some in the
-#      overflow leg, whose drain a walk can miss - S281, filed apart)
-#   4. when the pass is over, node 3 holds none of the 1500 deleted keys
-#      and all 1500 kept ones, and node 1 none of the deleted
-#   5. node 3 away again, 500 more deleted, no resize; node 2 frozen 2 s
-#      mid-walk: its silence rules on nothing, and every key still ends ruled
-# The standalone edition refuses [cluster]: SKIPPED, loudly.
-# Two defects, both measured here (DESIGN 12hc): the walk's raw cursor
-# (after the shrink the pass read "complete" having asked 137 of 1500),
-# and the resize copy restamping each record's write tick - which is what
-# marks a recovered record as held until the reconcile rules (S245) - so
-# the sweep pushed deleted keys back to every peer (236 of 1500, on the
-# whole fleet).  Node 1 is read too: a key back on a node that never
-# restarted is the second defect.
-# Fail-first: the build before S275 fails 4 on both counts; the one before
-# S471 fails 5, 133 of 500 kept on both builds (GitLab 112646).
-# Usage: test/reconcileresizetest.sh [./perfcached] [./perfcli]
+# reconcileresizetest.sh - a resize in the middle of the post-restart reconcile neither skips keys nor pushes
+# deleted ones back.  Usage: test/reconcileresizetest.sh [./perfcached] [./perfcli]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -74,8 +40,8 @@ plaintext = loopback
 multicast = 239.255.78.16:18999
 advertise = 127.0.31.$1
 mode = eager
-# S392/S393: the WALK, at its old pace, is what a resize must land inside -
-# a clean stop leaves a snapshot, which would take the fast path instead
+# the WALK, at 64 a second, is what a resize must land inside - a clean stop leaves
+# a snapshot, which would take the fast path instead
 reconcile_fast = no
 reconcile_rate_max = 64
 collections = 0
@@ -155,8 +121,8 @@ N=$(drive 1 set 0 3000)
 sleep 3                                    # everysec, and the eager push
 H3=$(held 3 0 3000)
 [ "$N" = 3000 ] && [ "$H3" = 3000 ] || { echo "reconcileresizetest: setup: stored $N, node 3 holds $H3 of 3000"; exit 1; }
-# 1. only once a restart of node 3 would be witnessed - else the pass is
-#    skipped and nothing is tested (S274)
+# 1. only once a restart of node 3 would be witnessed, else the pass is skipped and nothing is
+# tested
 i=0; while [ $i -lt 90 ] && [ "$(st 3 'c["restart"]["safe"]')" != True ]; do sleep 1; i=$((i+1)); done
 [ "$(st 3 'c["restart"]["safe"]')" = True ] && ok "1. a restart of node 3 would be witnessed (after ${i} s)" \
 	|| { bad "1. node 3 never said a restart would be witnessed"; echo "reconcileresizetest: $pass passed, $fail failed"; exit 1; }

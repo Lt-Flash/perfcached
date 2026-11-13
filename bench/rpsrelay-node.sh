@@ -1,17 +1,6 @@
 #!/bin/sh
-# rpsrelay-node.sh <verb> [args] - one host's side of bench/rpsrelay.sh.
-# Everything lives in $WORKDIR (default /tmp/rpsrelay); RUNTIME picks the
-# container runtime for the Redis arm (podman, nerdctl or docker).
-#
-#   pc-start | pc-pid | pc-stop      perfcached from ./perfcached -f n.conf,
-#                                    pinned to $SERVER_CPUS
-#   stats | members                  its /stats and /members (http door)
-#   redis-start | redis-stop         a cluster-enabled redis-server in a
-#                                    container on the host network
-#   redis-cli <args>                 redis-cli inside that container
-#   cpu <pid>                        utime+stime ticks of a process
-#   net <iface>                      tx bytes and packets of an interface
-#   softirq                          softirq ticks summed over all CPUs
+# rpsrelay-node.sh <verb> [args] - one host's side of bench/rpsrelay.sh, in $WORKDIR (default /tmp/rpsrelay):
+# pc-start|pc-pid|pc-stop, stats, members, redis-start|redis-stop, redis-cli, cpu <pid>, net <iface>, softirq
 D=${WORKDIR:-/tmp/rpsrelay}
 RT=${RUNTIME:-podman}
 CPUS=${SERVER_CPUS:-0-7}

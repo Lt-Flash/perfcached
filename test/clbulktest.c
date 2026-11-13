@@ -1,25 +1,5 @@
-/*
- * clbulktest.c - the bulk plane's framing and batch handoff (M7).
- *
- * The bulk plane carries records too big for a datagram over a Noise
- * session, and every case here is a way that stream could go wrong
- * without a fleet to notice:
- *   - a chunk header claiming a length the stream cannot honour, which
- *     is how a truncated batch must be refused: by exact length, before
- *     any of it reaches the store
- *   - a peer that stops mid-stream, which has to read as failure rather
- *     than as a short but complete batch
- *   - a stash too small for the chunk offered, which would otherwise
- *     overrun the receiver's buffer
- *   - a batch handed over while the bulk thread still holds the last
- *     one, which must be refused so the caller can count the loss
- *
- * The handshake is real and runs over a socketpair, so the round trip
- * is the production one; nothing here needs a second daemon.
- *
- * Build: cc -o clbulktest test/clbulktest.c src/clbulk.o src/pc_noise.o \
- *              src/compat/compat.o -lsodium
- */
+/* clbulktest.c - the bulk plane's framing and batch handoff over a real Noise handshake on a
+ * socketpair: bad chunks refused, queued batches keep their kind and order. */
 #include <sodium.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,10 +11,8 @@
 
 #include "../src/clbulk.h"
 
-/* write eight bytes in two parts, so the reader's first read returns
- * four and the retry loop is actually exercised - a socketpair never
- * gives a short read at these sizes otherwise, which is why the
- * mutation that removed the loop went unnoticed. */
+/* write eight bytes in two parts so the reader's retry loop runs: a socketpair never gives a short
+ * read at these sizes otherwise */
 struct slow_arg { int fd; };
 static void *slow_writer(void *arg)
 {
@@ -101,9 +79,8 @@ int main(void)
 	struct clbulk B;
 	pc_addr to, got_to;
 
-	/* unbuffered: a mutant that aborts must still show which assertion
-	 * it broke.  abort() discards buffered stdout, and three mutations
-	 * were reported as bare exit 134 because of it. */
+	/* unbuffered: abort() discards buffered stdout, and a mutant that aborts
+	 * must still show which assertion it broke */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (sodium_init() < 0) {
 		printf("clbulktest: libsodium would not initialise\n");
@@ -145,9 +122,7 @@ int main(void)
 	{
 		unsigned char hdr[2];
 
-		/* the four bytes ARE supplied, so the refusal cannot come
-		 * from a read timing out - which is what made the first
-		 * version of this case pass with the length check removed */
+		/* the four bytes ARE supplied, so the refusal cannot come from a read timing out */
 		hdr[0] = 4; hdr[1] = 0;            /* shorter than the tag */
 		chk(write(sv[0], hdr, 2) == 2, "B1 a chunk claiming four bytes");
 		chk(write(sv[0], "junk", 4) == 4, "B1 and supplying them");
@@ -205,13 +180,8 @@ int main(void)
 		chk(clbulk_offer(&B, b1, 16, 3, CLBULK_KIND_REPLICA, &to) == 1,
 			"C2 the first batch is accepted");
 		chk(clbulk_pending(&B), "C2 and reads as pending");
-		/* S178: a SECOND batch is accepted while the first waits.  A
-		 * sweep offers one per peer in the same tick, and refusing
-		 * the second told the caller its cycle had not delivered -
-		 * which pinned every sweep mark on the node and had the
-		 * fleet re-sending its whole keyspace for ever.  The queue
-		 * is finite, so an offer past its slots is still refused and
-		 * the caller keeps that buffer. */
+		/* a SECOND batch is accepted while the first waits (a sweep offers one per peer
+		 * per tick); past the queue's slots an offer is refused and the caller keeps it */
 		chk(clbulk_offer(&B, b2, 16, 9, CLBULK_KIND_MIGRATE, &to) == 1,
 			"C3 a second peer's batch is accepted alongside it");
 		{
@@ -236,17 +206,13 @@ int main(void)
 			taken == b1 && tlen == 16 && trecs == 3 &&
 			got_to.in4.sin_addr.s_addr == to.in4.sin_addr.s_addr,
 			"C4 the bulk thread takes exactly what was offered");
-		/* S174: the KIND travels with the batch - a replica must not
-		 * be applied as a placement move, which would make the
-		 * receiver the owner of a copy and put it in its WAL */
+		/* a replica applied as a placement move would make the receiver
+		 * the owner of a copy and put it in its WAL */
 		chk(tkind == CLBULK_KIND_REPLICA,
 			"C4 and the batch's kind arrives with it");
 		free(taken);
 		clbulk_done(&B);
-		/* S178: oldest first, so the peer whose batch was offered
-		 * first is served first - and every batch keeps its OWN kind
-		 * and destination, or a replica would be applied as a
-		 * placement move */
+		/* oldest first, and every batch keeps its OWN kind and destination */
 		chk(clbulk_take(&B, &taken, &tlen, &trecs, &tkind, &got_to) == 1 &&
 			taken == b2 && trecs == 9 && tkind == CLBULK_KIND_MIGRATE,
 			"C5 the next take is the SECOND batch, with its own kind");

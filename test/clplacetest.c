@@ -1,18 +1,5 @@
-/*
- * clplacetest.c — weighted rendezvous placement (step 4).
- *
- * The property that decides whether this can ship at all is the first
- * one: with uniform weights it must select IDENTICALLY to the plain
- * unweighted rendezvous the fleet uses today - not similarly, not
- * mostly.  If that holds, a map published with uniform weights moves no
- * data and the migration is opt-in.  If it does not, switching
- * placement on relocates the entire keyspace.
- *
- * It is asserted against an independent unweighted implementation here,
- * rather than by trusting the algebra in the header.
- *
- * Build: cc -o clplacetest test/clplacetest.c src/clplace.o src/clmap.o
- */
+/* clplacetest.c - weighted rendezvous placement: with uniform weights it selects IDENTICALLY to
+ * plain rendezvous, so a uniform map moves no data - checked against an independent reference. */
 #include <stdio.h>
 #include <string.h>
 
@@ -86,11 +73,7 @@ static void sort3(uint16_t *a)
 	}
 }
 
-/* what placement actually hands pc_clplace_owner(): a Redis slot.
- * This used to call pc_clplace_keyhash(), an FNV-1a that S44 left with
- * no production caller - so these assertions were exercising an input
- * the fleet never produces.  The slot has a far smaller range, which is
- * the point: it is what the daemon and every Redis client compute. */
+/* placement hands pc_clplace_owner() a Redis slot, what the daemon and every client computes */
 static uint64_t kh_of(int i)
 {
 	char k[32];
@@ -184,9 +167,8 @@ int main(void)
 			if (pc_clplace_owner(&A, kh) != pc_clplace_owner(&B, kh))
 				moved++;
 		}
-		/* only keys whose argmax became the new node should move:
-		 * about 1/9 = 11%.  Anything near 100% means the function is
-		 * not rendezvous at all. */
+		/* only keys whose argmax became the new node move: about 1/9;
+		 * near 100% means the function is not rendezvous */
 		CHK(moved > 20000 * 6 / 100 && moved < 20000 * 17 / 100,
 			"adding 1 node to 8 moved %d of 20000 keys (%d%%), "
 			"expected ~11%%", moved, moved * 100 / 20000);
@@ -223,13 +205,8 @@ int main(void)
 		"rank invented %d nodes from a 2-node map - an EC write must "
 		"fail to place rather than place badly", n);
 
-	/* ---- 7. GOLDEN VECTORS: the hash and the mix must not move -
-	 * These are computed independently from the algorithms cluster.c
-	 * uses, and hard-coded.  Without them the migration check above is
-	 * self-referential: its reference implementation calls the same
-	 * mix, so changing the mix moves BOTH sides together and the test
-	 * stays green while every key in the fleet relocates.  Caught by
-	 * breaking the mix and watching nothing fail. */
+	/* ---- 7. GOLDEN VECTORS: the migration check's reference calls the same mix, so a
+	 * changed mix would move both sides and stay green */
 	/* the key->slot half of the contract is pinned in slottest, against
 	 * Redis's own published vectors; the mix is pinned here. */
 	CHK(pc_key_slot("foo", 3) == 12182,
@@ -244,10 +221,8 @@ int main(void)
 	CHK(pc_clplace_mix(0x674C5FBB8347611Eull, 0x7F000001u, 17501) ==
 		0x75B5004FCEA5D813ull, "the node mix changed");
 
-	/* ---- 8. the tie-break, which real hashes never exercise ----
-	 * Two nodes at the same address and port score identically, so the
-	 * only thing separating them is the id.  Without it two nodes could
-	 * answer differently for the same key depending on map order. */
+	/* ---- 8. the tie-break: two nodes at one address and port score identically, and
+	 * only the id keeps the answer independent of map order */
 	{
 		static struct pc_clmap T;
 		uint16_t o1, o2;
@@ -464,11 +439,8 @@ int main(void)
 		CHK(!pc_clplace_has(NULL, known),
 			"a NULL map claims to know a node");
 
-		/* the distinction that matters: in_set() answers 0 for BOTH,
-		 * and a caller that DELETES on that 0 removes a node's own
-		 * records whenever the published map predates its id.  Find
-		 * a key this node does not hold at K=1, so both calls are 0
-		 * for genuinely different reasons. */
+		/* in_set() answers 0 for both, and a caller that DELETES on that 0 removes
+		 * a node's own records whenever the published map predates its id */
 		{
 			int i2, found = 0;
 

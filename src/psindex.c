@@ -5,7 +5,7 @@
 #include <string.h>
 
 #include "psindex.h"
-#include "resident.h"                   /* S265 */
+#include "resident.h"
 
 #define FNV_BASIS 2166136261u
 #define FNV_PRIME 16777619u
@@ -13,14 +13,8 @@
 #define LOAD(x)      __atomic_load_n(&(x), __ATOMIC_ACQUIRE)
 #define STORE(x, v)  __atomic_store_n(&(x), (v), __ATOMIC_RELEASE)
 
-/* ---- glob ------------------------------------------------------------------
- * Written for this engine, not ported.  Iterative with ONE backtrack point:
- * every token but '*' consumes exactly one byte, so when a later token
- * fails only the most recent '*' needs to take one more byte - an earlier
- * star taking more could only hand the rest a later start, which the most
- * recent star already covers.  Work is at most pattern x string, with no
- * recursion.  (The first engine's recursive matcher was exponential in '*'
- * and read past an open set; see CHANGELOG, SECURITY.) */
+/* glob with ONE backtrack point: every token but '*' takes one byte, so only the
+ * most recent '*' need take more - at most pattern x string work, no recursion */
 
 /* the set at p[i] == '[': is byte c in it, and the index past it (past its
  * ']', or the pattern's end when it is left open) */
@@ -125,8 +119,6 @@ size_t psi_literal_prefix(const char *p, size_t n)
 	return i;
 }
 
-/* ---- hashing ------------------------------------------------------------ */
-
 static uint32_t fnv(const char *s, size_t n, uint32_t h)
 {
 	size_t i;
@@ -158,8 +150,6 @@ static void node_key(const struct psi_table *t, const char *name, size_t nlen,
 	}
 }
 
-/* ---- the table ---------------------------------------------------------- */
-
 int psi_init(struct psi_table *t, unsigned nbuckets, unsigned flags)
 {
 	unsigned nb = 16;
@@ -170,7 +160,7 @@ int psi_init(struct psi_table *t, unsigned nbuckets, unsigned flags)
 	t->b = calloc(nb, sizeof *t->b);
 	if (!t->b)
 		return -1;
-	pc_touch_pages(t->b, nb * sizeof *t->b);          /* S265 */
+	pc_touch_pages(t->b, nb * sizeof *t->b);
 	t->nb = nb;
 	t->flags = flags;
 	return 0;
@@ -189,7 +179,7 @@ static int grow(struct psi_table *t)
 	unsigned nb = t->nb << 1, i;
 	struct psi_node **nbk = calloc(nb, sizeof *nbk);
 
-	pc_touch_pages(nbk, nb * sizeof *nbk);            /* S265 */
+	pc_touch_pages(nbk, nb * sizeof *nbk);
 
 	if (!nbk)
 		return -1;

@@ -1,25 +1,5 @@
-/*
- * clspreadtest.c - spread's decisions, with nothing of cluster.c linked
- * (M17, wave 4).
- *
- * Every one of these was learned from a fleet losing records or
- * crying wolf, and until now only a fleet could check them:
- *   - reclaim on a LOCAL view of the set: a returning node went 64 -> 25
- *     records and the fleet to 207 of 240 owed (29c989e) - so settled
- *     requires the shared map, covering the fleet, listing us;
- *   - settled for one tick is not settled: the drops raced the hand-off;
- *   - a fingerprint that hashed the node id armed the repair INSIDE the
- *     purge grace, because peer_gone zeroes the id;
- *   - the replicas-short warning must hold before it is believed, or a
- *     flapping peer turns it into a log writer.
- *
- * Links the REAL clspread.o and clplace.o (the map lookup).  Placement
- * itself (pc_spread_in_set, pc_spread_set_live) is a stand-in: what is
- * pinned is what the reclaim verdict does with its answers, not the
- * answers - clworktest and clplacetest have those.
- *
- * Build: see the Makefile's clspreadtest target.
- */
+/* clspreadtest.c - spread's reclaim, hold, fingerprint and replicas-short decisions on the real
+ * clspread.o and clplace.o; placement's answers are stood in (clworktest and clplacetest own them). */
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -97,7 +77,7 @@ int main(void)
 	p7 = add(7, 7, NOW - 10);
 	map(3, fleet);
 
-	/* ---- settled: the shared map, or nothing --------------------------- */
+	/* ---- settled: the shared map, covering the fleet and listing us, or nothing ---- */
 	chk(settled() == 1, "settled: K, no grace, a map of the whole fleet listing us, peers clean");
 	chk(clspread_settled(2, 0, NULL, 42, &PT, 0, NOW) == 0,
 		"NO USABLE MAP: not settled - a local view of the set never reclaims (29c989e)");
@@ -145,7 +125,7 @@ int main(void)
 	memset(p5->backfill, 0, sizeof p5->backfill);
 	memset(p5->repl_cursor, 0, sizeof p5->repl_cursor);
 
-	/* ---- the hold ------------------------------------------------------- */
+	/* ---- the hold: settled for one tick is not settled ---- */
 	{
 		unsigned int sf = 0, cur = 77;
 		int i, early = 0;
@@ -160,7 +140,7 @@ int main(void)
 			"one unsettled reading: nothing, the count and the walk start over");
 		for (i = 0, early = 0; i < CLSPREAD_SETTLE_TICKS - 1; i++)
 			early += clspread_hold(&sf, &cur, 1);
-		chk(early == 0 && clspread_hold(&sf, &cur, 1) == 1, "  and it takes ten again");
+		chk(early == 0 && clspread_hold(&sf, &cur, 1) == 1, "  and it takes the whole hold again");
 	}
 
 	/* ---- the reclaim verdict -------------------------------------------- */
@@ -190,7 +170,7 @@ int main(void)
 		chk(asked_live == 0, "  a holder's verdict does not need the set's liveness");
 	}
 
-	/* ---- the set fingerprint ------------------------------------------- */
+	/* ---- the set fingerprint: a gone peer's zeroed id must not arm the repair ---- */
 	{
 		unsigned long long fp = clspread_set_fp(&PT, NOW), fp5;
 		static struct clpeers one;   /* a table is large: not on the stack */
@@ -219,7 +199,7 @@ int main(void)
 		chk(clspread_set_fp(&one, NOW) == 0, "no peers: 0");
 	}
 
-	/* ---- replicas short -------------------------------------------------- */
+	/* ---- replicas short: held before it is believed, so a flapping peer stays quiet ---- */
 	{
 		struct clspread_short s = CLSPREAD_SHORT_INIT;
 		int ev[6], i;

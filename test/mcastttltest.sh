@@ -1,24 +1,6 @@
 #!/bin/sh
-# mcastttltest.sh - S291: [cluster] multicast_ttl lets a fleet span a
-# multicast router.
-#
-# Two nodes on two segments, a Linux multicast router between them - three
-# network namespaces, two veth pairs, smcrouted forwarding the cluster
-# group statically both ways and the kernel forwarding unicast:
-#
-#   A (10.251.1.2) --- R (10.251.1.1 | 10.251.2.1) --- B (10.251.2.2)
-#
-#   1  multicast_ttl = 2: the router forwards the cluster plane, and the
-#      two nodes form one fleet (each sees the other)
-#   2  multicast_ttl = 1 (the default): nothing crosses the router, and
-#      each stays alone - the documented one-segment behaviour
-#   3  ttl 2, the router restarted (2 s down): both stay members, no
-#      silent purge - beats survive a router restart inside the dead-node
-#      margins (6 s)
-#
-# Needs root, ip netns and smcroute (smcrouted); SKIPs loudly without
-# them - a skip is NOT a pass.
-# Usage: test/mcastttltest.sh [./perfcached]
+# mcastttltest.sh - [cluster] multicast_ttl = 2 lets a fleet span a multicast router (netns + smcrouted)
+# and survive its restart; ttl 1 does not cross.  Needs root, else SKIP.  Usage: test/mcastttltest.sh [./perfcached]
 set -u
 BIN=$(readlink -f "${1:-./perfcached}")
 if [ "$(id -u)" != 0 ] || ! command -v ip >/dev/null 2>&1 ||
@@ -124,7 +106,7 @@ router_up
 
 echo "--- 1: multicast_ttl = 2 across the router"
 start 2
-if both_see 20; then
+if both_see 40; then          # 20 s ran out under ASan with three pipelines on the runners (113384)
 	ok "the two segments form one fleet (each node sees the other)"
 else
 	bad "no fleet across the router (A sees $(peers $A), B sees $(peers $B))"

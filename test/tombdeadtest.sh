@@ -1,26 +1,6 @@
 #!/bin/sh
-# tombdeadtest.sh - S473: a hole in the deletes of an origin's run that is over.
-#
-# Only the origin, in that run, may floor a member's mark (S463).  Restart it
-# with the member still short - AR13 on 0.7.4.4-rc6: 245 floored up to 72 of 246's
-# 1,492 when 246 restarted - and nothing can move the mark: the peers keep no
-# copies past their time rule, so cluster.acks_stuck stays up for good, and a key
-# whose delete was in the hole stays on the member.  Three eager unicast nodes;
-# node 1 the master (the highest address), node 2 under netcutshim, node 3 never
-# restarts; the peers re-send no copies (a test flag, for that rule's 10 s tick):
-#   1. node 2, cut from node 3 for a second, deletes 200 of 300 keys; node 1
-#      takes them
-#   2. healed, one more delete tells node 3 of the hole, and node 2 is killed
-#      before node 3 asks; restarted, it is a new run
-#   3. the mark reaches the head, floored by node 3 itself (gap_dead)
-#   4. node 3 holds none of the 201 deleted keys and all 99 that live, with no
-#      resync; node 1 holds none: nothing came back to it
-#   5. no cluster.acks_stuck is left on any node
-# GitLab 112775: past that rule was a race, node 1 resent all 200 in 2 of 3 runs;
-# 112785: with the flag on gap asks alone, its 10 s catch-up closed the hole.
-# Fail-first (GitLab 112769, both builds): the mark 0 of 201 after 120 s, 13 asks, 0
-# resent, node 3 holding 200 of the 201 deleted keys, acks_stuck on nodes 1 and 2.
-# Usage: test/tombdeadtest.sh [./perfcached] [./netcutshim.so]
+# tombdeadtest.sh - a hole in the deletes of an origin's run that is over: a member floors its own mark
+# (gap_dead), drops the deleted keys without a resync, and no acks_stuck is left.
 set -u
 BIN=${1:-./perfcached}
 SHIM=${2:-./netcutshim.so}
@@ -120,21 +100,22 @@ PY
 }
 stuck() { st "$1" '[a["key"] for a in (r.get("alerts") or {}).get("active", []) if a["key"] == "cluster.acks_stuck"]'; }
 start 1; ready 1 1 || { bad "node 1 did not start: $(tail -2 "$D/n1.log" | tr '\n' ' ')"; done_; }
+# node 1 founds alone first: the founder is the lowest identity heard, not the highest address
+k=0; while [ $k -lt 150 ] && [ "$(st 1 'c.get("role")')" != master ]; do sleep 0.2; k=$((k+1)); done
 T0=$(date +%s)
-sleep 1
 start 2; start 3
 ready 2 1 && ready 3 1 || { bad "the members did not start"; done_; }
 k=0; while [ $k -lt 150 ] && { [ "$(st 3 'c.get("peers_up")')$(st 2 'c.get("peers_up")')" != 22 ] || [ "$(st 3 'c["acks"]["fleet"]["confirming"]')" != True ]; }; do sleep 0.2; k=$((k+1)); done
 [ "$(st 3 'c.get("peers_up")')" = 2 ] && [ "$(st 1 'c.get("role")')" = master ] \
 	|| { bad "the fleet did not form with node 1 master: node 1 $(st 1 'c.get("role")'), node 3 peers $(st 3 'c.get("peers_up")')"; done_; }
-# the pass's drops need a witness: a peer up 30 s before node 2's restart (S223)
+# the pass's drops need a witness: a peer up 30 s before node 2's restart
 w=$((33 - $(date +%s) + T0)); [ $w -gt 0 ] && sleep $w
 k=0; while [ $k -lt 75 ]; do [ "$(ops 1 set 0 1)" = 1 ] && break; sleep 0.2; k=$((k+1)); done
 S=$(ops 1 set 0 300)
 k=0; while [ $k -lt 100 ] && [ "$(held 3 0 300)" != 300 ]; do sleep 0.2; k=$((k+1)); done
 [ "$S" = 300 ] && [ "$(held 3 0 300)" = 300 ] || { bad "setup: node 1 took $S of 300, node 3 holds $(held 3 0 300)"; done_; }
-# 1
-echo "cut 127.0.161.3" > "$D/cut2"
+# 1. node 2, cut from node 3 for a second, deletes 200 of 300 keys; node 1 takes them
+echo "cut 127.0.161.3 rst" > "$D/cut2"
 sleep 0.3
 DEL=$(ops 2 del 0 200)
 [ "$DEL" = 200 ] || bad "1. node 2 took $DEL of the 200 deletes"
@@ -142,7 +123,8 @@ sleep 1
 H3=$(held 3 0 200)
 [ "$H3" = 200 ] && ok "1. node 2 deleted 200 of 300, cut from node 3, which still holds all 200" \
 	|| { bad "1. node 3 holds $H3 of the 200: the cut let them through, or a read pulled"; done_; }
-# 2: killed before node 3's first ask (GAP_WAIT_MS 500)
+# 2. healed, one more delete tells node 3 of the hole; node 2 is killed before node 3's first ask
+# (GAP_WAIT_MS 500) and restarts as a new run
 : > "$D/cut2"
 sleep 0.2
 python3 - "$P2" <<'PY'
@@ -154,7 +136,7 @@ os.kill(int(sys.argv[1]), signal.SIGKILL)
 PY
 wait "$P2" 2>/dev/null
 start 2; ready 2 2 || { bad "2. node 2 did not restart: $(tail -2 "$D/n2.log" | tr '\n' ' ')"; done_; }
-# 3
+# 3. the mark reaches the head, floored by node 3 itself (gap_dead)
 HOLE=
 k=0; while [ $k -lt 50 ]; do
 	HOLE=$(st 3 '[(m["origin"], m["incarn"], m["confirmed"], m["hi"]) for m in c["acks"]["marks"] if m["confirmed"] < m["hi"]]')
@@ -174,7 +156,8 @@ done
 [ "$L" = 0 ] && [ "$(st 3 'c["acks"].get("gap_dead", 0)')" -ge 1 ] 2>/dev/null \
 	&& ok "3. node 3 floored the run that was over itself, after $((k / 2)) s (gap_dead $(st 3 'c["acks"].get("gap_dead")'))" \
 	|| bad "3. node 3's mark still short after $((k / 2)) s: $(st 3 '[(m["confirmed"], m["hi"]) for m in c["acks"]["marks"] if m["confirmed"] < m["hi"]]'), gap_dead $(st 3 'c["acks"].get("gap_dead")'), asked $(st 3 'c["acks"]["gap_asked"]'), node 1 resent $(st 1 'c["acks"]["gap_resent"]')"
-# 4: the pass opens at a beat, so what says it ran is its drops
+# 4. node 3 holds none of the 201 deleted keys and all 99 live, without a resync; the pass opens at
+# a beat, so what says it ran is its drops
 k=0; while [ $k -lt 120 ] && [ "$(st 3 'c.get("reconciled", 0)')" -lt 200 ] 2>/dev/null; do sleep 0.5; k=$((k+1)); done
 k=0; while [ $k -lt 240 ] && { [ "$(st 3 'c.get("reconcile_open")')" != False ] || [ "$(st 3 'c.get("reconcile_pending")')" != 0 ]; }; do sleep 0.5; k=$((k+1)); done
 G3=$(held 3 0 201); K3=$(held 3 201 300); G1=$(held 1 0 201)
@@ -184,7 +167,7 @@ G3=$(held 3 0 201); K3=$(held 3 201 300); G1=$(held 1 0 201)
 [ "$(st 3 'c.get("resyncs")')" = 0 ] && [ "$(st 3 'r.get("state")')" = ready ] \
 	&& ok "4. no resync: node 3 stayed ready" \
 	|| bad "4. node 3: resyncs $(st 3 'c.get("resyncs")'), state $(st 3 'r.get("state")')"
-# 5
+# 5. no cluster.acks_stuck is left on any node
 k=0; while [ $k -lt 200 ]; do
 	[ "$(stuck 1)$(stuck 2)$(stuck 3)" = "[][][]" ] && break
 	sleep 0.5; k=$((k+1))

@@ -1,25 +1,6 @@
 #!/bin/sh
-# rebuildfloortest.sh - S463 x S455: a rebuild a floor asks for is not an
-# absence, and never S455's resync.
-#
-# THE BUG.  An origin asked for deletes it no longer holds floors the
-# member's mark and asks it to rebuild with the age 0xffffffff - "every
-# record".  The member took the age as an absence: ~4,294,967 s, past
-# resync_after_s, so S455 dropped every record in question and pulled the
-# fleet's whole state - the node back to RECOVERING after it had said
-# ready, requests refused meanwhile.  AR13 on 0.7.4.4-rc1 (245-247): after
-# both kills of 245 and both clean restarts of 246 under a delete stream.
-#
-# Two eager nodes, resync_after_s 20; node 2 holds node 1's 100 keys, node 1
-# up 32 s (a resync source); clinject plays a member (its ALIVE) and sends
-# node 2 one rebuild ask.  Its ALIVE says no start kind, so the reconcile
-# waits until it stops counting as live (10 s).  A fresh fleet per arm:
-#   A. the age 25 s, past resync_after_s - the premise: S455 resyncs node 2
-#   B. the age 0xffffffff, a floor's - node 2 takes the rebuild, does not
-#      resync in as long as A took and more, stays ready, keeps all 100 keys
-# Fail-first (GitLab 112573, without the fix): A resynced after 7 s; B took the
-# ask for ~4,294,967 s away, resynced, and went ready -> recovering.
-# Usage: test/rebuildfloortest.sh [./perfcached] [./clinject]
+# rebuildfloortest.sh - a rebuild a floor asks for (age 0xffffffff) is not an absence: the member
+# takes it without a resync and stays ready.  Usage: test/rebuildfloortest.sh [./perfcached] [./clinject]
 set -u
 T=$(cd "$(dirname "$0")" && pwd)
 PYTHONPATH=$T${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH

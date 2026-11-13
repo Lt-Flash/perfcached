@@ -1,27 +1,6 @@
 #!/bin/sh
-# dashtest.sh - DESIGN 12no (0.6.6, S407/S409): perfcached-dashboard serves
-# the status page from its own process, over libperfd, for a two-member
-# fleet with a write-through collection on fakes (test/fakeupstream.py).
-#
-#  1. the page: GET / is the daemon's page byte for byte, under the SAME
-#     Content-Security-Policy the daemon computes (the script's SHA-256)
-#  2. the trees: /stats, /members, /clients are the selected member's;
-#     ?node=N selects; /session names the tool and both members
-#  3. the gates: a POST without the custom header is refused (403), a
-#     non-JSON content type (415), a body over body_max (413), an unknown
-#     route (404), another method (405); a wrong enable secret is 401 and
-#     lockout_after of them lock the address out (429); the right secret
-#     opens a session; an action without the token is 401; over plain
-#     HTTP from another host the secret is refused (403, S468)
-#  4. the actions: check, upfill and stop reach the daemon's upfill verb,
-#     drain and drain-stop its updrain (S412 part 2)
-#     (its answer comes back; the daemon logged the raised privilege);
-#     reset-stats too; a bad op is 400
-#  5. a member that goes away is reported, the other keeps answering;
-#     TERM stops the tool cleanly
-# The browser side (the buttons, the session prompt) is the page's script,
-# which pagejstest.sh executes; this suite drives the tool with curl.
-# Usage: test/dashtest.sh ./perfcached ./perfcached-dashboard
+# dashtest.sh - perfcached-dashboard serves the page, trees, gates and actions for a two-member fleet over
+# libperfd (the page's script is pagejstest.sh's).  Usage: test/dashtest.sh ./perfcached ./perfcached-dashboard
 set -u
 BIN=${1:-./perfcached}
 DASH=${2:-./perfcached-dashboard}
@@ -109,11 +88,16 @@ node 1 $TCP1 $HTTP1
 node 2 $TCP2
 start 1 A
 start 2 B
-sleep 3.5   # the join window, the election, the first keepalives
+# a joiner is CONNECTING until its links answer: wait for both ready and seeing each other
+st() { "$(dirname "$BIN")/perfcli" -h 127.0.0.6$1 -p $2 -a dash-client-secret -q -j '{"method":"stats"}' 2>/dev/null \
+	| python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1 $TCP1)" != "ready 1" ] || [ "$(st 2 $TCP2)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
-# ---- the tool ---------------------------------------------------------------
-# S415: the first seed is dead (nobody serves $DEAD) - the second gets the
-# fleet; the session key is shared with a second instance later
+# ---- the tool: the first seed is dead (nobody serves $DEAD), the second gets the fleet; the
+# session key is shared with a second instance later
 KEY=$(python3 -c 'import os; print(os.urandom(32).hex())')
 cat > "$D/dash.conf" <<C
 [dashboard]
@@ -152,7 +136,7 @@ echo "--- 1. the page"
 req GET /
 [ "$ST" = 200 ] && ok "GET / 200" || bad "GET / $ST"
 hdr Content-Type | grep -q "text/html" && ok "text/html" || bad "content type $(hdr Content-Type)"
-# S407 part 3: the daemon serves no page; the page's bytes are pagedump's (the one object the tool links)
+# the daemon serves no page: the page's bytes are pagedump's (the one object the tool links)
 "${PAGEDUMP:-./pagedump}" > "$D/daemonpage"
 cmp -s "$D/body" "$D/daemonpage" && ok "the page is the page object's, byte for byte (pagedump)" || bad "the page differs from pagedump's"
 curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP1/" | grep -q '^410$' && ok "the daemon's GET / is 410 (the page left it)" || bad "the daemon's GET /: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP1/")"
@@ -181,9 +165,8 @@ done
 [ "$N" = 2 ] && ok "/session lists both members connected (and the dead seed)" || bad "/session lists $N connected members: $(cat "$D/body")"
 [ "$(jq1 "$D/body" "d['enabled']")" = False ] && ok "no privileged session yet" || bad "enabled before any secret"
 N1=$(jq1 "$D/body" "d['node']")
-# S410: the fleet in one answer.  10-19: one write through wt first - the
-# collection's stats then carry the write-through commands table, rows with
-# a "name" of their own ("set"), which the old scan took for collections
+# the fleet in one answer.  One write through wt first: the collection's stats then carry a
+# commands table whose rows have a "name" of their own, not to be taken for collections
 PCLI=$(dirname "$BIN")/perfcli
 "$PCLI" -h 127.0.0.61 -p $TCP1 -a dash-client-secret -q set wt fleetcols v > "$D/pcli.out" 2>&1 ||
 	bad "the write through wt for the /fleet check: $(head -c 200 "$D/pcli.out")"
@@ -197,7 +180,7 @@ BV=$("$BIN" -V | head -1 | awk '{print $2}')      # the version this tree builds
 	[ "$(jq1 "$D/body" "all(c['entries'] >= 0 for m in d['members'] if m['state']=='connected' for c in m['collections'])")" = True ] &&
 	ok "/fleet: only the collections, after a write-through - no command row taken for one, no entries -1" ||
 	bad "/fleet collections after a write-through: $(jq1 "$D/body" "[[(c['name'], c['entries']) for c in m['collections']] for m in d['members']]")"
-# 12nt TC-4: the through copies each member holds (wt has an upstream: its shadow_entries)
+# the through copies each member holds (wt has an upstream: its shadow_entries)
 [ "$(jq1 "$D/body" "all(isinstance([c for c in m['collections'] if c['name']=='wt'][0].get('copies'), int) for m in d['members'] if m['state']=='connected')")" = True ] && ok "/fleet: the through copies held per member (wt.copies)" || bad "/fleet copies: $(jq1 "$D/body" "[[c for c in m['collections'] if c['name']=='wt'] for m in d['members']]")"
 req GET /members
 [ "$(jq1 "$D/body" "len(d['members'])")" = 2 ] && ok "/members has two entries" || bad "/members: $(head -c 300 "$D/body")"
@@ -208,8 +191,7 @@ req GET "/members?node=$OTHER"
 [ "$ST" = 200 ] && [ "$(jq1 "$D/body" "[m['node'] for m in d['members'] if m.get('self')][0]")" = "$OTHER" ] && ok "?node=$OTHER reads the other member" || bad "?node=$OTHER: $ST $(head -c 200 "$D/body")"
 req GET "/stats?node=$OTHER"
 [ "$ST" = 200 ] && ok "/stats?node=$OTHER 200" || bad "/stats?node=$OTHER $ST"
-# S425 (0.7.1): a node that is not a member is refused, named - before, it fell
-# through to the default member and answered ITS figures (AR13: 30 s after a restart)
+# a node that is not a member is refused, named, not answered by the default member
 for r in stats members; do
 	req GET "/$r?node=99999"
 	[ "$ST" = 503 ] && grep -q "node 99999 is not a member" "$D/body" && ok "S425: /$r?node=99999 refused, naming it - never another node's" || bad "S425: /$r?node=99999 answered $ST $(head -c 160 "$D/body")"
@@ -241,8 +223,8 @@ done
 req POST /session -H 'X-Perfcached-Dashboard: 1' -H 'Content-Type: application/json' --data '{"secret":"dash-enable-secret"}'
 [ "$ST" = 429 ] && ok "the fourth try is locked out (429), even with the right secret" || bad "after 3 wrong: $ST"
 grep -q "locked out" "$D/dash.log" && ok "the lockout is logged" || bad "no lockout log line"
-# S416: from a trusted proxy the client is the last X-Forwarded-For address - its own counter, so
-# 127.0.0.1's lockout does not cover it, and a wrong secret from it is counted under its name
+# from a trusted proxy the client is the last X-Forwarded-For address, with its own counter, so
+# 127.0.0.1's lockout does not cover it and a wrong secret from it is counted under its name
 req POST /session -H 'X-Perfcached-Dashboard: 1' -H 'Content-Type: application/json' -H 'X-Forwarded-For: 198.51.100.7, 203.0.113.9' --data '{"secret":"wrong-secret"}'
 [ "$ST" = 401 ] && ok "a forwarded client behind the trusted proxy has its own lockout counter (401, not 429)" || bad "forwarded client: $ST"
 grep -q "203.0.113.9: enable refused" "$D/dash.log" && ok "the wrong secret is logged under the forwarded address" || bad "no log line for 203.0.113.9: $(grep 'enable refused' "$D/dash.log" | tail -1)"
@@ -261,9 +243,8 @@ grep -q "dashboard@[^ ]* raised privilege with enable" "$D/n1.log" && ok "S420: 
 req GET /session
 [ "$(jq1 "$D/body" "d['enabled']")" = True ] && ok "/session says enabled" || bad "/session not enabled"
 
-# S415: the token is a capability any instance holding the session key opens
-# - a second instance (same key) acts on it without a prompt; a third (its
-# own key) refuses it
+# the token is a capability any instance holding the session key opens: a second instance (same
+# key) acts on it, a third (its own key) refuses it
 sed -e "s/^listen = .*/listen = 127.0.0.1:$HP2/" "$D/dash.conf" > "$D/dash2.conf"
 sed -e "s/^listen = .*/listen = 127.0.0.1:$HP3/" -e "/^session_key/d" "$D/dash.conf" > "$D/dash3.conf"
 chmod 600 "$D/dash2.conf" "$D/dash3.conf"
@@ -282,8 +263,8 @@ reqp $HP2 GET /session
 reqp $HP3 POST /action $A --data '{"op":"stop","col":"wt"}'
 [ "$ST" = 401 ] && ok "instance 3 (another key) refuses the token" || bad "instance 3: $ST"
 kill -TERM $PD2 $PD3 2>/dev/null; wait $PD2 $PD3 2>/dev/null; PD2= PD3=
-# S468: plain HTTP from another host - the instance on this host's own non-loopback
-# address, so curl's source is not 127.0.0.1
+# plain HTTP from another host: the instance on this host's non-loopback address, so curl's
+# source is not 127.0.0.1
 IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
 if [ -n "$IP" ]; then
 	sed -e "s/^listen = .*/listen = $IP:$HP5/" "$D/dash.conf" > "$D/dash5.conf"; chmod 600 "$D/dash5.conf"
@@ -332,10 +313,8 @@ req POST /action $A --data '{"op":"check","col":"wt","node":99999}'
 [ "$ST" = 503 ] && grep -q "node 99999 is not a member" "$D/body" && [ "$(grep -c "check wt on node" "$D/dash.log")" = "$n0" ] && ok "S425: an action naming no member is refused and runs nowhere" || bad "S425: action on node 99999: $ST $(head -c 160 "$D/body"), action lines $n0 -> $(grep -c "check wt on node" "$D/dash.log")"
 req POST /action $A --data '{"op":"upfill","col":"wt"}'
 [ "$ST" = 200 ] || [ "$ST" = 409 ] && ok "upfill answered ($ST)" || bad "upfill: $ST $(cat "$D/body")"
-# S412 part 2: the drain sweep from the page - the daemon's updrain.  The
-# suite's collection reads through the fake master, so the sweep starts
-# (200) and is over at once; the stop then finds nothing running (409) -
-# either way the answer is the daemon's message, not the tool's
+# the drain sweep from the page is the daemon's updrain: it starts (200) and ends at once, the stop
+# then finds nothing (409); either way the answer is the daemon's message
 req POST /action $A --data '{"op":"drain","col":"wt"}'
 { [ "$ST" = 200 ] || [ "$ST" = 409 ]; } && [ -n "$(jq1 "$D/body" "d.get('drain') or d.get('error')")" ] && ok "drain answered ($ST)" || bad "drain: $ST $(cat "$D/body")"
 req POST /action $A --data '{"op":"drain-stop","col":"wt"}'
@@ -382,7 +361,7 @@ req GET /stats
 [ "$(jq1 "$D/body" "'dash-new' in [c['name'] for c in d['collections']]")" = True ] && ok "/stats lists the new collection" || bad "/stats lacks dash-new"
 req POST /ddl $A --data '{"op":"rename","col":"dash-new","to":"dash-ren"}'
 [ "$ST" = 200 ] && [ "$(jq1 "$D/body" "d['renamed']")" = True ] && ok "rename dash-new -> dash-ren" || bad "rename: $ST $(cat "$D/body")"
-# S432: map / unmap a RESP DB index from the page
+# map / unmap a RESP DB index from the page
 req POST /ddl $A --data '{"op":"map","col":"dash-ren"}'
 [ "$ST" = 400 ] && ok "map without \"index\" is 400" || bad "map without index $ST"
 req POST /ddl $A --data '{"op":"map","index":64,"col":"dash-ren"}'
@@ -446,7 +425,7 @@ req GET /stats
 [ "$ST" = 200 ] && ok "the other member still answers" || bad "survivor $ST"
 req GET /health
 [ "$ST" = 200 ] && [ "$(jq1 "$D/body" "d['connected']")" = 1 ] && ok "/health 200 with one member connected" || bad "/health after one member gone: $ST $(cat "$D/body")"
-# S415: no member at all -> 503, what a load balancer's check needs
+# no member at all -> 503, what a load balancer's check needs
 kill -9 $PA 2>/dev/null; wait $PA 2>/dev/null; PA=
 i=0
 while [ $i -lt 40 ]; do
@@ -460,6 +439,12 @@ i=0; while [ $i -lt 30 ] && kill -0 $PD 2>/dev/null; do sleep 0.1; i=$((i+1)); d
 kill -0 $PD 2>/dev/null && bad "the tool did not stop on TERM" || ok "TERM stops the tool"
 grep -q "stopped" "$D/dash.log" && ok "the tool logged its stop" || bad "no stop line"
 PD=
+
+# the built-in default of -f is the path every package installs and starts the tool with
+U=$("$DASH" -h 2>&1 | sed -n 's/^ *-f conf *\(\/[^ ]*\) by default$/\1/p')
+PK=$(cd "$T/.." && { sed -n 's/^ExecStart=.* -f \([^ ]*\).*/\1/p' contrib/perfcached-dashboard.service debian/perfcached-dashboard.service
+	sed -n 's/^cfgfile=\${cfgfile:-\(.*\)}$/\1/p' contrib/alpine/perfcached-dashboard.initd; } | sort -u)
+[ -n "$U" ] && [ "$PK" = "$U" ] && ok "the built-in config path is the packaged one: $U" || bad "built-in -f default '$U', the packages: $(echo $PK)"
 
 echo "dashtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

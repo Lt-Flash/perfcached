@@ -1,20 +1,5 @@
-/* cfgkvtest.c - the config sections (cfgcore.c, cfgcluster.c, cfgops.c;
- * the 0.7.2 split, wave 1): each section's function on its own keys - a
- * value taken into the config, one out of its range or its words
- * refused - and a key of another section answered CFG_KV_UNKNOWN, which
- * config.c turns into "unknown key".
- *
- *   A  [daemon]: allow_create's words, log_events_rate and workers by
- *      their ranges
- *   B  [memory] arena_mb; [secrets] client, up to PC_MAX_CLIENT_SECRETS;
- *      [listen] http_rate and http_cache_ms; [wal] fsync's words and
- *      segment_mb
- *   C  [cluster] port; [collection X] buckets_log2, on the section's
- *      collection, and durable (G5)
- *   D  [mail] timeout_s; [alerts] cpu_warn_pct; [upgrade] stage_mb
- *   E  every section: a key it does not know - CFG_KV_UNKNOWN, the config
- *      untouched; and parse_int's own rule - junk after the number refused
- */
+/* cfgkvtest.c - each config section's function on its own keys: a value taken, one out of range
+ * or its words refused, another section's key answered CFG_KV_UNKNOWN ("unknown key"). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,7 +33,7 @@ int main(void)
 	ps.cfg = &cfg;
 	ps.col = &col;
 
-	/* A */
+	/* A: [daemon] allow_create's words, log_events_rate and workers by their ranges */
 	CHK(kv(cfg_kv_daemon, "allow_create", "yes") == 0 && cfg.allow_create == 1 &&
 		kv(cfg_kv_daemon, "allow_create", "off") == 0 && cfg.allow_create == 0,
 		"A: allow_create yes / off");
@@ -61,7 +46,7 @@ int main(void)
 	CHK(kv(cfg_kv_daemon, "workers", "512") == 0 && cfg.workers == 512 &&
 		kv(cfg_kv_daemon, "workers", "513") == -1, "A: workers in 1..512");
 
-	/* B */
+	/* B: [memory], [secrets] client, [listen] http_rate/cache_ms, [wal] fsync/segment_mb */
 	CHK(kv(cfg_kv_memory, "arena_mb", "16") == 0 && cfg.arena_mb == 16 &&
 		kv(cfg_kv_memory, "arena_mb", "15") == -1, "B: arena_mb from 16");
 	for (n = 0, i = 0; i < PC_MAX_CLIENT_SECRETS; i++)
@@ -85,7 +70,7 @@ int main(void)
 	CHK(kv(cfg_kv_wal, "segment_mb", "1024") == 0 && cfg.wal_segment_mb == 1024 &&
 		kv(cfg_kv_wal, "segment_mb", "1025") == -1, "B: segment_mb in 0..1024");
 
-	/* C */
+	/* C: [cluster] port; [collection X] buckets_log2 and durable */
 	CHK(kv(cfg_kv_cluster, "port", "65535") == 0 && cfg.cl_port == 65535 &&
 		kv(cfg_kv_cluster, "port", "0") == -1 && kv(cfg_kv_cluster, "port", "65536") == -1,
 		"C: port in 1..65535");
@@ -97,7 +82,7 @@ int main(void)
 		kv(cfg_kv_collection, "durable", "sometimes") == -1 && col.nondurable == 0,
 		"C: [collection X] durable yes|no (G5), a third word refused");
 
-	/* D */
+	/* D: [mail] timeout_s; [alerts] cpu_warn_pct; [upgrade] stage_mb */
 	CHK(kv(cfg_kv_mail, "timeout_s", "300") == 0 && cfg.mail.timeout_s == 300 &&
 		kv(cfg_kv_mail, "timeout_s", "301") == -1, "D: [mail] timeout_s in 1..300");
 	CHK(kv(cfg_kv_alerts, "cpu_warn_pct", "80") == 0 && cfg.alerts.cpu_warn == 80 &&
@@ -106,7 +91,7 @@ int main(void)
 	CHK(kv(cfg_kv_upgrade, "stage_mb", "4096") == 0 && cfg.upgrade.stage_mb == 4096 &&
 		kv(cfg_kv_upgrade, "stage_mb", "15") == -1, "D: [upgrade] stage_mb in 16..4096");
 
-	/* E */
+	/* E: every section's unknown key - CFG_KV_UNKNOWN, config untouched; junk after a number */
 	{
 		static int (*const f[])(struct pstate *, char *, char *) = {
 			cfg_kv_daemon, cfg_kv_memory, cfg_kv_secrets, cfg_kv_listen,

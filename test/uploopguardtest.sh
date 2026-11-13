@@ -1,24 +1,6 @@
 #!/bin/sh
-# uploopguardtest.sh - S384 (0.6.1): no ring of read-throughs.  A perfcached
-# read-through upstream that is itself a perfcached (INFO server says
-# perfcached_version) is refused unless upstream_allow_perfcached = yes;
-# allowed, the fetch connection names itself (CLIENT SETNAME perfcached-
-# readthrough) and that node never reads through on its behalf - so a key
-# crosses at most one perfcached hop, and a ring (A <-> B, a node reading
-# its own door) answers a miss at once instead of bouncing until every
-# hop's timeout (single-flight is per node: across nodes it would storm).
-# Two real nodes, A and B, upstream_timeout_ms = 2000 (a ring that waited
-# would take that long):
-#  1. default: A's upstream is B - refused, "a perfcached node"; A's read
-#     answers an error; the log says why; the alert names it
-#  2. allowed: A reads B's own record (one hop); B lists A's fetcher by name
-#  3. a ring, both allowed (A -> B, B -> A), a key neither holds: nil in
-#     well under the timeout; B fetched nothing onward; both nodes warn
-#     chain.0 (read through by another perfcached) and count the reads
-#  4. A reading its own door (allowed): nil at once, one fetch, no ERROR
-#  5. config: a bad value, the key without an upstream - refused
-# Fail-first: 0.6.0.1 refuses upstream_allow_perfcached as an unknown key.
-# Usage: test/uploopguardtest.sh ./perfcached
+# uploopguardtest.sh - a perfcached upstream is refused unless allowed; allowed, a key crosses at most one
+# perfcached hop, so a ring answers a miss at once.  Usage: test/uploopguardtest.sh ./perfcached
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

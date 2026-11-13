@@ -1,16 +1,6 @@
 #!/bin/sh
-# readytest.sh - "perfcached ready" means the doors accept.
-#
-# The workers open their own SO_REUSEPORT listeners after the main thread
-# starts them, and the main thread logged "ready" without waiting: a client
-# that connected on the line could be refused.  v0.5.6 GitLab check-asan
-# (durability): waltest's client, started the moment the line appeared,
-# got "Connection refused" on a loaded runner.  slowlistenshim.so holds every
-# worker's listen() 300 ms, so the window is certain rather than a race:
-# the native, RESP and HTTP doors are dialled the instant the line appears,
-# three starts in a row, and none may refuse.
-# Fail-first: f19c4b3 refuses every time under the shim.
-# Usage: test/readytest.sh [./perfcached] [./slowlistenshim.so]
+# readytest.sh - "perfcached ready" means the doors accept: slowlistenshim.so holds every worker's
+# listen() 300 ms, and the native, RESP and HTTP doors dialled on the line must not refuse.
 set -u
 BIN=${1:-./perfcached}
 SHIM=$(readlink -f "${2:-./slowlistenshim.so}")

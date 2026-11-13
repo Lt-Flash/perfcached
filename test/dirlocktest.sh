@@ -1,18 +1,6 @@
 #!/bin/sh
-# dirlocktest.sh - S290: one daemon per state_dir and per [wal] dir.
-#
-# Before S290 two daemons pointed at the same directories - different
-# ports, a copy-pasted config - both started and both wrote the same
-# identity, WAL and snapshot.  Now each directory is locked (fcntl, held
-# for the process's life, released by the kernel when it dies).
-#
-#   1  a second daemon on the SAME directories is refused, naming the
-#      directory and the holder's pid; the first keeps serving
-#   2  a second daemon with its own state_dir but the SAME [wal] dir is
-#      refused too - the WAL is the part that corrupts
-#   3  kill -9 the holder: the next daemon on those directories starts -
-#      nothing stale is left to clear
-# Usage: test/dirlocktest.sh [./perfcached]
+# dirlocktest.sh - one daemon per state_dir and per [wal] dir (an fcntl lock for the process's life): a
+# second one is refused naming the holder's pid, and after a kill -9 the next one starts.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcdl.XXXXXX)
@@ -46,9 +34,7 @@ EOF
 	chmod 600 "$D/$1.conf"
 }
 ready() { # ready <log> -> 0 when the daemon said so (30 s: GitHub's
-	# check-standalone on v0.4.1 gave up at 10 s with the daemon still in
-	# its WAL probe and recovery on a slow-sync disk; the probe is off
-	# now as well, as in the other WAL suites)
+	# check-standalone once gave up at 10 s, mid WAL probe and recovery on a slow-sync disk)
 	i=0
 	while [ $i -lt 300 ]; do
 		grep -q "perfcached ready" "$1" 2>/dev/null && return 0

@@ -1,45 +1,6 @@
 #!/bin/sh
-# applythreadstest.sh - S217: replica apply sharded over N threads keeps
-# per-key order, loses nothing, and acks after the last record.
-#
-# One thread received, decrypted and applied every replicated record.
-# With `[cluster] apply_threads = N` the receiver keeps the socket and
-# hands each record to the thread its key hashes to, over that thread's
-# own ring - a consistent-hash exchange, not a shared queue, because
-# order per key is the correctness condition (S209).
-#
-# Two-node EAGER fleet, B the replica under test:
-#  N = 4   - a writer through A: 40 hot keys, versions v1..v300 each,
-#            interleaved, and 40 keys that alternate set/del ending set;
-#            a READER on B polling the hot keys throughout must never see
-#            a version go backwards (a value carries its own number); at
-#            the end every hot key reads v300 on B and every set/del key
-#            reads its final value; B's stats show 4 threads and every
-#            record dispatched; the eager repair SWEEP (an acked group)
-#            still completes - B answers its sync acks - measured as the
-#            sender's sweep counter moving with no loss reported.
-#  N = 1   - the same run: apply_threads = 1 is the receiver alone, and
-#            the stats say so (1 thread, 0 dispatched).  S219: these two
-#            arms are also what gates the collection being resolved ONCE
-#            - N = 1 hands apply_rec() the handle the caller looked up,
-#            N = 4 hands it NULL and it looks the handle up itself, and
-#            both must reach the same end state from the same writes.
-#  a value at the datagram ceiling (PC_MAX_FWD_VAL, 58,000 bytes; the
-#            ring's cap is 1 MB) still crosses by the push.  It was 60 KB,
-#            which is over the ceiling: the push skips it and only the
-#            sweep (bulk plane, ~10 s) carries it, and the test read it
-#            0.5 s later through a pull - which an eager miss no longer
-#            makes (S303).
-#  wedged   - ONE of B's four apply threads frozen (test/threadfreeze.c)
-#            with apply_stall_ms = 2000 and records queued on it: B says
-#            STALLED naming an apply thread (S216 sees 1/N of the keyspace
-#            stuck as it sees all of it), the other three threads keep
-#            applying, and B is READY again after the thread is released.
-# Fail-first: a daemon without S217 refuses the config key, so the N = 4
-# fleet does not start.  The order property is pinned where it can be
-# told apart - clapplytest, where round-robin dispatch is 5952 versions
-# backwards - because the table's own version check hides it here.
-# Usage: test/applythreadstest.sh [./perfcached] [./threadfreeze]
+# applythreadstest.sh - replica apply sharded over N threads (keyed, not a shared queue) keeps
+# per-key order, loses nothing, acks after the last record, and names a wedged thread STALLED.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -185,11 +146,8 @@ cb = stats(B).get("cluster") or {}
 out("THREADS", cb.get("apply_threads")); out("DISPATCHED", cb.get("apply_dispatched")); out("BLOCKS", cb.get("apply_blocks"))
 out("APPLIED", cb.get("rx_applied")); out("OLDER", cb.get("recv_older", cb.get("rx_older")))
 out("NOMEM", cb.get("recv_nomem"))
-# the ACKED path: a replica that restarts empty is backfilled in groups
-# that carry a req and want an ack - which now goes out after the LAST
-# record of the group is applied, whichever threads applied them.  The
-# sender counts what was acked (migrated_out, S200) and what was not
-# (migrate_lost, after three re-sends).
+# the acked path: a replica restarted empty is backfilled in groups acked after the
+# group's last record applies; acked ones count in migrated_out, lost in migrate_lost
 ca0 = stats(A).get("cluster") or {}
 o0 = ca0.get("migrated_out", 0); l0 = ca0.get("migrate_lost", 0)
 b.close()
@@ -255,7 +213,7 @@ if arm 1 4; then
 	[ "$(val 1 HOT_FINAL)" = "40/40" ] && [ "$(val 1 TOG_FINAL)" = "40/40" ] \
 		&& ok "every hot key ends at v300 and every set/del/set key at its final value on the replica" \
 		|| bad "final state on the replica: hot $(val 1 HOT_FINAL), set/del $(val 1 TOG_FINAL)"
-	# the premise (HG_MALLOC's lesson): a replica out of arena measures memory, not order
+	# the premise: a replica out of arena measures memory, not order
 	[ "$(val 1 NOMEM)" = 0 ] && ok "B never refused a copy for want of arena" \
 		|| bad "B refused $(val 1 NOMEM) copies for want of arena - the order checks measured memory: $(val 1 BACK_EV)"
 	[ "$(val 1 THREADS)" = 4 ] && [ "$(num "$(val 1 DISPATCHED)")" -ge 12000 ] \
@@ -263,13 +221,8 @@ if arm 1 4; then
 		|| bad "stats: threads $(val 1 THREADS), dispatched $(val 1 DISPATCHED)"
 	[ "$(val 1 BIG)" = ok ] && ok "a 58,000-byte value - the largest a datagram record can be - crosses" || bad "the 58,000-byte value did not arrive"
 	O=$(val 1 ACKED_OUT); L=$(val 1 LOST)
-	# Two roads bring a restarted replica back, and which one wins is a
-	# race the environment decides: the SENDER's backfill (REPL_MANY
-	# groups with a req, through the rings, acked after the last record)
-	# or the node's own bootstrap pull over the bulk plane (S83), which
-	# under a sanitizer's slowdown gets there first.  Either must leave
-	# every key in place and nothing lost; the acked road is asserted
-	# whenever it was the one taken.
+	# two roads bring a restarted replica back and the environment picks: the sender's acked backfill
+	# or its own bulk bootstrap pull; either must lose nothing, the acked road asserted when taken
 	ROAD=$(grep -q "bootstrapped from node" "$D/n12.log" && echo bulk || echo groups)
 	if [ "$(val 1 BACKFILLED)" = "40/40" ] && [ "${L##* }" = "${L%% *}" ] && [ "$(val 1 THREADS2)" = 4 ]; then
 		if [ "$ROAD" = groups ]; then
@@ -356,11 +309,7 @@ PY
 		[ "$(val 3 STATE1)" = stalled ] && [ "$T" -ge 1500 ] && [ "$T" -le 5000 ] \
 			&& ok "one apply thread frozen with records queued on it: B says STALLED $T ms in (limit 2000), backlog $(val 3 BACKLOG1) bytes" \
 			|| { bad "one apply thread frozen: B is '$(val 3 STATE1)' after $(val 3 STALLED_AFTER_MS) ms (backlog $(val 3 BACKLOG1))"
-			     # rc34's GitLab check-asan read STALLED 133 ms after the
-			     # writes began - before the frozen thread could have held
-			     # a record for 2 s - and two stalls; not reproduced here
-			     # (1-2 cores, a CPU hog beside it).  B's own stall lines
-			     # say which thread stalled, and when, next time:
+			     # B's own stall lines say which thread stalled, and when:
 			     grep -E "made no progress|STALLED|stalled|progress again" "$D/n32.log" | cut -c1-200 | sed 's/^/    B: /' | head -8; }
 		case "$(val 3 REASON1)" in *"cluster thread"*) ok "with the S216 reason";; *) bad "reason: '$(val 3 REASON1)'";; esac
 		grep -q "made no progress.*an apply thread with records queued" "$D/n32.log" && ok "and the log names the apply thread" || bad "the log: $(grep -m1 "made no progress" "$D/n32.log" | cut -c1-140)"

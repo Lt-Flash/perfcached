@@ -1,29 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clunk.h - the commands clients sent that this daemon does not implement
- * (S165): one bounded table of them, the frame that carries a node's
- * table to its peers, and the fold that turns every member's table into
- * one fleet list.
- *
- * A row is a NAME and how often, when and from whom it arrived - never an
- * argument.  A password sent to a misspelt command is still a password,
- * so nothing after the command (and, where the refusal is a subcommand's,
- * the subcommand) is ever copied in.  Names are hostile input: truncated
- * to CLUNK_NAME - 1 bytes and anything outside printable ASCII becomes
- * '?' before it is stored, logged or sent.
- *
- * Bounded twice over: CLUNK_ROWS distinct names, and past that the count
- * goes to `other` instead of evicting a row - a scanner spraying random
- * names cannot push the real gap off the table.  Unknowns sent before
- * AUTH are counted in `preauth` and never named: that is where port
- * scanners live.
- *
- * Pure, in the M-series sense: the caller owns every table, passes the
- * clock and the client's address, and does the logging.  The rules - the
- * cap, the sanitising, the fold's arithmetic, a frame accepted whole or
- * not at all - are cases in test/clunktest.c.
- */
+/* clunk.h - the commands clients sent that this daemon does not implement: a bounded table, its
+ * frame to peers, the fold into one fleet list.  Pure: the caller owns tables, clock, logging. */
 #ifndef PC_CLUNK_H
 #define PC_CLUNK_H
 
@@ -35,10 +13,8 @@
 #define CLUNK_ADDR    48               /* "ip:port", as CLIENT LIST shows it */
 #define CLUNK_CLIENT  24               /* CLIENT SETNAME, as obs keeps it */
 
-/* the dialect a sighting came in on; the byte in the M_UNKCMD frame.
- * S317 removed CLUNK_JSON with the JSON-RPC dialect, so CLUNK_BIN moved
- * from 2 to 1 - a frame from a 0.4.4 node would label its rows wrong,
- * which the wire epoch bump (cluster.h) keeps out of the fleet. */
+/* the dialect a sighting came in on, the byte in the M_UNKCMD frame (a renumbering needs a wire
+ * epoch bump, cluster.h) */
 enum { CLUNK_RESP, CLUNK_BIN, CLUNK_DIALECTS };
 
 struct clunk_row {
@@ -62,26 +38,19 @@ struct clunk_table {
 	struct clunk_row rows[CLUNK_ROWS];
 };
 
-/* Build the stored name: @cmd, and " " + @sub when @sub is given, each
- * upper-cased when @upper (RESP is case-insensitive, a native method
- * name keeps its case), cut to CLUNK_NAME - 1 bytes, non-printables
- * made '?'.  Returns
- * its length; @out holds CLUNK_NAME bytes. */
+/* the stored name, never an argument (a password can follow): @cmd [" " @sub], upper-cased when
+ * @upper, cut to CLUNK_NAME - 1, non-printables '?'; returns its length, @out holds CLUNK_NAME */
 size_t clunk_name(char *out, int upper, const char *cmd, size_t clen,
 		const char *sub, size_t slen);
 
-/* One sighting of an already-built @name.  Returns 1 when it made a new
- * row (the caller's cue to log a first sighting), 0 when it counted into
- * an existing one, -1 when the table was full and it went to `other`.
- * @addr and @client may be NULL. */
+/* one sighting of a built @name: 1 a new row (log a first sighting), 0 counted into one, -1 the
+ * table full, counted in `other` rather than evicting; @addr and @client may be NULL */
 int clunk_note(struct clunk_table *t, int dialect, const char *name,
 		size_t nlen, uint64_t now_s, const char *addr,
 		const char *client);
 
-/* Add @src into @dst: counts summed, the earliest first sighting, the
- * latest last one and the client that sent it; `other` and `preauth`
- * summed; a row with no room in @dst goes to its `other`.  @node names
- * the member @src belongs to (0 = this node, which is what `here` counts). */
+/* add @src into @dst: counts summed, earliest first and latest last sighting (with its client), no
+ * room to `other`; @node is @src's member (0 = this node, which is what `here` counts) */
 void clunk_fold(struct clunk_table *dst, const struct clunk_table *src,
 		int node);
 
@@ -89,15 +58,12 @@ void clunk_fold(struct clunk_table *dst, const struct clunk_table *src,
  * the order the page shows. */
 void clunk_sort(struct clunk_table *t);
 
-/* M_UNKCMD's body after the type byte: [node u16][other u64][preauth u64]
- * [n u8] then per row [dialect u8][nlen u8][name][count u64][first u64]
- * [last u64][alen u8][addr][clen u8][client].  Bytes past the last row
- * are ignored - fields are appended at the tail, as every frame here.
- * clunk_write returns the length, 0 if @cap is too small; clunk_parse
- * returns 0 and fills @node and @t, or -1 and leaves @t untouched when
- * any row is short or any length is out of bounds - all or nothing. */
+/* M_UNKCMD: [node u16][other u64][preauth u64][n u8] + n x ([dialect u8][nlen u8][name][count u64]
+ * [first u64][last u64][alen u8][addr][clen u8][client]); bytes past the last row are ignored */
 #define CLUNK_FRAME_MAX (19 + CLUNK_ROWS * (2 + (CLUNK_NAME - 1) + 24 + \
 		1 + (CLUNK_ADDR - 1) + 1 + (CLUNK_CLIENT - 1)))
+/* clunk_write: the length, 0 if @cap is too small; clunk_parse: 0 with @node and @t, or -1 and @t
+ * untouched when any row is short or any length out of bounds */
 size_t clunk_write(const struct clunk_table *t, unsigned node,
 		unsigned char *buf, size_t cap);
 int clunk_parse(const unsigned char *b, size_t n, unsigned *node,

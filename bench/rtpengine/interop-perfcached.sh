@@ -1,15 +1,9 @@
 #!/bin/sh
-# S29 proof obligation 3: does rtpengine work against perfcached?
-# See README.md.  Assumes a perfcached reachable on 127.0.0.1:6499 with
-# collections named "0" and "1" - either running locally, or tunnelled
-# from the host that has the binary:
-#     ssh -N -L 6499:127.0.0.1:6499 <daemon-host> &
-# (a Redis client cannot speak Noise, so RESP needs a plaintext
-# listener, and plaintext is loopback-only by policy).
+# does rtpengine work against perfcached (see README.md)?  Needs one on 127.0.0.1:6499 with collections
+# "0" and "1", local or tunnelled (RESP needs a plaintext listener, which is loopback-only).
 set -u
 D=$(cd "$(dirname "$0")" && pwd)
-# test/pcnative.py frames the native door's CMD requests (0.4.5: the
-# door speaks binary frames or RESP; the JSON-RPC dialect is gone)
+# test/pcnative.py frames the native door's CMD requests
 PYTHONPATH=$D/../../test${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 PP=6499
 NG=22224

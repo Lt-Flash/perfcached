@@ -1,25 +1,5 @@
-/* noisechantest.c - the client doors' Noise channel, the responder's side
- * (noisechan.c; the 0.7.2 split, wave 1), against pc_noise's own
- * initiator: a real handshake and real records, the connection's buffers
- * stubbed.
- *
- *   A  a handshake with the second of two client secrets: established,
- *      the frame consumed, message 2 staged on the wire and read by the
- *      client - whose keys then match the door's both ways; one with the
- *      cluster's secret too
- *   B  records: two in one read decrypted in order onto the input; a
- *      record cut short waits, its bytes kept; a tampered one is fatal; a
- *      length under a tag is fatal
- *   C  refusals: a plaintext binary header (S339) at once, not waited on;
- *      a handshake frame too short or too long; an unknown principal; no
- *      client secret matching; the cluster principal on a node with no
- *      cluster secret; an unknown client version.  And a frame not all
- *      read yet - 0, nothing consumed
- *   D  S468, plaintext after the handshake: asked in msg1, granted in
- *      msg2, switched by the client's first record; a replayed msg1's old
- *      switch record, or none - refused; not granted under encrypt = yes,
- *      to the cluster principal, or to a client that does not ask
- */
+/* noisechantest.c - the client doors' Noise channel, responder side (noisechan.c), against
+ * pc_noise's initiator: a real handshake and real records, the connection's buffers stubbed. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -29,7 +9,7 @@
 #include "proto.h"
 #include "protoint.h"
 
-/* S468: the records-opened counter lives in proto.c, not linked here */
+/* the records-opened counter lives in proto.c, not linked here */
 unsigned int pc_nat_bin_records, pc_nat_plain_conns, pc_nat_plain_refused;
 
 static int fails;
@@ -38,7 +18,7 @@ static int fails;
 
 /* ---- the stubs: the log, the input and output buffers ------------------- */
 int compat_log_level = L_WARN;
-/* CH-17: every line said - this test reads the refusals themselves */
+/* every line said - this test reads the refusals themselves */
 int pc_logrl_ok(int reason, const pc_addr *src) { (void)reason; (void)src; return 1; }
 static char last_log[256];
 
@@ -153,7 +133,7 @@ int main(void)
 	psk.n_client = 2;
 	psk.have_cluster = 1;
 
-	/* A */
+	/* A: handshakes with the second of two client secrets, and the cluster's: keys match */
 	fresh();
 	n = msg1(f, PC_PRIN_CLIENT, psk.client[1], PC_CLIENT_VER);
 	feed(f, n);
@@ -169,7 +149,7 @@ int main(void)
 		CHK(m == 4 && !memcmp(pt, "pong", 4), "A: the door's send key is the client's receive key");
 	}
 
-	/* B */
+	/* B: records - two in one read, in order; a cut one waits; tampered or too short: fatal */
 	n1 = record(r1, "hello ");
 	n2 = record(r2, "world");
 	feed(r1, n1);
@@ -200,7 +180,7 @@ int main(void)
 	feed(f, n);
 	CHK(channel_handshake(&c) == 1 && msg2(&st) == 0, "A: the cluster's secret, as the cluster principal");
 
-	/* C */
+	/* C: refusals - plaintext header, bad frame sizes, unknown principal, secret, version */
 	fresh();
 	f[0] = PC_BIN_MAGIC;
 	f[1] = PC_BIN_VER;
@@ -245,7 +225,7 @@ int main(void)
 	CHK(channel_handshake(&c) == -1 && strstr(last_log, "unsupported client version"),
 		"C: a client version this door does not speak - refused");
 
-	/* D */
+	/* D: plaintext after the handshake - asked in msg1, granted in msg2, then switched */
 	{
 		uint8_t pay[2] = { PC_CLIENT_VER, PC_HS_PLAIN }, m1[512], rec[64], st2[4];
 		size_t m1len = 0, sl = 0;

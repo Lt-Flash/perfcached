@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * hostmon.h - S380's host monitor (hostmon.c), for alerts.c: the minute's
- * ring and the percentages it reads, one second's readings, and the three
- * steps - pick the device, read, apply.
- */
+/* hostmon.h - the host monitor (hostmon.c) for alerts.c: the minute's ring and its
+ * percentages, one second's readings, and the steps - pick the device, read, apply. */
 #ifndef PC_HOSTMON_H
 #define PC_HOSTMON_H
 

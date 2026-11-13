@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * addrwait.c - S294: wait for a configured local address.  See addrwait.h.
- */
+/* addrwait.c - wait for a configured local address.  See addrwait.h. */
 #include <errno.h>
 #include <string.h>
 #include <time.h>

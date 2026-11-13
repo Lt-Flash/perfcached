@@ -1,18 +1,6 @@
 #!/bin/sh
-# sealbatchtest.sh - S468 B: libperfd seals once per flush, not once per
-# request.
-#
-# An async handle staged each request as a sealed record of its own, so a
-# pipeline of 32 SETs was 32 seals in the client and 32 opens in the
-# server - libsodium took 39.7% of the server's CPU on encrypted 32 B SETs
-# (OM-4, 207).  Now the plaintext waits in the handle and is sealed when the
-# buffer is pushed.  The server counts the records it opens
-# (/stats native.binary.records) beside the requests they carried
-# (native.binary.requests): one per request before, far fewer now.
-#   1. an encrypted natbench pipeline (depth 32) for 3 s: requests flowed,
-#      the counter moved (it counts), and at least 4 requests rode a record
-#      on average.
-# usage: test/sealbatchtest.sh [./perfcached] [./natbench]
+# sealbatchtest.sh - libperfd seals once per flush, not per request: an encrypted natbench pipeline
+# carries at least 4 requests per record opened.  usage: test/sealbatchtest.sh [./perfcached] [./natbench]
 set -u
 BIN=${1:-./perfcached}
 NB=${2:-./natbench}

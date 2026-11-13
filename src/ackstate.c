@@ -1,16 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * ackstate.c - 12ny AT-3b: the node's watermarks and their file.  See
- * ackstate.h.
- *
- * The file, explicit LE:
- *   u32 magic 'PCAK' | u32 ver 1 | u64 snapshot marker | u32 n
- *   n x [u64 oid][u32 incarn][u64 applied mark]
- *   u32 crc32c of everything before it
- * Written to a temp name, synced, renamed, the directory synced - the
- * snapshot's own discipline.
- */
+/* ackstate.c - the node's watermarks and their file (ackstate.h), LE: 'PCAK', ver, snapshot marker, n,
+ * n x [oid u64][incarn u32][mark u64], crc32c; temp name, sync, rename, dir sync, as the snapshot */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -32,12 +23,12 @@
 struct cap { uint64_t oid; uint32_t incarn; uint64_t mark; };
 
 static struct clack *A;
-static struct clackf *F;                   /* AT-4: under A_mx too */
+static struct clackf *F;                   /* under A_mx too */
 static pthread_mutex_t A_mx = PTHREAD_MUTEX_INITIALIZER;
 static struct cap capv[CLACK_SPACES];
 static unsigned int capn;
 static int cap_valid;
-/* AT-4: the keepalive's slice - the cluster thread's alone */
+/* the keepalive's slice - the cluster thread's alone */
 static struct cap slv[CLACK_SPACES];
 static unsigned int sln, slcur;
 

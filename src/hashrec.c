@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * hashrec.c - a Redis hash as ONE value (task S313).  See hashrec.h for
- * the record and the contract; every function here is pure.
- */
+/* hashrec.c - a Redis hash as ONE value.  See hashrec.h for the record and the contract;
+ * every function here is pure. */
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -43,10 +41,8 @@ int pc_hr_valid(const unsigned char *r, size_t n, unsigned int *count)
 	unsigned int cnt, i;
 	size_t off = PC_HR_HDR;
 
-	/* the ceiling is part of the format: every reader sizes its scratch
-	 * by PC_HR_MAX (HRANDFIELD's index array, one u32 per field), and a
-	 * record arrives here from the recover and cluster-apply paths too,
-	 * which stamp F_HASH on a value of any cell size without a look */
+	/* the ceiling is part of the format: readers size scratch by PC_HR_MAX, and the recover and
+	 * cluster-apply paths stamp F_HASH on a value of any cell size without a look */
 	if (!r || n > PC_HR_MAX || n < PC_HR_HDR || r[0] != 1 || r[1] ||
 	        r[2] || r[3])
 		return 0;

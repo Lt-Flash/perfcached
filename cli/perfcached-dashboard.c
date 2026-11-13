@@ -1,48 +1,7 @@
-/*
- * perfcached-dashboard - the status page served by its own process
- * (DESIGN 12no, S407/S409, 0.6.6).
- *
- * The page used to be served by the daemon's HTTP door, and every action
- * a dashboard might offer would have widened the daemon's largest attack
- * surface.  This tool serves the same page from a separate process: it is
- * a client of the fleet's NATIVE door through libperfd (Noise end to end,
- * one handle per member), so a dashboard under attack stalls this process
- * and no daemon.  Nothing in the daemon knows it exists.
- *
- * Routes (the page's own, so the page needs no new names):
- *   GET  /                 the page
- *   GET  /stats, /members, /clients   that node's trees as JSON, cached
- *                          cache_ms; ?node=N selects a member, the first
- *                          seed is the default
- *   GET  /session          {"tool":...,"node":N,"nodes":[...],"enabled":b}
- *   GET  /fleet            every member: version, state, install mode, the
- *                          staged builds, the collections' entries and the
- *                          through copies held (S410, 12nt TC-4)
- *                          - the page learns it is served by the tool
- *   POST /session          {"secret": enable secret} -> {"token"} after
- *                          perfd_enable on every member; wrong secrets are
- *                          counted per address and locked out
- *   POST /action           {"op": check|upfill|stop|drain|drain-stop,
- *                           "col": name, "node"}
- *                          -> the daemon's answer; needs the session token
- *   POST /reset-stats      the native reset_stats verb; needs the token
- *   POST /ddl              {"op": create|drop|resize|rename, "col", "buckets_log2",
- *                          "to", "force", "node"} -> the daemon's answer (S412)
- *   POST /stage?node=N     the body is a build (application/octet-stream,
- *                          under stage_max_mb), X-Perfcached-Version its
- *                          version, X-Perfcached-Sig (128 hex) its signature
- *                          -> the daemon's answer to upgrade_stage (S411)
- *
- * The HTTP layer is libmicrohttpd (12no, "The HTTP layer"): the parser, the
- * connection and per-address limits, the request timeout and the memory
- * bound are its options.  What is ours: every POST needs the custom header
- * X-Perfcached-Dashboard (no cross-site form can send one), a JSON body
- * under body_max, application/json; every byte rendered into JSON is
- * escaped; the page is served with the same CSP the daemon computes (the
- * SHA-256 of its one inline script).
- */
+/* perfcached-dashboard - the status page served by its own process, a libperfd client of the
+ * fleet's native door: an attack on the dashboard stalls this process and no daemon */
 #include <errno.h>
-#include <math.h>                      /* 12nx: the sketch estimate */
+#include <math.h>                      /* the sketch estimate */
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -59,11 +18,8 @@
 #include <sys/types.h>
 
 #include <microhttpd.h>
-/* libmicrohttpd 0.9.71 made the handlers' return type enum MHD_Result; the
- * releases before it (Ubuntu 20.04 ships 0.9.66) declare int.  The
- * library's own documented shim: one name for either, so the tool builds
- * against both - the 0.6.6 Ubuntu 20.04 packages went without the
- * dashboard for want of it. */
+/* libmicrohttpd 0.9.71 made the handlers' return type enum MHD_Result, older releases
+ * declare int: the library's documented shim builds against both */
 #if MHD_VERSION >= 0x00097002
 #define MHD_RESULT enum MHD_Result
 #else
@@ -85,6 +41,8 @@
 #define MAX_LOCK 64
 #define HDR_POST "X-Perfcached-Dashboard"
 #define HDR_SESSION "X-Perfcached-Session"
+/* where every package installs the config, and its units pass with -f */
+#define DASH_CONF "/etc/perfcached/perfcached-dashboard.conf"
 
 /* ---- configuration ----------------------------------------------------- */
 struct cfg {
@@ -97,7 +55,7 @@ struct cfg {
 	int cache_ms;
 	int refresh_ms;
 	int body_max;
-	int stage_max_mb;                 /* S411: a build posted to /stage */
+	int stage_max_mb;                 /* a build posted to /stage */
 	int timeout_s;
 	int lockout_after;
 	int lockout_s;
@@ -105,11 +63,11 @@ struct cfg {
 	int conn_limit;
 	int per_ip_limit;
 	int verbose;
-	unsigned char key[crypto_secretbox_KEYBYTES];  /* S415: session_key */
+	unsigned char key[crypto_secretbox_KEYBYTES];  /* session_key */
 	int key_set;
-	char trusted[MAX_SEEDS][64];      /* S416: proxies whose X-Forwarded-For is believed */
+	char trusted[MAX_SEEDS][64];      /* proxies whose X-Forwarded-For is believed */
 	int ntrusted;
-	char tls_cert[512], tls_key[512];  /* S414: PEM files; both or neither */
+	char tls_cert[512], tls_key[512];  /* PEM files; both or neither */
 };
 
 static struct cfg CF = {
@@ -146,7 +104,7 @@ static void logmsg(const char *fmt, ...)
 	fputc('\n', stderr);
 }
 
-/* host:port or [v6]:port; 0 ok - IP6-1: the one parser (src/pcaddr.c) */
+/* host:port or [v6]:port; 0 ok - the one parser (src/pcaddr.c) */
 static int parse_hostport(const char *s, char *host, size_t hcap, int *port)
 {
 	return pc_hostport_split(s, host, hcap, port);
@@ -305,8 +263,8 @@ struct member {
 	char *stats, *members, *clients;
 	long long stats_at, members_at, clients_at;
 	char err[160];
-	/* 12nx: the connection on which this member answered `sketch` with
-	 * "unknown verb" (a daemon before 0.7.1) - not asked again on it */
+	/* the connection on which this member answered `sketch` with "unknown verb"
+	 * (an older daemon) - not asked again on it */
 	perfd_t *nosk_p;
 	long long nosk_at;
 };
@@ -320,8 +278,8 @@ static struct {
 } FL = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static const char *SECRETS[2];
-static char CONN_NAME[128];            /* S420: dashboard@<host> */
-static int TLS_ON;                     /* S468: the page is served over TLS */
+static char CONN_NAME[128];            /* dashboard@<host> */
+static int TLS_ON;                     /* the page is served over TLS */
 
 static perfd_t *dial(const char *host, int port, char *err, size_t ecap)
 {
@@ -336,7 +294,7 @@ static perfd_t *dial(const char *host, int port, char *err, size_t ecap)
 	if (CF.secret[0])
 		po.secrets = SECRETS;
 	po.name = CONN_NAME;
-	po.encrypt = 1;                  /* S468: it raises privilege with enable */
+	po.encrypt = 1;                  /* it raises privilege with enable */
 	p = perfd_connect(host, port, &po);
 	if (!p)
 		snprintf(err, ecap, "%s", perfd_error(NULL));
@@ -389,7 +347,8 @@ static void member_drop(struct member *m, const char *why)
 		perfd_free(m->p);
 		m->p = NULL;
 	}
-	snprintf(m->err, sizeof m->err, "%s", why ? why : "lost");
+	if (why != m->err)                 /* already said: an overlapping snprintf is undefined */
+		snprintf(m->err, sizeof m->err, "%s", why ? why : "lost");
 	free(m->stats); free(m->members); free(m->clients);
 	m->stats = m->members = m->clients = NULL;
 	m->stats_at = m->members_at = m->clients_at = 0;
@@ -398,10 +357,8 @@ static void member_drop(struct member *m, const char *why)
 static const char *member_tree(struct member *m, int which);
 static int jget(const char *body, const char *key, char *out, size_t cap);
 
-/* the members tree a connected member answers names every member with
- * "addr", "port", "node" in that order and "self" on its own entry (the
- * daemon's pc_members_tree); the entries are read in that order, so a full
- * JSON parser is not carried for them */
+/* a members tree names every member with "addr", "port", "node" in that order and "self"
+ * on its own entry (pc_members_tree), so they are read in order without a full JSON parser */
 static void learn_from(struct member *src, const char *json)
 {
 	const char *p = json;
@@ -506,20 +463,16 @@ static struct member *member_by_node(int node)
 {
 	int i;
 
-	/* S425 (AR13, 2026-10-20): a node ASKED for is that node or none.  A
-	 * member the list does not hold now (it left, it is restarting, it
-	 * never was) fell through to the default below: /stats?node=676
-	 * answered 245's stats for 30 s after 246 restarted, and an action
-	 * naming a node would have run on another */
+	/* a node ASKED for is that node or none: the default below would show another
+	 * node's figures, and run an action naming a node on another */
 	if (node > 0) {
 		for (i = 0; i < FL.n; i++)
 			if (FL.m[i].node == node)
 				return &FL.m[i];
 		return NULL;
 	}
-	/* the default: the first seed that answers, then any member that
-	 * does (S415: a dead first seed must not be the page's node), then
-	 * the first seed so the error names it */
+	/* the default: the first seed that answers, then any member that does (a dead
+	 * first seed must not be the page's node), then the first seed so the error names it */
 	for (i = 0; i < FL.n; i++)
 		if (FL.m[i].seed && FL.m[i].p)
 			return &FL.m[i];
@@ -586,16 +539,8 @@ static void note_success(const char *addr)
 	l->until = 0;
 }
 
-/* S415: stateless sessions.  A token is a secretbox, under the instances'
- * shared session_key (a random key from this start when none is
- * configured), of
- *     expiry (8 bytes, unix seconds, big-endian) || the enable secret
- * so any instance holding the key opens it, learns the secret, raises
- * privilege on its own handles once (adopt_secret) and acts: the browser
- * holds the capability, the servers hold nothing, and a load balancer in
- * front of several dashboards needs no stickiness.  Rendered as hex,
- * nonce || box.  Not renewed on use: the page gets 401 at expiry and asks
- * for the secret again. */
+/* stateless sessions: a token is hex nonce || secretbox(expiry (8 bytes, unix s, BE) || the
+ * enable secret) under the shared session_key, so any instance opens it - no stickiness */
 #define SECRET_MAX 256
 #define TOKEN_BIN_MAX (crypto_secretbox_NONCEBYTES + crypto_secretbox_MACBYTES + 8 + SECRET_MAX)
 #define TOKEN_MAX (2 * TOKEN_BIN_MAX + 1)
@@ -735,9 +680,8 @@ static void sb_jstr(struct sb *b, const char *s)
 			sb_put(b, e, 2);
 		} else if (c < 0x20 || c == 0x7f || c == '<' || c == '>' ||
 		           c == '&') {
-			/* control bytes, and the HTML-significant three: the page
-			 * escapes what it renders, but a JSON body that is never
-			 * HTML-active costs nothing more */
+			/* control bytes, and the HTML-significant three: a JSON
+			 * body that is never HTML-active costs nothing more */
 			sb_fmt(b, "\\u%04x", c);
 		} else {
 			sb_put(b, (const char *)&c, 1);
@@ -746,10 +690,8 @@ static void sb_jstr(struct sb *b, const char *s)
 	sb_put(b, "\"", 1);
 }
 
-/* the value of "key" in a flat JSON object body: a string (unescaped into
- * @out) or a number; 1 found, 0 absent, -1 malformed.  The bodies this
- * tool accepts are three keys deep at most, so a full parser is not
- * carried for them. */
+/* the value of "key" in a flat JSON body: a string (unescaped into @out) or a number; 1 found,
+ * 0 absent, -1 malformed - bodies are three keys deep at most, so no full parser */
 static int jget(const char *body, const char *key, char *out, size_t cap)
 {
 	char pat[80];
@@ -825,9 +767,8 @@ static int jget(const char *body, const char *key, char *out, size_t cap)
 /* ---- responses --------------------------------------------------------- */
 static char PAGE_CSP[512];
 
-/* the daemon's rule (proto.c): script-src is the SHA-256 of the page's one
- * inline <script>, so an injected script does not run; connect-src keeps
- * the page talking to this tool only */
+/* the daemon's rule (proto.c): script-src is the SHA-256 of the page's one inline <script>,
+ * so an injected script does not run; connect-src keeps the page talking to this tool only */
 static void csp_build(void)
 {
 	const char *pg = pc_status_page;
@@ -912,10 +853,8 @@ static void client_addr(struct MHD_Connection *c, char *out, size_t cap)
 	} else if (sa->sa_family == AF_INET6)   /* no %scope: matched to trusted */
 		inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr,
 			out, (socklen_t)cap);
-	/* S416: behind a trusted proxy the client is the LAST address the
-	 * proxy appended to X-Forwarded-For (the one it saw itself; earlier
-	 * entries are whatever the client sent) - so the lockout counts per
-	 * browser, not per proxy.  Any other peer's header is ignored. */
+	/* behind a trusted proxy the client is the LAST X-Forwarded-For entry (the one the
+	 * proxy saw), so the lockout counts per browser; any other peer's header is ignored */
 	for (i = 0; i < CF.ntrusted; i++)
 		if (!strcmp(CF.trusted[i], out)) {
 			const char *xff = MHD_lookup_connection_value(c,
@@ -938,7 +877,7 @@ static void client_addr(struct MHD_Connection *c, char *out, size_t cap)
 		}
 }
 
-/* S468: the socket's own peer (never X-Forwarded-For) is this host */
+/* the socket's own peer (never X-Forwarded-For) is this host */
 static int peer_loopback(struct MHD_Connection *c)
 {
 	const union MHD_ConnectionInfo *ci = MHD_get_connection_info(c,
@@ -967,7 +906,7 @@ static int node_arg(struct MHD_Connection *c)
 	return v ? atoi(v) : 0;
 }
 
-/* S425: no member for a request - the node asked for named, so the page
+/* no member for a request - the node asked for named, so the page
  * says that node is away instead of showing another's figures */
 static MHD_RESULT no_member(struct MHD_Connection *c, int node)
 {
@@ -1007,9 +946,8 @@ static MHD_RESULT route_tree(struct MHD_Connection *c, int which)
 	return rc;
 }
 
-/* S410: the collections of one member's stats as [{"name","entries"}] -
- * a scan of the JSON text, which lists each collection as an object whose
- * "name" comes first and "entries" follows */
+/* the collections of one member's stats as [{"name","entries"}]: a scan of the JSON
+ * text, where each collection is an object with "name" first and "entries" after */
 /* the end of the JSON array that starts at @p (which points at its '['):
  * brackets counted, strings skipped; NULL when unterminated */
 static const char *json_array_end(const char *p)
@@ -1036,12 +974,8 @@ static const char *json_array_end(const char *p)
 	return NULL;
 }
 
-/* the value after "key": at the TOP level of the JSON object [o, oe] (o at
- * its '{'): a nested object's key of the same name is not it.  The
- * collections carry nested tables whose rows have a "name" of their own -
- * the write-through commands ("set", "json.set") - and a scan for any
- * "name" took each row for a collection: the fleet table grew a column per
- * command, its entries -1 (10-19, 245-247). */
+/* the value after "key": at the TOP level of the object [o, oe] (o at its '{'), since
+ * a collection's nested rows (the write-through commands) carry a "name" of their own */
 static const char *obj_top_key(const char *o, const char *oe, const char *key)
 {
 	size_t kl = strlen(key);
@@ -1099,10 +1033,8 @@ static void sb_collections(struct sb *b, const char *stats)
 			sb_fmt(b, "%s{\"name\":", any ? "," : "");
 			sb_jstr(b, name);
 			sb_fmt(b, ",\"entries\":%lld", ent ? atoll(ent) : -1LL);
-			/* 12nt TC-4: the through copies this member holds for the
-			 * collection (its upstream's shadow), when it has an upstream -
-			 * the fleet view sums them per collection: one per key in
-			 * shard, K per key in spread, one per member in eager */
+			/* the through copies this member holds (its upstream's shadow): one
+			 * per key in shard, K per key in spread, one per member in eager */
 			sh = NULL;
 			{
 				const char *x = q;
@@ -1125,15 +1057,8 @@ static void sb_collections(struct sb *b, const char *stats)
 	sb_str(b, "]");
 }
 
-/* ---- 12nx: the fleet's distinct keys, from the members' sketches --------
- * Every member keeps, per collection, a HyperLogLog sketch of the keys its
- * last held walk saw (the daemon's `sketch` verb: 4,096 one-byte registers,
- * one fixed hash on every node).  The register-wise max of the members'
- * sketches is the sketch of the union, so its estimate is the fleet's
- * distinct keys - what store mode's table can otherwise only bound from
- * below (the fullest member).  A sketch is fetched at most once in
- * SK_TTL_S per member and collection; the walks behind them run every
- * 5-60 s, so the figure is that old. */
+/* ---- the fleet's distinct keys: the register-wise max of the members' HyperLogLog
+ * sketches (the `sketch` verb) is the union's; fetched once in SK_TTL_S per member */
 #define SK_M     4096
 #define SK_TTL_S 10
 #define SK_MAX   512
@@ -1184,9 +1109,8 @@ static const struct sk_ent *sk_get(struct member *m, const char *col)
 	e->ok = 0;
 	if (!m->p)
 		return NULL;
-	/* an older daemon: ask once a connection (an upgrade restarts it, so
-	 * the re-dial asks again), not 'unknown verb' every 10 s a collection
-	 * on its unknown-commands card; an hour bounds a reused handle */
+	/* an older daemon: ask once a connection (an upgrade restarts it, so the
+	 * re-dial asks again), not every 10 s; an hour bounds a reused handle */
 	if (m->p == m->nosk_p && now - m->nosk_at < 3600)
 		return NULL;
 	sb_str(&q, "{\"col\":");
@@ -1311,10 +1235,8 @@ static void sb_distinct(struct sb *b)
 	sb_str(b, "}");
 }
 
-/* S410: the fleet in one answer - every member this tool knows: its
- * version, state, install mode, the builds staged there and its
- * collections' entry counts (the stats the page reads per node, side by
- * side).  Unprivileged; the stats are the cached ones. */
+/* the fleet in one answer: every member's version, state, install mode, staged builds
+ * and its collections' entry counts; unprivileged, the stats the cached ones */
 static MHD_RESULT route_fleet(struct MHD_Connection *c)
 {
 	struct sb b = { 0 };
@@ -1367,7 +1289,7 @@ static MHD_RESULT route_fleet(struct MHD_Connection *c)
 		sb_str(&b, "}");
 	}
 	sb_str(&b, "]");
-	sb_distinct(&b);                       /* 12nx */
+	sb_distinct(&b);
 	sb_str(&b, "}");
 	pthread_mutex_unlock(&FL.mu);
 	rc = b.oom ? MHD_NO : send_json(c, 200, b.s);
@@ -1455,10 +1377,8 @@ static MHD_RESULT route_session_post(struct MHD_Connection *c,
 	return rc;
 }
 
-/* The sweeps from the page (12no S407, S412 part 2): check, upfill and
- * stop reach the daemon's upfill verb on the selected member; drain and
- * drain-stop its updrain - the read-through drain sweep that takes over
- * every key the upstream still holds.  Privileged. */
+/* the sweeps from the page: check, upfill and stop reach the selected member's upfill
+ * verb, drain and drain-stop its updrain (the read-through drain sweep); privileged */
 static MHD_RESULT route_action(struct MHD_Connection *c,
 		const char *body, const char *from)
 {
@@ -1524,10 +1444,8 @@ static MHD_RESULT route_action(struct MHD_Connection *c,
 	return rc;
 }
 
-/* S412 part 1: the DDL from the page - create, drop (force), resize and
- * rename on the selected member, through libperfd's typed verbs; the
- * daemon announces the change to the fleet (S69).  S432 adds map {index,
- * col} and unmap {index}, the RESP door's DB-index map.  Privileged. */
+/* the DDL from the page: create, drop (force), resize, rename, and map {index, col} /
+ * unmap {index} (the RESP door's DB-index map) on the selected member; privileged */
 static MHD_RESULT route_ddl(struct MHD_Connection *c, const char *body,
 		const char *from)
 {
@@ -1541,7 +1459,7 @@ static MHD_RESULT route_ddl(struct MHD_Connection *c, const char *body,
 	if (jget(body, "op", op, sizeof op) != 1)
 		return send_err(c, 400, "\"op\" is needed: create, drop, resize, "
 			"rename, map or unmap");
-	if (!strcmp(op, "map") || !strcmp(op, "unmap")) {        /* S432 */
+	if (!strcmp(op, "map") || !strcmp(op, "unmap")) {
 		const char *d;
 
 		if (jget(body, "index", ib, sizeof ib) != 1 || !ib[0])
@@ -1588,7 +1506,7 @@ static MHD_RESULT route_ddl(struct MHD_Connection *c, const char *body,
 		pthread_mutex_unlock(&FL.mu);
 		return send_err(c, 502, err);
 	}
-	if (index >= 0)                    /* S432: what the log lines name */
+	if (index >= 0)                    /* what the log lines name */
 		snprintf(what, sizeof what, "db %d%s%s", index, col[0] ? " -> " : "",
 			col);
 	else
@@ -1636,7 +1554,7 @@ static MHD_RESULT route_reset(struct MHD_Connection *c, const char *from)
 		pthread_mutex_unlock(&FL.mu);
 		return send_err(c, 502, "not connected");
 	}
-	r = perfd_reset_stats_fleet(m->p);   /* S407 part 3: the fleet, as the page's POST did */
+	r = perfd_reset_stats_fleet(m->p);   /* the fleet, as the page's POST did */
 	if (!r) {
 		char err[300];
 
@@ -1659,16 +1577,11 @@ struct req {
 	size_t n, cap;
 	size_t limit;                     /* body_max, or stage_max_mb for /stage */
 	int too_big;
-	int raw;                          /* S411: /stage - the body is the build */
+	int raw;                          /* /stage - the body is the build */
 };
 
-/* S411 part 2: a build staged from the page.  The body is the tarball
- * (application/octet-stream, under stage_max_mb); X-Perfcached-Version
- * names its version and X-Perfcached-Sig (128 hex) its ed25519
- * signature when it has one; ?node= picks the member.  libperfd sends
- * it over the native door in chunks and the daemon verifies and keeps it
- * (12nf) - the fleet lock is held for the upload, which is seconds for a
- * build of a few MB on a LAN.  Privileged. */
+/* a build staged from the page: the tarball as the body, X-Perfcached-Version and -Sig
+ * (128 hex) beside it, ?node= the member; the fleet lock is held for the upload */
 static MHD_RESULT route_stage(struct MHD_Connection *c, struct req *q,
 		const char *from)
 {
@@ -1761,7 +1674,8 @@ static MHD_RESULT handle(void *cls, struct MHD_Connection *c,
 			return MHD_NO;
 		*con_cls = q;
 		if (is_post) {
-			/* the gates a POST passes before its body is read */
+			/* the gates a POST passes before its body is read: the header no
+			 * cross-site form can send, and the content type */
 			const char *h = MHD_lookup_connection_value(c,
 				MHD_HEADER_KIND, HDR_POST);
 			const char *ct = MHD_lookup_connection_value(c,
@@ -1770,7 +1684,7 @@ static MHD_RESULT handle(void *cls, struct MHD_Connection *c,
 			if (!h)
 				return send_err(c, 403, "a request header " HDR_POST
 					" is required on every POST");
-			if (!strcmp(url, "/stage")) {       /* S411: the body is a build */
+			if (!strcmp(url, "/stage")) {       /* the body is a build */
 				if (!ct || strncmp(ct, "application/octet-stream", 24))
 					return send_err(c, 415, "/stage takes application/octet-stream");
 				q->raw = 1;
@@ -1823,7 +1737,7 @@ static MHD_RESULT handle(void *cls, struct MHD_Connection *c,
 		if (!strcmp(url, "/fleet"))
 			return route_fleet(c);
 		if (!strcmp(url, "/health")) {
-			/* S415: what a load balancer's check needs - 503 when this
+			/* what a load balancer's check needs - 503 when this
 			 * dashboard sees no member at all */
 			char hb[96];
 			int i, n, conn = 0;
@@ -1849,7 +1763,7 @@ static MHD_RESULT handle(void *cls, struct MHD_Connection *c,
 	if (!q->body)
 		return send_err(c, 400, "a body is needed");
 	if (!strcmp(url, "/session")) {
-		/* S468: the enable secret never crosses the network in the clear -
+		/* the enable secret never crosses the network in the clear -
 		 * nor a proxy's hop to here, nor its browser's to the proxy */
 		const char *fp = MHD_lookup_connection_value(c, MHD_HEADER_KIND,
 			"X-Forwarded-Proto");
@@ -1888,7 +1802,7 @@ static MHD_RESULT handle(void *cls, struct MHD_Connection *c,
 	return send_err(c, 404, "no such route");
 }
 
-/* S414: a PEM file into memory, NUL-terminated (MHD takes the text) */
+/* a PEM file into memory, NUL-terminated (MHD takes the text) */
 static char *read_pem(const char *path)
 {
 	FILE *f = fopen(path, "rb");
@@ -1932,8 +1846,8 @@ static void on_signal(int sig)
 static void usage(void)
 {
 	fprintf(stderr,
-		"usage: perfcached-dashboard [-f conf] [-l host:port] [-s seed] [-a secret] [-v]\n"
-		"  -f conf      /etc/perfcached-dashboard.conf by default\n"
+		"usage: perfcached-dashboard [-f conf] [-l host:port] [-s seed] [-a secret] [-V]\n"
+		"  -f conf      " DASH_CONF " by default\n"
 		"  -l host:port where to serve (127.0.0.1:8090; [::]:8090 for dual-stack)\n"
 		"  -s seed      a member's native door, host:port (repeatable)\n"
 		"  -a secret    the client secret (or PERFCLI_AUTH)\n"
@@ -1970,8 +1884,8 @@ int main(int argc, char **argv)
 		         !strcmp(a, "-v")) { if (a[1] != 'v') i++; }
 		else { usage(); return 2; }
 	}
-	if (conf || access("/etc/perfcached-dashboard.conf", R_OK) == 0)
-		if (cfg_load(conf ? conf : "/etc/perfcached-dashboard.conf") != 0)
+	if (conf || access(DASH_CONF, R_OK) == 0)
+		if (cfg_load(conf ? conf : DASH_CONF) != 0)
 			return 1;
 	/* flags override the file; -s replaces its seeds */
 	for (i = 1; i < argc; i++) {
@@ -2016,7 +1930,7 @@ int main(int argc, char **argv)
 		snprintf(CONN_NAME, sizeof CONN_NAME, "dashboard@%s", hn);
 	}
 	if (!CF.key_set)
-		randombytes_buf(CF.key, sizeof CF.key);  /* S415: this start's own */
+		randombytes_buf(CF.key, sizeof CF.key);  /* this start's own */
 	for (i = 0; i < CF.nseeds; i++)
 		member_add(CF.seed_host[i], CF.seed_port[i], 0, 1);
 	csp_build();
@@ -2039,9 +1953,8 @@ int main(int argc, char **argv)
 	signal(SIGTERM, on_signal);
 	signal(SIGPIPE, SIG_IGN);
 
-	/* S414: TLS in the tool itself, for a bare install with no proxy in
-	 * front - libmicrohttpd's own (GnuTLS), the PEM files read once.  The
-	 * proxy pattern stays the default (12no). */
+	/* TLS in the tool itself for a bare install with no proxy in front (libmicrohttpd's
+	 * GnuTLS, the PEM files read once); a proxy in front stays the default */
 	{
 		struct MHD_OptionItem ops[16];
 		int no = 0;

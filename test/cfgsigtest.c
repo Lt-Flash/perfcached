@@ -1,19 +1,5 @@
-/* cfgsigtest.c - AR11's settings signature (cfgsig.c; the 0.7.2 split,
- * wave 1): cfgsig_build on configs built here, what it hands the cluster
- * captured, the log stubbed.
- *
- *   A  the fleet-wide four: [wal] fsync (off without a WAL), the HTTP
- *      token (set or none, never its value), the [alerts] thresholds, the
- *      tombstone retention - each named, said, and hashed: the name with
- *      bit 31 clear (a set bit is a fact), the value as said
- *   B  fsync's words, and "?" for a value outside them
- *   C  a read-through collection's four - writes, prefixes (spaces out),
- *      role, unknown - and none for a collection without an upstream
- *   D  a value longer than the alert can say is cut in the text, not in
- *      the hash: two that differ past the cut still differ
- *   E  more than the keepalive carries: the rest dropped, warned once by
- *      the first name left out, never again
- */
+/* cfgsigtest.c - the settings signature (cfgsig.c): cfgsig_build on configs built here,
+ * with what it hands the cluster captured and the log stubbed. */
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -108,7 +94,7 @@ int main(void)
 	char p1[80], p2[80];
 	int i, nh;
 
-	/* A */
+	/* A: the fleet-wide settings, named, said and hashed; a name's hash keeps bit 31 clear */
 	base();
 	cfgsig_build(&cfg);
 	CHK(ngot == 6, "A: no read-through - the fleet-wide six");
@@ -124,7 +110,7 @@ int main(void)
 		nh += !(got[i].name_h & PC_FACT_BIT);
 	CHK(nh == ngot, "A: every name hash with bit 31 clear - a setting, never a fact");
 
-	/* B */
+	/* B: fsync's words, and "?" for a value outside them */
 	base();
 	cfg.wal_dir = "/var/lib/perfcached";
 	cfg.wal_fsync = 1;
@@ -139,7 +125,7 @@ int main(void)
 	cfgsig_build(&cfg);
 	CHK(says("wal.fsync", "?"), "B: a value outside the three - ?");
 
-	/* C */
+	/* C: a read-through collection's four, and none for a collection without an upstream */
 	base();
 	cfg.col[0].name = "plain";
 	readthrough(1, "users", "user:*, sess:*");
@@ -157,7 +143,7 @@ int main(void)
 	CHK(says("cache.writes", "refuse") && says("cache.role", "any") && says("cache.unknown", "-"),
 		"C: cache - refuse, any, and unknown - (not through)");
 
-	/* D */
+	/* D: a value too long for the alert is cut in the text, not in the hash */
 	memset(p1, 'a', 70);
 	memcpy(p2, p1, 70);
 	strcpy(p1 + 70, "x");
@@ -166,18 +152,22 @@ int main(void)
 	readthrough(0, "c", p1);
 	cfgsig_build(&cfg);
 	{
-		struct pc_cfgsig one = *find("c.prefixes");
+		const struct pc_cfgsig *e = find("c.prefixes");
+		struct pc_cfgsig one = { 0 };
 
+		if (e)
+			one = *e;
 		base();
 		readthrough(0, "c", p2);
 		cfgsig_build(&cfg);
-		CHK(strlen(one.val) == sizeof one.val - 1 && !strcmp(one.val, find("c.prefixes")->val) &&
-			one.val_h != find("c.prefixes")->val_h,
+		e = find("c.prefixes");
+		CHK(e && strlen(one.val) == sizeof one.val - 1 && !strcmp(one.val, e->val) &&
+			one.val_h != e->val_h,
 			"D: 71 characters - the text cut at %d, the same; the hashes of all of it differ",
 			(int)sizeof one.val - 1);
 	}
 
-	/* E */
+	/* E: more than the keepalive carries - the rest dropped, warned of once */
 	base();
 	for (i = 0; i < 5; i++) {
 		static char nm[5][8];
@@ -196,7 +186,7 @@ int main(void)
 	cfgsig_build(&cfg);
 	CHK(warns == 1 && ngot == PC_CFGSIG_MAX - PC_CL_NFACTS, "E: built again - not warned again");
 
-	/* F: G5 - the cache collections, as one entry, in config order */
+	/* F: the cache collections, as one entry, in config order */
 	base();
 	cfg.col[0].name = "sess";
 	cfg.col[0].nondurable = 1;

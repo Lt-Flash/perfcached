@@ -1,29 +1,6 @@
 #!/bin/sh
-# mailtest.sh - S352a: the alert mailer's transport, against test/fakesmtp.py
-# on loopback.
-#  1. -C: a [mail] section in a build without an SMTP client is refused with
-#     the reason; with one, each bad value is refused by name - a URL with
-#     credentials, a path, another scheme, a bad from/to, a user without
-#     [secrets] mail, an unreadable ca_file - and a good one passes, -E
-#     masking the password
-#  2. mailtest needs privilege
-#  3. STARTTLS + AUTH: the mail arrives over TLS, authenticated, to every
-#     recipient, with the subject prefix; the verb answers the server's 250
-#  4. a wrong password: {sent: false} with the server's 535, counted, kept
-#     as last_error
-#  5. smtps:// (TLS from the first byte) delivers too
-#  6. smtp:// to a server that offers no STARTTLS: refused, nothing sent in
-#     the clear
-#  7. a dead server: refused at once; a stalled one: refused at timeout_s,
-#     not later - the verb's wait is bounded
-#  8. the password appears nowhere - not in the log, /stats or -E
-#  9. tls_verify = no: a server whose certificate cannot be verified (no
-#     ca_file for the fake's self-signed one) is refused by default, and
-#     reached - still over TLS - with tls_verify = no, which -C warns of
-# A binary without the SMTP client is used for (1)'s refusal, and a libcurl
-# build of this tree for the rest (built here when libcurl's development
-# files are installed; SKIPPED, loudly, when not).
-# Usage: test/mailtest.sh ./perfcached
+# mailtest.sh - the alert mailer's transport against test/fakesmtp.py: -C validation, STARTTLS/smtps
+# delivery with AUTH, refusals that send nothing in the clear, bounded waits, the password shown nowhere.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

@@ -1,31 +1,6 @@
 #!/bin/sh
-# tombforgettest.sh - 12ny AT-5 (AT-12 a, b): a numbered delete is forgotten
-# once every member holds it, not after tombstone_retain_s.
-#
-# The retained-delete table kept every delete for the whole window whether
-# or not any member could still need it - PROD held ~436,000 on 2026-10-24
-# (DESIGN 12ny AT-0).  Now an origin forgets through the lowest mark the
-# members confirm; a member gone silent keeps its marks where it left them,
-# so what it has not confirmed stays, and comes to it when it is back.
-# Three eager nodes, fsync everysec, tombstone_retain_s 900:
-#   1. 40 set+delete pairs a second through node 1 for 20 s: the table on
-#      every node stays at a few seconds' worth (under 400), the 800 deletes
-#      are forgotten - the time rule would hold all 800
-#   2. the driver stops: the tables empty
-#   3. node 3 frozen (SIGSTOP) 10 s while the deletes go on - past the purge
-#      (6 s), so it leaves node 1's peer table but stays a member: node 1
-#      keeps every delete made meanwhile
-#   4. node 3 back (SIGCONT): it is given what it missed (numbered, so it
-#      counts it), confirms, and the tables shrink again - and node 3 holds
-#      none of the deleted keys.  What it missed reached it by its own marks
-#      (it asks past them, AT-7) or by node 1's catch-up (the deletes its
-#      marks do not cover - v0.7.3-rc1)
-#   5. AT-5 (c): 100 keys with a 2-s TTL and 100 immortal keys given a 2-s
-#      TTL by EXPIRE (shortened - an older, immortal copy could outlive
-#      them): the first hundred's expiries are let go after the hold, the
-#      shortened hundred's stay, on every node
-# FAIL-FIRST: before AT-5 step 1's table holds every delete (800).
-# Usage: test/tombforgettest.sh [./perfcached]
+# tombforgettest.sh - a numbered delete is forgotten once every member holds it, not after
+# tombstone_retain_s; what a frozen member has not confirmed stays until it is back.
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -60,7 +35,7 @@ multicast = 239.255.77.166:17286
 advertise = 127.0.148.$i
 mode = eager
 collections = c
-# one copy a peer: on the group (AT-9) a frozen member's socket keeps the
+# one copy a peer: on the group a frozen member's socket keeps the
 # deletes made while it is stopped, and it misses nothing for case 4 to see
 data_multicast = off
 [wal]
@@ -156,9 +131,8 @@ k=0; while [ $k -lt 75 ]; do
 done
 [ "$E" = "0 0" ] && ok "4. node 3 back: it confirmed what it missed - nodes 1 and 3 forgot everything" ||
 	bad "4. node 3 back: numbered entries on nodes 1 and 3: $E (want 0 0); node 3's marks: $(tr 3 'c["acks"]["marks"]')"
-# what it missed reached it: asked for past its marks (AT-7), or replayed
-# by node 1's catch-up where its marks did not cover it (v0.7.3-rc1: the
-# catch-up skipped every numbered delete, and a partition's were lost)
+# what it missed reached it: asked for past its marks, or replayed by node 1's catch-up where
+# its marks did not cover it
 R1=$(tr 1 't["replayed"]'); G1=$(tr 3 'c["acks"]["gap_asked"]')
 { [ "${G1:-0}" -gt "${G0:-0}" ] || [ "${R1:-0}" -gt "${R0:-0}" ]; } 2>/dev/null &&
 	ok "4. what node 3 missed reached it: $G0 -> $G1 requests by its marks, $R0 -> $R1 replayed by node 1's catch-up" ||
@@ -197,10 +171,8 @@ k=0; while [ $k -lt 150 ]; do
 done
 sleep 2
 X="$(tr 1 't["expiries"]') $(tr 2 't["expiries"]') $(tr 3 't["expiries"]')"
-# more held than the shortened hundred: v0.7.3-rc4 GitLab read 200 200 100 -
-# most likely a member's late expiries of the plain keys (node 3 was frozen
-# in 3), arriving after a node had let its own go and held anew.  They must
-# go after the hold too: wait for it (14 s) and say how long, or fail
+# more held than the shortened hundred can be a member's late expiries of the plain keys; they
+# must go after the hold too: wait for it (14 s) and say how long, or fail
 X0=$X; w=0
 while [ "$X" != "100 100 100" ] && [ $w -lt 70 ]; do
 	sleep 0.2; w=$((w+1))

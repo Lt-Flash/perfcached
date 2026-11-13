@@ -1,32 +1,5 @@
-/*
- * selftest — S4: the M1 gate.
- *
- * Phase 1 runs the vendored startup selftests exactly as the module ran
- * them at mod_init: pcache_arena_selftest() on an own-backing 64M arena,
- * then pcache_htable_selftest().
- *
- * Phase 2 is the daemon's own addition: a cross-THREAD storm proving the
- * core's invariants hold between threads (the module only ever proved
- * them between processes):
- *   - 4 writers churn 2048 keys (store/remove/re-store) with values that
- *     carry their key and a generation number at BOTH ends - a reader
- *     that ever sees a mixed value has caught a torn read through the
- *     seqlock;
- *   - 4 readers hammer random keys and validate every hit;
- *   - 4+2 counter threads prove add/sub atomicity: the final value must
- *     be EXACTLY adds-subs;
- *   - a maintenance thread runs linear-hash growth and the expiry sweep
- *     concurrently (single-splitter, as designed) - the table starts at
- *     256 buckets and must grow under the storm;
- *   - a final single-threaded audit fetches every key (100% presence,
- *     all consistent) and iterates the table (exact entry count).
- *
- * Exit 0 = pass.  Any inconsistency prints and exits nonzero; a
- * watchdog alarm turns a livelock into a failure too.
- * `make selftest_broken` builds this same storm with the bucket locks
- * compiled out (PC_COMPAT_BROKEN_LOCKS) and must FAIL - proof the storm
- * detects what the locks prevent.
- */
+/* selftest.c - the vendored arena and table selftests, then a cross-thread storm (writers, readers,
+ * counters, growth and expiry) that must find no torn read, no lost count and an exact census. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,10 +21,8 @@ extern int pcache_arena_hugepage_mb;
 #define NCTR     4
 #define NSUB     2
 #define KEYS_PER_W 512
-/* scale knobs, not macros: PC_SELFTEST_LIGHT=1 shrinks the storm for
- * qemu-user emulation in the S27 arch matrix (8-16x slower than metal;
- * the full storm would trip the 120s livelock alarm there).  The
- * counter-exactness check derives from these, so it stays exact. */
+/* scale knobs, not macros: PC_SELFTEST_LIGHT=1 shrinks the storm for qemu-user, where the full one
+ * would trip the 120 s livelock alarm; the counter-exactness check derives from them */
 static unsigned int ROUNDS = 120;  /* vs the writers' unsigned r */
 static int READ_ITER = 400000;
 static int CTR_ADDS = 200000;
@@ -240,7 +211,7 @@ int main(void)
 	}
 	printf("phase 1: vendored arena + htable selftests PASS\n");
 
-	/* ---- phase 2: cross-thread storm ------------------------------- */
+	/* ---- phase 2: cross-thread storm; selftest_broken (no bucket locks) must FAIL it ---- */
 	ht = pcache_htable_new(8);         /* 256 buckets: must grow under load */
 	if (!ht) {
 		printf("FAIL: table\n");

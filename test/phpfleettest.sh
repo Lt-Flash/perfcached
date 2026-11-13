@@ -1,14 +1,6 @@
 #!/bin/sh
-# phpfleettest.sh - PE-4: the PHP extension against a three-node fleet.
-#   eager: a handle's reads survive a kill -9 of the node it works through, with
-#     no exception and a failover counted (test/phpfleettest.php failover)
-#   eager: a forked child dials its own and both sides go on working; a child
-#     sharing the parent's Noise channel would break it (... fork)
-#   shard: ownerOf() names the node that holds each key, by the daemons' own counts
-#     - the hash agreed bit for bit, asserted not assumed (... owners)
-#   eager: a list of seeds: one handle for the list, a dead seed passed over, a wrong
-#     secret stopping the walk, and nothing left to dial failing (... seeds)
-# Usage: test/phpfleettest.sh [./perfcached] [php8.3] [lang/php/modules/perfcached.so]
+# phpfleettest.sh - the PHP extension against a three-node fleet (test/phpfleettest.php): failover past a
+# killed node, a forked child's own channel, ownerOf() agreeing with the daemons, and a list of seeds.
 set -u
 BIN=${1:-./perfcached}
 PHP=${2:-php8.3}

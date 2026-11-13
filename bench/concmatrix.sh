@@ -1,32 +1,6 @@
 #!/bin/sh
-# concmatrix.sh — what N concurrent clients cost, and where the cost goes.
-#
-# Two questions, kept apart:
-#
-#   SCALING   one handle per thread, 1..8 threads, libperfd over Noise.
-#             Reports aggregate throughput AND per-connection throughput,
-#             because a cache that doubles its total while halving each
-#             client's share has not scaled for the client that is
-#             waiting.
-#
-#   OVERHEAD  at a fixed 4 connections, the same work three ways: the raw
-#             wire (pcbench -P bin, the data verbs libperfd rides),
-#             libperfd in plaintext, libperfd over Noise.  The
-#             differences price the library and the encryption
-#             SEPARATELY instead of reporting one blended gap.
-#
-# The native door speaks one protocol (binary frames; the JSON-RPC text
-# dialect went in S317), so there is one native arm per cell and the tsv's
-# dialect column reads 'binary' on every row - kept so the rows line up
-# with the older two-arm tables.
-#
-# The overhead arms need two fleets, because 'plaintext = loopback' makes
-# a loopback listener plaintext-EXCLUSIVE: a client that offers a Noise
-# handshake to one is sniffed as RESP and dropped.  So the two fleets are
-# identical in every other setting and started back to back on the same
-# host, and the flag is the only variable.
-#
-# usage: bench/concmatrix.sh [./perfcached] [./concbench] [./pcbench]
+# concmatrix.sh - what N concurrent clients cost: SCALING (1..8 handles, aggregate and per-connection)
+# and OVERHEAD at 4 connections (raw wire, libperfd plaintext, libperfd over Noise, each priced apart).
 set -u
 
 BIN=${1:-./perfcached}
@@ -45,11 +19,8 @@ dial=binary
 
 rm -rf "$D"; mkdir -p "$D"
 
-# PROVENANCE.  The numbers are only worth as much as the build that
-# produced them, so stamp the BINARY's revision (not the tree's - they
-# differ the moment you run an older binary against a newer checkout)
-# and refuse to run one that cannot name itself.  An unstamped build is
-# how a page ends up quoting figures nobody can reproduce.
+# stamp the BINARY's revision (not the tree's) and refuse one that cannot name itself: an unstamped
+# build yields figures nobody can reproduce
 BINREV=$("$BIN" -V 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')
 if [ -z "$BINREV" ] || [ "$BINREV" = unknown ]; then
 	echo "CONCMATRIX: refusing to measure an unstamped build ($BINREV) - \
@@ -112,11 +83,8 @@ stop_fleet() {
 }
 field() { printf '%s' "$1" | sed -n "s/.*$2=\([0-9-]*\).*/\1/p"; }
 
-# 224 is shared with another session's daemons, so a single pass is not a
-# measurement - the same arm moved 11% between two runs an hour apart, and
-# once inverted the ordering of two arms.  Every arm runs REPS times and
-# the MEDIAN is reported, with the spread printed so a noisy arm is
-# visible rather than averaged into looking solid.
+# a single pass on a shared host is not a measurement: every arm runs REPS times and reports the
+# median, with the spread printed so a noisy arm is visible
 med() { printf '%s\n' "$@" | sort -n | awk '{v[NR]=$1} END{print v[int((NR+1)/2)]}'; }
 spread() { printf '%s\n' "$@" | sort -n | awk '{v[NR]=$1} END{
 	printf "%d-%d", v[1], v[NR]}'; }
@@ -181,6 +149,7 @@ fi
 stop_fleet
 
 # ---- overhead arm 3: the SAME fleet with plaintext eligible -----------
+# restarted: 'plaintext = loopback' makes a loopback listener plaintext-only (Noise reads as RESP)
 start_fleet "plaintext = loopback"
 OPSL="" P50L="" P99L=""; r=0
 while [ $r -lt "$REPS" ]; do

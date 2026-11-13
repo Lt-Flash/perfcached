@@ -8,9 +8,12 @@ Two licences, one boundary, checked by a tool on every push:
   header the compiler reads for them - `make print-libperfd`) are **MIT**
   and carry `SPDX-License-Identifier: MIT`.
 - Every other file under `src/`, `cli/`, `tools/` and `test/` is
-  **GPL-2.0-or-later** and carries that SPDX line.  The six vendored
+  **GPL-2.0-or-later**.  New files carry that SPDX line; older ones
+  without any are on the same side (LICENSING.md).  The six vendored
   `src/core/` files keep their original GPL headers instead of an
   SPDX line - a recorded exception, not an omission.
+- `lang/php`, the PHP extension and its Symfony adapter, is **MIT**
+  as well (`lang/php/LICENSE`); it includes no daemon header.
 - A header both sides need goes on the MIT side from day one with no
   GPL-only dependency, or stays daemon-only with the minimal piece
   duplicated under MIT (as `PC_MUST_CHECK` is).  Never include a GPL
@@ -25,7 +28,7 @@ Two licences, one boundary, checked by a tool on every push:
   notice there.
 
 Expanding the MIT set is a licensing decision, not a refactor - say so
-in the commit and the ledger.
+in the commit message.
 
 ## Copyright
 

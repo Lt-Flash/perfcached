@@ -1,33 +1,6 @@
 #!/bin/sh
-# alerttest.sh - S352b: a node raises its own alerts, keeps them, and mails
-# them through [mail] - against test/fakesmtp.py and test/fakeupstream.py on
-# loopback, with PERFCACHED_ALERT_FAST=60 (every hold and clear time / 60).
-#  A. no [mail]: an alert is raised, logged and kept (/stats alerts, mail
-#     "no mailer"); alerts.mailer says none
-#  B. one node with [mail] (digest_s 3, min_interval_s 900):
-#     1. its start and a dead read-through upstream, raised within the
-#        digest window, arrive as ONE mail naming both
-#     2. the upstream comes up: the clear is mailed (its raise was)
-#     3. it goes down again inside min_interval: raised and kept, but
-#        suppressed - no second mail
-#     4. writes refused for want of memory: a CRITICAL mail at once
-#     5. kill -9 and restart: "after an UNCLEAN stop" mailed critical
-#  C. level = critical: a warning is kept but not mailed ("below level")
-#  D. S377 (0.6.1): level = info and a test event whose text carries markup -
-#     the clean start is mailed (info), the markup arrives escaped in HTML
-#  E. S377: a condition a warning, then critical, then clear (driven by
-#     PERFCACHED_ALERT_TEST_COND): the critical mail says "Problem, still
-#     open" and answers the warning's mail; the resolve answers the
-#     warning's mail too (the problem's FIRST mail), with the worst text
-#  and every mail (S377): multipart/alternative with a text/plain and a
-#     text/html part, quoted-printable (no line over 76), the subject
-#     "<STATE>: <title> on <host>[ (+N)]" in at most 78 characters, From
-#     the host's quoted name, no "RAISED" anywhere; a resolve answers its
-#     problem's mail (In-Reply-To)
-# The node with [mail] is a PC_MAIL=libcurl build of this tree (made here
-# when libcurl's development files are installed; B and C SKIPPED, loudly,
-# when not).
-# Usage: test/alerttest.sh ./perfcached
+# alerttest.sh - a node raises its own alerts, keeps them, and mails them through [mail] (digest,
+# min_interval, levels, MIME form) against test/fakesmtp.py and test/fakeupstream.py on loopback.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -45,6 +18,8 @@ for p in $P_SMTP $P_UP $TCP $HTTP; do
 	ss -ltn 2>/dev/null | grep -qE ":$p[[:space:]]" && { echo "alerttest: port $p already bound" >&2; exit 1; }
 done
 export PERFCACHED_ALERT_FAST=60
+# the host's busy is not this suite's: a busy runner would mail "CPU busy" into B3
+export PERFCACHED_ALERT_NO_HOST_BUSY=1
 
 # ---- the fake upstream, down to begin with ------------------------------------
 mkdir -p "$D/up"
@@ -72,15 +47,11 @@ http = 127.0.0.1:$HTTP
 plaintext = loopback
 [wal]
 dir = $D/wal
-# B4 fills the 16 MB arena with 150 KB values: the ring must hold what the
-# writer cannot drain meanwhile on a loaded runner, or 'WAL lost writes'
-# refuses first and the arena-full CRITICAL this suite is about never comes
+# B4 fills the arena with 150 KB values: the ring must hold what a slow writer cannot
+# drain, or the WAL refusal comes before the arena-full CRITICAL under test
 ring_kb = 16384
-# 8 x 8 MB, not the probe's recommendation (8 x 256 MB on the runners'
-# disks = 2.2 GB provisioned per run): beside the pipeline's other WAL
-# suites that took 224's 20 GB root to "633 MB free, needs 2252 MB" and the
-# daemon refused to start (dev-072 pipeline 111314, check + check-asan
-# core1).  64 MB holds what B4 writes many times over
+# 8 x 8 MB, not the probe's 8 x 256 MB: parallel WAL suites would fill a small runner
+# disk, and 64 MB holds what B4 writes many times over
 segment_mb = 8
 [collection 0]
 buckets_log2 = 8
@@ -99,10 +70,8 @@ io_crit_pct = 100
 memory_warn_pct = 99
 memory_crit_pct = 100
 EOF
-	# the HOST's alarms are not this suite's subject (hostalerttest, iobusytest):
-	# on a CI host running eight jobs they fired - "CPU busy", "disk busy" - and
-	# a digest headed by one carried E's RESOLVED where E could not see it
-	# (v0.6.4-rc5, GitLab 110463).  The arena's stay at their defaults: B4 uses them
+	# the HOST's alarms are not this suite's subject (hostalerttest, iobusytest): on a busy
+	# host they fire into the digests.  The arena's stay at their defaults: B4 uses them
 	if [ $# -gt 0 ]; then
 		printf '[mail]\n' >> "$f"
 		for l in "$@"; do printf '%s\n' "$l" >> "$f"; done
@@ -112,12 +81,9 @@ EOF
 start() { # start <binary> <conf>
 	"$1" -f "$2" >> "$D/n.log" 2>&1 &
 	PID=$!
-	# 30 s: under ASan on a 2-core runner the PC_MAIL build was not ready
-	# in 10, and the next /stats read came back empty (GitHub, v0.6.2)
+	# 30 s: under ASan on a small runner the PC_MAIL build is not ready in 10
 	i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/n.log"; do sleep 0.1; i=$((i+1)); done
-	# a node that is not ready says why: v0.7.0-rc3's check-asan core1
-	# (GitLab 110995) lost all of B to a mail node that never answered,
-	# and its log - an ASan report, a refused config - went with $D
+	# a node that is not ready says why: its log (an ASan report, a refused config) goes with $D
 	grep -q "perfcached ready" "$D/n.log" || { echo "  ..   the node ($1) is not ready after 30 s ($(kill -0 $PID 2>/dev/null && echo running || echo exited)); its log:"
 		tail -40 "$D/n.log" | sed 's/^/       /'; }
 }
@@ -132,6 +98,8 @@ elif what == "recent":   # recent <key> -> "event/mail" of the newest entries fo
     print(" ".join("%s/%s" % (e["event"], e["mail"]) for e in a["recent"] if e["key"] == sys.argv[3]))
 PY
 }
+hst() { python3 -c 'import json,sys,urllib.request
+print(json.loads(urllib.request.urlopen("http://127.0.0.1:%s/stats" % sys.argv[1], timeout=5).read())["alerts"]["host"][sys.argv[2]])' $HTTP "$1" 2>/dev/null; }
 wst() { # wst <python expression over w (/stats wal) and r (/stats rdb)> - printed
 	python3 - "$HTTP" "$1" <<'PY' 2>/dev/null
 import json, sys, urllib.request
@@ -165,7 +133,7 @@ else:
     cmd(*w)
 PY
 }
-# S377: the mail is MIME, its parts quoted-printable - read them decoded
+# the mail is MIME, its parts quoted-printable - read them decoded
 mpart() { # mpart <n> <subject|text|html|msgid|inreplyto> - one mail's part, decoded
 	python3 - "$D/m/$1.json" "$2" <<'PY' 2>/dev/null
 import email, json, sys
@@ -211,6 +179,11 @@ grep -q "WARNING: alert: the read-through upstream" "$D/n.log" && ok "A. and log
 [ "$(metric 'perfcached_mail_ready')" = 0 ] && [ "$(metric 'perfcached_alerts_active{level="warning"}')" -ge 1 ] 2>/dev/null &&
 	ok "A. /metrics: perfcached_mail_ready 0, an active warning counted" ||
 	bad "A. /metrics: ready '$(metric perfcached_mail_ready)', warning '$(metric 'perfcached_alerts_active{level="warning"}')'"
+waitfor 4 '[ "$(hst cpu_busy_pct)" != None ]'     # two samples make a figure under PERFCACHED_ALERT_FAST
+[ "$(hst cpu_busy_pct) $(hst disk_busy_pct)" = "None None" ] && [ "$(hst memory_used_pct)" != None ] &&
+	grep -q "PERFCACHED_ALERT_NO_HOST_BUSY" "$D/n.log" &&
+	ok "A. PERFCACHED_ALERT_NO_HOST_BUSY: CPU and disk busy not watched, memory $(hst memory_used_pct)%, said in the log" ||
+	bad "A. PERFCACHED_ALERT_NO_HOST_BUSY: cpu_busy_pct $(hst cpu_busy_pct), disk_busy_pct $(hst disk_busy_pct), memory_used_pct $(hst memory_used_pct), logged $(grep -c PERFCACHED_ALERT_NO_HOST_BUSY "$D/n.log")"
 stop -TERM
 
 # ---- the mail build ----------------------------------------------------------------
@@ -274,10 +247,7 @@ if [ -n "$MBIN" ]; then
 		ok "B2. it says how long it lasted and which mail it closes" || bad "B2. body: $(body 2 | head -24 | tr '\n' '|')"
 
 	# ---- B3. down again inside min_interval: suppressed ----------------------------
-	# the upstream dies: every connection to it closes at once (a "down"
-	# flag in the fake closes one only when it next reads).  Idle fetch
-	# connections notice on their next use - a few misses, as a real
-	# outage meets its first readers
+	# the upstream dies: every connection to it closes at once; idle fetches notice on next use
 	kill -9 $FU 2>/dev/null; wait $FU 2>/dev/null; FU=
 	waitfor 25 'resp 0 GET probe$w; case "$(al recent upstream.0)" in raised/*) true;; *) false;; esac'
 	sleep 4
@@ -317,12 +287,7 @@ PY
 		*) bad "B4. no 'writes refused' line in a critical mail ($(cat "$D/fill.out"); subjects: $(for i in $(seq $((n0 + 1)) $(mails)); do subj $i; done | tr '\n' '|'))";; esac
 
 	# ---- B5. kill -9 and back: an unclean stop ------------------------------------------
-	# The start calls a stop unclean when it replays WAL records above the last
-	# snapshot - so the records must BE above it at the kill.  B4's refusals start a
-	# heal, and a heal is a snapshot: records written while it runs land under it,
-	# the restart replays none and says a clean start (v0.6.4-rc3, GitLab 110419,
-	# check-asan: B4's mail one entry longer, B5's one shorter, no UNCLEAN).  The heal
-	# is waited out, then the records are seen synced above the snapshot's marker
+	# unclean = WAL records above the last snapshot at the kill, so B4's heal is waited out first
 	waitfor 30 '[ "$(wst "bool(w.get(\"healing\") or r.get(\"running\"))")" = False ]' ||
 		echo "  info B5. a heal or a snapshot still running after 30 s: $(wst '(w.get("healing"), r.get("running"))')"
 	n0=$(mails)
@@ -356,7 +321,7 @@ PY
 	[ "$(mails)" = "$n0" ] && ok "C. and nothing was mailed" || bad "C. $(mails) mails, was $n0: $(subj $(mails))"
 	stop -TERM
 
-	# ---- D. S377: level = info, and a text with markup ----------------------------
+	# ---- D. level = info, and a text with markup ----------------------------
 	n0=$(mails)
 	rm -rf "$D/wal"
 	conf "$D/d.conf" "$M" "$M2" "$M3" "$M4" "digest_s = 2" "level = info"
@@ -386,11 +351,8 @@ PY
 		bad "D. subject '$SL' (${#SL}), Host line '$(body $((n0 + 1)) | grep '^  Host')'"
 	stop -TERM
 
-	# ---- E. S377: a problem that gets worse, then clears ----------------------------
-	# driven by PERFCACHED_ALERT_TEST_COND (a file: "warning <text>",
-	# "critical <text>", or nothing).  The arena cannot stand in: a freed
-	# cell stays held until reclaim retires its chunk, so it does not clear
-	# on a test's clock (tried: 27% held after every record was deleted)
+	# ---- E. a problem that gets worse, then clears ----------------------------
+	# driven by PERFCACHED_ALERT_TEST_COND: the arena cannot clear on a test's clock
 	n0=$(mails)
 	up false                            # no upstream alert in these mails
 	rm -rf "$D/wal"
@@ -427,7 +389,7 @@ PY
 	fi
 	stop -TERM
 
-	# ---- every mail: S377's form ----------------------------------------------------
+	# ---- every mail: the MIME form ----------------------------------------------------
 	python3 - "$D/m" "$(hostname)" > "$D/form.out" 2>&1 <<'PY'
 import email, glob, json, re, sys
 from email import policy

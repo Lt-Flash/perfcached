@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-# fakesmtp.py - S352: a local SMTP server for the mail tests.  Standard
-# library only (smtpd left Python in 3.12).  Loopback only.
-#
-#   fakesmtp.py --port N --dir D [--mode starttls|tls|plain] [--cert C --key K]
-#               [--user U --password P] [--fail-auth] [--delay S] [--refuse]
-#
-#   starttls  plain first, advertises STARTTLS, a client upgrades (smtp://)
-#   tls       TLS from the first byte (smtps://)
-#   plain     no TLS at all
-# Each accepted message is written to D/<n>.json: {"from", "rcpt", "user",
-# "tls", "data"}.  --fail-auth answers 535 to every AUTH; --delay sleeps
-# before each reply (a slow server); --refuse greets with 421 and closes.
-# Writes D/ready when it listens.
+# fakesmtp.py - a loopback SMTP server for the mail tests (stdlib only: smtpd left Python in 3.12);
+# writes D/ready once it listens, and each accepted message to D/<n>.json.
 import argparse, base64, json, os, socket, ssl, sys, threading, time
 
 ap = argparse.ArgumentParser()

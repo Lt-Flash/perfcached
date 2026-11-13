@@ -1,33 +1,6 @@
 #!/bin/sh
-# stallmastertest.sh - S218: a master whose cluster thread has wedged is
-# replaced, and yields when it comes back.
-#
-# S216 made a wedged node SAY stalled.  A wedged MASTER was still the
-# master: the heartbeat watchdog re-sent its MASTER_ALIVE as faithfully as
-# its ALIVE, so members saw a live master, nobody elected, and nothing
-# only a master does happened - no joiner admitted, no map issued, no
-# re-shard.  And withholding the claim is not enough on its own: the
-# election defers to the highest LIVE address, a stalled node's watchdog
-# keeps it live, and when the wedged master held the highest address every
-# member deferred to it for ever.
-#
-# Three nodes; the master (the founder, and by address the one every
-# election would defer to) has its cluster thread frozen for 24 s with
-# apply_stall_ms = 2000, using test/threadfreeze.c:
-#  - the kernel shows that one thread stopped and pc-beat running;
-#  - a NEW master appears among the other two within apply_stall_ms +
-#    MASTER_DEAD_MS (8 s) + a margin, and both agree on who it is;
-#  - a fourth node started while the old master is still frozen is
-#    admitted (it reaches ready and lists the fleet);
-#  - the frozen node is listed as stalled by the new master, still a
-#    member (nothing purged it), and still answers a read;
-#  - at no sample are two RUNNING nodes both master;
-#  - released, the old master yields (role member, one demotion counted),
-#    the fleet has exactly one master, and a key the old master held
-#    before the freeze reads back everywhere.
-# Fail-first: on a daemon without S218 the frozen node stays master for
-# the whole freeze and the joiner never gets in.
-# Usage: test/stallmastertest.sh [./perfcached] [./threadfreeze] [./perfcli]
+# stallmastertest.sh - a master whose cluster thread has wedged is replaced (a joiner gets in, never
+# two running masters), stays a listed member, and yields when it comes back.
 set -u
 BIN=${1:-./perfcached}
 TF=${2:-./threadfreeze}

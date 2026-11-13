@@ -1,23 +1,5 @@
-/* respsrvtest.c - the RESP door's connection and server commands
- * (respsrv.c; the 0.7.2 split, wave 1): the store, the observers and the
- * password plane stubbed; every reply byte for byte.
- *
- *   A  PING: PONG, or the message back; in subscribed mode (PS2) the
- *      array predis's pubSubLoop reads, with or without a message
- *   B  AUTH: refused when no password is set; AUTH <pw> and AUTH <user>
- *      <pw> (the second word is the password); a wrong one is Redis's
- *      WRONGPASS and counted; the arity
- *   C  HELLO: RESP2's map of 14, bare or with 2; 3 is NOPROTO; a version
- *      that is not a number refused
- *   D  INFO: bare - server (standalone, or cluster), replication (the
- *      role rtpengine will not start without), cluster, clients, memory
- *      (the arena's held bytes), stats (hits and misses summed over the
- *      live collections), keyspace (each reachable collection with keys,
- *      under the index that reaches it; empty, dropped and unlisted ones
- *      left out) - and not commandstats or latencystats; one named
- *      section alone; all = every one; a reply that cannot fit refused
- *   E  TIME: seconds and microseconds, as two bulks of digits
- */
+/* respsrvtest.c - the RESP door's connection and server commands (respsrv.c), every reply byte for
+ * byte: the store, the observers and the password plane stubbed. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +26,8 @@ static int subs, pw_set, cluster_on;
 
 int pc_pubsub_count(void *conn) { (void)conn; return subs; }
 int pc_resp_password_set(void) { return pw_set; }
+int pc_auth_needs_tls(void) { return 0; }
+int pc_conn_secure(const void *conn) { (void)conn; return 1; }
 int pc_resp_password_ok(const char *p, size_t n) { return n == 6 && !memcmp(p, "sesame", 6); }
 int resp_cluster_on(void) { return cluster_on; }
 int pc_obs_conn_count(void) { return 7; }
@@ -53,9 +37,8 @@ unsigned long long pc_obs_inst_ops(void) { return 56; }
 void pc_obs_cmdstats(struct pc_jw *w) { pc_jw_lit(w, "cmdstat_get:calls=1\r\n"); }
 void pc_obs_latencystats(struct pc_jw *w) { pc_jw_lit(w, "latency_percentiles_usec_get:p50=1\r\n"); }
 
-/* four collections: "0" live with 3 keys, "gone" dropped, "empty" live with
- * none, "hidden" live but not on the RESP allow-list; "sess" live, reached
- * by index 5 */
+/* "0" live with 3 keys, "gone" dropped, "empty" live with none, "hidden" live but not on the
+ * RESP allow-list; "sess" live, reached by index 5 */
 static struct { const char *name; int live; unsigned long entries, hits, misses; } cols[] = {
 	{ "0", 1, 3, 10, 1 }, { "gone", 0, 9, 100, 100 }, { "empty", 1, 0, 2, 0 },
 	{ "hidden", 1, 4, 1, 1 }, { "sess", 1, 2, 5, 3 },
@@ -153,7 +136,7 @@ static int bulk_ok(void)
 
 int main(void)
 {
-	/* A */
+	/* A: PING - PONG or the message; subscribed, the array predis's pubSubLoop reads */
 	RUN(rh_ping, "PING");
 	CHK(is("+PONG\r\n"), "A: PING - PONG");
 	RUN(rh_ping, "PING", "hi");
@@ -165,7 +148,7 @@ int main(void)
 	CHK(is("*2\r\n$4\r\npong\r\n$2\r\nhi\r\n"), "A: subscribed with a message - [pong, hi]");
 	subs = 0;
 
-	/* B */
+	/* B: AUTH - refused with no password set; AUTH <pw> and <user> <pw>; WRONGPASS, counted */
 	RUN(rh_auth, "AUTH", "sesame");
 	CHK(is("-ERR Client sent AUTH, but no password is set\r\n") && !authed,
 		"B: no password set - refused");
@@ -182,7 +165,7 @@ int main(void)
 	RUN(rh_auth, "AUTH", "a", "b", "c");
 	CHK(is("-ERR wrong number of arguments for 'auth' command\r\n"), "B: the arity");
 
-	/* C */
+	/* C: HELLO - RESP2's map of 14, bare or with 2; 3 is NOPROTO; a non-number refused */
 	{
 		static const char hello[] = "*14\r\n$6\r\nserver\r\n$10\r\nperfcached\r\n"
 			"$7\r\nversion\r\n";
@@ -201,7 +184,7 @@ int main(void)
 	RUN(rh_hello, "HELLO", "x");
 	CHK(is("-ERR Protocol version is not an integer or out of range\r\n"), "C: not a number");
 
-	/* D */
+	/* D: INFO - sections bare, one by name, all; keyspace by reachable index; too big */
 	RUN(rh_info, "INFO");
 	CHK(bulk_ok(), "D: INFO is one bulk, its length right");
 	CHK(has("# Server\r\nredis_version:7.0.0\r\nredis_mode:standalone\r\n"
@@ -236,7 +219,7 @@ int main(void)
 	CHK(is("-ERR info too large\r\n"), "D: a reply that cannot fit the scratch - refused");
 	scratch_cap = sizeof scratch;
 
-	/* E */
+	/* E: TIME - seconds and microseconds, as two bulks of digits */
 	{
 		long long s, us;
 		char *e;

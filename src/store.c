@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * store.c — the collection registry (task S8).  See store.h.
- */
+/* store.c - the collection registry: lookup, runtime create/drop/rename/resize, and each
+ * collection's figures (written, held, hot keys, distinct-key sketch).  See store.h. */
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
@@ -20,123 +19,82 @@
 #include "compat/timer.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include "core/pcache_arena.h"      /* S120: pcache_arena_cell_size */
-#include "fnv1a.h"                  /* S397: the hot-key sketch */
+#include "core/pcache_arena.h"
+#include "fnv1a.h"
 
-/* S69: writers (create, drop) serialize here; readers take nothing.  An
- * entry is filled before reg_n is published, and reg_n never shrinks, so
- * a reader either does not see a new entry yet or sees it complete. */
+/* writers (create, drop) serialize here; readers take nothing: an entry is filled before reg_n
+ * is published and reg_n never shrinks, so a reader sees a new entry complete or not at all */
 static pthread_mutex_t reg_mx = PTHREAD_MUTEX_INITIALIZER;
 
 static struct {
-	/* S69: heap-owned, and swapped as a POINTER so a rename cannot be
-	 * read half-done by a lookup that takes no lock.  The old string is
-	 * never freed - one per rename, and a reader may still be holding
-	 * it. */
+	/* heap-owned and swapped as a pointer, so a lock-free lookup never reads a rename half-done;
+	 * the old string is never freed (a reader may still hold it) */
 	char *name;
-	int live;                          /* S69: 0 = dropped, slot reusable */
-	int runtime;                       /* S69: created by a client, persisted */
-	int buckets_log2;                  /* S69: what the table was made at */
-	int floor_log2;                    /* S328: what the OPERATOR made it at
-	                                    * - the config, a create, an
-	                                    * explicit resize; never an
-	                                    * automatic one.  FLOOR mode does
-	                                    * not shrink below it */
-	unsigned long long gen;            /* S69: the Lamport value of the
-	                                    * create or drop that last moved
-	                                    * this NAME - the fleet's tie
-	                                    * break, and what makes a drop
-	                                    * outrank the create it removed */
+	int live;                          /* 0 = dropped, slot reusable */
+	int runtime;                       /* created by a client, persisted */
+	int buckets_log2;                  /* what the table was made at */
+	int floor_log2;                    /* the size explicitly given (config, create,
+	                                    * explicit resize); FLOOR mode does not shrink below it */
+	unsigned long long gen;            /* Lamport value of the create or drop that last
+	                                    * moved this NAME: a drop outranks its create */
 	pcache_htable_t *ht;
-	/* S150 B: bumped at every publish of `ht` or `live` - create, drop,
-	 * the resize swap - so a walk that resumes across turns can tell
-	 * the table under it moved (the KEYS handle in proto.c) */
+	/* bumped at every publish of `ht` or `live` (create, drop, the resize swap), so a walk
+	 * resuming across turns can tell the table moved (the KEYS handle in proto.c) */
 	unsigned long long pub;
 	int pull;
 	int proxy;
 	int shard;
 	int eager;
-	/* S67's stored_bytes/stored_n/size_hist moved out to colst[] (S237) */
-	/* S109: the walked figure and its pacing (wall seconds) */
+	/* the walked figure and its pacing (wall seconds) */
 	unsigned long long held_bytes;
 	unsigned int held_at, held_next, held_walk_us;
-	/* S116: the value sizes HELD, from the same walk, in the eight
-	 * classes of size_hist.  Two slots and a generation: the walk fills
-	 * the slot the readers are not on, then publishes the generation, so
-	 * a reader never sees half of one walk and half of the next. */
+	/* value sizes held, from the same walk, in size_hist's classes: the walk fills the slot
+	 * readers are not on, then publishes the generation */
 	unsigned long long held_hist[2][8];
 	unsigned int held_gen;
-	/* S120: the budget's parts - the index regions this table was carved
-	 * (exact: noted at creation and at every growth step) and the records
-	 * as the cells they occupy (from the walk, class-rounded) */
+	/* index regions carved for this table (exact: noted at creation and at every growth step);
+	 * held_cells below is the records' cells, from the walk */
 	unsigned long index_bytes;
-	/* S69: the resize in flight for this collection, if any */
+	/* the resize in flight for this collection, if any */
 	pcache_htable_t *rs_to;
 	unsigned int rs_cursor;
 	int rs_target, rs_pass, rs_swapped;
-	int rs_closing;              /* S453: the old table is being emptied */
+	int rs_closing;              /* the old table is being emptied */
+	unsigned long rs_unfit;      /* copies this pass found no room for */
+	int rs_unfit_said;
 	unsigned long long rs_moved;
-	/* S255: a fleet resize that arrived while this one ran - started when
-	 * it finishes, the latest one winning - and the generation of the
-	 * newest fleet resize seen, so a late or repeated announce of an
-	 * older one cannot undo it */
+	/* a fleet resize that arrived while this one ran (started when it finishes, the latest
+	 * winning), and the newest fleet resize generation seen, so a late announce cannot undo it */
 	int rs_pending;
 	unsigned long long rs_gen;
 	unsigned long long held_cells;
-	int autoscale, as_target, as_set;   /* S239: mode, AUTO's target, set by the verb */
-	unsigned long long as_gen;          /* S436: the set mode's generation */
-	int redis_types;                    /* S280: PC_TYPES_* */
-	int nondurable;                     /* G5: a cache - off the WAL and the snapshot */
+	int autoscale, as_target, as_set;   /* mode, AUTO's target, set by the verb */
+	unsigned long long as_gen;          /* the set mode's generation */
+	int redis_types;                    /* PC_TYPES_* */
+	int nondurable;                     /* a cache - off the WAL and the snapshot */
 } reg[PC_MAX_COLLECTIONS];
 static int reg_n;
 
-static void retire_push(pcache_htable_t *ht, int idx);   /* S150 C */
+static void retire_push(pcache_htable_t *ht, int idx);
 
-/* S69: what a runtime-created collection inherits - the cluster's mode,
- * set once at startup (a fleet is ONE mode over ONE collection set) */
+/* what a runtime-created collection inherits: the cluster's mode, set once at startup */
 int pc_col_default_pull, pc_col_default_proxy, pc_col_default_shard,
 	pc_col_default_eager;
 
-/*
- * S67: what is being STORED, kept at store time so the page can say "are
- * we storing what we think we are" without a walk - a size distribution
- * in log2 classes, and the running total the page turns into a mean and
- * an estimate of memory held.  Expiry and eviction happen inside the
- * table and are not subtracted here: this is the write stream, and the
- * page says so.
- *
- * S237: NOT in reg[].  Every SET incremented these with plain `+=` in the
- * registry entry whose name, live, ht and mode flags every request's
- * lookup reads - so each write invalidated the lines every other
- * worker's pc_store_find/pc_store_ht/pc_store_shard_enabled needed (23%
- * of a saturated SET at 12 workers, DESIGN 12ga), and concurrent `+=`
- * from several workers lost counts.  Here, per collection, one padded
- * stripe per thread (round-robin, shared past COLST_STRIPES), added to
- * atomically and summed on read.
- */
+/* the write stream's sizes (expiry and eviction not subtracted), kept out of reg[], whose lines
+ * every lookup reads: one padded stripe per thread, added to atomically and summed on read */
 #define COLST_STRIPES 16
 static struct {
 	unsigned long long bytes, n, hist[8];
 	char pad[128 - 10 * sizeof(unsigned long long)];
 } colst[PC_MAX_COLLECTIONS][COLST_STRIPES] __attribute__((aligned(128)));
-/* S251: 128-aligned so each stripe owns its adjacent-line prefetch pair:
- * a stripe's 80 bytes of counters span two lines, and at 64-alignment
- * the second shared a pair with the next thread's stripe */
+/* 128-aligned so each stripe owns its adjacent-line prefetch pair
+ * (80 bytes of counters span two lines) */
 static unsigned int colst_next;
 static __thread int colst_mine = -1;
 
-/* S397 (DESIGN 12ng): hot keys, always on.  Per collection, a space-saving
- * sketch of the HOT_N heaviest keys over 1 request in HOT_RATE, sampled in
- * the data-verb cores (verbs.c) - every door, and a forwarded request at
- * the node that does its work.  The sampling decision is a per-thread
- * xorshift, not a counter, so a client cycling through HOT_RATE keys is
- * not aliased onto one of them; only a sampled request finds its slot and
- * takes the sketch's flag, and one that finds it held is counted in
- * `busy` and dropped rather than waited for.  Counts halve every
- * HOT_HALF_S, so the table is the last few minutes, the page's window,
- * not the whole uptime; reset with the stats and with the slot.
- * Space-saving: est >= true >= est - err, and every key above
- * sampled / HOT_N is in the table. */
+/* hot keys: sampled by a per-thread xorshift, not a counter, so a client cycling through keys is
+ * not aliased onto one; a sampler that finds the sketch's flag held counts `busy` and drops */
 #define HOT_N      32
 #define HOT_KEY    64              /* bytes of the key kept; klen is whole */
 #define HOT_RATE   64
@@ -318,7 +276,7 @@ int pc_store_hot_rate(void)
 	return HOT_RATE;
 }
 
-/* 12nx: the held walk's distinct-key sketches - see pc_store_sketch */
+/* the held walk's distinct-key sketches - see pc_store_sketch */
 static unsigned char hll[PC_MAX_COLLECTIONS][2][PC_HLL_M];
 static unsigned int hll_gen[PC_MAX_COLLECTIONS];
 static unsigned int hll_at[PC_MAX_COLLECTIONS];
@@ -334,8 +292,8 @@ static void colst_reset(int i)
 			__atomic_store_n(&colst[i][s].hist[c], 0,
 				__ATOMIC_RELAXED);
 	}
-	hot_reset(i);                   /* S397 */
-	__atomic_store_n(&hll_gen[i], 0, __ATOMIC_RELEASE);   /* 12nx: a new slot has no walk */
+	hot_reset(i);
+	__atomic_store_n(&hll_gen[i], 0, __ATOMIC_RELEASE);   /* a new slot has no walk */
 }
 
 void pc_store_note_set(pcache_htable_t *ht, size_t klen, size_t vlen)
@@ -361,30 +319,13 @@ void pc_store_note_set(pcache_htable_t *ht, size_t klen, size_t vlen)
 	__atomic_fetch_add(&colst[i][s].hist[c], 1, __ATOMIC_RELAXED);
 }
 
-/* S109: what a collection HOLDS, from a walk - not from this node's own
- * write stream (S67's estimate went blank on a node whose records all
- * arrived by the push, the sweep or the bootstrap pull).  The
- * maintenance thread walks each collection whole with the S40 cursor,
- * 1024 buckets per step under the bucket seqlock, values copied out as
- * SCAN does (the keys-only walk reports no length by design, and a
- * length-only flag would be a change to the vendored core), and
- * publishes the sum.  It paces itself on its own cost: the next walk
- * is 20x the last one's duration away, never sooner than 5 s nor later
- * than 60 s, so a large collection costs this thread at most 5%.  The
- * figure is exact when taken and a few seconds old when read. */
+/* held: the maintenance thread walks each collection whole, values copied as SCAN does, and
+ * paces itself at 20x the walk's cost (5..60 s), so it costs that thread at most 5% */
 #define PC_HELD_MIN_S 5
 #define PC_HELD_MAX_S 60
 
-/* 12nx: a HyperLogLog sketch of the keys each held walk saw - 4,096 one-
- * byte registers (p = 12, a standard error of 1.6%) per collection, built
- * fresh by every walk, so it is the keys held AT that walk and a delete or
- * an expiry is simply absent from the next one (a sketch cannot remove).
- * The hash is fixed (FNV-1a 64 then murmur's fmix64), the same on every
- * node, so the dashboard can merge the members' sketches - the max of
- * each register - into the fleet's distinct keys: what store mode can
- * otherwise only bound from below.  Two buffers per collection: the walk
- * fills the one readers are not on, then flips the generation. */
-/* (the registers, their generation and walk time are declared above colst_reset) */
+/* the HLL of the keys each held walk saw (p = 12, 1.6% error), rebuilt by every walk; the hash
+ * is the same on every node, so the dashboard merges members' sketches by register max */
 
 static inline uint64_t hll_hash(const char *k, size_t n)
 {
@@ -419,10 +360,10 @@ int pc_store_sketch(int i, unsigned char *out, unsigned int *walked_at)
 }
 
 struct held_acc {
-	unsigned char *hll;                /* 12nx: the registers this walk fills */
+	unsigned char *hll;                /* the registers this walk fills */
 	unsigned long long sum;            /* key + value bytes */
-	unsigned long long hist[8];        /* S116: value sizes, size_hist's classes */
-	unsigned long long cells;          /* S120: the cells the records occupy */
+	unsigned long long hist[8];        /* value sizes, size_hist's classes */
+	unsigned long long cells;          /* the cells the records occupy */
 };
 
 static int held_cb(const str *key, const str *val, unsigned int expires,
@@ -433,7 +374,7 @@ static int held_cb(const str *key, const str *val, unsigned int expires,
 	int c = 0;
 
 	(void)expires;                     /* held until the sweep frees it */
-	if (a->hll) {                      /* 12nx */
+	if (a->hll) {
 		uint64_t h = hll_hash(key->s, (size_t)key->len);
 		unsigned int idx = (unsigned int)(h >> (64 - PC_HLL_P));
 		uint64_t w = (h << PC_HLL_P) | (1ULL << (PC_HLL_P - 1));
@@ -443,7 +384,6 @@ static int held_cb(const str *key, const str *val, unsigned int expires,
 			a->hll[idx] = rho;
 	}
 	a->sum += (unsigned long long)key->len + (unsigned long long)val->len;
-	/* classes: <=64, <=256, <=1K, <=4K, <=16K, <=64K, <=256K, more */
 	while (c < 7 && v > (64u << (2 * c)))
 		c++;
 	a->hist[c]++;
@@ -462,9 +402,8 @@ void pc_store_held_tick(void)
 		unsigned int cursor = 0, span, g;
 		struct timespec t0, t1;
 
-		/* S69: a dropped collection has nothing to walk, and a
-		 * tombstone read back from the collections file has no table
-		 * at all */
+		/* a dropped collection has nothing to walk, and a tombstone
+		 * read back from the collections file has no table at all */
 		if (!__atomic_load_n(&reg[i].live, __ATOMIC_ACQUIRE) ||
 		        !reg[i].ht)
 			continue;
@@ -480,15 +419,8 @@ void pc_store_held_tick(void)
 				break;
 		} while (cursor);
 		clock_gettime(CLOCK_MONOTONIC, &t1);
-		/* Subtract as ONE signed nanosecond quantity.  Taking the two
-		 * components apart and casting the nanosecond difference to
-		 * unsigned turns every walk whose end nanoseconds are below
-		 * its start - about half of them - into 1.8e16 us, which
-		 * truncates to roughly 1,271 seconds.  Measured: a five-second
-		 * walk reported 1,276.283 s.  It was invisible while nobody
-		 * read the figure, but the PACING reads it: span is twenty
-		 * times the walk's cost, so a wrapped reading pinned it to
-		 * PC_HELD_MAX_S whatever the walk really took. */
+		/* one signed nanosecond quantity: an unsigned nanosecond difference wraps on about half
+		 * the walks, and the pacing below reads this figure */
 		{
 			long long dns =
 				(long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
@@ -496,14 +428,14 @@ void pc_store_held_tick(void)
 
 			us = dns > 0 ? (unsigned long long)dns / 1000ULL : 0;
 		}
-		/* S116: the histogram goes to the slot readers are not on */
+		/* the histogram goes to the slot readers are not on */
 		g = reg[i].held_gen + 1;
 		memcpy(reg[i].held_hist[g & 1], acc.hist, sizeof acc.hist);
 		__atomic_store_n(&reg[i].held_gen, g, __ATOMIC_RELEASE);
 		__atomic_store_n(&reg[i].held_cells, acc.cells, __ATOMIC_RELEASE);
 		__atomic_store_n(&reg[i].held_bytes, acc.sum, __ATOMIC_RELEASE);
 		__atomic_store_n(&reg[i].held_at, now, __ATOMIC_RELEASE);
-		__atomic_store_n(&hll_at[i], now, __ATOMIC_RELAXED);              /* 12nx */
+		__atomic_store_n(&hll_at[i], now, __ATOMIC_RELAXED);
 		__atomic_store_n(&hll_gen[i], __atomic_load_n(&hll_gen[i], __ATOMIC_RELAXED) + 1,
 			__ATOMIC_RELEASE);
 		reg[i].held_walk_us = (unsigned int)us;
@@ -516,13 +448,6 @@ void pc_store_held_tick(void)
 	}
 }
 
-/* S131: how long the last held walk took.  The pacing bounds the walk's
- * DUTY CYCLE (it sleeps twenty times its own cost, capped at 60 s) and
- * not its BLOCKING TIME: every other maintenance duty - the expiry
- * sweep, the splitter, the arena reclaim, S69's resize tick - waits
- * behind one walk, so a walk that takes 40 s is 40 s in which a table
- * cannot grow and nothing expires.  That number was recorded and never
- * reported, so the stall had no symptom but its consequences. */
 unsigned int pc_store_held_walk_us(int i)
 {
 	if (i < 0 || i >= reg_n)
@@ -545,8 +470,7 @@ unsigned long long pc_store_held(int i, unsigned int *age_s)
 	return __atomic_load_n(&reg[i].held_bytes, __ATOMIC_ACQUIRE);
 }
 
-/* S120: the index regions a table was carved, noted by whoever carved -
- * the daemon at creation, the maintenance thread at growth */
+/* called by whoever carved: the daemon at creation, the maintenance thread at growth */
 void pc_store_note_index(pcache_htable_t *ht, unsigned long bytes)
 {
 	int i;
@@ -570,8 +494,6 @@ unsigned long long pc_store_held_cells(int i)
 	return __atomic_load_n(&reg[i].held_cells, __ATOMIC_ACQUIRE);
 }
 
-/* S116: the value-size histogram of the last walk; -1 before the first
- * walk (the page shows a dash then, as it does for held). */
 int pc_store_held_hist(int i, unsigned long long hist[8])
 {
 	unsigned int g;
@@ -594,7 +516,7 @@ int pc_store_size_stats(int i, unsigned long long *bytes,
 	*bytes = *n = 0;
 	for (c = 0; c < 8; c++)
 		hist[c] = 0;
-	for (s = 0; s < COLST_STRIPES; s++) {      /* S237 */
+	for (s = 0; s < COLST_STRIPES; s++) {
 		*bytes += __atomic_load_n(&colst[i][s].bytes, __ATOMIC_RELAXED);
 		*n += __atomic_load_n(&colst[i][s].n, __ATOMIC_RELAXED);
 		for (c = 0; c < 8; c++)
@@ -612,7 +534,7 @@ int pc_store_register(const char *name, pcache_htable_t *ht, int pull,
 	reg[reg_n].name = strdup(name);
 	if (!reg[reg_n].name)
 		return -1;
-	reg[reg_n].live = 1;               /* S69 */
+	reg[reg_n].live = 1;
 	reg[reg_n].ht = ht;
 	/* proxy AND shard reads ride the pull path (unicast to the holder
 	 * / owner); shard needs no locator and no broadcast. */
@@ -620,12 +542,12 @@ int pc_store_register(const char *name, pcache_htable_t *ht, int pull,
 	reg[reg_n].proxy = proxy;
 	reg[reg_n].shard = shard;
 	reg[reg_n].eager = eager;
-	reg[reg_n].buckets_log2 = buckets_log2;                      /* S69 */
-	reg[reg_n].floor_log2 = buckets_log2;                        /* S328 */
-	reg[reg_n].autoscale = pc_autoscale_default;                 /* S239 */
-	reg[reg_n].redis_types = pc_types_default;                   /* S280 */
+	reg[reg_n].buckets_log2 = buckets_log2;
+	reg[reg_n].floor_log2 = buckets_log2;
+	reg[reg_n].autoscale = pc_autoscale_default;
+	reg[reg_n].redis_types = pc_types_default;
 	reg[reg_n].as_target = reg[reg_n].as_set = 0;
-	reg[reg_n].nondurable = 0;                                   /* G5 */
+	reg[reg_n].nondurable = 0;
 	__atomic_store_n(&reg_n, reg_n + 1, __ATOMIC_RELEASE);
 	return 0;
 }
@@ -660,15 +582,8 @@ int pc_store_proxy_enabled(pcache_htable_t *ht)
 	return 0;
 }
 
-/* S305: an EAGER collection always pulls.  The fleet-wide layout got it
- * by accident of representation - [cluster] mode = eager is store mode
- * plus the eager flag, and store stamps pull = 1 - while a collection's
- * own mode = eager, and one created at runtime (pc_col_default_pull is
- * proxy || shard), never did.  Such a node, restarted after a crash,
- * lacks every copy it received (they are off its WAL) until the sweep
- * re-sends them, and answered each of those misses "absent" (300 of 300
- * in eagerrestarttest part 1).  Steady state is unchanged: S303 answers
- * a settled eager miss before any pull is considered. */
+/* an eager collection always pulls, whatever its mode: restarted after a crash it lacks every
+ * copy it received (they are off its WAL) until the sweep re-sends them */
 int pc_store_pull_enabled(pcache_htable_t *ht)
 {
 	int i;
@@ -695,17 +610,8 @@ pcache_htable_t *pc_store_find(const char *name, size_t nlen)
 	return NULL;
 }
 
-/* S69: rename a collection.  One pointer swap, so a lookup sees the old
- * name or the new one and never a half-written string.
- *
- * The WAL is why the collections FILE is not updated here: records
- * written before the rename are logged under the OLD name, so a replay
- * must meet that name before the rename record moves it.  The file
- * therefore keeps naming the collection as it was at the start of the
- * replay window, and is brought forward when a checkpoint retires that
- * window (pc_store_persist is called after a successful snapshot) or at
- * once when no WAL is running at all.  0 ok; -1 no such collection;
- * -2 the new name is taken; -3 out of memory or a bad name. */
+/* 0 ok, -1 no such collection, -2 the new name is taken, -3 out of memory or a bad name.  The file
+ * keeps the old name until a checkpoint (at once without a WAL): earlier WAL records carry it */
 int pc_store_rename(const char *from, size_t flen, const char *to, size_t tlen,
 		unsigned long long gen)
 {
@@ -747,14 +653,8 @@ int pc_store_rename(const char *from, size_t flen, const char *to, size_t tlen,
 int pc_store_count(void)              { return __atomic_load_n(&reg_n, __ATOMIC_ACQUIRE); }
 const char *pc_store_name(int i)      { return reg[i].name; }
 pcache_htable_t *pc_store_ht(int i)   { return reg[i].ht; }
-/* S153: the registry slot a table belongs to, -1 if none */
-/* The published table of a live collection AND its publish generation,
- * read together under the registry lock.  Lock-free, the two can
- * disagree: a resize swap bumps `pub` BEFORE it stores the new pointer,
- * so a reader between the two pairs the new generation with the old
- * table.  `dump` hands the generation to its caller as the token every
- * later chunk is checked against, so the pair must be exact - one lock
- * per chunk, not per record. */
+/* the published table and its generation under one lock: lock-free, a resize swap bumps `pub`
+ * before the pointer, and `dump` checks every later chunk against this generation */
 pcache_htable_t *pc_store_find_pub(const char *name, size_t nlen,
 		unsigned long long *pub)
 {
@@ -773,12 +673,8 @@ pcache_htable_t *pc_store_find_pub(const char *name, size_t nlen,
 	return ht;
 }
 
-/* The slot that publishes @ht AND that slot's publish generation, read
- * together under the registry lock; -1 when no slot publishes @ht any
- * more (it was swapped out or dropped since the caller resolved it).  A
- * KEYS walk takes its handle here: slot_of then pub_gen, lock-free, could
- * pair the OLD table with the NEW generation across a swap, and that walk
- * would read the retired table to the end without ever seeing the swap. */
+/* the slot publishing @ht and its generation under one lock (-1: swapped out or dropped since);
+ * lock-free, a KEYS walk could pair the old table with the new generation and miss the swap */
 int pc_store_slot_pub(pcache_htable_t *ht, unsigned long long *pub)
 {
 	int i, slot = -1;
@@ -805,11 +701,10 @@ int pc_store_slot_of(pcache_htable_t *ht)
 }
 int pc_store_live(int i)              { return __atomic_load_n(&reg[i].live, __ATOMIC_ACQUIRE); }
 int pc_store_buckets_log2(int i)      { return reg[i].buckets_log2; }
-int pc_store_floor_log2(int i)        { return reg[i].floor_log2; }    /* S328 */
+int pc_store_floor_log2(int i)        { return reg[i].floor_log2; }
 
-/* S328: an operator's explicit resize is the new floor (the resize verb
- * here, the fleet's announce in pc_store_resize_request) - an automatic
- * resize never calls this, so FLOOR cannot ratchet itself up or down */
+/* only an explicit resize calls this (the verb, or the fleet's announce),
+ * so FLOOR cannot ratchet itself */
 void pc_store_set_floor(const char *name, size_t nlen, int log2)
 {
 	int i;
@@ -825,11 +720,8 @@ void pc_store_set_floor(const char *name, size_t nlen, int log2)
 }
 int pc_store_runtime(int i)           { return reg[i].runtime; }
 
-/* S69 ------------------------------------------------------------------
- * Runtime creation and removal.  Everything below runs on a worker while
- * the daemon serves, so the ordering matters more than the code length:
- * a new entry is complete before the count that publishes it, and a
- * dropped entry stops being findable before a single record is freed. */
+/* ---- runtime creation and removal, on a worker while the daemon serves: a new entry is complete
+ * before the count publishes it, and a dropped one stops being findable before a record is freed */
 
 static int reg_slot_for(const char *name, size_t nlen)
 {
@@ -842,10 +734,8 @@ static int reg_slot_for(const char *name, size_t nlen)
 				return -1;         /* the name is taken */
 			continue;
 		}
-		/* S150 C: a tombstone's table went back to the arena once its
-		 * readers had parked (pc_store_retire_tick); a dead slot is
-		 * reusable once it holds no table.  The size no longer matters:
-		 * the carve takes retired slots before it moves the frontier. */
+		/* a dead slot is reusable once its table went back to the arena (pc_store_retire_tick);
+		 * the size does not matter, the carve takes retired slots first */
 		if (!reg[i].ht)
 			return i;
 	}
@@ -857,9 +747,8 @@ int pc_store_create(const char *name, size_t nlen, int buckets_log2)
 	return pc_store_create_gen(name, nlen, buckets_log2, pc_lamport_tick());
 }
 
-/* S69: the same, with the generation supplied - a create arriving from
- * the fleet keeps the originator's stamp so every node orders it the
- * same way.  A name whose tombstone is NEWER is left dropped. */
+/* a create from the fleet keeps the originator's stamp so every node orders it the same
+ * way; a name whose tombstone is newer is left dropped */
 int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 		unsigned long long gen)
 {
@@ -884,7 +773,7 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 		pthread_mutex_unlock(&reg_mx);
 		return i == -2 ? -2 : -1;
 	}
-	/* S150 C: always a fresh carve - the arena serves it from retired
+	/* always a fresh carve - the arena serves it from retired
 	 * slots before it moves the frontier */
 	fresh = 1;
 	rg0 = pcache_arena_regions_bytes();
@@ -905,12 +794,12 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 		__atomic_store_n(&reg[i].name, nm, __ATOMIC_RELEASE);
 	}
 	reg[i].ht = ht;
-	reg[i].pub++;                      /* S150 B: a publish */
+	reg[i].pub++;                      /* a publish */
 	reg[i].buckets_log2 = buckets_log2;
-	reg[i].floor_log2 = buckets_log2;              /* S328 */
+	reg[i].floor_log2 = buckets_log2;
 	reg[i].runtime = 1;
-	pc_ev_configure(i, PC_EV_INHERIT);              /* S153 */
-	pc_ev_configure_notify(i, PC_EV_INHERIT);       /* PS8 */
+	pc_ev_configure(i, PC_EV_INHERIT);
+	pc_ev_configure_notify(i, PC_EV_INHERIT);
 	reg[i].gen = gen;
 	/* the fleet is one mode over one collection set: a created collection
 	 * takes the cluster's, never a per-collection variant of its own */
@@ -918,15 +807,15 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 	reg[i].proxy = pc_col_default_proxy;
 	reg[i].shard = pc_col_default_shard;
 	reg[i].eager = pc_col_default_eager;
-	reg[i].autoscale = pc_autoscale_default;        /* S239 */
-	reg[i].redis_types = pc_types_default;          /* S280 */
-	/* G5: a created collection is durable - a cache is the config's word,
+	reg[i].autoscale = pc_autoscale_default;
+	reg[i].redis_types = pc_types_default;
+	/* a created collection is durable - a cache is the config's word,
 	 * and a slot a dropped cache left must not hand that on */
 	__atomic_store_n(&reg[i].nondurable, 0, __ATOMIC_RELAXED);
-	reg[i].rs_pending = 0;                          /* S255 */
+	reg[i].rs_pending = 0;
 	reg[i].rs_gen = 0;
 	reg[i].as_target = reg[i].as_set = 0;
-	reg[i].as_gen = 0;                              /* S436 */
+	reg[i].as_gen = 0;
 	colst_reset(i);
 	reg[i].held_bytes = 0;
 	reg[i].held_at = reg[i].held_next = reg[i].held_walk_us = 0;
@@ -964,17 +853,8 @@ static int drop_cb(const str *key, const str *val, unsigned int exp, void *p)
 	return 0;
 }
 
-/* S69: empty a table.  Removing a record DURING a walk moved its
- * neighbours, so a single pass skipped some of them - a 20,000-record
- * table came out 17,452 removed the first time this ran - and a table
- * left holding records is a leak whose cells never return, and worse,
- * records that would reappear if the slot were reused.  So: passes until
- * one removes nothing.
- * S199: that skip was the walk's, not this caller's - the same defect
- * cost the proxy migration 164 of 400 records on rc16 (S198) - and the
- * walk now hands over every record in one pass (scanremovetest).  The
- * loop stays: it is cheap, and a drop that races a writer still wants
- * a second look. */
+/* passes until one removes nothing: the walk hands over every record in one pass, but a drop
+ * racing a writer still wants a second look (a record left would reappear on reuse) */
 static long drain_table(pcache_htable_t *ht)
 {
 	struct drop_walk d;
@@ -1020,24 +900,21 @@ long pc_store_drop_gen(const char *name, size_t nlen, unsigned long long gen)
 	/* off the map first: from here every lookup says "no such
 	 * collection", so nothing new lands in the table being emptied */
 	__atomic_store_n(&reg[found].live, 0, __ATOMIC_RELEASE);
-	reg[found].pub++;                  /* S150 B: a publish */
+	reg[found].pub++;                  /* a publish */
 	reg[found].runtime = 0;
 	reg[found].gen = gen;              /* the tombstone outranks the create */
 	pthread_mutex_unlock(&reg_mx);
 
-	/* ordinary removes: a walk another thread started on this table sees
-	 * it empty under it, which is the concurrent case it already
-	 * handles.  Nothing is freed out from under a pointer - the table
-	 * and its index stay carved for the next create of this size. */
+	/* ordinary removes: a concurrent walk sees the table empty under it, and nothing is
+	 * freed under a pointer */
 	{
 		long left;
 
-		pcache_ht_set_drain(reg[found].ht, NULL);   /* S459 */
+		pcache_ht_set_drain(reg[found].ht, NULL);
 		left = drain_table(reg[found].ht);
 
-		/* S150 C: the table goes back to the arena once every thread
-		 * that could still hold a pointer into it has parked; until
-		 * then the slot keeps it, and reg_slot_for passes the slot by */
+		/* the table goes back to the arena once every thread that could hold a pointer into it
+		 * has parked; until then the slot keeps it and reg_slot_for passes it by */
 		pthread_mutex_lock(&reg_mx);
 		retire_push(reg[found].ht, found);
 		pthread_mutex_unlock(&reg_mx);
@@ -1045,11 +922,8 @@ long pc_store_drop_gen(const char *name, size_t nlen, unsigned long long gen)
 	}
 }
 
-/* S150 B+C: tables the registry no longer publishes - what a resize
- * left, a dropped collection's - waiting for every thread that could
- * hold a pointer into them to park (pc_qs_clear).  A cleared table's
- * regions go back to the arena (pcache_htable_retire), its charge comes
- * off the collection, and the slot that still named it forgets it. */
+/* tables no longer published (a resize's old one, a dropped collection's) wait for every thread
+ * that could hold a pointer to park (pc_qs_clear); then their regions go back to the arena */
 #define RETQ_MAX (PC_MAX_COLLECTIONS * 2)
 static struct {
 	pcache_htable_t *ht;
@@ -1113,66 +987,62 @@ unsigned long long pc_store_pub_gen(int i)
 }
 
 
-/* S69 ------------------------------------------------------------------
- * Resize, in either direction, by migration.
- *
- * Two passes fill the new table from the live one, the registry pointer
- * is swapped, and two more passes follow it.  The version rule does the
- * hard part: a record copied twice is refused the second time, and a
- * record a client wrote to the NEW table after the swap outranks the
- * copy the migration is still carrying, so the passes cannot undo a live
- * write.  Deletes go to both tables while this runs (see
- * pc_store_resize_shadow), because a key deleted after the copier passed
- * it would otherwise be resurrected by the swap.  After the swap the new
- * table drains the old one (S459): a miss reads there and a write carries
- * the key over first, since a key written after the last pass is there only.
- *
- * The budget is records per tick, not buckets: a table's records are
- * what the copy costs, and the maintenance thread has an expiry sweep
- * and a give-back to run in the same second. */
+/* ---- resize by migration: copy passes, the pointer swap, more passes; the version rule keeps
+ * a copy from undoing a live write, and deletes go to both tables (pc_store_resize_shadow) */
 #define RS_PRE_PASSES   2
 #define RS_POST_PASSES  2
 #define RS_BUDGET   50000
 
 struct rs_ctx {
-	unsigned long expired;         /* S184: dropped for having expired */
+	unsigned long expired;         /* dropped for having expired */
+	unsigned long unfit;           /* not copied - no room, an error */
 	pcache_htable_t *to;
 	unsigned int now, budget, n;
 	unsigned long long moved;
 };
 
+/* tests only: PERFCACHED_TEST_RS_COPY_FAIL=<file> - while it exists, an
+ * "nf:" key's copy fails as one that finds the arena full does */
+static int rs_test_nofit(const str *key)
+{
+	static int init;
+	static const char *path;
+
+	if (!init) {
+		path = getenv("PERFCACHED_TEST_RS_COPY_FAIL");
+		init = 1;
+	}
+	return path && key->len >= 3 && !memcmp(key->s, "nf:", 3) &&
+		access(path, F_OK) == 0;
+}
+
 static int rs_copy_cb(const str *key, const str *val,
 		const struct pcache_rec_meta *mt, void *p)
 {
 	struct rs_ctx *c = p;
+	int rc;
 
 	if (c->n >= c->budget)
 		return -1;                 /* this tick's share is spent */
 	c->n++;
 	if (mt->expires && mt->expires <= c->now) {
-		/* S184: it does not travel - and it is GONE, so say so.  A
-		 * resize that drops 16,726 expired records used to report
-		 * nothing at all: the sweep had not reaped them, and the
-		 * new table never saw them. */
+		/* it does not travel, and it is gone: counted, so the resize says so */
 		c->expired++;
-		/* S333: and gone without a delete - the new table has no
-		 * record of it to floor a later write's version on, so the
-		 * clock carries it (pcache_ht_sweep says why) */
+		/* gone without a delete: the new table has no record to floor a later write's version
+		 * on, so the clock carries it (pcache_ht_sweep says why) */
 		pc_lamport_publish(mt->ver);
 		return 0;
 	}
-	/* the record's own version and expiry, PASSIVE if it is a replica,
-	 * and its TYPE (S280) - a copy that arrives at the new table must be
-	 * the same record, not a fresh local write */
-	/* S275: and its WRITE TICK - which says whether it is a recovered
-	 * record the reconcile has not ruled on (S245).  Restamped, a
-	 * replayed key the fleet had deleted read as freshly written and the
-	 * sweep pushed it back to every peer: measured, 236 of 1500 deleted
-	 * keys back on the whole fleet after a shrink mid-reconcile. */
-	if (pcache_ht_store_copy(c->to, key, val, mt->expires,
-	        (unsigned char)(mt->rflags & (PCACHE_F_PASSIVE | PCACHE_F_CARRY)),
-	        mt->ver, mt->wtick) == 0)
+	/* the same record, not a fresh local write: version, expiry, PASSIVE/CARRY, type and write
+	 * tick (a recovered record the reconcile has not ruled on must stay one) */
+	rc = rs_test_nofit(key) ? -2 : pcache_ht_store_copy(c->to, key, val,
+		mt->expires,
+		(unsigned char)(mt->rflags & (PCACHE_F_PASSIVE | PCACHE_F_CARRY)),
+		mt->ver, mt->wtick);
+	if (rc == 0)
 		c->moved++;
+	else if (rc != PCACHE_E_OLDER)
+		c->unfit++;                /* the original is all there is */
 	return 0;
 }
 
@@ -1201,16 +1071,15 @@ int pc_store_resize_start(const char *name, size_t nlen, int target_log2)
 		pthread_mutex_unlock(&reg_mx);
 		return -2;
 	}
-	/* S150 D: the size it was MADE at is not the size it has grown to -
+	/* the size it was MADE at is not the size it has grown to -
 	 * a table split up from 2^12 may be resized back to 2^12 */
 	if (reg[found].buckets_log2 == target_log2 &&
 	    pcache_ht_nbuckets(reg[found].ht) <= (1U << target_log2)) {
 		pthread_mutex_unlock(&reg_mx);
 		return -5;
 	}
-	/* a target the splitter would immediately undo is refused rather
-	 * than performed and lost: it grows while a bucket holds more than
-	 * four records */
+	/* a target the splitter would undo at once (it grows past four records a bucket) is
+	 * refused rather than performed and lost */
 	pcache_ht_totals(reg[found].ht, &tot);
 	if (tot.entries > ((unsigned long long)4 << target_log2)) {
 		pthread_mutex_unlock(&reg_mx);
@@ -1222,7 +1091,7 @@ int pc_store_resize_start(const char *name, size_t nlen, int target_log2)
 		pthread_mutex_unlock(&reg_mx);
 		return -4;
 	}
-	/* S331: the upstream shadow goes with the collection, not the table:
+	/* the upstream shadow goes with the collection, not the table:
 	 * a resize (autoscale's included) must not stop read-through */
 	pcache_ht_set_shadow(to, __atomic_load_n(&reg[found].ht->shadow,
 		__ATOMIC_ACQUIRE));
@@ -1233,27 +1102,16 @@ int pc_store_resize_start(const char *name, size_t nlen, int target_log2)
 	reg[found].rs_target = target_log2;
 	reg[found].rs_cursor = 0;
 	reg[found].rs_pass = 0;
+	reg[found].rs_unfit = 0;
+	reg[found].rs_unfit_said = 0;
 	reg[found].rs_swapped = 0;
 	reg[found].rs_moved = 0;
 	pthread_mutex_unlock(&reg_mx);
 	return 0;
 }
 
-/*
- * S255: a resize the FLEET asked for (handle_col_set), as opposed to one
- * a client asked this node for.  Two things pc_store_resize_start cannot
- * do for it:
- *   - order: @gen is the announce's generation, strictly rising (the
- *     sender ticks its clock for it).  One older than the newest applied
- *     is a late or repeated announce of a resize since superseded, and is
- *     ignored - which is what lets a sender repeat its announce;
- *   - wait: a node still running the previous resize used to REFUSE the
- *     new one, silently (-2, discarded), and kept the old size for good
- *     while the rest of the fleet moved on.  It is held instead, and
- *     started when the running one finishes; a newer one replaces it.
- * Returns what pc_store_resize_start returns, 1 for ignored (older), 2
- * for held.
- */
+/* @gen rises strictly (the sender ticks its clock), so an older one is a late or repeated announce;
+ * one arriving mid-resize is held, not refused, or this node would keep the old size for good */
 int pc_store_resize_request(const char *name, size_t nlen, int target_log2,
 		unsigned long long gen)
 {
@@ -1274,9 +1132,8 @@ int pc_store_resize_request(const char *name, size_t nlen, int target_log2,
 	}
 	if (gen)
 		reg[i].rs_gen = gen;
-	/* S328: the fleet's resize is an operator's, so its size becomes the
-	 * floor here too - once it is ACCEPTED, started or held; a refused
-	 * one moves nothing */
+	/* the fleet's resize is an explicit one, so its size becomes the floor here too - once
+	 * accepted (started or held); a refused one moves nothing */
 	if (reg[i].rs_to) {
 		reg[i].rs_pending = target_log2;
 		reg[i].floor_log2 = target_log2;
@@ -1297,7 +1154,7 @@ int pc_store_resize_request(const char *name, size_t nlen, int target_log2,
 	return rc;
 }
 
-/* S255: a resize this node started for a client and announced at @gen */
+/* a resize this node started for a client and announced at @gen */
 void pc_store_resize_gen_note(const char *name, size_t nlen,
 		unsigned long long gen)
 {
@@ -1315,7 +1172,7 @@ void pc_store_resize_gen_note(const char *name, size_t nlen,
 	pthread_mutex_unlock(&reg_mx);
 }
 
-/* S453: a walk that must see every record (the snapshot's) holds the swap
+/* a walk that must see every record (the snapshot's) holds the swap
  * and the drain's end; while it holds, the pair it was given stays as it is */
 static int walk_holds;
 
@@ -1345,28 +1202,8 @@ pcache_htable_t *pc_store_resize_shadow(pcache_htable_t *ht)
 	return NULL;
 }
 
-/*
- * S257: a client's scan across a resize.
- *
- * pcache_ht_scan_ex's cursor is a bucket index into the table it is given,
- * and its contract assumed tables only grow in place (3.4).  Since S69 a
- * resize is a MIGRATION and a swap, either way: after a shrink a cursor
- * past the new table's size walked nothing and reported the scan complete
- * (the spread census: node 1 at 294k keys of 641k), after a grow it
- * indexed buckets holding other keys.  Here the store, which knows the
- * swap, packs the cursor:
- *   bit  31     the overflow-leg flag, where it always was (S121 -
- *               PCACHE_CURSOR_OVF; legwalktest reads it off the wire)
- *   bits 30-28  the table's generation, 1..7 (a swap changes it; a cursor
- *               from another generation restarts at 0 - SCAN may repeat a
- *               key, it may not skip one)
- *   bit  27     walking the OLD table of a swapped resize still draining
- *   bits 26-0   the inner bucket / chain index
- * While a swapped resize drains, the walk takes the old table FIRST, then
- * the live one: a record the drain moves during the walk is seen before it
- * leaves or after it arrives.  Before the swap the live table holds every
- * record, and the swap itself restarts the walk.
- */
+/* client cursor: bit 31 the overflow-leg flag (PCACHE_CURSOR_OVF), bits 30-28 the table's
+ * generation 1..7 (another restarts at 0), bit 27 the OLD table of a draining resize, 26-0 index */
 #define SC_GEN_SHIFT 28
 #define SC_GEN_MASK  0x70000000u
 #define SC_OLD       0x08000000u
@@ -1443,9 +1280,8 @@ void pc_store_resize_tick(void)
 		if (!__atomic_load_n(&reg[i].live, __ATOMIC_ACQUIRE) ||
 		        !reg[i].rs_to)
 			continue;
-		/* before the swap: from the live table into the new one.
-		 * After it the two have changed places - rs_to holds the OLD
-		 * table - and the passes drain the old into the live one. */
+		/* before the swap: live into new; after it rs_to holds the OLD
+		 * table and the passes drain it into the live one */
 		from = reg[i].rs_swapped ? reg[i].rs_to : reg[i].ht;
 		to = reg[i].rs_swapped ? reg[i].ht : reg[i].rs_to;
 		c.to = to;
@@ -1454,24 +1290,37 @@ void pc_store_resize_tick(void)
 		c.n = 0;
 		c.moved = 0;
 		c.expired = 0;
+		c.unfit = 0;
 		if (pcache_ht_iter_meta_from(from, &reg[i].rs_cursor,
 		        rs_copy_cb, &c) < 0 && !c.n)
 			continue;              /* the walk failed: try next tick */
 		reg[i].rs_moved += c.moved;
-		if (c.expired)                 /* S184: on the LIVE table */
+		if (reg[i].rs_swapped)
+			reg[i].rs_unfit += c.unfit;
+		if (c.expired)                 /* on the LIVE table */
 			pcache_ht_note_expired(reg[i].ht, c.expired);
 		if (reg[i].rs_cursor)
 			continue;              /* mid-pass */
+		if (reg[i].rs_unfit) {
+			/* the closing drain drops the old table - a pass that
+			 * could not copy everything is made again, until it can */
+			if (!reg[i].rs_unfit_said)
+				LM_WARN("collection '%s': resize: %lu record(s) not copied "
+					"into the new table - no room in the arena; the old "
+					"table keeps them and the resize waits for room\n",
+					reg[i].name, reg[i].rs_unfit);
+			reg[i].rs_unfit_said = 1;
+			reg[i].rs_unfit = 0;
+			continue;
+		}
 		reg[i].rs_pass++;
 		if (!reg[i].rs_swapped) {
 			if (reg[i].rs_pass < RS_PRE_PASSES)
 				continue;
-			/* THE COMMIT POINT: one store, and every lookup from
-			 * here lands in the new table.  The old one keeps
-			 * taking the writes of requests that resolved before
-			 * this instant, which the passes below collect. */
+			/* THE COMMIT POINT: every lookup from here lands in the new table; the old one still
+			 * takes writes from requests resolved before, which the passes below collect */
 			pthread_mutex_lock(&reg_mx);
-			if (walk_holds) {          /* S453: after the snapshot's walk */
+			if (walk_holds) {          /* after the snapshot's walk */
 				pthread_mutex_unlock(&reg_mx);
 				continue;
 			}
@@ -1479,23 +1328,19 @@ void pc_store_resize_tick(void)
 				pcache_htable_t *old = reg[i].ht;
 				pcache_ht_totals_t oa, oc;
 
-				/* S184: the new table's counters start at
-				 * zero, so a collection's lifetime figures
-				 * reset every time it resized.  Carry them
-				 * before the swap, while `old` is still the
-				 * published table. */
+				/* the new table's counters start at zero: carry the
+				 * lifetime figures while `old` is still the published table */
 				pcache_ht_totals(old, &oa);
 				pcache_ht_totals_client(old, &oc);
 				pcache_ht_carry_totals(reg[i].rs_to, &oa, &oc);
-				/* S358: and what the resets took off, so the
+				/* and what the resets took off, so the
 				 * raw totals /metrics reads carry on too */
 				pcache_ht_carry_reset(reg[i].rs_to, old);
 
-				/* S459: before the publish - a reader of the
-				 * new table falls back to the old one, and a
-				 * writer carries the key over first */
+				/* before the publish: a reader of the new table falls
+				 * back to the old one, and a writer carries the key over first */
 				pcache_ht_set_drain(reg[i].rs_to, old);
-				reg[i].pub++;      /* S150 B: a publish */
+				reg[i].pub++;      /* a publish */
 				__atomic_store_n(&reg[i].ht, reg[i].rs_to,
 					__ATOMIC_RELEASE);
 				__atomic_store_n(&reg[i].rs_to, old,
@@ -1513,20 +1358,19 @@ void pc_store_resize_tick(void)
 		}
 		if (reg[i].rs_pass < RS_POST_PASSES)
 			continue;
-		/* done: the old table is emptied and kept carved for the next
-		 * create or resize of its size */
+		/* done: the old table is emptied, then retired */
 		{
 			pcache_htable_t *old = reg[i].rs_to;
 			long left;
 
 			pthread_mutex_lock(&reg_mx);
-			if (walk_holds) {          /* S453: after the snapshot's walk */
+			if (walk_holds) {          /* after the snapshot's walk */
 				pthread_mutex_unlock(&reg_mx);
 				continue;
 			}
 			reg[i].rs_closing = 1;
 			pthread_mutex_unlock(&reg_mx);
-			pcache_ht_set_drain(reg[i].ht, NULL);   /* S459 */
+			pcache_ht_set_drain(reg[i].ht, NULL);
 			left = drain_table(old);
 
 			pthread_mutex_lock(&reg_mx);
@@ -1535,18 +1379,17 @@ void pc_store_resize_tick(void)
 			reg[i].rs_swapped = 0;
 			reg[i].rs_closing = 0;
 			reg[i].rs_cursor = 0;
-			/* S150 B: unpublished on both paths now (the swap took it
-			 * off `ht`, this took it off the shadow); it waits for the
-			 * threads that may still hold it, then goes back (C) */
+			/* unpublished on both paths now (the swap took it off `ht`, this off
+			 * the shadow); it goes back once the threads that may hold it have parked */
 			retire_push(old, i);
-			pend = reg[i].rs_pending;      /* S255 */
+			pend = reg[i].rs_pending;
 			reg[i].rs_pending = 0;
 			pthread_mutex_unlock(&reg_mx);
 			LM_NOTICE("collection '%s': resize complete at 2^%d "
 				"buckets (%llu carried, %ld left behind in the "
 				"old table)\n", reg[i].name,
 				reg[i].buckets_log2, reg[i].rs_moved, left);
-			/* S255: a fleet resize that found this one running */
+			/* a fleet resize that found this one running */
 			if (pend && pend != reg[i].buckets_log2) {
 				int prc = pc_store_resize_start(reg[i].name,
 					strlen(reg[i].name), pend);
@@ -1561,9 +1404,8 @@ void pc_store_resize_tick(void)
 	}
 }
 
-/* S69: remember that this NAME was dropped at @gen, without there being
- * a table to empty - a tombstone read back from the file, or a drop
- * announced by a peer for a collection this node never had. */
+/* a tombstone with no table to empty: read back from the file, or a drop announced by a
+ * peer for a collection this node never had */
 void pc_store_note_drop(const char *name, size_t nlen, unsigned long long gen)
 {
 	int i;
@@ -1597,9 +1439,7 @@ void pc_store_note_drop(const char *name, size_t nlen, unsigned long long gen)
 	pthread_mutex_unlock(&reg_mx);
 }
 
-/* S69: the created set, for a peer that has just come up - name,
- * size, generation and whether it is a tombstone.  Returns 0 while @i is
- * in range. */
+/* the created set, for a peer that has just come up; 0 while @i is in range */
 int pc_store_entry(int i, const char **name, int *buckets_log2,
 		unsigned long long *gen, int *live)
 {
@@ -1612,16 +1452,8 @@ int pc_store_entry(int i, const char **name, int *buckets_log2,
 	return 0;
 }
 
-/* ---- the created set on disk ----------------------------------------
- *
- *   perfcached-collections 1
- *   collection sbcha 18
- *   collection sessions 12
- *
- * Written whole and renamed over the old file, so a torn write leaves the
- * previous set rather than half of this one.  Only runtime creations are
- * listed: a collection from the config file belongs to the config file,
- * and writing it here would resurrect it after the operator removed it. */
+/* ---- the created set on disk: "collection <name> <log2> <gen> <live>" lines, written whole and
+ * renamed over; config collections are not listed (that would resurrect one the config removed) */
 #define COLFILE_HEADER "perfcached-collections 1"
 
 static char colfile_dir[512];   /* remembered by pc_store_load() */
@@ -1651,9 +1483,8 @@ int pc_store_persist(void)
 		fprintf(f, "collection %s %d %llu %d\n", reg[i].name,
 			reg[i].buckets_log2, reg[i].gen, reg[i].live ? 1 : 0);
 	}
-	/* S239: a mode the verb set, config collections included - a line
-	 * an older build skips (it is not a "collection" line).  S436: and
-	 * its generation, a third field a build before reads past */
+	/* a mode the verb set, config collections included, with its generation: lines an
+	 * older build skips (not "collection" lines) */
 	for (i = 0; i < n; i++)
 		if (reg[i].live && reg[i].as_set)
 			fprintf(f, "autoscale %s %s %llu\n", reg[i].name,
@@ -1694,8 +1525,8 @@ int pc_store_load(const char *state_dir)
 		int live = 1, rc;
 		char mode[16];
 
-		/* S239: the verb's mode, applied over the config's; S436: with
-		 * its generation (none from a build before: 0) */
+		/* the verb's mode, applied over the config's, with its
+		 * generation (0 when the line has none) */
 		if (sscanf(line, "autoscale %63s %15s %llu", name, mode,
 		        &gen) >= 2) {
 			int m = pc_autoscale_parse(mode), i;
@@ -1722,8 +1553,8 @@ int pc_store_load(const char *state_dir)
 		}
 		if (pc_store_find(name, strlen(name)))
 			continue;          /* the config declares it too */
-		/* S343: a name from before the rule is KEPT - its records are
-		 * this node's data - and said, so an operator renames it */
+		/* a name from before the rule is KEPT - its records are
+		 * this node's data - and said, so it can be renamed */
 		if (!pc_col_name_held_ok(name, strlen(name))) {
 			char pb[4 * PC_COL_NAME_MAX + 1];
 
@@ -1750,12 +1581,8 @@ int pc_store_load(const char *state_dir)
 
 void pc_store_reset(void)             { reg_n = 0; }
 
-/* ---- G5: cache collections, not durable --------------------------------
- * `[collection x] durable = no`: the collection's records are never WAL-
- * logged and never written to the snapshot, and a restart starts it empty
- * - on this node; in a fleet, the peers' copies still reach it the
- * ordinary ways (the eager repair, a pull on a miss).  Set from the config
- * at start, never at runtime (a reload refuses the change by name). */
+/* ---- cache collections (`durable = no`): never WAL-logged or snapshotted, empty after a restart
+ * on this node (peers' copies still reach it); set at start only, a reload refuses the change */
 static int any_nondurable;             /* none: the WAL looks nothing up */
 
 void pc_store_set_nondurable_idx(int i, int on)
@@ -1778,8 +1605,8 @@ int pc_store_durable(pcache_htable_t *ht)
 	return pc_store_durable_idx(pc_store_slot_of(ht));
 }
 
-/* by name - the WAL knows a collection only by its name.  One load while
- * no collection is a cache, which is every fleet that does not use G5 */
+/* by name - the WAL knows a collection only by its name.  One load
+ * while no collection is a cache */
 int pc_store_durable_name(const char *name, size_t nlen)
 {
 	int i, n;
@@ -1800,7 +1627,7 @@ int pc_store_durable_name(const char *name, size_t nlen)
 	return 1;
 }
 
-/* ---- S280: redis_types ------------------------------------------------- */
+/* ---- redis_types ------------------------------------------------------- */
 
 int pc_types_default = PC_TYPES_STRICT;
 
@@ -1821,7 +1648,7 @@ int pc_store_types_strict(pcache_htable_t *ht)
 	return pc_types_default == PC_TYPES_STRICT;
 }
 
-/* ---- S239: autoscale --------------------------------------------------- */
+/* ---- autoscale --------------------------------------------------------- */
 
 int pc_autoscale_default = PC_AUTOSCALE_AUTO;
 
@@ -1854,9 +1681,8 @@ int pc_store_autoscale_apply(const char *name, size_t nlen, int m,
 	else if (reg[found].as_set &&
 	         (gen < reg[found].as_gen ||
 	          (gen == reg[found].as_gen && m <= reg[found].autoscale)))
-		/* S436: older, or the same change again (a resync re-sends
-		 * it every few seconds).  Not "set" over nothing set: any mode
-		 * set at runtime outranks the config's, whatever its stamp */
+		/* older, or the same change again (a resync re-sends it every few seconds); any
+		 * runtime mode outranks the config's, whatever its stamp */
 		rc = 0;
 	else {
 		__atomic_store_n(&reg[found].autoscale, m, __ATOMIC_RELAXED);

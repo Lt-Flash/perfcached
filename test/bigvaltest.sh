@@ -1,17 +1,6 @@
 #!/bin/sh
-# bigvaltest.sh - S174: values up to the largest cell a chunk can cut.
-#
-# The arena's top size class was 64 KB, so a value over ~65,470 bytes was
-# refused.  Measured against the operator's production keyspace (61,944
-# keys, 2026-09-20): 19 values did not fit, the largest 218,265 bytes -
-# so the ceiling was a product limit, not a theoretical one.
-#
-# A chunk is ONE 256 KB slot with a 64-byte header, so the largest class
-# that can be cut is 262,080 (exactly one cell, no waste); 262,144 would
-# cut zero cells.  That is the ceiling this pins, at the doors and
-# through the walk - a record larger than the walk's snapshot buffers
-# would be truncated on KEYS/dump/replication rather than refused.
-# Usage: test/bigvaltest.sh [./perfcached]
+# bigvaltest.sh - values up to 262,080 bytes, the largest cell a 256 KB chunk with a 64-byte header
+# can cut, at the doors, through the walk and in the WAL.  Usage: test/bigvaltest.sh [./perfcached]
 set -u
 
 BIN=${1:-./perfcached}
@@ -48,7 +37,7 @@ mkdir -p "$D/wal"
 "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 &
 P1=$!
 i=0
-while [ $i -lt 100 ]; do
+while [ $i -lt 300 ]; do        # 10 s ran out under ASan, the node mid-start (113384)
 	grep -q "perfcached ready" "$D/a.log" && break
 	sleep 0.1; i=$((i+1))
 done
@@ -90,8 +79,8 @@ def mkval(n):
     v = (seed * (n // len(seed) + 1))[:n]
     return v[:n-1] + b"Z"
 
-# 213.1 kB is the largest value in the operator's production keyspace;
-# 98,304 and 131,072 are class boundaries; 65,470 is the OLD ceiling.
+# 213.1 kB is the largest value of a real keyspace; 98,304 and 131,072 are class
+# boundaries; 65,470 is a former ceiling
 for n in (65470, 98304, 131072, 218265):
     v = mkval(n)
     r = call("SET", "big:%d" % n, v)
@@ -152,11 +141,8 @@ PYEOF
 rc=$?
 [ $rc = 0 ] || exit $rc
 
-# ---- durability: a record the store accepts must reach the log --------
-# The WAL kept a record cap of its own, a flat 80 KB - above the old cell
-# ceiling and below the new one.  A big value would have been acknowledged
-# to the client and then dropped from the log, and would vanish on the
-# next restart.
+# ---- durability: a record the store accepts must reach the log, whose own record cap must not
+# drop an acknowledged big value
 kill -TERM $P1 2>/dev/null; wait $P1 2>/dev/null; P1=
 : > "$D/a.log"                 # the ready line must be THIS start's
 "$BIN" -f "$D/a.conf" >> "$D/a.log" 2>&1 &

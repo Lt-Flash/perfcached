@@ -1,18 +1,6 @@
 #!/bin/sh
-# openstatstest.sh - S123: the doors report what is OPEN now beside the
-# running totals, and the totals can be reset - from the native door
-# (reset_stats), the RESP door (CONFIG RESETSTAT), the page (POST
-# /reset-stats, the only mutating HTTP route) and perfcli (reset-stats).
-# Two raw-frame connections, two CMD ones (through pcnative) and a
-# RESP-door one are held open and the stats block must count them open by
-# dialect - since S317 every native connection that spoke is binary, so
-# the four native ones are one gauge; a CMD request on a connection opened
-# with a raw frame is one more request on that dialect and no new
-# connection; closing one takes it out of the gauge and not out of the
-# total; a reset zeroes every total and stamps `since`, and leaves the
-# gauges - open connections, entries - alone.  Fail-first: a build before
-# S123 has no `open`, no `since`, answers method-not-found to reset_stats
-# and 405 to the POST.
+# openstatstest.sh - the doors report what is OPEN now beside the running totals (a close leaves the
+# total), and every reset path zeroes the totals, stamps `since` and leaves the gauges alone.
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -87,8 +75,8 @@ def stats():
 st = stats(); nt = st["native"]; rs = st["resp"]
 out["open1"] = "bin=%s/%s/%s resp=%s/%s/%s" % (nt["binary"].get("open"), nt["binary"]["conns"], nt["binary"]["requests"], rs.get("open"), rs["conns"], rs["requests"])
 breq0 = nt["binary"]["requests"]
-# a CMD request on a connection opened with a raw frame (S317: one native
-# dialect, so it is one more request on the same gauge and no new connection)
+# a CMD request on a connection opened with a raw frame: one native dialect, so it is
+# one more request on the same gauge and no new connection
 bw = pcnative.wrap(b1); bw.write(b'{"jsonrpc":"2.0","id":9,"method":"members"}\n'); bw.flush(); bw.readline()
 st = stats(); nt = st["native"]
 # two binary requests since the last reading: the previous stats call itself, and the members frame

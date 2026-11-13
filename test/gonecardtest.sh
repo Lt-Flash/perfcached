@@ -1,17 +1,6 @@
 #!/bin/sh
-# gonecardtest.sh - S192: a member that LEAVES keeps its place in the
-# fleet view for a couple of minutes.
-#
-# A node that shuts down cleanly sends GOODBYE and its peers purge it:
-# the slot's id is zeroed, so it fell out of /members entirely and its
-# card vanished from every other node's page.  The operator saw it
-# during a rolling deploy - "one node disappeared and there was no
-# backup" - and a fleet of three silently reading as two is the worst
-# possible way to show a restart.  The id is reserved for a week; the
-# CARD is kept for two minutes, which is what a restart takes.
-#
-# Fail-first: without S192 the departed node is absent from /members and
-# the first assertion below fails on a KeyError.
+# gonecardtest.sh - a member that leaves keeps its card in the fleet view for about two minutes, and
+# one that said goodbye does not read the same as one that just stopped.
 set -u
 
 BIN=${1:-./perfcached}
@@ -59,10 +48,8 @@ while [ $i -lt 200 ]; do
 done
 grep -q "perfcached ready" "$D/n1.log" || { echo "node 1 did not start"; cat "$D/n1.log"; exit 1; }
 
-# node 2 leaves the way a deploy makes it leave: SIGTERM, so it says
-# goodbye rather than simply stopping answering.  S293: node 3 leaves
-# the way 245's container did on 2026-10-01 - it simply stops (kill -9)
-# - and the two must NOT read the same: only one said goodbye.
+# node 2 leaves as a deploy makes it, SIGTERM and a goodbye; node 3 simply stops (kill -9), and the
+# two must not read the same
 python3 - "$P2" "$P3" <<'PY_EOF'
 import json, os, signal, sys, time, urllib.request
 
@@ -105,9 +92,8 @@ if m:
     (ok if m.get("gone_s", -1) >= 0 else bad)(
         "with how long ago it left (%s s)" % m.get("gone_s"))
     (ok if m.get("node") == peer else bad)("under its own id, which is held for it")
-    # the card's lifetime is the RESERVATION's, not a display timer: it
-    # goes when nothing is holding the id any more, which is the only
-    # honest moment for it to go
+    # the card's lifetime is the reservation's, not a display timer: it goes when
+    # nothing holds the id any more
     held = m.get("held_s", 0)
     (ok if held > 600000 else bad)(
         "and says how much longer the id is held - a week, not a made-up "
@@ -115,7 +101,7 @@ if m:
     (ok if m.get("gone_reason") == "goodbye" else bad)(
         "S293: the SIGTERM'd node left by saying goodbye (%r)" % m.get("gone_reason"))
 
-# S293: the killed node is purged after PEER_PURGE_MS of silence (6 s)
+# the killed node is purged after PEER_PURGE_MS of silence (6 s)
 end = time.time() + 30
 while time.time() < end:
     m3 = members().get(lost)
@@ -131,16 +117,12 @@ if m3:
     (ok if m3.get("gone_silent_s", 0) >= 5 else bad)(
         "S293: with how long it was silent before the purge (%s s)" % m3.get("gone_silent_s"))
 
-# S193: and every state a node CAN be in carries its reason, not just
-# the one failure that had a caller remember to set it.  A card that
-# says "recovering" and nothing else is the same complaint S186 fixed
-# for FAILED.
+# and every state a node CAN be in carries its reason, not just FAILED
 st = json.loads(urllib.request.urlopen(
     "http://127.0.0.1:17721/stats", timeout=8).read())
 (ok if "state_reason" in st else bad)("the node publishes its state_reason")
-# stated as an implication a reader can check: the pair must be
-# consistent, and the assertion prints BOTH so a pass cannot hide which
-# branch it took
+# the pair must be consistent; the assertion prints both, so a pass cannot hide
+# which branch it took
 (ok if (st.get("state") == "ready") == (st.get("state_reason") == "") else bad)(
     "state and reason agree: state=%r reason=%r"
     % (st.get("state"), st.get("state_reason")))

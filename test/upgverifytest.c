@@ -1,18 +1,5 @@
-/* upgverifytest.c - an upgrade artifact's checks (upgverify.c; the 0.7.2
- * split, wave 1): a key pair made here, an artifact signed with it, and
- * -K's report captured.
- *
- *   A  pc_upg_verify: signed by trusted_keys[1] - named, with its tag;
- *      by a key nobody trusts, or over other bytes - refused, counting
- *      the keys tried; no [upgrade] section - the built-in keys only
- *   B  pc_upg_read_sig: 64 raw bytes; 128 hex characters, with or
- *      without a line end; anything else -2; no file -1 (ENOENT)
- *   C  pc_upg_read_file: the bytes, whole; a directory refused (EFBIG,
- *      which -K says as "not a regular file of at most 1 GB")
- *   D  pc_upg_check_file: GOOD naming the key (0); BAD (1); no signature
- *      refused (1) unless allow_unsigned (0); a signature file of the
- *      wrong shape UNREADABLE (1); an artifact that is not there (2)
- */
+/* upgverifytest.c - an upgrade artifact's checks: a key pair made here, an artifact signed with it,
+ * and -K's report captured. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -95,7 +82,7 @@ int main(void)
 	up.n_keys = 2;
 	sodium_bin2hex(tag, sizeof tag, pk, 4);
 
-	/* A */
+	/* A: pc_upg_verify - a trusted key named, an untrusted key or other bytes refused, built-ins */
 	snprintf(want, sizeof want, "trusted_keys[1] %s", tag);
 	CHK(pc_upg_verify(body, sizeof body - 1, sig, &up, who, sizeof who) == 0 && !strcmp(who, want),
 		"A: signed by trusted_keys[1] - verified, named (%s)", who);
@@ -110,7 +97,7 @@ int main(void)
 	CHK(pc_upg_verify(body, sizeof body - 1, sig, NULL, who, sizeof who) == -1 && strstr(who, "0 in trusted_keys"),
 		"A: no [upgrade] section - only the built-in keys tried");
 
-	/* B */
+	/* B: pc_upg_read_sig - 64 raw bytes or 128 hex, a line end or not; else -2, no file -1 */
 	put(sigp, sig, sizeof sig);
 	CHK(pc_upg_read_sig(sigp, got) == 0 && !memcmp(got, sig, sizeof sig), "B: 64 raw bytes - read");
 	sodium_bin2hex(hex, sizeof hex, sig, sizeof sig);
@@ -127,7 +114,7 @@ int main(void)
 	errno = 0;
 	CHK(pc_upg_read_sig(sigp, got) == -1 && errno == ENOENT, "B: no signature file - -1, ENOENT");
 
-	/* C */
+	/* C: pc_upg_read_file - the bytes whole; a directory refused with EFBIG */
 	put(art, body, sizeof body - 1);
 	data = pc_upg_read_file(art, &len);
 	CHK(data && len == sizeof body - 1 && !memcmp(data, body, len), "C: the artifact - read whole (%zu bytes)", len);
@@ -135,7 +122,7 @@ int main(void)
 	errno = 0;
 	CHK(!pc_upg_read_file(dir, &len) && errno == EFBIG, "C: a directory - refused, EFBIG");
 
-	/* D */
+	/* D: pc_upg_check_file - GOOD 0, BAD 1, unsigned 1 unless allowed, UNREADABLE 1, missing 2 */
 	put(sigp, sig, sizeof sig);
 	CHK(check(art, &up) == 0 && strstr(said, "size 17 bytes") && strstr(said, "signature: GOOD, trusted_keys[1]"),
 		"D: -K - GOOD, naming the key");

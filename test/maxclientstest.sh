@@ -1,8 +1,6 @@
 #!/bin/sh
-# maxclientstest.sh - S161: `max_clients` refuses the connection past the
-# limit WITH A REASON, on every door, counts it, logs one line per
-# transition, and keeps the HTTP door answering at the limit.
-# Usage: test/maxclientstest.sh [./perfcached]
+# maxclientstest.sh - max_clients refuses the connection past the limit WITH A REASON on every door,
+# counts it, logs one line per transition, and keeps the HTTP door answering at the limit.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

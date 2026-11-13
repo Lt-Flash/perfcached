@@ -1,26 +1,6 @@
 #!/bin/sh
-# upgraderolltest.sh - UP7a (DESIGN 12ns): the roll driver, perfcli upgrade,
-# on a three-member loopback fleet with the switch hook in place of the root
-# helper.  The "new build" is this same binary restarted by the hook: the
-# driver's up-gate is a new pid on the version asked, so the roll is real
-# in every step but the install.  Cases, in order:
-#   A. a roll: staged on every member (relayed), then one node at a time,
-#      members first and the master last, each gated; done
-#   B. abort asked while a roll runs: it stops between nodes; resume ends it.
-#      The abort connects to nothing (S457): asked of a dead seed, it lands
-#   C. a build that does not come up (the hook kills, does not restart):
-#      the driver reverts THAT node (the hook again), says so, stops, and
-#      prints the rollback commands; the nodes already rolled stay; resume
-#   D. the driver killed mid-roll (SIGKILL after the first gate): resume
-#      re-reads the fleet and the journal and rolls only what is left
-#   E. rollback: the rolled nodes back in reverse order, the master first
-#   F. a member that refuses the artifact (allow_unsigned = no): nothing is
-#      switched, the stop names what is missing
-#   G. UP12b (12nv): plan reads the candidate's share/perfcached/RELEASE -
-#      the tree's own file joins on 2; another version, or a range without
-#      the fleet's epoch, is refused before anything is journalled; 2..3
-#      names the possible commit; a tarball without the file is allowed
-# Usage: test/upgraderolltest.sh [./perfcached] [./perfcli]
+# upgraderolltest.sh - the roll driver (perfcli upgrade) on a three-member loopback fleet, the switch
+# hook in place of the root helper: roll, abort, revert, resume, rollback, refusal, release epochs.
 set -u
 BIN=${1:-./perfcached}; CLI=${2:-./perfcli}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -100,7 +80,6 @@ EOF2
 chmod 755 "$D/hook.sh"
 node 1; node 2; node 3
 start 1; start 2; start 3
-sleep 3.5
 
 P="$CLI -q -h 127.0.0.71 -p 17701 -E roll-enable"
 stats() { python3 - "$@" <<'PY' 2>/dev/null
@@ -111,7 +90,9 @@ s = pcnative.call(f, "stats")["result"]
 print(eval(sys.argv[2]))
 PY
 }
-i=0; while [ $i -lt 100 ] && [ "$(stats 1 's["cluster"]["peers_up"]')" != 2 ]; do sleep 0.2; i=$((i+1)); done
+# a joiner is CONNECTING until its links answer: every node ready and seeing the others, up to 30 s
+formed() { for n in 1 2 3; do [ "$(stats $n 's["state"], s["cluster"]["peers_up"]')" = "('ready', 2)" ] || return 1; done; }
+i=0; while [ $i -lt 150 ] && ! formed; do sleep 0.2; i=$((i+1)); done
 [ "$(stats 1 's["cluster"]["peers_up"]')" = 2 ] && ok "three members up" || bad "peers_up on node 1: $(stats 1 's["cluster"]["peers_up"]')"
 master=$(for n in 1 2 3; do [ "$(stats $n 's["cluster"]["role"]')" = master ] && echo $n; done | head -1)
 [ -n "$master" ] && ok "the master is node $master" || bad "no master"
@@ -121,7 +102,10 @@ pids() { cat "$D/pid1" "$D/pid2" "$D/pid3" | tr '\n' ' '; }
 P0=$(pids)
 r=$($P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j1" ready_s=20 gate_s=40 2>&1); rc=$?
 [ $rc -eq 0 ] && grep -q '^[0-9]* plan artifact=' "$D/j1" && ok "A. plan: the journal holds the artifact, its sha256 and the version" || bad "A. plan rc=$rc: $r"
-r=$($P upgrade start journal="$D/j1" 2>&1); rc=$?
+# the printed next command, the enable secret filled in, is what starts the roll
+next=$(echo "$r" | sed -n 's/^next: perfcli \(.*\) -E <enable> \(upgrade start .*\)$/\1 -E roll-enable \2/p')
+[ "$next" = "-h 127.0.0.71 -p 17701 -E roll-enable upgrade start journal=$D/j1" ] && ok "A. plan: next names the seed as perfcli takes it" || bad "A. plan: $(echo "$r" | grep '^next:')"
+r=$($CLI -q ${next:-next-not-printed} 2>&1); rc=$?
 [ $rc -eq 0 ] && grep -q 'staged on every member' "$D/j1" && [ "$(grep -c 'event=gated' "$D/j1")" = 3 ] && grep -q '^[0-9]* done version=' "$D/j1" &&
 	ok "A. start: staged on every member, three nodes gated, done" || bad "A. start rc=$rc: $(tail -4 "$D/j1" | tr '\n' '|')"
 last=$(grep 'event=switching' "$D/j1" | tail -1 | sed 's/.*node=\([0-9]*\).*/\1/')
@@ -133,15 +117,15 @@ r=$($P upgrade status journal="$D/j1" 2>&1)
 echo "$r" | grep -q "3 node(s) gated, done" && [ "$(echo "$r" | grep -c ' gated$')" = 3 ] && ok "A. status: 3 gated, done; every node on it" || bad "A. status: $(echo "$r" | tr '\n' '|')"
 
 # ---- B. abort, then resume ----------------------------------------------------------------
-# S457: an abort connects to nothing - rc17's was refused while the seed was the node switching
+# an abort connects to nothing: asked of a dead seed, it still lands
 $CLI -q -h 127.0.0.1 -p 9 -E roll-enable upgrade abort journal="$D/jx" > "$D/ax.out" 2>&1; rc=$?
 [ $rc -eq 0 ] && [ -e "$D/jx.abort" ] && ok "B. abort with no daemon at the seed address: asked (rc 0)" || bad "B. abort with no daemon at the seed: rc=$rc, $(tr '\n' ' ' < "$D/ax.out")"
 $P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j2" ready_s=20 gate_s=40 > /dev/null 2>&1
 # the driver clears a stale abort when it starts, so the abort is asked while it runs
 $P upgrade start journal="$D/j2" > "$D/d2.out" 2>&1 &
 DP=$!
-# once the first node is switching, inside the loop: a fixed 3 s (rc15) and
-# the "start" line (rc16) both let the roll finish on GitLab cluster2
+# wait until the first node is switching, inside the loop: an earlier signal lets the roll finish
+# before the abort is asked
 i=0; while [ $i -lt 600 ] && ! grep -q 'event=switching' "$D/j2"; do sleep 0.1; i=$((i+1)); done
 $P upgrade abort journal="$D/j2" > "$D/abort.out" 2>&1
 wait $DP; rc=$?
@@ -157,11 +141,13 @@ first=$(for n in 1 2 3; do [ "$(stats $n 's["cluster"]["role"]')" = master ] || 
 r=$(UPROLL_FAIL=$first $P upgrade start journal="$D/j3" 2>&1); rc=$?
 [ $rc -eq 1 ] && grep -q 'reason=not-up-in-time' "$D/j3" && grep -q 'event=reverted' "$D/j3" && grep -q 'stop reason=node-[0-9]*-reverted' "$D/j3" &&
 	ok "C. the node did not come up in ready_s: reverted by the hook, the roll stopped" || bad "C. rc=$rc: $(tail -4 "$D/j3" | tr '\n' '|')"
-echo "$r" | grep -q 'rollback this node:' && echo "$r" | grep -q 'upgrade rollback journal=' && ok "C. the rollback commands were printed" || bad "C. output: $(echo "$r" | tail -4 | tr '\n' '|')"
+echo "$r" | grep -q 'rollback this node:' && echo "$r" | grep -q 'perfcli -h 127.0.0.71 -p 17701 -E <enable> upgrade rollback journal=' && ok "C. the rollback commands were printed" || bad "C. output: $(echo "$r" | tail -4 | tr '\n' '|')"
+cont=$(echo "$r" | sed -n 's/^continue: *perfcli \(.*\) -E <enable> \(upgrade resume .*\)$/\1 -E roll-enable \2/p')
 [ "$(grep -c 'event=gated' "$D/j3")" = 0 ] && ok "C. nothing was gated (the first node failed)" || bad "C. gated: $(grep -c 'event=gated' "$D/j3")"
-sleep 2; [ "$(stats $first 's["state"]')" = ready ] && ok "C. node $first is ready again on the old build" || bad "C. node $first: $(stats $first 's["state"]')"
-r=$($P upgrade resume journal="$D/j3" 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$(grep -c 'event=gated' "$D/j3")" = 3 ] && ok "C. resume: the roll finished" || bad "C. resume rc=$rc: $(tail -3 "$D/j3" | tr '\n' '|')"
+i=0; while [ $i -lt 150 ] && [ "$(stats $first 's["state"]')" != ready ]; do sleep 0.2; i=$((i+1)); done
+[ "$(stats $first 's["state"]')" = ready ] && ok "C. node $first is ready again on the old build" || bad "C. node $first: $(stats $first 's["state"]')"
+r=$($CLI -q ${cont:-continue-not-printed} 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(grep -c 'event=gated' "$D/j3")" = 3 ] && ok "C. resume by the printed continue command: the roll finished" || bad "C. resume ($cont) rc=$rc: $(tail -3 "$D/j3" | tr '\n' '|')"
 
 # ---- D. the driver killed after the first gate; resume -------------------------------------------
 $P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j4" ready_s=20 gate_s=40 > /dev/null 2>&1
@@ -189,7 +175,8 @@ echo "$r" | grep -q "0 node(s) gated" && ok "E. status after the rollback: nothi
 
 # ---- F. a member that refuses the artifact: nothing switched --------------------------------------
 kill $(cat "$D/pid3") 2>/dev/null; sleep 1
-node 3 "allow_unsigned = no"; start 3; sleep 3
+node 3 "allow_unsigned = no"; start 3
+i=0; while [ $i -lt 150 ] && ! formed; do sleep 0.2; i=$((i+1)); done
 head -c 300000 /dev/urandom > "$D/b.tgz"
 $P upgrade plan "$D/b.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j5" ready_s=20 gate_s=40 > /dev/null 2>&1
 h0=$(grep -c '^switch ' "$D/hook.log")
@@ -198,9 +185,8 @@ h1=$(grep -c '^switch ' "$D/hook.log")
 [ $rc -eq 1 ] && grep -q 'stop reason=not-staged-everywhere' "$D/j5" && grep -q 'event=failed reason=not-staged' "$D/j5" && [ $((h1 - h0)) -eq 0 ] &&
 	ok "F. a member refused the artifact: the stop names it, nothing was switched" || bad "F. rc=$rc, switches $((h1 - h0)): $(tail -3 "$D/j5" | tr '\n' '|')"
 
-# ---- G. UP12b: the candidate's own wire epochs, read from the tarball before anything is staged ----
-# share/perfcached/RELEASE is what `make install` writes (perfcached.release); the suite builds
-# tarballs around it and around edited copies.  The fleet speaks epoch 2 here.
+# ---- G. the candidate's own wire epochs, read from the tarball before anything is staged ----
+# share/perfcached/RELEASE is what `make install` writes; the fleet speaks epoch 4 here
 REL=$(dirname "$BIN")/perfcached.release
 reltgz() { # reltgz <name> <release file>: a prefix tarball with that RELEASE
 	rm -rf "$D/rt"; mkdir -p "$D/rt/perfcached-x/share/perfcached" "$D/rt/perfcached-x/bin"
@@ -213,21 +199,21 @@ if [ -f "$REL" ]; then
 		ok "G. perfcached.release names the version -V says, the revision, the edition and the epochs" || bad "G. perfcached.release: $(tr '\n' '|' < "$REL")"
 	reltgz g1 "$REL"
 	r=$($P upgrade plan "$D/g1.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/jg1" 2>&1); rc=$?
-	[ $rc -eq 0 ] && echo "$r" | grep -q "the candidate $VER (.*) speaks wire epochs 2\.\.2 - it joins on 2" && grep -q 'candidate_epochs=2\.\.2' "$D/jg1" &&
-		ok "G. the tree's own RELEASE: plan reads 2..2, joins on 2, journals it" || bad "G. own RELEASE rc=$rc: $r"
+	[ $rc -eq 0 ] && echo "$r" | grep -q "the candidate $VER (.*) speaks wire epochs 4\.\.4 - it joins on 4" && grep -q 'candidate_epochs=4\.\.4' "$D/jg1" &&
+		ok "G. the tree's own RELEASE: plan reads 4..4, joins on 4, journals it" || bad "G. own RELEASE rc=$rc: $r"
 	sed "s/^version=.*/version=9.9.9/" "$REL" > "$D/rel"; reltgz g2 "$D/rel"
 	r=$($P upgrade plan "$D/g2.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/jg2" 2>&1); rc=$?
 	[ $rc -eq 1 ] && echo "$r" | grep -q "is version 9.9.9 .* not the version=$VER asked - refused" && [ ! -s "$D/jg2" ] &&
 		ok "G. a tarball of another version than version= asked: refused, nothing journalled" || bad "G. version mismatch rc=$rc: $r"
-	sed -e "s/^wire_epoch_min=.*/wire_epoch_min=3/" -e "s/^wire_epoch_max=.*/wire_epoch_max=3/" "$REL" > "$D/rel"; reltgz g3 "$D/rel"
+	sed -e "s/^wire_epoch_min=.*/wire_epoch_min=5/" -e "s/^wire_epoch_max=.*/wire_epoch_max=5/" "$REL" > "$D/rel"; reltgz g3 "$D/rel"
 	r=$($P upgrade plan "$D/g3.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/jg3" 2>&1); rc=$?
-	[ $rc -eq 1 ] && echo "$r" | grep -q "speaks wire epochs 3\.\.3 and the fleet speaks 2 - it could not join" && [ ! -s "$D/jg3" ] &&
-		ok "G. a candidate at 3..3 against a fleet on 2: refused before staging, nothing journalled" || bad "G. 3..3 rc=$rc: $r"
-	sed -e "s/^wire_epoch_max=.*/wire_epoch_max=3/" "$REL" > "$D/rel"; reltgz g4 "$D/rel"
+	[ $rc -eq 1 ] && echo "$r" | grep -q "speaks wire epochs 5\.\.5 and the fleet speaks 4 - it could not join" && [ ! -s "$D/jg3" ] &&
+		ok "G. a candidate at 5..5 against a fleet on 4: refused before staging, nothing journalled" || bad "G. 5..5 rc=$rc: $r"
+	sed -e "s/^wire_epoch_max=.*/wire_epoch_max=5/" "$REL" > "$D/rel"; reltgz g4 "$D/rel"
 	r=$($P upgrade plan "$D/g4.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/jg4" 2>&1); rc=$?
-	[ $rc -eq 0 ] && echo "$r" | grep -q "speaks wire epochs 2\.\.3 - it joins on 2; a commit to 3 is possible once every node runs it" &&
-		[ "$(echo "$r" | grep -c '^note: node [0-9]* .* speaks up to 2 - it must be on the candidate before a commit to 3')" = 3 ] &&
-		ok "G. a candidate at 2..3: allowed, the commit to 3 named, each of the 3 members noted" || bad "G. 2..3 rc=$rc: $r"
+	[ $rc -eq 0 ] && echo "$r" | grep -q "speaks wire epochs 4\.\.5 - it joins on 4; a commit to 5 is possible once every node runs it" &&
+		[ "$(echo "$r" | grep -c '^note: node [0-9]* .* speaks up to 4 - it must be on the candidate before a commit to 5')" = 3 ] &&
+		ok "G. a candidate at 4..5: allowed, the commit to 5 named, each of the 3 members noted" || bad "G. 4..5 rc=$rc: $r"
 else
 	bad "G. $REL is missing - make perfcached.release (check-g-cluster2 builds it)"
 fi

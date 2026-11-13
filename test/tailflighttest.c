@@ -1,17 +1,5 @@
-/* S447: a carve while a tail punch is in flight must not land in the tail
- * being punched.
- *
- * The give-back plans its tail runs under the arena lock, drops the lock
- * for the madvise, and takes the groups off hcommit only after (phase 3).
- * A writer carving in between found the group still committed, carved its
- * chunk there and wrote records into it - and the madvise zeroed them: a
- * record served and then gone, or one a recovery had just replayed gone
- * (walordertest, v0.7.2-rc5 and rc6; rarely since 0.4.0-rc49).  The hook
- * (pcache_arena_tail_hook) runs exactly there: it carves cells until the
- * frontier passes into the tail in flight, writes a pattern into each, and
- * once the tick is done every cell must still hold it.
- * FAIL-FIRST: before the in-flight window, the cells carved inside the
- * punched tail read back as zeroes. */
+/* tailflighttest.c - a carve while a tail punch is in flight must not land in the punched tail: the
+ * hook carves cells into it mid-punch, and after the tick each cell must still hold its pattern */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"
@@ -67,8 +55,8 @@ int main(void)
 	pcache_reclaim_quiet_s = 1;
 	pcache_reclaim_cooloff_s = 0;
 	pcache_arena_tail_hook = hook;
-	/* the reservation's never-carved tail is punched once (S119) - the
-	 * first tick that plans it is the one the hook runs in */
+	/* the reservation's never-carved tail is punched once - the first tick that plans it is
+	 * the one the hook runs in */
 	for (t = 0; t < 12 && !hooked; t++)
 		pcache_arena_reclaim_tick();
 	pcache_arena_tail_hook = NULL;

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/Lt-Flash/perfcached/discussions/categories/q-a
+    about: Ask in Discussions (Q&A).
+  - name: Security vulnerability
+    url: https://github.com/Lt-Flash/perfcached/security/advisories/new
+    about: Report it privately - see SECURITY.md.

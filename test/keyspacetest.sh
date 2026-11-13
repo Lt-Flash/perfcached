@@ -1,12 +1,6 @@
 #!/bin/sh
-# keyspacetest.sh - PS8: keyspace notifications.  A collection with
-# `notify_events` publishes __keyspace@<col>__:<key> (payload: the event)
-# and __keyevent@<col>__:<event> (payload: the key) to THIS node's
-# subscribers for what it applies - a set at the door, a del, a miss, an
-# expiry from the sweep, a replica applied from a peer - and never
-# relays them: on a two-node eager fleet a write on node 1 is one event
-# on node 1 and one on node 2.  A collection without the mask says
-# nothing.  Usage: test/keyspacetest.sh [./perfcached]
+# keyspacetest.sh - keyspace notifications: a collection with notify_events publishes __keyspace@/__keyevent@
+# to THIS node's subscribers for what it applies, never relayed; without the mask, nothing.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pckeyspace.XXXXXX); P= P1= P2=

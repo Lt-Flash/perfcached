@@ -12,7 +12,7 @@ diff -ruN a/build_tools/menuselect-deps.in b/build_tools/menuselect-deps.in
 diff -ruN a/configs/samples/perfd.conf.sample b/configs/samples/perfd.conf.sample
 --- a/configs/samples/perfd.conf.sample
 +++ b/configs/samples/perfd.conf.sample
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,73 @@
 +;
 +; perfd.conf - func_perfd: PERFD_GET, PERFD_SET, PERFD_EXISTS, PERFD_DELETE
 +;
@@ -24,7 +24,8 @@ diff -ruN a/configs/samples/perfd.conf.sample b/configs/samples/perfd.conf.sampl
 +;
 +; What the server side needs:
 +;   binary - the secret below listed in [secrets] client on every perfcached
-+;            node (the native door is encrypted off loopback)
++;            node (the native door authenticates off loopback, and encrypts
++;            where the node's listener has encrypt = yes)
 +;   resp   - perfcached: [listen] resp = <ip:port>, resp_allow covering the
 +;            Asterisk hosts, [secrets] resp = <password>
 +;            Redis: a standalone server, or a master behind a VIP whose
@@ -33,7 +34,7 @@ diff -ruN a/configs/samples/perfd.conf.sample b/configs/samples/perfd.conf.sampl
 +;
 +
 +[general]
-+; binary: perfcached's native door through libperfd - encrypted, and
++; binary: perfcached's native door through libperfd - authenticated, and
 +;         fleet-aware: it learns the members, fails over, and can route
 +;         each key to its owner
 +; resp:   RESP2, to perfcached's RESP door or a standalone Redis
@@ -108,7 +109,7 @@ diff -ruN a/configure.ac b/configure.ac
 diff -ruN a/funcs/func_perfd.c b/funcs/func_perfd.c
 --- a/funcs/func_perfd.c
 +++ b/funcs/func_perfd.c
-@@ -0,0 +1,1387 @@
+@@ -0,0 +1,1379 @@
 +/*
 + * Asterisk -- An open source telephony toolkit.
 + *
@@ -123,12 +124,7 @@ diff -ruN a/funcs/func_perfd.c b/funcs/func_perfd.c
 + */
 +
 +/*! \file
-+ *
-+ * \brief perfcached dialplan functions: PERFD_GET, PERFD_SET, PERFD_EXISTS
-+ * and PERFD_DELETE, over libperfd (the binary protocol) or RESP2.
-+ *
-+ * \ingroup functions
-+ */
++ * \brief PERFD_GET, PERFD_SET, PERFD_EXISTS, PERFD_DELETE over libperfd or RESP2 \ingroup functions */
 +
 +/*** MODULEINFO
 +	<depend>perfd</depend>
@@ -158,7 +154,7 @@ diff -ruN a/funcs/func_perfd.c b/funcs/func_perfd.c
 +#include "asterisk/time.h"
 +#include "asterisk/utils.h"
 +
-+#include <perfd.h>                /* libperfd, linked (perfcached S371) */
++#include <perfd.h>                /* libperfd, linked */
 +#include "perfd/resp.h"
 +
 +/*** DOCUMENTATION
@@ -716,7 +712,7 @@ diff -ruN a/funcs/func_perfd.c b/funcs/func_perfd.c
 +				char name[160];
 +
 +				server_name(&cf->servers[i], name, sizeof(name));
-+				CONF_FAIL(0, "server %s is not loopback and no secret is set; the binary door is encrypted off-loopback\n", name);
++				CONF_FAIL(0, "server %s is not loopback and no secret is set; the binary door authenticates off loopback\n", name);
 +			}
 +		}
 +	}
@@ -782,7 +778,7 @@ diff -ruN a/funcs/func_perfd.c b/funcs/func_perfd.c
 +	char name[160];
 +	int k;
 +
-+	perfd_opts_init(&o);            /* zeroed, with its size (libperfd 0.5) */
++	perfd_opts_init(&o);            /* zeroed, with its size */
 +	o.secrets = cf->nsecrets ? (const char *const *)cf->secrets : NULL;
 +	o.connect_timeout_ms = cf->connect_timeout_ms;
 +	o.io_timeout_ms = cf->io_timeout_ms;
@@ -864,9 +860,8 @@ diff -ruN a/funcs/func_perfd.c b/funcs/func_perfd.c
 +	case PD_GET:
 +		rc = perfd_get(c->h, col, key, &v, &n, NULL);
 +		if (rc == 1) {
-+			/* the caller ast_std_free()s every value, the RESP
-+			 * client's too: hand it a copy of ours and give the
-+			 * library's buffer back to the library */
++			/* the caller ast_std_free()s every value, the RESP client's too: hand it a
++			 * copy of ours and give the library's buffer back to the library */
 +			*vout = ast_std_malloc(n + 1);
 +			if (*vout) {
 +				memcpy(*vout, v, n);
@@ -1116,10 +1111,8 @@ diff -ruN a/funcs/func_perfd.c b/funcs/func_perfd.c
 +	}
 +}
 +
-+/*
-+ * The one path every function takes.  GET: OK hands back a malloc'd value in
-+ * @vout (ast_std_free it).  EXISTS / DELETE: OK means 1, NOTFOUND means 0.
-+ */
++/* The one path every function takes.  GET: OK hands back a malloc'd value in @vout
++ * (ast_std_free it).  EXISTS / DELETE: OK means 1, NOTFOUND means 0. */
 +static enum pd_status pd_do(struct ast_channel *chan, int verb, char *data,
 +	const char *value, char **vout, size_t *vlout)
 +{
@@ -1507,7 +1500,7 @@ diff -ruN a/funcs/Makefile b/funcs/Makefile
 +# func_perfd: links libperfd (configure's PERFD, pkg-config libperfd) and
 +# carries only its own RESP2 client - never a copy of the library
 +$(if $(wildcard perfd/perfd.c perfd/lib/perfd.c perfd/src/pc_noise.c perfd/pc_noise.c),\
-+	$(error func_perfd: a copy of libperfd's source is in funcs/perfd - link the installed library instead (perfcached S371)))
++	$(error func_perfd: a copy of libperfd's source is in funcs/perfd - link the installed library instead))
 +$(call MOD_ADD_C,func_perfd,perfd/resp.c)
 diff -ruN a/funcs/perfd/resp.c b/funcs/perfd/resp.c
 --- a/funcs/perfd/resp.c
@@ -2142,20 +2135,11 @@ diff -ruN a/funcs/perfd/resp.c b/funcs/perfd/resp.c
 diff -ruN a/funcs/perfd/resp.h b/funcs/perfd/resp.h
 --- a/funcs/perfd/resp.h
 +++ b/funcs/perfd/resp.h
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,69 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later
 + * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-+/*
-+ * resp.h - the RESP2 client behind func_perfd's `protocol = resp`.
-+ *
-+ * Written from the RESP2 protocol description; no Redis or hiredis code.
-+ * No Asterisk header either, so the file builds and tests on its own.
-+ *
-+ * A session is one connection plus these rules:
-+ * dial the server list in order, AUTH, SELECT the collection when it
-+ * changes, and on a transport failure or -READONLY close, re-dial once
-+ * starting at the server AFTER the one that failed, and retry.
-+ */
++/* resp.h - func_perfd's RESP2 client (`protocol = resp`), written from the protocol description:
++ * no Redis or hiredis code, no Asterisk header.  A transport failure or -READONLY re-dials once. */
 +#ifndef FUNC_PERFD_RESP_H
 +#define FUNC_PERFD_RESP_H
 +
@@ -2201,16 +2185,13 @@ diff -ruN a/funcs/perfd/resp.h b/funcs/perfd/resp.h
 +struct resp_sess *resp_sess_new(const struct resp_sess_conf *cf);
 +void resp_sess_free(struct resp_sess *s);
 +
-+/* Dial the servers in order from the session's next one, AUTH, and SELECT
-+ * @collection when it is not empty.  0 open; 1 open but the SELECT was
-+ * refused (@err holds the server's text, nothing is selected); -1 no
-+ * server could be opened (@err says why). */
++/* Dial the servers in order from the session's next one, AUTH, SELECT @collection unless empty.
++ * 0 open; 1 open but the SELECT refused (@err: the server's text); -1 none opened (@err: why). */
 +int resp_sess_open(struct resp_sess *s, const char *collection,
 +		char *err, size_t errcap);
 +
-+/* Run one command in @collection (empty: whatever is selected).  0: a
-+ * reply is in @out, possibly RESP_T_ERROR - free it with resp_reply_free;
-+ * -1: no reply (@err says why).  Opens the session when it is closed. */
++/* Run one command in @collection (empty: whatever is selected), opening a closed session.  0: a
++ * reply in @out, maybe RESP_T_ERROR (free it with resp_reply_free); -1: none (@err says why). */
 +int resp_sess_call(struct resp_sess *s, const char *collection, int argc,
 +		const char *const *argv, const size_t *lens,
 +		struct resp_reply *out, char *err, size_t errcap);

@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clplat.c - platform-derived node identity.  See clplat.h.
- */
+/* clplat.c - platform-derived node identity.  See clplat.h. */
 #include <dirent.h>
 #include <net/if.h>
 #include <fcntl.h>
@@ -129,10 +127,8 @@ static int slurp(const char *path, char *buf, size_t cap)
 	return 0;
 }
 
-/* S326: the DMI uuid, from /sys - or, where this daemon is not root and
- * the file is 0400 root, from the copy a root ExecStartPre step of the
- * shipped unit leaves in the service's RuntimeDirectory=
- * ($RUNTIME_DIRECTORY/dmi-product-uuid).  0, or -1 with *why set. */
+/* the DMI uuid from /sys or, unreadable to a non-root daemon, from the copy the shipped unit's
+ * root ExecStartPre leaves in $RUNTIME_DIRECTORY; 0, or -1 with *why set */
 static int dmi_read(char *raw, size_t cap, const char **why)
 {
 	const char *rd = getenv("RUNTIME_DIRECTORY");
@@ -158,9 +154,8 @@ static int dmi_read(char *raw, size_t cap, const char **why)
 	return -1;
 }
 
-/* S326: inside a container /sys/class/dmi, where present, is the HOST's:
- * every container on one host would derive one identity from it.  The
- * usual markers; *what names the one found. */
+/* in a container /sys/class/dmi is the HOST's, so every container on it would derive one
+ * identity; *what names the marker found */
 int clplat_in_container(const char **what)
 {
 	static char sd[64];
@@ -209,8 +204,6 @@ static int first_mac(char *buf, size_t cap)
 		n++;
 	}
 	closedir(d);
-	/* by NAME, so the pick is stable across boots rather than whatever
-	 * readdir happened to enumerate first */
 	for (i = 1; i < n; i++) {
 		char t[IFNAMSIZ];
 
@@ -238,20 +231,14 @@ int clplat_probe(char *key, size_t cap, const char **why)
 
 	*why = "";
 	if (clplat_in_container(&ctr)) {
-		/* S326: the host's uuid, shared by every container on it */
 		*why = "inside a container - its DMI uuid is the host's";
 	} else if (dmi_read(raw, sizeof raw, &dwhy) == 0) {
 		if (clplat_key_build(CLPLAT_DMI, raw, key, cap))
 			return CLPLAT_DMI;
 		*why = "product_uuid unusable";
 	} else if (access(DMI_UUID, F_OK) == 0) {
-		/* The path is there but the read failed.  Two causes seen:
-		 * it is 0400 root and this daemon is not root (and no copy
-		 * was left in $RUNTIME_DIRECTORY), or an LXC exposes
-		 * /sys/class/dmi and masks the contents - MEASURED on
-		 * 245-247, where it reads empty even as root.  Report the fact
-		 * and not a guess at which, but say it: falling silently
-		 * through to a random mint is how a clone keeps its identity. */
+		/* present but unreadable (0400 root, or masked by an LXC): say so, as falling silently
+		 * through to a random mint is how a clone keeps its identity */
 		*why = dwhy;
 	}
 	if (first_mac(raw, sizeof raw) == 0 &&

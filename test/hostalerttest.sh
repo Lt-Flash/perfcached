@@ -1,21 +1,6 @@
 #!/bin/sh
-# hostalerttest.sh - S380 (0.6.0.1): alarms when the host's CPU, the state
-# device or the host's memory run high, and the arena at the same
-# thresholds; S381: /stats process.cpus.  With PERFCACHED_ALERT_FAST=60
-# (every hold and clear time, and the one-minute window, divided by 60).
-#  1. [alerts]: -E dumps the defaults (warning 65, critical 75); a warning
-#     not below its critical, a value outside 1-100 and an unknown key are
-#     config errors
-#  2. /stats alerts.host: CPU busy and perfcached's share, the CPUs, memory
-#     used, the watched disk or why it is not, the thresholds;
-#     /stats process.cpus is what nproc says (no quota on a test host) and
-#     /metrics carries perfcached_process_cpus
-#  3. thresholds at 1/2 %: host memory is critical at once; the arena after
-#     ~2 MB stored; CPU under a one-core busy loop; the disk under a write
-#     and fsync loop (SKIPPED, loudly, where the host gives no statistics
-#     for the device)
-# Fail-first: 0.6.0 refuses [alerts] as an unknown section.
-# Usage: test/hostalerttest.sh ./perfcached
+# hostalerttest.sh - alarms when host CPU, the state device, host memory or the arena run high ([alerts]
+# thresholds, PERFCACHED_ALERT_FAST=60), and /stats process.cpus; the disk arm SKIPs without device stats.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac

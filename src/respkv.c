@@ -1,14 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respkv.c - the RESP door's key-value and connection commands: GET, MGET,
- * SET, DEL, DELEX, EXPIRE, TTL, TYPE, EXISTS, KEYS, RL.HIT, INCR / DECR /
- * INCRBY / DECRBY, SELECT, CLIENT,
- * CONFIG, COMMAND, DBSIZE, FLUSH*, MEMORY, SLOWLOG, ECHO, RESET, QUIT.  They
- * answer through verbs.c's dialect-neutral data cores (verbsint.h), as the
- * native doors do, so the dialects cannot drift.  Moved from verbs.c
- * unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* respkv.c - the RESP door's key-value and connection commands, answered through verbs.c's
+ * dialect-neutral data cores (verbsint.h) like the native doors, so the dialects cannot drift */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +17,8 @@
 #include "verbs.h"
 #include "respout.h"
 #include "verbsint.h"
-#include "mgetfan.h"                    /* G8 */
+#include "mgetfan.h"
+#include "presence.h"
 
 int rh_reset(struct resp_ctx *c)
 {
@@ -32,8 +26,8 @@ int rh_reset(struct resp_ctx *c)
 	size_t nlen;
 	int left;
 
-	/* PS2: back to a fresh connection's shape - out of subscribed mode
-	 * and on db 0.  node-redis v4 uses it on its return paths. */
+	/* back to a fresh connection's shape: out of subscribed mode and on db 0 (node-redis v4
+	 * sends it on its return paths) */
 	while (pc_pubsub_pop(c->conn, 0, name, sizeof name, &nlen, &left))
 		;
 	while (pc_pubsub_pop(c->conn, 1, name, sizeof name, &nlen, &left))
@@ -71,10 +65,10 @@ int rh_config(struct resp_ctx *c)
 	if (c->nargs >= 2 && resp_is(c->argv[1], c->argl[1], "GET"))
 		resp_arr(c->out, 0);           /* "no such parameter" */
 	else if (c->nargs >= 2 && resp_is(c->argv[1], c->argl[1], "RESETSTAT")) {
-		pc_stats_reset();              /* S123: what redis-cli expects */
+		pc_stats_reset();              /* what redis-cli expects */
 		resp_simple(c->out, "OK");
 	} else {
-		unk_sub(c);                    /* S165 */
+		unk_sub(c);
 		resp_err(c->out, "unsupported CONFIG subcommand");
 	}
 	return 0;
@@ -99,15 +93,8 @@ int rh_flush(struct resp_ctx *c)
 	return 0;
 }
 
-/* CLIENT SETINFO LIB-NAME|LIB-VER <value>: what a client library sends
- * on connect to say what it is (redis-py, go-redis, ...).  The first
- * thing S165's unknown-command card caught on the staging fleet, 66
- * times in five minutes from behind the HAProxy - answered "unsupported"
- * every time, and with it the only clue to which client that was.  The
- * value is kept on the connection and shown in CLIENT LIST and /clients.
- * As Redis answers it: exactly one attribute and one value, the two
- * attribute names only, and no spaces, newlines or other unprintable
- * bytes in the value, which is written into a space-separated list. */
+/* CLIENT SETINFO LIB-NAME|LIB-VER <value>, kept for CLIENT LIST and /clients; checked as
+ * Redis does, since the value is written into a space-separated list */
 static void rh_client_setinfo(struct resp_ctx *c)
 {
 	int ver;
@@ -145,7 +132,7 @@ int rh_client(struct resp_ctx *c)
 {
 	if (c->nargs == 3 && resp_is(c->argv[1], c->argl[1], "SETNAME")) {
 		pc_obs_conn_name(c->obs, c->argv[2], c->argl[2]);
-		/* S384: a perfcached's read-through fetcher - no read-through
+		/* a perfcached's read-through fetcher - no read-through
 		 * on its behalf, ever */
 		if (resp_is(c->argv[2], c->argl[2], "perfcached-readthrough"))
 			pc_conn_set_rt_fetcher(c->conn);
@@ -168,9 +155,8 @@ int rh_client(struct resp_ctx *c)
 	           resp_is(c->argv[1], c->argl[1], "SETINFO")) {
 		rh_client_setinfo(c);
 	} else {
-		/* S165: a known subcommand with the wrong arguments is the
-		 * client's bug, answered correctly - only a name we do not
-		 * implement is a gap */
+		/* a known subcommand with the wrong arguments is the client's bug;
+		 * only a name we do not implement is a gap */
 		if (c->nargs >= 2 &&
 		    !resp_is(c->argv[1], c->argl[1], "SETNAME") &&
 		    !resp_is(c->argv[1], c->argl[1], "LIST") &&
@@ -199,7 +185,7 @@ int rh_slowlog(struct resp_ctx *c)
 		pc_obs_slowlog_reset();
 		resp_simple(c->out, "OK");
 	} else {
-		unk_sub(c);                    /* S165 */
+		unk_sub(c);
 		resp_err(c->out, "unsupported SLOWLOG subcommand");
 	}
 	return 0;
@@ -214,7 +200,7 @@ int rh_select(struct resp_ctx *c)
 	{
 		char nm[64];
 		size_t nl = resp_map_index(c->argv[1], c->argl[1], nm,
-			sizeof nm);   /* S69 */
+			sizeof nm);
 
 		if (!resp_col_allowed(nm, nl)) {
 			resp_err(c->out, "DB index is out of range");
@@ -232,11 +218,8 @@ int rh_select(struct resp_ctx *c)
 	return 0;
 }
 
-/* S48: MEMORY USAGE <key> [SAMPLES n] - their tooling's 76 calls/day.
- * The answer is the record's own bytes: the 24-byte record header plus
- * key plus value.  Slab-class rounding is NOT included - same estimate
- * class as Redis's own answer.  SAMPLES is accepted and ignored (it
- * concerns aggregate types). */
+/* MEMORY USAGE: the record's own bytes (24-byte header, key, value) without slab rounding,
+ * Redis's estimate class; SAMPLES is accepted and ignored */
 int rh_memory(struct resp_ctx *c)
 {
 	unsigned int vln, exp;
@@ -269,12 +252,8 @@ int rh_keys(struct resp_ctx *c)
 			"command");
 		return 0;
 	}
-	/* S40: KEYS held this worker for the WHOLE walk - 12-33ms
-	 * measured - and every other connection multiplexed here ate
-	 * it as tail latency (7.9ms p99 photographed on a user
-	 * host).  The verb now only DECLARES the walk; the proto
-	 * layer runs it one bounded chunk per event-loop turn and
-	 * the worker keeps serving between chunks. */
+	/* the verb only DECLARES the walk: the proto layer runs it a bounded chunk
+	 * per event-loop turn, so the worker keeps serving between chunks */
 	c->es->start = 1;
 	c->es->ht = c->ht;
 	c->es->patlen = (int)c->argl[1];
@@ -284,6 +263,29 @@ int rh_keys(struct resp_ctx *c)
 		memcpy(c->es->pat, c->argv[1], c->argl[1]);
 	c->es->limit = 100000;                 /* the keys-verb hard cap */
 	return 0;
+}
+
+/* a key absent here that a get would ask another node for: parked, the
+ * reply written when the pull lands (what the caller writes is the fallback) */
+static void pres_park(struct resp_ctx *c, str *k, int kind)
+{
+	if (op_pres_miss(c->ht, k, kind, c->park_req) == PC_OP_PARKED) {
+		*c->keyp = k->s;
+		*c->klenp = (size_t)k->len;
+	}
+}
+
+static const char *type_name(int none, unsigned int fl)
+{
+	return none ? "none" : (fl & PCACHE_F_JSON) ? "ReJSON-RL" :
+		(fl & PCACHE_F_RL) ? "ratelimit" : (fl & PCACHE_F_HASH) ? "hash" :
+		(fl & PCACHE_F_LOCK) ? "zset" : "string";
+}
+
+/* TTL's seconds (-2 absent, -1 none), or PTTL's milliseconds */
+static void ttl_reply(struct pc_jw *w, long long nv, int pttl)
+{
+	resp_int(w, nv > 0 && pttl ? nv * 1000 : nv);
 }
 
 int rh_exists(struct resp_ctx *c)
@@ -297,6 +299,25 @@ int rh_exists(struct resp_ctx *c)
 			"command");
 		return 0;
 	}
+	if (c->nargs > 2 && c->conn && mget_fans(c->ht)) {
+		/* fanned out as MGET is */
+		struct pc_mget *mg;
+		const char *code, *why;
+
+		if (op_mget_fan(c->ht, (const char *const *)c->argv + 1,
+		        c->argl + 1, (unsigned int)(c->nargs - 1), 1, &mg, &code,
+		        &why) < 0) {
+			resp_err_code(c->out, code, why);
+			return 0;
+		}
+		if (pc_mget_waiting(mg)) {
+			pc_mget_park(mg);
+			return 0;
+		}
+		pc_mget_resp(mg, c->out);
+		pc_mget_free(mg);
+		return 0;
+	}
 	for (i = 1; i < c->nargs; i++) {
 		if (c->argl[i] == 0 || c->argl[i] > KEY_MAX)
 			continue;
@@ -304,6 +325,8 @@ int rh_exists(struct resp_ctx *c)
 		k.len = (int)c->argl[i];
 		if (probe_or_present(c->ht, &k, NULL, NULL, NULL, NULL) == 0)
 			cnt++;
+		else if (c->nargs == 2)
+			pres_park(c, &k, PC_PRES_EXISTS);
 	}
 	resp_int(c->out, cnt);
 	return 0;
@@ -320,17 +343,15 @@ int rh_type(struct resp_ctx *c)
 	k.s = c->argv[1];
 	k.len = (int)c->argl[1];
 	{
-		/* S280: the recorded type, whichever redis_types - loose
+		/* the recorded type, whichever redis_types - loose
 		 * only relaxes what the commands accept */
 		unsigned char fl = 0;
 		int none = pcache_ht_getflags(c->ht, &k, &fl) != 0 &&
-			pcache_ht_probe_present(c->ht, &k, NULL, &fl) != 0;  /* ST2 */
+			pcache_ht_probe_present(c->ht, &k, NULL, &fl) != 0;
 
-		resp_simple(c->out, none ?
-			"none" : (fl & PCACHE_F_JSON) ? "ReJSON-RL" :
-			(fl & PCACHE_F_RL) ? "ratelimit" :             /* S314 */
-			(fl & PCACHE_F_HASH) ? "hash" :                /* S313 */
-			(fl & PCACHE_F_LOCK) ? "zset" : "string");     /* S170a */
+		if (none)
+			pres_park(c, &k, PC_PRES_TYPE);
+		resp_simple(c->out, type_name(none, fl));
 	}
 	return 0;
 }
@@ -338,7 +359,7 @@ int rh_type(struct resp_ctx *c)
 int rh_ttl(struct resp_ctx *c)
 {
 	unsigned int vln, exp;
-	int is_ctr, rc;
+	int is_ctr, rc, pttl;
 	long long nv;
 	str k;
 
@@ -348,17 +369,29 @@ int rh_ttl(struct resp_ctx *c)
 	}
 	k.s = c->argv[1];
 	k.len = (int)c->argl[1];
+	pttl = resp_is(c->cmd, c->cl, "PTTL");
 	rc = probe_or_present(c->ht, &k, &vln, &exp, &is_ctr, NULL);
-	if (rc == -2)
+	if (rc == -2) {
 		nv = -2;
-	else if (exp == 0)
+		pres_park(c, &k, pttl ? PC_PRES_PTTL : PC_PRES_TTL);
+	} else if (exp == 0)
 		nv = -1;
 	else
 		nv = (long long)exp - (long long)get_ticks();
-	if (nv > 0 && resp_is(c->cmd, c->cl, "PTTL"))
-		nv *= 1000;
-	resp_int(c->out, nv);
+	ttl_reply(c->out, nv, pttl);
 	return 0;
+}
+
+void pc_pres_resp(struct pc_jw *w, int kind, int found, unsigned int fl,
+		unsigned int ttl_left)
+{
+	if (kind == PC_PRES_EXISTS)
+		resp_int(w, found ? 1 : 0);
+	else if (kind == PC_PRES_TYPE)
+		resp_simple(w, type_name(!found, fl));
+	else
+		ttl_reply(w, !found ? -2 : ttl_left ? (long long)ttl_left : -1,
+			kind == PC_PRES_PTTL);
 }
 
 int rh_mget(struct resp_ctx *c)
@@ -373,14 +406,13 @@ int rh_mget(struct resp_ctx *c)
 		return 0;
 	}
 	if (c->conn && mget_fans(c->ht)) {
-		/* G8: a key on another node is looked up, never a nil for a
-		 * key the fleet holds.  All or nothing: a key whose lookup
-		 * did not answer turns the whole reply into -TRYAGAIN */
+		/* a key on another node is looked up there, never a nil for a key the fleet
+		 * holds; one whose lookup did not answer turns the reply into -TRYAGAIN */
 		struct pc_mget *mg;
 		const char *code, *why;
 
 		if (op_mget_fan(c->ht, (const char *const *)c->argv + 1,
-		        c->argl + 1, (unsigned int)(c->nargs - 1), &mg, &code,
+		        c->argl + 1, (unsigned int)(c->nargs - 1), 0, &mg, &code,
 		        &why) < 0) {
 			resp_err_code(c->out, code, why);
 			return 0;
@@ -393,8 +425,8 @@ int rh_mget(struct resp_ctx *c)
 		pc_mget_free(mg);
 		return 0;
 	}
-	/* local fetches, misses stay nil - the exact text-mget
-	 * semantics (a node that holds every key it may be asked for) */
+	/* local fetches, misses stay nil: right for a node that holds every key
+	 * it may be asked for */
 	resp_arr(c->out, c->nargs - 1);
 	for (i = 1; i < c->nargs; i++) {
 		if (c->argl[i] == 0 || c->argl[i] > KEY_MAX) {
@@ -403,12 +435,12 @@ int rh_mget(struct resp_ctx *c)
 		}
 		k.s = c->argv[i];
 		k.len = (int)c->argl[i];
-		HOT(c->ht, k.s, k.len);                /* S397: each key of the MGET */
+		HOT(c->ht, k.s, k.len);
 		{
 			unsigned char fl = 0;
 
 			if (pcache_ht_fetch_ex(c->ht, &k, &v, &exp, &fl) == 0) {
-				/* S280: Redis answers nil for a document
+				/* Redis answers nil for a document
 				 * here, not an error */
 				if ((fl & PCACHE_F_TYPES) &&
 				        pc_store_types_strict(c->ht))
@@ -457,7 +489,7 @@ int rh_get(struct resp_ctx *c)
 			return 0;
 		}
 	}
-	if (rc == PC_OP_ERR_TYPE)                      /* S280 */
+	if (rc == PC_OP_ERR_TYPE)
 		resp_err_line(c->out, pc_wrongtype_msg);
 	else if (rc == PC_OP_ERR_GET) {
 		resp_err(c->out, "get failed");
@@ -467,10 +499,8 @@ int rh_get(struct resp_ctx *c)
 	return 0;
 }
 
-/* S297: DELEX key [IFEQ v | IFNE v] - Redis 8.4.  Without a condition it
- * is DEL of one key.  IFDEQ/IFDNE compare a DIGEST, which perfcached does
- * not have: refused by name.  Replies as Redis 8.10.2 gave them: 1 / 0,
- * and a condition on a non-string key is an error. */
+/* DELEX key [IFEQ v | IFNE v] (Redis 8.4); without a condition it is DEL of one key.
+ * IFDEQ/IFDNE compare a DIGEST, which perfcached does not have: refused by name */
 int rh_delex(struct resp_ctx *c)
 {
 	int rc, kind = 0;
@@ -556,9 +586,8 @@ int rh_del(struct resp_ctx *c)
 			resp_int(c->out, rc == PC_OP_OK ? 1 : 0);
 		return 0;
 	}
-	/* multi-key: each op runs; a forwarded delete still executes
-	 * at its owner but its ack completes into nobody, so it
-	 * counts optimistically - stated, not hidden */
+	/* multi-key: a forwarded delete still runs at its owner but its ack
+	 * completes into nobody, so it counts optimistically */
 	for (i = 1; i < c->nargs; i++) {
 		unsigned int throwaway = 0;
 
@@ -586,12 +615,8 @@ int rh_expire(struct resp_ctx *c)
 			"command");
 		return 0;
 	}
-	/* S48: the AT forms carry an absolute wall-clock deadline;
-	 * convert to relative AT THE BOUNDARY - the TTL machinery is
-	 * tick-based and never learns wall time (the WAL's absolute
-	 * stamps are its own conversion).  A past deadline falls into
-	 * the ttl<=0 delete branch below, which is Redis's own
-	 * semantics for it. */
+	/* the AT forms become relative here: the TTL machinery is tick-based and never
+	 * learns wall time; a past deadline takes the ttl <= 0 delete branch, as in Redis */
 	if (resp_is(c->cmd, c->cl, "PEXPIREAT")) {
 		struct timespec tw;
 
@@ -676,7 +701,6 @@ int rh_set(struct resp_ctx *c)
 				i++;
 			} else if (resp_is(c->argv[i], c->argl[i], "NX") ||
 			        resp_is(c->argv[i], c->argl[i], "XX")) {
-				/* S279 */
 				int want = resp_is(c->argv[i], c->argl[i], "NX")
 					? PC_SETCOND_NX : PC_SETCOND_XX;
 
@@ -687,9 +711,8 @@ int rh_set(struct resp_ctx *c)
 				cond = want;
 			} else if (resp_is(c->argv[i], c->argl[i], "IFEQ") ||
 			        resp_is(c->argv[i], c->argl[i], "IFNE")) {
-				/* S297: Redis 8.4's compare-and-set; one
-				 * condition, never beside NX/XX (Redis: syntax
-				 * error) */
+				/* Redis 8.4's compare-and-set: one condition,
+				 * never beside NX/XX */
 				if (cond || ckind || i + 1 >= c->nargs) {
 					resp_err(c->out, "syntax error");
 					return 0;
@@ -730,25 +753,22 @@ int rh_set(struct resp_ctx *c)
 	if (rc == PC_OP_OK)
 		resp_simple(c->out, "OK");
 	else if (rc == PC_OP_ABSENT)
-		resp_nil(c->out);         /* S279: NX/XX (S297: IFEQ/IFNE) did not hold */
+		resp_nil(c->out);         /* NX/XX or IFEQ/IFNE did not hold */
 	else if (rc == PC_OP_ERR_TYPE)
-		resp_err_line(c->out, pc_wrongtype_msg);     /* S297 */
+		resp_err_line(c->out, pc_wrongtype_msg);
 	else if (rc == PC_OP_ERR_MODE)
 		resp_err(c->out, ckind ? cmp_mode_msg : setcond_mode_msg);
 	else if (rc == PC_OP_PARKED)
 		resp_err(c->out, "busy");         /* park fallback only */
 	else if (rc == PC_OP_ERR_BUSY)
-		/* Redis Cluster's own retryable code: a stock client
-		 * backs off and retries instead of aborting, which is
-		 * what a full parked-request table deserves - the
-		 * request has NOT happened and trying again is
-		 * correct.  redis-benchmark aborts on -ERR. */
+		/* Redis Cluster's retryable code: the request has NOT happened, and a
+		 * stock client backs off and retries where -ERR would abort it */
 		resp_err_code(c->out, "TRYAGAIN", "cluster busy, retry");
 	else if (rc == PC_OP_ERR_FWD)
 		resp_err(c->out, "forward failed");
 	else if (rc == PC_OP_ERR_WRFAIL)
-		/* not TRYAGAIN: retrying here cannot help, the node
-		 * is out of the map until an operator fixes it */
+		/* not TRYAGAIN: retrying cannot help while the node
+		 * is out of the map */
 		resp_err(c->out, wr_refused_msg());
 	else if (rc == PC_OP_ERR_FULL)
 		resp_err(c->out, "cache full");
@@ -757,8 +777,8 @@ int rh_set(struct resp_ctx *c)
 	return 0;
 }
 
-/* S314: RL.HIT key window_ms [limit] -> *2 :count :allowed (1 when no
- * limit is given).  A perfcached extension, not a Redis command. */
+/* RL.HIT key window_ms [limit] -> *2 :count :allowed (1 when no limit is given);
+ * a perfcached extension, not a Redis command */
 int rh_rlhit(struct resp_ctx *c)
 {
 	long long win, lim = 0, cnt = 0;
@@ -846,15 +866,10 @@ int rh_incr(struct resp_ctx *c)
 	if (rc == PC_OP_PARKED)
 		resp_err(c->out, "busy");         /* park fallback only */
 	else if (rc == PC_OP_ERR_BUSY)
-		/* Redis Cluster's own retryable code: a stock client
-		 * backs off and retries instead of aborting, which is
-		 * what a full parked-request table deserves - the
-		 * request has NOT happened and trying again is
-		 * correct.  redis-benchmark aborts on -ERR. */
 		resp_err_code(c->out, "TRYAGAIN", "cluster busy, retry");
 	else if (rc == PC_OP_ERR_FWD)
 		resp_err(c->out, "forward failed");
-	else if (rc == PC_OP_ERR_TYPE)                 /* S280 */
+	else if (rc == PC_OP_ERR_TYPE)
 		resp_err_line(c->out, pc_wrongtype_msg);
 	else if (rc == PC_OP_ERR_NOTINT)
 		resp_err(c->out, "value is not an integer or out of range");

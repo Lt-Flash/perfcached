@@ -1,16 +1,6 @@
 #!/bin/sh
-# standalonetest.sh - S158: a standalone daemon (no [cluster] section)
-# ACCEPTS the fleet-shaped collection keys, runs them as store, and says
-# so once at WARNING - so one config file serves both shapes.  Also: the
-# cluster secret is optional standalone (nothing derives from it there)
-# and still required, and still distinct, where a [cluster] section is.
-# Optional means every reader copes with its absence: 0.3.8-rc1 through
-# 0.4.0-rc3 read the missing secret in three places and a standalone
-# daemon SEGV'd on -E, on a resp password, and at startup whenever a
-# door was encryption-required.  And an underived cluster key is all
-# zeros, so the door must refuse that principal outright rather than
-# hand-shake with a key anyone can present.
-# Usage: test/standalonetest.sh [./perfcached] [./noisetest]
+# standalonetest.sh - a standalone daemon accepts the fleet-shaped collection keys (run as store, one
+# WARNING), needs no cluster secret, and refuses the all-zero underived cluster principal outright.
 set -u
 BIN=${1:-./perfcached}
 NT=${2:-./noisetest}

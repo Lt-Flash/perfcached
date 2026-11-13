@@ -1,46 +1,6 @@
 #!/bin/sh
-# stoptest.sh - S222: a clean stop leaves a snapshot, so a node that was
-# stopped on purpose comes back COMPLETE on its own.
-#
-# An eager replica never logs the copies it receives - its WAL holds only
-# what that node WROTE.  Before S222 a clean stop took no snapshot, so
-# after the whole fleet was stopped every node came back off its WAL with
-# its own third and waited on the repair sweep for the rest: none of them
-# could have served the keyspace alone, and a node restarted by itself
-# answered "not found" for two thirds of it.  The snapshot walk stores the
-# copies too, and a clean stop now takes one after every thread has
-# joined.
-#
-# Asserted (three eager nodes, WAL on, `save = off` so the ONLY snapshot
-# is the one the stop takes; 100 keys authored per node):
-#   1. SIGTERM the fleet: every node logs its shutdown snapshot; node 3,
-#      restarted ALONE, serves all 300 keys - two thirds of them copies
-#      it could only have had from that snapshot;
-#   2. bring 1 and 2 back: all 300 on all three, nothing reconcile-dropped;
-#   3. kill -9 the fleet instead: no snapshot is taken, and node 3 alone
-#      has its own 100 - crash behaviour is exactly what it was;
-#   4. THE FLEET STOP: `fleetstop` without privilege is refused; with it
-#      (enable, then fleetstop, on one connection) node 1 reports both
-#      peers stopped, all three exit cleanly with a snapshot each, node 1
-#      last, and node 2 restarted alone serves all 300;
-#   5. FAIL-FIRST, a step of the run: scenario 1 on a build with the stop
-#      snapshot short-circuited must leave the lone node with 100.
-#   6. S233, the split RV-5's fault run left behind: a member whose own
-#      claimed term is ABOVE the map it follows (node 3 joins with a
-#      persisted term of 50) still obeys its master's fleet stop - it was
-#      judged against the claim and ignored as "a fleet that has since
-#      moved on".  And a peer that leaves WITHOUT a goodbye (kill -9 just
-#      before the stop) is reported "lost", not "stopped".  Both run on a
-#      build with the two fixes reverted too, where both must fail.
-#   7. S233, perfcli: a stop that outwaits the client's read timeout (a
-#      peer that ignores it - the reverted build as node 3 - holds it the
-#      whole timeout_ms, 40 s here).  Piped, perfcli's 30 s timeout
-#      expires first; it redials and must NOT send the stop again (it
-#      did: the fault run's second "asking").  One-shot `perfcli
-#      fleetstop 40000` waits long enough to get the answer, naming the
-#      peer still up.  A perfcli
-#      with both changes reverted, built here, must fail both.
-# Usage: test/stoptest.sh [./perfcached] [./perfcli]
+# stoptest.sh - a clean stop (SIGTERM or fleetstop) leaves a snapshot holding the replicas' copies too, so a node
+# restarted alone serves the whole keyspace.  Usage: test/stoptest.sh [./perfcached] [./perfcli]
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -66,8 +26,8 @@ grep -q "if (0 && pc_rdb_save_on_stop() != 0)" "$D/t/src/daemon.c" ||
 make -C "$D/t" -j"$(nproc 2>/dev/null || echo 4)" perfcached > "$D/build.log" 2>&1 || {
 	echo "the variant did not build:"; tail -5 "$D/build.log"; exit 1; }
 cp "$D/t/perfcached" "$D/perfcached.nostop"
-# S233's variant: the stop gate on the node's own claim again, and
-# "stopped" for anything that left the live set
+# the reverted variant: the stop gate on the node's own claim again, and "stopped" for anything
+# that left the live set
 sed -i 's/ours = C.map_valid ? C.map.term : pc_term_current();/ours = pc_term_current();/' "$D/t/src/cluster.c"
 sed -i 's/} else if (bye_since(targets\[i\], bye_mark)) {/} else if (1 || bye_since(targets[i], bye_mark)) {/' "$D/t/src/cluster.c"
 grep -q "ours = pc_term_current();" "$D/t/src/cluster.c" && grep -q "} else if (1 || bye_since" "$D/t/src/cluster.c" ||
@@ -76,7 +36,7 @@ sed -i 's/if (0 \&\& pc_rdb_save_on_stop() != 0)/if (pc_rdb_save_on_stop() != 0)
 make -C "$D/t" -j"$(nproc 2>/dev/null || echo 4)" perfcached > "$D/build2.log" 2>&1 || {
 	echo "the S233 variant did not build:"; tail -5 "$D/build2.log"; exit 1; }
 cp "$D/t/perfcached" "$D/perfcached.s233old"
-# and perfcli before S233: resends anything after a redial, 30 s for all
+# and perfcli reverted: resends anything after a redial, 30 s timeout for all
 sed -i 's/if (unsafe_twice(method)) {/if (0 \&\& unsafe_twice(method)) {/' "$D/t/cli/perfcli.c"
 sed -i 's/o.io_timeout_ms = 125000;/o.io_timeout_ms = 30000;/' "$D/t/cli/perfcli.c"
 grep -q "if (0 && unsafe_twice(method)) {" "$D/t/cli/perfcli.c" && grep -q "o.io_timeout_ms = 30000;$" "$D/t/cli/perfcli.c" ||
@@ -159,9 +119,8 @@ cl() { call "$1" '{"method":"stats"}' | python3 -c \
 	'import json,sys
 try: print((json.load(sys.stdin)["result"]["cluster"]).get(sys.argv[1], "?"))
 except Exception: print("?")' "$2" 2>/dev/null || echo "?"; }
-# the records node $1's WAL has APPENDED (wal.appended): a write is acked at
-# the producer ring, before the pump appends it (src/wal.h), and a kill -9
-# takes what is still in the ring - restarttest's premise, 0.3.7-rc7
+# the records node $1's WAL has appended: a write is acked at the producer ring, before the pump
+# appends it (src/wal.h), and a kill -9 takes what is still in the ring
 walapp() { call "$1" '{"method":"stats"}' | python3 -c \
 	'import json,sys
 try: print(int((json.load(sys.stdin)["result"].get("wal") or {}).get("appended", 0)))
@@ -181,6 +140,16 @@ f.flush()
 for _ in range(n): f.readline()' "$1" "$2" "$3"; }
 # how many of the 3*PER keys a node answers for LOCALLY: a node with no
 # peers cannot forward, so this is what it holds
+# alone_ready <port>: a node restarted alone founds only after the settle window and refuses data
+# until it does - until it reports ready, up to 30 s
+alone_ready() {
+	i=0
+	while [ $i -lt 300 ] && [ "$(timeout 5 python3 -c 'import json, socket, sys, pcnative
+f = pcnative.wrap(socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3))
+print(pcnative.call(f, "stats")["result"].get("state"))' "$1" 2>/dev/null)" != ready ]; do
+		sleep 0.1; i=$((i+1))
+	done
+}
 present() { timeout 60 python3 -c '
 import json, socket, sys, pcnative
 port, n = int(sys.argv[1]), int(sys.argv[2])
@@ -206,18 +175,8 @@ converged() { # converged <count> <seconds> <ports...>
 	done
 	return 1
 }
-# formed <secs>: all three nodes are members (or the master) of one usable
-# map at the same seq - the fleet has FORMED.  load_fleet used to sleep 4
-# s and write: a cold start can take longer (a joiner waits 2 s for a
-# master, then defers up to four times), more under a sanitizer, and a
-# node not yet in the map when its 100 keys are written leaves them to
-# the eager repair sweep.  GitLab check-asan (0.4.0, 92b69a5) failed "the
-# fleet did not load" here once and then "node 2 alone serves 200 of 300"
-# - one author's keys - though nothing like it was reproduced on 222
-# (6 rounds writing with no wait at all, ASan included, all converged).
-# So: wait for the fact rather than a time, and on a failure print what
-# each node held and routed by (load_dump), so the next one explains
-# itself.
+# formed <secs>: all three nodes in one usable map at the same seq.  Wait for that, not a time (a
+# cold start defers, more under a sanitizer); on failure load_dump prints what each node held.
 formed() {
 	secs=$1; i=0
 	while [ $i -lt $((secs * 5)) ]; do
@@ -265,7 +224,7 @@ SNAP=0; for n in 1 2 3; do grep -q "taking the shutdown snapshot" "$D/n$n.log" &
 [ $SNAP = 3 ] && ok "and every one took its shutdown snapshot: $(grep -h "rdb: snapshot" "$D/n3.log" | tail -1 | sed 's/.*rdb: //' | cut -c1-60)" \
 	|| bad "only $SNAP of 3 logged a shutdown snapshot"
 start 3 "$BIN" || bad "node 3 did not restart"
-sleep 2
+alone_ready 17343
 P3=$(present 17343 $PER)
 [ "$P3" = $TOT ] && ok "node 3, ALONE, serves all $TOT keys - 200 of them are copies it held for its peers, and only the snapshot could have brought them back" \
 	|| bad "node 3 alone serves $P3 of $TOT (without the stop snapshot it would be $PER)"
@@ -285,8 +244,7 @@ for n in 1 2 3; do stop_kill $n; done
 # ---- 3. a crash is still a crash ---------------------------------------
 echo "--- 3. kill -9 the fleet instead: no snapshot"
 load_fleet "$BIN" || bad "the fleet did not load"
-# node 3's own $PER on its WAL before the kill - not a fixed sleep (0.7.1-rc1,
-# GitHub check-asan: killed with 99 of them still in the ring, "serves 1")
+# node 3's own $PER on its WAL before the kill, not a fixed sleep: the ring may still hold them
 i=0; while [ $i -lt 60 ] && [ "$(walapp 17343)" -lt $PER ] 2>/dev/null; do sleep 0.5; i=$((i+1)); done
 W3=$(walapp 17343)
 [ "$W3" -ge $PER ] 2>/dev/null || bad "node 3's WAL appended only $W3 of its $PER in 30 s - the kill below would test the ring, not the WAL road"
@@ -295,7 +253,7 @@ sleep 1
 grep -q "taking the shutdown snapshot" "$D/n3.log" && bad "a killed node claims a shutdown snapshot" \
 	|| ok "no node took a shutdown snapshot - there was no shutdown"
 start 3 "$BIN" || bad "node 3 did not restart"
-sleep 2
+alone_ready 17343
 P3=$(present 17343 $PER)
 [ "$P3" = $PER ] && ok "node 3 alone has its own $PER - the WAL road, exactly as before" \
 	|| bad "after kill -9, node 3 alone serves $P3 (want $PER)"
@@ -342,7 +300,7 @@ L3=$(grep -h "clean shutdown" "$D/n3.log" | tail -1 | cut -c8-15)
 [ "$L1" \> "$L2" -o "$L1" = "$L2" ] && [ "$L1" \> "$L3" -o "$L1" = "$L3" ] \
 	&& ok "and node 1 went last ($L2, $L3, then $L1)" || bad "node 1 did not go last ($L1 vs $L2, $L3)"
 start 2 "$BIN" || bad "node 2 did not restart"
-sleep 2
+alone_ready 17342
 P2=$(present 17342 $PER)
 [ "$P2" = $TOT ] && ok "node 2, restarted alone, serves all $TOT" || bad "node 2 alone serves $P2 of $TOT"
 stop_kill 2
@@ -352,13 +310,13 @@ echo "--- 5. fail-first: scenario 1 on a build without the stop snapshot"
 load_fleet "$D/perfcached.nostop" || bad "the fleet did not load"
 for n in 1 2 3; do stop_clean $n; done
 start 3 "$D/perfcached.nostop" || bad "node 3 did not restart"
-sleep 2
+alone_ready 17343
 P3=$(present 17343 $PER)
 [ "$P3" = $PER ] && ok "without it, node 3 alone serves only its own $PER of $TOT - which is what scenario 1 fixed" \
 	|| bad "without the stop snapshot node 3 alone serves $P3 - scenario 1 proves nothing"
 stop_kill 3
 
-# ---- 6. S233 ------------------------------------------------------------
+# ---- 6. a claim above the followed map, and a peer lost without a goodbye ---
 mapterm() { call "$1" '{"method":"stats"}' | python3 -c \
 	'import json,sys
 try: print(json.load(sys.stdin)["result"]["cluster"]["map"]["term"])
@@ -373,9 +331,8 @@ print(last)'; }
 reply() { echo "$1" | python3 -c 'import json,sys
 r=json.load(sys.stdin).get("result") or {}
 print("asked=%s stopped=%d still_up=%d lost=%s" % (r.get("asked"), len(r.get("stopped",[])), len(r.get("still_up",[])), len(r.get("lost",[])) if "lost" in r else "-"))' 2>/dev/null; }
-# running = alive and not a zombie: this arm runs inside $(...), so a
-# daemon that exited stays unreaped while the subshell waits, and kill -0
-# answers for a zombie
+# running = alive and not a zombie: inside $(...) an exited daemon stays unreaped while the
+# subshell waits, and kill -0 answers for a zombie
 alive() { p=$(cat "$D/n$1.pid" 2>/dev/null) || return 1
 	s=$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null) || return 1
 	[ -n "$s" ] && [ "$s" != Z ]; }
@@ -394,10 +351,8 @@ split_fleet() { # split_fleet <binary>: nodes 1+2, then 3 with term 50
 	# check = FNV-1a over the term's four LE bytes (clterm.c's format)
 	printf 'perfcached-node-term 1\nterm 50\ncheck 8d700e0ae6ddc407\n' > "$D/wal3/node-term"
 	start 3 "$1" || return 1
-	# node 3 must FOLLOW the fleet's map before the stop - the split is a
-	# claim above a map it follows.  A fixed sleep 4 raced a slow runner
-	# (GitHub 2026-10-08: node 3 still at map term 0, not joined, then on a
-	# map of its own at its claimed 50 - and a term-1 stop rightly ignored)
+	# node 3 must follow the fleet's map before the stop (the split is a claim above a map it
+	# follows); a fixed sleep raced a slow runner
 	i=0
 	while [ $i -lt 100 ]; do
 		m=$(mapterm 17343)
@@ -441,7 +396,7 @@ set -- $(s233 "$D/perfcached.s233old" "fixes reverted")
 [ "$3" = 0 ] && ok "fail-first: with 'stopped' = 'left the live set', the killed peer was reported stopped" \
 	|| bad "fail-first: the reverted reply still reported the killed peer lost"
 
-# ---- 7. S233, perfcli ------------------------------------------------------
+# ---- 7. perfcli: a stop that outwaits the read timeout ----------------------
 stuck_fleet() { # nodes 1+2 on this build, node 3 on the reverted one
 	for n in 1 2 3; do stop_kill $n; done
 	rm -rf "$D"/wal1 "$D"/wal2 "$D"/wal3 "$D"/n1.log "$D"/n2.log "$D"/n3.log "$D"/*.readies

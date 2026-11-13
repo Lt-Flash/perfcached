@@ -1,14 +1,6 @@
 #!/bin/sh
-# fleetcolstest.sh - S164: the daemon answers for the fleet per collection.
-# On a three-node EAGER fleet every member holds every entry, so /stats'
-# `fleet` block must report the entries once (the fullest member), not the
-# copies summed; client writes, hits and removes are counted once, on the
-# node the client reached, even though every member applies each write;
-# an expiry each member counts on its own copy is reported once; the block
-# is the same on every node; a standalone daemon has none.
-# Fail-first: v0.4.0-rc4 has no `fleet` block, and its gossiped `stores`
-# counted every apply (8,663 on 245 for ~2,992 client writes).
-# Usage: test/fleetcolstest.sh [./perfcached]
+# fleetcolstest.sh - /stats' per-collection `fleet` block on an eager fleet: entries once (the fullest
+# member), client writes, hits, removes and expiries once, the same on every node; none standalone.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -89,9 +81,8 @@ def col(port):
         if c.get("name") == "f": return c
     return {}
 def fl(port): return col(port).get("fleet") or {}
-# a native connection also carries unsolicited notifications (a member
-# joining sends {"notify":"membership",...} to every client), so the reply
-# is the first line that answers this request's id - not the first line
+# a native connection also carries unsolicited notify lines (a member joining), so the
+# reply is the first line that answers this request's id
 def jcall(port, method, params):
     s = socket.create_connection(("127.0.0.1", port), timeout=5); f = pcnative.wrap(s)
     f.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) + "\n").encode()); f.flush()
@@ -157,6 +148,7 @@ page = subprocess.check_output([os.environ.get("PAGEDUMP", "./pagedump")]).decod
 check("x.fleet&&x.fleet.members>1" in page and "fv(FG.entries,x.entries,LB)" in page and "entc(x,FG,LB,cpe)" in page and "fv(wv5(FG,'stores'),wv5(x,'stores_client'))" in page,
       "the page renders the daemon's fleet block, not its own sum")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"

@@ -1,34 +1,6 @@
 #!/bin/sh
-# typestest.sh - S280: a JSON document is a TYPE, not a string that
-# happens to parse, and redis_types decides what the string commands do
-# with it.
-#
-# Before S280 GET returned a document's text and JSON.GET served any
-# string that parsed as JSON - a client that probes a key with GET and
-# switches to JSON.GET on WRONGTYPE could never tell them apart.  Every
-# record now carries its type (PCACHE_F_JSON), set by the JSON verbs and
-# cleared by a plain SET, and it travels wherever the record does.  The
-# expected answers are Redis 8.10.1's, probed 2026-09-30.
-#
-#   A. strict (the default), one node, all three doors: GET/INCR/SET NX
-#      and XX/MGET/TYPE/EXPIRE/TTL/EXISTS/DEL against a document, JSON.*
-#      against a string (Redis's exact words), path updates keep the type,
-#      a SET over a document makes a string, native get/mget/add/jget as
-#      CMD requests and the data verbs' own frames answer the same
-#   B. the type survives a table resize (buckets grow, the copy is typed),
-#      the dump (a "t" field), a restart from the WAL, and a restart from
-#      the snapshot alone (the WAL removed)
-#   C. loose: GET serves a document's text, JSON.GET a string that parses,
-#      TYPE still reports the recorded type
-#   D. three EAGER nodes: a document written on one is a document on the
-#      others (the push), and on a node that rejoins EMPTY (the boot pull)
-#   E. three SHARD nodes: GET through a non-owner (the pull answer) is
-#      WRONGTYPE, INCR through one (the forwarded add) is WRONGTYPE, and a
-#      JSON write through one to a string key (the forwarded JSON) is the
-#      JSON refusal
-# The standalone edition refuses [cluster]: D and E are SKIPPED, loudly.
-# Fail-first: rc58 answers GET with the document's text and TYPE "string".
-# Usage: test/typestest.sh [./perfcached]
+# typestest.sh - a JSON document is a TYPE (strict: GET answers WRONGTYPE, as Redis does) on every
+# door, across resize, dump, WAL and snapshot restarts, loose mode, eager push and shard forwards.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -152,10 +124,8 @@ class N:
     def rpc(self, method, **params):
         self.id += 1
         self.f.write((json.dumps({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params}) + "\n").encode()); self.f.flush()
-        # a membership notification can arrive between a request and its
-        # reply - v0.5.6.1 GitHub check (core): "jset key 31 via node 1"
-        # read {"notify": "membership", "event": "joined"} as its answer.
-        # Skip them, as the other suites do.
+        # a membership notification can arrive between a request and its reply:
+        # skip them, as the other suites do
         while True:
             m = json.loads(self.f.readline())
             if not (isinstance(m, dict) and "notify" in m):
@@ -248,9 +218,8 @@ if part == "A":
     b = n.bin(2, "plain")
     ok(isinstance(b, bytes) and b[:1] == b"\x01" and b[5:] == b'{"b":2}', "A binary GET of the string: served")
 elif part == "A2":
-    # B: a RESIZE - the verb, which builds a new table and copies every
-    # record into it (store.c rs_copy_cb); the core's own growth only
-    # moves pointers and would keep the type whatever the copy did
+    # B: a RESIZE - the verb, which copies every record into a new table; the core's own
+    # growth only moves pointers and would keep the type whatever the copy did
     c = R(1); n = N(1)
     ok("result" in n.rpc("enable", secret="typ-enable"), "B enable (resize and restore are privileged)")
     b0 = col0(1)["buckets"]
@@ -303,12 +272,8 @@ elif part == "E":
     for i in range(40):
         n1.rpc("jset", col="0", key="sd%d" % i, val='{"a":%d}' % i)
         n1.rpc("set", col="0", key="ss%d" % i, value="7")
-    # the S296 rebalancer sheds records toward the node that took the
-    # writes (all 80 came through node 1) and a record in flight is on
-    # neither node: v0.5.6 GitLab check (core) read 119/120 on the jset
-    # loop once, never reproduced in 40 runs on 222.  Read once the
-    # moves have landed, as fwdtest and loadtest do (a node that reports
-    # no rebalance block counts as settled), and name any odd answer
+    # the rebalancer sheds records toward the node that took the writes, and one in flight
+    # is on neither node: read once the moves have landed, and name any odd answer
     rbs = lambda: [(stats(n)["cluster"].get("rebalance") or {}).get("state", "settled") for n in (1, 2, 3)]
     t0 = time.time(); rb = rbs()
     while any(s != "settled" for s in rb) and time.time() - t0 < 90:

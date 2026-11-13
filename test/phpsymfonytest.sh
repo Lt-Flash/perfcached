@@ -1,7 +1,6 @@
 #!/bin/sh
-# phpsymfonytest.sh - PE-3: PerfcachedAdapter under symfony/cache 5.4, the line
-# the site runs, used the way its services use a pool: test/phpsymfonytest.php.
-# Usage: test/phpsymfonytest.sh [./perfcached] [php8.3] [lang/php/modules/perfcached.so] [autoload.php]
+# phpsymfonytest.sh - PerfcachedAdapter under symfony/cache 5.4, used the way an application's services use
+# a pool: test/phpsymfonytest.php.
 set -u
 BIN=${1:-./perfcached}
 PHP=${2:-php8.3}

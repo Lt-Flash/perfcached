@@ -1,19 +1,6 @@
 #!/bin/sh
-# bigreplicatest.sh - S174: an eager collection replicates values that
-# are too large for a datagram.
-#
-# PC_MAX_FWD_VAL is 58,000 - a UDP limit - and until 2026-09-20 both the
-# write-path push and the sweep behind it simply SKIPPED anything above
-# it (counted as migrate_skipped_big).  With the store's ceiling at
-# 64 KB that was a 7.5 KB band nobody noticed; with it at 256 KB it
-# would have meant a 218 KB value living on one node of three and
-# reading as a miss on the other two.
-#
-# The TCP bulk plane already carried oversized records for placement
-# moves.  This asserts that the eager sweep now uses it, that what
-# arrives is a PASSIVE copy (a replica that re-propagated would echo the
-# keyspace around the fleet), and that a small value's path is unchanged.
-# Usage: test/bigreplicatest.sh [./perfcached]
+# bigreplicatest.sh - an eager collection replicates values too large for a datagram (above
+# PC_MAX_FWD_VAL) over the TCP bulk plane, as PASSIVE copies; a small value's path is unchanged.
 set -u
 
 BIN=${1:-./perfcached}
@@ -66,8 +53,8 @@ start() { # start <id>
 	echo "node $1 did not start"; cat "$D/n$1.log"; exit 1
 }
 
-# THREE nodes, not two: the defect this pins needs a tick in which the
-# sweep offers a bulk batch to more than one peer (S178).
+# THREE nodes, not two: the defect this pins needs a tick in which the sweep offers a bulk batch
+# to more than one peer
 node 1 17696 17697
 node 2 17698 17699
 node 3 17700 17701
@@ -184,16 +171,22 @@ else:
     bad("it never reached the other node in %.0f s (skipped_big=%s)" %
         (time.time()-t0, sk))
 
-# the bulk plane carried it, to BOTH peers - one offer per peer in the
-# same tick is the case the one-slot handoff could not serve
+# both peers' batches leave in one tick, but the bulk thread streams them one after the other:
+# the third node's may still be on its way when the second node's has landed
+N3 = conn(17700)
+t1 = time.time()
+g3 = None
+while time.time() - t1 < 30:
+    g3 = call(N3, "GET", "br:big")
+    if isinstance(g3, bytes):
+        break
+    time.sleep(1)
+(ok if isinstance(g3, bytes) and g3 == v else bad)(
+    "the third node has it too, whole, %.0f s after the second (%s)"
+    % (time.time() - t1, len(g3) if isinstance(g3, bytes) else g3))
 b_in = [stats(p)["cluster"].get("bulk_in") or 0 for p in (17699, 17701)]
 (ok if min(b_in) >= 1 else bad)(
     "the copy arrived over the bulk plane at both peers (bulk_in=%s)" % b_in)
-N3 = conn(17700)
-g3 = call(N3, "GET", "br:big")
-(ok if isinstance(g3, bytes) and g3 == v else bad)(
-    "the third node has it too, whole (%s)"
-    % (len(g3) if isinstance(g3, bytes) else g3))
 
 # and it arrived PASSIVE: a copy that re-propagated would come back to
 # node 1 and be refused there as older, every sweep, for ever
@@ -213,12 +206,8 @@ lost = stats(17697)["cluster"].get("repl_bulk_lost") or 0
     "no oversized batch went unconfirmed - with one slot in the handoff "
     "the second peer's batch is refused every tick (%d)" % lost)
 
-# S178: and the sweep must SETTLE.  A refused offer used to be reported
-# through a fleet-wide counter that only climbs, compared at the cycle
-# boundary, so one refusal pinned every mark on the node and the sweep
-# re-sent the whole keyspace to every peer for ever - measured live at
-# ~1,900 records/s a node, all refused as older.  Three nodes and one
-# oversized value is the smallest shape that reproduces it.
+# and the sweep must SETTLE: one refused offer must not pin every mark and re-send
+# the whole keyspace each cycle (three nodes and one oversized value show it)
 r0 = [stats(p)["cluster"].get("repl_out", 0) for p in (17697, 17699, 17701)]
 time.sleep(30)
 r1 = [stats(p)["cluster"].get("repl_out", 0) for p in (17697, 17699, 17701)]
@@ -234,13 +223,8 @@ PY_EOF
 rc=$?
 [ $rc = 0 ] || exit $rc
 
-# ---- S179: a node that comes BACK re-offers what its peers already have
-# Its sweep marks are zeroed on a rejoin, so it sends its whole recovered
-# keyspace - the big value included - to peers that hold every record
-# already.  The bulk receiver used to answer with the number it STORED,
-# and a batch that was entirely refused as older therefore read as a
-# failed transfer: the sender retried it every sweep, for ever.  This is
-# the fleet's own shape after a deploy.
+# ---- a node that comes BACK re-offers what its peers already have
+# a bulk batch refused entirely as older is not a failed transfer to retry every sweep
 kill -TERM $P1 2>/dev/null; wait $P1 2>/dev/null; P1=
 start 1
 sleep 2

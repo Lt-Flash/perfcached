@@ -1,12 +1,5 @@
-/* S155: the index is carved in whole 256 KB arena slots, and a bucket
- * segment (4,096 x 64 B) is EXACTLY one slot - so the 16-byte region
- * header that sat in front of every region pushed each segment into a
- * second slot, and the 16 KB hint block took a third of its own.
- * Header-less reservation regions and sixteen hint blocks to a slot: a
- * segment costs a slot and a sixteenth.  This pins that geometry, and
- * the oracle the freelist (S150) is measured against: what
- * pcache_htable_index_bytes() quotes is what the arena's regions_bytes
- * moves by, at a create and at a split. */
+/* indextest.c - the index geometry: a bucket segment is EXACTLY one 256 KB arena slot, sixteen hint
+ * blocks share a slot, and pcache_htable_index_bytes() quotes what the arena carves. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"
@@ -22,8 +15,8 @@ static int fails;
 #define CHK(c, ...) do { if (c) printf("  ok   " __VA_ARGS__); \
 	else { printf("  FAIL " __VA_ARGS__); fails++; } printf("\n"); } while (0)
 
-/* header and stat lines: one slot each (the leg's overflow heads went with
- * OC-3); n segments at one slot each; a hint slab for every sixteen segments */
+/* header and stat lines: one slot each; n segments at one slot each; a hint slab
+ * for every sixteen segments */
 static unsigned long expect_slots(unsigned int log2)
 {
 	unsigned long n = (1UL << log2) >> PCACHE_SEG_BITS;

@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Yury Kirsanov - see lib/LICENSE */
-/*
- * abicaller.c - S370: a program built against the FROZEN libperfd.so.0
- * header (test/abi/perfd-abi0.h), run against whatever libperfd.so the tree
- * builds now.  If the shared library still serves it - connect with the
- * options of that day, ping, set, get, release the value, read an error's
- * kind - the ABI held.  Usage: abicaller <port>
- */
+/* abicaller.c - built against the frozen libperfd.so.0 header, run against the libperfd.so the tree
+ * builds now: if connect, ping, set, get, free and an error's kind still work, the ABI held. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +35,21 @@ int main(int argc, char **argv)
 	if (perfd_set(p, "c", big, "v", 1, 0) == 0 || perfd_error_kind(p) != PERFD_E_ARG) {
 		printf("FAIL error kind %d\n", perfd_error_kind(p));
 		fails++;
+	}
+	/* the plain perfd_opts_init() zeroes no byte past this header's struct, and says its size */
+	{
+		struct { perfd_opts o; unsigned char guard[32]; } g;
+		size_t i, over = 0;
+
+		memset(&g, 0xa5, sizeof g);
+		perfd_opts_init(&g.o);
+		for (i = 0; i < sizeof g.guard; i++)
+			over += g.guard[i] != 0xa5;
+		if (over || g.o.size != sizeof g.o) {
+			printf("FAIL perfd_opts_init zeroed %zu byte(s) past a %zu-byte perfd_opts, size %zu\n",
+				over, sizeof g.o, g.o.size);
+			fails++;
+		}
 	}
 	printf("abicaller: library %s, header %s, %d failed\n", perfd_version(),
 		PERFD_VERSION, fails);

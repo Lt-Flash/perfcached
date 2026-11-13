@@ -1,12 +1,13 @@
-# perfcached.conf.example — every option, annotated (task S24).
+# perfcached.conf.example — every option, annotated.
 # Copy to /etc/perfcached/perfcached.conf, chmod 640, edit the secrets.
-# Defaults shown commented out; uncomment to change.
+# A commented-out line shows the default where the key has one, otherwise
+# an example value; uncomment to change.
 
 [daemon]
 # worker threads serving client connections (the peer/cluster thread,
 # WAL writer and RDB walker are separate)
 workers = 4
-# the workers' I/O backend (S361): io_uring, or epoll.  io_uring is used
+# the workers' I/O backend: io_uring, or epoll.  io_uring is used
 # only where this host can run it - at start the daemon tries it for real
 # (a multishot receive into provided buffers, a cancel, a send, over a
 # loopback TCP pair) and falls back to epoll if the kernel is too old
@@ -15,14 +16,14 @@ workers = 4
 # io.backend; perfcached -C says what this host would run.  A cluster may
 # mix the two: the backend never changes what goes on the wire.
 #io = io_uring
-# a client whose pipelined replies outrun its socket (S372): at 4 MB of
+# a client whose pipelined replies outrun its socket: at 4 MB of
 # replies waiting for it, its further requests wait too and its socket is
 # not read - TCP holds the client back - until they drain below 1 MB.  A
 # client that reads nothing for this many seconds meanwhile is closed as a
 # slow consumer.  (8 MB stays the hard cap for what a client did not ask
 # at its own pace: pub/sub pushes, and one reply that alone outgrows it.)
 #output_stall_s = 30
-# opt-in busy polling (S363): a worker spins on the network device's queue
+# opt-in busy polling: a worker spins on the network device's queue
 # for up to this many microseconds before its wait sleeps.  Its effect on
 # perfcached is not measured yet - measure it on your own NIC and load
 # first; it costs CPU that spins (felt on shared VMs).  Per worker: EPIOCSPARAMS on an epoll worker, NAPI on an
@@ -48,7 +49,7 @@ workers = 4
 # when the address appears; an address that never appears is still an
 # error at the end of the window.  0 = do not wait.
 #address_wait_s = 30
-# a KEYS walk's time budget per worker turn, in microseconds (S292).  A
+# a KEYS walk's time budget per worker turn, in microseconds.  A
 # walk takes at least 1,024 hash buckets a turn, then goes on until the
 # turn has spent this long, and lets the worker's other connections run.
 # Larger: KEYS answers sooner, everyone else on that worker waits longer
@@ -58,14 +59,14 @@ workers = 4
 # the smaller of what the descriptor limit and the memory allow.  At the
 # limit a client is told why and closed; /stats keeps answering.
 #max_clients = 10000
-# a privilege secret being guessed (S417): after this many wrong `enable`
+# a privilege secret being guessed: after this many wrong `enable`
 # secrets from one address within enable_lockout_s seconds, every enable
 # from that address is refused for enable_lockout_s - whatever sends them
 # (a dashboard, perfcli, a script).  A right secret clears the address.
 # Counted as door.enable_lockouts and door.enable_refused.  0 = off.
 #enable_lockout_after = 5
 #enable_lockout_s = 60
-# how this daemon was installed (DESIGN 12nr): auto detects it - a binary
+# how this daemon was installed: auto detects it - a binary
 # under /opt/perfcached-* is a prefix install (the release tarballs, the
 # self-upgrade's layout), the packages write /usr/share/perfcached/
 # INSTALL-MODE, anything else is local (a `make install`).  A package
@@ -95,8 +96,48 @@ workers = 4
 # environment (off, 1d .. 7d) overrides stats_reset.
 #stats_reset = 1d
 #stats_reset_at = 00:00
-# crit | err | warn | notice | info | dbg
+# crit | err | warn | notice | info | dbg (unset: info)
 log_level = notice
+# whether a client may create, drop, resize and rename collections here -
+# with the enable secret ([secrets] enable) as well.  It gates who may
+# ORIGINATE a change; a change made on any node reaches every member.
+#allow_create = no
+# the SLOWLOG threshold, microseconds (Redis's own default)
+#slowlog_usec = 10000
+# requests to the log: off | all | sampled:N (one in N); their keys
+# hashed, in full, or not at all: hashed | full | no
+#query_log = off
+#query_log_keys = hashed
+# one NOTICE line per event (miss, expired, store, remove, all, none;
+# comma-separated) - the default for every collection, each of which may
+# set its own; at most log_events_rate lines a second, the rest counted;
+# log_events_hash = yes logs a hash of the key instead of the key
+#log_events = none
+#log_events_rate = 100
+#log_events_hash = no
+# the same events published as Redis keyspace notifications
+#notify_events = none
+# THE INDEX SIZES ITSELF.  A table splits once it passes grow_at_pct of its
+# slots, and is resized down once it has sat below shrink_at_pct (unset: a
+# quarter of grow_at_pct) for shrink_cooloff_s since it last split, was
+# resized or started.  Once chained records pass leg_stuck_pct of the
+# entries the splitter aims at grow_floor_pct instead (0 = never).
+# autoscale: auto | floor (never below the configured size) | warn (says
+# what auto would do, changes nothing) | off - each collection may set its
+# own.
+#grow_at_pct = 75
+#shrink_at_pct = 0
+#shrink_cooloff_s = 60
+#leg_stuck_pct = 1
+#grow_floor_pct = 50
+#autoscale = auto
+# a key a JSON command wrote is a JSON document to Redis's type rules
+# (strict: WRONGTYPE across the two, as Redis 8) or not (loose) - each
+# collection may set its own (REDIS-COMMANDS.md, "Types")
+#redis_types = strict
+# a table with fewer keys than this skips the lookahead prefetch (it is
+# cache-resident, and the prefetch only costs there)
+#prefetch_min_keys = 65536
 # Where this node's identity and mastership term live, so a restart
 # comes back as the SAME node - same id, classified recovering.  Name
 # it: the prefix's var/ on a tarball install, /var/lib/perfcached from
@@ -129,15 +170,21 @@ arena_mb = 1024
 #backing = own
 # reclaim: chunks idle past quiet_s are given back to the kernel,
 # keeping at least reclaim_keep chunks; cooloff_s throttles the sweep
-#reclaim_keep = 4
-#reclaim_quiet_s = 300
-#reclaim_cooloff_s = 60
+#reclaim_keep = 1
+#reclaim_quiet_s = 5
+#reclaim_cooloff_s = 10
 #reclaim_giveback = 1
+# never give back below this many MB held, and at most shrink_step_mb in
+# one tick (0: an eighth of the ceiling)
+#reclaim_floor_mb = 0
+#shrink_step_mb = 0
 # pin: the arena is always mlock()ed if it can be, and a failure is a
 # WARNING - the node runs swappable.  require refuses the start instead,
 # for a node that must be resident.  RLIMIT_MEMLOCK is what refuses it
 # (systemd LimitMEMLOCK=infinity; in an unprivileged container the
-# CONTAINER's limit is the one that counts).
+# CONTAINER's limit is the one that counts).  no (0.7.5) never locks it,
+# so the kernel may swap it.  reclaim_* gives idle groups back either way:
+# a locked group is unlocked first, and locked again when it is reused.
 #pin = auto
 # huge_pages: auto probes MAP_HUGETLB -> THP -> 4K.  off forces plain 4K
 # and disables THP for the process, so growing the arena costs many
@@ -149,7 +196,7 @@ arena_mb = 1024
 # equal.  Clients authenticate with the client secret; nodes seal the
 # datagram plane with the cluster secret.  Both are Argon2id-stretched
 # into Noise PSKs at startup, never kept in cleartext memory.
-# The client line may repeat (up to 4) for zero-downtime rotation.
+# The client line may repeat (up to 8) for zero-downtime rotation.
 client = CHANGE-ME-client
 # Optional on a standalone daemon (nothing there derives from it); with a
 # [cluster] section it is required and must differ from the client secret.
@@ -158,16 +205,24 @@ cluster = CHANGE-ME-cluster-DIFFERENT
 # Rotate in three rolling restarts - cluster = old, cluster_accept = new on
 # every node; then cluster = new, cluster_accept = old; then drop it.
 #cluster_accept = THE-OTHER-ONE
-# Optional Redis AUTH password for a dedicated RESP listener (S33).
+# Optional Redis AUTH password for a dedicated RESP listener.
 # Stock Redis clients can only send a password, so this is the strongest
 # in-band control that dialect allows - and it crosses the wire IN THE
 # CLEAR, which is why it must differ from both secrets above (the daemon
 # refuses to start if it matches either).
 #resp = CHANGE-ME-resp-password
-# The SMTP password for [mail] (S352) - here, never in [mail] itself.
+# The SMTP password for [mail] - here, never in [mail] itself.
 #mail = CHANGE-ME-smtp-password
+# The privilege secret: a connection that presents it (perfcli -E, the
+# dashboard's session prompt) may create, drop, resize and rename
+# collections, map DB indexes, restore and run the sweeps.  Never empty;
+# it may repeat (up to 8).  Without it every such request is refused.
+#enable = CHANGE-ME-enable
+# A token for the HTTP listener: Authorization: Bearer <token>, or a
+# browser's login with the token as the password.
+#http = CHANGE-ME-http-token
 
-# Alert mail (S352) - needs a build with an SMTP client (make menuconfig:
+# Alert mail - needs a build with an SMTP client (make menuconfig:
 # mail = libcurl; without it -C refuses this section).  smtp:// upgrades
 # with STARTTLS and will not send without it; smtps:// is TLS from the
 # first byte.  No credentials in the URL: user here, the password as
@@ -184,7 +239,7 @@ cluster = CHANGE-ME-cluster-DIFFERENT
 #timeout_s = 30                             # one send, connect to QUIT
 #min_interval_s = 900                       # the same alert at most once per window
 #digest_s = 60                              # alerts within it go as one mail
-#level = warning                            # or critical
+#level = warning                            # the lowest mailed: info | warning | critical
 
 # THE HIGH-WATER ALARMS (0.6.0.1) - raised, kept and mailed like every other
 # alert.  Each is a warning at *_warn_pct and critical at *_crit_pct (the
@@ -199,7 +254,7 @@ cluster = CHANGE-ME-cluster-DIFFERENT
 #            pool when there is one: the pool is reserved, most often
 #            for the arena, and its use is the arena's alert (0.6.4)
 #   arena  - the arena's held memory against its ceiling
-# And one warning only (0.6.1, S379): a node on epoll whose busiest worker
+# And one warning only (0.6.1): a node on epoll whose busiest worker
 # spends epoll_busy_pct of its time outside its wait, averaged over a
 # minute, for five minutes - with what to change (io = io_uring where the
 # host can run it, else what refused it).  Never raised on io_uring.
@@ -225,6 +280,10 @@ cluster = CHANGE-ME-cluster-DIFFERENT
 #[upgrade]
 #trusted_keys = <64 hex characters>
 #allow_unsigned = no
+# the builds staged here for an upgrade, at most this many MB together
+#stage_mb = 256
+# where the upgrade helper writes its results (its `results` setting)
+#results_dir = /var/lib/perfcached-upgrade
 
 [listen]
 # client listeners; the native protocol (binary frames) and RESP2 are
@@ -254,14 +313,16 @@ tcp = 0.0.0.0:6479
 #pubsub_udp = yes
 plaintext = never
 
-# A DEDICATED RESP LISTENER (S33) - the way to let LAN Redis clients in.
+# A DEDICATED RESP LISTENER - the way to let LAN Redis clients in.
 # It is RESP2 ONLY: the native protocol is refused on it, so the admin
 # verbs are unreachable from it by construction.  A Redis client cannot
-# speak the Noise channel, so this listener is plaintext - which is why
-# the guards below are not optional decoration:
+# speak the Noise channel, so this listener is plaintext unless given
+# `tls` (TLS, below) - which is why the guards below are not optional
+# decoration:
 #   * off-box, resp_allow is REQUIRED or the daemon refuses to start;
 #   * without [secrets] resp it warns loudly at startup;
-#   * the traffic is UNENCRYPTED - put it on a trusted segment.
+#   * without tls the traffic, AUTH included, is UNENCRYPTED - put it on
+#     a trusted segment.
 # SELECT n maps onto the collection NAMED n, so declare [collection 0],
 # [collection 1] ... to serve Redis clients that expect db indices.
 #resp = 192.0.2.31:6379
@@ -287,6 +348,9 @@ plaintext = never
 # user, the token as the password).
 #http = 192.0.2.31:8080
 #http_allow = 192.0.2.0/24
+# an HTTP connection that has not sent a whole request this many seconds
+# after it opened is closed (0 = never)
+#http_timeout = 5
 # requests a second per client address, in a bucket of twice that; an
 # address asking faster is answered 429 until it slows.  Loopback is not
 # limited.  0 = off
@@ -295,6 +359,27 @@ plaintext = never
 # served in between - the dashboard polls every 3 s per open tab.  Loopback
 # always reads them fresh.  0 = built for every request
 #http_cache_ms = 1000
+
+# TLS ON THE RESP AND HTTP DOORS (0.7.5; a build with OpenSSL - perfcached -V
+# prints "tls: OpenSSL ..." or "tls: off").  `tls` after the address; a
+# plaintext loopback door can stay beside a TLS one.  Clients: redis-cli
+# --tls --cacert, rediss:// URLs, Prometheus scheme: https.  The native
+# door has its own encryption and takes no `tls`.
+#resp = 192.0.2.31:6380 tls
+#http = 192.0.2.31:8443 tls
+# The certificate (PEM, its chain after it; it must name the address
+# clients dial) and its key, readable by the daemon's user.  -C and the
+# start check that they match; a reload reads both again, so a renewal is
+# `systemctl reload perfcached`.  /stats tls shows the days left, and the
+# alert tls.cert warns 14 days before the expiry.
+#tls_cert = /etc/perfcached/tls/cert.pem
+#tls_key = /etc/perfcached/tls/key.pem
+# the oldest TLS version taken: 1.2 | 1.3
+#tls_min = 1.2
+# A plaintext RESP or HTTP door off loopback with a password or a token is
+# warned about at start.  yes: AUTH and the token are refused there, with
+# a reply that says so - only TLS and loopback connections may send them.
+#auth_needs_tls = no
 
 [wal]
 # comment the whole section out for a pure in-memory cache.
@@ -324,6 +409,8 @@ dir = /var/lib/perfcached
 # you whether yours can.  everysec fsyncs on a timer, so the ring drains
 # freely between them and the question does not arise.
 #fsync = everysec
+# 64, or 256 where the probe measures ms-class storage.  The log takes
+# segments x segment_mb of disk from the start.
 #segment_mb = 64
 # segments is the floor, always kept (segments_min says the same);
 # segments_max lets the log grow under a burst - in the background, when
@@ -354,14 +441,16 @@ dir = /var/lib/perfcached
 # snapshot already covers never refuses).  "skip" starts without such
 # records and logs how many - keep it while an older build runs.
 #unknown_records = refuse
-# RDB snapshot triggers, Redis-style "seconds changes", repeatable;
-# OR-ed.  "save = off" turns off these timed rules, NOT snapshots: the
-# WAL still asks for one when its free segments run short, or a busy ring
-# would overrun and FAIL the node.  With mode = eager it is a data-loss
-# configuration (replica copies are only in the snapshots).
-#save = 900 1
-#save = 300 10000
-# rate limit for the snapshot walker's writes
+# RDB snapshot triggers, Redis-style "seconds changes", comma-separated
+# on ONE line and OR-ed - a second save line replaces the first.  Unset:
+# 900 1, 300 10, 60 10000.  "save = off" turns off these timed rules,
+# NOT snapshots: the WAL still asks for one when its free segments run
+# short, or a busy ring would overrun and FAIL the node.  With mode =
+# eager it is a data-loss configuration (replica copies are only in the
+# snapshots).
+#save = 900 1, 300 10, 60 10000
+# rate limit for the snapshot walker's writes, MB/s (unset: a quarter of
+# the probe's sequential rate, else 64)
 #rdb_mb_s = 64
 
 #[cluster]
@@ -422,6 +511,9 @@ dir = /var/lib/perfcached
 # own unicast address (the data plane binds it); default = the
 # interface a route toward the group picks - set it on multi-homed hosts
 #advertise = 10.0.0.1
+# mixed into an identity derived from the machine, so the same machine in
+# two fleets (two daemons, one host) is two members
+#site_salt = fleet-b
 # pub/sub relays and (0.7.4) eager replication's write-path pushes have a
 # UDP port of their own, read by threads of their own, so neither fills
 # the socket membership reads from.  Default: the cluster port + 1, so a firewall
@@ -441,7 +533,7 @@ dir = /var/lib/perfcached
 # itself, so a fleet can move one node at a time; older builds relay
 # everything regardless.
 #pubsub_relay = all
-# THE CLUSTER OWNS THE COLLECTION CONFIG (S30).  Declaring `collections`
+# THE CLUSTER OWNS THE COLLECTION CONFIG.  Declaring `collections`
 # here makes this description authoritative: ONE mode for the whole
 # cluster, over an EXHAUSTIVE set of collections.  Members then carry no
 # private collections, and a peer whose config differs is REFUSED at
@@ -451,15 +543,35 @@ dir = /var/lib/perfcached
 # Without `collections` the legacy per-collection form still parses and
 # warns: nothing checks that your peers agree.
 # A deployment needing two modes runs TWO clusters on distinct groups.
-#mode = shard                 ; store | proxy | shard
-#eager = 1                    ; mode = store only
+#mode = shard                 # store | eager | proxy | shard | spread
 #collections = sessions, dialogs
+# mode = spread only, and required there: how many nodes hold each record
+# (2 up to the fleet's size; 1 is shard)
+#replicas = 3
 # how long a miss waits for a pull answer before reporting not-found
-#pull_timeout_ms = 200
+#pull_timeout_ms = 80
 # a confirmed fleet-wide miss is remembered this long
-#negative_ms = 500
+#negative_ms = 300
 # deletes shield against racing pulls this long
 #tombstone_ms = 2000
+# a delete is forgotten once every member holds it (tombstone_acks = yes),
+# else after tombstone_retain_s; tombstone_retain_max caps how many are
+# kept either way
+#tombstone_acks = yes
+#tombstone_retain_s = 900
+#tombstone_retain_max = 250000
+# on a multicast fleet a delete goes to the group once (auto), or one
+# copy to each peer (off)
+#data_multicast = auto
+# the eager repair sweep compares per-slot digests with each peer and
+# walks only the slots that differ (yes), or walks every slot (no)
+#sweep_digests = yes
+# a restarted node first asks one witness for the deletes made since its
+# last snapshot began (yes), and asks the fleet about every replayed key
+# when the witness cannot vouch for that (or with no) - at most
+# reconcile_rate_max keys a second
+#reconcile_fast = yes
+#reconcile_rate_max = 1024
 # A node back after an absence longer than this - a restart or a split -
 # drops what it stored before and pulls the fleet's state (RECOVERING
 # meanwhile) instead of reconciling record by record.  A node back from a
@@ -489,6 +601,13 @@ dir = /var/lib/perfcached
 #apply_threads = 1
 # how many cluster requests may be PARKED at once, waiting on a peer.
 # This is backpressure, not a buffer: a forward or pull that cannot park
+# a Sentinel as the upstream (0.7.5): name one sentinel and the master it
+# watches and that master's replicas become the upstreams, followed
+# through failovers; upstream_sentinel_master names the master when it
+# watches several, upstream_sentinel_password is the sentinels' own AUTH
+#upstream = redis://reader@10.0.0.20:26379
+#upstream_sentinel_master = mymaster
+#upstream_sentinel_password = <the sentinels' password>
 # is REFUSED - a routing client is told -TRYAGAIN and should retry - so
 # this bounds how much state one pipelining client can make the daemon
 # hold while a peer is slow.
@@ -513,11 +632,11 @@ buckets_log2 = 18
 # store mode + pull: a local miss fetches from peers and KEEPS a copy
 # (read-heavy shared data; every node converges on the working set)
 #pull = 1
-# eager store: the rebalancer's distributor pushes EVERY record to all
+# eager: the rebalancer's distributor pushes EVERY record to all
 # peers in the background (10s sweep, budgeted, idempotent retries;
 # rejoining nodes resync in full).  For keyspaces whose TTLs are too
-# short to ever converge via pull-on-miss.  Needs mode=store+[cluster].
-#eager = 1
+# short to ever converge via pull-on-miss.  Requires [cluster].
+#mode = eager
 # proxy mode: keys live on exactly ONE node (placement by free memory),
 # reads are served through without storing, writes forward to the
 # holder, the 10s rebalancer keeps the fleet level - fleet capacity is
@@ -535,6 +654,9 @@ buckets_log2 = 18
 # starts it empty on this node (in a fleet, the peers still refill it, by
 # the repair sweep and pulls).  Default yes.
 #durable = no
+# this collection's own log_events, notify_events, autoscale and
+# redis_types, over [daemon]'s
+#log_events = expired, remove
 
 #[collection counters]
 #buckets_log2 = 14
@@ -556,7 +678,7 @@ buckets_log2 = 18
 # is a fetch storm); yes allows it, one hop: that node never reads
 # through for this one (0.6.1)
 #upstream_allow_perfcached = no
-# several upstreams (0.6.1): up to 8, comma-separated; replicas only, the
+# several upstreams (0.6.1): up to 32 (0.7.5; 8 before), comma-separated; replicas only, the
 # master read only while no replica serves (if you allow that); balance
 # (the fewest fetches in flight) or failover (one active, the primary
 # first; it takes over again once it has served for the hold)
@@ -564,15 +686,43 @@ buckets_log2 = 18
 #upstream_role = replica
 #upstream_master_fallback = no
 #upstream_mode = balance
+# upstream_mode = failover only: the primary, and whether it takes over
+# again once it has served for the hold
 #upstream_primary = 10.0.0.13:6379
 #upstream_preempt = yes
 #upstream_preempt_hold_s = 30
+# REQUIRED with upstream: the keys that may be read through ("*" for all,
+# said explicitly)
 #upstream_prefixes = sess:*, tok:*
 #upstream_timeout_ms = 500
+# connections to each upstream server
+#upstream_conns = 2
 #upstream_negative_ms = 2000
 # an invalidation within this many ms of this node's own write-through is
 # its echo: the key is fetched again, not left empty (0 = drop, as 0.6.x)
 #upstream_echo_ms = 2000
+# the replicas a listed master's ROLE names (0.7.5): auto adds them only
+# when the master answers at the address dialled - behind a proxy they are
+# shown, not used; yes dials them directly; no ignores them
+#upstream_discover = auto
+# an upstream that is a Redis Sentinel (0.7.5): the master it watches, the
+# replicas and the other sentinels it names become the upstreams, read
+# again every 10 s; a sentinel itself is never read from.  Name the master
+# when it watches more than one; its own password if it asks for one
+#upstream_sentinel_master = mymaster
+#upstream_sentinel_password = <the sentinels' password>
+# rediss:// (0.7.5): the upstreams over TLS - all of the collection's or none.
+# The certificate is checked against upstream_tls_ca (the system's store when
+# not given) and the URL's host, or upstream_tls_name when the certificate
+# names a host and the URL an address.  A Redis with tls-auth-clients yes
+# wants a client certificate (both lines).  verify = no checks nothing and is
+# warned about; a self-signed certificate can be named in upstream_tls_ca.
+#upstream = rediss://reader@10.0.0.12:6380/0
+#upstream_tls_ca = /etc/perfcached/redis-ca.pem
+#upstream_tls_name = redis.example.net
+#upstream_tls_cert = /etc/perfcached/redis-client.pem
+#upstream_tls_key = /etc/perfcached/redis-client.key
+#upstream_tls_verify = yes
 # after a tracking gap (a restart, a lost tracking connection) the records
 # written through are dropped; this many of their names are fetched again in
 # the background at upstream_drain_rate (0 = off: cold, as 0.6.x)

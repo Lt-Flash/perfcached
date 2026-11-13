@@ -1,13 +1,6 @@
 #!/bin/sh
-# growtest.sh - S97: growth by 2 MB group under an address-space reservation.
-# arena_mb 16 with arena_cap_mb 64: the mapping is the CAP (64 MB of VA,
-# nothing charged for it), 16 MB is committed and resident at start, and
-# writing past 16 MB commits groups inside the reservation - on the same
-# tier, never as 4K pages - until the ceiling refuses.  The kernel's own
-# figure is asserted: the mapping's Rss from the daemon's smaps follows
-# arena_committed, not the reservation.  Fail-first: a build before S97
-# has no arena_reserved, and its growth past 16 MB is 4K pages
-# (arena_page_slack > 0) with the mapping stuck at 16 MB.
+# growtest.sh - growth by 2 MB group under an address-space reservation: writing past arena_mb
+# commits groups inside the cap's mapping, never 4K pages, and the mapping's Rss follows it.
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 D=$(mktemp -d /var/tmp/pcgr.XXXXXX)
@@ -38,15 +31,8 @@ chmod 640 "$D/n.conf"
 P=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n.log" 2>/dev/null && break; sleep 0.1; i=$((i+1)); done
 grep -q "perfcached ready" "$D/n.log" || { echo "node did not start"; cat "$D/n.log"; exit 1; }
-# The arena mapping's resident bytes, identified by the SIZE the daemon
-# publishes as arena_reserved rather than by a size band - a sanitizer
-# build carries other read-write anonymous mappings within a few hundred
-# kB of it, and picking the most resident of those reads the WRONG
-# mapping whenever one of them is busy (that is what made the rc27 and
-# rc28 tag runs fail and pass alternately on identical commits).  mlock
-# splits a pinned reservation into several adjacent mappings, so an
-# adjacent RUN summing to the reservation is the arena; anything
-# ambiguous says so rather than guessing.
+# the arena mapping's resident bytes, found by the SIZE published as arena_reserved (a sanitizer
+# build has look-alike mappings); mlock splits it, so an adjacent run summing to it counts
 arena_rss() {
 	python3 - "$P" "$(mem arena_reserved)" <<'PYEOF'
 import sys
@@ -62,10 +48,8 @@ for line in open("/proc/%s/smaps" % pid):
         vmas.append([lo, hi, anon, 0])
     elif line.startswith("Rss:") and vmas:
         vmas[-1][3] = int(line.split()[1]) * 1024
-# every ADJACENT SUB-RUN, from every start - not just those beginning a
-# group.  An anonymous mapping sitting immediately before the arena makes
-# no prefix of its group sum to the reservation, and the first cut of this
-# reader answered MISSING for that reason on the public runner.
+# every adjacent sub-run, from every start: an anonymous mapping right before the
+# arena makes no prefix of its group sum to the reservation
 hits = []
 for i in range(len(vmas)):
     if not vmas[i][2]:
@@ -116,12 +100,8 @@ print("stored=%d refused=%d" % (stored, refused))
 PYEOF
 }
 MB=1048576
-# The kernel's own VmLck against what the daemon believes it pinned.  A
-# sanitizer intercepts mlock(), reports success and populates NOTHING, so
-# the daemon logs "N MB pinned", nothing is resident, and every residency
-# assertion below is unanswerable rather than false.  A genuine mlock
-# FAILURE is different: the daemon says so and pre-faults with a memset,
-# so residency still holds and the assertions still run.
+# the kernel's VmLck against what the daemon pinned: a sanitizer's mlock() populates nothing, so
+# the residency assertions below are unanswerable there, not false
 LCK=$(awk '/^VmLck:/{print $2}' /proc/$P/status 2>/dev/null)
 CLAIMED=$(grep -c "MB pinned from swapping" "$D/n.log")
 FAILED_PIN=$(grep -c "mlock of the" "$D/n.log")
@@ -148,15 +128,8 @@ COM=$(mem arena_committed); HELD=$(mem arena_held); SLACK=$(mem arena_page_slack
 echo "  ..   after 32 MB: committed $COM held $HELD page slack $SLACK mapping rss $RSS"
 [ "$HELD" -gt $((16 * MB)) ] && ok "held grew past the initial commit ($HELD)" || bad "held $HELD"
 [ "$SLACK" = 0 ] && ok "no 4K pages: the growth is inside the reservation (page slack 0)" || bad "page slack $SLACK: growth left the reservation for 4K pages"
-# S166/S177: committed runs AHEAD of held on purpose - the reclaim tick
-# keeps PCACHE_AHEAD_GROUPS + 1 groups (10 MB) committed above the chunk
-# frontier while a carve is recent, so a carve crossing a group boundary
-# does not populate 2 MB on the write path.  This is measured right
-# after a 32 MB fill, which is exactly "a carve is recent", so the
-# window is present by design; the tolerance is that window plus the
-# partial group held rounds up to.  It was 6 MB, which predates the
-# window and had this suite failing since S166 landed - unseen, because
-# `check` runs on tags and no tag pipeline was read between rc9 and rc13.
+# committed runs AHEAD of held by design: the reclaim tick keeps PCACHE_AHEAD_GROUPS + 1 groups
+# (10 MB) committed above the frontier while a carve is recent, as right after this fill
 [ "$COM" -ge "$HELD" ] && [ "$COM" -le $((HELD + 12 * MB)) ] && ok "committed follows held by whole groups plus the ahead window: $COM for $HELD held" || bad "committed $COM against held $HELD (window is 10 MB + a partial group)"
 if [ "$RSS_OK" = 1 ]; then
 	[ "$RSS" != MISSING ] && [ "$RSS" -ge $((COM - 8 * MB)) ] && [ "$RSS" -le $((COM + 8 * MB)) ] && ok "the mapping is resident to the commit: rss $RSS, committed $COM" || bad "mapping rss $RSS, committed $COM"
@@ -170,24 +143,17 @@ echo "  ..   at the cap: held $HELD committed $COM reserved $RES nomem $NOMEM"
 [ "$HELD" -le $((64 * MB)) ] && [ "$COM" -le $((64 * MB)) ] && ok "held and committed stay under the cap" || bad "held $HELD committed $COM over 64 MB"
 [ "$RES" = $((64 * MB)) ] && ok "the reservation did not move" || bad "reserved $RES"
 [ "${NOMEM:-0}" -gt 0 ] && ok "the refusals are counted (nomem $NOMEM)" || bad "nomem $NOMEM"
-# S131: the overflow leg, and what the walk across it costs.  Both were
-# maintained and reported nowhere, so a table holding 89% of its records
-# on one chain per hash bucket - under ONE lock - looked from the outside
-# exactly like a table at its target load factor.  Fail-first: a build
-# before S131 answers MISSING for both.
+# the overflow leg and the cost of the walk across it, reported: a table with most records on
+# one chain per bucket otherwise looks like one at its target load factor
 OVF=$(col overflow); ENT=$(col entries); WLK=$(col held_walk_us); BKT=$(col buckets)
 echo "  ..   entries $ENT in $BKT buckets, in the leg $OVF, last held walk ${WLK}us"
-# the load factor after this burst does NOT discriminate the S131 fix -
-# 41k records is too small a deficit for the old flat budget to fall far
-# behind (9.4 against the fixed build's 5.5).  splitkeeptest.sh drives a
-# deficit big enough to tell them apart.
+# the load factor after this burst does not tell a good build from a bad one (41k records is
+# too small a deficit); splitkeeptest.sh drives one big enough
 [ "$OVF" != MISSING ] && ok "the overflow leg is reported ($OVF of $ENT entries)" \
 	|| bad "S131: collections carry no overflow figure"
 [ "$WLK" != MISSING ] && ok "the held walk's cost is reported (${WLK}us)" \
 	|| bad "S131: collections carry no held_walk_us"
-# the walk's duration is a real elapsed time, not the 1,271-second
-# artefact a component-wise timespec subtraction produced whenever the
-# end nanoseconds fell below the start's - about half of all walks
+# the walk's duration is a real elapsed time, not a component-wise timespec subtraction's artefact
 { [ "$WLK" != MISSING ] && [ "$WLK" -lt 60000000 ]; } \
 	&& ok "and it is a plausible elapsed time, not the unsigned-wrap artefact" \
 	|| bad "held_walk_us is ${WLK}us (over 60 s for a table this size: the timespec subtraction wrapped)"

@@ -1,19 +1,6 @@
 #!/bin/sh
-# unknowntest.sh - S165: the commands clients sent that no door implements
-# are counted by name and shown, never with their arguments.
-#
-# One standalone daemon, every door: an unknown RESP command, unsupported
-# RESP subcommands (CLIENT, CONFIG) and a known subcommand with the wrong
-# arity (NOT a gap), an unknown native CMD method (sent through
-# test/pcnative.py; counted under dialect `binary`, the method text as
-# its name), an unknown fixed-layout binary verb, and an unknown command
-# before AUTH (counted, never named).  Then the
-# argument that must not leak - it is sent with every unknown RESP command
-# and searched for in /stats, /metrics, the page and the journal - the
-# NOTICE once per distinct name, 200 random names against the 64-row cap,
-# and a stats reset.
-# Fail-first: v0.4.0-rc5 has no `unknown_commands` in /stats.
-# Usage: test/unknowntest.sh [./perfcached]
+# unknowntest.sh - commands no door implements are counted by name on every door and shown (stats,
+# metrics, the page's card), never with their arguments, capped at 64 rows.  Usage: test/unknowntest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -48,7 +35,7 @@ grep -q "perfcached ready" "$D/n.log" || { bad "the daemon never became ready"; 
 
 RES="$D/res"; : > "$RES"
 RESFILE="$RES" LOG="$D/n.log" python3 - <<'PY'
-import json, os, socket, struct, time, urllib.request
+import json, os, socket, struct, subprocess, time, urllib.request
 import pcnative
 res = open(os.environ["RESFILE"], "a")
 def check(cond, name): res.write(("P " if cond else "F ") + name + "\n"); res.flush()
@@ -151,10 +138,11 @@ check(u.get("members") == 1 and u.get("reporting") == 1, "standalone: this node 
 
 # 4. the argument never leaks
 time.sleep(0.3)
-st, mt, pg, lg = http("/stats"), http("/metrics"), http("/"), open(os.environ["LOG"]).read()
-check(SECRET not in st and SECRET not in mt and SECRET not in pg and SECRET not in lg,
-      "the argument is in none of /stats, /metrics, the page, the journal (%s)" %
-      [n for n, t in (("stats", st), ("metrics", mt), ("page", pg), ("log", lg)) if SECRET in t])
+# the daemon's / is 410 (the page is perfcached-dashboard's, drawn from /stats)
+st, mt, lg = http("/stats"), http("/metrics"), open(os.environ["LOG"]).read()
+check(SECRET not in st and SECRET not in mt and SECRET not in lg,
+      "the argument is in none of /stats, /metrics, the journal (%s)" %
+      [n for n, t in (("stats", st), ("metrics", mt), ("log", lg)) if SECRET in t])
 def metric(name):
     for ln in mt.splitlines():
         if ln.startswith(name + " "): return int(float(ln.split()[-1]))
@@ -181,7 +169,8 @@ check(row(u, "XYZZY", "resp") is not None, "the flood did not push the real gap 
 time.sleep(0.3)
 check(firsts() == 64, "one NOTICE per STORED name, not per send: 64 (%r)" % firsts())
 
-# 6. the page renders it
+# 6. the page renders it - the dashboard's page, from ./pagedump (its object)
+pg = subprocess.run(["./pagedump"], capture_output=True).stdout.decode("utf-8", "replace")
 check("function unkcard(" in pg and "unkcard(s)+" in pg and "['unknown commands','resp door']" in pg, "the page carries the unknown-commands card, stacked with the resp door")
 
 # 7. a stats reset empties it
@@ -189,6 +178,7 @@ check(c.cmd("CONFIG", "RESETSTAT") == "OK", "CONFIG RESETSTAT")
 u = unk()
 check(u.get("rows") == [] and u.get("other") == 0 and u.get("preauth") == 0, "a stats reset empties the table (%r rows)" % len(u.get("rows", [])))
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"

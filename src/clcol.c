@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clcol.c - the collection-announce frame.  See clcol.h.
- */
+/* clcol.c - the collection-announce frame.  See clcol.h. */
 #include <string.h>
 
 #include "clcol.h"
@@ -48,7 +46,7 @@ int clcol_parse(const unsigned char *p, size_t n, struct clcol_ann *a)
 	if (!a->nlen || !pc_rfits(&c, a->nlen))
 		return 0;                  /* a frame that names nothing */
 	a->name = (const char *)pc_rubytes(&c, a->nlen);
-	/* S432: an unmap names only the index */
+	/* an unmap names only the index */
 	if (a->op == CLCOL_OP_MAP && !a->buckets_log2)
 		return 1;
 	if (a->op != CLCOL_OP_RENAME && a->op != CLCOL_OP_MAP)

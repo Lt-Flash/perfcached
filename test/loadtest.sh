@@ -1,15 +1,6 @@
 #!/bin/sh
-# loadtest.sh - S113: the `restore` verb and perfload.  A three-node eager
-# fleet is filled and dumped with perfdump; the file set is loaded into an
-# EMPTY two-node SHARD fleet and into an empty two-node eager fleet, and
-# every record must arrive with the value, the VERSION and the remaining
-# TTL the dump held (absolute expiry preserved, not re-based).  Then the
-# policies over a fleet holding a newer copy, a record that expired between
-# the dump and the load, the resume file, a load into another collection,
-# a load that sends everything to one node of the shard fleet (the daemon
-# names what belongs elsewhere and the loader re-routes it), and the
-# comparator (--via-set) as the fail-first control: plain SET assigns fresh
-# versions, so the version assertion MUST fail against it.
+# loadtest.sh - the `restore` verb and perfload: a dumped fleet loads into empty shard and eager
+# fleets with every value, version and absolute expiry intact.
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 DUMP=${2:-./perfdump}
@@ -34,9 +25,8 @@ arena_mb = 32
 [secrets]
 client = lo-client-secret
 cluster = lo-cluster-secret
-# S129: restore is privileged, and perfload is how a fleet is
-# rolled back - without this the tool cannot raise privilege
-# and every connection it opens is refused.
+# restore is privileged: without this, perfload cannot raise privilege and every
+# connection it opens is refused
 enable = lo-enable-secret
 [listen]
 tcp = $2:$3
@@ -72,18 +62,8 @@ ready() { # ready <id>...: every node READY (a node still pulling its bootstrap 
 	done
 	echo "nodes $* never became ready"; exit 1
 }
-# drive <addr:port> <op> [args]
-#   fill <n>        -> n records dk<i> (value v<i>+x*(i%50), ttl 300 on even i) + every 10th overwritten (w<i>)
-#                      + dkshort (ttl 15); prints sets=<n>
-#   dump <col>      -> one line per record "key value expiry ver", sorted; expiry = unix seconds
-#                      the record's TTL points at when the dump was read (-1 = none), so two
-#                      dumps taken at different times compare on the ABSOLUTE expiry
-#   get <col> <key> -> "value ttl" or MISSING
-#   set <col> <key> <value> -> OK
-#   entries <col>   -> entries of <col>
-#   buckets <col>   -> buckets of <col>
-#   compare <src> <got> <tol> -> same= diff_val= diff_ver= exp_bad= missing= extra= dups=
-#                      (exp_bad: absolute expiries further apart than <tol> seconds, or one side never)
+# drive <addr:port> <op> [args]: fill <n>, dump <col> (expiry absolute, unix s), get, set, entries,
+# buckets, compare <src> <got> <tol> (exp_bad: expiries further apart than <tol> s)
 drive() {
 	python3 - "$@" <<'PYEOF'
 import json, pcnative, socket, sys, time
@@ -115,16 +95,11 @@ if op == "fill":
     if "error" not in call(f, "set", col="dc", key="dkshort", value="gone", ttl=15): done += 1
     print("sets=%d" % done)
 elif op == "dump":
-    # pinned to the table the first chunk walked, and restarted if the
-    # collection is resized under it: a member still growing from the push
-    # otherwise hands back records twice (rc32's check-asan red)
+    # pinned to the table the first chunk walked, and restarted if the collection is
+    # resized under it
     f = conn(); col = sys.argv[3]; cursor = 0; out = []; table = None; restarts = 0
-    # each record once only while the table is QUIET: a linear-hash split
-    # during the walk moves half a bucket ahead of the cursor, which then
-    # sees it again - the documented at-least-once.  A member still
-    # growing from the push did exactly that on rc32's check-asan (114
-    # repeats).  Wait for the bucket count to stand still for 1.5 s with
-    # no resize running; a swap during the walk is caught by `table`.
+    # each record once only while the table is QUIET (a split moves records ahead of the
+    # cursor): wait for the bucket count to stand still 1.5 s with no resize running
     last = None; still = 0
     for _ in range(120):
         st = call(f, "stats")
@@ -255,11 +230,7 @@ E=$(( $(drive $B1 entries dc) + $(drive $B2 entries dc) ))
 [ "$E" = 2000 ] && ok "entries unchanged at 2000 after the resume" || bad "entries $E after resume"
 
 # ---- into another collection, and the dry run
-# without --no-settle: dl is a NEW collection on the shard fleet, and its
-# records are still moving between the owners when the load returns - read
-# at once, a record in flight is on both (v0.5.6 GitHub check: dups=124,
-# every value, version and expiry right).  The first load waits for the
-# members' counts to stand still before it is read; this one must too.
+# without --no-settle: dl is NEW on the shard fleet, and a record still moving between owners is on both
 env -u PERFCLI_AUTH "$LOAD" --enable lo-enable-secret "$D/dump" --to $B1 --threads 2 --restart --collection-map dc=dl > "$LOG" 2>&1
 { drive $B1 dump dl; drive $B2 dump dl; } > "$D/gotl.txt"
 C=$(drive x compare "$D/src_live.txt" "$D/gotl.txt" 2 | head -1)
@@ -297,17 +268,104 @@ drive $C2 dump dc > "$D/gote.txt"
 C=$(drive x compare "$D/src_live.txt" "$D/gote.txt" 2 | head -1)
 [ "$C" = "same=2000 diff_val=0 diff_ver=0 exp_bad=0 missing=0 extra=0 dups=0" ] && ok "the copies on the member that took no file carry the dumped versions and expiries" || bad "eager member 2 holds: $C"
 
-# S344: a manifest naming anything but a file in the dump's directory is refused
+# a manifest naming anything but a file in the dump's directory is refused
 # before a byte is read - no shell ever sees the name
 mkdir -p "$D/evil"
 cat > "$D/evil/manifest.json" <<'EOF'
-{"source":"x","files":[{"file":"../x'; touch s344-ran; echo '","collection":"c","records":0,"crc32":0,"complete":true}]}
+{"format":"perfdump-format","format_version":2,"source":"x","files":[{"file":"../x'; touch s344-ran; echo '","collection":"c","records":0,"crc32":0,"complete":true}]}
 EOF
 LOADA=$(readlink -f "$LOAD")
 (cd "$D/evil" && env -u PERFCLI_AUTH "$LOADA" --enable lo-enable-secret "$D/evil" --to $B1 > "$D/evil.out" 2>&1)
 [ $? -ne 0 ] && [ ! -e "$D/evil/s344-ran" ] && grep -q "not a file in the dump's directory" "$D/evil.out" \
 	&& ok "S344: a manifest naming a path is refused, and nothing ran" \
 	|| bad "S344: $(ls "$D/evil" | tr '\n' ' ')/ $(tr '\n' ' ' < "$D/evil.out" | cut -c1-200)"
+
+# ---- every type the daemon dumps, and a value over 64 KB: two standalone nodes with a RESP door,
+# filled on one over RESP, dumped there and loaded into the other
+mk1() { # mk1 <id> <addr> <port> <resp port>
+	cat > "$D/n$1.conf" <<CONF
+[daemon]
+workers = 2
+log_level = notice
+[memory]
+arena_mb = 32
+[secrets]
+client = lo-client-secret
+enable = lo-enable-secret
+[listen]
+tcp = $2:$3
+resp = $2:$4
+plaintext = loopback
+[collection 0]
+buckets_log2 = 8
+CONF
+}
+# rx <addr:port> <arg>...: one RESP command, its reply flattened ([a,b], nil, -ERR ..).  @big is
+# a 100,000-byte binary value, @save/@exists a Symfony lock script's SHA1, @now the time
+rx() {
+	python3 - "$@" <<'PYEOF'
+import hashlib, socket, sys, time
+from symfony_lock import SHA
+h, p = sys.argv[1].rsplit(":", 1)
+big = bytes(range(256)) * 390 + bytes(160)
+sub = {"@big": big, "@save": SHA["save"].encode(), "@exists": SHA["exists"].encode(),
+       "@now": ("%.4f" % time.time()).encode()}
+a = [sub.get(x, x.encode()) for x in sys.argv[2:]]
+s = socket.create_connection((h, int(p)), timeout=10)
+s.sendall(b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a))
+f = s.makefile("rb")
+def rd():
+    l = f.readline().rstrip(b"\r\n").decode()
+    t, v = l[0], l[1:]
+    if t == "*": return "nil" if v == "-1" else "[" + ",".join(rd() for _ in range(int(v))) + "]"
+    if t == "$":
+        if v == "-1": return "nil"
+        b = f.read(int(v) + 2)[:-2]
+        if len(b) > 64: return "<%d bytes sha1 %s>" % (len(b), hashlib.sha1(b).hexdigest()[:16])
+        return b.decode(errors="replace")
+    return v if t in ":+" else "-" + v
+print(rd())
+PYEOF
+}
+mk1 8 127.0.1.81 17676 17678
+mk1 9 127.0.1.82 17677 17679
+start 8; start 9
+S8=127.0.1.81:17678 S9=127.0.1.82:17679
+rx $S8 SET s plain > /dev/null
+rx $S8 SET big @big > /dev/null
+rx $S8 HSET h f1 v1 f2 v2 > /dev/null
+rx $S8 JSON.SET j '$' '{"a":1,"b":[1,2]}' > /dev/null
+rx $S8 RL.HIT rl 600000 10 > /dev/null
+rx $S8 RL.HIT rl 600000 10 > /dev/null
+rx $S8 EVALSHA @save 1 L @now tokA 300000 > /dev/null
+types() { for k in s big h j rl L; do printf '%s ' "$(rx $1 TYPE $k)"; done; }
+TS=$(types $S8)
+[ "$TS" = "string string hash ReJSON-RL ratelimit zset " ] && ok "the source holds a string, a 100 KB string, a hash, a document, a rate limit and a lock" || bad "source types: $TS"
+env -u PERFCLI_AUTH "$DUMP" --from 127.0.1.81:17676 --collections 0 --threads 1 --zstd $Z --out "$D/dumpt" > "$LOG" 2>&1
+grep -q "^perfdump: 6 records" "$LOG" && ok "dumped the six" || bad "typed dump: $(tr '\n' '|' < "$LOG")"
+env -u PERFCLI_AUTH "$LOAD" --enable lo-enable-secret "$D/dumpt" --to 127.0.1.82:17677 --threads 1 > "$LOG" 2>&1
+case "$(grep "^perfload: 6 records" "$LOG")" in
+	*"stored 6, older 0, existing 0, expired 0, refused 0, bad 0"*) ok "loaded the six, the 100 KB value with them";;
+	*) bad "typed load: $(tr '\n' '|' < "$LOG")";;
+esac
+TT=$(types $S9)
+[ "$TT" = "$TS" ] && ok "every type came back: $TT" || bad "types after the load: $TT (the source: $TS)"
+for c in "GET s" "GET big" "HGETALL h" "JSON.GET j"; do
+	X=$(rx $S8 $c); Y=$(rx $S9 $c)
+	[ "$X" = "$Y" ] && case "$X" in nil|-*) false;; esac && ok "$c answers as at the source: $Y" || bad "$c: $Y (the source: $X)"
+done
+case "$(rx $S9 GET big)" in "<100000 bytes "*) ok "the big value is 100,000 bytes";; *) bad "big: $(rx $S9 GET big)";; esac
+[ "$(rx $S9 EVALSHA @exists 1 L @now tokA)" = 1 ] && ok "the lock is held by its token after the load" || bad "lock: $(rx $S9 EVALSHA @exists 1 L @now tokA)"
+[ "$(rx $S9 RL.HIT rl 600000 10)" = "[3,1]" ] && ok "the rate limit counts on from the two hits it had" || bad "rate limit: $(rx $S9 RL.HIT rl 600000 10)"
+# a format-1 dump: refused, with the reason, by perfload and by --inspect
+mkdir "$D/dumpv1" && cp "$D/dumpt"/*.pcd* "$D/dumpv1/"
+sed 's/"format_version":2,/"format_version":1,/' "$D/dumpt/manifest.json" > "$D/dumpv1/manifest.json"
+env -u PERFCLI_AUTH "$LOAD" --enable lo-enable-secret "$D/dumpv1" --to 127.0.1.82:17677 --threads 1 --restart > "$LOG" 2>&1; rc=$?
+"$DUMP" --inspect "$D/dumpv1" > "$D/inspv1.out" 2>&1; irc=$?
+[ $rc -ne 0 ] && [ $irc -ne 0 ] && grep -q "is perfdump format 1; perfload [0-9.]* loads format 2 only" "$LOG" &&
+	grep -q "is perfdump format 1; perfdump [0-9.]* reads format 2 only" "$D/inspv1.out" &&
+	ok "a format-1 dump is refused by perfload and by --inspect, naming the format" ||
+	bad "format 1: perfload rc=$rc $(tr '\n' '|' < "$LOG") / inspect rc=$irc $(tr '\n' '|' < "$D/inspv1.out")"
 
 echo "loadtest: $pass passed, $fail failed"
 [ $fail = 0 ]

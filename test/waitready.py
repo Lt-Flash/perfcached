@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
-# waitready.py <host:port>... [-t seconds] - wait until every node's /stats
-# says state "ready" (the native door), then return 0; 1 when one does not
-# within the time (15 s), naming it.
-#
-# A node that has just started reports "perfcached ready", joins, and the
-# fleet's figures - peers up, the acks gate confirming - read as formed while
-# its own state is still RECOVERING: every verb that touches data answers
-# "node is not READY (recovering) - retry, or use another member"
-# (serving_denied, verbs.c) for a beat or a few.  A suite that writes the
-# moment the fleet looks formed loses those writes and goes on testing
-# nothing (v0.7.3-rc3..rc6: tombjointest, tombrebuildtest, tombacktest,
-# tombmcasttest).  When it had to wait it says how long, on one line.
+# waitready.py <host:port>... [-t seconds] - until every node's state is "ready" (a node can read as
+# formed while still RECOVERING and refusing data verbs); 1 when one is not within 15 s, naming it
 import socket, sys, time
 import pcnative
 

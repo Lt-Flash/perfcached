@@ -1,45 +1,6 @@
 #!/bin/sh
-# expirerejointest.sh - RV-4d: an eager fleet's mass expiry while a node
-# is down, and that node coming back.
-#
-# RV-4's map (DESIGN 12gb): mass expiry was never exercised in a cluster.
-# Expiry is not a delete - no tombstone travels - so the only things that
-# stop a returning node from bringing expired keys back are the absolute
-# (wall-clock) expiry its snapshot and WAL carry, and B4's reconcile for
-# what it replays that the fleet no longer holds.
-#
-# Three eager nodes with a WAL; half the keys written through node 1,
-# half through node 3 (so node 3's WAL AUTHORS some of each kind):
-#   s  3,000 keys, ttl 12 s        - expire while node 3 is down
-#   i  1,000 keys, immortal        - must all survive
-#   x    500 keys, ttl 12 s, then re-set ttl 600 while node 3 is down:
-#                                    node 3's copy is older and dies first
-#   t    500 keys, immortal, then re-set ttl 6 while node 3 is down:
-#                                    node 3's copy is older and IMMORTAL
-# Node 3 goes down, the re-sets land, everything short expires, node 3
-# comes back, its reconcile finishes and 25 s of repair cycles follow,
-# with nothing read.  Then, through every node: s 0, t 0, x 500 at the NEW value,
-# i 1,000.  Twice: a clean stop (node 3 restores from its shutdown
-# snapshot, replicas included) and kill -9 (its WAL only - its own
-# records).  The t keys node 3 authored are the case only reconcile
-# stands in front of: replayed immortal, gone everywhere else.
-# A third run reads the t keys through node 1 while node 3 reconciles:
-# none may be answered.  Before S303 the miss pulled and node 3 had to
-# hold the pull back; since S303 node 1's eager miss is final and asks
-# nobody - S245's pull guard is no longer reached from here.
-#
-# S245, found here: expiry leaves no tombstone, so a peer accepts ANY
-# copy of an expired key.  Node 3's sweep pushed its recovered t copies
-# before its reconcile had asked about them - the peers took them, then
-# answered the probe "held" - and they came back immortal on every node
-# (376 of 500 from the snapshot, 158 of 500 from the WAL, with a
-# witness; all 500 without one).  Now a recovered record is neither
-# swept nor served to a pull until reconcile has ruled on it.
-# FAIL-FIRST: the build before S245 fails every "through node" check.
-# Not covered, by design (S223): a fleet with no witness skips
-# reconcile, and then nothing stands between a replayed key and the
-# fleet - the arms wait out the witness grace first.
-# Usage: test/expirerejointest.sh [./perfcached]
+# expirerejointest.sh - mass expiry while a node is down: on its return no expired key comes back
+# on any node, since a recovered record is neither swept nor served until reconcile rules on it.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -151,10 +112,8 @@ arm() { # arm <term|kill> [pull]
 	for n in 1 2 3; do conf $n; done
 	for n in 1 2 3; do start $n || { bad "$1: node $n did not start"; return; }; done
 	ready3 || { bad "$1: the fleet did not form"; return; }
-	# S223: reconcile trusts only a peer up WITNESS_GRACE (30 s) before
-	# this node went down - a younger fleet skips it by design.  S392: and
-	# a witness vouches only for a window opening after its own grace, the
-	# window being node 3's stop snapshot less a 10 s margin - so 45, not 32
+	# reconcile trusts only a peer up WITNESS_GRACE (30 s) before this node went down, and a witness
+	# vouches only for a window past its own grace (the stop snapshot less 10 s) - so 45, not 32
 	sleep 45
 	W=$(( $(put 1 s 0 1500 v1 12) + $(put 3 s 1500 3000 v1 12) + $(put 1 i 0 500 v1 0) + $(put 3 i 500 1000 v1 0) \
 		+ $(put 1 x 0 250 v1 12) + $(put 3 x 250 500 v1 12) + $(put 1 t 0 250 v1 0) + $(put 3 t 250 500 v1 0) ))
@@ -177,43 +136,24 @@ arm() { # arm <term|kill> [pull]
 	start 3 || { bad "$1: node 3 did not come back"; return; }
 	ready3 || bad "$1: the fleet did not re-form"
 	if [ -n "${2:-}" ]; then
-		# node 3 holds every t key, immortal, until its reconcile has
-		# asked about it.  Before S303 a miss on node 1 pulled and node
-		# 3 had to hold the pull back (S245); since S303 a READY eager
-		# node's miss is final and asks nobody.  Either way none of the
-		# 500 may be answered.
+		# node 3 holds every t key, immortal, until its reconcile has asked about it; a READY eager
+		# node's miss is final, so none of the 500 may be answered through node 1
 		PS0=$(st 1 'r["cluster"].get("pull_sent", 0)')
 		P1=$(reads 1 t 0 500); PH=$(st 3 'r["cluster"].get("pull_held_recovered", 0)')
 		PS1=$(st 1 'r["cluster"].get("pull_sent", 0)')
-		# S392: after a clean stop the fast path can end node 3's pass - the
-		# t keys dropped by the witness's replay - before these reads, and
-		# then there is nothing left to hold back: none answered, and node 3
-		# itself serves none (GitHub 38404002054's repl3: pulls 0 -> 500,
-		# none held, none answered)
-		# ... or the walk ended it first: S393's budget walks these keys in
-		# seconds (GitHub 38408244573: no fast path, the pass already shut)
+		# after a clean stop the fast path, or the budgeted walk, can end node 3's pass before these
+		# reads: nothing left to hold back, none answered, node 3 serving none
 		O3B=$(st 3 'r["cluster"].get("reconcile_open")')    # BEFORE node 3's reads
 		P3=$(reads 3 t 0 500); F3=$(st 3 'r["cluster"].get("reconcile_fast")')
 		O3=$(st 3 'r["cluster"].get("reconcile_open")')
-		# ... or node 1 pulled and nobody answered while the pass was still
-		# open (GitHub 38410859243 and 38419424148: pulls 0 -> 500, none
-		# held, pass open, node 3 serving none).  Four outcomes so far, each
-		# legitimate, each read off a different counter.  What must hold is
-		# what the header says: none answered THROUGH NODE 1.  Node 3 itself
-		# serves none only once its pass has closed (the keys dropped) -
-		# while it is open, whether node 3 already serves is timing (rc5,
-		# GitHub 38483271484: pass open, node 3 serving all 500, node 1 none).
-		# So node 3's reads count only when the pass was shut before them.
-		# The counters stay in the line, to say which way it went.
+		# ... or node 1 pulled while the pass was open; what must hold is none answered through node 1,
+		# and node 3's own reads count only when its pass was shut before them
 		[ "$P1" = 0 ] && { [ "$O3B" = True ] || [ "$P3" = 0 ]; } \
 			&& ok "$1: t read through node 1 during node 3's reconcile: 0 of 500 answered (node 1 pulls $PS0 -> $PS1, $PH held back by node 3; node 3 fast path $F3, pass open $O3, serves $P3)" \
 			|| bad "$1: t read through node 1 during node 3's reconcile answered $P1 of 500 (node 1 pulls $PS0 -> $PS1, node 3 held back $PH, fast path $F3, pass open $O3B before node 3's reads and $O3 after, serves $P3)"
 	fi
-	# NOTHING else is read from here to the checks: what matters is the sweep
-	# AFTER the pass - held records are released then, and a leak would land
-	# on the peers.  S392: after a clean stop node 3 holds its stop snapshot
-	# and a witness replays every delete AND expiry since it (the fast path);
-	# after kill -9 it holds no snapshot (save = off) and walks
+	# NOTHING else is read until the checks: the sweep after the pass releases held records and a
+	# leak would land on the peers; the pass ends by the fast path (clean stop) or the walk (kill -9)
 	FIN="reconcile pass finished asking|reconcile finished by the fast path"
 	i=0; while [ $i -lt 240 ]; do
 		grep -q -E "$FIN" "$D/n3.log.1" && [ "$(st 3 'r["cluster"]["reconcile_pending"]')" = 0 ] && break

@@ -1,20 +1,6 @@
 #!/bin/sh
-# foreigntest.sh - S36 step d: a SECOND cluster on the same seeds is an
-# alarm, never a merge.
-#
-# In unicast mode every node beats at every seed, so two fleets that
-# share a seed list hear each other all the time.  S302 already refuses
-# the other cluster's frames; this asserts the operator is TOLD: an
-# ERROR the first time a foreign id is heard, /stats
-# cluster.foreign_clusters naming it, and the /metrics gauge.
-#   two fleets pinned to different ids (alpha: nodes 1, 2; beta: 3, 4),
-#   every node seeded with node 1 and node 3:
-#   1  each fleet stays two members - no merge
-#   2  each side lists the other's id in foreign_clusters, from a member
-#      of the other fleet
-#   3  the ERROR is logged once per foreign id per node, not per frame
-#   4  /metrics perfcached_cluster_foreign_clusters is 1
-# Usage: test/foreigntest.sh [./perfcached]
+# foreigntest.sh - a second cluster on the same seeds is an alarm, never a merge: an ERROR once per
+# foreign id, /stats foreign_clusters and the gauge.  Usage: test/foreigntest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcfor.XXXXXX)

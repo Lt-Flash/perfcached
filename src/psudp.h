@@ -1,21 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * psudp.h - a connection's pub/sub push stream over UDP (PS5), the part
- * that decides: when to probe, when a probe has gone unanswered too long,
- * and when a confirmed stream has stopped being acknowledged.  Header-only
- * and pure, so the unit test drives what the worker runs.  The datagram is
- * lib/perfd_push.h; proto.c does the sockets.
- *
- * THE LIFE OF A STREAM
- *   probing   PSU_PROBES probes, PSU_PROBE_MS apart; deliveries stay on TCP.
- *             Unconfirmed after PSU_EXPIRE_MS, the stream is dropped without
- *             a word - the client's own wait for a probe has long ended.
- *   active    deliveries that fit go over UDP.  Pruned when no ACK has come
- *             for PFP_PRUNE_MS (a client that stopped), or when the daemon
- *             has been sending past an acknowledgement that stopped moving
- *             for PFP_PRUNE_MS (UDP broke while TCP still carries the ACKs).
- *             An idle stream is not stalled: nothing unacknowledged.
- */
+/* psudp.h - when a UDP push stream probes, expires or is pruned: pure and
+ * header-only so the unit test drives what the worker runs */
 #ifndef PC_PSUDP_H
 #define PC_PSUDP_H
 
@@ -34,18 +19,17 @@ struct psu_stream {
 	long long started_ms;
 	long long probe_ms;                /* the last probe */
 	long long ack_ms;                  /* the last acknowledgement */
-	long long pending_ms;              /* since when something sent is
-	                                    * unacknowledged and the ack has not
-	                                    * moved; 0 = nothing pending */
+	long long pending_ms;              /* since when the ack has not moved over
+	                                    * unacked data; 0 = nothing pending */
 	int probes;
 	uint8_t active;
 };
 
 #define PSU_NOTHING         0
 #define PSU_PROBE           1
-#define PSU_EXPIRE          2
-#define PSU_PRUNE_SILENT    3
-#define PSU_PRUNE_STALLED   4
+#define PSU_EXPIRE          2           /* unconfirmed: dropped without a word */
+#define PSU_PRUNE_SILENT    3           /* no ack for PFP_PRUNE_MS: client stopped */
+#define PSU_PRUNE_STALLED   4           /* ack stuck while sending: UDP broke */
 
 static inline void psu_start(struct psu_stream *s, uint64_t id, long long now)
 {

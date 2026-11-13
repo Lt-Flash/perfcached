@@ -1,29 +1,6 @@
 #!/bin/sh
-# masterlosstest.sh - RV-4b: shard and spread fleets losing their MASTER.
-#
-# RV-4's map (DESIGN 12gb): master loss was asserted only for store and
-# eager.  Shard and spread place every key by the master's map, and the
-# suites that kill a node there kill it by NUMBER (shardswitchtest's
-# victim "may be the master", unasserted).  Here the victim is chosen by
-# ROLE.  Per mode (shard; spread with replicas = 2), three nodes with a
-# WAL:
-#   1. 300 keys through node 1: every node answers every key the same,
-#      and the fleet holds each key exactly once (shard) / exactly K = 2
-#      times (spread);
-#   2. kill -9 the node whose role is master: the survivors elect one
-#      master under a HIGHER term and agree on the map;
-#   3. through both survivors every key answers the SAME (no split
-#      ownership).  Shard may miss the keys the dead master owned - it
-#      keeps one copy; spread must serve all of them, and repairs to K
-#      copies on the survivors;
-#   4. 100 new keys through the survivors land once (shard) / K times
-#      (spread) and read from both;
-#   5. the old master restarts from its WAL: one master, one map term,
-#      and within 60 s every key reads the same from all three and the
-#      fleet holds each key exactly once / exactly K times - reshard's
-#      invariant: a miss is allowed while a node is down, two live copies
-#      of a shard key never are.
-# Usage: test/masterlosstest.sh [./perfcached]
+# masterlosstest.sh - shard and spread fleets losing the node whose ROLE is master: a new master under a
+# higher term, every key answered alike, held once (shard) or K times (spread), also after its return.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -97,6 +74,14 @@ try:
     print(c.get("role"), m.get("nodes"), m.get("term"), m.get("seq"), e[0] if e else "?")
 except Exception: print("? ? ? ? ?")' "1736$1" 2>/dev/null || echo "? ? ? ? ?"; }
 w() { echo "$1" | cut -d' ' -f"$2"; }
+rdy() { # rdy <n>: "state peers_up"
+	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"stats"}' | timeout 10 python3 -c '
+import json, socket, sys, pcnative
+try:
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5); f = pcnative.wrap(s)
+    f.write(sys.stdin.read().encode()); f.flush()
+    r = json.loads(f.readline())["result"]; print(r.get("state"), r["cluster"].get("peers_up"))
+except Exception: print("? ?")' "1736$1" 2>/dev/null || echo "? ?"; }
 put() { # put <n> <prefix> <from> <to>
 	timeout 60 python3 -c '
 import json, socket, sys, pcnative
@@ -141,8 +126,9 @@ run() { # run <label> <K> <cluster lines>
 	rm -rf "$D"/s? "$D"/n?.log
 	for n in 1 2 3; do conf $n "$3"; done
 	start 1 && sleep 1 && start 2 && start 3 || { bad "$label: the fleet did not start"; return; }
-	i=0; while [ $i -lt 60 ]; do [ "$(w "$(st 1)" 2)" = 3 ] && [ "$(w "$(st 3)" 2)" = 3 ] && break; sleep 0.5; i=$((i+1)); done
-	sleep 2
+	# a joiner is CONNECTING until its links answer: every node ready, seeing the others, on the 3-node map
+	i=0; while [ $i -lt 90 ]; do [ "$(w "$(st 1)" 2)$(w "$(st 2)" 2)$(w "$(st 3)" 2)" = 333 ] && \
+		[ "$(rdy 1)$(rdy 2)$(rdy 3)" = "ready 2ready 2ready 2" ] && break; sleep 0.5; i=$((i+1)); done
 	B=$(put 1 k 0 $N)
 	i=0; while [ $i -lt 60 ]; do [ "$(sumentries 1 2 3)" = $((K * N)) ] && break; sleep 0.5; i=$((i+1)); done
 	A1=$(answers 1); A2=$(answers 2); A3=$(answers 3); T=$(sumentries 1 2 3)
@@ -194,9 +180,7 @@ EOF
 
 	# ---- the old master returns ----
 	start $M || { bad "$label: node $M did not restart"; return; }
-	# up to 150 s: a spread return leaves surplus copies (the survivors'
-	# re-placed ones) that the SETTLED reclaim pass drops - spreadtest
-	# allows 120 s for it
+	# up to 150 s: a spread return leaves surplus copies that the SETTLED reclaim pass drops
 	i=0; while [ $i -lt 300 ]; do
 		s1=$(st 1); s2=$(st 2); s3=$(st 3)
 		ms=0; for s in "$s1" "$s2" "$s3"; do [ "$(w "$s" 1)" = master ] && ms=$((ms+1)); done

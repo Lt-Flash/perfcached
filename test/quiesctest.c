@@ -1,9 +1,5 @@
-/* S150 B: the quiescent-state primitive a table retirement waits on.
- * Readers are threads scripted from main: attach, enter, exit on
- * command, so every ordering below is exact, not raced.  A stamp is
- * taken AFTER an unpublish; it is clear once no line is inside since
- * before it - a thread that entered later, or parked since, cannot hold
- * what was unpublished. */
+/* quiesctest.c - the quiescent-state primitive a table retirement waits on, with scripted readers:
+ * a stamp taken after an unpublish clears once no thread has been inside since before it. */
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>

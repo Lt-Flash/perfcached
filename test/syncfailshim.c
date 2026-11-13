@@ -1,33 +1,5 @@
-/* syncfailshim.c - S215: an LD_PRELOAD shim that makes the device refuse
- * a sync, by descriptor CLASS, armed at runtime.
- *
- * The daemon has to start on a healthy device - segment provisioning
- * syncs, and refuses to start when that fails - so the fault is armed
- * afterwards through a file: PC_SYNCFAIL_CTL names it, and its content
- * is read on every fdatasync/fsync (these calls cost milliseconds; one
- * small read beside them is nothing):
- *
- *   wal    a WAL segment        (.../wal-NNN.seg)
- *   walwrite  a WAL segment's pwrite or pwritev fails with ENOSPC - the
- *          append itself is refused, not the sync after it (S306: the
- *          pump writes batches with pwritev; a shim that wrapped pwrite
- *          alone refused nothing, and syncfailtest said so)
- *   walslow   a WAL segment's pwrite or pwritev SUCCEEDS, after PC_SYNCFAIL_SLOW_MS
- *          (default 100) - a device that cannot keep up, so the WAL
- *          pump falls behind and its producer rings overflow on any
- *          runner, sanitizer or not (S229's healtest: a burst that
- *          merely raced the pump dropped nothing under ASan)
- *   ctrl   the WAL's CONTROL    (.../CONTROL)
- *   dir    a directory          (the snapshot's rename)
- *   nodir  open(O_DIRECTORY) fails with EACCES - the directory sync
- *          cannot even be attempted
- *
- * A matching call fails with EIO and does NOT reach the device; anything
- * else passes through.  Every refused call is appended to
- * PC_SYNCFAIL_LOG ("<class> <path>"), so a test can prove the fault was
- * DELIVERED - a green run against a shim that never fired proves
- * nothing.
- */
+/* syncfailshim.c - LD_PRELOAD shim: the classes the file PC_SYNCFAIL_CTL names, read at each sync,
+ * make those syncs or WAL appends fail or stall; every refusal is logged to PC_SYNCFAIL_LOG. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -39,9 +11,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-/* The real calls are reached as raw syscalls rather than through
- * dlsym(RTLD_NEXT): RTLD_NEXT needs a feature-test macro, and this tree
- * keeps its sources free of them. */
+/* the real calls are raw syscalls: dlsym(RTLD_NEXT) needs a feature-test macro, and this tree
+ * keeps its sources free of them */
 static int real_open(const char *path, int flags, mode_t mode)
 {
 	return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
@@ -64,7 +35,19 @@ static void armed(char *out, size_t cap)
 	if (n < 0)
 		n = 0;
 	out[n] = 0;
-	out[strcspn(out, " \r\n")] = 0;
+	out[strcspn(out, "\r\n")] = 0;
+}
+
+/* @cls is one of the classes armed */
+static int has(const char *want, const char *cls)
+{
+	size_t n = strlen(cls);
+	const char *p = want;
+
+	for (; (p = strstr(p, cls)); p += n)
+		if ((p == want || p[-1] == ' ') && (p[n] == 0 || p[n] == ' '))
+			return 1;
+	return 0;
 }
 
 static void note(const char *cls, const char *path)
@@ -107,17 +90,37 @@ static int refuse(int fd)
 		cls = "ctrl";
 	else if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
 		cls = "dir";
-	if (!cls || strcmp(cls, want) != 0)
+	if (!cls || !has(want, cls))
 		return 0;
 	note(cls, path);
 	errno = EIO;
 	return 1;
 }
 
+/* "dirslow": a directory's sync is delayed, not refused */
+static void slow_dir(int fd)
+{
+	char want[32], lnk[64], path[512];
+	const char *ms = getenv("PC_SYNCFAIL_DIR_MS");
+	struct stat st;
+	ssize_t n;
+	int d = ms ? atoi(ms) : 5000;
+
+	armed(want, sizeof want);
+	if (!has(want, "dirslow") || fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode))
+		return;
+	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
+	n = readlink(lnk, path, sizeof path - 1);
+	path[n > 0 ? n : 0] = 0;
+	note("dirslow", path);
+	usleep((useconds_t)(d > 0 ? d : 5000) * 1000);
+}
+
 int fdatasync(int fd)
 {
 	if (refuse(fd))
 		return -1;
+	slow_dir(fd);
 	return (int)syscall(SYS_fdatasync, fd);
 }
 
@@ -125,6 +128,7 @@ int fsync(int fd)
 {
 	if (refuse(fd))
 		return -1;
+	slow_dir(fd);
 	return (int)syscall(SYS_fsync, fd);
 }
 
@@ -136,7 +140,7 @@ static int refuse_write(int fd)
 	ssize_t n;
 
 	armed(want, sizeof want);
-	if (strcmp(want, "walwrite") != 0)
+	if (!has(want, "walwrite"))
 		return 0;
 	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
 	n = readlink(lnk, path, sizeof path - 1);
@@ -161,7 +165,7 @@ static void slow_write(int fd)
 	int d = ms ? atoi(ms) : 100;
 
 	armed(want, sizeof want);
-	if (strcmp(want, "walslow") != 0)
+	if (!has(want, "walslow"))
 		return;
 	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
 	n = readlink(lnk, path, sizeof path - 1);
@@ -194,8 +198,8 @@ ssize_t pwrite64(int fd, const void *buf, size_t n, off_t off)
 	return (ssize_t)syscall(SYS_pwrite64, fd, buf, n, off);
 }
 
-/* S306: the WAL pump's batches.  The offset goes as the kernel's low/high
- * pair, split the way glibc does it, so a 32-bit build passes it right */
+/* the WAL pump's batches; the offset goes as the kernel's low/high pair, split as glibc
+ * does, so a 32-bit build passes it right */
 static ssize_t real_pwritev(int fd, const struct iovec *iov, int cnt,
 		off_t off)
 {
@@ -229,7 +233,7 @@ static int nodir(const char *path, int flags)
 	if (!(flags & O_DIRECTORY))
 		return 0;
 	armed(want, sizeof want);
-	if (strcmp(want, "nodir") != 0)
+	if (!has(want, "nodir"))
 		return 0;
 	note("nodir", path);
 	errno = EACCES;

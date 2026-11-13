@@ -1,33 +1,15 @@
 #!/bin/sh
-# recoverytest.sh — S15 verification: a perfcached node survives death.
-#  1. Full round-trip: dataset -> snapshot -> MORE writes (the WAL tail)
-#     -> SIGKILL -> restart -> every key verified: values, counters
-#     (absolute), deletes stayed dead, TTLs survived, expired stayed
-#     expired.
-#  2. Kill -9 storm: five generations of writes, each ended by SIGKILL
-#     at a random moment; the survivor set must match the model.
-#  3. Torn tail: garbage appended to the active segment after a kill -
-#     restart succeeds, replay stops cleanly at the tear.
-#  4. FAIL-FIRST: a corrupted mid-WAL record provably GATES replay (a
-#     later write is lost exactly as the CRC dictates), and -W calls the
-#     WAL torn before anything trusts it.
-#  5. Corrupt snapshot: CRIT + cold start + WAL-alone rebuild.
-# Usage: test/recoverytest.sh [./perfcached]
+# recoverytest.sh - a node survives death: snapshot + WAL tail round-trip, a kill -9 storm, a torn
+# tail, a corrupted mid-WAL record that gates replay, and a corrupt snapshot rebuilt from the WAL.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
 BIN=${1:-./perfcached}
-# PCREC_TMP puts the whole fixture on a chosen filesystem: S62 only ever
-# failed on slow storage, and without this the test cannot be pointed at
-# any.  PCREC_KEEP leaves the directory (and its per-generation logs)
-# behind for a post-mortem.
+# PCREC_TMP puts the whole fixture on a chosen filesystem (slow storage is where it matters);
+# PCREC_KEEP leaves the directory and its per-generation logs behind
 D=$(mktemp -d "${PCREC_TMP:-/var/tmp}/pcrec.XXXXXX")
 PID=
-# Startup includes the WAL probe, which on heavily throttled or very slow
-# storage legitimately takes tens of seconds - measured at 29s under a
-# cgroup io.max of 10 wiops, where the probe correctly reports ~5
-# sustainable synced writes/s.  The old fixed 8s wait called that a dead
-# daemon.  A generous default only costs time when a start really fails.
+# startup includes the WAL probe, which on throttled storage legitimately takes tens of seconds
 STARTMAX=$(( ${PCREC_START_WAIT:-45} * 10 ))
 cleanup() {
 	[ -n "$PID" ] && kill -9 $PID 2>/dev/null
@@ -54,21 +36,8 @@ tcp = 127.0.0.1:16487
 plaintext = loopback
 [wal]
 dir = $D/wal
-# probe = auto, NOT no.  (No backticks below: this is an unquoted
-# heredoc, and a backtick here is command substitution - the first
-# draft of this comment made the shell try to RUN "probe".)
-#
-# This leg asserts that acked writes survive SIGKILL, and fsync = always
-# only delivers that if the ring can absorb what arrives while the pump
-# sits in fdatasync.  With probe = no the depth cannot be sized for the
-# device, and the daemon says so on every start: dropped records are
-# acknowledged writes that will be missing after a restart.
-#
-# MEASURED 2026-09-02, on a GitHub runner where this leg fails 2 of 20:
-# fdatasync p50 0.60ms but p99 148.86ms, max 181.53ms - a 250x tail.
-# On the NVMe build host the same leg passes ~50 for 50, which is why
-# it looked like a CI mystery for three failures rather than a config
-# the daemon had already warned about.
+# probe = auto, NOT no: acked writes survive SIGKILL only if the ring, sized for the
+# device by the probe, absorbs what arrives while the pump sits in fdatasync
 probe = auto
 fsync = always
 segment_mb = 2
@@ -92,10 +61,7 @@ start() {
 	done
 	echo "daemon did not start"; tail -5 "$D/log"; exit 1
 }
-# Each start appends.  Rounds used to share ONE log truncated between
-# them, which is fine for a clean grep and catastrophic for a failure
-# you cannot reproduce: by the time the storm asserted, four of the five
-# daemons' logs had been overwritten.  Keep them, numbered.
+# each start appends to its own numbered log, so a storm failure keeps every daemon's words
 LOGN=0
 newlog() {
 	LOGN=$((LOGN + 1))
@@ -192,13 +158,8 @@ for i in range(120):
 call("add", col="cnt", key="gens", by=1)
 EOF
 	[ $? -eq 0 ] || bad "storm gen $gen writes"
-	# THE PREMISE, CHECKED: an ack is at the producer ring, not the file
-	# (src/wal.h), and kill -9 takes whatever is still in a ring.  A fixed
-	# sleep assumed the pump had drained; under ASAN on a two-core runner
-	# it had not, and 95 of 600 acked keys were "lost" by a test that had
-	# never waited for them to be logged.  Wait on the mark the daemon
-	# publishes for exactly this - wal.staged (S145) - bounded, and say so
-	# if it never drains rather than blame recovery for it.
+	# an ack is at the producer ring, not the file (src/wal.h), and kill -9 takes what a ring holds:
+	# wait on wal.staged, bounded, and say so if it never drains
 	w=0
 	while [ $w -lt 100 ]; do
 		st=$(python3 - <<'PYS'
@@ -241,13 +202,7 @@ if [ $? -eq 0 ]; then
 	ok
 else
 	bad "storm verification"
-	# SHOW THE DAEMON'S OWN WORDS.  This leg has failed intermittently
-	# on CI three times and been mute every time, because the daemon
-	# logs land in $D and CI only ever sees the assertion.  The WAL has
-	# a great deal to say about lost records - "wal: FULL - no free
-	# segment ... no longer replayable", "wal: DROPPED %llu
-	# acknowledged write(s)" - and any of it would have turned three
-	# unexplained reds into a diagnosis.
+	# show the daemons' own words: the WAL logs every lost record ("wal: FULL", "wal: DROPPED")
 	echo "--- what the daemons said (one log per generation) ---"
 	for L in "$D"/log[0-9]*; do
 		[ -f "$L" ] || continue
@@ -275,23 +230,28 @@ hardkill
 # corrupt the SECOND record (keepB stays valid, lostC is beyond the tear)
 python3 - "$D/wal" <<'EOF'
 import glob, struct, sys
-best = None
+def records(path):          # bounded: a segment just rotated in may hold none (ASan 113382)
+    data = open(path, "rb").read()
+    off, out = 8, []
+    while off + 12 <= len(data):
+        ln = struct.unpack("<I", data[off:off+4])[0]
+        if ln == 0 or off + 12 + ln > len(data): break
+        out.append(off)
+        off += 12 + ln
+    return out
+cands = []
 for seg in glob.glob(sys.argv[1] + "/wal-*.seg"):
     with open(seg, "rb") as f:
-        magic, gen = struct.unpack("<II", f.read(8))
-    if magic == 0x4C574350 and (best is None or gen > best[1]):
-        best = (seg, gen)
-seg = best[0]
-with open(seg, "rb") as f:
-    data = f.read()
-off = 8
-recs = []
-while True:
-    ln = struct.unpack("<I", data[off:off+4])[0]
-    if ln == 0: break
-    recs.append(off)
-    off += 12 + ln
-assert len(recs) >= 3, recs
+        h = f.read(8)
+    if len(h) == 8 and struct.unpack("<I", h[:4])[0] == 0x4C574350:
+        cands.append((struct.unpack("<I", h[4:])[0], seg))
+seg, recs = None, []
+for gen, path in sorted(cands, reverse=True):   # the newest that holds the last writes
+    recs = records(path)
+    if len(recs) >= 3:
+        seg = path
+        break
+assert seg and len(recs) >= 3, (cands, recs)
 tgt = recs[-2]                       # the middle of the last three
 with open(seg, "r+b") as f:
     f.seek(tgt + 20)

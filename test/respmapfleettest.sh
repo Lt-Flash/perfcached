@@ -1,33 +1,6 @@
 #!/bin/sh
-# respmapfleettest.sh - S432 (0.7.1): the RESP door's DB-index map, changed on
-# a running fleet: one serving `resp_collections = 0, 1:prod-redis, 2:th`
-# moves DB 0 onto prod-redis without a restart.
-#   - three eager members with RESP doors and that list; DB 0 holds "zero",
-#     DB 1 (prod-redis) holds "pr" and a second key;
-#   - one RESP connection held open on EACH member, never re-selecting:
-#     `perfcli map 0 prod-redis` on node 1, and each connection's next GET
-#     answers prod-redis's value (no reconnect, every member);
-#   - maps / stats resp.map on every member: index 0 -> prod-redis, runtime;
-#     INFO keyspace reports prod-redis as db0; the audit line names the
-#     client on node 1 and "by the fleet" on the others;
-#   - refused: without -E; a collection that does not exist; index 64;
-#     the words swapped (perfcli refuses before sending); an unmap of an
-#     index only the config maps;
-#   - a reload with resp_collections changed is refused with the
-#     `perfcli map` hint; -C reports the runtime map;
-#   - the whole fleet restarted: the map holds (the respmap file);
-#   - node 3 stopped, `unmap 0` on node 1, node 3 started with its stale
-#     map: the fleet's tombstone (newer) brings it back to the config's
-#     word within a few beats;
-#   - a fourth member that does not take the map (the test flag
-#     PERFCACHED_TEST_NO_RESPMAP, as a build before 0.7.1): map is refused
-#     naming it; once it has left, map goes through again;
-#   - a standalone node (no [cluster]): with allow_create = no map is
-#     refused naming the setting; with it on: map, restart, unmap - with no
-#     peer to resync from, only the clock resumed above the persisted map
-#     lets the unmap outrank it.
-# Fail-first: a daemon before S432 answers method-not-found to map.
-# Usage: test/respmapfleettest.sh [./perfcached] [./perfcli]
+# respmapfleettest.sh - the RESP DB-index map changed on a running fleet (perfcli map/unmap): open connections
+# follow, restarts keep it, refusals say why.  Usage: test/respmapfleettest.sh [./perfcached] [./perfcli]
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -202,9 +175,8 @@ node 1; node 2; node 3
 waitfor 20 '[ "$(st 1 "s[\"cluster\"][\"peers_up\"]")" = 2 ]' || bad "4. the fleet did not come back"
 ready 1 2 3
 for n in 1 2 3; do [ "$(mapsof $n)" = "[(0, 'prod-redis', 'runtime'), (1, 'prod-redis', 'config'), (2, 'th', 'config')]" ] || bad "4. node $n after the restart: $(mapsof $n)"; done
-# no WAL or snapshot here: the records went with the fleet, the map did not.
-# Seed them again over the native door - collection '0' has no RESP index
-# while DB 0 is mapped away from it.
+# no WAL or snapshot: the records went with the fleet, the map did not.  Seed them over the native
+# door, as collection '0' has no RESP index while DB 0 is mapped away.
 "$CLI" -q -h 127.0.87.1 -p 15511 set 0 k zero >/dev/null 2>&1; "$CLI" -q -h 127.0.87.1 -p 15511 set prod-redis k pr >/dev/null 2>&1
 waitfor 10 '[ "$(rs 3 0 GET k)" = pr ]'
 [ "$(rs 1 0 GET k)" = pr ] && [ "$(rs 3 0 GET k)" = pr ] && grep -q "1 DB index(es) mapped at runtime" "$D/n2.log" && ok "4. after a full restart DB 0 is still prod-redis everywhere, and the start says so" || bad "4. db0 k: $(rs 1 0 GET k)/$(rs 3 0 GET k)"

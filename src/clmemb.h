@@ -1,47 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clmemb.h - the membership keepalive frames (M12, slice 2).
- *
- * ALIVE (every node, 1 Hz) and MASTER_ALIVE (the master, 1 Hz) are the
- * two highest-rate frames in the daemon and the two that have grown the
- * most: both are ADDITIVE, each new field appended at the tail behind a
- * length gate so a peer built before it reads the prefix it knows and
- * ignores the rest.  ALIVE is up to sixteen fields and eleven gates.
- *
- * That growth is exactly why the layout is worth having in one place.
- * The gates were written one at a time at two ends of a 6,000-line file
- * - built in send_alive, read in handle_alive - and every one of them
- * is an off-by-one that says nothing when it is wrong: a gate one byte
- * too low reads a field out of a frame that never carried it, a gate
- * one too high silently drops a field that did.  Neither logs, neither
- * crashes, and the fleet keeps running with one node's view of another
- * quietly wrong.
- *
- * So parse reports PRESENCE, never a default.  The `have` mask says
- * which fields the frame actually carried, and cluster.c applies its own
- * defaults (PC_NST_READY, PC_START_UNKNOWN, 0) on top - those are its
- * policy, not the wire's.  A test can then hand the parser a frame of
- * every length from 0 to the full one and assert exactly which fields
- * appear at which byte.
- *
- * 64-bit fields are packed as two little-endian halves rather than
- * memcpy'd from a host uint64, matching clfwd and clcodec.  On every
- * host this daemon has run on that is byte-identical to what it did
- * before; on a big-endian one the old code put native bytes on a wire
- * that is little-endian everywhere else.
- *
- * Every _write takes the buffer's CAPACITY and returns the number of
- * bytes it actually wrote, 0 if the buffer was too small - so the
- * CLMEMB_*_LEN values below size a buffer rather than being a total that
- * has to be kept true by hand.  Positions come from a cursor
- * (clcodec.h): order decides them, not arithmetic.
- *
- * NOT extracted: everything the handlers DO with these fields - the
- * config-mismatch refusal, the split-brain cure, peer_publish, the
- * client announcements.  That is orchestration over C and it stays in
- * cluster.c, the same line M10, M11 and M13 drew.
- */
+/* clmemb.h - membership frames; new fields go at the tail behind a length gate,
+ * so an older peer reads the prefix it knows.  _write returns 0 if @cap is short. */
 #ifndef PC_CLMEMB_H
 #define PC_CLMEMB_H
 
@@ -49,25 +9,20 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include "fnv1a.h"                   /* S163: clmemb_col_hash() */
+#include "fnv1a.h"                   /* clmemb_col_hash() */
 
 #define CLMEMB_IDENT_LEN     16
 
 /* ---- ALIVE ------------------------------------------------------- */
-#define CLMEMB_ALIVE_LEN     (88 + 56 * CLMEMB_COLS_BEAT + 15)  /* the LONGEST without the AR11 group: 551 (S469: 8 collections a beat) */
-/* AR11: the settings group, written only when there is one - so a frame
- * without it is byte for byte what 0.6.4 sent; buffers take this */
+#define CLMEMB_ALIVE_LEN     (88 + 56 * CLMEMB_COLS_BEAT + 15)  /* the LONGEST without the settings group: 551 */
+/* the settings group, written only when there is one; buffers take this */
 #define CLMEMB_CFG_MAX       24
-#define CLMEMB_ALIVE_CFGMAX  (CLMEMB_ALIVE_LEN + 1 + 8 * CLMEMB_CFG_MAX)  /* 744: the longest without AT-4's group */
-/* 12ny AT-4: the watermarks group, after the settings - the features word
- * (4), the pairs in this frame (1), the spaces the sender holds in all
- * (2), then CLMEMB_MARKS_MAX pairs at most: a sender holding more sends a
- * rotating slice, one a second each is enough for a mark that only grows.
- * Ten keep the longest frame sealed (+ 79: header 63, tag 16) well inside
- * the 1,232 bytes of UDP IPv6 guarantees (S469, CH-8, CH-1). */
+#define CLMEMB_ALIVE_CFGMAX  (CLMEMB_ALIVE_LEN + 1 + 8 * CLMEMB_CFG_MAX)  /* 744: the longest without the watermarks group */
+/* watermarks: a sender holding more than CLMEMB_MARKS_MAX sends a rotating slice;
+ * ten keep the longest frame sealed (+ 79) inside the 1,232 bytes UDP IPv6 guarantees */
 #define CLMEMB_MARKS_MAX     10
 #define CLMEMB_MARK_LEN      20    /* oid 8, incarn 4, mark 8 */
-#define CLMEMB_ALIVE_MAX     (CLMEMB_ALIVE_CFGMAX + 4 + 1 + 2 + CLMEMB_MARK_LEN * CLMEMB_MARKS_MAX + 2)  /* 953; S469: + 79 sealed <= 1,232 */
+#define CLMEMB_ALIVE_MAX     (CLMEMB_ALIVE_CFGMAX + 4 + 1 + 2 + CLMEMB_MARK_LEN * CLMEMB_MARKS_MAX + 2)  /* 953; + 79 sealed <= 1,232 */
 #define CLMEMB_ALIVE_MIN      7    /* below this the frame is refused */
 
 #define CLMEMB_A_MEM       0x0001u  /* total_mb, live_kb        n >= 15 */
@@ -81,92 +36,51 @@
 #define CLMEMB_A_RESPPORT  0x0100u  /* resp_port                n >= 63 */
 #define CLMEMB_A_STARTKIND 0x0200u  /* start_kind               n >= 64 */
 #define CLMEMB_A_HTTP      0x0400u  /* http_port, uptime_s      n >= 70 */
-/* S317: four counts, not five - cl_json left with the JSON-RPC dialect.
- * The one non-additive change this frame has had: everything behind
- * it moved up four bytes, which is why PC_CL_EPOCH went to 2. */
+/* the one non-additive change: a count was dropped and everything behind it
+ * moved up four bytes, which is why PC_CL_EPOCH went to 2 */
 #define CLMEMB_A_CLIENTS   0x0800u  /* cl_open .. cl_nresp      n >= 86 */
 #define CLMEMB_A_COLS      0x1000u  /* ncols, ncols_total, cols n >= 88 + 56 * ncols */
-/* PS11: AFTER the variable collection block.  Placed before it, a build from
- * S163 onward read this field's bytes as its collection count and a newer
- * build read that count as a relay port (seen: port 257) - after it, every
- * earlier build ends its parse where it always did. */
+/* after the variable collection block, so every older parser still ends where it did */
 #define CLMEMB_A_PSRELAY   0x2000u  /* ps_port, ps_interest     n >= 88 + 56 * ncols + 10 */
-/* S186: WHY this member is not ready - a code, not a sentence, so the
- * frame stays fixed and the wording lives in one place on the reader's
- * side.  Appended after everything, because every earlier build ends
- * its parse where it always did; a peer that does not send it reads as
- * "no reason given", which is what a node before this could say. */
+/* why this member is not ready: a code, the wording lives on the reader's side;
+ * absent reads as "no reason given" */
 #define CLMEMB_A_REASON    0x4000u  /* nreason                  n >= ... + 1 */
-#define CLMEMB_A_EPOCH     0x8000u  /* S221: wire epoch         n >= ... + 2 */
-/* S314/S313 (DESIGN 12ic): what this member can carry, a bit each.
- * Appended after the epoch: 0.4.3's parser stops at the epoch, so an
- * older member ignores it, and its absence reads as "none" - which is
- * exactly what gates the new types off a fleet that still has one. */
+#define CLMEMB_A_EPOCH     0x8000u  /* wire epoch               n >= ... + 2 */
+/* what this member can carry, a bit each; absent reads as "none", which gates
+ * new record types off a fleet that still has an older member */
 #define CLMEMB_A_FEATURES  0x10000u /* features                 n >= ... + 3 */
-/* 0.5.7.1 (DESIGN 12kx): a node with a reconcile open names its ONLY live
- * witness - 0 none, CLMEMB_SOLEWIT_MANY two or more - so a peer refuses a
- * restart only when it is that one.  Appended after the features: every
- * older parser stops there; its absence reads as "unknown" (refuse). */
+/* a node with a reconcile open names its only live witness (0 none, _MANY two or
+ * more), so a peer refuses a restart only when it is that one; absent = refuse */
 #define CLMEMB_A_SOLEWIT   0x20000u /* sole_witness             n >= ... + 5 */
-/* AR11 (DESIGN 12ms): the settings members must agree on - per setting a
- * 32-bit hash of its name and one of its value, so a member names the one
- * that differs.  [n u8][n x (name u32, value u32)], appended after the sole
- * witness and only when n > 0: every older parser stops before it, and its
- * absence reads as "not reported" - nothing is compared with that member. */
+/* the settings members must agree on: per setting a 32-bit hash of its name and
+ * of its value, so the one that differs is named; written only when n > 0 */
 #define CLMEMB_A_CFGSIG    0x40000u /* ncfg, cfg_name/val       n >= ... + 6 + 8 * ncfg */
-/* 12ny AT-4 (DESIGN 12ny): after the settings, and with the settings'
- * count always written before it (0 when there are none - every older
- * parser reads 0 as "no settings" and stops there, as it stops at the
- * end of the frame today).  [features32 u32][nmarks u8][nspaces u16]
- * then nmarks x (oid u64, incarn u32, mark u64): the 32-bit features word
- * (the byte above is full since S436 - its bits are the word's low eight)
- * and this member's CONFIRMED mark of each numbering space it holds
- * (clack.h), a slice of nspaces when they do not all fit.  The pairs are
- * all or nothing; the word stands without them.  Absent: no word, no
- * marks - nothing confirmed by that member. */
+/* the 32-bit features word (low 8 bits = the byte) and this member's CONFIRMED mark
+ * per space held (clack.h), sliced if they do not fit; the settings count precedes it */
 #define CLMEMB_A_FEAT32    0x80000u /* features32, nspaces      n >= ... + 7 + 8 * ncfg */
 /* the word's bits past the byte's eight */
-#define CLMEMB_F32_ACKS    (1u << 8) /* 12ny AT-4/AT-10: counts numbered
-                                       * deletes and announces its marks -
-                                       * an origin forgets by marks only
-                                       * while every member sets it */
+#define CLMEMB_F32_ACKS    (1u << 8) /* counts numbered deletes and announces marks;
+                                      * an origin forgets by marks only while all set it */
 #define CLMEMB_A_MARKS     0x100000u /* nmarks pairs            n >= ... + 7 + 8 * ncfg + 20 * nmarks */
-#define CLMEMB_A_LINK      0x200000u /* S465: link_pct, link_level, after the marks */
+#define CLMEMB_A_LINK      0x200000u /* link_pct, link_level, after the marks */
 #define CLMEMB_SOLEWIT_MANY 0xFFFF
-#define CLMEMB_FEAT_TYPES2 0x01     /* rate-limit (S314) and hash (S313) records */
-#define CLMEMB_FEAT_HREAD  0x02
-#define CLMEMB_FEAT_SLOCK  0x04        /* S170a: lock records + the approved
-                                        * Symfony lock scripts */        /* S319: answers a forwarded hash
-                                         * READ with the record (jop 7) */
-/* S352c (DESIGN 12le): this node can mail - it has [mail], a build with an
- * SMTP client, and its sender runs - and so accepts alert relays.  Unlike
- * the bits above it says what this node is CONFIGURED to do, not what its
- * build can carry, so it must never gate a record type or a verb:
- * pc_cluster_fleet_has() is asked for one bit at a time and nothing asks it
- * for this one.  The mailer election (pc_cluster_mailer) is its only reader. */
-#define CLMEMB_FEAT_STAGE  0x10        /* UP6n: takes a staged build over the
-                                         * bulk lane (CLBULK_KIND_STAGE) */
+#define CLMEMB_FEAT_TYPES2 0x01     /* rate-limit and hash records */
+#define CLMEMB_FEAT_HREAD  0x02     /* answers a forwarded hash READ with the record */
+#define CLMEMB_FEAT_SLOCK  0x04        /* lock records + the approved Symfony lock scripts */
+#define CLMEMB_FEAT_STAGE  0x10        /* takes a staged build (CLBULK_KIND_STAGE) */
+/* MAILER: this node is configured to mail and so accepts alert relays; being
+ * configuration, not build, it must never gate a record type or a verb */
 #define CLMEMB_FEAT_MAILER 0x08
-#define CLMEMB_FEAT_RESPMAP 0x20       /* S432: reads CLCOL_OP_MAP (a build
-                                        * before reads it as a SET) */
-#define CLMEMB_FEAT_HOLDQ  0x40        /* S394: answers M_HOLD_Q (a build
-                                        * before drops it, so the reconcile
-                                        * asks with it only when every live
-                                        * member sets this) */
-#define CLMEMB_FEAT_AUTOSCALE 0x80     /* S436: reads CLCOL_OP_AUTOSCALE (a
-                                        * build before reads it as a SET).
-                                        * The byte's last bit: the next
-                                        * feature needs a wider field */
-/* S163: one collection's figures as the member counts them - its OWN
- * client hits and misses (a pull it served for a peer stays out, or the
- * fleet total would count that lookup twice), entries, stores, removes,
- * expired.  S164: stores and removes are its CLIENT writes as well - a
- * build before S164 sends every store into the table, applies included.  64-bit because they are cumulative.  Named by the FNV-1a of
- * the collection name: the config digest already guarantees the fleet
- * agrees on the names, so a hash is enough to join on. */
+#define CLMEMB_FEAT_RESPMAP 0x20       /* reads CLCOL_OP_MAP (an older build: a SET) */
+#define CLMEMB_FEAT_HOLDQ  0x40        /* answers M_HOLD_Q; asked only when every live
+                                        * member sets it (an older build drops it) */
+#define CLMEMB_FEAT_AUTOSCALE 0x80     /* reads CLCOL_OP_AUTOSCALE (older: a SET);
+                                        * the byte's last bit */
+/* a collection's figures as the member counts them: CLIENT traffic only (a pull
+ * served for a peer would count twice); named by FNV-1a, the config digest pins names */
 #define CLMEMB_COLS_MAX 16
-/* S469: a frame carries this many, rotating through the first COLS_MAX - the
- * longest ALIVE then fits IPv6's minimum MTU (1,232 bytes of UDP) sealed */
+/* a frame carries this many, rotating through the first COLS_MAX - the longest
+ * ALIVE then fits IPv6's minimum MTU (1,232 bytes of UDP) sealed */
 #define CLMEMB_COLS_BEAT 8
 struct clmemb_col {
 	uint64_t hash;
@@ -191,57 +105,44 @@ struct clmemb_alive {
 	uint64_t lamport;
 	int nstate, mem_tier, resp_port, start_kind, http_port;
 	uint32_t uptime_s;
-	/* S160: open client connections, total and by door/dialect - the
-	 * page sums them across the map for the fleet-wide figure.  S317:
-	 * resp door, native binary, native RESP (the json count is gone) */
+	/* open client connections, total and by door; the page sums them fleet-wide */
 	uint32_t cl_open, cl_resp, cl_bin, cl_nresp;
-	/* PS11: the port this node reads pub/sub relays on (0 = only the
-	 * cluster socket), and PS12's interest version */
+	/* the port this node reads pub/sub relays on (0 = only the cluster socket),
+	 * and the interest version */
 	int ps_port;
 	uint64_t ps_interest;
-	int nreason;                       /* S186: PC_NRE_*, 0 = none */
-	int epoch;                         /* S221: PC_CL_EPOCH; 0 = absent */
-	int features;                      /* S314: CLMEMB_FEAT_*; 0 = absent */
-	int sole_witness;                  /* 0.5.7.1: see CLMEMB_A_SOLEWIT */
-	int ncfg;                          /* AR11: see CLMEMB_A_CFGSIG */
+	int nreason;                       /* PC_NRE_*, 0 = none */
+	int epoch;                         /* PC_CL_EPOCH; 0 = absent */
+	int features;                      /* CLMEMB_FEAT_*; 0 = absent */
+	int sole_witness;                  /* see CLMEMB_A_SOLEWIT */
+	int ncfg;                          /* see CLMEMB_A_CFGSIG */
 	uint32_t cfg_name[CLMEMB_CFG_MAX], cfg_val[CLMEMB_CFG_MAX];
-	/* 12ny AT-4: see CLMEMB_A_FEAT32.  The writer adds the group only
-	 * with ext set - without it the frame is byte for byte 0.7.2's */
+	/* the CLMEMB_A_FEAT32 group, written only with ext set */
 	int ext;
 	uint32_t features32;
 	int nmarks, nspaces;
 	struct clmemb_mark marks[CLMEMB_MARKS_MAX];
-	/* S465: the link's busier direction, % of its speed (-1 = not watched),
+	/* the link's busier direction, % of its speed (-1 = not watched),
 	 * and host.link's level (0 none, 1 warning, 2 critical) - with ext only */
 	int link_pct, link_level;
-	/* S163: the first ncols of ncols_total live collections */
+	/* the first ncols of ncols_total live collections */
 	int ncols, ncols_total;
 	struct clmemb_col cols[CLMEMB_COLS_MAX];
 };
 
-/* Build an ALIVE.  @type is the caller's M_ALIVE; the frame carries
- * every field up to the collection block, so `have` is ignored on this
- * side.  Returns the length written - CLMEMB_ALIVE_MAX at most, which is
- * what @buf needs; fewer collections make a shorter frame, and no settings
- * (ncfg 0) one that ends at the sole witness, CLMEMB_ALIVE_LEN at most. */
+/* @type is M_ALIVE; `have` is ignored on this side.  Returns the length
+ * written, CLMEMB_ALIVE_MAX at most - what @buf needs. */
 size_t clmemb_alive_write(unsigned char *buf, size_t cap, unsigned char type,
 		const struct clmemb_alive *in);
 
-/* S216: overwrite the state and the reason in a BUILT ALIVE.  The
- * heartbeat watchdog re-sends the last frame the cluster thread built,
- * and that frame says what the node was when the thread last ran - READY,
- * for a thread that has since wedged.  The watchdog cannot rebuild the
- * frame (everything else in it is the cluster thread's to read), so it
- * corrects the two bytes that are its to say.  Returns 0, or -1 if @len
- * is not a frame clmemb_alive_write() produced (too short to hold both);
- * clmembtest holds the patched bytes equal to a fresh encode. */
+/* rewrite state and reason in a built ALIVE: the watchdog re-sends the last frame,
+ * which says READY even for a wedged cluster thread.  -1 if @len is too short. */
 #define CLMEMB_ALIVE_NSTATE_OFF (43 + CLMEMB_IDENT_LEN)
 int clmemb_alive_patch_state(unsigned char *buf, size_t len, int nstate,
 		int nreason);
 
-/* Parse one.  Returns 0 and touches nothing if n < CLMEMB_ALIVE_MIN.
- * Absent fields are left ZERO and their have bit clear - the caller's
- * defaults are the caller's business. */
+/* 0 and nothing touched if n < CLMEMB_ALIVE_MIN; absent fields stay zero with
+ * their have bit clear - defaults are the caller's. */
 int clmemb_alive_parse(const unsigned char *p, size_t n,
 		struct clmemb_alive *out);
 
@@ -252,22 +153,21 @@ int clmemb_alive_parse(const unsigned char *p, size_t n,
 #define CLMEMB_M_MEM       0x0001u  /* total_mb, live_kb        n >= 25 */
 #define CLMEMB_M_CFG       0x0002u  /* mode, eager, cfg_digest  n >= 35 */
 #define CLMEMB_M_TERM      0x0004u  /* term                     n >= 39 */
-#define CLMEMB_M_EPOCH     0x0008u  /* S221: wire epoch         n >= 40 */
-#define CLMEMB_M_COMMIT    0x0010u  /* 12nu: the committed epoch n >= 41 */
+#define CLMEMB_M_EPOCH     0x0008u  /* wire epoch               n >= 40 */
+#define CLMEMB_M_COMMIT    0x0010u  /* committed epoch          n >= 41 */
 
 struct clmemb_malive {
 	unsigned have;
 	int node, members;
-	/* the membership digest.  cluster.c writes it on every beat and
-	 * reads it nowhere - decoded here because the frame carries it,
-	 * not because anything consumes it yet. */
+	/* the membership digest, every beat; a member whose own differs three beats
+	 * running asks the master for the list */
 	uint64_t member_digest;
 	uint32_t free_mb, total_mb, live_kb;
 	int mode, eager;
 	uint64_t cfg_digest;
 	uint32_t term;
 	int epoch;
-	int committed;                     /* 12nu: the epoch the fleet speaks */
+	int committed;                     /* the epoch the fleet speaks */
 };
 
 size_t clmemb_malive_write(unsigned char *buf, size_t cap, unsigned char type,
@@ -275,14 +175,8 @@ size_t clmemb_malive_write(unsigned char *buf, size_t cap, unsigned char type,
 int clmemb_malive_parse(const unsigned char *p, size_t n,
 		struct clmemb_malive *out);
 
-/* ---- JOIN_REQ ----------------------------------------------------
- *
- * The joiner states its whole position up front (S30): who it is, what
- * collections it believes in, which id it would like.  Additive like the
- * keepalives, and its gates are NOT in offset order - `proposed` at 35
- * is gated at 37 and read before the config block at 9.  That is worth
- * preserving exactly rather than tidying, so the gates are listed here
- * against their offsets and the test walks every length. */
+/* ---- JOIN_REQ ---- its gates are NOT in offset order (`proposed` at 35 is
+ * gated at 37, read before the config block at 9): keep them exactly */
 #define CLMEMB_JOINREQ_LEN   43
 #define CLMEMB_JOINREQ_MIN    9
 
@@ -291,7 +185,7 @@ int clmemb_malive_parse(const unsigned char *p, size_t n,
 #define CLMEMB_J_PROP     0x04u  /* proposed                  n >= 37 */
 #define CLMEMB_J_INCARN   0x08u  /* incarn                    n >= 41 */
 #define CLMEMB_J_WAL      0x10u  /* wal posture               n >= 42 */
-#define CLMEMB_J_EPOCH    0x20u  /* S221: wire epoch          n >= 43 */
+#define CLMEMB_J_EPOCH    0x20u  /* wire epoch                n >= 43 */
 
 struct clmemb_joinreq {
 	unsigned have;
@@ -302,8 +196,7 @@ struct clmemb_joinreq {
 	int proposed;
 	uint32_t incarn;
 	int wal;                           /* 1 = none, 2 = logs; 0 = unknown */
-	int epoch;                         /* S221: PC_CL_EPOCH; 0 = the peer
-	                                    * predates the epoch entirely */
+	int epoch;                         /* PC_CL_EPOCH; 0 = absent */
 };
 
 size_t clmemb_joinreq_write(unsigned char *buf, size_t cap, unsigned char type,
@@ -311,17 +204,8 @@ size_t clmemb_joinreq_write(unsigned char *buf, size_t cap, unsigned char type,
 int clmemb_joinreq_parse(const unsigned char *p, size_t n,
 		struct clmemb_joinreq *out);
 
-/* ---- ASSIGN ------------------------------------------------------
- *
- * A 15-byte header then `count` fixed 20-byte member records.  The
- * count is written AFTER the walk, because the sender skips the
- * addressee and any peer that is not live, so it cannot know it in
- * advance - hence the separate _count_set.
- *
- * The address and port in a record are NETWORK ORDER and are copied
- * VERBATIM, never packed little-endian: they come off a sockaddr and go
- * straight back into one.  Everything else in this file is LE; these
- * two are the exception and that is deliberate. */
+/* ---- ASSIGN ---- a 15-byte header, then `count` 20-byte records; address and
+ * port are NETWORK order, copied verbatim off a sockaddr (all else here is LE) */
 #define CLMEMB_ASSIGN_HDR    15
 #define CLMEMB_ASSIGN_REC    20
 #define CLMEMB_ASSIGN_MIN    15
@@ -347,22 +231,13 @@ size_t clmemb_member_write(unsigned char *buf, size_t cap,
 
 int clmemb_assign_parse(const unsigned char *p, size_t n,
 		struct clmemb_assign *out);
-/* Record @i, bounds-checked against the REAL frame length rather than
- * the header's count - a count of 100 in a 40-byte frame must read two
- * records and stop, not overrun.  Returns 0 when record @i is not
- * wholly present. */
+/* record @i, bounds-checked against the REAL frame length, not the header's
+ * count; 0 when record @i is not wholly present */
 int clmemb_member_at(const unsigned char *p, size_t n, int i,
 		struct clmemb_member *out);
 
-/* ---- JOIN_WAIT, JOIN_REJ, GOODBYE --------------------------------
- *
- * JOIN_WAIT is a bare token; JOIN_REJ is a token plus a reason byte that
- * older builds do not send.  GOODBYE is [type1][node2][incarn4]: the
- * departing node's id and its incarnation (CH-13).  The
- * address alone was the identity, so a goodbye captured from any earlier
- * run, sent again from that address, expelled the node running there now;
- * the receiver now matches the id and the incarnation against the slot.
- * An older build sends the first three bytes only. */
+/* ---- JOIN_WAIT, JOIN_REJ, GOODBYE ---- GOODBYE is [type1][node2][incarn4]: id and
+ * incarnation, so a replayed goodbye cannot expel a later run; older: 3 bytes */
 #define CLMEMB_TOK_LEN        9
 #define CLMEMB_REJ_LEN       10
 #define CLMEMB_GOODBYE_LEN    7
@@ -384,5 +259,36 @@ int clmemb_goodbye_parse(const unsigned char *p, size_t n, int *node,
 int clmemb_tok_parse(const unsigned char *p, size_t n, uint64_t *tok);
 int clmemb_rej_parse(const unsigned char *p, size_t n, uint64_t *tok,
 		int *reason, int *have_reason);
+
+/* JOIN_WAIT [type1][tok8][reason1][term4][node2][count2]: QUEUED carries the master's
+ * term, id and the joiner's place, ELECTING a member's term, id and the member count */
+#define CLMEMB_WAIT_LEN       18
+#define CLMEMB_WAIT_HELD       0       /* an identity like ours is still live there */
+#define CLMEMB_WAIT_QUEUED     1
+#define CLMEMB_WAIT_ELECTING   2
+struct clmemb_wait {
+	int reason;
+	uint32_t term;
+	int node, count;
+};
+/* a trailer behind an ASSIGN's records, [flags1][part1][parts1]; an older
+ * joiner reads the records by count and never looks behind them */
+#define CLMEMB_ASSIGN_TRAILER  3
+#define CLMEMB_ASSIGN_CONNECT  0x01u   /* connect first: CONNECTING until the master's ONLINE */
+struct clmemb_trailer {
+	unsigned flags;
+	int part, parts;
+};
+size_t clmemb_trailer_write(unsigned char *buf, size_t cap, const struct clmemb_trailer *t);
+/* 1 and *t from the bytes behind @count records, 0 (and *t zero) if there are none */
+int clmemb_trailer_parse(const unsigned char *p, size_t n, int count,
+		struct clmemb_trailer *t);
+
+size_t clmemb_wait_write(unsigned char *buf, size_t cap, unsigned char type,
+		uint64_t tok, const struct clmemb_wait *w);
+/* 1 and the token, *w from an 18-byte frame (a 9-byte one reads as HELD, the rest 0); 0 if
+ * @n is under CLMEMB_TOK_LEN */
+int clmemb_wait_parse(const unsigned char *p, size_t n, uint64_t *tok,
+		struct clmemb_wait *w);
 
 #endif /* PC_CLMEMB_H */

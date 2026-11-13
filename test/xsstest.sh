@@ -1,25 +1,6 @@
 #!/bin/sh
-# xsstest.sh - S205: what goes into the cache cannot run in the dashboard.
-#
-# The operator was hacked through exactly this once: a key carrying a
-# script import, a dashboard that rendered it, a browser that fetched
-# the rest from a remote site.  Two layers, both asserted here:
-#   1. every cache-fed string the page renders is escaped - keys, values,
-#      client names, command names, slow-log arguments;
-#   2. the page carries a Content-Security-Policy whose script-src is the
-#      SHA-256 of its one inline script, so an injected script - inline
-#      or remote - does not run even if a sink is missed, and the page
-#      can talk to nothing but this node.
-# Layer 1 is proved by RUNNING the page (js2py, stub DOM) after hostile
-# strings went in through the doors, and scanning everything it wrote
-# into the DOM.  Layer 2 by reading the headers and hashing the script.
-# The detector is checked against a known-bad string first, so a green
-# run means it looked.  js2py is not on the runner: layer 1 SKIPS
-# loudly there, layer 2 still runs.
-# S407 part 3 (0.7.0): the daemon serves no page - perfcached-dashboard
-# does, with the policy; layer 2 reads it from the tool (SKIPPED loudly when
-# the tool is not built), layer 1 takes the page's bytes from pagedump.
-# Usage: test/xsstest.sh [./perfcached] [./perfcached-dashboard]
+# xsstest.sh - what goes into the cache cannot run in the dashboard: every cache-fed string the page
+# renders is escaped (run under js2py), and its CSP admits only its one inline script's hash.
 set -u
 BIN=${1:-./perfcached}
 DASH=${2:-./perfcached-dashboard}
@@ -112,7 +93,7 @@ if dash:
     hdrs = {k.lower(): v for k, v in page.getheaders()}
     served = page.read().decode("utf-8", "replace")
     (ok if served == html else bad)("the tool serves the page pagedump prints (%d bytes)" % len(served))
-# the daemon itself serves no page any more (S407 part 3): 410 Gone
+# the daemon itself serves no page: 410 Gone
 try:
     urllib.request.urlopen("http://127.0.0.1:17935/", timeout=10); bad("the daemon still serves a page on /")
 except urllib.error.HTTPError as e:
@@ -145,11 +126,7 @@ jh = {k.lower(): v for k, v in j.getheaders()}
 (ok if jh.get("x-content-type-options") == "nosniff" else bad)("the JSON answers carry nosniff too")
 
 # ---- layer 1: the page, run -----------------------------------------------
-# What would be LIVE if a sink were unescaped: a script tag anywhere (the
-# page never writes one), an image or svg tag carrying an event handler,
-# and the two attribute-breaking payloads with their quote intact.  The
-# page writes its own <svg viewBox=...> sparklines, and an escaped payload
-# keeps words like onmouseover= as plain text - neither is a hit.
+# live if unescaped: a script tag, an img or svg tag with a handler, a payload whose quote survives
 def detector(s):
     return re.findall(r"<script|<img\b[^>]*onerror=|<svg/onload=|\"><svg/|\x27 onmouseover=\x27|<script src=", s, re.I)
 (ok if detector('x<img src=y onerror=1>') else bad)("positive control: the detector flags a raw tag")

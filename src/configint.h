@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * configint.h - the config parser's internal interface (config.c): the
- * parse state, the section being read, the error macro, and the value
- * parsers the sections share.  For the files the parser is split into
- * (the 0.7.2 split, wave 1 - doc/MODULARITY.md); config.h stays the API.
- */
+/* configint.h - the config parser's internal interface (config.c): the parse state, the
+ * section being read, the error macro and the shared value parsers.  config.h is the API. */
 #ifndef PC_CONFIGINT_H
 #define PC_CONFIGINT_H
 

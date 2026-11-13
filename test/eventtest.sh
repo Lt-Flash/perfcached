@@ -1,10 +1,6 @@
 #!/bin/sh
-# S153: per-key event logging, selected per collection.
-#
-# One node, two collections.  `a` logs everything, `b` logs nothing, and
-# the assertion that matters is the negative one: a hook that leaks past
-# its mask is a production flood, not a feature.  Then the two ceilings -
-# rate and level - and the key hash.
+# per-key event logging, selected per collection: a collection without a mask must log nothing,
+# then the rate and level ceilings and the key hash
 BIN=${1:-./perfcached}; CLI=${2:-./perfcli}
 D=$(mktemp -d /var/tmp/pcevent.XXXXXX)
 P=""
@@ -42,7 +38,7 @@ start() {
 	chmod 640 "$D/n.conf"
 	"$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 	P=$!
-	# NOT the "perfcached ready" line: at log_level = warn it is not printed
+	# not the "perfcached ready" line: at log_level = warn it is not printed
 	i=0; while [ $i -lt 100 ] && ! "$CLI" -q -h 127.0.0.1 -p 17901 ping >/dev/null 2>&1; do sleep 0.1; i=$((i+1)); done
 	"$CLI" -q -h 127.0.0.1 -p 17901 ping >/dev/null 2>&1 || { bad "node did not start"; tail -3 "$D/n.log"; exit 1; }
 }
@@ -61,11 +57,8 @@ c get a nope1
 [ "$(grep -c 'event=miss cause=absent col=a key=nope1 door=binary' "$D/n.log")" = 1 ] \
 	&& ok "miss on a key that never existed says cause=absent" \
 	|| bad "absent miss: $(grep 'event=miss' "$D/n.log" | head -1)"
-# cause=expired - a miss on a record still PRESENT but past its TTL - is
-# only observable between the TTL and the sweep that reaps it, which on a
-# live node is under a second and not a window a shell test can hit.  It
-# is asserted deterministically in origintest, where the clock moves and
-# the sweep does not.  What IS observable here is the sweep's own event.
+# cause=expired is observable only between the TTL and the sweep (under a second here), so it is
+# asserted in origintest; here, the sweep's own event
 c set a short v 1
 i=0; while [ $i -lt 100 ] && [ "$(grep -c 'event=expired col=a key=short door=sweep' "$D/n.log")" = 0 ]; do sleep 0.1; i=$((i+1)); done
 [ "$(grep -c 'event=expired col=a key=short door=sweep' "$D/n.log")" -ge 1 ] \

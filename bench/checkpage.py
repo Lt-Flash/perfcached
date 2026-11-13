@@ -58,9 +58,8 @@ def page_numbers(html):
             label = re.sub(r"<[^>]+>", " ", cells[0][1])
             label = " ".join(label.split())[:40]
             for tag, cell in cells[1:]:
-                # only NUMERIC cells: a prose cell holds numbers that are
-                # not measurements ("ChaCha20-Poly1305" offered up 1305),
-                # and a measured value always carries class="num"
+                # only NUMERIC cells (class="num"): a prose cell holds numbers that are not
+                # measurements ("ChaCha20-Poly1305" offered up 1305)
                 if "num" not in tag:
                     continue
                 text = re.sub(r"<[^>]+>", " ", cell)
@@ -88,9 +87,8 @@ def file_tokens(path):
                 continue
             for tok in re.findall(r"[0-9]+(?:\.[0-9]+)?", line):
                 toks.add(tok)
-                # results pack several figures per cell (a/b/c) and the
-                # page prints them with thousands separators; normalise
-                # both directions so a match is a match
+                # results pack several figures per cell and the page prints thousands
+                # separators; normalise both directions so a match is a match
                 if "." in tok:
                     toks.add(tok.rstrip("0").rstrip("."))
     return toks, build

@@ -1,12 +1,5 @@
-/*
- * jwtest.c — the reply writer, including the heap mode CLUSTER SLOTS
- * needs.
- *
- * The growth path is the reason this file exists.  In production the
- * SLOTS branch sizes its buffer from the range count and gets it right,
- * so the realloc never runs - which would leave it untested until the
- * day an estimate is wrong.  Here it is driven directly.
- */
+/* jwtest.c - the reply writer, including the heap mode CLUSTER SLOTS needs: its growth path never
+ * runs in production (the buffer is sized right), so it is driven directly here. */
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -96,11 +89,8 @@ static void t_bound(void)
 {
 	struct pc_jw w;
 
-	/* the len guard reads whatever is in the struct, so a caller with
-	 * an UNINITIALISED stack writer gets a refusal that presents as
-	 * OOM - exactly how CLUSTER NODES shipped broken.  Every call
-	 * site must zero or pc_jw_init first; asserted here so the
-	 * contract has a name. */
+	/* the len guard reads whatever is in the struct, so an uninitialised stack writer refuses
+	 * as if OOM: every call site must zero or pc_jw_init first */
 	memset(&w, 0, sizeof w);
 	if (pc_jw_init_heap(&w, (size_t)JW_HEAP_MAX + 1) != 0)
 		ok("pc_jw_init_heap refuses a capacity past JW_HEAP_MAX");
@@ -146,10 +136,8 @@ static void t_i64(void)
 		bad("pc_jw_i64 disagrees with %lld");
 }
 
-/* S322: the inline append and pc_jw_i64's direct write - at the exact
- * capacity, one byte past it (nothing may land beyond the capacity: the
- * bytes after it are sentinels), after content already written, and a
- * number that has to grow a heap writer */
+/* the inline append and pc_jw_i64's direct write: at exact capacity, one byte past (the bytes
+ * after it are sentinels), after content, and a number that must grow a heap writer */
 static void t_edges(void)
 {
 	char buf[32];

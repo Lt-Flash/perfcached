@@ -1,19 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * storage.h — the storage identity walk (task S11).
- *
- * Resolves a directory to its mount, filesystem, and the FULL device
- * chain underneath (dm/LVM/md recursed to leaf devices), classifying
- * each leaf's transport from sysfs - never from the device NAME (the
- * NVMe-oF trap: /dev/nvmeXnY may be TCP fabric).  Identity is a LABEL;
- * policy always follows measurement (S12's probe).  Failure semantics
- * aggregate as WORST LEAF WINS: any network leaf makes the whole stack
- * network-class (stalls are hangs, not errors).
- *
- * Pure /proc + /sys reads; every field is best-effort and reported as
- * absent when the kernel does not expose it - nothing is guessed.
- */
+/* storage.h - a directory's mount, filesystem and full device chain, each leaf's transport read
+ * from sysfs, never from its NAME (/dev/nvmeXnY may be TCP); the worst leaf classes the stack. */
 #ifndef PC_STORAGE_H
 #define PC_STORAGE_H
 
@@ -48,9 +36,8 @@ struct pc_st_id {
 	int  is_tmpfs, is_nfs;
 };
 
-/* resolve @dir; returns 0 (id filled) or -1 (dir unusable).  Chain
- * resolution deeper than the mount is best-effort: a walk failure
- * degrades to zero leaves with the fs-level class kept. */
+/* resolve @dir: 0 (id filled) or -1 (dir unusable); a walk failure below the mount
+ * degrades to zero leaves with the fs-level class kept */
 int pc_storage_identity(const char *dir, struct pc_st_id *id);
 
 /* multi-line human report into @buf; returns bytes written */

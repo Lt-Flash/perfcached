@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* hostlink.c - S465: the physical link under the node's address - a VLAN
- * followed to its bond, an active-backup bond to its active slave - and its
- * kernel counters, read once a second on pc-maint and kept a minute */
+/* hostlink.c - the physical link under the node's address (a VLAN to its bond, an
+ * active-backup bond to its active slave); its counters read once a second, kept a minute */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -142,26 +141,97 @@ static void fds_open(const char *phys)
 	snprintf(open_phys, sizeof open_phys, "%s", phys);
 }
 
-/* the host's UDP receive-buffer drops (/proc/net/snmp Udp: RcvbufErrors) */
-static unsigned long long udp_rcvbuf_errors(void)
+/* the host's UDP receive-buffer drops and TCP retransmits (/proc/net/snmp
+ * Udp: RcvbufErrors, Tcp: RetransSegs) */
+static void snmp_read(unsigned long long *udperr, unsigned long long *retrans)
 {
 	char p[300], hdr[1024], val[1024], *ht, *vt, *hs = NULL, *vs = NULL;
-	unsigned long long v = 0;
 	FILE *f;
 
+	*udperr = *retrans = 0;
 	snprintf(p, sizeof p, "%s/proc/net/snmp", root);
 	if (!(f = fopen(p, "r")))
-		return 0;
-	while (fgets(hdr, sizeof hdr, f))
-		if (!strncmp(hdr, "Udp:", 4) && fgets(val, sizeof val, f)) {
-			for (ht = strtok_r(hdr, " \n", &hs), vt = strtok_r(val, " \n", &vs);
-			     ht && vt; ht = strtok_r(NULL, " \n", &hs), vt = strtok_r(NULL, " \n", &vs))
-				if (!strcmp(ht, "RcvbufErrors"))
-					v = strtoull(vt, NULL, 10);
-			break;
-		}
+		return;
+	while (fgets(hdr, sizeof hdr, f)) {
+		int udp = !strncmp(hdr, "Udp:", 4);
+
+		if ((!udp && strncmp(hdr, "Tcp:", 4)) || !fgets(val, sizeof val, f))
+			continue;
+		for (ht = strtok_r(hdr, " \n", &hs), vt = strtok_r(val, " \n", &vs);
+		     ht && vt; ht = strtok_r(NULL, " \n", &hs), vt = strtok_r(NULL, " \n", &vs))
+			if (!strcmp(ht, udp ? "RcvbufErrors" : "RetransSegs"))
+				*(udp ? udperr : retrans) = strtoull(vt, NULL, 10);
+	}
 	fclose(f);
-	return v;
+}
+
+/* a CPU list ("0-3,8") into @set */
+static void cpus_add(const char *s, unsigned long long *set, int max)
+{
+	char *e;
+	long a, b;
+
+	while (*s) {
+		a = strtol(s, &e, 10);
+		if (e == s)
+			return;
+		b = *e == '-' ? strtol(e + 1, &e, 10) : a;
+		for (; a <= b && a >= 0 && a < max; a++)
+			set[a / 64] |= 1ULL << (a % 64);
+		if (*e != ',')
+			return;
+		s = e + 1;
+	}
+}
+
+#define HL_CPUS 4096
+
+/* @phys's receive queues, its MSI interrupts and the CPUs they land
+ * on; -1 for what has no device (a bond, a bridge, a veth) or says nothing */
+static void nic_queues(const char *phys, int *rxq, int *irqs, int *cpus)
+{
+	static const char *const msi[] = { "device/msi_irqs", "device/../msi_irqs" };
+	unsigned long long set[HL_CPUS / 64] = { 0 };
+	char p[384], q[384], l[1024];
+	struct dirent *e;
+	size_t m;
+	DIR *d;
+	int k;
+
+	*rxq = *irqs = *cpus = -1;
+	if (net_path(p, sizeof p, phys, "device") != 0 || access(p, F_OK) != 0 ||
+	    net_path(p, sizeof p, phys, "queues") != 0 || !(d = opendir(p)))
+		return;
+	*rxq = 0;
+	while ((e = readdir(d)))
+		*rxq += !strncmp(e->d_name, "rx-", 3);
+	closedir(d);
+	for (m = 0, d = NULL; m < sizeof msi / sizeof msi[0] && !d; m++)
+		if (net_path(p, sizeof p, phys, msi[m]) == 0)
+			d = opendir(p);
+	if (!d)
+		return;
+	*irqs = 0;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] < '0' || e->d_name[0] > '9')
+			continue;
+		(*irqs)++;
+		snprintf(q, sizeof q, "%s/proc/irq/%.32s/effective_affinity_list", root,
+			e->d_name);
+		if (rd_line(q, l, sizeof l) != 0) {
+			snprintf(q, sizeof q, "%s/proc/irq/%.32s/smp_affinity_list", root,
+				e->d_name);
+			if (rd_line(q, l, sizeof l) != 0)
+				continue;
+		}
+		cpus_add(l, set, HL_CPUS);
+	}
+	closedir(d);
+	*cpus = 0;
+	for (k = 0; k < HL_CPUS / 64; k++)
+		*cpus += __builtin_popcountll(set[k]);
+	if (!*cpus)
+		*cpus = -1;
 }
 
 /* the device holding @addr, else the default route's */
@@ -214,7 +284,8 @@ void hl_init(const char *mode, int speed_mbps, const char *addr)
 	fds_close();
 	HL.on = HL.have = HL.i = 0;
 	HL.rx_pct = HL.tx_pct = HL.rx_peak_pct = HL.tx_peak_pct = HL.speed_mbps = -1;
-	HL.rx_bps = HL.tx_bps = HL.drops_ps = HL.udperr_ps = 0;
+	HL.rx_bps = HL.tx_bps = HL.drops_ps = HL.udperr_ps = HL.retrans_ps = 0;
+	HL.rx_queues = HL.irqs = HL.irq_cpus = -1;
 	HL.speed_cfg = speed_mbps > 0 ? speed_mbps : 0;
 	HL.why[0] = HL.path[0] = HL.phys[0] = 0;
 	snprintf(HL.want, sizeof HL.want, "%s", mode && strcasecmp(mode, "auto") ? mode : "");
@@ -236,6 +307,7 @@ void hl_init(const char *mode, int speed_mbps, const char *addr)
 		return;
 	}
 	HL.speed_mbps = HL.speed_cfg ? HL.speed_cfg : sp;
+	nic_queues(HL.phys, &HL.rx_queues, &HL.irqs, &HL.irq_cpus);
 	fds_open(HL.phys);
 	HL.on = 1;
 }
@@ -251,6 +323,7 @@ void hl_read(struct hl_obs *o, long long now)
 		if (resolve(HL.dev, o->phys, sizeof o->phys, o->path, sizeof o->path,
 		        &o->speed) == 0 && strcmp(o->phys, open_phys)) {
 			fds_open(o->phys);
+			nic_queues(o->phys, &o->rx_queues, &o->irqs, &o->irq_cpus);
 			o->moved = 1;
 		}
 		if (!o->moved)
@@ -260,7 +333,7 @@ void hl_read(struct hl_obs *o, long long now)
 	o->rx = rd_fd(fd_rx);
 	o->tx = rd_fd(fd_tx);
 	o->drops = rd_fd(fd_rxd) + rd_fd(fd_txd) + rd_fd(fd_miss);
-	o->udperr = udp_rcvbuf_errors();
+	snmp_read(&o->udperr, &o->retrans);
 	o->ok = fd_rx >= 0 && fd_tx >= 0;
 }
 
@@ -284,6 +357,9 @@ void hl_apply(const struct hl_obs *o, int fast)
 	if (o->moved) {
 		snprintf(HL.phys, sizeof HL.phys, "%s", o->phys);
 		snprintf(HL.path, sizeof HL.path, "%s", o->path);
+		HL.rx_queues = o->rx_queues;
+		HL.irqs = o->irqs;
+		HL.irq_cpus = o->irq_cpus;
 		HL.have = 0;                   /* another device's counters */
 	}
 	if (o->speed != -2)
@@ -295,6 +371,7 @@ void hl_apply(const struct hl_obs *o, int fast)
 	HL.tx[cur] = o->tx;
 	HL.drops[cur] = o->drops;
 	HL.udperr[cur] = o->udperr;
+	HL.retrans[cur] = o->retrans;
 	HL.ms[cur] = o->now;
 	HL.i = (cur + 1) % HM_N;
 	if (HL.have < HM_N)
@@ -316,6 +393,8 @@ void hl_apply(const struct hl_obs *o, int fast)
 		HL.drops[old]) * 1000 / (unsigned long long)dt) : 0;
 	HL.udperr_ps = HL.udperr[cur] >= HL.udperr[old] ? (long long)((HL.udperr[cur] -
 		HL.udperr[old]) * 1000 / (unsigned long long)dt) : 0;
+	HL.retrans_ps = HL.retrans[cur] >= HL.retrans[old] ? (long long)((HL.retrans[cur] -
+		HL.retrans[old]) * 1000 / (unsigned long long)dt) : 0;
 	HL.rx_pct = pct_of(HL.rx_bps, HL.speed_mbps);
 	HL.tx_pct = pct_of(HL.tx_bps, HL.speed_mbps);
 	HL.rx_peak_pct = HL.tx_peak_pct = -1;

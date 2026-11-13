@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * statscluster.h - the stats tree's "cluster" block (statscluster.c), for
- * statstree.c.
- */
+/* statscluster.h - the stats tree's "cluster" block (statscluster.c), for
+ * statstree.c. */
 #ifndef PC_STATSCLUSTER_H
 #define PC_STATSCLUSTER_H
 

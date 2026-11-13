@@ -1,16 +1,6 @@
 #!/bin/sh
-# loadfactortest.sh - S180: the LOAD column is a load FACTOR.
-#
-# The status page divided entries by buckets and ignored the six slots
-# in each, so a table at half its capacity reported "300.00%".  The
-# operator read that column, on a fleet holding 63,968 records in 21,323
-# buckets - 50% - and asked for a warning threshold on it.  A number six
-# times too large is worse than no number.
-#
-# What can be asserted without a browser: the daemon publishes the slots
-# per bucket, its own arithmetic agrees with entries/(buckets x slots),
-# and the page's script uses that form and carries the thresholds.
-# Usage: test/loadfactortest.sh [./perfcached]
+# loadfactortest.sh - the LOAD column is entries / (buckets x slots): the daemon publishes slots per bucket and
+# the page's script uses that form and carries the thresholds.  Usage: test/loadfactortest.sh [./perfcached]
 set -u
 
 BIN=${1:-./perfcached}
@@ -43,8 +33,7 @@ P=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/a.log" && break; sleep 0.1; i=$((i+1)); done
 grep -q "perfcached ready" "$D/a.log" || { echo "daemon did not start"; cat "$D/a.log"; exit 1; }
 
-# S407 part 3: the daemon serves no page (GET / is 410); its bytes come from
-# pagedump, the dashboard's object
+# the daemon serves no page (GET / is 410): its bytes come from pagedump, the dashboard's object
 PAGE=$("${PAGEDUMP:-./pagedump}")
 
 # the page must divide by buckets x slots, and must carry both thresholds
@@ -57,10 +46,8 @@ case "$PAGE" in
 	*) bad "the load column has no 70/90 thresholds";;
 esac
 
-# S185: the commands table is folded to its slowest verb until asked.
-# A browser is needed to see it fold; what can be pinned here is that
-# the page ships the parts - the fold class on the wrapper, the hidden
-# class on every row after the first, and a handler on the label.
+# the commands table folds to its slowest verb until asked: the page ships the fold class, the
+# hidden rows and the label's handler
 case "$PAGE" in
 	*"cmdfold"*"tr.cx{display:none}"*) ok "the commands table ships folded (cmdfold + hidden rows)";;
 	*) bad "the commands table has no fold";;
@@ -69,9 +56,8 @@ case "$PAGE" in
 	*"cmdtog"*"addEventListener('click',cmdfold)"*) ok "and its label opens it";;
 	*) bad "the fold has no click handler";;
 esac
-# S183: the slowest-call column is the exact max when the daemon sends
-# one, not a bucket bound derived from the histogram
-# S183/S194: the exact max, read through the window accessor
+# the slowest-call column is the exact max when the daemon sends one, read through the window
+# accessor, not a histogram bucket bound
 case "$PAGE" in
 	*"function wmax(x){var mx=wq(x,'max_us');if(mx>0)return lat(mx)"*)
 		ok "the slowest call is the exact max, not a bucket bound";;
@@ -83,12 +69,8 @@ case "$PAGE" in
 		ok "the commands table reads the five-minute window";;
 	*) bad "the commands table is still cumulative";;
 esac
-# S197: the ROWS are the window as much as the columns - the operator's
-# call.  A verb the window has not seen is not listed, and an empty
-# table says what "nothing" means instead of "no commands yet" on a
-# daemon that has served millions.  (S195 briefly kept idle verbs as
-# rows of dashes; the empty table it answered was S196's render
-# error, not the filter.)
+# the rows are the window too: a verb the window has not seen is not listed, and an empty table
+# says what "nothing" means
 case "$PAGE" in
 	*"(s.commands||[]).filter(function(x){return wcalls(x)>0;})"*)
 		ok "the commands table lists the verbs the window saw";;
@@ -98,9 +80,8 @@ case "$PAGE" in
 	*"nothing called in the last 5 min"*) ok "and says what an empty window means";;
 	*) bad "an empty window still reads 'no commands yet'";;
 esac
-# S195: one dropped poll - a node restarting under a deploy - is not a
-# node that did not answer.  The banner waits for a second miss and
-# then says for how long.
+# one dropped poll (a node restarting) is not a node that did not answer: the banner waits for a
+# second miss, then says for how long
 case "$PAGE" in
 	*"if(++MISS>1)"*) ok "the unreachable banner waits for a second missed poll";;
 	*) bad "a single missed poll still paints 'this node did not answer'";;
@@ -145,16 +126,14 @@ ld = 100.0 * c["entries"] / (c["buckets"] * slots) if slots and c["buckets"] els
     % (c["entries"], c["buckets"], slots, ld,
        100.0 * c["entries"] / c["buckets"]))
 
-# S183: every command row carries an exact max beside the percentiles
+# every command row carries an exact max beside the percentiles
 st = json.loads(urllib.request.urlopen(
     "http://127.0.0.1:17705/stats", timeout=10).read())
 cmds = [x for x in (st.get("commands") or []) if x.get("calls")]
 (ok if cmds and all("max_us" in x for x in cmds) else bad)(
     "every command row reports an exact max_us (%d rows)" % len(cmds))
-# S189: the dialect is a FIELD, not a prefix a reader has to parse.  A
-# Redis command name may contain a dot (JSON.GET, TS.ADD), so "json.get"
-# could not say whether it was the native JSON door or a RESP client
-# sending JSON.GET.
+# the dialect is a FIELD, not a prefix: a Redis command name may contain a dot
+# (JSON.GET), so "json.get" could not say which door it came through
 (ok if all(x.get("dialect") and x.get("verb") for x in cmds) else bad)(
     "every row carries its dialect and verb apart from the key (%s)"
     % [(x["name"], x.get("dialect"), x.get("verb")) for x in cmds[:3]])

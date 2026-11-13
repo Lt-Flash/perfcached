@@ -1,7 +1,5 @@
-/* pagedump - the status page's bytes on stdout (S407 part 3, 0.7.0).
- * The daemon no longer serves the page; the tests that read its text
- * (the elements it carries, no external assets, the script pagejstest
- * runs) take it from here, the same object perfcached-dashboard links. */
+/* pagedump - the status page's bytes on stdout for the tests that read its text: the daemon does
+ * not serve it, and this links the same object perfcached-dashboard does. */
 #include <stdio.h>
 #include "../src/statuspage.h"
 

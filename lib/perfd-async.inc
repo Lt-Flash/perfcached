@@ -3,14 +3,8 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-async.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds the async API (S32): output buffering, the input path, the id -> callback
- * table, the readiness-driven handshake and the public async calls.
- */
+/* perfd-async.inc - the async API, #included by perfd.c (one translation unit, never compiled
+ * alone): output buffering, input path, id -> callback table, readiness-driven handshake. */
 /* ---- output buffering -------------------------------------------------- */
 
 static int wbuf_room(perfd_t *p, size_t more)
@@ -31,10 +25,8 @@ static int wbuf_room(perfd_t *p, size_t more)
 	return 0;
 }
 
-/* stage plaintext for the socket.  S468: on a sealed channel it waits in
- * wst and wbuf_push seals all of it at once - a record per request was a
- * seal here and an open in the server per request (libsodium 39.7% of an
- * encrypted SET's server CPU, OM-4) */
+/* stage plaintext for the socket; on a sealed channel it waits in wst and
+ * wbuf_push seals it all at once, not a record per request */
 static int wbuf_put(perfd_t *p, const char *b, size_t n)
 {
 	if (!p->encrypted) {
@@ -63,9 +55,8 @@ static int wbuf_put(perfd_t *p, const char *b, size_t n)
 	return 0;
 }
 
-/* S468: what is staged, sealed into records of up to PC_NOISE_MAXPT after
- * what w still owes - the same record shape send_bytes() writes; the
- * server reads a record's contents as a stream, so any server takes it */
+/* what is staged, sealed into records of up to PC_NOISE_MAXPT after what w
+ * still owes; the server reads a record's contents as a stream */
 static int wbuf_seal(perfd_t *p)
 {
 	const char *b = p->wst;
@@ -96,7 +87,7 @@ static int wbuf_seal(perfd_t *p)
 /* 0 = buffer drained, 1 = partial (watch for writability), -1 = failed */
 static int wbuf_push(perfd_t *p)
 {
-	if (p->wstlen && wbuf_seal(p) != 0)   /* S468: one seal a push */
+	if (p->wstlen && wbuf_seal(p) != 0)   /* one seal a push */
 		return -1;
 	while (p->woff < p->wlen) {
 		ssize_t r = write(p->fd, p->w + p->woff, p->wlen - p->woff);
@@ -161,9 +152,8 @@ static int cin_pull(perfd_t *p)
 	}
 }
 
-/* move complete records out of cin and into rbuf as plaintext.  A record
- * split across reads is simply left in cin until the rest turns up -
- * this is the whole reason the blocking fill() cannot be reused. */
+/* move complete records out of cin into rbuf as plaintext; a record split
+ * across reads waits in cin, which is why the blocking fill() cannot serve */
 static int cin_drain(perfd_t *p)
 {
 	if (!p->encrypted) {
@@ -205,19 +195,8 @@ static int cin_drain(perfd_t *p)
 	}
 }
 
-/* An async handle learns the fleet THROUGH ITS OWN PIPELINE.  It cannot
- * use learn_members(): that calls roundtrip_once(), which blocks for a
- * reply, and an async handle's socket is non-blocking and driven by the
- * caller's event loop.  So the request goes out as an ordinary async
- * submit and this callback parses the answer when it arrives.
- *
- * Until this lands, route_ok is 0 and perfd_owner_of() returns -1, which
- * is the honest answer - the fleet is genuinely unknown until the reply
- * comes back.  Callers that need routing from the first request should
- * pump perfd_events() until perfd_routing() turns 1.
- *
- * S34's standbys are deliberately NOT opened here: they are separate
- * connections the caller would never poll.  See perfd_owner_of(). */
+/* the fleet is learned through the handle's own pipeline (learn_members() blocks); route_ok
+ * stays 0 until this lands.  Standbys are not opened: the caller would never poll them. */
 static void members_learned(char *result, size_t len, const char *errmsg,
 		void *ctx)
 {
@@ -237,7 +216,7 @@ static int learn_members_async(perfd_t *p)
 	if (!p->route_want)            /* nobody asked to route */
 		return 0;
 	p->learning = 1;
-	p->learned_async = 1;          /* a failure is not fatal; S462: again at refresh_ms */
+	p->learned_async = 1;          /* a failure is not fatal; again at refresh_ms */
 	p->async_learn_ms = now_ms_lib() + (p->refresh_ms > 0 ? p->refresh_ms : 30000);
 	if (submit_tree(p, "members", NULL, 0, members_learned, p, 0) != 0) {
 		p->learning = 0;
@@ -270,12 +249,8 @@ static int call_add(perfd_t *p, unsigned long long id, perfd_reply_cb cb,
 	return 0;
 }
 
-/* hand a completed reply to whoever asked for it.  Arrival order, not
- * request order: that is the point of the async surface - a slow KEYS
- * must not hold up the gets queued behind it.  A perfd_submit() caller
- * asked in JSON and is answered in JSON (render): the reply tree is
- * rendered here, so the callback sees NUL-terminated text and its
- * length; everyone else gets the payload as it came. */
+/* arrival order, not request order: a slow KEYS must not hold up the gets behind it.
+ * A perfd_submit() caller (render) gets the reply tree as NUL-terminated JSON. */
 static void call_fire(perfd_t *p, unsigned long long id, char *result,
 		size_t rlen, const char *errmsg)
 {
@@ -326,7 +301,7 @@ static void call_fail_all(perfd_t *p, const char *why)
 static int hs_build_msg1(perfd_t *p)
 {
 	uint8_t psk[PC_NOISE_KEYLEN], prologue[1] = { PC_PRIN_CLIENT };
-	uint8_t ver[2] = { PC_CLIENT_VER, PC_HS_PLAIN }, msg[3 + PERFD_HS_MAX];  /* S369 */
+	uint8_t ver[2] = { PC_CLIENT_VER, PC_HS_PLAIN }, msg[3 + PERFD_HS_MAX];
 	size_t mlen = 0;
 
 	if (psk_for(p->sec[p->hs_sec], psk) != 0)
@@ -352,7 +327,7 @@ static int hs_build_msg1(perfd_t *p)
  * -1 = failed. */
 static int hs_take_msg2(perfd_t *p)
 {
-	uint8_t m2[PERFD_HS_MAX], pay[PERFD_HS_MAX];          /* S369 */
+	uint8_t m2[PERFD_HS_MAX], pay[PERFD_HS_MAX];
 	uint8_t rec[2 + PC_HS_SWITCH_LEN + PC_NOISE_TAGLEN];
 	size_t cl, plen = 0;
 	int rl;
@@ -376,7 +351,7 @@ static int hs_take_msg2(perfd_t *p)
 		return errk(p, PERFD_E_AUTH, "handshake failed (wrong secret?)");
 	}
 	p->encrypted = 1;
-	/* S468: plaintext granted - the switch record leads the first push */
+	/* plaintext granted - the switch record leads the first push */
 	if (!p->want_enc && plen >= 2 && pay[1] == PC_HS_PLAIN) {
 		if ((rl = plain_switch_rec(p, rec)) < 0 || wbuf_room(p, (size_t)rl) != 0) {
 			p->poisoned = 1;
@@ -411,9 +386,8 @@ int perfd_events(const perfd_t *p)
 
 	if (!p || p->fd < 0)
 		return 0;
-	/* the TCP connect completes as writability, and a partial write
-	 * needs the same signal - so this is not constant and must be
-	 * re-read after every entry point */
+	/* the TCP connect completes as writability, as does a partial write:
+	 * not constant, re-read after every entry point */
 	if (p->hs_stage == PD_HS_TCP || p->woff < p->wlen || p->wstlen)
 		ev |= PERFD_EV_WRITE;
 	return ev;
@@ -443,7 +417,7 @@ perfd_t *perfd_connect_async(const char *host, int port,
 	p->aport = port;
 
 	memset(&hints, 0, sizeof hints);
-	hints.ai_family = pc_resolve_family();     /* 12np: no AAAA without IPv6 */
+	hints.ai_family = pc_resolve_family();     /* no AAAA without IPv6 */
 	hints.ai_socktype = SOCK_STREAM;
 	snprintf(ps, sizeof ps, "%d", port);
 	if (getaddrinfo(host, ps, &hints, &res) != 0) {
@@ -458,7 +432,7 @@ perfd_t *perfd_connect_async(const char *host, int port,
 		fl = fcntl(p->fd, F_GETFL, 0);
 		fcntl(p->fd, F_SETFL, (fl < 0 ? 0 : fl) | O_NONBLOCK);
 		setsockopt(p->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-		sock_keepalive(p->fd, p->keepalive_s);                  /* S104 */
+		sock_keepalive(p->fd, p->keepalive_s);
 		if (connect(p->fd, ai->ai_addr, ai->ai_addrlen) == 0 ||
 		        errno == EINPROGRESS)
 			break;
@@ -474,11 +448,8 @@ perfd_t *perfd_connect_async(const char *host, int port,
 	return p;
 }
 
-/* the request just framed into p->q (one CMD or data-verb frame, id =
- * p->next_id) is handed to the async write buffer and correlated by
- * callback.  enqueue_cmd and enqueue_bin both append to p->q and take
- * ++p->next_id without touching the blocking collector's FIFO, so the
- * correlation is the same either way. */
+/* hand the frame just built in p->q (id = p->next_id) to the async write
+ * buffer, correlated by callback; the blocking collector's FIFO is untouched */
 static int submit_framed(perfd_t *p, perfd_reply_cb cb, void *ctx,
 		int render)
 {
@@ -551,9 +522,8 @@ int perfd_submit_kv(perfd_t *p, int verb, const char *col, const char *key,
 	return submit_framed(p, cb, ctx, 0);
 }
 
-/* NOT perfd_flush: that name belongs to the SYNC pipeline
- * (perfd_append/perfd_flush/perfd_next_reply), which queues into p->q
- * and sends with send_bytes.  This is the async write buffer. */
+/* NOT perfd_flush, which is the SYNC path's (p->q, send_bytes); this
+ * pushes the async write buffer */
 int perfd_push(perfd_t *p)
 {
 	if (!p->async)
@@ -661,8 +631,7 @@ int perfd_read_ready(perfd_t *p)
 			call_fail_all(p, p->err);
 			return -1;
 		}
-		/* call_fire owns and frees its reply; result points into
-		 * rbuf (S284) */
+		/* call_fire owns and frees its reply; result points into rbuf */
 		if (result && !(result = dup_reply(p, result, rlen))) {
 			p->st = PERFD_ST_FAILED;
 			call_fail_all(p, p->err);
@@ -670,5 +639,6 @@ int perfd_read_ready(perfd_t *p)
 		}
 		call_fire(p, got, result, rlen, result ? NULL : ebuf);
 	}
+	learn_members_async(p);        /* due at refresh_ms, or now after a push counted another fleet */
 	return 0;
 }

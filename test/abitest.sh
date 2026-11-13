@@ -1,15 +1,6 @@
 #!/bin/sh
-# abitest.sh - S370: libperfd.so keeps the ABI its SONAME promises.
-#   1  its SONAME is libperfd.so.<PERFD_SOVER>
-#   2  it exports every symbol the frozen list for that SONAME names
-#      (test/abi/libperfd.so.<N>.symbols) - one missing is an ABI break and
-#      needs a new SONAME; one added is fine (and joins the list when frozen)
-#   3  it exports nothing but perfd_* (the version script)
-#   4  a caller built against the FROZEN header of that SONAME
-#      (test/abi/perfd-abi<N>.h) runs against it: connect, ping, set, get,
-#      perfd_free_value, an error's kind
-# Fail-first: a version script that hides perfd_ping fails 2 and 4.
-# Usage: test/abitest.sh [./perfcached] [./abicaller]
+# abitest.sh - libperfd.so keeps the ABI its SONAME promises: every frozen symbol exported, nothing but
+# perfd_*, a caller built on the frozen header runs.  Usage: test/abitest.sh [./perfcached] [./abicaller]
 set -u
 BIN=${1:-./perfcached}
 CALLER=${2:-./abicaller}

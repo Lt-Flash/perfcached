@@ -1,17 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clpeers.c - the peer table (M1).  See clpeers.h.
- *
- * Every function here is the body that was in cluster.c, moved unchanged:
- * C.peers / C.n_peers / C.dup_seen are reached through the caller's
- * pointer, and the clock is passed in rather than read.  The two things
- * the originals did BESIDES touching the table - shard_note_change() on
- * an appended slot, and peer_gone() on a forgotten address - belong to
- * the caller again.  That is what keeps this file clear of the cluster's
- * sockets, logging and notifications, and is why its test links against
- * clpeers.o alone.
- */
+/* clpeers.c - the peer table (see clpeers.h): no sockets, logging or notifications
+ * and the clock passed in, so its test links against clpeers.o alone */
 #include <string.h>
 
 #include "clpeers.h"
@@ -27,21 +17,25 @@ struct peer *clpeers_by_id_live(struct clpeers *pt, int node, long long now)
 	return NULL;
 }
 
-/* Was cluster.c's ps_peer_from (M16). */
+int clpeers_id_elsewhere(struct clpeers *pt, int node, const pc_addr *from,
+		long long now)
+{
+	int i;
+
+	for (i = 0; i < pt->n_peers; i++)
+		if (pt->peers[i].node == node && clpeers_live(&pt->peers[i], now) &&
+		    !pc_addr_eq(&pt->peers[i].addr, from))
+			return 1;
+	return 0;
+}
+
 struct peer *clpeers_by_id_from(struct clpeers *pt, unsigned node,
 		const pc_addr *from)
 {
 	int i;
 
-	/* Node 0 is nobody: a peer that has not been assigned an id yet, or
-	 * the slot a departed peer leaves behind (peer_gone zeroes it and
-	 * keeps the address).  Matching 0 answered a restarted node that
-	 * asked for our interest state before its id was assigned - found
-	 * by the stale slot at its address - so it began FILTERING relays
-	 * to us while we did not count it live and sent it none of our
-	 * updates: a subscription made in that window was never relayed
-	 * (relayinteresttest, 6 of 9 on two CPUs).  Unmatched, it asks
-	 * again once it has an id, which is when we send it updates too. */
+	/* node 0 is nobody (no id yet, or a departed peer's slot); matching it let
+	 * a restarted node filter relays before we counted it live: lost updates */
 	if (!node)
 		return NULL;
 	for (i = 0; i < pt->n_peers; i++) {
@@ -95,11 +89,14 @@ struct peer *clpeers_upsert(struct clpeers *pt, const pc_addr *addr,
 		memset(freep->repl_mark, 0, sizeof freep->repl_mark);
 		memset(freep->repl_cursor, 0, sizeof freep->repl_cursor);
 		memset(freep->repl_bfcycle, 0, sizeof freep->repl_bfcycle);
-		memset(freep->backfill, 0, sizeof freep->backfill);   /* S102 */
-		freep->tomb_mark = freep->tomb_win = 0;     /* S238 */
+		memset(freep->backfill, 0, sizeof freep->backfill);
+		freep->tomb_mark = freep->tomb_win = 0;
 		freep->tomb_gap_from = 0;
 		freep->tomb_drop_mark = freep->tomb_sent = 0;
 		freep->tomb_owed = 0;
+		freep->alive_ms = 0;
+		freep->link_since_ms = freep->link_probe_ms = freep->link_ok_ms = 0;
+		memset(freep->link_tcp_ms, 0, sizeof freep->link_tcp_ms);
 		/* publish the slot after addr is in place */
 		freep->addr = *addr;
 		__atomic_store_n(&pt->n_peers, pt->n_peers + 1,
@@ -107,16 +104,18 @@ struct peer *clpeers_upsert(struct clpeers *pt, const pc_addr *addr,
 		*created = 1;
 		return freep;
 	}
+	/* a slot reused for a new address inherits nothing from its last occupant */
 	memset(freep->repl_mark, 0, sizeof freep->repl_mark);
 	memset(freep->repl_cursor, 0, sizeof freep->repl_cursor);
 	memset(freep->repl_bfcycle, 0, sizeof freep->repl_bfcycle);
-	memset(freep->backfill, 0, sizeof freep->backfill);   /* S102: a slot
-	                                     * reused for a new address must not
-	                                     * inherit its last occupant's flag */
-	freep->tomb_mark = freep->tomb_win = 0;      /* S238: a new address */
+	memset(freep->backfill, 0, sizeof freep->backfill);
+	freep->tomb_mark = freep->tomb_win = 0;
 	freep->tomb_gap_from = 0;
 	freep->tomb_drop_mark = freep->tomb_sent = 0;
 	freep->tomb_owed = 0;
+	freep->alive_ms = 0;
+	freep->link_since_ms = freep->link_probe_ms = freep->link_ok_ms = 0;
+	memset(freep->link_tcp_ms, 0, sizeof freep->link_tcp_ms);
 	freep->addr = *addr;
 	return freep;
 }
@@ -153,8 +152,8 @@ void clpeers_dup_forget(struct clpeers *pt, const pc_addr *from)
 		}
 }
 
-/* S108: is @addr a joiner that was held for a duplicate claim within
- * the grace window - i.e. still knocking? */
+/* is @addr a joiner held for a duplicate claim within the grace window -
+ * i.e. still knocking? */
 int clpeers_dup_seen_recent(struct clpeers *pt, const struct in_addr *addr,
 		long long now)
 {

@@ -1,30 +1,11 @@
-/* clinject.c - a test tool: one cluster frame, built with the cluster's own
- * codecs, sealed the way a node seals it (the cluster secret's Argon2id
- * key, the fleet's cluster id in the header), and sent from an address of
- * the suite's choosing - so a suite can play a sender the fleet does not
- * know (CH-12/CH-14: the gates on who may send what).
- *
- *   clinject -s SECRET -c CLUSTER_ID -f FROM_IP:PORT -t TO_IP:PORT
- *            [-n COUNT] [-i GAP_MS] [-w WAIT_MS] FRAME...
- *
- *   FRAME:  raw HEX            the plaintext, as given
- *           pullreq COL KEY    a PULL_REQ for COL/KEY
- *           joinreq            a JOIN_REQ with a fresh identity
- *           alive NODE         an ALIVE claiming NODE, a fresh identity
- *           malive NODE N TERM a master's beacon: NODE, N members, at TERM
- *           fwdadd COL KEY D   a forwarded INCR of KEY by D (CH-1: sent twice
- *                              with -n 2, the second copy is a replay)
- *
- * -i seals each copy afresh, GAP_MS apart: not replays, but a sender's stream.
- * Prints "sent N", and with -w, each sealed reply that opens ("reply
- * TYPE LEN") and then "replies N".  CLUSTER_ID as /stats prints it (hex,
- * dashes allowed).  Nothing here is part of the daemon.
- */
+/* clinject.c - test tool: sends one cluster frame, sealed the way a node seals it, from an address
+ * of the suite's choosing, so a suite can play a sender the fleet does not know. */
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -38,11 +19,19 @@
 #include "clpull.h"
 #include "clfwd.h"
 
+static long long mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int usage(void)
 {
 	fprintf(stderr, "usage: clinject -s SECRET -c CLUSTER_ID -f FROM_IP:PORT "
 		"-t TO_IP:PORT [-n COUNT] [-i GAP_MS] [-w WAIT_MS] raw HEX | pullreq COL "
-		"KEY | joinreq | alive NODE | malive NODE MEMBERS TERM | fwdadd COL KEY "
+		"KEY | joinreq | alive NODE [IDENT] | malive NODE MEMBERS TERM | fwdadd COL KEY "
 		"DELTA\n");
 	return 2;
 }
@@ -135,6 +124,8 @@ int main(int argc, char **argv)
 
 		memset(&a, 0, sizeof a);
 		a.node = atoi(argv[optind + 1]);
+		if (optind + 2 < argc && unhex(argv[optind + 2], ident, sizeof ident) != 16)
+			return usage();
 		a.ident = ident;
 		randombytes_buf(&a.incarn, sizeof a.incarn);
 		a.incarn |= 1;
@@ -162,7 +153,7 @@ int main(int argc, char **argv)
 		return usage();
 
 	clwire_set_cid(cid, CLWIRE_CID_ESTABLISHED);
-	clwire_set_self(from.in4.sin_addr.s_addr, ntohs(from.in4.sin_port));   /* CH-1 */
+	clwire_set_self(from.in4.sin_addr.s_addr, ntohs(from.in4.sin_port));
 	sl = clwire_seal(psk, pt, n, sealed);
 	fd = socket(pc_addr_family(&from), SOCK_DGRAM, 0);
 	if (fd < 0 || bind(fd, &from.sa, pc_addr_len(&from)) != 0) {
@@ -180,8 +171,10 @@ int main(int argc, char **argv)
 	printf("sent %d\n", count);
 	if (wait_ms > 0) {
 		struct pollfd p = { fd, POLLIN, 0 };
+		long long end = mono_ms() + wait_ms, left;
 
-		while (poll(&p, 1, wait_ms) == 1) {
+		/* WAIT_MS in all, not per reply: closely spaced replies would hold it open */
+		while ((left = end - mono_ms()) > 0 && poll(&p, 1, (int)left) == 1) {
 			unsigned char buf[HDR_LEN + MAX_DGRAM + 64], rp[MAX_DGRAM + 16];
 			unsigned long long rl = 0;
 			ssize_t r = recv(fd, buf, sizeof buf, 0);

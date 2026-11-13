@@ -1,21 +1,5 @@
-/* lingershim.c - S329: an LD_PRELOAD shim that makes a stopping daemon
- * LINGER after its goodbye, as a production one does.
- *
- * On the PROD AU fleet a master stopping for a reboot said goodbye and
- * then took its shutdown snapshot while the system went down - its TCP
- * lane (whose thread is never joined) still answered two seconds later,
- * and the members took that for "UDP blocked, TCP up".  On a test host
- * the snapshot is milliseconds and the process is gone before a member
- * looks.  This holds the snapshot's final rename - the step after the
- * goodbye - for PC_LINGER_S seconds (default 3), but only once the file
- * named by PC_LINGER_MARK exists, so the daemon starts and runs normally
- * until the test arms it right before the stop.
- *
- * Every hold is appended to PC_LINGER_LOG ("held <path>"), so a test can
- * prove the delay was DELIVERED - a green run against a shim that never
- * fired proves nothing.  The real call is a raw syscall (no RTLD_NEXT:
- * this tree keeps its sources free of feature-test macros).
- */
+/* lingershim.c - LD_PRELOAD shim: a stopping daemon lingers past its goodbye: the snapshot's
+ * final rename waits PC_LINGER_S once PC_LINGER_MARK exists, each hold logged to PC_LINGER_LOG */
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>

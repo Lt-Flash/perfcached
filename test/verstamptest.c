@@ -1,34 +1,5 @@
-/* verstamptest.c - S234: a local write's version is stamped under the
- * bucket lock, where the record is published.
- *
- * The replacement record is built before lock_get (3.5b rule 3), and so
- * was its version: a tick taken while building could reach the bucket
- * after a later one.  Two workers on one key, A ticking 100 and B 101, B
- * storing first - A stored 100 over 101, this node kept A's value, and
- * every peer refused A's push as older and kept B's.  The same gap sat
- * between a delete and its tombstone, ticked after the lock was dropped.
- *
- * A thread race cannot be pinned, so the test pins it: it includes the
- * table and holds the bucket's lock itself.  The writer starts, reaches
- * the lock and waits (the pre-S234 code has ticked by then); the test,
- * still holding the lock, commits "the other worker's" version to the
- * key - exactly what B did - and lets go.  The writer's version must land
- * above it.  Deterministic, milliseconds.
- *
- *   1. replace: a value that outgrows its cell (the path that kept the
- *      early tick)
- *   2. insert: an absent key, against a delete stamped under the lock
- *   3. delete then set: the tombstone's version is below a set that lands
- *      after the delete (-DOLD_REMOVE builds the pre-S234 delete verb:
- *      remove, then tick - the fail-first for this arm)
- *   4. an accumulate on a counter in a bucket's chain (the overflow leg,
- *      before OC) moves its version
- *      (that path handed out the discarded prebuilt record's tick and
- *      left the record's own number where it was)
- *   5. every write path leaves a non-zero, rising version that matches
- *      pcache_last_ver - the control that moving the stamps lost none
- *
- * FAIL-FIRST: arms 1-4 fail against the pre-S234 table. */
+/* verstamptest.c - a local write's version is stamped under the bucket lock where the record is
+ * published: the test holds the lock, commits a rival version first, and the write lands above. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -66,9 +37,8 @@ static unsigned long long ver_of(pcache_htable_t *ht, const str *k)
 	return pcache_ht_getver(ht, k, &v) == 0 ? v : 0;
 }
 
-/* hold @k's bucket lock while a writer stores @val to it; under the lock,
- * @commit stands in for the other worker.  Returns the version it put
- * there; *@w reports the writer's. */
+/* hold @k's bucket lock while a writer stores @val; under it @commit stands in for the other
+ * worker; returns the version put there, *@w the writer's */
 static unsigned long long race(pcache_htable_t *ht, const str *k,
 		const str *val, int existing, struct writer *w, int *waited)
 {
@@ -97,9 +67,8 @@ static unsigned long long race(pcache_htable_t *ht, const str *k,
 		else
 			other = 0;
 	}
-	/* else: a delete of the absent key, stamped under this lock - and,
-	 * as the table's remove does since S252, published as the floor for
-	 * the next tick (a no-op where the clock is one shared counter) */
+	/* else: a delete of the absent key, stamped under this lock and published as the
+	 * floor for the next tick (a no-op where the clock is one shared counter) */
 	else
 		pc_lamport_publish(other);
 	lock_release(&b->lock);
@@ -132,7 +101,7 @@ int main(void)
 	}
 	memset(big, 'x', sizeof big);
 
-	/* 1. replace */
+	/* 1. replace: a value that outgrows its cell */
 	k.s = "k1"; k.len = 2;
 	val.s = "a"; val.len = 1;
 	if (pcache_ht_store(ht, &k, &val, 0) != 0)
@@ -149,7 +118,7 @@ int main(void)
 	CHK(w.ver == v, "   and the writer reports the version it stored "
 		"(%llu)", w.ver);
 
-	/* 2. insert */
+	/* 2. insert: an absent key, against a delete stamped under the lock */
 	k.s = "k2";
 	val.s = "b"; val.len = 1;
 	other = race(ht, &k, &val, 0, &w, &waited);
@@ -160,7 +129,7 @@ int main(void)
 	CHK(v > other, "   the insert landed above the delete: %llu over "
 		"%llu", v, other);
 
-	/* 3. delete, then a set that lands after it */
+	/* 3. delete, then a set that lands after it (-DOLD_REMOVE: remove, then tick) */
 	k.s = "k3";
 	val.s = "c"; val.len = 1;
 	if (pcache_ht_store(ht, &k, &val, 0) != 0)

@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respmap.c - S432: the RESP door's DB-index map at runtime.  See respmap.h.
- */
+/* The RESP door's DB-index map at runtime (see respmap.h). */
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -82,10 +80,8 @@ static int is_index(const char *s, size_t n, int idx)
 	return (size_t)l == n && !memcmp(s, b, n);
 }
 
-/* what @idx resolves to in @list, as the door would (resp_map_index, then
- * resp_col_allowed): the NAME of an INDEX:NAME entry; else the index
- * itself when the list allows it (NULL list, "*", or a bare entry).  1 when
- * an entry names the index, 0 when only an open door lets it through */
+/* @idx in @list as the door resolves it: INDEX:NAME's NAME, else the index if the list
+ * allows it.  1 = an entry names the index, 0 = only an open door lets it through */
 static int resolve_in(const char *list, int idx, char *out, size_t cap)
 {
 	const char *p = list, *s;
@@ -146,9 +142,8 @@ static char *build(void)
 		memcpy(b + used, (str), (n)); used += (n); b[used] = 0; } while (0)
 	if (!file_list)
 		ADD("*", 1);                   /* the open door stays open */
-	/* the overrides FIRST: INDEX:NAME is read in order by resp_index_for,
-	 * so a collection the file also maps elsewhere is reported (INFO
-	 * keyspace) under the index the operator moved it to */
+	/* the overrides FIRST: resp_index_for reads INDEX:NAME in order, so a collection
+	 * the file also maps elsewhere is reported under the index it was moved to */
 	for (i = 0; i < PC_RESPMAP_MAX; i++)
 		if (OV[i].held && OV[i].set) {
 			char e[PC_COL_NAME_MAX + 8];
@@ -194,11 +189,8 @@ static void publish(void)
 	if (!old)
 		return;
 	if (nretired == RETIRE_MAX) {
-		/* sixteen changes inside one quiescent window (a pipeline of
-		 * maps in one worker turn holds its own line inside, so waiting
-		 * here could never end): the oldest is let go UNFREED - a few
-		 * dozen bytes - rather than freed under a reader or a worker
-		 * held waiting */
+		/* a pipeline of maps in one worker turn holds its own line, so waiting
+		 * never ends: leak the oldest (a few dozen bytes), never free under a reader */
 		LM_WARN("resp: %d map changes inside one worker turn - an old map "
 			"string is kept, not freed\n", RETIRE_MAX + 1);
 		memmove(retired, retired + 1, sizeof retired[0] * (RETIRE_MAX - 1));
@@ -429,10 +421,8 @@ int pc_respmap_init(const char *list, const char *dir)
 	if (state_dir[0])
 		rc = read_file(state_dir, load_one, NULL);
 	{
-		/* the clock resumes above every change loaded: a map minted
-		 * after the last data write is above what recovery restores,
-		 * and an unmap after a restart must outrank it.  restore, not
-		 * observe - at boot the clock is 0 (recover.c says why) */
+		/* resume the clock above every loaded change so an unmap after a restart
+		 * outranks it; restore, not observe: at boot the clock is 0 */
 		uint64_t high = 0;
 		int i;
 
@@ -446,7 +436,7 @@ int pc_respmap_init(const char *list, const char *dir)
 	__atomic_store_n(&inited, 1, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&mx);
 	if (rc == 0 && pc_respmap_overrides() > 0)
-		LM_NOTICE("resp: %d DB index(es) mapped at runtime (S432) override "
+		LM_NOTICE("resp: %d DB index(es) mapped at runtime override "
 			"resp_collections - perfcli maps lists them\n",
 			pc_respmap_overrides());
 	return rc;

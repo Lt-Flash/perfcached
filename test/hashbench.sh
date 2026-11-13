@@ -1,29 +1,6 @@
 #!/bin/sh
-# hashbench.sh - S318: HGET and HSET ops/s on a hash - one daemon, one
-# RESP client on plaintext loopback.  The number the hash path's lock and
-# copy work is judged by (DESIGN 12ig).
-#
-# Two hashes: 100 fields of 495 bytes (~50 KB - a 65,536-byte cell) and 10
-# fields of 41 bytes (~500 B).  Four cases, one line each:
-#   hashbench: HGET 50KB N ops/s (server U us cpu/op, pipe P, ...)
-#   hashbench: HSET 50KB ...   hashbench: HGET 500B ...   hashbench: HSET 500B ...
-# HGET reads the middle field (the lookup is linear, so half the record).
-# HSET writes the middle field with a value of the SAME length whose bytes
-# differ every op: the record's size does not change between ops, and a
-# byte-identical HSET would take the store's versionless TTL bump and skip
-# the very copy this measures.  Every reply is checked against what the
-# command must answer, and the hash's shape is checked after each HSET run.
-#
-# One connection, PIPE commands in flight (default 64): one at a time
-# measures the loopback round trip (~30 us), not the hash path.  The driver
-# is Python, so on the small hash the ops/s can be the CLIENT's ceiling; the
-# daemon's CPU per op (the sum of its threads' on-CPU time from /proc, in
-# ns) is what the server paid regardless, and is the figure to compare
-# between builds.  No WAL unless WAL=1 (fsync = everysec): 50 KB through
-# the WAL per HSET measures the pump, not the hash path.
-#
-# Usage: test/hashbench.sh [./perfcached]
-#   env: PIPE=64 OPS=50000 WORKERS=1 WAL=0 KEEP=<dir to keep the run's files>
+# hashbench.sh - HGET/HSET ops/s and daemon CPU per op (the figure to compare: the Python client can
+# be the ceiling); each HSET's bytes differ, or the versionless TTL bump would skip the copy measured.
 set -u
 BIN=${1:-./perfcached}
 PIPE=${PIPE:-64}; OPS=${OPS:-50000}; WORKERS=${WORKERS:-1}; WAL=${WAL:-0}

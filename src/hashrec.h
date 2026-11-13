@@ -1,30 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * hashrec.h - a Redis hash as ONE value (task S313, DESIGN 12ic).
- *
- * perfcached keeps one record per key; a hash is that record's value,
- * typed PCACHE_F_HASH, holding every field.  The H* commands read it (a
- * lock-free copy-out, as GET - S318), or edit a copy and store the copy
- * whole under the key's stripe - the same read-modify-write the JSON path
- * verbs do.  Nothing here touches the
- * store, a lock or the wire: these are pure functions over bytes, so the
- * format is tested on its own (test/hashrectest.c).
- *
- * The record, little-endian:
- *   [1][0][0][0][n u32]   then n x  [flen u16][vlen u32][field][value]
- * Fields in insertion order (an update keeps its place, a delete closes
- * the gap) - the order Redis answers HGETALL/HKEYS in for small hashes.
- * An empty record (n = 0) is never stored: the last HDEL deletes the key.
- * The whole record must stay under PC_HR_MAX - the live forward and push
- * ceiling a record has to fit to reach every node at once; pc_hr_valid
- * refuses a longer one, so a reader may size its scratch by it.
- */
+/* hashrec.h - a Redis hash as ONE value (typed PCACHE_F_HASH): pure functions over
+ * the record's bytes, no store, lock or wire */
 #ifndef PC_HASHREC_H
 #define PC_HASHREC_H
 
 #include <stddef.h>
 
+/* little-endian [1][0][0][0][n u32] then n x [flen u16][vlen u32][field][value], in
+ * insertion order as Redis answers HGETALL; an empty record is never stored */
 #define PC_HR_HDR      8
 #define PC_HR_MAX      58000           /* PC_MAX_FWD_VAL: forward + push */
 #define PC_HR_FIELD_MAX 4096           /* a field name, as a key */
@@ -34,7 +18,8 @@
 #define PC_HR_E_OVF    (-4)            /* the increment overflows */
 #define PC_HR_E_ARG    (-5)            /* a bad argument (empty or long field) */
 
-/* is @r a well-formed hash record?  1 yes (*@count = its fields), 0 no */
+/* is @r a well-formed hash record under PC_HR_MAX?  1 yes (*@count = its fields),
+ * 0 no - so a reader may size its scratch by PC_HR_MAX */
 int pc_hr_valid(const unsigned char *r, size_t n, unsigned int *count);
 
 /* iterate: start with *@off = 0; 1 = an entry (field and value point into
@@ -47,10 +32,8 @@ int pc_hr_next(const unsigned char *r, size_t n, size_t *off,
 int pc_hr_get(const unsigned char *r, size_t n, const void *field,
 		size_t flen, const unsigned char **val, size_t *vlen);
 
-/* the new record in @out: @r with @field = @val (replacing it in place,
- * or appended).  @r may be NULL/0 for a new hash.  With @nx and the field
- * present, nothing changes: *@added = 0 and @out is @r unchanged.
- * *@added = 1 when the field was new.  Returns the new length, or < 0. */
+/* @r (NULL for a new hash) with @field = @val, in place or appended, into @out; with
+ * @nx and the field present nothing changes; *@added = 1 if new; new length or < 0 */
 long pc_hr_set(const unsigned char *r, size_t n, const void *field,
 		size_t flen, const void *val, size_t vlen, int nx,
 		unsigned char *out, size_t cap, int *added);
@@ -60,17 +43,14 @@ long pc_hr_set(const unsigned char *r, size_t n, const void *field,
 long pc_hr_del(const unsigned char *r, size_t n, const void *field,
 		size_t flen, unsigned char *out, size_t cap, int *removed);
 
-/* HINCRBY: the field as a 64-bit integer (absent = 0) plus @by, stored
- * back as decimal; *@result gets the sum.  PC_HR_E_NUM / PC_HR_E_OVF as
- * Redis refuses them.  Returns the new length, or < 0. */
+/* HINCRBY: field as int64 (absent = 0) plus @by, stored back as decimal and in
+ * *@result; PC_HR_E_NUM / PC_HR_E_OVF as Redis refuses them; new length or < 0 */
 long pc_hr_incrby(const unsigned char *r, size_t n, const void *field,
 		size_t flen, long long by, long long *result,
 		unsigned char *out, size_t cap);
 
-/* HINCRBYFLOAT: as Redis - long double arithmetic, the result written
- * with 17 significant digits and no trailing zeros (the same text goes in
- * the field and in @result, NUL-terminated, at most 64 bytes).  NaN or
- * infinity in or out is PC_HR_E_NUM.  Returns the new length, or < 0. */
+/* HINCRBYFLOAT as Redis: long double, 17 significant digits, no trailing zeros,
+ * same text in field and @result (<= 64 bytes); NaN/inf is PC_HR_E_NUM */
 long pc_hr_incrbyfloat(const unsigned char *r, size_t n, const void *field,
 		size_t flen, const char *by, size_t bylen, char *result,
 		unsigned char *out, size_t cap);

@@ -1,31 +1,6 @@
 #!/bin/sh
-# keyscanbench.sh - KEYS and SCAN against Redis, on keyspaces shaped like
-# two production Redis instances, with the cost that matters measured:
-# what a key walk does to everyone ELSE's GETs.
-#
-# Redis runs one command at a time, so a KEYS that walks 74,000 keys holds
-# every other client for its whole duration (one production instance: 186,745
-# KEYS calls at 9.45 ms each).  perfcached's KEYS is cooperative - a chunk
-# per event-loop turn - and its workers keep serving.  This puts numbers
-# on both sides, three ways:
-#
-#   keys   KEYS <pattern> back to back: per-call latency (narrow - the
-#          production lookup, ~1 match - and broad, ~4,400 matches)
-#   scan   the same lookup as a SCAN MATCH walk, COUNT 1000 and 100:
-#          walk time and round trips; every walk is checked against KEYS
-#   stall  50 connections of GETs on the session keys (pcbench, depth 1,
-#          per-op p50/p99/p999) while one client sends KEYS at 0, 10 and
-#          50 per second - the GETs' throughput and tail are the result
-#
-# Datasets and patterns: bench/keyscan.py (shapes only - no production
-# key or value is in this repository).
-#
-# Rig: both servers on SERVER (containers, --network host, the same
-# cpuset), the client here.  Arms alternate within every rep; median of
-# REPS.  Refuses a busy server host, as xhostbench.sh does.
-#
-#   SERVER=<ip> bench/keyscanbench.sh [reps]
-#   DATASETS="mixed tokens" RATES="0 10 50" CPUSET=0-3 WORKERS=4
+# keyscanbench.sh - KEYS and SCAN against Redis on keyspaces shaped by bench/keyscan.py, and what a key
+# walk does to everyone ELSE's GETs.  SERVER=<ip> bench/keyscanbench.sh [reps]
 set -u
 SERVER=${SERVER:?set SERVER=<ip of the host that runs both servers>}
 REPS=${1:-3}
@@ -105,11 +80,8 @@ for ds in $DATASETS; do
 		$PY load "$SERVER" "$(port_of $arm)" "$ds" | sed "s/^/  $arm: /" || { echo "keyscanbench: $arm load failed"; exit 1; }
 	done
 	NJWT=$($PY njwt "$SERVER" $RPORT "$ds")
-	# SETTLE: perfcached sizes its table to the load after the fact -
-	# 74k keys into the configured 131,072 buckets shrink to 32,768
-	# 40-60 s later (measured 2026-10-01).  A walk visits buckets, so the
-	# first rep of the first run ran on the big table: KEYS 11 ms against
-	# ~5 ms, SCAN 73 calls against 33.  Measure the table the daemon keeps.
+	# SETTLE: perfcached resizes its table to the load 40-60 s after the fill, and a walk visits buckets:
+	# measure the table the daemon keeps
 	sleep "${SETTLE:-75}"
 	for rep in $(seq 1 "$REPS"); do
 		for arm in redis perfcached; do

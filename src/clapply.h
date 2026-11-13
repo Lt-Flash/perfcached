@@ -1,35 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clapply.h - S217: replica apply sharded by key hash over N threads.
- *
- * One thread (pc-cluster) receives, authenticates and decrypts every
- * datagram, and until now also APPLIED every replicated record in it.
- * With `[cluster] apply_threads = N` (N >= 2) the receiver keeps the
- * socket and the decrypt and hands each record to apply thread
- * hash(col, key) % N over that thread's own ring - one producer, one
- * consumer, no lock.
- *
- * WHY A HASH AND NOT A QUEUE.  A work queue with competing consumers
- * gives no order between two items taken by different workers, and
- * replica apply is the one job here where order is the correctness
- * condition: a set and the delete that follows it, or two versions of
- * one key, applied by two workers in either order, is S209 built back
- * in.  Versions make the END state converge; a reader between the two
- * applies would see the older value after the newer, and the tombstone
- * and negative-cache paths assume per-key order.  So every record of a
- * key goes to the same thread, in the order it arrived - what RabbitMQ
- * calls a consistent-hash exchange.  The trade-off is accepted: a hot
- * key pins one thread.
- *
- * A full ring BLOCKS the receiver (the socket buffer takes the
- * backpressure, where S38 already counts drops); nothing here drops or
- * reorders a record.
- *
- * Pure over its struct: no socket, no log, no clock.  The apply itself
- * and the ack are callbacks, so the module is exercised without a
- * daemon (clapplytest).
- */
+/* clapply.h - replica apply sharded by hash(col, key) over N threads, one SPSC ring
+ * each, so a key's records apply in arrival order (a hot key pins one thread). */
 #ifndef PC_CLAPPLY_H
 #define PC_CLAPPLY_H
 
@@ -48,7 +20,7 @@ struct clapply_rec {
 	unsigned int collen, klen, vlen, ttl_left;
 	unsigned long long ver;
 	int passive;
-	unsigned char flags;           /* S280: the record's type */
+	unsigned char flags;           /* the record's type */
 };
 
 /* a group that wants an ack once EVERY record of it has been applied,
@@ -73,18 +45,11 @@ struct clapply_ring {
 	unsigned int cap;
 	unsigned int head;             /* consumer reads, producer writes: atomic */
 	unsigned int tail;             /* producer writes, consumer reads: atomic */
-	/* the consumer's progress, for the stall detector (S216): the
-	 * moment it took the item it is on, 0 = idle.  Stamped from the
-	 * owner's clock at the take itself (a->clock), never from the
-	 * caller's argument: that argument is read before clapply_take()
-	 * blocks, and after an idle gap it is the gap old - rc34 and
-	 * v0.4.5.2's CI read a 3.7 s "stall" on the first record of a
-	 * burst that way. */
+	/* for the stall detector: when the consumer took its current item, 0 = idle; stamped
+	 * by a->clock at the take, not from now_ms, which is read before the take blocks */
 	long long busy_since_ms;
-	/* and the other way a consumer stalls: it never TAKES.  The stall
-	 * detector stamps this when it sees a backlog on an idle ring and
-	 * the consumer clears it on every take, so "a backlog nobody has
-	 * touched for apply_stall_ms" is readable from outside. */
+	/* the other stall, a consumer that never TAKES: the detector stamps this on a
+	 * backlog over an idle ring, and every take clears it */
 	long long wait_since_ms;
 	unsigned long long items, blocks;   /* handled; producer waits on full */
 	pthread_mutex_t mx;            /* the consumer's wait, not the data */
@@ -95,9 +60,8 @@ struct clapply_ring {
 struct clapply {
 	int n;                         /* threads; 0 = off, apply inline */
 	struct clapply_ring ring[CLAPPLY_MAX];
-	/* callbacks */
 	int (*apply)(const struct clapply_rec *r, void *ctx);   /* 1 = stored,
-	                                  * 2 = already had it newer (S253) */
+	                                                         * 2 = already had it newer */
 	void (*ack)(const struct clapply_grp *g, void *ctx);
 	void *ctx;
 	long long (*clock)(void);      /* ms clock for busy_since_ms; NULL =
@@ -117,21 +81,16 @@ void clapply_free(struct clapply *a);
 int clapply_shard(const struct clapply *a, const unsigned char *col,
 		unsigned int collen, const unsigned char *key, unsigned int klen);
 
-/* Receiver side.  A group is opened when the sender wants an ack
- * (req != 0): the receiver holds one count on it until clapply_close()
- * so an early thread cannot finish it first.  clapply_push() copies the
- * record into its thread's ring, waiting (never dropping) while the ring
- * is full; @now_ms is stamped for the stall detector.  Returns the
- * thread it went to. */
+/* Receiver side: a group (req != 0) holds a count until clapply_close(), so no thread
+ * finishes it early; clapply_push() copies into the ring, waiting - never dropping - if full. */
 struct clapply_grp *clapply_open(struct clapply *a,
 		const pc_addr *from, uint32_t req);
 int clapply_push(struct clapply *a, const struct clapply_rec *r,
 		struct clapply_grp *g);
 void clapply_close(struct clapply *a, struct clapply_grp *g);
 
-/* Consumer side, thread @idx.  clapply_take() blocks until an item is
- * there or @stop is set (0 = stopped, 1 = an item); clapply_done()
- * releases it and completes the group. */
+/* Consumer side, thread @idx: clapply_take() blocks for an item or @stop (0 = stopped,
+ * 1 = an item); clapply_done() releases it and completes the group. */
 int clapply_take(struct clapply *a, int idx, volatile int *stop,
 		struct clapply_item *out, long long now_ms);
 void clapply_done(struct clapply *a, int idx, struct clapply_item *it);

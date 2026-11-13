@@ -1,28 +1,6 @@
 #!/bin/sh
-# autoscalefleettest.sh - S436: a collection's autoscale mode is the fleet's.
-#
-# Seen on 245-247 (rc11, 2026-10-23): `autoscale thbench floor` on the master
-# changed the master only; the other two kept auto and shrank the table to
-# 34,892 buckets while the master stayed at 4,194,304 - one collection, a
-# 120x different table, and nothing said so.  Three nodes (shard), c at 2^12,
-# autoscale from the config (auto), shrink_cooloff_s = 2:
-#   1. node 3 stands in for a build before 0.7.2 (PERFCACHED_TEST_NO_AUTOSCALE):
-#      `autoscale c floor` through node 1 is refused, naming it;
-#   2. node 3 stopped: the verb through node 1 is accepted, and node 2 takes
-#      floor at node 1's generation;
-#   3. node 3 back as the older build: the cluster.autoscale alert names it;
-#   4. node 3 back as this build: it takes the fleet's floor (the resync), and
-#      the alert clears;
-#   5. `resize c 14` through node 2: every table reaches 16,384 buckets and
-#      STAYS there past the cool-off - under auto, 0 keys shrink it to 4,096;
-#   6. node 2 restarted: floor and its generation come back from its
-#      collections file, and the resync's re-sends log nothing again;
-#   7. node 3 deaf to the fleet's modes (PERFCACHED_TEST_AUTOSCALE_DEAF):
-#      `autoscale c warn` through node 1 reaches node 2 and not node 3, and
-#      the alert names node 3 as differing - its stats too.
-# FAIL-FIRST: the build before S436 accepts step 1, never moves node 2 off
-# auto (step 2), raises no alert (3, 7) and shrinks nodes 2 and 3 (5).
-# Usage: test/autoscalefleettest.sh [./perfcached]
+# autoscalefleettest.sh - a collection's autoscale mode is the fleet's: set through one node it reaches all,
+# survives restarts; a member that differs raises an alert.  Usage: test/autoscalefleettest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -156,8 +134,7 @@ case "$R" in *older*) ok "1. autoscale c floor refused while node 3 predates it:
 echo "--- 2. the older member gone: the mode reaches the fleet"
 stop 3
 ready "1 2" || bad "2. nodes 1 and 2 did not settle without node 3"
-# a member that said goodbye may read live a moment longer: the verb is
-# refused until it does not (that refusal is step 1's, not this step's)
+# a member that said goodbye may read live a moment longer: the verb is refused until it does not
 i=0; while [ $i -lt 20 ]; do
 	R=$(priv 1 autoscale '{"col": "c", "mode": "floor"}')
 	case "$R" in *older*) sleep 0.5; i=$((i+1));; *) break;; esac

@@ -1,30 +1,6 @@
 #!/bin/sh
-# upthroughshardtest.sh - DESIGN 12nt, TC-1 (0.7.1): a read-through
-# collection in SHARD mode fetches at the key's owner, and nowhere else.
-#   - three shard members, collection 0 read-through on the fakes (M, R1,
-#     R2 of upwritethroughtest), 30 keys seeded straight into the master;
-#   - every key reads through node 1 with its value: a key node 1 does not
-#     own is pulled from the owner, which fetches it from a replica and
-#     keeps the copy (cluster.pull_fetching on the owners);
-#   - the copies sit on the owners only: the fleet's shadow_entries sum to
-#     30 and no node holds them all; the fakes were fetched 30 times;
-#   - the same keys through node 2: found, and not fetched again;
-#   - a change on the master reaches the owner's copy (tracking): the next
-#     read through node 3 is the new value, one more fetch;
-#   - an absent key reads as absent through a non-owner, one fetch (the
-#     owner's negative marker).
-#   TC-2 (the write at the owner):
-#   - a write through node 2 for a key another node owns lands on that node
-#     only, and the fake master got the SET exactly once (cluster.fwd_through
-#     = fwd_through_acked on the owner);
-#   - SET NX through node 2: the master decides - stored once, the second one
-#     refused and stored nowhere; SET XX on an absent key: nothing anywhere;
-#   - a delete through node 2 reaches the master and empties the owner;
-#   - the RESP forms (SET, SET NX, DEL, INCRBY, EXPIRE) through node 2 do the same;
-#   TC-4: the drain sweep on every node takes over the owner's share only.
-# Before 12nt the node a client read on fetched and kept its own copy, so
-# three nodes held three copies and the fakes were fetched three times.
-# Usage: test/upthroughshardtest.sh [./perfcached]
+# upthroughshardtest.sh - a read-through collection in SHARD mode fetches and keeps at the key's owner
+# only, writes through the owner to the master once, and drains only the owner's share.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -147,8 +123,7 @@ f1c=$(col0 1 "['upstream']['fetches']"); f2c=$(col0 2 "['upstream']['fetches']")
 [ $((f1c + f2c + f3c)) -eq 31 ] && ok "3. one more fetch in all ($((f1c + f2c + f3c)))" || bad "3. fetches $f1c/$f2c/$f3c (31 expected)"
 
 # ---- 4. an absent key through a non-owner ------------------------------------------------
-# an absent key is asked of every upstream before it is absent (one fetch per upstream, three
-# here); the owner's negative marker then answers the next pull without a fetch
+# one fetch per upstream (three) before it is absent; the owner's negative marker answers the next pull
 r=$(nget 1 k:nope)
 f1d=$(col0 1 "['upstream']['fetches']"); f2d=$(col0 2 "['upstream']['fetches']"); f3d=$(col0 3 "['upstream']['fetches']")
 r2=$(nget 2 k:nope)
@@ -158,7 +133,7 @@ nh=$(( $(col0 1 "['upstream']['negative_hits']") + $(col0 2 "['upstream']['negat
 [ $((f1d + f2d + f3d)) -gt 31 ] && [ $((f1d + f2d + f3d)) -le 34 ] && ok "4. the first read fetched the absent key once per upstream ($((f1d + f2d + f3d - 31)) fetches, at the owner)" || bad "4. fetches after the first absent read $f1d/$f2d/$f3d (32..34 expected)"
 [ $((f1e + f2e + f3e)) -eq $((f1d + f2d + f3d)) ] && [ "$nh" -ge 1 ] && ok "4. the second read through node 2 fetched nothing: the owner's negative marker answered the pull (negative_hits $nh)" || bad "4. fetches after the second read $f1e/$f2e/$f3e (was $f1d/$f2d/$f3d), negative_hits $nh"
 
-# ---- TC-2: the write at the owner --------------------------------------------------------
+# ---- 5. the write at the owner -----------------------------------------------------------
 # nset <n> <verb> <key> <value> [ttl] - one native write, its result JSON
 nset() {
 	python3 - "$@" <<'PY' 2>&1
@@ -194,9 +169,8 @@ for n in (1, 2, 3):
 print(" ".join(str(x) for x in h))
 PY
 }
-# a key node 2 does NOT own: written through node 2, its owner runs it through (the owner's
-# fwd_through grows by one; the record itself is dropped and refetched by the write's own echo
-# within milliseconds, so entries cannot tell the owner)
+# a key node 2 does NOT own: its owner runs the write through (its fwd_through grows by one; the
+# record is dropped and refetched by the write's echo, so entries cannot tell the owner)
 fwt() { echo "$(col0 1 "['upstream']['fwd_through']") $(col0 2 "['upstream']['fwd_through']") $(col0 3 "['upstream']['fwd_through']")"; }
 e0=$(fwt); OWN=; WK=
 for cand in $(seq 1 40); do

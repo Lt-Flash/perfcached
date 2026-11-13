@@ -1,39 +1,6 @@
 #!/bin/sh
-# reconcilefasttest.sh - S392: the reconcile's fast path.  A node back from
-# a restart asks a witness for every delete - and every expiry - planted
-# since its snapshot began, instead of asking the fleet about each key it
-# replayed; when the witness vouches for the whole window and the whole
-# replay arrives, the pass is over.
-#
-# WHY IT CAN BE ENOUGH.  An eager replica persists no copy and no delete
-# it receives: after a restart it holds its last snapshot plus its own
-# writes since.  So what can come back that the fleet no longer holds is
-# (a) a key deleted after that snapshot began - while the node was up but
-# had not persisted the delete, or while it was down - and (b) a key the
-# fleet re-wrote with a shorter TTL that then expired, whose older copy
-# the snapshot holds.  Each live peer planted (a) in its retained table
-# when the delete was made (S238) and, since S392, (b) when its sweep
-# reaped the record.  Both are versioned, so the replay drops only what
-# they superseded.
-#
-# Three eager nodes, `save = 900 1` (no snapshot but the one asked for),
-# every node up past the 30 s witness grace.  Through node 2: 300 tk keys,
-# 100 immortal tx keys; node 1 SNAPSHOTS; then, node 1 still up, tk 1-100
-# are deleted and tx 1-100 re-set with a 3 s TTL; node 1 is killed -9;
-# tk 101-200 are deleted while it is down and the tx keys expire on the
-# peers; node 1 comes back from its snapshot.
-#   A  defaults: the fast path ends the pass (reconcile_fast true, nothing
-#      probed, a few seconds): node 1 holds tk 201-300 only, no tx - and
-#      after a repair cycle node 2 holds the same (nothing spread back)
-#   B  tombstone_retain_s = 5: the window is older than the witnesses'
-#      table - it says so, and the WALK runs and drops the same keys
-#   C  tombstone_retain_max = 1000 and 1,200 more deletes after the
-#      snapshot: the cap drops some inside the window - it says so, and
-#      the walk runs
-# FAIL-FIRST: before S392 arm A has no reconcile_fast (the stat reads
-# absent) and walks; without the expiry planting the tx copies come back
-# immortal through the fast path - arm A's tx count is that check.
-# Usage: test/reconcilefasttest.sh [./perfcached]
+# reconcilefasttest.sh - the reconcile's fast path: a node back from a restart asks a witness for
+# every delete and expiry since its snapshot, and walks the fleet only when that window is short.
 set -u
 
 BIN=${1:-./perfcached}
@@ -80,7 +47,7 @@ advertise = 127.0.72.$1
 pull_timeout_ms = 400
 tombstone_retain_s = $2
 tombstone_retain_max = $3
-# 12ny AT-5: S392's windows under the time rule - no forgetting by marks
+# the reconcile windows under the time rule - no forgetting by marks
 tombstone_acks = no
 mode = eager
 collections = c
@@ -160,8 +127,7 @@ stop_all() {
 }
 
 # ---- one arm --------------------------------------------------------
-# Leaves FAST, WHY, PROBED, RMS, TK1, TX1, FK1 (node 1 after its pass)
-# and TK2, TX2 (node 2 a repair cycle later).
+# Leaves FAST, WHY, PROBED, RMS, TK1, TX1, FK1 (node 1 after its pass), TK2, TX2 (node 2 later)
 run_arm() { # run_arm <label> <retain_s> <retain_max> <fillers>
 	ra=$1; FILL=$4
 	echo "--- arm $ra: tombstone_retain_s $2, tombstone_retain_max $3, $FILL extra deletes after the snapshot"
@@ -169,7 +135,7 @@ run_arm() { # run_arm <label> <retain_s> <retain_max> <fillers>
 	for i in 1 2 3; do mk $i "$2" "$3"; done
 	for i in 1 2 3; do start $i "$ra-a" || return 1; done
 	# the witnesses must be up past the grace before node 1 dies, and
-	# (S392) before the window opens: its snapshot, less a 10 s margin
+	# before the window opens: its snapshot, less a 10 s margin
 	i=0
 	while [ $i -lt 90 ]; do
 		[ "$(stat_of 2 '(r.get("process") or {}).get("uptime_s", 0)')" -ge 46 ] 2>/dev/null && break
@@ -244,7 +210,7 @@ run_arm B 5 250000 0 || { echo "reconcilefasttest: arm B did not run"; exit 1; }
 check_dropped B
 
 run_arm C 900 1000 1200 || { echo "reconcilefasttest: arm C did not run"; exit 1; }
-# the replay can bring every delete before the cap is felt: a walk with nothing left to ask (GitLab 112703)
+# the replay can bring every delete before the cap is felt: a walk with nothing left to ask
 [ "$FAST" = False ] && echo "$WHY" | grep -q "cap" && [ "${WALKED:-0}" -gt 0 ] 2>/dev/null \
 	&& ok "C: the cap dropped deletes inside the window: the witness said so ($WHY) and node 1 walked ($WALKED walked, $PROBED probed)" \
 	|| bad "C: reconcile_fast $FAST, why '$WHY', walked $WALKED, probed $PROBED - want the walk, the cap having dropped inside the window"

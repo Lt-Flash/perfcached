@@ -1,26 +1,6 @@
 #!/bin/sh
-# upreplicatest.sh - S382 (0.6.1): several upstreams for one read-through
-# collection, replicas only.  Three fakes (test/fakeupstream.py, which
-# answers ROLE and INFO replication as its ctl.json says): R1 and R2
-# replicas, M a master, all three in `upstream`, `upstream_role = replica`;
-# PERFCACHED_ALERT_FAST=60 (the alerts' hold and clear times / 60).
-#  1. the master is refused at its first connect, the replicas serve
-#  2. reads spread over both replicas (each fetches some); none goes to M
-#  3. R1 lost (down, its tracking connection closed): ITS copies are
-#     dropped and R2's stay; R2 serves every read; R1's warning is raised,
-#     the master's none (skipped by design, listed to follow a failover)
-#  4. R1 back: served again, within the 2 s it is dialled at
-#  5. R2 promoted (ROLE says master): refused within the 10 s ROLE check;
-#     a replica again: taken back
-#  6. both replicas down: the master is NOT read - the read answers as
-#     upstream_on_error says, and "no upstream serves" is critical
-#  7. upstream_master_fallback = yes, both replicas down: the master serves,
-#     with its warning, until a replica is back
-#  8. config: the fallback without upstream_role = replica, a ninth
-#     upstream, upstream_role without an upstream - each refused
-#  and nothing is ever written to any of them.
-# Fail-first: 0.6.0.1 refuses upstream_role as an unknown key.
-# Usage: test/upreplicatest.sh ./perfcached
+# upreplicatest.sh - several upstreams for one read-through collection, replicas only (three fakes): the
+# master is refused unless upstream_master_fallback, reads spread over replicas, and nothing is written.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -225,10 +205,10 @@ conf c "upstream_role = any" "upstream_master_fallback = yes"
 "$BIN" -C -f "$D/c.conf" > "$D/c.out" 2>&1
 [ $? -ne 0 ] && grep -q "upstream_master_fallback = yes needs upstream_role = replica" "$D/c.out" &&
 	ok "8. the fallback without upstream_role = replica is refused" || bad "8. fallback/any: $(tail -1 "$D/c.out")"
-L=""; for i in 1 2 3 4 5 6 7 8 9; do L="$L${L:+, }redis://127.0.0.1:$((20000 + i))"; done
+L=""; for i in $(seq 1 33); do L="$L${L:+, }redis://127.0.0.1:$((20000 + i))"; done
 sed "s|^upstream = .*|upstream = $L|" "$D/a.conf" > "$D/d.conf"; chmod 600 "$D/d.conf"
 "$BIN" -C -f "$D/d.conf" > "$D/d.out" 2>&1
-[ $? -ne 0 ] && grep -q "upstream: at most 8" "$D/d.out" && ok "8. a ninth upstream is refused" || bad "8. nine: $(tail -1 "$D/d.out")"
+[ $? -ne 0 ] && grep -q "upstream: at most 32" "$D/d.out" && ok "8. a 33rd upstream is refused (S478: 32)" || bad "8. 33: $(tail -1 "$D/d.out")"
 printf '[daemon]\nworkers = 1\n[secrets]\nclient = x-client-secret\n[listen]\ntcp = 127.0.0.1:%s\nplaintext = loopback\n[collection 0]\nbuckets_log2 = 8\nupstream_role = replica\n' $TCP > "$D/e.conf"
 chmod 600 "$D/e.conf"
 "$BIN" -C -f "$D/e.conf" > "$D/e.out" 2>&1

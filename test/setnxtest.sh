@@ -1,36 +1,6 @@
 #!/bin/sh
-# setnxtest.sh - S279: SET key value [EX n] NX|XX on the RESP door.
-#
-# A production Redis's clients send `SET k v EX n NX` - 51% of their SETs,
-# measured 2026-09-30 - and perfcached refused every one ("unsupported
-# SET option").  It is the lock idiom: take it if nobody holds it, for n
-# seconds.  A lock is only a lock if two clients cannot both be granted
-# it, so in a cluster every NX/XX of a key is decided by ONE node, the
-# slot's owner; eager and spread otherwise let each node decide alone.
-#
-#   A. one unclustered node: NX on absent -> OK, on present -> nil; XX on
-#      absent -> nil, on present -> OK; EX rides along (TTL); an expired
-#      key is absent to NX; NX with XX is a syntax error; KEEPTTL and GET
-#      are still refused; 16 clients racing NX on one key, 30 rounds:
-#      exactly one OK per round
-#   B. three EAGER nodes: 12 clients spread over all three doors race
-#      `SET k v EX 30 NX`, 40 rounds: exactly one OK per round, and every
-#      node then answers the winner's value
-#   C. three SHARD nodes: NX and XX through a node that does not own the
-#      key are forwarded - OK, nil, OK, nil as in A - and the owner holds
-#      the value
-#   B and C also drive the NATIVE door through every node (S279b): the
-#      setnx/setxx CMD requests and the SETNX/SETXX data frames - a
-#      non-owner parks the request and completes it from the owner's
-#      answer, the path only a forward exercises
-#   D. a PROXY cluster has no node that decides a key: NX is refused,
-#      said, and nothing is stored
-# The standalone edition refuses [cluster], so there B and C are SKIPPED,
-# loudly.
-# Fail-first: rc58 refuses NX ("unsupported SET option") - A, B and C
-# fail.  A build that decides NX on the receiving node in eager fails B's
-# one-winner count (the mutation this suite was checked against).
-# Usage: test/setnxtest.sh [./perfcached]
+# setnxtest.sh - SET k v [EX n] NX|XX on the RESP and native doors: in a cluster the slot's owner
+# decides, so racing clients get exactly one OK; proxy refuses NX.  Usage: test/setnxtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -86,10 +56,8 @@ start() {
 	echo "node $1 did not start: $(tail -2 "$D/n$1.log" | tr '\n' ' ')"
 	return 1
 }
-# every part reuses the last one's addresses, multicast group and state
-# directories, so a node still stopping (a snapshot on the way down, slow
-# under ASan) must be gone before the next part starts - not given a
-# second and its directory removed under it
+# each part reuses the last one's addresses, group and directories: a node still stopping must be
+# gone before the next part starts
 stopall() {
 	pids=
 	for f in "$D"/*.pid; do [ -f "$f" ] && { pids="$pids $(cat "$f")"; rm -f "$f"; }; done
@@ -237,13 +205,12 @@ else:
         time.sleep(1.5)
         vals = [R(p).cmd("GET", last[0]) for p in ports]
         ok(all(v == last[1] for v in vals), "%s: every node answers the winner's value (%r)" % (part, vals))
-    # the deciding node is the owner: a client on any other door is
-    # forwarded, so the forward path MUST have run - an eager build that
-    # decided locally would serve none
+    # the deciding node is the owner: a client on any other door is forwarded, so the
+    # forward path MUST have run
     st = [json.load(urllib.request.urlopen("http://127.0.0.1:1892%d/stats" % (i + 1), timeout=5))["cluster"] for i in range(len(ports))]
     served = sum(int(s.get("fwd_served", 0)) for s in st)
     ok(served >= 40, "%s: the owner decided - %d forwards served across the fleet (want >= 40)" % (part, served))
-    # S279b: the native doors, through every node
+    # the native doors, through every node
     tcp = [p - 10 for p in ports]
     for i, p in enumerate(tcp):
         n = N(p); k = "nj%d" % i
@@ -257,9 +224,8 @@ else:
         seq = [n.bin(15, "0", k, "1", 30), n.bin(15, "0", k, "2"), n.bin(16, "0", k, "3"), n.bin(16, "0", k + "-no", "1")]
         ok(seq == [b"\x01", b"\x00", b"\x01", b"\x00"] and settled(ports[i], k, "3"), "%s binary via node %d: SETNX/SETNX/SETXX/SETXX -> %r" % (part, i + 1, seq))
     if part == "C":
-        # the forwarded path explicitly: through each node, one key, the
-        # same sequence as A - whichever node owns it, two of the three
-        # doors forward
+        # the forwarded path explicitly: one key through each node, as in A - whichever
+        # node owns it, two of the three doors forward
         for i, p in enumerate(ports):
             c = R(p); k = "fw%d" % i
             seq = [c.cmd("SET", k, "1", "EX", "30", "NX"), c.cmd("SET", k, "2", "NX"),

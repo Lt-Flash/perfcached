@@ -1,25 +1,6 @@
 #!/bin/sh
-# emptywraptest.sh - S334: an EMPTY node restarted more times than its WAL
-# has segments comes back READY, not FAILED.
-#
-# Every start activates the next WAL generation, round the segment ring.
-# pc_wal_init refuses to activate a segment that still holds records newer
-# than the last completed snapshot - correct - but it read that marker
-# before this process had completed a snapshot, and the post-recovery
-# checkpoint that sets it runs only when recovery brought records back.
-# An empty node (a fresh fleet, PROD AU before any client) started with
-# marker 0 while the snapshot it had just LOADED covered the WAL's old
-# records; once its restarts had gone round the ring the oldest segment
-# "still held seqs 1..1, NEWER than the last completed snapshot marker 0"
-# and the node went FAILED - refusing writes until restarted, and every
-# restart did it again.  PROD AU .65, the 0.5.6 roll: generation 9 of 8.
-#
-# One node, a 4-segment WAL: a key written and deleted (so the WAL holds
-# seqs and the node holds nothing), then six clean restarts - each a stop
-# snapshot and a new generation; the fifth start reuses the first
-# segment.  Every start must log no "FULL at startup", come back READY and
-# take a write.  FAIL-FIRST: before S334 the fifth start is FAILED.
-# Usage: test/emptywraptest.sh [./perfcached]
+# emptywraptest.sh - an EMPTY node restarted more times than its WAL has segments comes back READY: the
+# snapshot it LOADED covers the old segment, so starts that wrap the ring must not read it as newer.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

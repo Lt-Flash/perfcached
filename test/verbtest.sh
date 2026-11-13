@@ -1,10 +1,6 @@
 #!/bin/sh
-# verbtest.sh — S8 verification: the full v1 verb set over a live daemon
-# (CMD requests on the native door, through test/pcnative.py - S317:
-# the text dialect is gone).  Covers hit/miss, TTL semantics, counters,
-# binary values (sent as b64, back as the bytes), batch ops, stats, and
-# the error paths (every error is a frame with a message, no code).
-# Usage: test/verbtest.sh [./perfcached]
+# verbtest.sh - the full v1 verb set as CMD requests (test/pcnative.py): hit/miss, TTLs, counters,
+# binary values, batches, stats and every error as a frame.  Usage: test/verbtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -103,9 +99,8 @@ c.call("set", col="th", key="str", value="notanumber")
 r = c.call("add", col="th", key="str")
 check("add non-integer errors", "error" in r, r)
 
-# binary value (NUL + high byte): sent as b64 with enc (pcnative honours
-# it and sends the bytes), comes back as the bytes themselves - a str via
-# surrogateescape, with no enc sibling
+# binary value (NUL + high byte): sent as b64 with enc, back as the bytes themselves
+# (a str via surrogateescape), with no enc sibling
 raw = b"bin\x00\xffval"
 r = c.call("set", col="th", key="bk",
            value=base64.b64encode(raw).decode(), enc="b64")

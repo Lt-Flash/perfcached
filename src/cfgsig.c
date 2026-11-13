@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * cfgsig.c - AR11: the settings the fleet's members must agree on, built
- * from the config at start and handed to the cluster for its keepalive.
- * Moved from daemon.c unchanged (the 0.7.2 split, wave 1 -
- * doc/MODULARITY.md).
- */
+/* cfgsig.c - the settings the fleet's members must agree on, built from the config at start and
+ * handed to the cluster for its keepalive */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -15,16 +11,12 @@
 #include "fnv1a.h"
 #include "cfgsig.h"
 
-/* AR11 (DESIGN 12ms, AR6): the settings the members must agree on, for the
- * keepalive - the ones whose difference changes what the FLEET does: where
- * writes go (a member on allow while the others write through never
- * reaches Redis), what a crash loses, who may read the page, what raises
- * an alert, how long deletes are remembered.  Not the per-node ones:
- * addresses, io, workers, mail */
+/* only settings whose difference changes what the FLEET does - where writes go, what a crash loses,
+ * who reads the page, what alerts, how long deletes are remembered - not per-node ones */
 static int cfgsig_add(struct pc_cfgsig *e, int n, const char *name,
 		const char *what, const char *val)
 {
-	if (n >= PC_CFGSIG_MAX - PC_CL_NFACTS) {        /* UP1: room for the facts */
+	if (n >= PC_CFGSIG_MAX - PC_CL_NFACTS) {        /* room for the facts */
 		static int said;
 
 		if (!said++)
@@ -37,7 +29,7 @@ static int cfgsig_add(struct pc_cfgsig *e, int n, const char *name,
 	snprintf(e[n].name, sizeof e[n].name, "%s", name);
 	snprintf(e[n].what, sizeof e[n].what, "%s", what);
 	snprintf(e[n].val, sizeof e[n].val, "%s", val);
-	/* bit 31 clear: a set bit names a FACT (UP1), never compared */
+	/* bit 31 clear: a set bit names a FACT, never compared */
 	e[n].name_h = (uint32_t)fnv1a64(e[n].name, strlen(e[n].name)) &
 		~PC_FACT_BIT;
 	e[n].val_h = (uint32_t)fnv1a64(val, strlen(val));    /* all of it */
@@ -65,7 +57,7 @@ void cfgsig_build(const struct pc_config *cfg)
 	snprintf(v, sizeof v, "%d s, %d at most", cfg->cl_tomb_retain_s,
 		cfg->cl_tomb_retain_max);
 	n = cfgsig_add(e, n, "tombstones", "tombstone_retain_s / _max", v);
-	snprintf(v, sizeof v, "%d", cfg->cl_max_dgram);       /* CH-6 */
+	snprintf(v, sizeof v, "%d", cfg->cl_max_dgram);
 	n = cfgsig_add(e, n, "max_datagram", "[cluster] max_datagram", v);
 	for (i = 0; i < cfg->n_col; i++) {
 		const struct pc_collection *c = &cfg->col[i];
@@ -95,11 +87,8 @@ void cfgsig_build(const struct pc_config *cfg)
 		n = cfgsig_add(e, n, nm, wt, !c->up_write_through ? "-" :
 			c->up_unknown == PC_UP_UNKNOWN_PASS ? "pass" : "refuse");
 	}
-	/* G5: which collections are caches (durable = no), as one entry: a
-	 * member that logs one the others do not comes back from a restart
-	 * with what they start without.  After the per-collection ones, so it
-	 * is the first left out, never them; a member without the setting
-	 * (an older build) sends no such name and is not compared */
+	/* which collections are caches: a member logging one the others do not comes back from a restart
+	 * with what they start without; last, so it is what gets left out (an older build sends none) */
 	{
 		size_t m = 0;
 

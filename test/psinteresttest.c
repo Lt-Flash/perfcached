@@ -1,8 +1,5 @@
-/*
- * psinteresttest.c - the interest filter, its version and a sender's view
- * of a peer (PS12), driven through src/psinterest.h exactly as the nodes
- * run it.
- */
+/* psinteresttest.c - the interest filter, its version and a sender's view of a peer, driven through
+ * src/psinterest.h exactly as the nodes run it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,25 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * daemon.c — S6: the threading frame.
- *
- * Threads (identity = pc_worker_id(), over struct pc_thread):
- *   0        main: init, signal handling, join, teardown
- *   1..N     workers: one epoll each, own SO_REUSEPORT TCP listeners
- *            (kernel balances accepts), the shared UNIX listener via
- *            EPOLLEXCLUSIVE; S6 behavior on accept is a polite immediate
- *            close - the protocol layer (S7) replaces the handler
- *   N+1      maintenance: 1/s arena reclaim tick + per-collection sweep
- *            and linear-hash growth (the single-splitter home)
- *   N+2      WAL stub: parked until M3 fills it in
- *
- * Every thread owns an eventfd used for two things: waking it out of its
- * wait, and delivering broadcast RPCs.  compat_set_broadcast() wires the
- * shim's ipc_send_rpc_all (the arena hoard flush) to run the callback on
- * EVERY live thread - inline on the caller, queued + eventfd-kicked on
- * the rest.  Shutdown: SIGTERM/SIGINT set the stop flag and kick every
- * eventfd (both async-signal-safe), main joins everything, tears down.
- */
+/* daemon.c - the threading frame: main, the workers (one epoll or io_uring each), maintenance and
+ * the rest; every thread owns an eventfd for wakes and broadcast RPCs. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -56,9 +38,9 @@
 #include "core/pcache_arena.h"
 #include "core/pcache_htable.h"
 #include "proto.h"
-#include "reload.h"                    /* 12nw */
-#include <sodium.h>                    /* 12nw: wiping retired secrets */
-#include "memguard.h"                  /* S366 */
+#include "reload.h"
+#include <sodium.h>
+#include "memguard.h"
 #include "pubsub.h"
 #include "store.h"
 #include "events.h"
@@ -67,7 +49,7 @@
 #include "wal.h"
 #include "rdb.h"
 #include "recover.h"
-#include "ackstate.h"                /* 12ny AT-3b */
+#include "ackstate.h"
 #include "verbs.h"
 #include "cluster.h"
 #include "obs.h"
@@ -77,18 +59,17 @@
 #include "upstream.h"
 #include "mail.h"
 #include "alerts.h"
-#include "addrwait.h"               /* S294 */
-#include "dirlock.h"                /* S290 */
-#include "upgrade.h"                /* UP5 */
-#include "pcaddr.h"                 /* 12np: the IPv6 guard */
-#include "doorlive.h"                /* 12nw: the doors' live settings */
-#include "listenfd.h"                /* the listener sockets */
-#include "cfgsig.h"                  /* AR11: what the members must agree on */
-#include "autosize.h"                /* S150 D, S239: the tables' sizing */
+#include "addrwait.h"
+#include "dirlock.h"
+#include "upgrade.h"
+#include "pcaddr.h"
+#include "doorlive.h"
+#include "listenfd.h"
+#include "cfgsig.h"
+#include "autosize.h"
+#include "keeps.h"
 
-/* the WAL directory's resolved storage identity, retained for the
- * stats verb (class + chain belong next to the wal counters, not only
- * in a startup log line) */
+/* the WAL directory's resolved storage identity, kept for the stats verb */
 static struct pc_st_id wal_sid;
 static int wal_id_valid;
 static struct pc_wal_probe wal_probe;
@@ -121,18 +102,14 @@ extern int pcache_reclaim_keep, pcache_reclaim_quiet_s,
 struct pc_thread {
 	pthread_t tid;
 	int efd;
-	int idx;                            /* this worker's index; also
-	                                     * handed to the vendored core
-	                                     * as process_no, see
-	                                     * compat_thread_register() */
+	int idx;                            /* this worker's index; also the vendored core's process_no */
 	/* tiny locked RPC queue - broadcast is rare control-plane traffic */
 	pthread_mutex_t mx;
 	ipc_rpc_f fn[PC_RPCQ];
 	void *arg[PC_RPCQ];
 	int head, tail;
 	int live;
-	struct pc_conn **conns;             /* S107: this worker's client
-	                                     * list - read on this worker */
+	struct pc_conn **conns;             /* this worker's client list, read on this worker only */
 };
 
 struct pc_collection_rt {
@@ -149,17 +126,17 @@ static int n_cols;
 
 static const struct pc_config *CFG;
 
-int pc_http_rate(void)                 /* 0.6.2 */
+int pc_http_rate(void)
 {
 	return CFG ? CFG->http_rate : 0;
 }
 
-int pc_http_cache_ms(void)             /* 0.6.2 */
+int pc_http_cache_ms(void)
 {
 	return CFG ? CFG->http_cache_ms : 0;
 }
 
-/* ---- S89: the listeners, as facts stats can carry ---------------------- */
+/* ---- the listeners, as facts stats can carry --------------------------- */
 static int listener_plaintext_ok(const struct pc_listener *l);
 
 int pc_listener_count(void)
@@ -203,9 +180,8 @@ const char *pc_resp_door(void)
 	return NULL;
 }
 
-/* the optional collection allow-list for RESP clients: NULL = all.  S432:
- * once respmap is up, its effective list - the file's with the runtime
- * overrides applied (respmap.h) */
+/* the optional collection allow-list for RESP clients: NULL = all; once respmap is up, its
+ * effective list (the file's with the runtime overrides applied) */
 const char *pc_resp_collections(void)
 {
 	if (pc_respmap_ready())
@@ -218,10 +194,8 @@ static int workers_listening;
 static int unix_fd = -1;
 static struct pc_psk_ctx PSK;
 static int have_psk;
-/* 12nw: the PSK table a NEW connection takes (proto.c, at accept).  A
- * reload of [secrets] client publishes a fresh one; an old table is never
- * freed - a connection mid-handshake still holds it - which is a few
- * hundred bytes a reload. */
+/* the PSK table a NEW connection takes (proto.c, at accept); a reload publishes a fresh one and
+ * never frees the old - a connection mid-handshake still holds it */
 static const struct pc_psk_ctx *PSK_CUR;
 
 const struct pc_psk_ctx *pc_psk_current(void)
@@ -229,10 +203,8 @@ const struct pc_psk_ctx *pc_psk_current(void)
 	return __atomic_load_n(&PSK_CUR, __ATOMIC_ACQUIRE);
 }
 
-/* 12nw: apply a reload.  @nc is the whole new config, parsed and validated;
- * reload.c has already refused it unless every key that changed is one of
- * PC_RL_*, so the reloadable fields @nc does not change equal the running
- * ones and the new snapshot is simply @nc's.  0, or -1 with @msg set. */
+/* apply a reload: reload.c refused it unless every changed key is a PC_RL_* one, so the new
+ * snapshot is simply @nc's.  0, or -1 with @msg set. */
 int pc_live_reload(const struct pc_config *nc, unsigned int what,
 		char *msg, size_t ml)
 {
@@ -265,7 +237,7 @@ int pc_live_reload(const struct pc_config *nc, unsigned int what,
 		}
 	}
 	if (what & (PC_RL_RESP_ALLOW | PC_RL_HTTP_ALLOW | PC_RL_HTTP_TOKEN |
-	            PC_RL_RESP_PASSWORD | PC_RL_ENABLE)) {
+	            PC_RL_RESP_PASSWORD | PC_RL_ENABLE | PC_RL_AUTH_TLS)) {
 		nl = live_from(nc);
 		if (!nl) {
 			snprintf(msg, ml, "out of memory for the new settings");
@@ -276,13 +248,8 @@ int pc_live_reload(const struct pc_config *nc, unsigned int what,
 	return 0;
 }
 
-/* the `probe` verb: re-measure on demand.  BLOCKS THE CALLER for the
- * probe's duration (like sync), and the measurement I/O shares the WAL
- * device with the live pump - expect perturbed fsync latency while it
- * runs; that is inherent to re-measuring.  Updates the retained result
- * (stats flips to cached:false) and the on-disk cache.  Concurrent
- * stats readers may see a torn number mid-update - counters only,
- * accepted like every other stats read. */
+/* the probe's I/O shares the WAL device with the live pump: fsync latency is perturbed while it
+ * runs, and a stats reader may see a torn number mid-update */
 int pc_wal_reprobe(int secs, struct pc_wal_policy *pol)
 {
 	if (!CFG || !CFG->wal_dir)
@@ -305,14 +272,8 @@ static struct pc_thread *slot_init(int idx)
 	return t;
 }
 
-/* S110: a thread carries its role in its name, so `top -H`, perf and a
- * core say which of the daemon's threads is the busy one (measured: the
- * eager write ceiling was suspected to be the single cluster thread, and
- * nothing on the host could point at it by name).  15 bytes + NUL.
- * prctl(PR_SET_NAME) names the calling thread on every Linux libc with
- * no feature-test macro; pthread_setname_np is the GNU spelling of the
- * same call and would need _GNU_SOURCE, which this tree keeps out of its
- * files (see find_bytes in proto.c).  Elsewhere the threads go unnamed. */
+/* the thread's role in its name, for top -H, perf and cores (15 bytes + NUL); prctl, not
+ * pthread_setname_np, which would need _GNU_SOURCE */
 static void thread_name(const char *name)
 {
 #ifdef __linux__
@@ -330,11 +291,10 @@ static void slot_attach(struct pc_thread *t)
 	self_slot = t;
 	t->tid = pthread_self();
 	compat_thread_register(t->idx);
-	pc_qs_attach();                     /* S150 B: a quiescence line */
+	pc_qs_attach();                     /* a quiescence line */
 	__atomic_store_n(&t->live, 1, __ATOMIC_RELEASE);
 }
 
-/* the worker index, from the context this thread already carries */
 int pc_worker_id(void)
 {
 	return self_slot ? self_slot->idx : -1;
@@ -384,7 +344,7 @@ static void pc_broadcast(void (*fn)(int sender, void *param), void *param)
 	}
 }
 
-/* ---- S107: membership notifications to every client ------------------- */
+/* ---- membership notifications to every client -------------------------- */
 
 struct notify_msg {
 	int refs;                           /* one per queued worker */
@@ -401,14 +361,8 @@ static void notify_release(struct notify_msg *m)
 /* the caller holds a reference for as long as this runs */
 static void notify_deliver(const struct notify_msg *m)
 {
-	/* The thread this runs on is the one whose queue it was put in,
-	 * and self_slot is that thread's slot.  NOT threads[idx]: a
-	 * worker's public idx is 1 + its slot (slot_init order), so that
-	 * lookup walked the NEXT worker's connection list from this
-	 * thread - and the last worker's landed on the maintenance
-	 * thread's empty slot.  Measured: a client sitting on worker 1 of
-	 * two never received a push; one on worker 2 received worker 1's
-	 * copy, written from the wrong thread. */
+	/* self_slot, NOT threads[idx]: a worker's public idx is 1 + its slot, so threads[idx] is the
+	 * NEXT worker's connection list, written from the wrong thread */
 	struct pc_thread *t = self_slot;
 
 	if (t && t->conns)
@@ -465,26 +419,12 @@ struct worker_arg {
 	int wid;
 };
 
-/* Plaintext eligibility per listener: only loopback/unix listeners under
- * plaintext=loopback may speak in the clear, without the Noise channel.
- *
- * A RESP listener (S33) is the deliberate exception: it is plaintext BY
- * CONSTRUCTION - a stock Redis client cannot speak the Noise channel, so
- * requiring a handshake there would mean the listener could never serve
- * anyone.  Its safety comes from being narrow instead: RESP2 only (no
- * native protocol, no admin verbs), an allow-list the config REFUSES to
- * start without off-box, an optional AUTH password, and an optional
- * collection scope.  Without this, a LAN RESP listener silently fed
- * every client's first command into the Noise responder and dropped the
- * connection - which is exactly how it behaved before this line. */
+/* only loopback/unix listeners under plaintext=loopback skip the Noise channel - and RESP and
+ * HTTP, plaintext by construction (their clients cannot speak Noise), kept narrow instead */
 static int listener_plaintext_ok(const struct pc_listener *l)
 {
 	if (l->resp)
 		return 1;
-	/* S46: HTTP is plaintext by definition - a scraper cannot speak
-	 * Noise, exactly as a Redis client cannot.  Its safety is the
-	 * same narrowness: GET-only, two paths, an allow-list the config
-	 * refuses to start without off-box. */
 	if (l->http)
 		return 1;
 	if (CFG->plaintext != PC_PLAINTEXT_LOOPBACK)
@@ -492,7 +432,7 @@ static int listener_plaintext_ok(const struct pc_listener *l)
 	return l->loopback;
 }
 
-/* S468: what pc_conn_accept's plaintext_ok gets for @l */
+/* what pc_conn_accept's plaintext_ok gets for @l */
 static int listener_door(const struct pc_listener *l)
 {
 	if (listener_plaintext_ok(l))
@@ -511,8 +451,8 @@ static void worker_efd(struct worker_arg *wa)
 	while (read(wa->slot->efd, &junk, sizeof junk) > 0)
 		;
 	rpc_drain(wa->slot);
-	pc_pubsub_drain(wa->slot->idx);        /* PS1 */
-	pc_upstream_drain(wa->slot->idx);      /* S331 */
+	pc_pubsub_drain(wa->slot->idx);
+	pc_upstream_drain(wa->slot->idx);
 	while ((nd = pc_cluster_drain(wa->slot->idx, done, 16)) > 0)
 		for (k = 0; k < nd; k++) {
 			pc_proto_pull_complete(&done[k]);
@@ -520,7 +460,7 @@ static void worker_efd(struct worker_arg *wa)
 		}
 }
 
-/* S379: the clock either side of a worker's wait - the vDSO, no system
+/* the clock either side of a worker's wait - the vDSO, no system
  * call; what lies between two waits is the worker's busy time */
 static unsigned long long wclock(void)
 {
@@ -531,12 +471,8 @@ static unsigned long long wclock(void)
 		(unsigned long long)ts.tv_nsec;
 }
 
-/* S361: the io_uring worker loop - the epoll loop's turn, with the wait
- * an io_uring_enter() that also hands over every request the last turn
- * queued, and the ready list its completions.  The eventfd and the
- * listeners ride multishot polls (armed again if one ends); a listener
- * whose accept budget stopped it is retried next turn without waiting,
- * since a poll reports only what is new. */
+/* the io_uring worker loop: the wait is an io_uring_enter() that also submits the last turn's
+ * requests; a listener its accept budget stopped is retried next turn without waiting */
 static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 		struct pc_conn **conns, int nlfd, const int *lfds,
 		const int *plok, const int *lresp)
@@ -548,13 +484,13 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 	struct pc_ur_sqe *s;
 	unsigned int hs_deferred;
 	int efd_armed = 0, any_more, tmo, rc, hs, j, ncq;
-	unsigned long long t_wake = wclock(), t_wait;   /* S379 */
+	unsigned long long t_wake = wclock(), t_wait;
 
 	pc_conn_uring_attach(ur);
 	while (!stop_flag) {
 		pc_conn_resume_paused();
-		pc_conn_resume_out();          /* S372 */
-		pc_conn_resume_wal();          /* S466 */
+		pc_conn_resume_out();
+		pc_conn_resume_wal();
 		pc_pubsub_flush_wakes();
 		pc_conn_flush_pushes();
 		pc_qs_exit();
@@ -575,11 +511,11 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 			any_more |= lmore[j];
 		}
 		tmo = pc_enum_pending() || pc_conn_hs_parked() || any_more ? 0
-			: pc_conn_wal_paused_open() ? 1                    /* S466 */
+			: pc_conn_wal_paused_open() ? 1
 			: pc_conn_paused_open() || pc_conn_deny_open() ? 50
 			: (pc_conn_http_open() || pc_conn_udp_open() ||
 			   pc_conn_bufs_held() || pc_conn_out_paused_open() ? 1000 : -1);
-		t_wait = wclock();             /* S379: busy until here */
+		t_wait = wclock();             /* busy until here */
 		PC_IOBUSY_ADD(busy_ns, t_wait - t_wake);
 		rc = pc_ur_submit(ur, tmo != 0, tmo);
 		t_wake = wclock();
@@ -589,7 +525,7 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 		pc_conn_sweep_idle(conns);
 		pc_conn_sweep_http(conns, CFG->http_timeout_s);
 		pc_conn_sweep_udp(conns);
-		pc_conn_sweep_deny();          /* 0.6.2: refused HTTP peers */
+		pc_conn_sweep_deny();          /* refused HTTP peers */
 		if (rc < 0 && rc != -ETIME && rc != -EINTR && rc != -EBUSY &&
 		    rc != -EAGAIN) {
 			LM_CRIT("worker %d: io_uring_enter: %s - the worker "
@@ -641,7 +577,7 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 					lfds[j], plok[j], lresp[j],
 					have_psk ? &PSK : NULL, conns);
 		if (hs_deferred)
-			pc_conn_hs_deferred(hs_deferred);   /* ST5 */
+			pc_conn_hs_deferred(hs_deferred);
 		pc_enum_step();
 	}
 	pc_conn_destroy_all(conns);
@@ -657,9 +593,9 @@ static void *worker_main(void *p)
 	unsigned int hs_deferred;
 	int lfds[PC_MAX_LISTEN + 1], plok[PC_MAX_LISTEN + 1];
 	int lresp[PC_MAX_LISTEN + 1];
-	struct pc_ur ur;                       /* S361 */
+	struct pc_ur ur;
 	int use_uring = 0;
-	unsigned long long t_wake, t_wait;     /* S379 */
+	unsigned long long t_wake, t_wait;
 
 	slot_attach(wa->slot);
 	{
@@ -668,14 +604,14 @@ static void *worker_main(void *p)
 		snprintf(wn, sizeof wn, "pc-w%d", wa->wid);
 		thread_name(wn);
 	}
-	wa->slot->conns = &conns;           /* S107: read on this thread only */
+	wa->slot->conns = &conns;           /* read on this thread only */
 	pc_cluster_worker_register(wa->slot->idx, wa->slot->efd);
-	pc_pubsub_worker_register(wa->slot->idx, wa->slot->efd);   /* PS1 */
-	pc_upstream_worker_register(wa->slot->idx, wa->slot->efd); /* S331 */
-	pcache_ht_shadow_reads(1);          /* S331: client reads only */
+	pc_pubsub_worker_register(wa->slot->idx, wa->slot->efd);
+	pc_upstream_worker_register(wa->slot->idx, wa->slot->efd);
+	pcache_ht_shadow_reads(1);          /* client reads only */
 	pc_conn_push_batching();
 	pc_pubsub_defer_wakes();
-	/* S361: this worker's backend - io_uring where the start's check
+	/* this worker's backend - io_uring where the start's check
 	 * passed and this worker's own ring comes up, epoll otherwise */
 	if (pc_io_backend.active == PC_IO_URING) {
 		char err[200];
@@ -692,7 +628,7 @@ static void *worker_main(void *p)
 		}
 	}
 	ep = use_uring ? -1 : epoll_create1(0);
-	if (CFG->busy_poll_us > 0) {            /* S363 */
+	if (CFG->busy_poll_us > 0) {
 		char err[200];
 		int rc = use_uring
 			? pc_bp_ring(&ur, (unsigned)CFG->busy_poll_us,
@@ -732,8 +668,9 @@ static void *worker_main(void *p)
 		if (lfds[nlfd] < 0)
 			continue;                  /* failure already logged */
 		plok[nlfd] = listener_door(&CFG->listen[i]);
-		lresp[nlfd] = CFG->listen[i].http ? PC_LK_HTTP :
-			CFG->listen[i].resp ? PC_LK_RESP : PC_LK_NATIVE;
+		lresp[nlfd] = (CFG->listen[i].http ? PC_LK_HTTP :
+			CFG->listen[i].resp ? PC_LK_RESP : PC_LK_NATIVE) |
+			(CFG->listen[i].tls ? PC_LK_TLS : 0);
 		ev.events = EPOLLIN;
 		ev.data.u64 = (uint64_t)lfds[nlfd];
 		if (ep >= 0)
@@ -743,14 +680,9 @@ static void *worker_main(void *p)
 	/* the single shared UNIX listener: EPOLLEXCLUSIVE avoids the herd */
 	if (unix_fd >= 0) {
 		lfds[nlfd] = unix_fd;
-		plok[nlfd] = 0;    /* default-deny; the loop below sets the
-		                    * configured value - the analyzer cannot see
-		                    * that unix_fd >= 0 implies the loop matches */
+		plok[nlfd] = 0;    /* default-deny; the loop below sets the configured value */
 		lresp[nlfd] = PC_LK_NATIVE;
-		                   /* the RESP door is TCP-only (S33); this was
-		                    * UNINITIALIZED - garbage nonzero would have
-		                    * served RESP on the unix socket at random
-		                    * (found by clang-analyzer CallAndMessage) */
+		                   /* the RESP door is TCP-only */
 		for (i = 0; i < CFG->n_listen; i++)
 			if (CFG->listen[i].type == PC_LISTEN_UNIX)
 				plok[nlfd] = listener_door(&CFG->listen[i]);
@@ -764,7 +696,7 @@ static void *worker_main(void *p)
 	 * to open was logged above and counts as done) */
 	__atomic_add_fetch(&workers_listening, 1, __ATOMIC_RELEASE);
 
-	if (use_uring) {                       /* S361 */
+	if (use_uring) {
 		__atomic_add_fetch(&pc_io_backend.workers_uring, 1,
 			__ATOMIC_RELAXED);
 		worker_loop_uring(wa, &ur, &conns, nlfd, lfds, plok, lresp);
@@ -781,52 +713,42 @@ static void *worker_main(void *p)
 
 	t_wake = wclock();
 	while (!stop_flag) {
-		/* an active cooperative walk (S40) must not sit behind a
-		 * blocking wait: poll, step the walks, wait again */
-		/* An open HTTP connection needs a bounded wait: its
-		 * request head may simply never arrive, and nothing else
-		 * would wake this worker to notice (S46). */
-		/* the last turn's pub/sub work, before it parks and waits: its
-		 * wakes to other workers, then its staged frames - every path
-		 * back to the wait passes here */
+		/* the last turn's pub/sub work before it parks: its wakes to other workers, then its staged
+		 * frames - every path back to the wait passes here */
 		pc_conn_resume_paused();
-		pc_conn_resume_out();          /* S372 */
-		pc_conn_resume_wal();          /* S466 */
+		pc_conn_resume_out();
+		pc_conn_resume_wal();
 		pc_pubsub_flush_wakes();
 		pc_conn_flush_pushes();
-		pc_qs_exit();                  /* S150 B: parked across the wait */
-		pc_conn_reap();                /* S356: no batch in flight here */
-		/* PS5: a UDP push stream is probed and pruned on a clock too.
-		 * Both counts are read HERE, not kept from the sweeps: a
-		 * connection or stream opened by this turn's events must
-		 * shorten this wait - an idle HTTP connection accepted after
-		 * the sweep used to leave a quiet worker waiting forever, and
-		 * never closed */
-		t_wait = wclock();             /* S379: busy until here */
+		pc_qs_exit();                  /* parked across the wait */
+		pc_conn_reap();                /* no batch in flight here */
+		/* an active walk polls; an open HTTP connection (its head may never arrive) or UDP stream bounds
+		 * the wait - read HERE, so one opened by this turn's events shortens it */
+		t_wait = wclock();             /* busy until here */
 		PC_IOBUSY_ADD(busy_ns, t_wait - t_wake);
 		n = epoll_wait(ep, evs, 32,
-			pc_enum_pending() || pc_conn_hs_parked() ? 0     /* ST5 */
-			: pc_conn_wal_paused_open() ? 1                    /* S466 */
+			pc_enum_pending() || pc_conn_hs_parked() ? 0
+			: pc_conn_wal_paused_open() ? 1
 			: pc_conn_paused_open() || pc_conn_deny_open() ? 50
 			: (pc_conn_http_open() || pc_conn_udp_open() ||
-			   pc_conn_bufs_held() || pc_conn_out_paused_open() ? 1000 : -1));    /* S366, S372 */
+			   pc_conn_bufs_held() || pc_conn_out_paused_open() ? 1000 : -1));
 		t_wake = wclock();
 		PC_IOBUSY_ADD(wait_ns, t_wake - t_wait);
-		if (n >= 0) {                  /* 0.6.0 step 1: waits vs events */
+		if (n >= 0) {                  /* waits vs events */
 			PC_IOSTAT_ADD(ep_waits, 1);
 			PC_IOSTAT_ADD(ep_events, (unsigned)n);
 		}
 		pc_qs_enter();                 /* the turn: events, drains, walks */
-		pc_conn_sweep_idle(&conns);    /* S366: first - it stamps the tick */
+		pc_conn_sweep_idle(&conns);    /* first - it stamps the tick */
 		pc_conn_sweep_http(&conns, CFG->http_timeout_s);
 		pc_conn_sweep_udp(&conns);
-		pc_conn_sweep_deny();          /* 0.6.2: refused HTTP peers */
+		pc_conn_sweep_deny();          /* refused HTTP peers */
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
-		/* ST5: the handshakes put off earlier first, oldest first;
+		/* the handshakes put off earlier first, oldest first;
 		 * past the turn's budget a new one is parked behind them */
 		hs = pc_conn_hs_run(PC_HS_PER_TURN);
 		hs_deferred = 0;
@@ -854,7 +776,7 @@ static void *worker_main(void *p)
 				}
 		}
 		if (hs_deferred)
-			pc_conn_hs_deferred(hs_deferred);   /* ST5 */
+			pc_conn_hs_deferred(hs_deferred);
 		pc_enum_step();
 	}
 	pc_conn_destroy_all(&conns);
@@ -866,51 +788,40 @@ static void *worker_main(void *p)
 	return NULL;
 }
 
-/* S131: the splitter's per-tick bound.  A CHUNK is one call into the
- * core's grow loop; the SLICE is how long the maintenance thread will
- * spend splitting one collection before moving on, because the expiry
- * sweep, the arena reclaim and S69's resize tick all queue behind it.
- * 20 ms a collection a second is 2% of this thread at the very worst,
- * and a table that is not behind pays one call that splits nothing. */
-int pc_grow_at_pct = 75;                 /* S150: [daemon] grow_at_pct */
-int pc_shrink_at_pct = 18;               /* S150 D: [daemon] shrink_at_pct, resolved */
-int pc_shrink_cooloff_s = 60;            /* S150 D: [daemon] shrink_cooloff_s */
-/* S175: the chains as a growth signal.  grow_at_pct alone decides how
- * much of a keyspace lives in chains - at six slots a bucket and a 75%
- * target that is ~7% of records, each a cache line or more past its
- * bucket - and only a wider table changes that, their buckets being full.
- * So a table holding more than leg_stuck_pct of its records in chains is
- * widened past grow_at_pct, as far as the floor and no further; a table
- * with quiet chains grows exactly as before (names kept from the leg). */
-int pc_grow_floor_pct = 50;              /* S175: [daemon] grow_floor_pct */
-int pc_leg_stuck_pct = 1;                /* S175: [daemon] leg_stuck_pct */
+/* the splitter's per-tick bound: a CHUNK is one call into the core's grow loop, the SLICE how long
+ * one collection may split, since expiry, reclaim and the resize tick queue behind it */
+int pc_grow_at_pct = 75;                 /* [daemon] grow_at_pct */
+int pc_shrink_at_pct = 18;               /* [daemon] shrink_at_pct, resolved */
+int pc_shrink_cooloff_s = 60;            /* [daemon] shrink_cooloff_s */
+/* a table holding more than leg_stuck_pct of its records in chains grows past grow_at_pct, as far
+ * as grow_floor_pct: only a wider table empties full buckets' chains */
+int pc_grow_floor_pct = 50;              /* [daemon] grow_floor_pct */
+int pc_leg_stuck_pct = 1;                /* [daemon] leg_stuck_pct */
 #define PC_GROW_CHUNK     512
-#define PC_EVAC_BUCKETS   4096         /* S190: buckets per second */
+#define PC_EVAC_BUCKETS   4096         /* buckets per second */
 #define PC_EVAC_BUDGET    512          /* records moved per second, at most */
 #define PC_GROW_SLICE_US  20000
 
 /* ---- maintenance ------------------------------------------------------- */
 
-/* S153: the sweep names each reaped record; the event log may want it,
- * and (S392) the cluster remembers it as a delete at that version */
+/* the sweep names each reaped record, for the event log; the cluster keeps it as a
+ * delete at that version */
 static void ev_expired_cb(const str *key, unsigned long long ver,
 		unsigned char rflags, void *ctx)
 {
 	pc_ev_expired((int)(long)ctx, key);
 	pc_cluster_note_expired((int)(long)ctx, key->s, key->len, ver,
-		(rflags & PCACHE_F_SHORTENED) != 0);    /* 12ny AT-5 (c) */
+		(rflags & PCACHE_F_SHORTENED) != 0);
 }
 
-/* S358: a peer's fleet-wide stats reset (M_STATS_RESET), as of its time */
+/* a peer's fleet-wide stats reset (M_STATS_RESET), as of its time */
 static void stats_reset_peer(long long at)
 {
 	(void)pc_stats_reset_at(at);
 }
 
-/* S131: split in chunks until the table has caught up (a short chunk means
- * the loop's condition went false) or the slice is spent.  Only AUTO (and
- * FLOOR, S328) sizes the table; under WARN and OFF the keys past its slots go
- * to their buckets' chains (OC) */
+/* split in chunks until the table has caught up (a short chunk) or the slice is spent; only AUTO
+ * and FLOOR size the table - under WARN and OFF keys past its slots go to chains */
 static long long grow_slice(pcache_htable_t *cht, long long budget_us)
 {
 	struct timespec g0, g1;
@@ -921,7 +832,7 @@ static long long grow_slice(pcache_htable_t *cht, long long budget_us)
 	do {
 		did = pcache_ht_grow_at_leg(cht, (unsigned int)pc_grow_at_pct,
 			(unsigned int)pc_grow_floor_pct,
-			(unsigned int)pc_leg_stuck_pct, PC_GROW_CHUNK);   /* S150, S175 */
+			(unsigned int)pc_leg_stuck_pct, PC_GROW_CHUNK);
 		clock_gettime(CLOCK_MONOTONIC, &g1);
 		us = (long long)(g1.tv_sec - g0.tv_sec) * 1000000LL +
 			(g1.tv_nsec - g0.tv_nsec) / 1000;
@@ -929,9 +840,8 @@ static long long grow_slice(pcache_htable_t *cht, long long budget_us)
 	return us;
 }
 
-/* OC: a split re-lays its bucket's whole chain, so a table a burst left with
- * long chains catches up slowly on one slice a second - one past S175's line
- * also splits at the loop's 100 ms cadence until it has */
+/* a split re-lays its bucket's whole chain, so a table past the leg_stuck_pct line also splits
+ * at the loop's 100 ms cadence until it has caught up */
 static long long grow_behind(int i, long long budget_us)
 {
 	pcache_htable_t *cht = pc_store_ht(i);
@@ -960,20 +870,14 @@ static void *maint_main(void *p)
 	slot_attach(p);
 	thread_name("pc-maint");
 	while (!stop_flag) {
-		pc_qs_exit();                  /* S150 B: parked across the sleep */
+		pc_qs_exit();                  /* parked across the sleep */
 		usleep(100 * 1000);
 		pc_qs_enter();
 		rpc_drain(self_slot);
-		/* S188: the commit-ahead window at THIS loop's cadence, not
-		 * the 1 Hz one below.  A bulk load crosses a 2 MB group
-		 * boundary every ~50 ms and a once-a-second refill cannot
-		 * follow it, so the crossings fell through to the worker
-		 * holding the client's write - the millisecond tail S166
-		 * exists to remove.  Everything else here stays on the
-		 * second; an idle node pays one predicate ten times a
-		 * second and takes nothing. */
+		/* the commit-ahead window at THIS loop's 100 ms cadence: a bulk load crosses a 2 MB group
+		 * every ~50 ms, and a 1 Hz refill left the crossings to the worker holding the write */
 		pcache_arena_ahead_tick();
-		/* OM2-16: one slice a pass for every collection, the first in turn */
+		/* one slice a pass for every collection, the first in turn */
 		gleft = PC_GROW_SLICE_US;
 		n = pc_store_count();
 		for (k = 0; k < n && gleft > 0; k++) {
@@ -987,16 +891,14 @@ static void *maint_main(void *p)
 			continue;
 		last = now;
 		pc_obs_tick_1hz();
-		pc_stats_reset_tick();         /* S358: the daily (N-day) reset */
-		pc_doors_widen();              /* S360: no door total wraps unseen */
-		pc_memguard_tick();            /* S366: the client guard, the trim */
-		pc_iobusy_tick();              /* S379: before the alerts read it */
-		pc_alerts_tick();              /* S352b: the node's own alerts */
-		pc_upg_node_tick();            /* UP5: the helper's READY */
-		/* S351: build /stats once a minute and throw it away - every
-		 * counter's five-minute window takes its snapshot as the tree
-		 * is written, and this is what keeps a snapshot a minute when
-		 * nobody is reading the page (winctr.h).  ~ a millisecond. */
+		pc_stats_reset_tick();         /* the daily (N-day) reset */
+		pc_doors_widen();              /* no door total wraps unseen */
+		pc_memguard_tick();            /* the client guard, the trim */
+		pc_iobusy_tick();              /* before the alerts read it */
+		pc_alerts_tick();              /* the node's own alerts */
+		pc_upg_node_tick();            /* the helper's READY */
+		/* build /stats once a minute and throw it away: it takes each five-minute window's snapshot
+		 * when nobody reads the page (winctr.h) */
 		if (now - win_built >= 60) {
 			struct pc_tw wt;
 
@@ -1005,7 +907,7 @@ static void *maint_main(void *p)
 			pc_stats_tree(&wt, NULL);
 			pc_tw_free(&wt);
 		}
-		pc_store_held_tick();          /* S109: the paced walk */
+		pc_store_held_tick();          /* the paced walk */
 		/* fsync watchdog: a hung fsync on network-class storage is a
 		 * HANG, not an error - flag it loudly, workers never block */
 		{
@@ -1026,16 +928,14 @@ static void *maint_main(void *p)
 		}
 		/* the 1/s duties: reclaim, expiry, single-splitter growth */
 		pcache_arena_reclaim_tick();
-		pc_store_resize_tick();        /* S69: a migration in flight */
-		pc_store_retire_tick();        /* S150 B: what a resize left, once
-		                                * no thread can still hold it */
-		pc_ev_tick();                  /* S153: refill, report suppression */
-		pc_store_hot_tick();           /* S397: the hot-key counts halve each minute */
-		pc_reload_tick();              /* 12nw: a SIGHUP's reload */
-		pc_live_retire_tick();         /* 12nw: free what a reload replaced */
-		/* S69: the REGISTRY, not the startup array - a collection
-		 * created at runtime needs its expiry sweep and its splitter
-		 * too, and a dropped one must not be swept at all */
+		pc_store_resize_tick();        /* a migration in flight */
+		pc_store_retire_tick();        /* what a resize left, once no thread can still hold it */
+		pc_ev_tick();                  /* refill, report suppression */
+		pc_store_hot_tick();           /* the hot-key counts halve each minute */
+		pc_reload_tick();              /* a SIGHUP's reload */
+		pc_live_retire_tick();         /* free what a reload replaced */
+		/* the REGISTRY, not the startup array: a runtime collection needs its sweep and splitter
+		 * too, and a dropped one must not be swept */
 		gleft = PC_GROW_SLICE_US;
 		for (i = 0; i < pc_store_count(); i++) {
 			unsigned long rg0;
@@ -1043,46 +943,22 @@ static void *maint_main(void *p)
 
 			if (!pc_store_live(i))
 				continue;
-			rg0 = pcache_arena_regions_bytes();   /* S120 */
+			rg0 = pcache_arena_regions_bytes();
 			cht = pc_store_ht(i);
-			pcache_ht_sweep(cht, now, ev_expired_cb, (void *)(long)i);   /* S153 */
-			/* S131: the splitter's budget was a flat 128 splits a
-			 * tick whatever the deficit, so it could not keep up
-			 * with a burst and never caught up afterwards at any
-			 * useful speed.  MEASURED: 600,000 records written in
-			 * about a minute leaves a table needing ~146,000
-			 * splits to reach its target load factor, which at
-			 * 128 a second is nineteen minutes of ticking - and
-			 * the splitter was observed running at exactly its
-			 * cap, 115-129 buckets a second, for the whole of it.
-			 * Everything that did not fit six to a bucket went to
-			 * the overflow leg meanwhile.
-			 *
-			 * A count is the wrong bound anyway: what must be
-			 * bounded is the TIME this thread spends here, since
-			 * the expiry sweep, the arena reclaim and the resize
-			 * tick are all behind it.  So: split in chunks until
-			 * the table has caught up (a short chunk means the
-			 * loop's condition went false) or the slice is spent.
-			 * A caught-up table costs one chunk call that returns
-			 * 0, which is what it cost before. */
-			if (as_sizes(i) && gleft > 0)  /* S239, S328; OM2-16 */
+			pcache_ht_sweep(cht, now, ev_expired_cb, (void *)(long)i);
+			if (as_sizes(i) && gleft > 0)
 				gleft -= grow_slice(cht, gleft);
-			/* S190: move the survivors of a mass expiry out of the
-			 * chunks they pin, so those chunks can retire.  The
-			 * arena says which chunks are sparse (its reclaim
-			 * tick); this walks a slice of buckets per second and
-			 * moves at most a few hundred records, and does nothing
-			 * when no chunk is sparse - the ordinary case. */
+			/* move a mass expiry's survivors out of the sparse chunks they pin, so those chunks can
+			 * retire; nothing to do when no chunk is sparse (the ordinary case) */
 			if (pcache_arena_sparse_chunks())
 				pcache_ht_evacuate(cht, PC_EVAC_BUCKETS, PC_EVAC_BUDGET);
 			if (pcache_arena_regions_bytes() > rg0)
 				pc_store_note_index(cht,
 					pcache_arena_regions_bytes() - rg0);
-			if (as_sizes(i))                       /* S328 */
+			if (as_sizes(i))
 				shrink_consider(i, cht, now,
 					pcache_arena_regions_bytes() > rg0);
-			autoscale_advise(i, cht, now);          /* S239 */
+			autoscale_advise(i, cht, now);
 		}
 	}
 	return NULL;
@@ -1117,7 +993,7 @@ static void *beat_main(void *p)
 	pc_cluster_beat_thread((volatile int *)&stop_flag);
 	return NULL;
 }
-/* PS11: a pub/sub relay receive thread */
+/* a pub/sub relay receive thread */
 struct psrx_arg {
 	struct pc_thread *slot;
 	int idx;
@@ -1131,7 +1007,7 @@ static void *psrx_main(void *p)
 	pc_cluster_pubsub_rx_thread((volatile int *)&stop_flag, a->idx);
 	return NULL;
 }
-/* S217: a replica-apply thread */
+/* a replica-apply thread */
 static void *apply_main(void *p)
 {
 	struct psrx_arg *a = p;
@@ -1194,9 +1070,8 @@ static void on_signal(int sig)
 			if (write(threads[i].efd, &one, sizeof one) < 0) { /* best effort */ }
 }
 
-/* 12nw: SIGHUP asks for a config reload - the maintenance thread runs it.
- * Before this the signal's default action ended the daemon: a `systemctl
- * reload` or a stray `kill -HUP` stopped it. */
+/* SIGHUP asks for a config reload, which the maintenance thread runs; the signal's
+ * default action would end the daemon */
 static void on_hup(int sig)
 {
 	(void)sig;
@@ -1205,10 +1080,8 @@ static void on_hup(int sig)
 
 /* ---- the run ----------------------------------------------------------- */
 
-/* S361: io = io_uring (the default) runs only where the host can - the
- * functional check in uring.c decides, and anything it refuses is the
- * reason the workers run on epoll instead.  A default that falls back is
- * a NOTICE; a configured io_uring that does is a WARNING. */
+/* io = io_uring (the default) runs only where uring.c's functional check passes; a default
+ * that falls back to epoll is a NOTICE, a configured io_uring that does is a WARNING */
 static void io_decide(const struct pc_config *cfg)
 {
 	struct pc_io_backend *b = &pc_io_backend;
@@ -1219,14 +1092,14 @@ static void io_decide(const struct pc_config *cfg)
 	b->explicit_set = cfg->io_explicit;
 	b->workers = cfg->workers;
 	b->active = PC_IO_EPOLL;
-	b->bp_us = cfg->busy_poll_us;           /* S363 */
+	b->bp_us = cfg->busy_poll_us;
 	b->bp_prefer = cfg->busy_poll_prefer;
 	pc_uring_check(&v);
-	b->uring_ok = v.ok;                     /* S379 */
+	b->uring_ok = v.ok;
 	b->uring_tier = v.buf_tier;
 	snprintf(b->uring_why, sizeof b->uring_why, "%s", v.ok ? "" : v.why);
 	if (cfg->io_backend == PC_IO_EPOLL) {
-		/* S379: the lever this node has, said once - its epoll-busy
+		/* the lever this node has, said once - its epoll-busy
 		 * alert repeats it when the workers run out of time */
 		if (v.ok)
 			LM_NOTICE("io: epoll (io = epoll) - io_uring is usable on "
@@ -1247,7 +1120,7 @@ static void io_decide(const struct pc_config *cfg)
 		return;
 	}
 	b->buf_tier = v.buf_tier;
-	b->counts_iowait = v.counts_iowait;     /* 0.6.0.1 */
+	b->counts_iowait = v.counts_iowait;
 	b->active = PC_IO_URING;
 	LM_NOTICE("io: io_uring (%s; %u KB of receive buffers a worker; "
 		"ring flags 0x%x)\n", pc_ur_buf_tier_name(v.buf_tier),
@@ -1263,23 +1136,23 @@ int pc_daemon_run(struct pc_config *cfg)
 	struct worker_arg wargs[512];
 	struct pc_thread *mt, *wt, *rt = NULL, *ct = NULL, *bt = NULL;
 	struct pc_thread *hb = NULL;
-	struct psrx_arg psrx[16];               /* PS11 */
-	struct psrx_arg apth[16];               /* S217 */
+	struct psrx_arg psrx[16];
+	struct psrx_arg apth[16];
 	int npsrx = 0, napply = 0;
 	struct sigaction sa;
 	sigset_t blocked, old;
 	pthread_attr_t tattr;
 	int i, nw = cfg->workers;
-	long fd_limit = 0, fd_reserve = 0;      /* S161, logged with S366's figure */
+	long fd_limit = 0, fd_reserve = 0;      /* logged with the memory guard's figure */
 
 	CFG = cfg;
-	__atomic_store_n(&LIVE, live_from(cfg), __ATOMIC_RELEASE);   /* 12nw */
+	__atomic_store_n(&LIVE, live_from(cfg), __ATOMIC_RELEASE);
 	if (!LIVE) {
 		LM_CRIT("out of memory for the reloadable settings\n");
 		return 1;
 	}
-	io_decide(cfg);                         /* S361 */
-	{                                       /* 12np: the IPv6 guard, said once */
+	io_decide(cfg);
+	{                                       /* the IPv6 guard, said once */
 		const char *why;
 
 		if (!pc_ipv6_usable(&why))
@@ -1289,11 +1162,10 @@ int pc_daemon_run(struct pc_config *cfg)
 	}
 
 	/* memory first: probe the ladder, size the arena from config */
-	if (cfg->huge_pages_off) {                  /* S167 */
+	if (cfg->huge_pages_off) {
 		pcache_mem_no_huge = 1;
-		/* the advice is not enough on `enabled = always`: the kernel
-		 * folds anonymous pages without being asked, so the process
-		 * says no once, here, before anything is mapped */
+		/* the advice is not enough on `enabled = always`: the kernel folds anonymous pages
+		 * unasked, so the process says no once, before anything is mapped */
 		if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) != 0)
 			LM_WARN("huge_pages = off: the kernel refused "
 				"PR_SET_THP_DISABLE (%s) - the arena asks for "
@@ -1307,11 +1179,8 @@ int pc_daemon_run(struct pc_config *cfg)
 	pcache_backing_policy = "own";
 	pcache_arena_hugepage_mb = cfg->backing_heap ? 0 : cfg->arena_mb;
 	pcache_arena_hugepage_cap_mb = cfg->arena_cap_mb;
-	/* The HARD ceiling, which arena_mb alone never was: past the
-	 * huge-page reservation the arena carves from shm_malloc - plain
-	 * malloc here - so a node grew without any configured bound.
-	 * config.h has always said arena_cap_mb "0 = fixed at arena_mb";
-	 * this is what makes that true. */
+	/* the HARD ceiling: past the huge-page reservation the arena carves from plain malloc, so
+	 * without it a node grows unbounded (arena_cap_mb 0 = fixed at arena_mb) */
 	pcache_arena_max_bytes = (unsigned long)(cfg->arena_cap_mb
 		? cfg->arena_cap_mb : cfg->arena_mb) << 20;
 	pcache_reclaim_keep = cfg->reclaim_keep;
@@ -1324,11 +1193,17 @@ int pc_daemon_run(struct pc_config *cfg)
 		LM_ERR("arena init failed\n");
 		return 1;
 	}
-	/* S167: pinning is attempted on every start and degrades to a
-	 * warning, so a node can believe it is resident while it is
-	 * swappable.  `pin = require` makes that a refusal instead - said
-	 * with the limit, because RLIMIT_MEMLOCK is what refuses it, and an
-	 * unprivileged container's cap beats the unit's LimitMEMLOCK. */
+	if (cfg->pin_off) {                     /* memory given back over held */
+		if (pcache_arena_unpin())
+			LM_NOTICE("[memory] pin = no: the arena is not locked - the kernel may "
+				"swap it, and idle groups go back to it (reclaim_*)\n");
+		else
+			LM_NOTICE("[memory] pin = no: the arena is on reserved huge pages, which "
+				"are never swapped or given back - huge_pages = off for an arena "
+				"that gives memory back\n");
+	}
+	/* pinning degrades to a warning, so a node can believe it is resident while swappable;
+	 * `pin = require` refuses instead, naming RLIMIT_MEMLOCK (a container's cap beats the unit's) */
 	if (cfg->pin_require) {
 		struct pcache_arena_pressure pr;
 		struct rlimit rl;
@@ -1352,19 +1227,17 @@ int pc_daemon_run(struct pc_config *cfg)
 			"(pin = require)\n", pr.locked_bytes >> 20);
 	}
 
-	/* S69: what a collection created at runtime inherits.  A fleet is
-	 * ONE mode over ONE collection set, so it takes the cluster's mode
-	 * rather than a per-collection variant nobody declared. */
+	/* what a runtime-created collection inherits: a fleet is ONE mode over ONE collection set,
+	 * so it takes the cluster's mode */
 	pc_col_default_proxy = cfg->cl_mode == PC_MODE_PROXY;
 	pc_col_default_shard = cfg->cl_mode == PC_MODE_SHARD;
 	pc_col_default_eager = cfg->cl_eager;
-	pc_grow_at_pct = cfg->grow_at_pct;                     /* S150 */
-	pc_output_stall_s = cfg->output_stall_s;               /* S372 */
-	pc_autoscale_default = cfg->autoscale;                 /* S239 */
-	pc_types_default = cfg->redis_types;                   /* S280 */
-	/* S150 D: the shrink threshold sits a quarter of the way up unless
-	 * pinned, and never at or above the growth threshold - the two would
-	 * chase each other across every boundary */
+	pc_grow_at_pct = cfg->grow_at_pct;
+	pc_output_stall_s = cfg->output_stall_s;
+	pc_autoscale_default = cfg->autoscale;
+	pc_types_default = cfg->redis_types;
+	/* the shrink threshold: a quarter of the growth one unless pinned, never at or above it -
+	 * the two would chase each other across every boundary */
 	pc_shrink_at_pct = cfg->shrink_at_pct ? cfg->shrink_at_pct
 		: cfg->grow_at_pct / 4;
 	if (pc_shrink_at_pct >= pc_grow_at_pct) {
@@ -1376,11 +1249,10 @@ int pc_daemon_run(struct pc_config *cfg)
 	{
 		extern int pc_prefetch_min_keys;
 
-		pc_prefetch_min_keys = cfg->prefetch_min_keys;   /* S232 */
+		pc_prefetch_min_keys = cfg->prefetch_min_keys;
 	}
-	/* S175: a floor at or above the ordinary target asks for nothing,
-	 * and one at or below the shrink threshold would have the leg and
-	 * the shrinker pulling the same table in opposite directions */
+	/* a floor at or above the ordinary target asks for nothing; one at or below the shrink
+	 * threshold would have the leg and the shrinker pull the same table both ways */
 	pc_grow_floor_pct = cfg->grow_floor_pct;
 	pc_leg_stuck_pct = cfg->leg_stuck_pct;
 	if (pc_grow_floor_pct && pc_grow_floor_pct >= pc_grow_at_pct) {
@@ -1398,20 +1270,15 @@ int pc_daemon_run(struct pc_config *cfg)
 	}
 	pc_col_default_pull = pc_col_default_proxy || pc_col_default_shard;
 
-	/* S151: workers are slots 1..n (slot_init(1 + i) at start), recovery
-	 * has just run on slot 0, and the peer rx thread will take n + 4.
-	 * Register the client range before the first table exists so every
-	 * table - config, runtime create, resize shadow - inherits it. */
-	/* S154: main is slot 0, workers 1..n, then maint, wal, rdb, peer, bulk
-	 * and beat at n+1..n+6.  Sixteen spare so a thread added later is
-	 * counted rather than silently dropped by the guard. */
+	/* main is slot 0, workers 1..n, then maint, wal, rdb, peer, bulk and beat at n+1..n+6, sixteen
+	 * spare; the client range is set before the first table, so every table inherits it */
 	pcache_ht_default_stat_slots((unsigned int)cfg->workers + 7 + 16);
 	pcache_ht_default_client_slots(1, 1 + (unsigned int)cfg->workers);
-	pc_ev_set_default(cfg->log_events, cfg->log_events_rate, cfg->log_events_hash);   /* S153 */
-	pc_ev_set_notify_default(cfg->notify_events);                                  /* PS8 */
+	pc_ev_set_default(cfg->log_events, cfg->log_events_rate, cfg->log_events_hash);
+	pc_ev_set_notify_default(cfg->notify_events);
 
 	for (i = 0; i < cfg->n_col; i++) {
-		unsigned long rg0 = pcache_arena_regions_bytes();   /* S120 */
+		unsigned long rg0 = pcache_arena_regions_bytes();
 
 		cols[i].conf = &cfg->col[i];
 		cols[i].ht = pcache_htable_new((unsigned int)cfg->col[i].buckets_log2);
@@ -1425,41 +1292,37 @@ int pc_daemon_run(struct pc_config *cfg)
 			cfg->col[i].mode == PC_MODE_PROXY,
 			cfg->col[i].mode == PC_MODE_SHARD,
 			cfg->col[i].eager, cfg->col[i].buckets_log2);
-		if (cfg->col[i].has_autoscale)                               /* S239 */
+		if (cfg->col[i].has_autoscale)
 			pc_store_set_autoscale_idx(i, cfg->col[i].autoscale);
-		if (cfg->col[i].has_redis_types)                             /* S280 */
+		if (cfg->col[i].has_redis_types)
 			pc_store_set_types_idx(i, cfg->col[i].redis_types);
-		if (cfg->col[i].nondurable)                                  /* G5 */
+		if (cfg->col[i].nondurable)
 			pc_store_set_nondurable_idx(i, 1);
-		pc_store_note_index(cols[i].ht, pcache_arena_regions_bytes() - rg0);   /* S120 */
+		pc_store_note_index(cols[i].ht, pcache_arena_regions_bytes() - rg0);
 		pc_ev_configure(i, cfg->col[i].has_log_events ? cfg->col[i].log_events
-			: PC_EV_INHERIT);                                    /* S153 */
+			: PC_EV_INHERIT);
 		pc_ev_configure_notify(i, cfg->col[i].has_notify_events
-			? cfg->col[i].notify_events : PC_EV_INHERIT);          /* PS8 */
+			? cfg->col[i].notify_events : PC_EV_INHERIT);
 	}
 	n_cols = cfg->n_col;
-	/* S69: the collections a client created before the last restart,
-	 * BEFORE the replay and the snapshot import - both address
-	 * collections by name and drop records for a name they cannot
-	 * resolve, so a created collection has to exist first. */
-	/* S290: one daemon per state_dir and per [wal] dir - locked before
-	 * anything in either is opened (the same directory twice is one
-	 * lock: fcntl locks are per process).  See dirlock.h. */
-	pc_recover_note_last_write(cfg->wal_dir);  /* S455: before the lock writes there */
+	/* one daemon per state_dir and per [wal] dir, locked before anything in either is opened
+	 * (fcntl locks are per process: the same directory twice is one lock) */
+	pc_recover_note_last_write(cfg->wal_dir);  /* before the lock writes there */
 	if (pc_dir_lock(cfg->state_dir, "state_dir", 1) != 0 ||
 	        pc_dir_lock(cfg->wal_dir, "wal dir", 0) != 0)
 		return 1;
+	/* the collections clients created, BEFORE the replay and the snapshot import: both drop
+	 * records for a collection name they cannot resolve */
 	if (pc_store_load(cfg->state_dir) != 0)
 		return 1;
-	/* S432: the RESP map's runtime overrides, before any worker reads it */
+	/* the RESP map's runtime overrides, before any worker reads it */
 	if (pc_respmap_init(cfg->resp_collections, cfg->state_dir) != 0)
 		return 1;
-	pc_upg_set_conf(&cfg->upgrade);                       /* UP6n */
+	pc_upg_set_conf(&cfg->upgrade);
 	pc_verb_set_allow_create(cfg->allow_create);
-	pc_verb_set_resp_redirect(cfg->resp_redirect);      /* RV-10 */
-	pc_stats_reset_schedule(cfg->stats_reset_days,      /* S358 */
+	pc_verb_set_resp_redirect(cfg->resp_redirect);
+	pc_stats_reset_schedule(cfg->stats_reset_days,
 		cfg->stats_reset_at_s);
-	/* S360: tests only - start the door counters just below their wrap */
 	{
 		const char *e = getenv("PERFCACHED_TEST_DOOR_START");
 
@@ -1469,7 +1332,7 @@ int pc_daemon_run(struct pc_config *cfg)
 				"(PERFCACHED_TEST_DOOR_START)\n", e);
 		}
 	}
-	pc_keys_set_turn_us(cfg->keys_turn_us);             /* S292 */
+	pc_keys_set_turn_us(cfg->keys_turn_us);
 
 	/* the shared UNIX listener (TCP ones are per-worker SO_REUSEPORT) */
 	for (i = 0; i < cfg->n_listen; i++)
@@ -1487,30 +1350,19 @@ int pc_daemon_run(struct pc_config *cfg)
 		LM_ERR("observability init failed\n");
 		return 1;
 	}
-	pc_pubsub_init(cfg->workers + 8);             /* PS1: worker ids are 1-based */
-	/* S331: read-through - the collections exist, the workers do not */
+	pc_pubsub_init(cfg->workers + 8);             /* worker ids are 1-based */
+	/* read-through: the collections exist, the workers do not */
 	if (pc_upstream_init(cfg, cfg->workers + 8) != 0)
 		return 1;
-	/* S352: the alert mailer's sender thread - its own copy of [mail],
+	/* the alert mailer's sender thread - its own copy of [mail],
 	 * so the config's secrets can be wiped below without touching it */
 	if (cfg->mail_on && pc_mail_start(&cfg->mail) != 0)
 		return 1;
-	pc_alerts_init(cfg);                          /* S352b: [mail]'s rules */
-	pc_keepalive_s = cfg->keepalive_s;            /* PS2 */
+	pc_alerts_init(cfg);                          /* [mail]'s rules */
+	pc_keepalive_s = cfg->keepalive_s;
 	pc_pubsub_set_queue_cap((size_t)cfg->pubsub_queue_mb << 20);
-	/*
-	 * S161: THE CLIENT LIMIT AND THE DESCRIPTORS BEHIND IT.  A node that
-	 * ran into the descriptor ceiling failed accept() with EMFILE and
-	 * said nothing; the client saw a hang or a reset.  Now the limit is
-	 * either configured or derived from the ceiling, the ceiling is
-	 * raised toward the hard limit when the configured value needs it
-	 * (as redis does), and a node that still cannot fit runs with the
-	 * limit it can afford and says so - a smaller limit is a degraded
-	 * node, not a wrong one.  The reserve is what the process needs open
-	 * beyond clients: the listeners, every thread's epoll and eventfd,
-	 * the cluster and bulk sockets, the WAL and RDB files, and a few
-	 * HTTP connections so /stats answers when the limit is hit.
-	 */
+	/* the client limit, configured or derived from the fd ceiling (raised toward the hard limit);
+	 * the reserve covers listeners, threads, cluster, WAL/RDB and a few HTTP doors for /stats */
 	{
 		struct rlimit rl;
 		long reserve = 64 + 2L * (cfg->workers + 8) + cfg->n_listen
@@ -1544,23 +1396,22 @@ int pc_daemon_run(struct pc_config *cfg)
 		} else {
 			pc_max_clients = (int)avail;
 		}
-		pc_enable_lockout_after = cfg->enable_lockout_after;   /* S417 */
+		pc_enable_lockout_after = cfg->enable_lockout_after;
 		pc_enable_lockout_s = cfg->enable_lockout_s;
-		/* S366: the line waits for the memory figure (pc_memguard_init,
+		/* the line waits for the memory figure (pc_memguard_init,
 		 * once the arena and the WAL exist) */
 		fd_limit = (long)rl.rlim_cur;
 		fd_reserve = reserve;
 		pc_max_clients_basis = cfg->max_clients ? "configured" : "descriptors";
 	}
 
-	/* fail fast if a TCP listener cannot bind at all, and - because
-	 * SO_REUSEPORT hides it - if one is already held by another
-	 * process */
+	/* fail fast if a TCP listener cannot bind at all, and - since SO_REUSEPORT hides it - if
+	 * another process already holds it */
 	for (i = 0; i < cfg->n_listen; i++)
 		if (cfg->listen[i].type == PC_LISTEN_TCP) {
 			int probe;
 
-			/* S294: an address not configured YET is waited
+			/* an address not configured YET is waited
 			 * for, not failed on - see addrwait.h */
 			if (pc_addr_wait(cfg->listen[i].addr,
 			        cfg->address_wait_s, "listener") != 0)
@@ -1586,10 +1437,8 @@ int pc_daemon_run(struct pc_config *cfg)
 				return 1;
 			close(probe);
 		}
-	/* PS5: each native TCP door sends UDP pushes from its own address and
-	 * port, so a client's firewall admits them with one rule.  Nothing
-	 * is read from it; a port held elsewhere only turns the feature off
-	 * for that door. */
+	/* each native TCP door sends UDP pushes from its own address and port (one firewall rule);
+	 * a port held elsewhere only turns the feature off for that door */
 	for (i = 0; cfg->pubsub_udp && i < cfg->n_listen; i++) {
 		const struct pc_listener *l = &cfg->listen[i];
 		struct addrinfo hints, *res = NULL;
@@ -1623,15 +1472,13 @@ int pc_daemon_run(struct pc_config *cfg)
 		}
 		freeaddrinfo(res);
 	}
-	/* 12ny AT-3b: the watermarks, before the recovery counts into them -
-	 * without a WAL that syncs, a delete is as durable as it will ever
-	 * be the moment it is applied */
+	/* the watermarks, before the recovery counts into them: without a WAL that syncs, a delete
+	 * is as durable as it will ever be once applied */
 	if (pc_ack_init(!cfg->wal_dir || cfg->wal_fsync == 2) != 0) {
 		LM_ERR("no memory for the watermarks\n");
 		return 1;
 	}
-	/* WAL storage: identity (the label) + probe (the measurement) at
-	 * startup; S13 consumes the numbers, S12 reports them honestly */
+	/* WAL storage: identity (the label) and probe (the measurement) at startup */
 	if (cfg->wal_dir) {
 		struct pc_wal_policy pol;
 		int ring_kb;
@@ -1644,14 +1491,8 @@ int pc_daemon_run(struct pc_config *cfg)
 		pc_storage_format(&wal_sid, rep, sizeof rep);
 		LM_NOTICE("%s", rep);
 
-		/* No cache, by decision (DESIGN 12am): it was keyed by device
-		 * id, and storage moves under a stable device number - a
-		 * hypervisor-side migration changes nothing the key can see,
-		 * so a cached entry serves numbers for storage that is gone.
-		 * That is not hypothetical: it happened twice in one day.
-		 * `auto` and `always` therefore both measure; the difference
-		 * is only the budget.  Costing ~1s per start buys never
-		 * lying, and `probe = no` remains the way to pay nothing. */
+		/* no probe cache: storage moves under a stable device number (a hypervisor migration), so a
+		 * cached entry could describe storage that is gone; `probe = no` pays nothing */
 		if (cfg->wal_probe == PC_WPROBE_ALWAYS)
 			pc_wal_probe_run(cfg->wal_dir, cfg->wal_probe_secs,
 				&wal_probe);
@@ -1663,7 +1504,7 @@ int pc_daemon_run(struct pc_config *cfg)
 			sizeof rep);
 		LM_NOTICE("%s", rep);
 
-		/* S13: bring the WAL up - explicit knobs win, the probe's
+		/* bring the WAL up - explicit knobs win, the probe's
 		 * policy fills what the config left at 0 */
 		if (cfg->wal_fsync == 1 &&
 		        strcmp(pol.fsync_recommend, "always"))
@@ -1687,25 +1528,16 @@ int pc_daemon_run(struct pc_config *cfg)
 				return 1;
 			}
 		}
-		/* S15: recovery BEFORE wal activation (activation claims the
-		 * next generation slot), and a fresh checkpoint BEFORE it too
-		 * (the clobbered oldest segment must already be covered).
-		 * The checkpoint stamps its marker with the WAL sequence, so
-		 * the WAL has to know where it left off BEFORE the walk -
-		 * hence the preload, which reads the WAL's own control file
-		 * rather than being handed a value. */
+		/* recovery and a fresh checkpoint BEFORE wal activation (it claims the next generation slot);
+		 * the preload gives the checkpoint's marker the WAL sequence before the walk */
 		pc_wal_preload_seq(cfg->wal_dir, cfg->wal_segments);
 
 		{
 			struct pc_recover_stats rst;
 
-			/* A node with nothing of its own to bring back is
-			 * STARTING; one that restores something is RECOVERING
-			 * until the fleet settles it.  Which of the two it
-			 * really is, is ultimately the master's call from the
-			 * identity history - this is the node's own best
-			 * guess, and the map is what settles it. */
-			pc_recover_set_skip_unknown(cfg->wal_unknown_skip);   /* UP3 */
+			/* nothing of its own to bring back: STARTING; something restored: RECOVERING until the
+			 * fleet settles it - the master decides from the identity history */
+			pc_recover_set_skip_unknown(cfg->wal_unknown_skip);
 			if (pc_recover(cfg->wal_dir, &rst) != 0) {
 				LM_ERR("recovery failed\n");
 				return 1;
@@ -1713,7 +1545,7 @@ int pc_daemon_run(struct pc_config *cfg)
 			/* before the checkpoint below, whose marker is
 			 * stamped with this sequence */
 			pc_wal_seq_atleast(rst.last_seq);
-			/* S334: the loaded snapshot covers what it covers,
+			/* the loaded snapshot covers what it covers,
 			 * checkpoint or not - pc_wal_init asks below */
 			if (rst.rdb_ok)
 				pc_rdb_seed_marker(rst.marker);
@@ -1726,13 +1558,8 @@ int pc_daemon_run(struct pc_config *cfg)
 				return 1;
 			}
 		}
-		/* fsync = always fsyncs once per drained batch, so the ring
-		 * must absorb everything that arrives while the pump sits in
-		 * fdatasync.  On ms-class storage the shipped 1 MB is not
-		 * enough and the overflow path DROPS acknowledged writes, so
-		 * take the depth the probe derived unless the operator pinned
-		 * one.  Measured before this existed: ~13% of acknowledged
-		 * writes absent after a restart, at 3 ms per fsync. */
+		/* fsync = always fsyncs once per drained batch, so the ring must absorb the fdatasync window:
+		 * on ms-class storage 1 MB overflows and DROPS acknowledged writes - take the probe's depth */
 		ring_kb = cfg->wal_ring_kb;
 		if (cfg->wal_fsync == 1 && !cfg->wal_ring_kb_set &&
 		        pol.ring_kb_always > ring_kb) {
@@ -1763,7 +1590,7 @@ int pc_daemon_run(struct pc_config *cfg)
 				pol.fsync_recommend, pol.note ? pol.note : "",
 				pol.max_durable_wps);
 		}
-		/* S265: the WAL's buffers are locked when the arena is -
+		/* the WAL's buffers are locked when the arena is -
 		 * both or neither, settled just below */
 		{
 			struct pcache_arena_pressure apr;
@@ -1771,27 +1598,12 @@ int pc_daemon_run(struct pc_config *cfg)
 			pcache_arena_pressure(&apr);
 			pc_wal_set_pin(apr.locked_bytes > 0);
 		}
-		/* S217: the apply threads sit at nw+7.. and a migration they
-		 * apply lands in THEIR ring, so the WAL needs one per thread;
-		 * 1 (the default) adds none */
+		/* the apply threads sit at nw+7.. and a migration they apply lands in THEIR ring, so
+		 * the WAL needs one per thread; 1 (the default) adds none */
 		int wnr = cfg->workers + 6 + (cfg->cl_apply_threads >= 2
 		        ? 1 + cfg->cl_apply_threads : 0);
-		/* S266: a ring's size follows what its thread WRITES.  The
-		 * slots are the ones spawned below: 0 main, 1..nw workers,
-		 * nw+1 maintenance, nw+2 the WAL pump, nw+3 RDB, nw+4 the peer
-		 * thread, nw+5 bulk, nw+6 the heartbeat, nw+7.. apply.
-		 * Measured over 13 WAL+cluster suites: the workers and the
-		 * peer thread write (the peer 29.9 MB in fwdtest - forwarded
-		 * writes land there), and bulk_rx logs every non-replica
-		 * batch (a migration of large records) - they keep ring_kb.
-		 * Main, maintenance, the pump, RDB and the heartbeat wrote
-		 * nothing in any of them and no path makes them: they get
-		 * min(ring_kb, 512 KB), still two maximum records, so an
-		 * unforeseen write is a counted, shouted drop (S174), not an
-		 * impossible one.  Unclustered, the peer, bulk, heartbeat and
-		 * apply threads do not exist.  On 245-247 (ring_kb 16384, 4
-		 * workers) this is 102 MB of WAL buffers where S265 made 164
-		 * resident. */
+		/* slots: 0 main, 1..nw workers, nw+1 maint, +2 pump, +3 RDB, +4 peer, +5 bulk, +6 beat, +7.. apply;
+		 * only workers, peer, bulk and apply write - the rest get min(ring_kb, 512 KB) */
 		int small_kb = ring_kb < 512 ? ring_kb : 512;
 		int *wkb = calloc((size_t)wnr, sizeof *wkb);
 		int wi, nbig = 0;
@@ -1812,7 +1624,7 @@ int pc_daemon_run(struct pc_config *cfg)
 		LM_NOTICE("wal: %d ring(s) of %d KB for the threads that write, "
 			"%d of %d KB for the rest\n", nbig, ring_kb, wnr - nbig,
 			small_kb);
-		pc_wal_set_segments_max(cfg->wal_segments_max); /* S466 step 2 */
+		pc_wal_set_segments_max(cfg->wal_segments_max);
 		if (pc_wal_init(cfg->wal_dir,
 		        cfg->wal_fsync == 1 ? PC_WFSYNC_ALWAYS :
 		        cfg->wal_fsync == 2 ? PC_WFSYNC_NO : PC_WFSYNC_EVERYSEC,
@@ -1823,12 +1635,10 @@ int pc_daemon_run(struct pc_config *cfg)
 			return 1;
 		}
 		free(wkb);
-		pc_wal_set_on_full(cfg->wal_on_full);           /* S466 */
+		pc_wal_set_on_full(cfg->wal_on_full);
 		pc_wal_set_workers(1, cfg->workers);
-		/* S265: never half pinned.  A locked arena beside swappable
-		 * WAL buffers stalls the write path on a swapped ring page
-		 * while claiming to be resident; the reverse is not reachable
-		 * (the WAL is asked to lock only when the arena did). */
+		/* never half pinned: a locked arena beside swappable WAL buffers stalls the write path on
+		 * a swapped ring page while claiming to be resident */
 		{
 			struct pcache_arena_pressure apr;
 			struct rlimit rl;
@@ -1902,7 +1712,7 @@ int pc_daemon_run(struct pc_config *cfg)
 				        PSK.client[i]) != 0)
 					return 1;
 			PSK.n_client = cfg->n_client_secrets;
-			/* S158: optional standalone; absent, the door
+			/* optional standalone; absent, the door
 			 * refuses the cluster principal (have_cluster) */
 			if (cfg->cluster_secret) {
 				if (pc_psk_derive(cfg->cluster_secret,
@@ -1911,7 +1721,7 @@ int pc_daemon_run(struct pc_config *cfg)
 					return 1;
 				PSK.have_cluster = 1;
 			}
-			if (cfg->cluster_accept_secret) {          /* CH-7 */
+			if (cfg->cluster_accept_secret) {
 				if (pc_psk_derive(cfg->cluster_accept_secret,
 				        strlen(cfg->cluster_accept_secret),
 				        PC_PRIN_CLUSTER, PSK.cluster_accept) != 0)
@@ -1919,7 +1729,7 @@ int pc_daemon_run(struct pc_config *cfg)
 				PSK.have_cluster_accept = 1;
 			}
 			have_psk = 1;
-			__atomic_store_n(&PSK_CUR, &PSK, __ATOMIC_RELEASE);   /* 12nw */
+			__atomic_store_n(&PSK_CUR, &PSK, __ATOMIC_RELEASE);
 			LM_NOTICE("Noise PSKs derived (%d client + %d cluster)\n",
 				PSK.n_client, PSK.have_cluster);
 		}
@@ -1938,32 +1748,22 @@ int pc_daemon_run(struct pc_config *cfg)
 		}
 	}
 
-	/* S59: the PSKs are cached (or the secrets were never needed) -
-	 * the raw strings' job is done here, so their plaintext must not
-	 * live for the process lifetime.  The exit paths that never
-	 * reach this point are covered by pc_config_free wiping again. */
+	/* the PSKs are cached, so the raw secrets' plaintext must not live for the process lifetime;
+	 * exit paths that never get here are covered by pc_config_free wiping again */
 	pc_config_wipe_secrets(cfg);
+	pc_keeps_log(cfg);
 
 	if (!cfg->cl_enabled) {
 		pc_node_state_set(PC_NST_READY);   /* nothing to join */
-		/* S215: pc_cluster_init() is where this was installed, so a
-		 * daemon with no cluster never had it - a ring drop, an
-		 * overrun or a refused sync logged its CRIT and the node went
-		 * on taking writes.  After READY, so a failure the WAL found
-		 * at startup (delivered by this call) is what stands. */
+		/* installed here too, not only in pc_cluster_init(); after READY, so a failure the WAL
+		 * found at startup (delivered by this call) is what stands */
 		pc_wal_on_shed(pc_node_wal_shed);
-		pc_wal_on_heal(pc_node_wal_heal);        /* S229 */
+		pc_wal_on_heal(pc_node_wal_heal);
 	}
 
 	if (cfg->cl_enabled) {
-		/* S80: identity and the mastership term live in the admin's
-		 * state_dir.  A [wal] dir without one keeps serving as it
-		 * always has, so an upgrade changes nothing; when state_dir
-		 * is later introduced beside a WAL, what the WAL dir already
-		 * holds is carried across once.  Neither set = ephemeral:
-		 * legal, and LOUD, because a node that presents as new after
-		 * every restart is what left a fleet renumbering itself on
-		 * every deploy. */
+		/* identity and the mastership term live in state_dir (else the [wal] dir, carried across
+		 * once); neither set is legal but LOUD - the node presents as new after every restart */
 		const char *sd = cfg->state_dir ? cfg->state_dir : cfg->wal_dir;
 		const char *legacy = (cfg->state_dir && cfg->wal_dir &&
 			strcmp(cfg->state_dir, cfg->wal_dir) != 0)
@@ -1982,59 +1782,54 @@ int pc_daemon_run(struct pc_config *cfg)
 		/* before init: the identity is derived in there, and it has
 		 * to be settled before this node joins anything */
 		pc_cluster_set_site_salt(cfg->cl_site_salt);
-		pc_cluster_set_apply_stall_ms(cfg->cl_apply_stall_ms);   /* S216 */
-		pc_cluster_set_apply_threads(cfg->cl_apply_threads);     /* S217 */
-		pc_cluster_set_sweep_digests(cfg->cl_sweep_digests);     /* S260 */
-		pc_cluster_set_reconcile_fast(cfg->cl_reconcile_fast);   /* S392 */
-		pc_cluster_set_reconcile_rate_max(cfg->cl_reconcile_rate_max);   /* S393 */
-		pc_cluster_set_multicast_ttl(cfg->cl_mcast_ttl);         /* S291 */
-		pc_cluster_set_max_members(cfg->cl_max_members);         /* S299 */
-		pc_cluster_set_cluster_id(cfg->cl_cluster_id);           /* S302 */
-		pc_cluster_set_discovery(cfg->cl_unicast, cfg->cl_seeds);  /* S36 */
-		pc_cluster_set_lane(cfg->cl_max_dgram, cfg->cl_lane_port); /* S36b */
-		pc_cluster_set_lane_retry(cfg->cl_lane_retry_s);          /* S329 */
-		pc_cluster_set_expect(cfg->cl_expect);                   /* S36c */
-		pc_cluster_set_identity_source(cfg->cl_id_source);       /* S143 */
-		pc_cluster_set_retain(cfg->cl_tomb_retain_s,              /* S238 */
+		pc_cluster_set_apply_stall_ms(cfg->cl_apply_stall_ms);
+		pc_cluster_set_apply_threads(cfg->cl_apply_threads);
+		pc_cluster_set_sweep_digests(cfg->cl_sweep_digests);
+		pc_cluster_set_reconcile_fast(cfg->cl_reconcile_fast);
+		pc_cluster_set_reconcile_rate_max(cfg->cl_reconcile_rate_max);
+		pc_cluster_set_multicast_ttl(cfg->cl_mcast_ttl);
+		pc_cluster_set_max_members(cfg->cl_max_members);
+		pc_cluster_set_cluster_id(cfg->cl_cluster_id);
+		pc_cluster_set_discovery(cfg->cl_unicast, cfg->cl_seeds);
+		pc_cluster_set_lane(cfg->cl_max_dgram, cfg->cl_lane_port);
+		pc_cluster_set_lane_retry(cfg->cl_lane_retry_s);
+		pc_cluster_set_expect(cfg->cl_expect);
+		pc_cluster_set_identity_source(cfg->cl_id_source);
+		pc_cluster_set_retain(cfg->cl_tomb_retain_s,
 			cfg->cl_tomb_retain_max);
-		pc_cluster_set_acks(cfg->cl_tomb_acks);                    /* 12ny AT-5 */
-		pc_cluster_set_resync_after(cfg->cl_resync_after_s);      /* S455 */
-		pc_cluster_set_data_multicast(cfg->cl_data_mcast);         /* 12ny AT-9 */
-		cfgsig_build(cfg);                                       /* AR11 */
-		/* S294: the cluster binds its sockets to the advertise
+		pc_cluster_set_acks(cfg->cl_tomb_acks);
+		pc_cluster_set_resync_after(cfg->cl_resync_after_s);
+		pc_cluster_set_data_multicast(cfg->cl_data_mcast);
+		cfgsig_build(cfg);
+		/* the cluster binds its sockets to the advertise
 		 * address - wait for it like a listener's */
 		if (pc_addr_wait(cfg->cl_advertise, cfg->address_wait_s,
 		        "cluster advertise") != 0)
 			return 1;
 		if (PSK.have_cluster_accept)
-			pc_cluster_set_accept_psk(PSK.cluster_accept);   /* CH-7 */
+			pc_cluster_set_accept_psk(PSK.cluster_accept);
 		if (pc_cluster_init(cfg->cl_mcast, cfg->cl_port,
 		        cfg->cl_advertise, PSK.cluster,
 		        cfg->cl_pull_timeout_ms, cfg->cl_negative_ms,
 		        cfg->cl_tombstone_ms, sd, legacy,
 		        cfg->cl_max_pending) != 0)
 			return 1;
-		pc_cluster_set_stats_reset_cb(stats_reset_peer);  /* S358 */
-		pc_cluster_set_alert_relay_cb(pc_alerts_relayed); /* S352c */
-		/* PS11: relays on a port of their own, or stay on the cluster socket */
-		napply = pc_cluster_apply_threads();                     /* S217 */
+		pc_cluster_set_stats_reset_cb(stats_reset_peer);
+		pc_cluster_set_alert_relay_cb(pc_alerts_relayed);
+		/* relays on a port of their own, or stay on the cluster socket */
+		napply = pc_cluster_apply_threads();
 		npsrx = pc_cluster_pubsub_rx_open(cfg->cl_ps_port, cfg->cl_ps_rx_threads);
-		pc_pubsub_set_interest(cfg->cl_ps_interested);   /* PS12 */
+		pc_pubsub_set_interest(cfg->cl_ps_interested);
 		if (npsrx > 16)
 			npsrx = 16;
-		/* S30: what this node believes the clustered collections
-		 * ARE.  It rides every ALIVE, and a peer that disagrees is
-		 * refused rather than fed (see config_digest()). */
+		/* what this node believes the clustered collections ARE: it rides every ALIVE, and a peer
+		 * that disagrees is refused rather than fed (config_digest()) */
 		{
 			int cport = 0, rport = 0, k;
-			int hport = 0;             /* S78: the first HTTP door's port */
+			int hport = 0;             /* the first HTTP door's port */
 
-			/* the first non-RESP TCP listener is where native
-			 * clients dial us; the first RESP one is where Redis
-			 * clients do.  Peers publish both, because the two
-			 * audiences cannot use each other's door: RESP has no
-			 * Noise handshake, and the native protocol is not
-			 * spoken on the RESP listener. */
+			/* peers publish the first native TCP door and the first RESP one: the two audiences
+			 * cannot use each other's door (RESP has no Noise handshake) */
 			for (k = 0; k < cfg->n_listen; k++)
 				if (cfg->listen[k].type == PC_LISTEN_TCP &&
 				        !cfg->listen[k].resp) {
@@ -2057,24 +1852,21 @@ int pc_daemon_run(struct pc_config *cfg)
 				: (cfg->n_col ? (int)cfg->col[0].mode : 0),
 				cfg->cl_eager,
 				cfg->n_cl_col != 0, cport, rport, hport,
-				cfg->wal_dir != NULL,    /* S73b */
-				cfg->cl_replicas);       /* S127 */
+				cfg->wal_dir != NULL,
+				cfg->cl_replicas);
 		}
 	}
 
 	compat_set_broadcast(pc_broadcast);
 
-	/* S366: the memory guard's first sample, and the client limit with
-	 * the memory counted.  Here, not in S161's block: the arena and the
-	 * WAL rings exist now, so the process base is measured, not guessed.
-	 * A configured limit stands (the operator asked for it) - the guard
-	 * refuses at the floor whatever the limit says - but not silently. */
+	/* the memory guard's first sample: the arena and WAL rings exist now, so the base is
+	 * measured; a configured limit stands (the guard refuses at the floor) but not silently */
 	{
 		long mem = pc_memguard_init(cfg);
 		char why[96] = "";
 
 		if (mem == PC_MEMGUARD_NOFIT)
-			return 1;                  /* S406: said why */
+			return 1;                  /* said why */
 
 		if (mem >= 0 && !cfg->max_clients && mem < pc_max_clients) {
 			pc_max_clients = (int)mem;
@@ -2093,24 +1885,18 @@ int pc_daemon_run(struct pc_config *cfg)
 			pc_max_clients_basis, fd_limit, fd_reserve, why);
 	}
 
-	/* spawn with signals blocked (inherited); main alone handles them.
-	 * Explicit 1MB stacks: the cluster plane keeps ~65-130KB of
-	 * datagram/seal buffers in stack frames, fine on glibc's 8MB
-	 * default but PAST the 128KB default some other libcs use - a
-	 * worker-thread forward segfaulted on one until it was pinned. */
-	/* UP5: the node file the upgrade helper reads, in [daemon] state_dir
-	 * only - the helper needs one too - and only now: recovery and the
-	 * cluster's identity have accepted what is on disk, so a start that
-	 * refuses (UP3) has written nothing, and the threads that tick it
-	 * start below */
-	pc_upg_set_install_mode(cfg->install_mode);     /* PD-9 */
+	/* the node file the upgrade helper reads (state_dir only), written only now: recovery and
+	 * the cluster identity accepted what is on disk, so a refused start has written nothing */
+	pc_upg_set_install_mode(cfg->install_mode);
 	pc_upg_node_init(cfg->state_dir);
+	/* threads spawn with signals blocked (main alone handles them) and 1 MB stacks: the cluster
+	 * plane keeps ~65-130 KB of buffers on the stack, past some libcs' 128 KB default */
 	pthread_attr_init(&tattr);
 	pthread_attr_setstacksize(&tattr, 1024L * 1024);
 	sigemptyset(&blocked);
 	sigaddset(&blocked, SIGTERM);
 	sigaddset(&blocked, SIGINT);
-	sigaddset(&blocked, SIGHUP);            /* 12nw: the threads leave it to this one */
+	sigaddset(&blocked, SIGHUP);            /* the threads leave it to this one */
 	pthread_sigmask(SIG_BLOCK, &blocked, &old);
 
 	for (i = 0; i < nw; i++) {
@@ -2134,7 +1920,7 @@ int pc_daemon_run(struct pc_config *cfg)
 		pthread_create(&bt->tid, &tattr, bulk_main, bt);
 		hb = slot_init(nw + 6);
 		pthread_create(&hb->tid, &tattr, beat_main, hb);
-		/* S217: the apply threads take nw+7.., the relay threads
+		/* the apply threads take nw+7.., the relay threads
 		 * follow them - the WAL ring count above depends on it */
 		for (i = 0; i < napply; i++) {
 			apth[i].slot = slot_init(nw + 7 + i);
@@ -2154,17 +1940,12 @@ int pc_daemon_run(struct pc_config *cfg)
 	sa.sa_handler = on_signal;
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
-	sa.sa_handler = on_hup;                 /* 12nw */
+	sa.sa_handler = on_hup;
 	sigaction(SIGHUP, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
-	/* "ready" promises that the doors accept: each worker opens its OWN
-	 * SO_REUSEPORT listener inside worker_main, after this thread
-	 * created it, so the line waited for nothing and a client that
-	 * connected on it could be refused - v0.5.6 GitLab check-asan
-	 * (durability): waltest's client, started on the line, got
-	 * "Connection refused" on a loaded runner.  Wait for every worker,
-	 * bounded: a worker that never gets there is said, not hidden. */
+	/* "ready" promises that the doors accept, and each worker opens its OWN listener: wait for
+	 * every worker, bounded - one that never gets there is said, not hidden */
 	{
 		struct timespec ms1 = { 0, 1000000 };
 		int w = 0;
@@ -2180,18 +1961,16 @@ int pc_daemon_run(struct pc_config *cfg)
 				__atomic_load_n(&workers_listening, __ATOMIC_ACQUIRE),
 				nw, w);
 	}
-	pc_metrics_mark_start();       /* S46: uptime counts from HERE,
-	                                * not from exec - a slow recovery
-	                                * is not uptime */
+	pc_metrics_mark_start();       /* uptime counts from HERE: a slow recovery is not uptime */
 	LM_NOTICE("perfcached ready: %d workers, %d collections, %d "
 		"listeners, arena %s\n", nw, n_cols, cfg->n_listen,
 		cfg->backing_heap ? "heap" : "reserved");
 
 	for (i = 0; i < nw; i++)
 		pthread_join(wargs[i].slot->tid, NULL);
-	pc_upstream_shutdown();                       /* S331: no gate runs now */
+	pc_upstream_shutdown();                       /* no gate runs now */
 	pthread_join(mt->tid, NULL);
-	pc_mail_stop();                               /* S352: after the alert source */
+	pc_mail_stop();                               /* after the alert source */
 	pthread_join(wt->tid, NULL);
 	if (rt)
 		pthread_join(rt->tid, NULL);
@@ -2199,7 +1978,7 @@ int pc_daemon_run(struct pc_config *cfg)
 		pthread_join(ct->tid, NULL);
 	if (hb)
 		pthread_join(hb->tid, NULL);
-	/* S217: after the cluster thread (ct) - nothing pushes any more,
+	/* after the cluster thread (ct) - nothing pushes any more,
 	 * and a thread drains what it holds before it sees the flag */
 	for (i = 0; i < napply; i++)
 		pthread_join(apth[i].slot->tid, NULL);
@@ -2211,24 +1990,8 @@ int pc_daemon_run(struct pc_config *cfg)
 			if (cfg->listen[i].type == PC_LISTEN_UNIX)
 				unlink(cfg->listen[i].addr);
 	}
-	/*
-	 * S222: A CLEAN STOP LEAVES A SNAPSHOT.
-	 *
-	 * Until this, a node stopped on purpose came back off its WAL alone -
-	 * correct, and in eager mode exactly the problem: an eager replica
-	 * never logs the copies it receives, so the WAL holds only what this
-	 * node WROTE.  After the whole fleet was stopped, every node returned
-	 * with its own share and waited on the repair sweep for the rest;
-	 * none of them could have served the whole keyspace alone.  The
-	 * snapshot walk stores the copies too, so a node that stopped cleanly
-	 * now comes back complete on its own.
-	 *
-	 * Here, after every join: nothing writes, the WAL has had its final
-	 * flush, the RDB thread is gone, and the arena is still intact.  Any
-	 * mode with a WAL directory - a store node's pulled copies and a
-	 * spread node's placed ones are lost from its WAL in the same way.
-	 * A failure is logged and changes nothing else: the WAL is intact.
-	 */
+	/* a clean stop leaves a snapshot: the WAL holds only what this node WROTE (received copies
+	 * are not logged), and the snapshot walk stores the copies too */
 	if (rt) {
 		LM_NOTICE("perfcached: stopping - taking the shutdown snapshot\n");
 		if (pc_rdb_save_on_stop() != 0)

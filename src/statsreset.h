@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * statsreset.h - the stats reset (S123) and its schedule (S358): the
- * baselines a reset snapshots for the planes whose counters it does not
- * own, and when the running totals count from.  The resets themselves -
- * pc_stats_reset, _at, _fleet, _schedule, _tick - are declared in verbs.h,
- * where their callers have always found them.
- */
+/* statsreset.h - the baselines a stats reset snapshots for the planes whose counters it
+ * does not own; the resets themselves are declared in verbs.h. */
 #ifndef PC_STATSRESET_H
 #define PC_STATSRESET_H
 

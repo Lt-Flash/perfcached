@@ -1,19 +1,6 @@
 #!/bin/sh
-# statsschedtest.sh - S358: the scheduled stats reset.  /stats and the page
-# start counting again every stats_reset days at stats_reset_at, local
-# time (default: daily at midnight), so no count they show reaches the
-# billions; /metrics is never reset.  PERFCACHED_STATS_RESET beats the
-# file - `make check` sets it to off so no suite goes red across midnight.
-#   A  stats_reset = 1d at a time 5 s ahead: next_reset is that moment;
-#      it resets then (reset_at = that moment, hits 0, /metrics untouched)
-#      and next_reset moves to the same time tomorrow
-#   B  the same file under PERFCACHED_STATS_RESET=off: no schedule
-#      (next_reset 0), and nothing is reset when the moment passes
-#   C  stats_reset = 7d: the next reset is a Monday, 00:00 local
-#   D  stats_reset = 8d, stats_reset_at = 24:00 and
-#      PERFCACHED_STATS_RESET=9d are refused by the config check
-# Fail-first: 0.5.6.3 knows neither key and refuses the config.
-# Usage: test/statsschedtest.sh [./perfcached]
+# statsschedtest.sh - the scheduled stats reset (every stats_reset days at stats_reset_at, /metrics never);
+# PERFCACHED_STATS_RESET beats the file - `make check` sets it off so no suite goes red across midnight.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcstatssched.XXXXXX); PA= PB= PC=
@@ -79,6 +66,7 @@ check(metric_hits(18936) == 3, "A: /metrics was not reset (%s)" % metric_hits(18
 check(b1["since"].get("reset_at") == 0 and hits(b1) == 3,
       "B: nothing reset when the moment passed (reset_at %s, hits %s)" % (b1["since"].get("reset_at"), hits(b1)))
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

@@ -1,26 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * uring.h - S361 (0.6.0): the io_uring layer the worker backend is built
- * on, and the startup check that decides whether it is used at all.
- *
- * Raw system calls - no liburing, no <linux/io_uring.h> - so it builds on
- * every target the releases do (old kernel headers, musl) and adds no
- * dependency.  What a host can actually run is decided at RUN time by
- * pc_uring_check(): it does the real thing on a loopback TCP pair (a
- * multishot receive into provided buffers, a cancel, a multishot poll, a
- * send) rather than trusting a kernel version - Ubuntu's 6.8.0-136
- * refuses buffer rings that 5.19 introduced, a container's seccomp
- * profile can refuse io_uring_setup itself, kernel.io_uring_disabled can
- * turn it off.  Whatever fails is the reason the daemon falls back to
- * epoll, and it is reported as such.
- *
- * Buffer tiers, best first:
- *   PC_UR_BUF_RING     a registered provided-buffer ring (5.19+)
- *   PC_UR_BUF_CLASSIC  IORING_OP_PROVIDE_BUFFERS (5.7+), where the ring
- *                      is refused
- * The backend needs multishot receive either way (6.0+).
- */
+/* uring.h - the io_uring layer the worker backend runs on, by raw system calls (no liburing, no
+ * kernel headers: old headers and musl build), and the startup check deciding if it is used. */
 #ifndef PC_URING_H
 #define PC_URING_H
 
@@ -49,25 +30,19 @@ struct pc_ur_cqe {
 #define PC_UR_CQE_F_MORE    (1u << 1)
 #define PC_UR_CQE_BID(f)    ((uint16_t)((f) >> 16))
 
+/* buffer tiers, best first: a provided-buffer ring (5.19+), else IORING_OP_PROVIDE_BUFFERS (5.7+);
+ * the backend needs multishot receive either way (6.0+) */
 enum { PC_UR_BUF_NONE = 0, PC_UR_BUF_RING, PC_UR_BUF_CLASSIC };
 
-/* the worker's tags (a connection's are its address | an op, >= 65536):
- * what the backend never dispatches - cancels, classic buffer
- * hand-backs - and the worker's own eventfd and listeners */
+/* the worker's tags (a connection's are its address | an op, >= 65536): what the backend never
+ * dispatches (cancels, classic buffer hand-backs), the worker's own eventfd and listeners */
 #define PC_UR_UD_IGNORE     1ULL
 #define PC_UR_UD_EFD        2ULL
 #define PC_UR_UD_LISTEN(j)  (16ULL + (uint64_t)(j))
 #define PC_UR_UD_PROVIDE    (~0ULL)
 #define PC_UR_BGID          0          /* the worker's buffer group */
-/* a worker's receive buffers: 512 x 4 KB, 2 MB.  A receive takes one per
- * completion and the worker hands it back as it copies it out; when all
- * are out the receive ends with ENOBUFS and is armed again - the bytes
- * wait in the socket meanwhile.  Many small buffers suit many connections
- * each sending small requests (a large value just arrives in more
- * pieces).  The pool is touched at start: a buffer RING hands buffers out
- * in turn, so under load every page of it becomes resident anyway - first
- * 256 x 16 KB crept to 4 MB a worker during idlebuftest on 224 - and a
- * fixed cost paid at start is one an operator can see and plan for. */
+/* a worker's receive buffers, 512 x 4 KB: all out, the receive ends ENOBUFS and is re-armed (bytes
+ * wait in the socket).  Touched at start: a ring hands them out in turn, so all go resident */
 #define PC_UR_WORKER_BUFS     512
 #define PC_UR_WORKER_BUF_SIZE 4096
 
@@ -93,9 +68,8 @@ struct pc_ur {
 	uint16_t br_tail;
 };
 
-/* Set up a ring of @entries submissions (completions: @cq_entries, 0 for
- * the kernel's default).  0, or -1 with @err filled - the reason in words
- * an operator can act on. */
+/* a ring of @entries submissions (completions: @cq_entries, 0 for the kernel's default): 0, or -1
+ * with @err the reason in words an operator can act on */
 int pc_ur_init(struct pc_ur *r, unsigned entries, unsigned cq_entries,
 		char *err, size_t errsz);
 void pc_ur_free(struct pc_ur *r);
@@ -123,9 +97,8 @@ void pc_ur_prep_send(struct pc_ur_sqe *s, int fd, const void *buf,
 		size_t len, uint64_t ud);
 void pc_ur_prep_cancel(struct pc_ur_sqe *s, uint64_t target, uint64_t ud);
 
-/* Publish what was prepared and, with @wait, block until a completion
- * arrives or @timeout_ms passes (-1: no limit).  The number submitted,
- * or -errno (-ETIME on a timeout with nothing submitted, -EINTR). */
+/* publish what was prepared and, with @wait, block for a completion or @timeout_ms (-1: no limit):
+ * the number submitted, or -errno (-ETIME on a timeout with nothing submitted, -EINTR) */
 int pc_ur_submit(struct pc_ur *r, int wait, int timeout_ms);
 
 /* Completions: peek the next, then mark it seen.  The CQ head is
@@ -150,13 +123,12 @@ struct pc_uring_verdict {
 	int ok;                             /* 1: the backend can run here */
 	int buf_tier;                       /* PC_UR_BUF_* when ok */
 	unsigned setup_flags;               /* the ring flags the kernel took */
-	int counts_iowait;                  /* 0.6.0.1: 1 = this kernel (before
+	int counts_iowait;                  /* 1 = this kernel (before
 	                                     * 6.15) counts a ring wait as iowait */
 	char why[200];                      /* when !ok: the reason */
 };
-/* The functional check (see the top of this file).  Never fails the
- * caller: the verdict says what to do.  PERFCACHED_URING_DENY=1 in the
- * environment makes it refuse - for the fallback's tests. */
+/* the real thing on a loopback TCP pair, not a kernel version (seccomp, io_uring_disabled, kernels
+ * refusing buffer rings); never fails the caller.  PERFCACHED_URING_DENY=1 refuses (tests). */
 void pc_uring_check(struct pc_uring_verdict *v);
 const char *pc_ur_buf_tier_name(int tier);
 

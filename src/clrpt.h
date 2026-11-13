@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* clrpt.h - S469: replication groups over max_datagram go by TCP to the peer's
+/* clrpt.h - replication groups over max_datagram go by TCP to the peer's
  * relay port - a connection per sending worker, read by the relay threads */
 #ifndef PC_CLRPT_H
 #define PC_CLRPT_H
@@ -10,11 +10,11 @@
 #include "pcaddr.h"
 
 #define CLRPT_QMAX       (4u << 20)    /* bytes queued on one connection */
-#define CLRPT_QTOTAL     (64u << 20)   /* OM2-12: what every sending thread's queues hold together */
+#define CLRPT_QTOTAL     (64u << 20)   /* what every sending thread's queues hold together */
 #define CLRPT_PEERS      64            /* connections a sending thread holds */
 #define CLRPT_RX_CONNS   256           /* connections a receive thread holds */
 #define CLRPT_IDLE_MS    120000        /* an inbound connection silent this long goes */
-#define CLRPT_FRAME_MS   10000         /* OM2-11: a frame begun must be whole by then */
+#define CLRPT_FRAME_MS   10000         /* a frame begun must be whole by then */
 #define CLRPT_RETRY_MS   1000          /* after a failed connect or a broken one */
 
 /* ---- sending: any worker, its own connections (thread-local) ---- */
@@ -33,7 +33,7 @@ int clrpt_listen(const pc_addr *at);
 typedef void (*clrpt_frame_fn)(void *ctx, const unsigned char *f, size_t n,
 		const pc_addr *from);
 struct clrpt_rx;
-/* OM2-11: @host_ok refuses a connection at accept by its address (NULL: any) */
+/* @host_ok refuses a connection at accept by its address (NULL: any) */
 typedef int (*clrpt_host_fn)(const pc_addr *from);
 struct clrpt_rx *clrpt_rx_new(int lfd, clrpt_host_fn host_ok);
 void clrpt_rx_free(struct clrpt_rx *r);
@@ -47,6 +47,7 @@ struct clrpt_figs {
 	unsigned long long sent_frames, sent_bytes, fallbacks, connects,
 		connect_fail, lost_frames;
 	unsigned long long rx_frames, rx_bytes, rx_accepts, rx_refused;
+	unsigned long long rx_held;        /* receive buffers' bytes now */
 };
 void clrpt_figures(struct clrpt_figs *f);
 

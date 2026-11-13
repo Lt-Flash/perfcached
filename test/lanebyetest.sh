@@ -1,28 +1,6 @@
 #!/bin/sh
-# lanebyetest.sh - S329: a master's GOODBYE is not a UDP block.
-#
-# On the PROD AU fleet (0.4.6, unicast, the TCP frame lane on) each member
-# that heard the master say goodbye - it was stopping for a reboot - logged
-# "<master> has sent no UDP for 50 s but answers on TCP - UDP is blocked
-# or lost on this path" and forced its lane to that address: the goodbye
-# sets master_seen_ms = 0 ("elect at once"), the member tick then measured
-# the master's silence as now - 0 (the time since the MACHINE booted) and
-# asked the lane, and the departing master's TCP lane was still up while it
-# finished stopping.  The force was never lifted, so the master's return,
-# a new process at the same address, was sent everything by TCP for good.
-#
-# Three unicast nodes on loopback addresses with a WAL each, under
-# test/lingershim.so: armed right before the stop, it holds the departing
-# master's shutdown snapshot - the step after its goodbye - for 4 s, so its
-# TCP lane still answers while the members look, as on the PROD fleet (on a
-# test host the process is otherwise gone in milliseconds, and the old
-# build passed this suite by luck):
-#   1  the master stops cleanly: the two left elect a new master, neither
-#      logs "has sent no UDP", and neither has a forced lane;
-#   2  it comes back: three again, and no node anywhere has a forced lane.
-# FAIL-FIRST: before S329 the members force their lane to the departing
-# master (the ERROR line, cluster.lane.forced 1).
-# Usage: test/lanebyetest.sh [./perfcached] [./lingershim.so]
+# lanebyetest.sh - a master's GOODBYE, its return, and a member's restart inside the purge window are
+# no UDP block: no node forces its TCP lane (lingershim holds the stop 4 s so the lane still answers).
 set -u
 BIN=$(readlink -f "${1:-./perfcached}")
 SHIM=$(readlink -f "${2:-./lingershim.so}")
@@ -118,12 +96,38 @@ fi
 	|| bad "forced lanes after the goodbye: node $O1 $(forced $O1), node $O2 $(forced $O2)"
 
 echo "--- 2: it comes back"
+# the lines since the restart: a cold start with two founders can log one at formation, not the return
+for n in 1 2 3; do eval "K$n=\$(wc -l < \"$D/n$n.log\")"; done
 start $M
 wait_for $FW '[ "$(up 1)$(up 2)$(up 3)" = 222 ]' && ok "three again" || bad "the fleet did not re-form ($(up 1)/$(up 2)/$(up 3))"
 sleep 3
-[ "$(forced 1)$(forced 2)$(forced 3)" = 000 ] && ! grep -q "has sent no UDP" "$D"/n*.log \
-	&& ok "no node has a forced lane, and none ever logged a UDP block" \
-	|| bad "forced lanes $(forced 1)/$(forced 2)/$(forced 3); UDP-block lines: $(grep -c "has sent no UDP" "$D"/n*.log | tr '\n' ' ')"
+for n in 1 2 3; do eval "tail -n +\$((K$n + 1)) \"$D/n$n.log\"" > "$D/n$n.back"; done
+[ "$(forced 1)$(forced 2)$(forced 3)" = 000 ] && ! grep -q "has sent no UDP" "$D"/n*.back \
+	&& ok "no node has a forced lane, and none logged a UDP block since it came back" \
+	|| bad "forced lanes $(forced 1)/$(forced 2)/$(forced 3); UDP-block lines since the restart: $(grep -c "has sent no UDP" "$D"/n*.back | tr '\n' ' ')"
+
+echo "--- 3: a member killed and started again inside the purge window"
+# its new process answers the lane's TCP probe on the old address: that is no UDP block
+X=0; for n in 1 2 3; do [ "$(role $n)" = member ] && X=$n; done
+if [ "$X" = 0 ]; then
+	bad "no member to kill: roles $(role 1)/$(role 2)/$(role 3)"
+else
+	for n in 1 2 3; do eval "J$n=\$(wc -l < \"\$D/n\$n.log\")"; done
+	kill -9 "$(cat "$D/n$X.pid")"; wait "$(cat "$D/n$X.pid")" 2>/dev/null; rm -f "$D/n$X.pid"
+	sleep 2
+	start $X
+	wait_for $FW '[ "$(up 1)$(up 2)$(up 3)" = 222 ] && [ "$(st $X "r[\"state\"]")" = ready ]' \
+		&& ok "node $X is back and ready, three again" || bad "node $X did not come back: $(up 1)/$(up 2)/$(up 3), $(st $X 'r["state"]')"
+	sleep 3
+	for n in 1 2 3; do eval "tail -n +\$((J$n + 1)) \"\$D/n\$n.log\"" > "$D/n$n.kill"; done
+	if grep -h "has sent no UDP" "$D"/n*.kill > "$D/err3" 2>/dev/null; then
+		bad "a peer took node $X's restart for a UDP block: $(head -1 "$D/err3" | sed 's/.*ERROR: //' | cut -c1-120)"
+	else
+		ok "no peer took node $X's restart for a UDP block"
+	fi
+	[ "$(forced 1)$(forced 2)$(forced 3)" = 000 ] && ok "and no lane is forced" \
+		|| bad "forced lanes after node $X's restart: $(forced 1)/$(forced 2)/$(forced 3)"
+fi
 
 echo "lanebyetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

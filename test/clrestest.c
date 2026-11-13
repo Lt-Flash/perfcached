@@ -1,18 +1,5 @@
-/*
- * clrestest.c - id reservations for departed members (M12 slice 1, S90).
- *
- * The table is a courtesy that is invisible when it misbehaves: a
- * reservation that lapses early renumbers a restarting node, one that
- * lapses late holds an id nobody is coming back for, and a claim that
- * matches by address before identity hands a returning node the id of
- * whoever last used its address.  None of that shows up on a healthy
- * fleet, and all of it is a case here.
- *
- * No clock and no TTL of its own: both are injected, so the expiry
- * boundary is placed exactly rather than slept through.
- *
- * Build: cc -o clrestest test/clrestest.c src/clres.o
- */
+/* clrestest.c - id reservations for departed members: expiry exact at the boundary (clock and TTL
+ * injected), claims by identity before address, refresh in place, and what the bound evicts. */
 #include <stdio.h>
 #include <string.h>
 
@@ -28,8 +15,8 @@ static void chk(int cond, const char *what)
 
 static struct clres R;
 
-/* an identity whose bytes are asymmetric: i*17 has palindromic nibbles
- * and hid a nibble swap in M13's suite */
+/* an identity whose bytes are asymmetric: i*17 has palindromic nibbles and would hide
+ * a nibble swap */
 static void ident_of(unsigned char *out, int seed)
 {
 	int i;

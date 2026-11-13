@@ -1,15 +1,5 @@
-/*
- * clunktest.c - the unknown-command table, its frame and the fleet fold
- * (S165).
- *
- * What goes wrong here goes wrong quietly: a table that evicts lets a
- * scanner push the real gap off the card, a name that keeps its bytes
- * puts a terminal escape in the journal, a fold that sums the wrong way
- * shows a gap on one page and not another, and a frame parsed partly
- * leaves a half-filled table on a peer.  Every one of those is a case.
- *
- * Build: cc -o clunktest test/clunktest.c src/clunk.o
- */
+/* clunktest.c - the unknown-command table, its frame and the fleet fold: no eviction, names
+ * sanitised, the fold summed one way, and a frame applied all or nothing. */
 #include <stdio.h>
 #include <string.h>
 
@@ -178,9 +168,8 @@ static void frame(void)
 	chk(clunk_parse(buf, n, &node, &G) == -1, "an empty name: refused");
 	buf[20] = 15;
 	chk(clunk_parse(buf, n, &node, &G) == 0, "restored, it parses again (the mutations were the cause)");
-	/* the byte-flip above misaligns every later field, so it would be
-	 * refused even with no empty-name rule: a WELL-FORMED frame whose
-	 * row has an empty name is what proves the rule itself */
+	/* the byte-flip above misaligns every later field; a well-formed frame with an empty-name
+	 * row is what proves the empty-name rule itself */
 	{
 		struct clunk_table E;
 		size_t en;

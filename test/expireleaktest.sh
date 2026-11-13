@@ -1,20 +1,6 @@
 #!/bin/sh
-# expireleaktest.sh - EXPIRE does not leak the value it re-reads.
-#
-# S213 made a TTL re-arm travel as a write: after the touch, the record is
-# read back whole (pcache_ht_fetch_full - value, expiry and version out of
-# one read) so the WAL and the eager push carry the right bytes.  That read
-# hands back a malloc'd copy the caller must free, and op_expire_local never
-# did: every EXPIRE that hit leaked the value.  Found by S254 as a scaling
-# fault - EXPIRE fell from 1.42M/s at 4 workers to 1.21M/s at 12, the
-# workers queued on the mm lock in mprotect (glibc growing the per-thread
-# heaps to hold the leak, ~300 MB/s at 256 B values).
-#   - 200,000 EXPIREs on 1,000 keys of 1 KB: the daemon's RSS grows by less
-#     than 32 MB (the leak is ~200 MB); the arena is pinned and prefaulted,
-#     so the store itself does not move RSS
-#   - every EXPIRE answered 1, and the keys are still there with a TTL
-# Fail-first: the unfixed build grows by ~220 MB.
-# Usage: test/expireleaktest.sh [./perfcached]
+# expireleaktest.sh - EXPIRE does not leak the value it re-reads (pcache_ht_fetch_full's malloc'd
+# copy): 200,000 EXPIREs on 1 KB keys grow RSS by less than 32 MB.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcexpleak.XXXXXX); P1=

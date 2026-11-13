@@ -1,26 +1,6 @@
 #!/bin/sh
-# clustercfgtest.sh — the cluster owns the collection config (task S30).
-#
-# THE BUG THIS CLOSES, demonstrated before it was fixed: two nodes in
-# one cluster, collection 'c' declared store on one and shard on the other,
-# joined happily; a write through either VANISHED for the other, and
-# neither log said a word.  A cluster is ONE mode over ONE collection
-# set, and members that disagree must not federate.
-#
-# Asserted:
-#  - config rules, before any traffic: [cluster] collections needs a
-#    mode; a [collection X] outside the set is a parse error; a local
-#    mode that contradicts the cluster's is a parse error; eager
-#    params need their mode;
-#  - the set travels: a collection the cluster declares but the node
-#    has no block for is CREATED with default sizing, and served;
-#  - matching nodes federate normally (the fix must not break agreement);
-#  - MISMATCHED nodes REFUSE each other - loudly, naming both configs,
-#    and neither ends up in the other's membership - for every pair:
-#    store-vs-shard, store-vs-proxy, proxy-vs-shard,
-#    eager-vs-not, and a differing collection SET;
-#  - a restarted node with a matching config rejoins cleanly.
-# Usage: test/clustercfgtest.sh [./perfcached]
+# clustercfgtest.sh - the cluster owns the collection config: rules refused at parse, the set travels to bare
+# nodes, members whose mode or set differ refuse each other.  Usage: test/clustercfgtest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -86,6 +66,14 @@ print(f.readline().decode().strip())' "$1"; }
 peers() { call $1 '{"method":"stats"}' | python3 -c \
 	'import json,sys; print(json.load(sys.stdin)["result"]["cluster"]["peers_up"])' \
 	2>/dev/null || echo "?"; }
+# a joiner is CONNECTING until its links answer: up to 30 s for both ready and seeing each other
+st() { call $1 '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+formed() {
+	i=0
+	while [ $i -lt 300 ] && { [ "$(st 17301)" != "ready 1" ] || [ "$(st 17302)" != "ready 1" ]; }; do
+		sleep 0.1; i=$((i+1))
+	done
+}
 
 # ---- 1. config rules, before any traffic ----------------------------
 badconf() { # badconf <label> <cluster-block> <collection-block> <expect>
@@ -132,9 +120,8 @@ collections = c" \
 buckets_log2 = 10
 mode = eager" "contradicts"
 
-# ---- S127: mode = spread and its copy factor -------------------------
-# Every rule here exists to refuse a config that would LOOK like it works
-# and quietly place records where the rest of the fleet is not looking.
+# ---- mode = spread and its copy factor: each rule refuses a config that would look like it works
+# and place records where the fleet is not looking
 badconf "spread without replicas" "mode = spread
 collections = c" \
 	"[collection c]
@@ -221,7 +208,7 @@ conf "$D/m2.conf" 17302 2 "$CL" "[collection c]
 buckets_log2 = 12"       # DIFFERENT local sizing: node-local, allowed
 start "$D/m1.conf" P1 "$D/m1.log" || { echo "m1 no start"; exit 1; }
 start "$D/m2.conf" P2 "$D/m2.log" || { echo "m2 no start"; exit 1; }
-sleep 4
+formed
 A=$(peers 17301); B=$(peers 17302)
 [ "$A" = "1" ] && [ "$B" = "1" ] && ok || bad "matching nodes did not federate ($A/$B)"
 call 17301 '{"method":"set","params":{"col":"c","key":"shared","value":"yes"}}' >/dev/null
@@ -265,10 +252,8 @@ collections = c"
 pair "collection SET differs" "mode = store
 collections = c" "mode = store
 collections = c, other"
-# S127: THE COPY FACTOR IS INTERCHANGE STATE.  Two members running
-# different K place the same record on different nodes and each reads
-# the other as missing it - the exact failure the digest exists to
-# refuse, and the reason `replicas` is folded into it.
+# the copy factor is interchange state: members with different K place a record on different
+# nodes and each reads the other as missing it
 pair "spread K=2 vs K=3" "mode = spread
 replicas = 2
 collections = c" "mode = spread
@@ -286,14 +271,14 @@ conf "$D/r2.conf" 17302 2 "$CL" "[collection c]
 buckets_log2 = 10"
 start "$D/r1.conf" P1 "$D/r1.log" || { echo "r1 no start"; exit 1; }
 start "$D/r2.conf" P2 "$D/r2.log" || { echo "r2 no start"; exit 1; }
-sleep 4
+formed
 [ "$(peers 17301)" = "1" ] && ok || bad "rejoin rig did not federate"
 kill -9 $P2 2>/dev/null; wait $P2 2>/dev/null; P2=
 sleep 7
 : > "$D/r2.log"
 start "$D/r2.conf" P2 "$D/r2.log" || { echo "r2 restart failed"; exit 1; }
-# held until its old process ages out of the live set (PEER_UP_MS, 10 s from
-# the kill - S108), then admitted: 4 s was the edge on ASan (GitLab rc2, 0/1)
+# held until its old process ages out of the live set (PEER_UP_MS, 10 s from the kill), then
+# admitted
 i=0
 while [ $i -lt 30 ]; do
 	sleep 0.5; i=$((i + 1))

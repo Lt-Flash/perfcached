@@ -1,21 +1,6 @@
 #!/bin/sh
-# prefetchtest.sh - S232: the RESP lookahead never changes an answer.
-#
-# With a table past [daemon] prefetch_min_keys, the RESP drain parses up to
-# eight frames ahead, prefetches their buckets and records, and hands the
-# frame about to run the hash it computed while parsing ahead ("hash once" -
-# pcache_key_hash takes it when the key pointer and length match).  Every
-# suite in make check uses a keyspace under the 65,536-key default, so none
-# of that runs there.  This forces it on (prefetch_min_keys = 1) and checks
-# every reply of a long pipelined mix against a model:
-#   - 60,000 commands in pipelines of 2,000 over 1,000 overlapping keys:
-#     SET, GET, DEL, EXISTS, INCR, MGET (keys ahead of and behind the one
-#     that runs), EXPIRE, PING - keyed, multi-key and keyless frames mixed,
-#     so a hash handed to the wrong frame would answer for the wrong key
-#   - every reply equal to the model's
-# Fail-first: a build whose hint hands the NEXT frame's hash fails at once
-# (checked by mutation when this was written).
-# Usage: test/prefetchtest.sh [./perfcached]
+# prefetchtest.sh - the RESP lookahead (prefetch, hash once) never changes an answer: forced on with
+# prefetch_min_keys = 1, a long pipelined mix of keyed, multi-key and keyless frames vs a model.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcprefetch.XXXXXX); P1=

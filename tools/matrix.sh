@@ -1,27 +1,6 @@
 #!/bin/sh
-# matrix.sh — the S27 four-arch build+test matrix (Linux-only, by
-# decree: x86_64, i386, arm64, arm32).
-#
-# Runs on the build host (224) with podman + qemu-user binfmt.  Each
-# arch gets a debian:trixie-slim toolchain image (built once, reused)
-# and a THROWAWAY copy of the tree - .o files never cross arches.
-#
-# What runs where:
-#  - all four:  make perfcached selftest selftest_broken noisetest
-#               memprobe;  ./noisetest;  ./selftest;  and the canary -
-#               selftest_broken MUST FAIL (a lock shim that cannot fail
-#               detectably proves nothing).
-#  - amd64+i386 (native execution): full-scale selftest + memprobe.
-#  - arm64+arm32 (qemu-user): PC_SELFTEST_LIGHT scale - emulation is
-#    8-16x slower and the storm would trip the livelock alarm - and NO
-#    memprobe: qemu-user's guest addresses do not line up with
-#    /proc/self/smaps, so tier detection would lie.  Documented, not
-#    papered over.
-#
-# ~2-6 min/arch under emulation.  Not part of make check; run it before
-# a release or after touching compat/, core/ or anything word-size- or
-# endian-sensitive.
-# Usage: tools/matrix.sh [arch...]   (default: all four)
+# matrix.sh - the four-arch build+test matrix (x86_64, i386 native; arm64, arm32 under qemu-user at light
+# scale, no memprobe); run before a release or after touching compat/, core/ or word-size/endian code.
 set -u
 
 ARCHES=${*:-amd64 i386 arm64 arm32}
@@ -30,12 +9,8 @@ TOP=$(cd "$(dirname "$0")/.." && pwd)
 WORK=/var/tmp/pc-matrix          # NOT /tmp - tmpfs on the build host
 failed=""
 
-# ---- preflight (S60) ----------------------------------------------------
-# In CI this runs wherever the pipeline lands, and a runner without podman
-# or without qemu-user binfmt cannot do this work at all.  Announce that
-# LOUDLY and skip, rather than failing (which would look like a code
-# regression) or passing quietly (which would look like coverage we do not
-# have).  Same contract as storagetest's fixture check.
+# ---- preflight ----------------------------------------------------------
+# a runner without podman or qemu-user binfmt skips LOUDLY: neither a fake failure nor fake coverage
 if ! command -v podman >/dev/null 2>&1; then
 	echo "############################################################"
 	echo "# matrix: SKIPPED - podman is not installed on this host.  #"
@@ -95,18 +70,8 @@ run_arch() { # run_arch <arch>
 		light="PC_SELFTEST_LIGHT=1"
 		probe="echo 'memprobe: SKIPPED under qemu-user (smaps/guest-address mismatch)'"
 	esac
-	# UBSan on arm64 (S60 follow-up).  The reason it is worth the extra
-	# pass is specific: S56 was a shift-by-32 UB that x86's shift-wrap
-	# HID natively, and shift-width UB is exactly what a different
-	# architecture surfaces.  Verified to actually work under qemu-user
-	# before being wired in.
-	#
-	# arm64 ONLY, and UBSan ONLY:
-	#  - arm32 would add another slow emulated pass for the same class
-	#    of finding; revisit if a 32-bit-specific UB ever turns up.
-	#  - ASan is deliberately absent - its shadow-memory scheme is the
-	#    part user-mode emulation reproduces badly, so a failure there
-	#    would more likely be the rig than the code.
+	# UBSan on arm64 only: shift-width UB is what a different architecture surfaces (x86's shift-wrap
+	# hid one); ASan is absent, as user-mode emulation reproduces its shadow memory badly
 	case $a in arm64)
 		ubsan="echo '--- rebuilding selftest+noisetest under UBSan ---'
 		make SAN='-fsanitize=undefined -fno-omit-frame-pointer' \

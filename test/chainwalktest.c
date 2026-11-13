@@ -1,22 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * chainwalktest.c - OC-7 (DESIGN 12oc): a walk hands over every record of
- * a chain exactly once while the chain is changed under it.
- *
- * A remove fills its hole with the chain's LAST record, so a walker that
- * trusted positions would pass the hole before the move and never meet the
- * record that moved into it - the leg's S330, in a new form.  The chain
- * walk trusts a position only while the bucket's version stands, and walks
- * the chain again from its start when it moves, skipping what it handed
- * over.
- *
- * The shape: a 16-bucket table, 60 keys of one bucket - five home, the rest
- * chained.  The callback removes, every third call, a record it was handed
- * earlier, so the tail fill keeps moving unseen records behind the walker.
- * Every record never removed must be handed over exactly once - through
- * iter_meta and through scan.  Each run ends with the chains' shape check.
- */
+/* chainwalktest.c - a chain walk hands over every record exactly once while a remove's tail fill
+ * keeps moving unseen records behind it (iter_meta and scan; chain shape checked after each run). */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"

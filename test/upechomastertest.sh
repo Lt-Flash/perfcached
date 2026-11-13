@@ -1,43 +1,6 @@
 #!/bin/sh
-# upechomastertest.sh - S423 (0.7.1; AR13 on 245-247, 2026-10-20): a client
-# reads the key it has just written through.  Three fakes
-# (test/fakeupstream.py): M the master, accepting writes and copying its
-# keyspace to R1 50 ms and R2 700 ms later (replicate_delay_ms - replicas'
-# lags differ;
-# each echoes the write when it lands, as a tracked Redis replica does).
-# Collection 0 reads the replicas and writes through to M - staging-redis's
-# settings on 245-247 (master_fallback: M is tracked too).  Redis echoes a
-# node's own write at once from M: S422 refetched the key - from a replica,
-# which did not have the write yet, so the read after a SET answered nil (or
-# the value before it).  S423 sends a fetch inside the echo window to the
-# master.
-#  A. a new key: SET, then a GET every 10 ms for 800 ms, 40 keys - every
-#     GET the value just set (on 245-247: nil for ~4% of the writes, 0.7.0)
-#  B. an existing key overwritten: the new value, never the replica's older
-#     one
-#  C. a change racing the write is honoured: after our SET another client
-#     sets the key on M - the node answers that within 100 ms (0.7.1 before
-#     S423: the older state for 750 ms, until the slow replica had it)
-#  D. outside the window a read still goes to a replica: a key written on M
-#     by another client, read here once the replicas hold it, is fetched
-#     from R1 or R2 - the master's fetch count does not move
-#  E. upstream_echo_ms = 0 (S422 and S423 off - the old drop) reproduces the
-#     stale read A guards against: the suite can fail
-#  F. S435: a read the gate let through whose key an invalidation took before
-#     its handler read it is gated again and fetches - it answered nil (A's
-#     and B's rare miss, each just after a replica's echo).  The window is
-#     held open: PERFCACHED_TEST_GATE_DELAY_US keeps every such read 300 ms
-#     between the gate and the handler, and another client changes the key
-#     on M meanwhile (M's push takes the copy from every shadow).  First with
-#     the re-gate off (PERFCACHED_TEST_LOST_OFF): nil - the suite can fail
-#  G. S451: a DELETE through the node, then a GET every 10 ms for 800 ms,
-#     40 keys another client set on M - every GET nil.  M's echo of the
-#     delete dropped the "g" mark the read-back left, and the read after it
-#     went to a replica that still held the key: the value just deleted
-#     (AR13 on 0.7.2-rc9, once in ~29,400 deletes - replicas a few ms
-#     behind; here 50 and 700).  With upstream_echo_ms = 0 (E's node) the
-#     old way answers the deleted value: the suite can fail
-# Usage: test/upechomastertest.sh [./perfcached]
+# upechomastertest.sh - a client reads the key it has just written through: a fetch inside the echo
+# window goes to the master, not a lagging replica (fakes: R1 50 ms, R2 700 ms behind M).
 set -u
 BIN=${1:-./perfcached}
 T=$(cd "$(dirname "$0")" && pwd)
@@ -185,6 +148,20 @@ elif what == "F":
     m.cmd("SET", "lost:1", "x2")       # M pushes: the copy goes from every shadow
     th.join(10)
     print("%s %s %.0f" % (first, res.get("g", "noreply"), (time.time() - t0) * 1000))
+elif what == "H":
+    import threading
+    bad = []
+    for i in range(5):
+        k, v = "gap:%d" % i, "h%d" % i
+        c.cmd("SET", k, v)
+        res = []
+        def held():
+            res.append(R(port).cmd("GET", k))
+        th = [threading.Thread(target=held) for _ in range(4)]
+        [t.start() for t in th]; [t.join(10) for t in th]
+        if any(g != v for g in res) or len(res) != 4:
+            bad.append((k, res))
+    print("%d/5 wrong%s" % (len(bad), (" - first: %s read %r" % bad[0]) if bad else ""))
 elif what == "G":
     m = R(pm)
     for i in range(40):
@@ -229,7 +206,7 @@ ready_writer
 r=$(drive E); case "$r" in "0/40 wrong") bad "E. with the echo handling off the stale read did not appear ($r) - this rig cannot show the defect";; *) ok "E. upstream_echo_ms = 0 (the old drop) reads stale after its own write: $r - the suite can fail";; esac
 r=$(drive G); case "$r" in "0/40 wrong") bad "G. with the echo handling off no read after a delete answered the deleted value ($r) - this rig cannot show S451";; *) ok "G. upstream_echo_ms = 0 reads the deleted value after its own delete: $r - the suite can fail";; esac
 stop
-# F (S435): the read held between the gate and its handler, its copy taken
+# F: the read held between the gate and its handler, its copy taken
 fakes; conf lostoff
 PERFCACHED_TEST_GATE_DELAY_US=300000; PERFCACHED_TEST_LOST_OFF=1
 export PERFCACHED_TEST_GATE_DELAY_US PERFCACHED_TEST_LOST_OFF
@@ -250,6 +227,16 @@ r=$(drive F); set -- $r; nl=$(st 'u.get("read_lost")')
 [ "${1:-}" = x1 ] && { [ "${2:-}" = x1 ] || [ "${2:-}" = x2 ]; } && [ "${nl:-0}" -ge 1 ] 2>/dev/null &&
 	ok "F. the held read whose copy an invalidation took is gated again and fetches: '${2:-}' (read_lost $nl)" ||
 	bad "F. the held read: '$r', read_lost '$nl' - expected x1, then x1 or x2, read_lost >= 1"
+stop
+# H: the read held past its record's drop while the mark lingers
+fakes; conf gap
+PERFCACHED_TEST_GATE_DELAY_US=300000; PERFCACHED_TEST_INV_GAP_US=600000
+export PERFCACHED_TEST_GATE_DELAY_US PERFCACHED_TEST_INV_GAP_US
+start gap || { bad "the node (gate delay, invalidation gap) did not start"; tail -5 "$D/gap.log"; exit 1; }
+unset PERFCACHED_TEST_GATE_DELAY_US PERFCACHED_TEST_INV_GAP_US
+ready_writer
+r=$(drive H); [ "$r" = "0/5 wrong" ] && ok "H. S481: a held read whose record an echo took, its mark left: the value every time ($r)" ||
+	bad "H. a held read, its record gone, its mark left: $r; read_lost $(st 'u.get("read_lost")'), of them with the re-gates spent $(st 'u.get("read_lost_spent")'), fetches by port $(fetches)"
 stop
 echo "upechomastertest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

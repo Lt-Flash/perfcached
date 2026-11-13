@@ -3,15 +3,9 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-members.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds membership pushed by the fleet (S107), recovery and maintenance after a
- * call, and the read-only accessors (perfd_member_info, the counters).
- */
-/* ---- S107: membership pushed by the fleet, members recovered ------------ */
+/* perfd-members.inc - part of perfd.c, #included in order (one translation unit): membership
+ * pushed by the fleet, recovery and maintenance after a call, the read-only accessors. */
+/* ---- membership pushed by the fleet, members recovered ------------------ */
 
 static int spare_for(perfd_t *p, int node)
 {
@@ -23,7 +17,7 @@ static int spare_for(perfd_t *p, int node)
 	return -1;
 }
 
-/* S474: does this handle spread at all?  Not the default policy, and not one that
+/* does this handle spread at all?  Not the default policy, and not one that
  * routes by key or holds subscriptions on its connection */
 static int spreading(const perfd_t *p)
 {
@@ -31,7 +25,7 @@ static int spreading(const perfd_t *p)
 		!p->route_ok && !p->route_hints && !p->ps_subs;
 }
 
-/* S474: a spreading handle takes its share of a member that came up: 1 in N of the
+/* a spreading handle takes its share of a member that came up: 1 in N of the
  * members serving moves, so the shares even out with no rush.  One draw an event */
 static void spread_arm(perfd_t *p, const struct pd_member *m)
 {
@@ -53,7 +47,7 @@ static void spread_arm(perfd_t *p, const struct pd_member *m)
 	}
 }
 
-/* S474: the member this handle works through stopped serving in full: any serving
+/* the member this handle works through stopped serving in full: any serving
  * standby, at the next call.  A failure this is not, so no failover */
 static void spread_leave(perfd_t *p)
 {
@@ -67,7 +61,7 @@ static void spread_leave(perfd_t *p)
 	p->spread_until_ms = now_ms_lib() + 300000;
 }
 
-/* S462: a member is routed to while ready or draining (C7) */
+/* a member is routed to while ready or draining */
 static int state_usable(const char *s, int sl)
 {
 	return sl < 0 || (sl == 5 && !memcmp(s, "ready", 5)) ||
@@ -97,11 +91,11 @@ static void member_join(perfd_t *p, const char *addr, int port, int node,
 	m->draining = draining;
 	m->down = 0;
 	m->why[0] = 0;
-	if (ready && node != p->active_node && !held)
-		dial_start(p, m, 1);
+	if (ready && node != p->active_node && !held && !p->async)
+		dial_start(p, m, 1);       /* async: one fd polled, no standby behind it */
 }
 
-/* S462: "state": a listed member's state changed */
+/* "state": a listed member's state changed */
 static void member_state(perfd_t *p, int node, int ready, int draining)
 {
 	struct pd_member *m = member_of(p, node);
@@ -117,7 +111,7 @@ static void member_state(perfd_t *p, int node, int ready, int draining)
 		spread_leave(p);
 		return;
 	}
-	if (ready && !was && spare_for(p, node) < 0) {
+	if (ready && !was && spare_for(p, node) < 0 && !p->async) {
 		dial_start(p, m, !was_spread);
 		return;
 	}
@@ -148,12 +142,8 @@ static void member_expel(perfd_t *p, int node)
 		p->active_stale = 1;           /* fail over before the next call */
 }
 
-/* a NOTIFY frame's tree: act on membership before the application's
- * hook sees it.  Children carry no member table; their parent hears
- * the same push on its own link.  Shapes (DESIGN 12if): a delivery is
- * {"method": "message"|"pmessage"|"pubsub_udp_pruned", "params": {..}};
- * the membership push is the flat map {"notify": "membership", "event",
- * "addr", "port", "node", "identity", "members"}. */
+/* a NOTIFY tree, membership acted on before the application's hook (a child's parent hears it too):
+ * a delivery is {"method": ..., "params": {..}}, the membership push a flat {"notify": ...} map */
 static void notify_internal(perfd_t *p, const unsigned char *tree, size_t n)
 {
 	struct pc_tv v;
@@ -168,27 +158,27 @@ static void notify_internal(perfd_t *p, const unsigned char *tree, size_t n)
 		pc_tv_free(&v);
 		return;
 	}
-	/* PS5: the daemon dropped the UDP stream and every subscription */
+	/* the daemon dropped the UDP stream and every subscription */
 	if (p->udp && pc_tv_streq(&v, pc_tv_get(&v, 0, "method"),
 	        "pubsub_udp_pruned")) {
 		udp_drop(p, 1);
 		pc_tv_free(&v);
 		return;
 	}
-	if (p->ignore_push ||              /* RV-10: a test's stale map */
+	if (p->ignore_push ||              /* a test's stale map */
 	    !pc_tv_streq(&v, pc_tv_get(&v, 0, "notify"), "membership")) {
 		pc_tv_free(&v);
 		return;
 	}
 	el = pc_tv_get_str(&v, 0, "event", event, sizeof event - 1);
 	al = pc_tv_get_str(&v, 0, "addr", addr, sizeof addr - 1);
-	sl = pc_tv_get_str(&v, 0, "state", state, sizeof state - 1);   /* S462 */
+	sl = pc_tv_get_str(&v, 0, "state", state, sizeof state - 1);
 	if (el < 0 || al < 0 || pc_tv_get_int(&v, 0, "port", &port) != 0 ||
 	        pc_tv_get_int(&v, 0, "node", &node) != 0 || !node) {
 		pc_tv_free(&v);
 		return;
 	}
-	/* S462: a fleet of another size than this handle holds - learn it again */
+	/* a fleet of another size than this handle holds - learn it again */
 	if (pc_tv_get_int(&v, 0, "members", &members) == 0 && members != p->nmem)
 		p->async_learn_ms = 0;
 	event[el] = 0;
@@ -204,14 +194,13 @@ static void notify_internal(perfd_t *p, const unsigned char *tree, size_t n)
 		member_expel(p, (int)node);
 }
 
-/* whatever the daemon pushed while nothing was being read: a bounded,
- * non-blocking look at the socket, so a push is acted on at the next
- * call rather than at the next reply */
-static void drain_notifications(perfd_t *p)
+/* whatever the daemon pushed while nothing was read: a bounded non-blocking look, so a push is
+ * acted on at the next call rather than at the next reply */
+static void drain_link(perfd_t *p)
 {
 	int rounds;
 
-	if (p->is_child || p->fd < 0 || p->poisoned)
+	if (p->fd < 0 || p->poisoned)
 		return;
 	for (rounds = 0; rounds < 8; rounds++) {
 		struct pollfd pf;
@@ -243,9 +232,24 @@ static void drain_notifications(perfd_t *p)
 	}
 }
 
-/* S107: members marked down are re-dialled in the background, one per
- * scan, at most once a second, on a backoff of 1 s doubling to 30 s -
- * while every request keeps flowing over the live links (S476: dial_failed backs off) */
+static void drain_notifications(perfd_t *p)
+{
+	if (!p->is_child)
+		drain_link(p);
+}
+
+/* a restart closes a link its caller has not used since.  Looked at before
+ * the request goes out, nothing is sent yet, so even a counter update can move */
+static int link_closed(perfd_t *t)
+{
+	if (!(t->nids - t->idhead) && !t->qlen &&
+	        now_ms_lib() - t->last_reply_ms >= LOOK_QUIET_MS)
+		drain_link(t);
+	return t->poisoned;
+}
+
+/* members marked down are re-dialled in the background, one per scan, at most once a second, on
+ * a backoff of 1 s doubling to 30 s (dial_failed), while requests flow over the live links */
 static void maybe_recover(perfd_t *p)
 {
 	long long now = now_ms_lib();
@@ -265,16 +269,8 @@ static void maybe_recover(perfd_t *p)
 	}
 }
 
-/* every successful call lands here: the link is known good NOW */
-/* RV-10: the reply that just arrived on @t said the daemon had to forward
- * it.  If this handle ROUTES, and the map the daemon routed by is not the
- * one the member list was learned under, the handle is behind: re-learn
- * now - maybe_refresh() does it right behind this - instead of at the
- * next push or the next refresh_ms.  A handle that does not route asks
- * any node on purpose, and the same stamp means the forward was not this
- * handle's doing (a holder mid-convergence); neither re-learns.  At most
- * once a second: a node that is itself behind must not make a client
- * ask for the member list on every reply. */
+/* the daemon forwarded @t's reply: a ROUTING handle whose map stamp differs is behind and re-learns
+ * now (maybe_refresh, right after), at most once a second so a lagging node cannot drive it */
 static void hint_check(perfd_t *p, perfd_t *t)
 {
 	long long now;
@@ -306,13 +302,8 @@ static void after_success(perfd_t *p)
 	maybe_recover(p);
 }
 
-/* S107: a call routed to a standby (S35) is a successful call too, and
- * the handle's maintenance - the pushes waiting on its own link, the
- * idle standbys, the members to recover - must not wait for a key that
- * happens to live on the active node.  Measured: a client whose keys
- * all routed away from its active never read the "joined" push sitting
- * in that socket, and learned nothing for as long as that held.  The
- * active's own last_reply_ms is NOT touched: it did not answer. */
+/* a call routed to a standby is a successful call too: maintenance must not wait for a key on the
+ * active node.  The active's own last_reply_ms is NOT touched: it did not answer. */
 static void after_routed(perfd_t *p, perfd_t *t)
 {
 	t->last_reply_ms = now_ms_lib();   /* the standby did */
@@ -365,13 +356,8 @@ static void apply_policy(perfd_t *p)
 		return;
 	switch (p->policy) {
 	case PERFD_POLICY_LEAST_CONN:
-		/* POWER OF TWO CHOICES, not strict least-loaded.  Picking
-		 * the emptiest member outright makes every client choose
-		 * the SAME one - measured: 11 of 12 clients on one node,
-		 * which is the herding par 6.5 already rejects for
-		 * write-time placement.  Sampling two and taking the
-		 * better spreads without coordination and still avoids
-		 * the worst node. */
+		/* POWER OF TWO CHOICES: the emptiest member outright makes every client choose the
+		 * SAME one; the better of two spreads without coordination and avoids the worst */
 		if (p->nmem >= 2) {
 			int a = (int)(pd_rand(p) % (unsigned int)p->nmem);
 			int b = (int)(pd_rand(p) % (unsigned int)p->nmem);
@@ -385,9 +371,8 @@ static void apply_policy(perfd_t *p)
 		}
 		break;
 	case PERFD_POLICY_WEIGHTED: {
-		/* random, weighted BY free space - the name's promise.
-		 * Taking the maximum is not weighting, it is a tie-break
-		 * that every client resolves identically. */
+		/* random, weighted BY free space: the maximum would be a tie-break every client
+		 * resolves identically */
 		long total = 0, r;
 
 		for (i = 0; i < p->nmem; i++)
@@ -409,10 +394,8 @@ static void apply_policy(perfd_t *p)
 		break;
 	}
 	default: {
-		/* round robin: random start, step.  It skipped NOTHING
-		 * before C7 - not even a member this client had already
-		 * seen fail - so the cursor is advanced past unusable
-		 * members rather than landing on one and failing over. */
+		/* round robin: random start, step, past unusable members rather than landing on one
+		 * and failing over */
 		int tries;
 
 		best = -1;
@@ -462,12 +445,8 @@ int perfd_spare_count(const perfd_t *p)
 	return p ? p->nspare : 0;
 }
 
-/* S70: what this handle knows, from its own dials, about member @i.
- * "active" serves this handle; "standby" has a spare open from here;
- * "down" is a member this handle failed to dial, and @why says how -
- * nothing is inferred from anyone else's view; "not-ready" the member
- * itself says it is not serving data yet; "idle" is fine as far as
- * known with no connection held from here. */
+/* what this handle knows of member @i from its own dials: "down" it failed to dial (@why how), not
+ * inferred from others' views; "not-ready" by the member's own word; "idle" fine, no link held */
 const char *perfd_member_state(const perfd_t *p, int i, char *why,
 		size_t wcap)
 {
@@ -492,7 +471,7 @@ const char *perfd_member_state(const perfd_t *p, int i, char *why,
 	return "idle";
 }
 
-/* S70: the daemon version the member list reported; "" until a member
+/* the daemon version the member list reported; "" until a member
  * list has been read (standbys off, or a daemon older than the field) */
 const char *perfd_server_version(const perfd_t *p)
 {

@@ -1,19 +1,5 @@
-/* crc32ctest.c - CRC32C (crc32c.c; the 0.7.2 split, wave 1): the published
- * vectors, chaining, and every length and alignment against a bitwise
- * reference written here.  The backend is whichever this CPU gets: the
- * lazy choice on the first call, then pc_crc32c_select's.
- *
- *   A  the check value ("123456789") and RFC 3720's four 32-byte vectors,
- *      on the first call's lazy choice
- *   B  nothing hashed: 0 from 0, and any running value unchanged
- *   C  chaining: a running CRC carried across any split of a buffer is
- *      the CRC of the whole - how the snapshot writer hashes as it goes
- *   D  lengths 0..64 at offsets 0..7 equal the reference: the 8-byte
- *      loop, its tail, unaligned starts
- *   E  pc_crc32c_select: a name, and the same answers after it
- *   F  pc_crc32c_x3 (S466): three buffers at once equal three single
- *      CRCs - equal and unequal lengths 0..72, unaligned starts
- */
+/* crc32ctest.c - CRC32C: published vectors, chaining, every length and alignment against a bitwise
+ * reference, on whichever backend this CPU gets (the lazy first call, then pc_crc32c_select's). */
 #include <stdio.h>
 #include <string.h>
 #include "crc32c.h"
@@ -69,34 +55,34 @@ int main(void)
 		buf[i] = (unsigned char)x;
 	}
 
-	/* A */
+	/* A: the check value ("123456789") and RFC 3720's four 32-byte vectors, lazy choice */
 	CHK(vectors(), "A: 123456789 -> e3069283; 32 x 00, 32 x ff, 00..1f, 1f..00 - RFC 3720's four");
 	CHK(ref(0, (const unsigned char *)"123456789", 9) == 0xE3069283u, "A: and the reference agrees");
 
-	/* B */
+	/* B: nothing hashed - 0 from 0, a running value unchanged */
 	CHK(pc_crc32c(0, buf, 0) == 0 && pc_crc32c(0x12345678u, buf, 0) == 0x12345678u,
 		"B: nothing hashed - 0 from 0, a running value unchanged");
 
-	/* C */
+	/* C: chaining - a CRC carried across any split equals the whole's (the snapshot writer) */
 	for (bad = 0, k = 0; k <= 64; k++)
 		bad += pc_crc32c(pc_crc32c(0, buf, (size_t)k), buf + k, (size_t)(64 - k)) !=
 			pc_crc32c(0, buf, 64);
 	CHK(bad == 0, "C: carried across each of 65 splits of 64 bytes - the whole's CRC");
 
-	/* D */
+	/* D: lengths 0..64 at offsets 0..7 equal the reference: 8-byte loop, tail, unaligned */
 	for (bad = 0, k = 0; k < 8; k++)
 		for (n = 0; n <= 64; n++)
 			bad += pc_crc32c(0x5A5A5A5Au, buf + k, (size_t)n) != ref(0x5A5A5A5Au, buf + k, (size_t)n);
 	CHK(bad == 0, "D: 65 lengths x 8 offsets - all equal to the reference");
 
-	/* E */
+	/* E: pc_crc32c_select names a backend and gives the same answers after it */
 	be = pc_crc32c_select();
 	CHK(be && (!strcmp(be, "hardware") || !strcmp(be, "software")), "E: selected - %s", be ? be : "(null)");
 	for (bad = 0, n = 0; n <= 64; n++)
 		bad += pc_crc32c(0, buf + 3, (size_t)n) != ref(0, buf + 3, (size_t)n);
 	CHK(vectors() && bad == 0, "E: and after it, the same answers");
 
-	/* F */
+	/* F: pc_crc32c_x3 equals three single CRCs - lengths 0..72, equal and unequal, unaligned */
 	bad = 0;
 	for (n = 0; n <= 72 && !bad; n++)
 		for (k = 0; k < 8 && !bad; k++) {

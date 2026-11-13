@@ -1,16 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * mgetextest.c - G8 (DESIGN 12nh): libperfd's two mgets against one node
- * of a fleet, driven by test/mgetfantest.sh.  The keys are <prefix>NNN for
- * NNN below <n> (written as "v-<key>"), then <m> keys zzNNN nobody holds.
- * Prints one line:
- *   mget rc=<rc> kind=<perfd_error_kind> found=<n> bad=<n> |
- *   ex rc=<rc> found=<n> absent=<n> unanswered=<n> bad=<n>
- * bad: a value found that is not the one written, or (ex) a status out of
- * range, a value with an absent or unanswered status, or one missing with
- * found.  Usage: mgetextest <port> <col> <prefix> <n> <m>
- */
+/* mgetextest.c - libperfd's two mgets against one node of a fleet (test/mgetfantest.sh): <n> keys
+ * written, then <m> nobody holds; bad counts a wrong value or an inconsistent status. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

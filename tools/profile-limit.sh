@@ -1,25 +1,6 @@
 #!/bin/sh
-# profile-limit.sh - 0.6.0 step 2's instrument (DESIGN 12li): what a node
-# spends its CPU on while a load drives it to its limit, so S361-S364 are
-# built only where the network and the system calls are a real share.
-#
-# Runs ON the node, as root, while a load generator elsewhere saturates it
-# (pcbench / perfload from client hosts - the benchmarks are client-bound,
-# so one client host is rarely enough).  It does not generate load.
-#
-#   sh profile-limit.sh [seconds=30] [http port=8080] [outdir=/var/tmp/pcprof.<time>]
-#   PID=<pid> picks the daemon when several run on the host (a local fleet)
-#
-# Over the same window it takes:
-#   - /stats before and after: requests (both doors, every dialect), the
-#     workers' epoll waits / events and client read() / write() calls, the
-#     cluster plane's and the pub/sub relay's UDP syscalls against their
-#     datagrams (src/iostat.c), the process's user and system CPU;
-#   - perf record -g on the daemon (when perf is installed): the samples'
-#     split between the kernel and the daemon, and the top symbols.
-# and writes summary.txt with the figures that decide:
-#   requests/s and CPU% (user, sys); system calls per request; events per
-#   epoll wait; datagrams per UDP syscall; the kernel's share of samples.
+# profile-limit.sh [seconds=30] [http port=8080] [outdir] - run ON a node at its limit (load from elsewhere;
+# PID= picks the daemon): /stats deltas and perf samples over one window, summarised in summary.txt.
 set -u
 DUR=${1:-30}
 HTTP=${2:-8080}

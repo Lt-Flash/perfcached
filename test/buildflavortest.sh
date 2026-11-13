@@ -1,20 +1,6 @@
 #!/bin/sh
-# buildflavortest.sh - S357: make menuconfig chooses a build flavor (release |
-# debug | asan) and the binary says which one it is.
-#  1. menuconfig writes each flavor to config.mk and make reads it back
-#     (make print-build); PC_BUILD on the command line overrides config.mk;
-#     SAN set by hand makes the build an asan one; a flavor make or menuconfig
-#     does not know is refused
-#  2. the release flavor's flags are today's: -O2 -g, no -Og, no sanitizer,
-#     no arena debug - no surprise optimisation change in what ships
-#  3. -V and /stats process.build: the release binary under test says
-#     nothing extra and "release"; a debug build of this tree says "debug"
-#  4. the asan flavor's flags reach the link with the runtimes static: a
-#     program with a use after free built with them aborts with an
-#     AddressSanitizer report and needs no libasan (skipped on musl, where
-#     the sanitizers do not run)
-# Works on a copy of the tree, so the checkout's own config.mk is untouched.
-# Usage: test/buildflavortest.sh ./perfcached
+# buildflavortest.sh - menuconfig's build flavor (release | debug | asan) round-trips through config.mk,
+# keeps release's flags, reaches the link, and the binary says which it is; works on a copy of the tree.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -31,12 +17,8 @@ mkdir -p "$D/t"
 tar -cf - --exclude=./.git --exclude='*.o' --exclude='*.a' --exclude=config.mk . 2>/dev/null |
 	(cd "$D/t" && tar -xf -) || { bad "cannot copy the tree"; exit 1; }
 T="$D/t"
-# the copy's makes run clean of the make that runs this suite: under `make
-# check-asan` the outer make hands SAN=... to its recipes TWICE - in MAKEFLAGS
-# (with -w) and, as GNU make exports a command-line variable, in the
-# environment - and either one turns every flavor here into asan.  So both
-# go, with the other build variables an outer make may pass: config.mk and
-# this suite's own command lines decide here, nothing inherited.
+# the copy's makes run clean of the outer make: under `make check-asan` SAN=... arrives in MAKEFLAGS
+# and the environment, and would turn every flavor here into asan
 M() { env -u MAKEFLAGS -u MAKELEVEL -u MAKEOVERRIDES -u MFLAGS \
 	-u SAN -u CFLAGS -u LDLIBS -u PC_BUILD -u PC_EDITION -u PC_ALLOC -u PC_MAIL \
 	make --no-print-directory "$@"; }
@@ -73,8 +55,7 @@ echo "$D2" | grep -q -- '-Og -g3 -fno-omit-frame-pointer' && echo "$D2" | grep -
 	ok "2. debug: -Og -g3 -fno-omit-frame-pointer -DPCACHE_ARENA_DEBUG" || bad "2. debug flags: $D2"
 
 # ---- 3. the binary says what it is -------------------------------------------
-# what the binary under test IS, read from the binary: the sanitizer
-# ladder (make check-asan) hands this suite an asan build
+# read from the binary under test: make check-asan hands this suite an asan build
 EXP=release
 grep -q __asan_init "$BIN" && EXP=asan
 V=$("$BIN" -V | head -1)

@@ -1,16 +1,6 @@
 #!/bin/sh
-# electboundtest.sh - CH-19: a member's election defers to a live higher
-# address only so long.  The highest live address self-promotes, and every
-# other member waits for it - for ever, while that address beats as a
-# member and never takes mastership (a replayed ALIVE from it looks exactly
-# so).  The wait is now bounded by the higher node's own probe hold and a
-# master's death (MPROBE_HOLD_MS + MASTER_DEAD_MS, 38 s); then it promotes.
-# Three unicast nodes; node 3, the highest address, runs with
-# PERFCACHED_TEST_NO_PROMOTE - it beats and follows, and never promotes.
-#   1  node 1, the founder and master, is killed: node 2 defers to node 3,
-#      and takes mastership within the bound - said in its log
-#   2  node 3 follows it; the cluster id is unchanged
-# Usage: test/electboundtest.sh [./perfcached]
+# electboundtest.sh - a member's election defers to a live higher address that never promotes only
+# so long (MPROBE_HOLD_MS + MASTER_DEAD_MS, 38 s); then it promotes itself.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -70,17 +60,22 @@ up() { st "$1" 'r["cluster"]["peers_up"]'; }
 role() { st "$1" 'r["cluster"]["role"]'; }
 
 conf 1; conf 2; conf 3
-# node 1 founds alone first: who founds among nodes started together is a
-# race, and the suite needs node 1 the master and node 3 (never promoting,
-# which does not stop a founding) a member
+# node 1 founds alone first: who founds among nodes started together is a race, and node 3
+# (never promoting, which does not stop a founding) must be a member
 start 1
 wait_for 30 '[ "$(role 1)" = master ]' || bad "node 1 did not found the fleet"
 start 2
 PERFCACHED_TEST_NO_PROMOTE=1 "$BIN" -f "$D/n3.conf" >> "$D/n3.log" 2>&1 & echo $! > "$D/n3.pid"
-wait_for 40 '[ "$(up 1)$(up 2)$(up 3)" = 222 ] && [ "$(role 1)" = master ]' \
+# peers_up counts a joiner still CONNECTING, which never elects: all three ready before the kill
+wait_for 40 '[ "$(up 1)$(up 2)$(up 3)" = 222 ] && [ "$(role 1)" = master ] && [ "$(st 1 "r[\"state\"]")$(st 2 "r[\"state\"]")$(st 3 "r[\"state\"]")" = readyreadyready ]' \
 	|| bad "the fleet did not form with node 1 the master: peers $(up 1)/$(up 2)/$(up 3), role $(role 1)"
 grep -q "PERFCACHED_TEST_NO_PROMOTE" "$D/n3.log" || bad "node 3 does not announce its test flag"
 C0=$(st 2 'r["cluster"]["cluster_id"]')
+# a standby node 2 would take over at once, rightly: the case is node 3 named standby, which a restage
+# does once node 3 is usable
+N3=$(st 3 'r["cluster"]["node"]')
+wait_for 30 '[ "$(st 1 "r[\"cluster\"][\"map\"][\"backup\"]")" = "$N3" ]' \
+	|| bad "node 1's map never named node 3 ($N3) its standby: backup $(st 1 'r["cluster"]["map"]["backup"]')"
 
 echo "--- 1: the master is killed; the highest address never promotes"
 kill -9 "$(cat "$D/n1.pid")"; rm -f "$D/n1.pid"

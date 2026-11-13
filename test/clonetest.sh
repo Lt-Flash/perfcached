@@ -1,19 +1,6 @@
 #!/bin/sh
-# clonetest.sh — a node whose identity file was copied with the machine.
-#
-# The identity is persisted, so cloning a VM or container clones it too,
-# and two daemons then claim to BE each other.  Everything built on
-# identity stops meaning anything: whether a node restarted, who should
-# backfill it, whether a keyspace was already sent.  The master refuses
-# such a join outright and the clone stops, rather than serving clients
-# stale data under a name that belongs to someone else.
-#
-# Asserted:
-#  - a genuine RESTART (same identity, same address) is still admitted;
-#  - a CLONE (same identity, different address) is refused and exits;
-#  - it says why, and names the fix;
-#  - the original is undisturbed.
-# usage: test/clonetest.sh [./perfcached]
+# clonetest.sh - a node whose identity file was copied with the machine: a genuine restart is still
+# admitted, a clone (same identity, other address) is refused, says why and exits.
 set -u
 
 BIN=${1:-./perfcached}
@@ -22,10 +9,8 @@ SEC=cl-client-secret
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a
+# reused pid never hits a stranger; the name-bound pattern stays as a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -51,11 +36,8 @@ tcp = 127.0.50.$1:1796$1
 [cluster]
 multicast = 239.255.77.157:17257
 advertise = 127.0.50.$1
-# S326: auto now derives the identity from the platform (salted by the
-# state directory - here the WAL directory), which makes a copied file
-# NOT a clone: the derived identity overrides it.  This suite tests the
-# refusal a duplicate identity still gets where nothing can be derived -
-# the identity file alone, as a StatefulSet or an LXC without a MAC has
+# auto derives the identity from the platform, so a copied file is no clone; this
+# suite tests the file alone, where a duplicate identity is still refused
 identity_source = file
 pull_timeout_ms = 400
 mode = store
@@ -85,7 +67,13 @@ alive() { pgrep -f "[p]erfcached -f $D/n$1.conf" >/dev/null 2>&1; }
 mk 1; mk 2; mk 3
 start 1 a || { echo "node1 did not start"; exit 1; }
 start 2 a || { echo "node2 did not start"; exit 1; }
-sleep 6
+# node 2 a member before its restarts: a joiner is CONNECTING until its links answer
+st() { ./perfcli -h 127.0.50.$1 -p 1796$1 -a $SEC -q -j '{"method":"stats"}' 2>/dev/null \
+	| python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+i=0
+while [ $i -lt 300 ] && { [ "$(st 1)" != "ready 1" ] || [ "$(st 2)" != "ready 1" ]; }; do
+	sleep 0.1; i=$((i+1))
+done
 
 # a genuine restart must still be admitted: same identity, same address
 pkill -9 -f "[p]erfcached -f $D/n2.conf"; sleep 8
@@ -94,17 +82,12 @@ sleep 5
 alive 2 && ok "a genuine restart (same identity, same address) is admitted" \
 	|| bad "a genuine restart was refused"
 
-# A restart FASTER than its predecessor ages out must still be admitted,
-# not shot for impersonating itself.  The master stays silent while the
-# answer is ambiguous and the joiner retries.
+# a restart FASTER than its predecessor ages out must still be admitted: the master stays silent
+# while the answer is ambiguous and the joiner retries
 pkill -9 -f "[p]erfcached -f $D/n2.conf"; sleep 1
 start 2 c || bad "a fast restart never came up"
-# Assert the EFFECT - it ends up a working member of a fleet that agrees -
-# not a particular log line.  Killing the master and restarting it inside
-# the detection window legitimately produces either path: it may join the
-# survivor, or found its own and reconcile ("yielding mastership ...
-# re-joining").  An earlier version of this grepped for "joined as node"
-# and failed the second path, which is a correct outcome.
+# assert the EFFECT, a working member of a fleet that agrees: a master restarted inside the
+# detection window may join the survivor or found its own and reconcile - both are right
 i=0
 while [ $i -lt 45 ]; do
 	alive 2 || break
@@ -125,11 +108,8 @@ alive 2 && [ "$UP" = 1 ] \
 # now the clone: node3 gets node2's identity file, as a copied disk would
 cp "$D/w2/node-identity" "$D/w3/node-identity"
 start 3 a
-# Ambiguous for one grace window (3 x PEER_UP_MS = 30 s), then condemned
-# at the clone's next join retry.  Poll for the shutdown rather than
-# sleeping the window: a fixed 30 s sleep was written when PEER_UP_MS
-# was 5 s and sampled the very second the window closed once it became
-# 10 s (S108).  75 s is two windows and a retry.
+# ambiguous for one grace window (3 x PEER_UP_MS = 30 s), then condemned at the clone's next join
+# retry: poll for the shutdown, up to 75 s (two windows and a retry)
 i=0
 while [ $i -lt 75 ]; do
 	alive 3 || break
@@ -144,9 +124,8 @@ grep -q "already held by a live member" "$D/n3.a.log" 2>/dev/null \
 	&& ok "it said why" || bad "no duplicate-identity message in its log"
 grep -q "node-identity" "$D/n3.a.log" 2>/dev/null \
 	&& ok "it named the fix" || bad "the message does not say how to fix it"
-# S108: while the master holds the join it must SAY so, and the held
-# joiner must not found a cluster of its own - a silent hold made the
-# clone a second master under the duplicate identity.
+# while the master holds the join it must SAY so, and the held joiner must not found a cluster of
+# its own (a silent hold made the clone a second master)
 grep -q "holding it to see" "$D/n1.a.log" "$D/n2.c.log" 2>/dev/null \
 	&& ok "the master held the join out loud" || bad "no 'holding' line on the master"
 grep -q "is holding this join" "$D/n3.a.log" 2>/dev/null \

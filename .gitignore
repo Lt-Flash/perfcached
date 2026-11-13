@@ -71,7 +71,10 @@ routedpairtest
 movedhinttest
 workerbaltest
 respreadtest
+privmovetest
 frozentest
+quietlinktest
+asyncstatetest
 mgetextest
 libtest
 liballoc
@@ -139,3 +142,5 @@ perfcached.release
 !/lang/php/README.md
 !/lang/php/symfony/
 !/lang/php/debian/
+__pycache__/
+*.pyc

@@ -1,13 +1,6 @@
 #!/bin/sh
-# clientsfleettest.sh - S160: the fleet-wide clients figure rides the
-# membership plane.  On a three-node fleet every member's open count
-# (and its dialect split) appears in /members on EVERY node, at most one
-# heartbeat stale, and the sum equals the sum of the members' own
-# /stats clients.open; a standalone daemon publishes no members, so the
-# page's denominator is absent there rather than "N / N".
-# Fail-first: v0.4.0-rc1's ALIVE has no clients field, so /members
-# carries no `clients` object.
-# Usage: test/clientsfleettest.sh [./perfcached]
+# clientsfleettest.sh - each member's open-client count reaches /members on every node via the membership plane,
+# summing to the members' own figures; standalone shows none.  Usage: test/clientsfleettest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -118,6 +111,7 @@ sa = get(18494, "/members")
 check(sa.get("members") == [], "a standalone daemon publishes no members, so the page has no denominator to show")
 check(get(18494, "/stats").get("clients", {}).get("open") == 0, "while its own /stats count is still there")
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"

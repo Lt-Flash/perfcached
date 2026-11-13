@@ -1,30 +1,6 @@
 #!/bin/sh
-# rdbkilltest.sh - RV-14: a node killed while a snapshot is being written.
-#
-# Snapshots were tested for landing atomically when they finish, and nodes
-# for surviving kill -9 at random moments - but nothing killed a node WHILE
-# a snapshot was in flight.  That is where three things must hold:
-#   1. recovery uses the last PUBLISHED snapshot plus the WAL after its
-#      marker, so every acknowledged write is there - the ones made while
-#      the killed snapshot ran included;
-#   2. while that snapshot ran, the WAL ring wrapped and recycled only what
-#      the published snapshot covers, never what the half-written one would
-#      have (seg_hot against safe_marker, S215) - the ring here is sized so
-#      it DOES wrap during the save, or this arm would test nothing;
-#   3. the dead snapshot's temp file does not outlive the restart.  It did:
-#      nothing removed PC_RDB_FILE.tmp.<pid>, a table-sized file per crash
-#      on the WAL's volume - and because it is opened O_EXCL under the pid,
-#      a daemon back with the SAME pid (always, as pid 1 in a container)
-#      could never write a snapshot again, nor, since S229, heal.
-# Arms: kill -9 mid-save twice (debris would accumulate), then a stale temp
-# planted under the running daemon's own pid (the same-pid case): the next
-# snapshot must still succeed.
-# Not an arm, and why: "killed between the rename and the directory fsync"
-# is a POWER-loss property; a killed process cannot lose a rename the
-# kernel has already made, so kill -9 cannot test it.
-# FAIL-FIRST: the build before RV-14 keeps both temp files and fails the
-# snapshot under the planted name.
-# Usage: test/rdbkilltest.sh [./perfcached]
+# rdbkilltest.sh - a node killed mid-snapshot: recovery has every acked write, the ring recycled only
+# what the published snapshot covers, and no temp file is left to block the next save.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -41,10 +17,8 @@ if ss -ltn 2>/dev/null | grep -qE ":$PORT[[:space:]]"; then
 	echo "rdbkilltest: port $PORT already bound" >&2; exit 1
 fi
 mkdir -p "$D/wal"
-# a 24 MB ring: the fill before the first snapshot (10 MB) plus everything
-# after it (~16 MB) wraps it during the second save, without ever holding
-# more than it can since the published marker; snapshots throttled to
-# 8 MB/s so the second one (~22 MB) is in flight for seconds
+# a 24 MB ring: the 10 MB fill plus ~16 MB after it wraps it during the second save; snapshots
+# throttled to 8 MB/s so the second one (~22 MB) is in flight for seconds
 cat > "$D/n.conf" <<CONF
 [daemon]
 workers = 2
@@ -118,11 +92,8 @@ elif op == "midsave":              # fill B, start a slow save, write C during i
     out("STARTED", call("save").get("result", {}).get("started"))
     time.sleep(0.3)
     out("C", fill(lo + 12000, lo + 16000))
-    # a write is acknowledged at its producer ring, and kill -9 takes what
-    # the WAL thread has not drained yet - the documented semantics.
-    # Killed the instant the last write was answered, GitHub's rc37 run lost
-    # 1 of 42,000: the test claimed more than an ack promises.  The sync
-    # barrier puts every acknowledged write in the log file first.
+    # an ack is at the producer ring and kill -9 takes what the WAL thread has not drained:
+    # the sync barrier puts every acknowledged write in the log file first
     out("SYNC", json.dumps(call("sync").get("result")))
     st = stats()
     out("RUNNING", st["rdb"]["running"]); out("RECYCLED_DURING", st["wal"]["recycles"] - r0)

@@ -1,13 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * main.c — perfcached entry point.
- *
- * S5 scope: CLI + config load/validate/dump.  Actual daemon startup
- * (threads, listeners) arrives with S6 - until then a bare run loads the
- * config and exits NONZERO with a clear message, so nothing scripted can
- * mistake this build for a serving daemon (no false green).
- */
+/* main.c - perfcached entry point: command line, config check and dump, then the daemon. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,14 +15,16 @@
 #include "wal.h"
 #include "rdb.h"
 #include "upgrade.h"
-#include "reload.h"                     /* 12nw */
+#include "reload.h"
 
+#include "tls.h"
+#include "uptls.h"
 #include "version.h"
 #include "uring.h"
 #include "busypoll.h"
-#include "respmap.h"                    /* S432: -C reports runtime maps */
-#include "pcaddr.h"                     /* 12np: -C reports the IPv6 guard */
-#include "memguard.h"                   /* S406: -C reports the cgroup fit */
+#include "respmap.h"
+#include "pcaddr.h"
+#include "memguard.h"
 #ifndef PC_BUILD_REV
 #define PC_BUILD_REV "unknown"
 #endif
@@ -37,11 +32,12 @@
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s -f <config> [-C] [-E] [-D] [-V] [-h] | -I <dir>\n"
+		"usage: %s -f <config> [-C | -E | -H <pid>] [-D]\n"
+		"       %s -I|-P|-W|-R <dir> | -K <file> [-f <config>] | -V | -h\n"
 		"  -f <file>  configuration file (required)\n"
 		"  -C         load + validate the config, report, exit\n"
 		"  -E         dump the normalized effective config (implies -C)\n"
-		"  -D         stay in the foreground (S6+)\n"
+		"  -D         run in the foreground - the only mode, so -D changes nothing\n"
 		"  -I <dir>   print the storage identity of <dir> and exit\n"
 		"  -P <dir>   identity + WAL probe of <dir> (always measured),\n"
 		"             policy recommendation, exit\n"
@@ -52,8 +48,10 @@ static void usage(const char *argv0)
 		"             trusted_keys); print its sha256, exit 0 if good\n"
 		"  -H <pid>   reload the running daemon <pid> (systemctl reload):\n"
 		"             check the file, signal it, print its answer; exit 0\n"
-		"             applied, 1 refused - see DESIGN 12nw for what reloads\n"
-		"  -V         print version and exit\n", argv0);
+		"             applied, 1 refused (what reloads: GUIDE.md,\n"
+		"             \"Reloading the configuration\")\n"
+		"  -V         print version and exit\n"
+		"  -h         this help\n", argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -62,7 +60,7 @@ int main(int argc, char **argv)
 	const char *cfile = NULL;
 	int opt, check = 0, dump = 0, foreground = 0;
 	const char *kfile = NULL;
-	long hup_pid = 0;                       /* 12nw: -H */
+	long hup_pid = 0;                       /* -H */
 	struct pc_keymap *km;
 
 	while ((opt = getopt(argc, argv, "f:CEDI:P:W:R:K:H:Vh")) != -1) {
@@ -95,10 +93,10 @@ int main(int argc, char **argv)
 				"%llu, crc ok\n", n, ncols, marker);
 			return 0;
 		}
-		case 'H':                  /* 12nw: the ExecReload side */
+		case 'H':                  /* the ExecReload side */
 			hup_pid = atol(optarg);
 			break;
-		case 'K':                  /* UP5: after -f, wherever it stands */
+		case 'K':                  /* after -f, wherever it stands */
 			kfile = optarg;
 			break;
 		case 'W': {
@@ -125,21 +123,22 @@ int main(int argc, char **argv)
 		}
 		case 'V':
 		{
-			/* S282: an allocator other than the C library's is named;
+			/* an allocator other than the C library's is named;
 			 * the default line is unchanged */
 			const char *al = strcmp(PC_ALLOC_NAME, "libc") ?
 				", allocator " PC_ALLOC_NAME : "";
-			/* S357: a debug or sanitizer build says so beside the
+			/* a debug or sanitizer build says so beside the
 			 * revision; a release line is unchanged */
 			const char *fl = strcmp(PC_BUILD_FLAVOR, "release") ?
 				", " PC_BUILD_FLAVOR : "";
 #ifdef PC_EDITION_STANDALONE
 			printf("perfcached %s (%s%s) standalone%s\n", PC_VERSION,
-				PC_BUILD_REV, fl, al);     /* S250 */
+				PC_BUILD_REV, fl, al);
 #else
 			printf("perfcached %s (%s%s)%s\n", PC_VERSION, PC_BUILD_REV,
 				fl, al);
 #endif
+			printf("tls: %s\n", pc_tls_version());
 			return 0;
 		}
 		case 'h': usage(argv[0]); return 0;
@@ -153,9 +152,9 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	if (hup_pid)                            /* 12nw */
+	if (hup_pid)
 		return pc_reload_client(cfile, hup_pid);
-	/* 12nw: what the file said, key by key, for a reload to compare with */
+	/* what the file said, key by key, for a reload to compare with */
 	km = calloc(1, sizeof *km);
 	if (!km) {
 		LM_ERR("out of memory\n");
@@ -167,6 +166,38 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	pc_reload_init(cfile, km, cfg.state_dir);
+	{       /* the TLS doors' pair, loaded now - -C checks it, a start needs it */
+		int t;
+
+		for (t = 0; t < cfg.n_listen && !cfg.listen[t].tls; t++)
+			;
+		if (t < cfg.n_listen) {
+			char e[400];
+
+			if (pc_tls_load(cfg.tls_cert, cfg.tls_key, cfg.tls_min13, e, sizeof e) != 0) {
+				LM_ERR("TLS: %s - not starting\n", e);
+				free(km);
+				return 1;
+			}
+			LM_NOTICE("TLS: %s, certificate %s, TLS %s or later\n", pc_tls_version(),
+				cfg.tls_cert, cfg.tls_min13 ? "1.3" : "1.2");
+		}
+		for (t = 0; t < cfg.n_col; t++) {        /* the rediss:// upstreams' files too */
+			const struct pc_collection *cc = &cfg.col[t];
+			struct up_tls *ut;
+			char e[400];
+
+			if (!cc->up_tls)
+				continue;
+			if (!(ut = uptls_new(cc->up_tls_ca, cc->up_tls_cert, cc->up_tls_key,
+			        cc->up_tls_verify, e, sizeof e))) {
+				LM_ERR("[collection %s] %s - not starting\n", cc->name, e);
+				free(km);
+				return 1;
+			}
+			uptls_free(ut);
+		}
+	}
 	if (kfile) {
 		opt = pc_upg_check_file(kfile, &cfg.upgrade);
 		pc_config_free(&cfg);
@@ -179,10 +210,10 @@ int main(int argc, char **argv)
 			pc_config_dump(&cfg);
 		printf("config OK: %d collection(s), %d listener(s), %d worker(s)\n",
 			cfg.n_col, cfg.n_listen, cfg.workers);
-		if (cfg.io_backend == PC_IO_EPOLL) {      /* S361 */
+		if (cfg.io_backend == PC_IO_EPOLL) {
 			struct pc_uring_verdict v;
 
-			/* S379: whether the other backend would run here */
+			/* whether the other backend would run here */
 			pc_uring_check(&v);
 			if (v.ok)
 				printf("io: epoll (io = epoll) - io_uring is usable on "
@@ -207,7 +238,7 @@ int main(int argc, char **argv)
 				printf("io: epoll - io_uring is not usable on this "
 					"host: %s\n", v.why);
 		}
-		{                                         /* 12np */
+		{
 			const char *why;
 
 			if (pc_ipv6_usable(&why))
@@ -217,7 +248,7 @@ int main(int argc, char **argv)
 					"listeners and every name resolved are IPv4 only "
 					"(no AAAA query goes out)\n", why);
 		}
-		{                                         /* S432 */
+		{
 			int nm = pc_respmap_count_file(cfg.state_dir);
 
 			if (nm > 0)
@@ -230,7 +261,7 @@ int main(int argc, char **argv)
 					"refuse to start until it is fixed or moved away\n",
 					cfg.state_dir);
 		}
-		if (cfg.busy_poll_us > 0) {               /* S363 */
+		if (cfg.busy_poll_us > 0) {
 			char why[200];
 			struct pc_uring_verdict v;
 			int ur = cfg.io_backend == PC_IO_URING;
@@ -248,7 +279,7 @@ int main(int argc, char **argv)
 					"it - the workers would run without: %s\n",
 					cfg.busy_poll_us, why);
 		}
-		{                                         /* S406 */
+		{
 			char mem[512];
 			int nofit = pc_memguard_precheck(&cfg, mem, sizeof mem);
 

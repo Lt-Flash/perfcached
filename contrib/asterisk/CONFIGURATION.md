@@ -25,18 +25,21 @@ setting is refused, not ignored.
 | `policy` | binary | `failover` | `failover`, `round_robin`, `least_conn`, `weighted` |
 | `spares` | binary | `0` | `none` or -1..64 |
 | `route_keys` | binary | `no` | `yes` or `no` |
-| `keepalive_s` | binary | `30` | -1..86400, -1 = off |
+| `keepalive_s` | binary | `30` | -1..86400, -1 = off, 0 = libperfd's 30 |
 
 - **`protocol`** - `binary` is perfcached's native door through libperfd:
-  encrypted off loopback, and it knows the fleet.  `resp` is RESP2, to
-  perfcached's RESP door or to a Redis server.
+  authenticated off loopback (the requests are encrypted too when the
+  node's listener has `encrypt = yes`), and it knows the fleet.  `resp` is
+  RESP2, to perfcached's RESP door or to a Redis server.
 - **`server`** - tried in the order written.  With `binary` each line is a
   seed: the fleet's members are learned from whichever one answers.  With
   `resp`, a reconnect after a failure starts at the line after the one that
   failed.
 - **`secret`** - required with `binary` unless every server is loopback or a
-  unix socket.  Repeat the line to rotate: add the new secret, then remove
-  the old one once the daemons have dropped it.
+  unix socket, and then the node must allow it with `[listen] plaintext =
+  loopback` (the default, `never`, asks every client for the secret,
+  loopback included).  Repeat the line to rotate: add the new secret, then
+  remove the old one once the daemons have dropped it.
 - **`password` / `username`** - `resp` only.  The password crosses the
   network in the clear.  Leave `username` out for Redis older than 6.
 - **`collection`** - on perfcached, a collection name.  On Redis, a database
@@ -69,13 +72,15 @@ Sockets held by one Asterisk: about `pool` x (members) with the default
 ### Server side
 
 On every node, the client secret and the collection the dialplan uses
-(on a fleet, also list it in `[cluster] collections`):
+(on a fleet, also list it in `[cluster] collections`, beside the fleet's
+`mode`):
 
 ```
 [secrets]
 client = CHANGE-ME-client
 
 [collection calls]
+buckets_log2 = 16
 ```
 
 For `protocol = resp` also open a RESP listener.  Off-box it needs an
@@ -89,6 +94,9 @@ resp_allow = 192.0.2.0/24
 [secrets]
 resp = CHANGE-ME-resp-password
 ```
+
+func_perfd has no TLS, so a node with `[listen] auth_needs_tls = yes`
+refuses its `AUTH` on a plaintext door off loopback; use `binary` there.
 
 ### Binary
 
@@ -172,6 +180,8 @@ exten => s,1,Set(PERFD_SET(0,cid-${UNIQUEID},600)=${CALLERID(num)})
 asterisk -rx "perfd show status"
 ```
 
-This shows the protocol, the servers, each pooled connection, and counters
-for hits, misses, errors, wait timeouts, reconnects and failovers.
+This shows the protocol, the servers, each pooled connection, and the
+counters `get_hits`, `get_misses`, `sets`, `exists_yes`, `exists_no`,
+`deletes_removed`, `deletes_absent`, `errors`, `wait_timeouts`,
+`reconnects` and `failovers`.
 Per-call failures are logged as warnings, at most ten a second.

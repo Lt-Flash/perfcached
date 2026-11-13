@@ -6,8 +6,8 @@
 </h1>
 
 <p align="center">
-  A multithreaded cache for Linux, with its own encrypted protocols and
-  a Redis-compatible door.  One node to start; a cluster when you need it.
+  A multithreaded cache for Linux, with its own authenticated protocol
+  and a Redis-compatible door.  One node to start; a cluster when you need it.
 </p>
 
 perfcached is an in-memory key-value cache.  It runs as one daemon that
@@ -106,13 +106,14 @@ they find each other, elect a master and share the keyspace.
 
 ## Status
 
-The last tagged release is **0.7.4.4** (2026-11-02).  It is young
+The last tagged release is **0.7.5** (2026-11-13).  It is young
 software and we want to hear how it behaves on your workload.  Please
 [open an issue](https://github.com/Lt-Flash/perfcached/issues) for
 anything odd, and include the output of `perfcached -V`, your config
-(secrets removed) and the log around the event.
+(secrets removed) and the log around the event.  A security problem
+goes privately instead, as [SECURITY.md](SECURITY.md) says.
 
-Known limits in 0.7.0:
+Known limits in 0.7.5:
 
 - A read-through collection's password moved from `[secrets] upstream`
   into the collection, as `upstream_password` (each collection may now
@@ -125,10 +126,13 @@ Known limits in 0.7.0:
   libperfd 0.3.0 or later (or the RESP door) at the same time.  State
   from 0.4.1 or later is kept.  No upgrade path from 0.3.x.  From
   0.4.5 on, every release is a rolling restart within the support
-  window ("Compatibility" below); use SET IFEQ/IFNE and DELEX once
-  every node runs 0.5.0 or later.  A node keeps the identity an
-  earlier release minted at random, and its log says how to switch to
-  one derived from the machine.
+  window ("Compatibility" below) but two: 0.7.4.3 changed the cluster
+  header, so a fleet on 0.7.3 or earlier moves to it together
+  (`fleetstop`, install, start; clients keep working), and 0.7.5, as
+  the next item says.  Use SET
+  IFEQ/IFNE and DELEX once every node runs 0.5.0 or later.  A node
+  keeps the identity an earlier release minted at random, and its log
+  says how to switch to one derived from the machine.
 - No lists, sets, sorted sets, streams, bitmaps, HyperLogLog or geo
   yet.  Keys hold strings, counters, JSON documents or hashes (a hash
   is one value, under 58,000 bytes).
@@ -153,24 +157,27 @@ Known limits in 0.7.0:
   `multicast_ttl` and multicast routing, not measured over WAN links;
   `discovery = unicast` (clouds, Kubernetes) is tested in lab network
   namespaces that drop IP fragments and block UDP, not yet in a real
-  cloud deployment, and suits a fleet of a few dozen nodes; `spread`
-  mode has not yet carried production traffic; and in `eager` mode a
-  delete made on one side of a network partition can be undone when
-  the partition heals.
+  cloud deployment, and suits a fleet of a few dozen nodes; and
+  `spread` mode has not yet carried production traffic.
+- 0.7.5 speaks cluster wire epoch 4 alone and refuses a node of an
+  earlier release: from 0.7.4, stop every node and start them all on
+  0.7.5 (the state is kept).  A libperfd older than 0.7.6 does not route
+  by key against it - every request then takes the forward.
 - Read-through from a Redis upstream carries strings, hashes and
   RedisJSON documents (a list, set, sorted set or stream answers
   `WRONGTYPE`); `KEYS` and `SCAN` see only what perfcached holds;
-  `proxy`, `shard` and `spread` collections refuse an upstream; and
+  `proxy` collections refuse an upstream (in `shard` and `spread` a
+  key is fetched at its owner or holders); and
   tracking the upstream's changes needs every connection on one Redis
   server and, from 0.5.6, an upstream user allowed `INFO`.
   Write-through (0.6.2) does not bridge pub/sub, costs each write a
   round trip to the master, and two clients writing one key through
   two nodes at the same moment can leave Redis and the fleet with
   different winners.
-- The RESP and HTTP doors are plaintext, and no TLS is planned for them
-  for now.  Under `upstream_writes = through` the RESP door can write to
-  Redis: keep it on a trusted segment, behind `resp_allow` and
-  `[secrets] resp`.
+- The RESP and HTTP doors are plaintext unless their listener says
+  `tls` (0.7.5, a build with OpenSSL).  Under `upstream_writes =
+  through` the RESP door can write to Redis: keep it on a trusted
+  segment, behind `resp_allow` and `[secrets] resp`, or on TLS.
 
 ## Install
 
@@ -180,10 +187,13 @@ Ubuntu 24.04 and 20.04 (amd64) are on the
 both editions (see [Choosing a build](#choosing-a-build)):
 `perfcached` is the clustered daemon and `perfcached-standalone` the
 single-node one.  They install the same files and replace each other.
+The dashboard is a package of its own, `perfcached-dashboard` (Debian
+13 and 12, Ubuntu 24.04).  On Alpine all three come as signed `.apk`
+files.
 
 ```
-sudo apt install ./perfcached_0.6.1-1+deb13_amd64.deb
-sudo apt install ./perfcached-standalone_0.6.1-1+deb13_amd64.deb   # or this one
+sudo apt install ./perfcached_0.7.5-1+deb13_amd64.deb
+sudo apt install ./perfcached-standalone_0.7.5-1+deb13_amd64.deb   # or this one
 ```
 
 **libperfd**, the client library, has packages of its own from 0.5.8:
@@ -194,13 +204,17 @@ sudo apt install ./perfcached-standalone_0.6.1-1+deb13_amd64.deb   # or this one
 with the same SONAME is then an install and a restart, with no rebuild.
 See [lib/README.md](lib/README.md).
 
-**From source:** needs a C compiler, make and libsodium.
+**From source:** needs a C compiler, make and libsodium.  Where
+pkg-config finds OpenSSL (libssl-dev; Alpine `openssl-dev`) the daemon
+is built with TLS for the RESP and HTTP doors and `rediss://`
+upstreams (`make PC_TLS=yes` insists on it, `PC_TLS=no` leaves it out).
 
 ```
 make                 # perfcached, perfcli, perfdump, perfload, libperfd.a
                      # (+ perfcached-dashboard where libmicrohttpd-dev is installed)
 make libperfd.so     # the shared library beside the archive
 sudo make install    # binaries, libperfd, example config, systemd unit
+sudo systemd-sysusers  # the perfcached account the unit runs as
 ```
 
 ### Choosing a build
@@ -211,7 +225,7 @@ choice in `config.mk`:
 | edition | build it for | what you get |
 |---|---|---|
 | `clustered` (the default) | anything that may grow beyond one node | every cluster mode: eager, store, shard, proxy, spread |
-| `standalone` | a cache that will only ever be one node | no cluster code at all: the binary is a third smaller, its static memory 7 MB less, and a `[cluster]` section in the config is refused rather than ignored |
+| `standalone` | a cache that will only ever be one node | no cluster code at all: the binary is about a quarter smaller, its static memory 13 MB less, and a `[cluster]` section in the config is refused rather than ignored |
 
 Without a `config.mk` the build is `clustered`.  The `.deb` packages
 come in both editions: `perfcached` and `perfcached-standalone`.  To
@@ -241,8 +255,15 @@ ship) by default; `debug` (`-Og -g3`, frame pointers, the arena's own
 consistency checks); `asan` (debug plus AddressSanitizer and UBSan, their
 runtimes linked statically so the target needs nothing installed; glibc
 only).  A non-release build says so in `perfcached -V`
-(`perfcached 0.6.1 (abc1234, asan)`), in `/stats` `process.build` and in
-the dashboard's header.  `make clean` after changing it.  For a test
+(`perfcached 0.7.5 (abc1234, asan)`), in `/stats` `process.build` and in
+the dashboard's header.  `make clean` after changing it.  Release stays at
+`-O2`: `-O3` was measured against it on one commit (single node, native and
+RESP, 32- and 200-byte values) and bought nothing beyond the run-to-run
+spread, for a 15% larger binary; `-Os` cost about 10% more CPU a request
+(3% to 13% by cell) for a 21% smaller one.  The tree builds warning-free
+at `-O3` and `-Os` (gcc 14) for anyone who wants either - set it in the
+environment, `CFLAGS="-O3 -g" make`; on the make command line it would
+replace the warning and feature flags the Makefile adds.  For a test
 node, `contrib/systemd/` has two drop-ins for `perfcached.service.d/`:
 `cores.conf` keeps the newest two cores, and `asan.conf` sends a sanitizer
 report there.
@@ -253,13 +274,20 @@ PC_MAIL=libcurl`; Debian/Ubuntu `libcurl4-openssl-dev`, Alpine
 TLS).  A build without it refuses a `[mail]` section rather than ignore
 it; its alerts are logged and kept on the dashboard all the same.
 
+**TLS** (0.7.5) is not a `make menuconfig` question: `PC_TLS=auto`, the
+default, links OpenSSL into the daemon when pkg-config finds it (`yes`
+insists, `no` leaves it out; libperfd never links it).  The `tls`
+listeners and `rediss://` upstreams need it, and `perfcached -V` says
+`tls: OpenSSL ...` or `tls: off`.
+
 ## Quick start
 
 ### A single node
 
 The native door on the network, and the Redis door on
 localhost.  Save this as
-`/etc/perfcached/perfcached.conf` (mode 640):
+`/etc/perfcached/perfcached.conf`, owned by root with group
+`perfcached` and mode 640 (the service runs as `perfcached`):
 
 ```ini
 [daemon]
@@ -269,11 +297,11 @@ workers = 4                      # the number of cores
 arena_mb = 512                   # memory for keys and values
 
 [secrets]
-client = pick-a-client-secret    # for the native, encrypted protocol
+client = pick-a-client-secret    # proven at the native protocol's handshake
 enable = pick-an-enable-secret   # privileged commands only (perfcli -E)
 
 [listen]
-tcp = 0.0.0.0:6479               # native protocol (encrypted)
+tcp = 0.0.0.0:6479               # native protocol
 resp = 127.0.0.1:6379            # Redis protocol (optional)
 resp_collections = 0:cache       # Redis database 0 is the collection "cache"
 
@@ -301,7 +329,9 @@ redis-cli -p 6379 GET greeting
 
 To serve Redis clients across a network, give the door a LAN address
 plus `resp_allow` and a `[secrets] resp` password; the daemon refuses
-to open it off-box without an allow-list.
+to open it off-box without an allow-list.  With a build that has
+OpenSSL, `resp = <addr:port> tls` keeps the password off the wire too
+(`redis-cli --tls --cacert ca.pem`); GUIDE.md has the rest.
 
 ### Growing into a cluster
 
@@ -309,25 +339,28 @@ When one node is no longer enough, add machines.  On one L2 segment
 the nodes find each other by multicast: it is sent with a TTL of 1 and
 does not cross a router unless `[cluster] multicast_ttl` raises it for
 multicast routing (PRODUCTION.md has the checklist).  Add the same
-`[cluster]` section to the config on every machine and start them in
-any order:
+lines to the config on every machine - the `client` and `enable`
+secrets stay as they are - and start them in any order:
 
 ```ini
+[daemon]
+state_dir = /var/lib/perfcached  # restarts as the same member
+
 [cluster]
 multicast = 239.68.68.1:6480     # same group on every node
 mode = eager                     # every node holds every key
 collections = cache
 
 [secrets]
-client = pick-a-client-secret
-enable = pick-an-enable-secret
 cluster = a-different-secret     # only the daemons hold this one
 ```
 
 Between the nodes, open port 6480 for both UDP (membership,
 replication, reads from peers) and TCP (large records and a new node's
-initial copy).  UDP 6481 is optional: it keeps pub/sub relays off the
-membership socket, and when it is closed they travel on 6480 instead.
+initial copy), and 6481 for UDP and TCP: it carries pub/sub relays and
+replication on threads of their own, off the membership socket.  A
+joining node serves nothing until 6481 answers both ways with every
+member (0.7.5).
 
 **No multicast** (AWS, GCP, Azure, Kubernetes, or a LAN that filters
 it): name a few members as seeds instead of a group.  Every node
@@ -379,13 +412,14 @@ turn on the WAL and snapshots if the whole fleet may stop at once.
 ## Clients
 
 - **libperfd**, the C client (MIT, so it can go in proprietary code).
-  It is encrypted and pipelined, and it follows the fleet: it keeps
-  spare connections, fails over in one `send()`, and can route each key
+  It authenticates, pipelines (encrypted when the listener or
+  `opts.encrypt` asks), and follows the fleet: it keeps spare
+  connections, fails over in one `send()`, and can route each key
   straight to its owner.  See [lib/README.md](lib/README.md).
 - **perfcli**, the `redis-cli` of the native protocol
   ([PERFCLI-COMMANDS.md](PERFCLI-COMMANDS.md)); for scripts, `-j` takes
-  a request typed as JSON and sends it as the binary request (plain
-  text on localhost with `plaintext = loopback`, encrypted otherwise).
+  a request typed as JSON and sends it as the binary request (no
+  handshake on localhost with `plaintext = loopback`).
   Plus **perfdump** and **perfload** for parallel backup and restore
   between fleets of any size or mode, and **perfcached-dashboard**, the
   status page served by its own process over libperfd (0.6.6; since
@@ -434,8 +468,8 @@ to reproduce it: [GUIDE.md](GUIDE.md#measured) and
   tools, the clients, and all measurements.
 - [REDIS-COMMANDS.md](REDIS-COMMANDS.md): every Redis command it
   answers, and what an unsupported one gets.
-- [contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md): ten complete
-  configurations.
+- [contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md): eleven
+  complete configurations.
 - [PRODUCTION.md](PRODUCTION.md): the pre-deployment checklist.
 - [PERFCLI-COMMANDS.md](PERFCLI-COMMANDS.md): the perfcli reference.
 - [lib/README.md](lib/README.md): libperfd.
@@ -454,13 +488,15 @@ tools/alpine-check.sh  # Alpine (musl, gcc 15): both editions + check-standalone
 
 CI runs lint and the fast suite on every push, and the full suite,
 the sanitizer suite, the four-architecture matrix and the Alpine check
-on every release tag.  Debian and Alpine - glibc and musl - are both
+on every release candidate's tag; a release is tagged on the candidate
+that passed.  Debian and Alpine - glibc and musl - are both
 built and tested; `bench/Containerfile.alpine` is the small image.
 
 ## Compatibility
 
-perfcached is pre-1.0 and its formats may still change - but every
-change rolls, within one support window:
+perfcached is pre-1.0 and its formats may still change - but a change
+rolls, within one support window, unless its release note says
+otherwise (three have, below):
 
 **The support window.**  A fleet on any patch of a minor upgrades by a
 rolling restart to any later patch of that minor and to the next minor's
@@ -479,19 +515,27 @@ fleets run libperfd 0.6.0 against 0.6.x daemons).
 Packages upgrade through the package manager, which leaves the running
 daemon in place until you restart it (PRODUCTION.md, section 8); a
 tarball install under `/opt/perfcached-<version>` upgrades through the
-staged build and the helper (GUIDE.md, "The upgrade helper").  The one
-break in the record is 0.4.5, which replaced the native protocol and the
-cluster wire: from 0.4.4 or earlier the fleet is stopped and started
-whole ("Known limits" above).  State from 0.4.1 or later is kept across
-every upgrade since; there is no path from 0.3.x.
+staged build and the helper (GUIDE.md, "The upgrade helper").  Two
+releases break the roll: 0.4.5, which replaced the native protocol and
+the cluster wire (from 0.4.4 or earlier the fleet is stopped and started
+whole, "Known limits" above), and 0.7.4.3, whose cluster header cannot
+talk to 0.7.3 (the fleet moves together: `fleetstop`, install, start);
+0.7.5, which speaks cluster wire epoch 4 alone, breaks it a third time
+from 0.7.4 (stop every node, start them all on 0.7.5).
+State from 0.4.1 or later is kept across every upgrade since; there is
+no path from 0.3.x.
 
 ## License
 
 - The daemon and its tools: **GPL-2.0-or-later** ([COPYING](COPYING)).
 - libperfd, the client library: **MIT** ([lib/LICENSE](lib/LICENSE)),
   so applications of any license can link it.
+- The PHP extension and its Symfony adapter: **MIT**
+  ([lang/php/LICENSE](lang/php/LICENSE)).
 
-Each source file carries an SPDX line, and CI checks that the MIT side
-never includes GPL code.  libsodium is ISC (see
+[LICENSING.md](LICENSING.md) says which files are on which side.  Every
+file libperfd is built from carries an MIT SPDX line, a file with no
+SPDX line is GPL-2.0-or-later, and CI checks that the MIT side never
+includes GPL code.  libsodium is ISC (see
 [lib/NOTICE](lib/NOTICE)).  Contributions need a DCO sign-off; see
 [CONTRIBUTING.md](CONTRIBUTING.md).

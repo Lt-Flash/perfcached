@@ -1,30 +1,6 @@
 #!/bin/sh
-# stalebackfilltest.sh — S102: a backfill flag that never fired must not
-# fire later, when the ids reshuffle.
-#
-# Every live node arms backfill[] for a peer that restarts cold; only the
-# lowest live id walks it, and only the walker clears its flag.  On every
-# other node the flag went STALE - and the moment the lowest id left, a
-# stale holder became the designated sender, pushed the whole keyspace at
-# a node that was already full, and logged "backfilled node N after its
-# restart" for a restart long past.  Seen on the fleet (.245, "node 846");
-# it is what failed eagertest's quiet window on alternate tags, the same
-# first slice from bucket 0 every time.
-#
-# Ids are hashes of random identities, so the roles are READ, not
-# assumed: L = lowest id (the sender), X = highest (restarted cold),
-# Y = the middle one (the stale holder; lower than X, so that once L is
-# gone Y is the lowest live and X is its only possible target).
-#  1. records on L; X restarts empty and PULLS its bootstrap from L (S83:
-#     the joiner is the one that knows when it is complete; nobody walks
-#     a push for it)
-#  2. once X reports itself established (at once, after its pull), Y
-#     drops the flag it never used, and says so - and so does L
-#  3. L is killed.  Y is now the lowest live id.  With a stale flag Y would
-#     push everything at X - repl_out grows, a false completion is logged.
-#     It must do neither.
-# Before the fix: step 2's line is absent and step 3 pushes a full slice.
-# Usage: test/stalebackfilltest.sh [./perfcached]
+# stalebackfilltest.sh - a backfill flag a non-sender never used is dropped once its target is
+# established, so it cannot fire when the lowest id leaves.  Usage: test/stalebackfilltest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -90,6 +66,8 @@ if op == "node":
     print(call("stats")["result"]["cluster"]["node"])
 elif op == "repl_out":
     print(call("stats")["result"]["cluster"]["repl_out"])
+elif op == "state":
+    r = call("stats")["result"]; print(r.get("state"), r["cluster"].get("peers_up"))
 elif op == "entries":
     print(call("stats")["result"]["collections"][0]["entries"])
 elif op == "view":
@@ -105,7 +83,7 @@ elif op == "fill":
         call("set", col="s", key="sk%04d" % i, value=v, ttl=900)
     print("filled")
 PYEOF
-q() { python3 "$CLI" "$@" 2>/dev/null; }   # q <port> node|repl_out|entries|fill N
+q() { python3 "$CLI" "$@" 2>/dev/null; }   # q <port> node|repl_out|state|entries|fill N
 await_entries() { # await_entries <port> <n> <secs>
 	i=0
 	while [ $i -lt "$3" ]; do
@@ -119,12 +97,13 @@ conf 1; conf 2; conf 3
 start 1 || { echo "node 1 did not start"; tail -3 "$D/n1.log"; exit 1; }
 start 2 || { echo "node 2 did not start"; tail -3 "$D/n2.log"; exit 1; }
 start 3 || { echo "node 3 did not start"; tail -3 "$D/n3.log"; exit 1; }
-# BACKFILL_SENDER_HOLDOFF_MS: for 30 s after ready every node reports
-# itself COLD, and a cold candidate is skipped by the sender election -
-# so restarting X now would leave L and Y BOTH self-designating (the
-# documented two-senders-during-holdoff case), and Y walking would be
-# correct, not a bug.  Wait it out first: this suite is about a flag
-# that goes stale on an ESTABLISHED non-sender.
+# the cold window runs from each node's ready, and a joiner is CONNECTING until its links answer
+i=0
+while [ $i -lt 300 ] && [ "$(q 17111 state) $(q 17112 state) $(q 17113 state)" != "ready 2 ready 2 ready 2" ]; do
+	sleep 0.1; i=$((i+1))
+done
+# for BACKFILL_SENDER_HOLDOFF_MS after ready every node is cold and skipped by the sender election,
+# so two senders would be correct then: wait it out, this suite is about an established non-sender
 echo "  waiting out the cold window (35s) so L is the only sender"
 sleep 35
 
@@ -146,19 +125,8 @@ q "1711$L" fill 300 >/dev/null
 await_entries "1711$X" 300 30 && await_entries "1711$Y" 300 30 \
 	&& ok "300 records on every node" || bad "the eager push did not converge (X=$(q 1711$X entries) Y=$(q 1711$Y entries))"
 
-# ---- 1b. S103: Y's VIEW of L must not flap ------------------------------
-# The sender election on Y reads L's record count and start kind from
-# Y's peer slot.  The master's keepalive used to overwrite that slot
-# with zeros once a second, so half of Y's ticks saw the lowest id as
-# empty and Y walked too.  Twenty samples over three seconds must all
-# show what L's own heartbeat says.  (Whether L is the master depends on
-# the ids; the flap hit any master.)
-#
-# A view holds what the peer's LAST heartbeat said, so it lags the
-# peer's own count by up to one beat: sampled the instant the fill
-# lands, the first half second reads the pre-fill zero.  That is a lag,
-# not the flap - two instrumented fleets showed every beat honest - so
-# give the next heartbeat time to land before judging.
+# ---- 1b. Y's view of L must not flap: twenty samples over three seconds all show L's own
+# heartbeat.  A view lags by up to one beat, so let the next heartbeat land first.
 sleep 1.5
 bad_views=""; i=0
 while [ $i -lt 20 ]; do
@@ -171,11 +139,8 @@ done
 eval "kill -9 \$$PX" 2>/dev/null; eval "$PX="
 sleep 8                              # past the purge window
 start "$X" || bad "X did not restart"
-# S83: it came back holding nothing, so it joins RECOVERING and pulls; a
-# count read here would race the pull (rc16's lesson) - the state is the
-# property
-# the join decision is the cluster thread's, a moment after "ready": wait
-# for the line rather than read it once (a slow runner missed it)
+# it came back empty, so it joins RECOVERING and pulls: the state is the property, a count would
+# race the pull.  The join is the cluster thread's, a moment after ready: wait for the line.
 i=0; while [ $i -lt 75 ] && ! grep -q "holding nothing - pulling a bootstrap" "$D/n$X.log"; do sleep 0.2; i=$((i+1)); done
 grep -q "holding nothing - pulling a bootstrap" "$D/n$X.log" \
 	&& ok "X came back empty and set out to pull (after $((i / 5))s)" || bad "X did not join as an empty puller: $(grep 'joined as' "$D/n$X.log" | tail -1)"
@@ -197,12 +162,8 @@ grep -q "backfilled node $IX after its restart" "$D/n$L.log" && bad "L walked a 
 grep -q "backfilled node $IX after its restart" "$D/n$Y.log" && bad "Y ALSO walked a backfill - it was not the sender" \
 	|| ok "Y did not walk it (as it should not - it is not the lowest)"
 
-# ---- 2. X established: Y and L drop the flags they never used ----------
-# A pulled node reports ESTABLISHED as soon as it is ready - it knows it is
-# complete - so the stale flags drop at the survivors' next tick.  EACH
-# survivor's own tick: L's drop can trail Y's by a tick (more on a loaded
-# runner - the rc18 tag pipeline, with the sanitizer job beside it, saw L
-# still armed at the instant Y's line appeared), so each is polled for.
+# ---- 2. X established: Y and L drop the flags they never used, each at its own tick (L can trail
+# Y on a loaded runner), so each is polled for
 i=0
 while [ $i -lt 60 ]; do
 	grep -q "node $IX is established - a backfill armed for it here" "$D/n$Y.log" && break

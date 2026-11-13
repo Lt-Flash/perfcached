@@ -1,20 +1,6 @@
 #!/bin/sh
-# sweepgatetest.sh - S260: the repair sweep compares before it re-sends.
-#
-# The sweep re-sent every record a node authored above a peer's watermark
-# about ten seconds after the write-path push had delivered it: on a
-# 3-node spread fleet after 1M writes the holders refused 336k and 333k
-# copies as older - the sweep doubled their apply work after every burst.
-# Now an ordinary cycle digests its slots, asks the peer which differ, and
-# walks only those.  Per mode (eager; spread K=2), three nodes:
-#   1. 3,000 keys through node 1, then two sweep cycles: the peers refuse
-#      almost none as older (under 5%), node 1 reports rounds answered
-#      clean, and every key is where placement puts it;
-#   2. node 3 cut off from node 1 while 500 more keys go through node 1
-#      (the pushes to it are lost), then healed: node 3 holds all its keys
-#      within a few cycles - the gate must still send what differs.
-# Fail-first: the build before S260 has the peers refuse ~3,000 each.
-# Usage: test/sweepgatetest.sh [./perfcached] [./netcutshim.so]
+# sweepgatetest.sh - the repair sweep compares slot digests before it re-sends: after a burst the peers
+# refuse almost nothing as older, yet a node that missed pushes is still repaired.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -104,10 +90,8 @@ PY
 older() { st $1 'x.get("recv_older", 0)'; }
 gate() { st 1 'json.dumps(x.get("sweep_gate"))'; }
 ent() { st $1 'c["entries"]'; }
-# short <copies> <keys>: how many of k00000.. are on fewer than <copies>
-# nodes - each node's own keys by its node-scoped scan.  Surplus copies (a
-# spread node keeping one a holder never acknowledged, S253) are allowed;
-# a key short of its copies is not.
+# short <copies> <keys>: how many of k00000.. are on fewer than <copies> nodes, by each node's own
+# scan; surplus copies are allowed, a key short of its copies is not
 short() { python3 - "$1" "$2" <<'PY'
 import json, pcnative, socket, sys
 want, n = int(sys.argv[1]), int(sys.argv[2])
@@ -128,7 +112,24 @@ print(sum(1 for i in range(n) if seen.get("k%05d" % i, 0) < want))
 PY
 }
 
-run() { # run <label> <copies> <cluster lines> <collection lines>
+clean() { st 1 'x.get("sweep_gate", {}).get("clean", 0)'; }
+steady() { # once the one-time re-send has drained, two more sweep rounds refuse almost nothing
+	P=; i=0; while [ $i -lt 30 ]; do
+		Q="$(older 2)/$(older 3)"; [ "$Q" = "$P" ] && break
+		P=$Q; sleep 2; i=$((i+2))
+	done
+	O2=$(older 2); O3=$(older 3); C0=$(clean)
+	i=0; while [ $i -lt 45 ]; do
+		[ "$(clean)" -ge $(( ${C0:-0} + 2 )) ] 2>/dev/null && break
+		sleep 1; i=$((i+1))
+	done
+	R2=$(( $(older 2) - O2 )); R3=$(( $(older 3) - O3 ))
+	[ "$R2" -lt 150 ] && [ "$R3" -lt 150 ] \
+		&& ok "$1: two more sweep rounds once that drained: the peers refused $R2 / $R3 as older" \
+		|| bad "$1: two more sweep rounds refused $R2 / $R3 as older - the sweep keeps re-sending what the peers hold"
+}
+
+run() { # run <label> <copies> <cluster lines> <collection lines> [walk]
 	D=$(mktemp -d /var/tmp/pcsweepgate.XXXXXX)
 	echo "--- $1"
 	for n in 1 2 3; do conf $n "$3" "$4"; done
@@ -138,20 +139,23 @@ run() { # run <label> <copies> <cluster lines> <collection lines>
 	O2=$(older 2); O3=$(older 3)
 	# two sweep cycles (10 s each) and the answer between them
 	i=0; while [ $i -lt 45 ]; do
-		[ "$(st 1 'x.get("sweep_gate", {}).get("clean", 0)')" -ge 2 ] 2>/dev/null && break
+		[ "$(clean)" -ge 2 ] 2>/dev/null && break
 		sleep 1; i=$((i+1))
 	done
 	R2=$(( $(older 2) - O2 )); R3=$(( $(older 3) - O3 ))
-	[ "$R2" -lt 150 ] && [ "$R3" -lt 150 ] \
-		&& ok "$1: after the sweep, the peers refused $R2 / $R3 copies as older (the push already delivered them)" \
-		|| bad "$1: the peers refused $R2 / $R3 copies as older - the sweep re-sent what the push delivered"
+	# spread re-sends a node's share once when the map first places it: one share, no more
+	A2=150; A3=150; [ "${5:-}" = walk ] && { A2=$(( $(ent 2) + 150 )); A3=$(( $(ent 3) + 150 )); }
+	[ "$R2" -lt "$A2" ] && [ "$R3" -lt "$A3" ] \
+		&& ok "$1: after the sweep, the peers refused $R2 / $R3 copies as older (under $A2 / $A3)" \
+		|| bad "$1: the peers refused $R2 / $R3 copies as older (not under $A2 / $A3) - the sweep re-sent what the push delivered"
+	[ "${5:-}" = walk ] && steady "$1"
 	G=$(gate)
 	case "$G" in *'"clean": '[1-9]*) ok "$1: node 1's sweep rounds answered clean: $G";; *) bad "$1: no clean round on node 1: $G";; esac
 	SH=$(short $2 3000)
 	[ "$SH" = 0 ] && ok "$1: every one of 3,000 keys has its $2 copies" \
 		|| bad "$1: $SH of 3,000 keys are short of their $2 copies"
 	# 2: pushes to node 3 lost, then healed by the gated sweep
-	echo "cut 127.0.22.1" > "$D/cut3"; echo "cut 127.0.22.3" > "$D/cut1"
+	echo "cut 127.0.22.1 rst" > "$D/cut3"; echo "cut 127.0.22.3 rst" > "$D/cut1"
 	sleep 0.5
 	F=$(fill 3000 3500); [ "$F" = 500 ] || bad "$1: stored $F of the 500"
 	: > "$D/cut3"; : > "$D/cut1"
@@ -162,13 +166,14 @@ run() { # run <label> <copies> <cluster lines> <collection lines>
 	SH=$(short $2 3500)
 	[ "$SH" = 0 ] && ok "$1: node 3 cut off for 500 writes, then healed: every one of 3,500 keys has its $2 copies after ${i} s - the gate sent what differed" \
 		|| bad "$1: $SH of 3,500 keys still short of $2 copies after the heal - gate $(gate)"
-	kill -9 $(cat "$D"/*.pid) 2>/dev/null
+	# gone before the next arm binds the same ports
+	for p in $(cat "$D"/*.pid); do kill -9 "$p"; wait "$p"; done 2>/dev/null
 	rm -rf "$D"; D=
 }
 
 run "eager" 3 "" "mode = eager"
 run "spread K=2" 2 "mode = spread
 replicas = 2
-collections = c" ""
+collections = c" "" walk
 echo "sweepgatetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

@@ -1,24 +1,5 @@
-/* legmetatest.c - S173: the metadata walk must report a record in the
- * OVERFLOW LEG with the same version, flags and write tick as one in a
- * bucket.
- *
- * A key lives in its bucket or, when that bucket is full, in the leg.
- * Both are emitted by the same walk and every consumer of it reads the
- * metadata: the eager sweep filters on the write tick and the PASSIVE
- * flag and sends the version, the RDB writes all three to disk, the
- * bootstrap serve and the collection resize carry them across.
- *
- * Measured on the fleet 2026-09-20 with 39,390 of 63,951 records in the
- * leg: the two nodes holding copies pushed 6.5M records apiece to peers
- * that already had them, every sweep, and every one came back refused as
- * older - the copies looked local (the PASSIVE bit read off the write
- * tick's low byte), looked newly written (the write tick read off the
- * version) and carried a version of 2 (the flags).
- *
- * Fail-first: with the leg's emit call taking its arguments in the
- * struct's order rather than the function's, every leg record here
- * reports version 2, flags from the tick and a tick in the millions.
- */
+/* legmetatest.c - the metadata walk gives a record in the OVERFLOW LEG the same version, flags
+ * and write tick as one in a bucket: the sweep, the RDB, bootstrap and resize all read them. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"
@@ -91,9 +72,8 @@ int main(void)
 		return 2;
 	}
 
-	/* every record identical in kind - a PASSIVE copy carrying the
-	 * sender's version - so bucket and leg differ in nothing but where
-	 * they landed.  No grow_at call: nothing moves them back. */
+	/* every record a PASSIVE copy carrying the sender's version, so bucket and leg
+	 * differ only in where they landed; no grow_at call moves them back */
 	for (i = 0; i < N; i++) {
 		k.len = snprintf(kb, sizeof kb, "k%d", i);
 		k.s = kb;

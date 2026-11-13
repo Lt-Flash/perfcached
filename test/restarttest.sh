@@ -1,22 +1,6 @@
 #!/bin/sh
-# restarttest.sh — a whole eager fleet restarting AT ONCE keeps its data.
-#
-# THE BUG THIS EXISTS FOR, measured on the 245-247 fleet 2026-09-14 while
-# upgrading 0.3.5 -> 0.3.7-rc4.  A second positive answer to a pull used
-# to mean "birth race" on its own, and the loser's copy was demoted.  In
-# EAGER mode two holders is the NORMAL state - every key is on every node
-# by design - so when all three nodes restarted together, each recovered
-# the same keyspace from its own RDB, every reconcile probe drew two
-# positives, and two of the three shed their copies: 1988 records down to
-# ~425 each.  It did NOT heal, because the eager sweep re-sends only what
-# a node AUTHORED.
-#
-# Nothing cheaper than a fleet finds this.  It needs durable state on
-# every node, a simultaneous restart, and a keyspace big enough that the
-# loss is visible - the fleet had been restarted many times before at 3
-# records, where 3 -> 1 looks like nothing.
-#
-# Usage: test/restarttest.sh [./perfcached]
+# restarttest.sh - a whole eager fleet restarting AT ONCE keeps its data: two holders is normal in eager
+# mode, so a second positive pull answer must not demote a copy (the sweep re-sends only authored keys).
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -59,27 +43,11 @@ buckets_log2 = 12
 pull = 1
 [wal]
 dir = $D/wal.$1
-# fsync = always: this suite restarts the fleet and reads back what
-# survived, so it should not also be a bet on flush timing.
-#
-# fsync is NOT what bounds the loss here, and assuming it was cost two
-# red tags.  A producer stages a record into its own SPSC ring and is
-# acknowledged THERE; the WAL thread drains, appends and fsyncs later,
-# and a full ring drops the record and counts it (src/wal.h) - a worker
-# never blocks on storage.  So a burst can be acknowledged and never
-# reach the log whatever the fsync policy says, which is exactly why
-# switching everysec -> always did not move the recovered count by one
-# record.  The assertions below therefore read wal.dropped instead of
-# assuming zero loss.
-#
-# Do not put backticks in this comment.  The heredoc above is UNQUOTED
-# (it has to be - it interpolates $D and the port arithmetic), so the
-# shell executes anything backquoted here and prints "not found" three
-# times per run.
+# fsync = always so the readback is no bet on flush timing; an ack is at the producer
+# ring and a full ring drops the record, so the assertions read wal.dropped
 fsync = always
-# small segments on purpose: the default 8 x 256 MB provisions 2 GB PER
-# NODE, and three of those fills a test box.  The suite needs durability
-# across a restart, not capacity.
+# small segments on purpose: the default 8 x 256 MB provisions 2 GB per node, and
+# the suite needs durability across a restart, not capacity
 segments = 2
 segment_mb = 16
 EOF
@@ -133,10 +101,8 @@ try:
 except Exception:
     print("")' "$1" 2>/dev/null; }
 
-# "appended dropped late" off /stats, empty when the WAL is off.  The
-# premise below has to assert CONTENT: segment_mb PREALLOCATES, so an
-# empty wal dir measures 16 MB and passed every size threshold the
-# earlier du-based check applied to it.
+# "appended dropped late" off /stats, empty when the WAL is off; the premise asserts content, since
+# segment_mb preallocates and an empty wal dir measures 16 MB
 walst() { timeout 6 python3 -c '
 import json, sys, urllib.request
 try:
@@ -148,10 +114,8 @@ if not w:
     sys.exit(0)
 print("%d %d %d" % (w.get("appended", 0), w.get("dropped", 0),
         w.get("late", 0)))' "$1" 2>/dev/null; }
-# "perfcached ready" in the log is the LISTENER; the cluster node state
-# reaches ready later, and a write before then is refused with "node is
-# not READY (recovering)".  Wait for the STATE on every node - the same
-# trap clitest and spreadtest both hit.
+# "perfcached ready" is the LISTENER; writes are refused until the node STATE is ready, so wait for
+# the state on every node
 readyall() {
 	w=0
 	while [ $w -lt 300 ]; do
@@ -177,28 +141,8 @@ allready $NKEYS && ok "all three hold the $NKEYS keys before the restart" \
 	|| { bad "fleet never converged: $(ent 18471)/$(ent 18472)/$(ent 18473)"; \
 	     echo "restarttest: $pass passed, $fail failed"; exit 1; }
 
-# THE PREMISE, CHECKED: at least one node must actually hold the
-# keyspace durably, or the restart proves nothing about recovery - it
-# would just be three empty nodes agreeing.
-# WAIT FOR THE PUMP TO DRAIN, and do not assert no-loss until it has.
-#
-# kill -9 ends a PROCESS; it does not touch the page cache.  Anything
-# the WAL thread has write()n survives it whether or not an fsync has
-# happened - so the flush policy cannot affect this suite at all, which
-# is why everysec -> always did not move the recovered count by one
-# record.  What a kill -9 DOES take is whatever is still inside the
-# process: records staged in a producer ring that the pump has not
-# drained yet.  A starved pump on a loaded runner leaves a tail there
-# with dropped still reading 0 - the ring never filled, it just was not
-# emptied.  So the premise for a no-loss assertion is appended == NKEYS,
-# and a fixed sleep is not a way to establish it.
-#
-# The fsync mode does change ring residency, just not durability: the
-# pump's poll timeout is mode-dependent (wal.c, end of pc_wal_pump) -
-# always re-drains immediately while there is work, everysec waits 20 ms
-# after a drain and up to 200 ms idle.  That is why v0.3.7-rc6 turned
-# GitLab's `check` green where rc5 was red, while check-asan stayed red:
-# the change shortened the drain, it did not make anything durable.
+# the premise: wait for the pump to drain (appended == NKEYS) before asserting no loss - kill -9
+# spares the page cache but takes records still in a producer ring
 walsum() {
 	DUR=0; APP=0; DROP=0; LATE=0
 	for n in 1 2 3; do
@@ -234,14 +178,8 @@ start 2 2 || exit 1
 start 3 3 || exit 1
 readyall || echo "  (nodes slow to reach ready after the restart)"
 
-# give reconcile and any demotion the time it would have taken to fire:
-# the failure was not slow, the nodes shed within ~30s and then sat flat
-# The HIGH-WATER mark per node is what makes this suite able to name
-# the failure.  Recovering short and shedding after recovery produce the
-# same final triple and are completely different faults: the first is
-# durability (the record never reached the log), the second is the
-# demotion this suite exists to catch.  Only the trajectory separates
-# them, so keep it.
+# the high-water mark per node separates recovering short (durability) from shedding after recovery
+# (the demotion caught here); the wait lets any demotion fire (the bug shed within ~30s)
 HA=0; HB=0; HC=0; FA=-1; FB=-1; FC=-1
 w=0
 while [ $w -lt 20 ]; do
@@ -261,25 +199,20 @@ a=$(ent 18471); b=$(ent 18472); c=$(ent 18473)
 echo "  after a simultaneous restart: $a/$b/$c (each owes $NKEYS)"
 echo "    first sample $FA/$FB/$FC, high-water $HA/$HB/$HC"
 
-# 1. THE ASSERTION THIS SUITE EXISTS FOR.  Recovering short is a
-# durability question; going DOWN from what you already served is the
-# demotion bug (production: 1990 -> ~425 on two of three).
+# 1. going DOWN from what a node already served is the demotion bug; recovering short is a
+# durability question
 [ "${a:-0}" -ge "$HA" ] && [ "${b:-0}" -ge "$HB" ] && [ "${c:-0}" -ge "$HC" ] \
 	&& ok "no node shed a record it had already recovered ($HA/$HB/$HC -> $a/$b/$c)" \
 	|| bad "a node SHED records after recovering them: high-water $HA/$HB/$HC -> final $a/$b/$c"
 
-# 2. the original signature was 336/184/336 - unequal, and it stayed
-# unequal, because the sweep re-sends only what a node AUTHORED
+# 2. all three hold the same count: a shed copy stays shed, as the sweep re-sends only what a node
+# AUTHORED
 [ "$a" = "$b" ] && [ "$b" = "$c" ] \
 	&& ok "all three converged on the same count ($a)" \
 	|| bad "the fleet did not converge: $a/$b/$c - a node holds a different set from its peers"
 
-# 3. zero loss is still asserted - but only where the WAL accepted
-# everything.  Where it did not, the count is reported and attributed
-# rather than blamed on the cluster.
-# recovery owes exactly what reached the log.  APP is what the WAL
-# actually held when the fleet was killed, so this asserts the real
-# obligation and still fails when a logged record does not come back.
+# 3. zero loss only where the WAL accepted everything; otherwise recovery owes exactly what reached
+# the log (APP), and still fails when a logged record does not come back
 if [ "${APP:-0}" -ge "$NKEYS" ] && [ "${DROP:-0}" -eq 0 ]; then
 	[ "$a" = "$NKEYS" ] && [ "$b" = "$NKEYS" ] && [ "$c" = "$NKEYS" ] \
 		&& ok "the whole keyspace was logged and the whole keyspace came back ($NKEYS)" \

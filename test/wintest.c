@@ -1,23 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * wintest.c - S351: the daemon's five-minute counter windows (winctr.c),
- * on an injected clock so minutes pass in microseconds.
- *
- * What the status page now reads as "last 5 min" comes from here, so each
- * promise winctr.h makes is asserted:
- *   - a counter that started with the process counts from 0 while the
- *     process is younger than five minutes;
- *   - warm, the window spans between four and five minutes, whether the
- *     tree is built every 3 s (a page polling) or once a minute (the
- *     maintenance thread alone), and its value is the counter's rise over
- *     exactly that span;
- *   - a key seen for the first time later reports NO window (-1) until a
- *     minute of it has been seen - never a few seconds as five minutes;
- *   - a counter that went backwards counts from its new start;
- *   - pc_winmax: the largest value of the last five minutes, not of all
- *     time - a spike six minutes ago is gone.
- */
+/* wintest.c - the five-minute counter windows (winctr.c) on an injected clock: every promise
+ * winctr.h makes, from a young process to a counter gone backwards and pc_winmax's old spikes. */
 #include <stdio.h>
 #include <string.h>
 

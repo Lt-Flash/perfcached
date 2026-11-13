@@ -1,24 +1,5 @@
-/* clacktest.c - 12ny AT-3: the watermarks (clack.c).
- *
- *   A  in order: the confirmed mark follows the WAL's sync, never ahead
- *   B  out of order and a hole: the applied mark stops below the hole,
- *      the gap is reported exactly, a fill connects what was held
- *   C  duplicates, seq 0, a seq past the window (FAR: not recorded, and
- *      the gap reaches it)
- *   D  durability folded conservatively: a fill applied later waits for
- *      its own WAL record, and what it connects waits with it
- *   E  durable_on_apply (fsync = no) and walseq 0: confirmed on apply
- *   F  a restore from an OLDER snapshot lowers the mark; what lies above
- *      it counts again
- *   G  spaces: one origin's two incarnations are separate; the table's
- *      bound refuses a new one, a drop makes room
- *   H  a full queue of pending pairs still confirms, only later
- *   J  AT-7: a floor - a space never heard of starts at it, a floor
- *      below the mark is nothing, pending pairs inside it never take the
- *      confirmed mark back
- *   I  model: 200,000 deliveries shuffled within blocks of 300, 1% lost
- *      and sent again later (oldest first), random syncs - the confirmed mark never passes the
- *      exact one, and equals it once the WAL has synced everything */
+/* clacktest.c - the watermarks (clack.c): order, holes, duplicates, durability, restores, spaces,
+ * floors, and a shuffled lossy model in which the confirmed mark never passes the exact one. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,7 +37,7 @@ int main(void)
 	unsigned int i;
 	int ok;
 
-	/* ---- A: in order */
+	/* ---- A: in order - the confirmed mark follows the WAL's sync, never ahead */
 	for (s = 1; s <= 5; s++)
 		clack_applied(a, 7, 1, s, 100 + s);       /* WAL 101..105 */
 	CHK(mk(a, 7, 1) == 0, "A: 5 applied, nothing synced: confirmed 0 (%llu)",
@@ -70,7 +51,7 @@ int main(void)
 	CHK(mk(a, 7, 1) == 5, "A: synced through 105: confirmed 5");
 	CHK(mk(a, 8, 1) == ~0ull, "A: a space never heard of has no mark");
 
-	/* ---- B: a hole */
+	/* ---- B: a hole - applied stops below it, the gap exact, a fill connects what was held */
 	clack_applied(a, 7, 1, 6, 0);
 	clack_applied(a, 7, 1, 8, 0);
 	clack_applied(a, 7, 1, 9, 0);
@@ -88,7 +69,7 @@ int main(void)
 	CHK(mk(a, 7, 1) == 12 && !clack_gap(a, 7, 1, &f, &t),
 		"B: filled in reverse: confirmed 12, no hole");
 
-	/* ---- C: duplicates, 0, FAR */
+	/* ---- C: duplicates, seq 0, past the window (FAR: not recorded, the gap reaches it) */
 	clack_get_stats(a, &st);
 	CHK(clack_applied(a, 7, 1, 12, 0) == CLACK_DUP &&
 	    clack_applied(a, 7, 1, 3, 0) == CLACK_DUP, "C: at or below the mark: DUP");
@@ -115,7 +96,7 @@ int main(void)
 		st.far, st.dups);
 	clack_free(a);
 
-	/* ---- D: durability folded conservatively */
+	/* ---- D: durability folded conservatively: a late fill waits for its own WAL record */
 	a = clack_new(0);
 	clack_applied(a, 1, 1, 1, 10);
 	clack_applied(a, 1, 1, 3, 12);
@@ -136,7 +117,7 @@ int main(void)
 	CHK(mk(a, 1, 1) == 5, "D: synced 40: confirmed 5");
 	clack_free(a);
 
-	/* ---- E: confirmed on apply */
+	/* ---- E: confirmed on apply (durable_on_apply, walseq 0) */
 	a = clack_new(1);
 	clack_applied(a, 1, 1, 1, 999);
 	clack_applied(a, 1, 1, 2, 1000);
@@ -148,7 +129,7 @@ int main(void)
 	CHK(mk(a, 1, 1) == 1, "E: walseq 0 (no WAL, or a replay): confirmed at once");
 	clack_free(a);
 
-	/* ---- F: restore lowers */
+	/* ---- F: a restore from an older snapshot lowers the mark; what lies above counts again */
 	a = clack_new(0);
 	for (s = 1; s <= 50; s++)
 		clack_applied(a, 9, 3, s, 0);
@@ -159,7 +140,7 @@ int main(void)
 	CHK(clack_applied(a, 9, 3, 20, 0) == CLACK_DUP, "F: 20 is below the restored mark: DUP");
 	clack_free(a);
 
-	/* ---- G: spaces */
+	/* ---- G: spaces - incarnations separate; the bound refuses a new one, a drop makes room */
 	a = clack_new(0);
 	clack_applied(a, 5, 100, 1, 0);
 	clack_applied(a, 5, 200, 1, 0);
@@ -180,7 +161,7 @@ int main(void)
 		"G: each walks %u spaces; full counted %llu", cn.n, st.full);
 	clack_free(a);
 
-	/* ---- H: the pending queue overflows */
+	/* ---- H: the pending queue overflows and still confirms, only later */
 	a = clack_new(0);
 	for (s = 1; s <= 10 * CLACK_PEND; s++)
 		clack_applied(a, 1, 1, s, s);             /* a new max each time */
@@ -192,7 +173,7 @@ int main(void)
 		10 * CLACK_PEND);
 	clack_free(a);
 
-	/* ---- J: AT-7 - a floor */
+	/* ---- J: a floor - a new space starts at it; pending pairs never take confirmed back */
 	a = clack_new(0);
 	CHK(!clack_known(a, 4, 4) && clack_floor(a, 4, 4, 50) == CLACK_NEW &&
 		clack_known(a, 4, 4) && mk(a, 4, 4) == 50,
@@ -216,7 +197,7 @@ int main(void)
 	CHK(mk(a, 5, 5) == 9, "J: synced through 9's record: confirmed 9");
 	clack_free(a);
 
-	/* ---- I: model */
+	/* ---- I: model - shuffled deliveries, 1% lost and resent, random syncs */
 	{
 		enum { N = 200000, R = 300, L = 4096 };
 		uint64_t *order = malloc(N * sizeof *order), *w = calloc(N + 2, sizeof *w);

@@ -1,18 +1,6 @@
 #!/bin/sh
-# fleetresettest.sh - S358: the page's reset-stats resets the FLEET.  The
-# page shows fleet figures first, summed from every member; a reset that
-# reached only the node it was pressed on left the other members' totals
-# standing under it.  The fleet reset - since S407 part 3 the native verb
-# reset_stats {"fleet": true}, what the dashboard's button sends (the
-# daemon's HTTP door takes no POST any more) - resets this node and sends
-# M_STATS_RESET to every live peer, each counting from the SENDER's moment.
-# RESP's CONFIG RESETSTAT stays the node's own, as redis-cli expects.
-#   - three nodes, eager; misses on every node
-#   - reset_stats {"fleet": true} on node 1: all three report node 1's reset time
-#     and count their misses from 0
-#   - CONFIG RESETSTAT on node 2 a second later: node 2 alone moves on
-# Fail-first: on 0.5.6.3 nodes 2 and 3 are never reset.
-# Usage: test/fleetresettest.sh [./perfcached]
+# fleetresettest.sh - reset_stats {"fleet": true} (the dashboard's button) resets every live member from
+# the sender's moment; RESP's CONFIG RESETSTAT stays the node's own, as redis-cli expects.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH   # pcnative
 BIN=${1:-./perfcached}
@@ -106,6 +94,7 @@ ra2 = {n: stats(n)["since"].get("reset_at") for n in (1, 2, 3)}
 check(h.startswith(b"+OK") and ra2[2] > at and ra2[1] == at and ra2[3] == at,
       "CONFIG RESETSTAT on node 2 resets node 2 alone (%s)" % ra2)
 PY
+drv=$?; [ $drv -eq 0 ] || echo "F the driver stopped: exit $drv" >> "$RES"   # S488
 while IFS= read -r l; do case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac; done < "$RES"
 [ -s "$RES" ] || bad "the python driver produced nothing"
 [ -s "$D/py.err" ] && { bad "the python driver raised:"; tail -3 "$D/py.err"; }

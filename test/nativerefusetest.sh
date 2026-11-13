@@ -1,16 +1,6 @@
 #!/bin/sh
-# nativerefusetest.sh - S368: an ENCRYPTED native client past the limit is
-# refused at accept, before the Noise handshake - the daemon pays no crypto
-# for a connection it will not keep.  10-10 on 245: 38,666 refused native
-# clients each cost a full handshake (the refusal came at the first request,
-# inside the channel), and the RESP probe's p99 rose 4 -> 37 ms beside them.
-# It is told what a RESP client is told - "-ERR max number of clients
-# reached" - and closed; a library that does not read that text sees the
-# handshake fail, as on any close.  A PLAINTEXT native door (loopback, unix)
-# keeps the error frame at the first request: it does no crypto
-# (maxclientstest).  Both refusals: max_clients and the memory floor (S366).
-# Fail-first: 0.5.6.5 accepts the client and waits for its handshake.
-# Usage: test/nativerefusetest.sh [./perfcached]
+# nativerefusetest.sh - an ENCRYPTED native client past max_clients or the memory floor is refused at
+# accept, before the Noise handshake, told what a RESP client is told; a plaintext door keeps its error frame.
 set -u
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pcnatrefuse.XXXXXX); P=
@@ -81,7 +71,7 @@ pass=$((pass + $(grep -c "^  ok " "$D/py.out"))); fail=$((fail + $(grep -c "^  F
 grep -q "handshake" "$D/pc.log" && bad "the refused client reached the handshake: $(grep handshake "$D/pc.log" | head -1)" || ok "nothing about a handshake in the log"
 stop
 
-# ---- the memory floor (S366)
+# ---- the memory floor
 printf 'MemTotal:        1048576 kB\nMemAvailable:     409600 kB\n' > "$D/meminfo"
 mkdir -p "$D/cg"; echo "0::/none" > "$D/cgroup"
 conf ""

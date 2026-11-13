@@ -1,44 +1,6 @@
 #!/bin/sh
-# syncfailtest.sh - S215: a sync the device refused must not move the
-# durable watermark, and must not be survived quietly.
-#
-# THE BUG (found by an outside read of the source, 2026-09-22, rc24):
-# wal_fdatasync_timed() called fdatasync() and returned void, and four
-# callers then wrote W.synced_seq = W.pending_hi - so on EIO the `sync`
-# verb answered {"synced":true}, the metric and the page agreed, and the
-# node went on as a healthy member.  The snapshot's directory fsync was
-# unchecked too, and R.safe_marker moved behind it - the value the WAL
-# consults before it overwrites a segment.
-#
-# The policy: the FIRST refused sync fails the node and is never retried
-# on that descriptor - after a failed fsync Linux marks the pages clean,
-# so the retry can return 0 having written nothing ("fsyncgate").
-#
-# The device here is test/syncfailshim.c, an LD_PRELOAD that refuses
-# fdatasync/fsync by descriptor class and is armed at RUNTIME, so each
-# daemon starts on a healthy device and does real work first.  Every arm
-# asserts the fault was DELIVERED (the shim's own log) before it reads
-# anything into what the daemon did about it.
-#
-#  always    standalone, fsync = always: the watermark stays where it
-#            was, `sync` answers failure and promptly, the node is FAILED
-#            and says why, the next write is refused, a read is served,
-#            the log names the errno.  A daemon with no [cluster] must do
-#            all of it - it has no cluster plane to be told by.
-#  everysec  a one-node CLUSTER, fsync = everysec: the timer's sync is
-#            refused; the same, through the cluster's callback.
-#  append    the pwrite is refused, not the sync: this used to be
-#            `W.enabled = 0` - the WAL stopped, the node carried on taking
-#            writes, and `sync` said persistence was not configured.
-#  ctrl      CONTROL's sync refused: logged with the errno and counted,
-#            and the node stays READY - CONTROL is rewritten whole each
-#            time, so the next sync covers all of it (DESIGN 12fi).
-#  dir       the snapshot's directory sync refused: the snapshot is NOT
-#            published - saves and safe_marker stay, save_errors moves,
-#            the node stays READY - and with the device healthy again the
-#            next snapshot publishes.
-#  nodir     the directory cannot be opened at all: the same.
-# Usage: test/syncfailtest.sh [./perfcached] [./syncfailshim.so]
+# syncfailtest.sh - a sync the device refused (syncfailshim.so, armed at runtime) must not move the durable
+# watermark; a refused WAL sync fails the node, never retried (a retry can return 0 having written nothing).
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -53,9 +15,8 @@ bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 
 [ -f "$SHIM" ] || { echo "syncfailtest: $SHIM is missing (make syncfailshim.so) - there is no device to refuse anything"; exit 1; }
 case "$SHIM" in /*) ;; *) SHIM="$PWD/$SHIM";; esac
-# A daemon built with a DYNAMIC sanitizer runtime (gcc's check-asan)
-# refuses to start unless that runtime is first in the preload list; a
-# static one (clang) has nothing to order.  Either way the shim goes last.
+# a DYNAMIC sanitizer runtime (gcc's check-asan) must be first in the preload list; a static one
+# (clang) has nothing to order.  The shim goes last.
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 PRELOAD="${SANRT:+$SANRT }$SHIM"
 
@@ -178,7 +139,7 @@ else:                                               # dir, nodir
     call("save")
     wait(lambda: (stats().get("rdb") or {}).get("saves") == 1, 10)
     # a save while the last one finishes answers "already running" and does nothing:
-    # the armed one then never ran (3 of 97 runs, GitLab 112574, 112739, 112787)
+    # the armed one would then never run
     wait(lambda: not (stats().get("rdb") or {}).get("running"), 10)
     r0 = stats().get("rdb") or {}
     out("SAVES0", r0.get("saves")); out("SAFE0", r0.get("safe_marker", "absent"))
@@ -201,7 +162,8 @@ EOF
 val() { sed -n "s/^$2=//p" "$D/$1.out" | head -1; }
 num() { case "${1:-}" in ''|*[!0-9]*) echo -1;; *) echo "$1";; esac; }
 
-# ---- the WAL's own sync refused ---------------------------------------
+# ---- the WAL's own sync (always, everysec) or pwrite (append) refused: the watermark stays, `sync`
+# fails promptly, the node is FAILED and says why, writes are refused, reads served
 walarm() { # walarm <arm> <port> <fsync> <cluster> <what> <shim-class> <errno-text>
 	conf $1 $2 $3 "save = off" 8 $4
 	start $1 || { bad "$1: no daemon"; return; }
@@ -245,7 +207,8 @@ walarm everysec 18432 everysec 1 "one-node cluster, fsync = everysec" wal "Input
 echo "--- append: the append itself refused (ENOSPC)"
 walarm append 18436 everysec 0 "standalone, a refused append" walwrite "No space left on device"
 
-# ---- CONTROL ----------------------------------------------------------
+# ---- CONTROL's sync refused: logged and counted, the node stays READY (CONTROL is rewritten whole,
+# so the next sync covers it)
 echo "--- ctrl: CONTROL's sync refused"
 conf ctrl 18433 everysec "save = off" 1 0
 if start ctrl; then
@@ -264,7 +227,8 @@ else
 	bad "ctrl: no daemon"
 fi
 
-# ---- the snapshot's directory ------------------------------------------
+# ---- the snapshot's directory sync refused or unopenable: not published, saves and safe_marker stay,
+# save_errors moves, the node stays READY, and a healthy device's next snapshot publishes
 dirarm() { # dirarm <arm> <port> <what>
 	conf $1 $2 everysec "" 8 0
 	start $1 || { bad "$1: no daemon"; return; }

@@ -498,6 +498,16 @@ void pcache_ht_set_shadow_gate(pcache_htable_t *ht,
  * thread or anything else reading the table never sees a fetched copy
  * as this node's own record. */
 void pcache_ht_shadow_reads(int on);
+/* S490: fetched copies the arena had no room for, answered to THIS thread's
+ * reads of @ht after its shadow chain, as copies are (NULL @r: none) */
+struct pcache_relay {
+	struct pcache_relay *next;
+	str key, val;
+	unsigned int exp;                  /* absolute ticks, 0 = never */
+	unsigned char fl;                  /* the record flags a copy would have */
+	unsigned long long ver;
+};
+void pcache_ht_set_relay(pcache_htable_t *ht, const struct pcache_relay *r);
 /* S331: is @key in @ht ITSELF - the shadow not consulted.  0 present,
  * -2 absent or expired; *@rflags (may be NULL) the record's flags */
 int pcache_ht_probe_main(pcache_htable_t *ht, const str *key,
@@ -554,6 +564,11 @@ int pcache_ht_store_ex(pcache_htable_t *ht, const str *key, const str *val,
 #define PCACHE_E_OLDER      (-4)
 
 int pcache_ht_store_ver(pcache_htable_t *ht, const str *key, const str *val,
+		unsigned int expires, unsigned char rflags,
+		unsigned long long ver);
+/* store_ver() for an eager replica: an EQUAL version with other bytes is a tie
+ * two writers made, and the greater type, bytes, length wins - the same on every node */
+int pcache_ht_store_peer(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned int expires, unsigned char rflags,
 		unsigned long long ver);
 /* S275: store_ver() keeping @wtick too - a record moved between tables

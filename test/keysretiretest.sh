@@ -1,23 +1,6 @@
 #!/bin/sh
-# keysretiretest.sh - S150 step B: a KEYS walk resumes across worker
-# turns holding a table pointer, and a resize swaps the table under it.
-#
-# Two things must hold.  The walk must END on the swap - what was
-# emitted stands - rather than read on from a table the registry no
-# longer publishes (step C reuses such a table).  And the old table must
-# be RETIRED only once every thread that could hold a pointer into it
-# has parked: /stats shows it pending, then cleared.  Six connections
-# (spread over both workers) keep no-match KEYS walks (full-length,
-# 4-byte reply) running through the whole resize, so the swap lands under
-# several walks in flight.  It was three: GitLab check (0.4.0, 8087253)
-# read keys_ended_on_swap 0 where 15 runs on 222 read 1-3 (usually 3),
-# with no code path found that would let a walk cross a swap unseen -
-# so more walkers make a timing gap unable to read zero while a real
-# defect still would, and a failure now prints the daemon's own counter
-# over time and every walk in flight at the swap.
-#
-# Fail-first: before B there is no `retire` object in /stats and no walk
-# ends on a swap - every figure below reads MISSING.
+# keysretiretest.sh - a KEYS walk resumed across worker turns ENDS on a resize's table swap, and
+# the old table is retired only once every thread that could hold it has parked.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -33,12 +16,8 @@ trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
 if ss -ltn 2>/dev/null | grep -qE ":1759[12][[:space:]]"; then
 	echo "keysretiretest: port 17591/17592 already bound" >&2; exit 1
 fi
-# keys_turn_us = 1: every turn walks its floor of 1,024 buckets and yields,
-# so a walk of 2^18 buckets spans ~256 turns - the premise above.  Under
-# S292's default (250 us a turn) a sparse no-match walk ends in a turn or
-# two on a fast runner: there is almost no moment between its turns for the
-# swap to land in, and keys_ended_on_swap read 0 with the walkers staggered
-# (v0.7.3-rc5 GitHub core2; S454)
+# keys_turn_us = 1: every turn walks its floor of 1,024 buckets and yields, so a walk spans ~256
+# turns; at the default a sparse walk ends in a turn or two, leaving the swap no gap to land in
 cat > "$D/n.conf" <<EOF
 [daemon]
 workers = 2
@@ -161,22 +140,15 @@ else:
 stop = False
 stats = {"walks": 0, "bad": 0, "err": ""}
 lock = threading.Lock()
-# when each walk was sent and answered, per connection - so a walk IN
-# FLIGHT at the swap can be named, and a zero below explained rather than
-# retried.  GitHub's check on rc33 read zero with 5790 walks through the
-# resize, which 14 runs here never did; the timeline is what the next one
-# will show.
+# when each walk was sent and answered, per connection, so a walk in flight at the
+# swap can be named and a zero below explained rather than retried
 NW = 6
 spans = [[] for _ in range(NW)]
 def walker(ix):
     try:
         c = conn(); rd = Resp(c)
-        # staggered: six walkers sent back to back from one moment stay in
-        # lockstep - v0.7.2-rc9's check-standalone had all six sent within
-        # 0.7 ms and answered within 0.4 ms of each other, so the swap
-        # landing between two walks missed all six at once (rc33's GitHub
-        # zero too).  An offset each and a jitter after every walk spread
-        # them over a walk's length, and keep them spread.
+        # staggered: walkers sent together stay in lockstep and a swap between two walks
+        # misses all of them; an offset each and a jitter after every walk keep them spread
         time.sleep(ix * 0.008)
         while not stop:
             t0 = time.time()
@@ -193,10 +165,8 @@ def walker(ix):
     except Exception as e:
         with lock:
             stats["bad"] += 1; stats["err"] = repr(e)[:80]
-# the swap's moment: the bucket count stats reports moves from 2^18 to
-# 2^16 when the registry publishes the new table.  Also the daemon's own
-# keys_ended_on_swap over time, until a second after the swap - what a
-# zero below is read against.
+# the swap's moment (the bucket count moves from 2^18 to 2^16), and keys_ended_on_swap
+# over time until a second after it - what a zero below is read against
 swap_at = [None]
 ended_tl = []
 def swapwatch():

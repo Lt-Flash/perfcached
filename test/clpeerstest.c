@@ -1,22 +1,5 @@
-/*
- * clpeerstest.c - the peer table (M1).
- *
- * The table is where membership is decided, and every case here is a way
- * that decision could go wrong without a fleet ever noticing:
- *   - liveness read one millisecond off the boundary, so a peer is
- *     mourned early or kept past death
- *   - a slot reused for a new address inheriting its last occupant's
- *     replication flags, which is S102: the new peer never gets the
- *     copies the stale flags say it already has
- *   - an id looked up and answered by a DEAD slot that still holds it
- *   - duplicate-id arbitration firing inside its grace window, which
- *     turns this node's own stale view into an accusation
- *
- * No socket, no second daemon, no clock: every entry point takes `now`,
- * so the boundary is placed exactly rather than slept through.
- *
- * Build: cc -o clpeerstest test/clpeerstest.c src/clpeers.o
- */
+/* clpeerstest.c - the peer table, where membership is decided: liveness at the exact boundary
+ * (every entry point takes `now`), slot reuse, lookups past dead slots, duplicate-id grace. */
 #include <stdio.h>
 #include <string.h>
 
@@ -112,7 +95,8 @@ int main(void)
 		"a new address is appended and reports created");
 	check(PT.n_peers == 3, "the table grew by one");
 
-	/* S102: a reclaimed slot must not inherit the last occupant's flags */
+	/* a reclaimed slot must not inherit the last occupant's flags, or the new peer never gets
+	 * the copies they claim it has */
 	fill(2, now);
 	PT.peers[0].node = 0;                      /* died */
 	PT.peers[0].backfill[0] = 1;

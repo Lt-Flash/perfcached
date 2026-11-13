@@ -34,5 +34,6 @@ RUN apk add --no-cache libsodium python3
 COPY --from=build /src/perfcached /src/perfcli /src/bench/pcbench \
      /src/natbench /usr/local/bin/
 COPY --from=build /src/bench/stallprobe.py /usr/local/bin/stallprobe.py
+COPY --from=build /src/test/pcnative.py /usr/local/test/pcnative.py
 ENTRYPOINT ["perfcached"]
 CMD ["-f", "/etc/perfcached.conf"]

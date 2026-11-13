@@ -1,21 +1,6 @@
 #!/bin/sh
-# iobusytest.sh - S379 (0.6.1): each worker's busy share - its time outside
-# epoll_wait / io_uring_enter - and the alert that tells a node on epoll
-# whose workers run out of time the lever it has.  One worker, pcbench
-# (8 connections, depth 32) to saturate it, PERFCACHED_ALERT_FAST=60 (the
-# alert's hold 5 s, its clear 1 s, its one-minute window 3 s) and
-# [alerts] epoll_busy_pct = 20.
-#  1. idle: /stats io.workers has a row per worker, under 10% busy;
-#     /metrics has perfcached_io_worker_busy_seconds_total per worker
-#  2. io = epoll under the load: the worker over 50% busy, io.epoll_busy a
-#     warning with the advice for this host - "change io = epoll to io =
-#     io_uring" where io_uring is usable, "not usable here either" where
-#     not; cleared once the load stops
-#  3. the default refused (PERFCACHED_URING_DENY=1), epoll as its fallback:
-#     the same load raises it, naming the refusal
-#  4. io_uring (where usable): the same load raises nothing
-# Fail-first: 0.6.0.1 has no io.workers and no io.epoll_busy.
-# Usage: test/iobusytest.sh ./perfcached [./pcbench]
+# iobusytest.sh - each worker's busy share (time outside epoll_wait/io_uring_enter) in /stats and
+# /metrics, and io.epoll_busy telling a saturated epoll node its lever; io_uring raises nothing.
 set -u
 BIN=${1:-./perfcached}
 PB=${2:-./pcbench}

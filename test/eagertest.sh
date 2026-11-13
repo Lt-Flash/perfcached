@@ -1,14 +1,6 @@
 #!/bin/sh
-# eagertest.sh — eager store mode: the distributor as a background
-# push-to-all synchronizer.  Asserted:
-#  - records written through ONE node appear on EVERY node WITHOUT any
-#    reads (the whole point: low-TTL keyspaces never converge via
-#    pull-on-miss, eager pushes them);
-#  - converged reads are LOCAL (a read burst adds zero pulls);
-#  - TTLs travel with the copies; updates re-propagate (wtick moves);
-#  - a node that died and rejoined resyncs IN FULL from zeroed marks;
-#  - deletes still ride the tombstone plane fleet-wide.
-# Usage: test/eagertest.sh [./perfcached]
+# eagertest.sh - eager mode pushes every write to every node without reads; converged reads are
+# local, TTLs and updates travel, a rejoined node resyncs in full, deletes tombstone fleet-wide.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -77,7 +69,7 @@ entc() { call $1 '{"method":"stats","params":{"col":"eg"}}' \
 	| python3 -c 'import json,sys; print(json.load(sys.stdin)["collections"][0]["entries"])'; }
 cstat() { call $1 '{"method":"stats"}' \
 	| python3 -c "import json,sys; print(json.load(sys.stdin)[\"cluster\"][\"$2\"])"; }
-# the node's OWN start kind, from its members entry (S82/S103)
+# the node's OWN start kind, from its members entry
 selfstart() { call $1 '{"method":"members"}' | python3 -c '
 import json,sys
 d = json.load(sys.stdin)
@@ -94,8 +86,8 @@ node 3 17073
 start 1
 start 2
 start 3
-# S83: a joiner is RECOVERING until it knows there is nothing to pull, and
-# a write into that window is refused; wait for each node's own ready line
+# a joiner is RECOVERING until it knows there is nothing to pull, and a write into that window
+# is refused; wait for each node's own ready line
 i=0
 while [ $i -lt 200 ]; do
 	grep -q "node state .* -> ready" "$D/n1.log" && grep -q "node state .* -> ready" "$D/n2.log" \
@@ -119,24 +111,20 @@ while [ $i -lt 5 ]; do
 done
 E2=$(entc 17072); E3=$(entc 17073)
 echo "eager census after writes only: 200 / $E2 / $E3"
-# S105: the write-path push coalesces - 200 writes down one connection
-# are a handful of datagrams per peer, not 200
+# the write-path push coalesces - 200 writes down one connection are a handful of datagrams
+# per peer, not 200
 RP=$(cstat 17071 repl_pushed); RG=$(cstat 17071 repl_groups)
 [ "$RG" -gt 0 ] && [ $((RG * 4)) -le "$RP" ] && ok \
 	|| bad "S105: the push did not coalesce (records $RP in $RG datagram(s))"
 echo "  push coalescing: $RP records in $RG datagrams"
 [ "$E2" -eq 200 ] && [ "$E3" -eq 200 ] && ok \
 	|| bad "eager push did not converge ($E2/$E3)"
-# S73: delivery is the write-path push - 200 keys to 2 peers; the sweep
-# is repair and may not have run yet
+# delivery is the write-path push - 200 keys to 2 peers; the sweep is repair and may not have run
 PU=$(cstat 17071 repl_pushed 2>/dev/null || echo 0)
 [ "${PU:-0}" -ge 400 ] 2>/dev/null && ok || bad "repl_pushed at convergence: $PU (want >= 400)"
 
-# S73: a write replicates ON THE WRITE, whatever its TTL.  A 30 s key
-# and a 5 s key written through node1 must be held by node2 and node3
-# within a second or two - not on the next 10 s sweep, which the old
-# "dying soon" rule would have skipped them from anyway.  Fails against
-# a build that only sweeps: neither key ever arrives.
+# a write replicates on the write, whatever its TTL: a 30 s and a 5 s key reach node2 and node3
+# within a second or two, not on the next 10 s sweep
 E2b=$(entc 17072); E3b=$(entc 17073)
 call 17071 '{"method":"set","params":{"col":"eg","key":"short30","value":"lives-30s","ttl":30}}' > /dev/null
 call 17071 '{"method":"set","params":{"col":"eg","key":"short5","value":"lives-5s","ttl":5}}' > /dev/null
@@ -181,10 +169,8 @@ T=$(call 17073 '{"method":"ttl","params":{"col":"eg","key":"gk005"}}' \
 	| python3 -c 'import json,sys; print(json.load(sys.stdin)["ttl"])')
 [ "$T" -gt 400 ] && [ "$T" -le 500 ] && ok || bad "replicated ttl: $T"
 
-# updates re-propagate (the wtick moves past the mark).  gk010 rewrites
-# the value in place (same cell - the reused-cell wtick re-stamp);
-# gk011 re-sets the SAME value with a new TTL (the versionless bump
-# path must re-stamp too, or a TTL refresh never travels)
+# updates re-propagate: gk010 rewrites in place (the reused-cell wtick re-stamp); gk011 re-sets
+# the same value with a new TTL (the versionless bump path must re-stamp too)
 call 17072 '{"method":"set","params":{"col":"eg","key":"gk010","value":"updated","ttl":500}}' > /dev/null
 call 17072 '{"method":"set","params":{"col":"eg","key":"gk011","value":"val-011","ttl":900}}' > /dev/null
 i=0
@@ -225,9 +211,8 @@ echo "$R" | grep -q '"late-250"' && ok || bad "late key on rejoined node: $R"
 R=$(call 17073 '{"method":"get","params":{"col":"eg","key":"gk003"}}')
 echo "$R" | grep -q '"val-003"' && ok || bad "old key on rejoined node: $R"
 
-# NO ECHO: replicas are passive and never re-propagate.  node3
-# authored nothing since its rejoin - if pushed copies bounced, its
-# repl_out would grow every sweep
+# NO ECHO: replicas are passive; node3 authored nothing since its rejoin, so its repl_out must
+# not grow every sweep
 sleep 12
 R3=$(cstat 17073 repl_out)
 [ "$R3" -eq 0 ] && ok || bad "replica echo: node3 repl_out=$R3"
@@ -236,11 +221,8 @@ sleep 12
 RO2=$(cstat 17071 repl_out)
 [ "$RO2" -eq "$RO1" ] && ok || bad "author keeps re-pushing ($RO1 -> $RO2)"
 
-# BUDGET: a keyspace larger than one tick's byte budget must still
-# converge.  Before the resumable cursor the sweep restarted at bucket 0
-# every tick, so it replicated exactly one budget's worth (4MiB) and
-# re-sent that same head forever - measured, with the tail never
-# arriving.  200 x 30KB is comfortably past the budget.
+# BUDGET: a keyspace past one tick's byte budget (4MiB) must still converge through the resumable
+# cursor; 200 x 30KB is past it
 for i in $(seq 0 199); do
 	printf '{"method":"set","params":{"col":"eg","key":"big%03d","value":"' $i
 	awk 'BEGIN{while(i++<30000) printf "x"}'
@@ -256,10 +238,8 @@ E2=$(entc 17072); E3=$(entc 17073)
 echo "over-budget census: $E2 / $E3 (want >= 480 each)"
 [ "$E2" -ge 480 ] && [ "$E3" -ge 480 ] && ok \
 	|| bad "over-budget keyspace did not converge ($E2/$E3 of 480)"
-# and once converged the sweep goes QUIET - it must not re-push forever.
-# S73: convergence is now the push, which lands before the sweep has run;
-# let the repair sweep finish its first pass (repl_out stops moving across
-# one sweep period) BEFORE the quiet window opens
+# once converged the sweep goes QUIET; let the repair sweep's first pass finish (repl_out stops
+# moving across one sweep period) before the quiet window opens
 RQ0=$(cstat 17071 repl_out); i=0
 while [ $i -lt 6 ]; do
 	sleep 11; RQn=$(cstat 17071 repl_out)
@@ -273,33 +253,17 @@ RQ2=$(cstat 17071 repl_out)
 	|| bad "sweep still re-pushing after convergence ($RQ1 -> $RQ2)"
 
 # ---- a node that comes back EMPTY must be refilled by its peers -------
-# The steady sweep deliberately sends only records this node AUTHORED: a
-# copy it merely received is PASSIVE, and re-sending those would echo the
-# keyspace around the fleet for ever.  The consequence was that a node
-# restarted empty got NOTHING from peers holding only copies - measured
-# before the fix at 120 seconds flat at 0 entries while both peers held
-# 20000.  The fix arms a ONE-SHOT backfill when a peer's incarnation
-# changes, from a single designated sender.
+# the sweep sends only authored records, so a peer's new incarnation arms a one-shot backfill
 WANT=$(entc 17072)
 COLD0=$(grep -c "started cold" "$D/n2.log")
-# where each survivor's log ends BEFORE the restart: only lines written
-# after this point may satisfy the waits below.  Node 2's log already
-# carries "backfilled node <3> after its restart" from node 3's rejoin,
-# and an un-named grep over the whole file was satisfied by that line
-# instantly - so the "wait for the sender" below was inert from rc9 on,
-# and the quiet window opened while the sender's own cycle still had a
-# slice to collect (rc10, rc11: 618 -> 766, one slice).
+# only survivor log lines written after the restart may satisfy the waits below: node 2's log
+# already carries a backfill line from node 3's rejoin
 POS2=$(wc -l < "$D/n2.log"); POS3=$(wc -l < "$D/n3.log")
 kill -9 $P1 2>/dev/null; P1=
 sleep 8                        # past the purge window, so the fleet notices
 start 1
-# It came back with nothing of its OWN: the daemon classifies such a
-# start as "cold" (no records at start) and says so in its own members
-# entry for 30 s after ready.  Do NOT assert entries == 0 here: every
-# pipeline run, green or red, has the backfill completing "after 0s",
-# i.e. inside the first sample, so a count taken at the event races the
-# refill this leg exists to test - rc16's sanitized run lost that race.
-# The start kind is the property; the count is the outcome.
+# a start with nothing of its own reads "cold" in its members entry for 30 s; no entries == 0
+# check here - the backfill completes inside the first sample, the start kind is the property
 ST1=$(selfstart 17071)
 [ "$ST1" = "cold" ] && ok || bad "node1 did not come back cold (start=$ST1)"
 i=0
@@ -316,17 +280,8 @@ echo "refill after empty restart: $E1 of $WANT"
 # start byte, not from a record count a sweep could have bumped first
 [ "$(grep -c "started cold" "$D/n2.log")" -gt "$COLD0" ] && ok \
 	|| bad "node2 did not see the restart as a cold start: $(grep -E 'NOT backfilling|cold' "$D/n2.log" | tail -1)"
-# ...and having refilled it, the fleet must go QUIET again: a backfill
-# that keeps firing IS the echo the PASSIVE rule exists to prevent.
-#
-# S83: the restarted node PULLS its bootstrap and is the one that knows
-# when it is complete - the window opens on ITS OWN completion line,
-# written after its restart.  (It used to open on a survivor's
-# "backfilled node N" line; a sender is the wrong party to ask, and a
-# second sender during the holdoff could still have a slice to collect.
-# The push path is now the fallback, exercised by boottest.)  One sweep
-# period is still allowed for anything in flight to land; after that
-# EVERY node's counter must hold.
+# ...and having refilled it the fleet goes QUIET again: the window opens on the restarted node's
+# own completion line, and after one sweep period every node's counter must hold
 ID1=$(cstat 17071 node)
 after() { tail -n +"$(($2 + 1))" "$D/n$1.log"; }   # after <n> <pos>: lines since the restart
 i=0

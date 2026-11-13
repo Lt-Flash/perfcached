@@ -1,21 +1,6 @@
 #!/bin/sh
-# healroutinetest.sh - S306 step 3: a node that heals again and again says
-# healing has become routine (the log is undersized for the write rate).
-#
-# S229 heals a WAL loss in place - writes refused, a snapshot, READY - and
-# the operator kept it (DESIGN 12fx, 12ia): clients never wait.  One heal
-# is an incident; PC_WAL_HEAL_ROUTINE (3) within PC_WAL_HEAL_WIN_S (600 s)
-# is the load, every time it returns.  One node, 16 KB rings, the device
-# slowed (syncfailshim "walslow") during each of four bursts, so every
-# burst loses records and heals:
-#   1. after the FIRST heal nothing says routine (heals_recent 1, false)
-#   2. after four heals: /stats wal.heals_recent >= 3, heal_routine true
-#   3. /metrics perfcached_wal_heal_routine 1, heals_recent >= 3
-#   4. the WARNING "healing has become routine" appears exactly ONCE
-#      (once per window, not once per heal)
-#   5. the node is READY afterwards with nothing unhealed
-# Fail-first: before step 3 the fields and the line do not exist.
-# Usage: test/healroutinetest.sh [./perfcached] [./syncfailshim.so]
+# healroutinetest.sh - a node that heals PC_WAL_HEAL_ROUTINE times within PC_WAL_HEAL_WIN_S says healing is
+# routine: /stats, /metrics, one WARNING.  Usage: test/healroutinetest.sh [./perfcached] [./syncfailshim.so]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -60,7 +45,7 @@ segment_mb = 16
 segments = 16
 ring_kb = 16
 save = off
-# S466: the default waits rather than lose a record; this test is about the heal
+# the default waits rather than lose a record; this test is about the heal
 on_full = heal
 CONF
 chmod 600 "$D/n.conf"

@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * relkey.h - the release keys this build trusts with no configuration
- * (UP6n, DESIGN 12nf).  Data only, so the configuration dump and its
- * tests link it without the upgrade code.
- */
+/* relkey.h - the release keys this build trusts with no configuration.  Data
+ * only, so the configuration dump and its tests link it without the upgrade code. */
 #ifndef PC_RELKEY_H
 #define PC_RELKEY_H
 

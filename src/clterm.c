@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clterm.c — the mastership term: persistence and the three rules.
- *
- * Kept free of cluster.c so the rules can be exercised without a fleet;
- * the decisions are pure functions and the state is one small file.
- */
+/* clterm.c - the mastership term: persistence and the three rules, free of cluster.c so the
+ * rules (pure functions over one small file) can be exercised without a fleet. */
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,16 +12,8 @@
 
 #define TERM_MAGIC 0x4D544350u             /* 'PCTM' LE - the legacy form */
 
-/* S106: the file is text, in the identity file's style:
- *
- *   perfcached-node-term 1
- *   term 11
- *   check ecf582caa5b1b50e
- *
- * The check is FNV-1a (fnv1a.h) over the term's four little-endian bytes
- * - a torn-write detector, not a guard.  The value above is the real one
- * for term 11, so the example can be checked against the code.  The legacy eight-byte form (magic
- * + term) is read once and rewritten.  Anything else refuses. */
+/* the file is three lines: TERM_HEADER, "term <n>", "check <%016llx FNV-1a of the term's 4 LE
+ * bytes>" (a torn-write detector).  The legacy 8-byte form (magic + term) is read, rewritten. */
 #define TERM_HEADER "perfcached-node-term 1"
 
 static struct {
@@ -68,7 +56,7 @@ static int hexval(int c)
 	return -1;
 }
 
-/* strict: the three lines above and nothing else; 0 parsed, -1 not */
+/* strict: those three lines and nothing else; 0 parsed, -1 not */
 static int term_parse(const unsigned char *buf, size_t len, uint32_t *out)
 {
 	const char *s = (const char *)buf;
@@ -107,14 +95,8 @@ static int term_parse(const unsigned char *buf, size_t len, uint32_t *out)
 	return 0;
 }
 
-/*
- * Written through a temp file and a rename, not in place.  The term is
- * rewritten every mastership change, so unlike the write-once identity
- * it can be torn by a crash mid-write - and a half-written term is not
- * a smaller term, it is an arbitrary one.  The directory fsync is what
- * makes the rename itself durable; without it the old name can survive
- * a power loss and the new content be lost.
- */
+/* Through a temp file and a rename: the term is rewritten on every mastership change, and a
+ * torn term is an arbitrary one.  The directory fsync makes the rename itself durable. */
 static int term_store(uint32_t t)
 {
 	char tmp[600], fin[600], buf[96];
@@ -166,9 +148,8 @@ int pc_term_init(const char *state_dir)
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
-		/* absent is the normal first boot; prove we CAN write before
-		 * claiming durability, so a read-only state dir is caught
-		 * here rather than at the moment of a promotion */
+		/* absent is the normal first boot; prove we CAN write before claiming
+		 * durability, so a read-only state dir is caught now, not at a promotion */
 		T.durable = term_store(0);
 		return 0;
 	}

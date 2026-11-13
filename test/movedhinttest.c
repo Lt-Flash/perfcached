@@ -1,26 +1,5 @@
-/* movedhinttest.c - RV-10: a forwarded reply tells a routing client it is
- * behind, and the client catches up in ONE request.
- *
- * A request that lands on the wrong node is forwarded and answered -
- * a stale client map costs a hop, never correctness.  But nothing in the
- * reply said so: a routing client that missed the membership push kept
- * paying the hop on every mis-owned key until its own periodic refresh
- * (opts.refresh_ms, 30 s by default) came round.  Under shard and spread
- * a reply the daemon had to forward now carries the stamp of the map it
- * routed by (S317: the PC_BIN_F_MOVED frame flag, [term][seq] after the
- * reply tree) - and a handle holding another stamp re-learns its
- * members right behind that call.
- *
- * The stale map is BUILT here: the handle connects to a two-node shard
- * fleet with the pushes ignored (opts.ignore_member_push) and the
- * periodic refresh pushed out to an hour, so only the hint can help it;
- * then a third node joins (the driver starts it on the ADD-NODE cue) and
- * a third of the keyspace changes owner.  Asserted: the handle learns
- * the third member within a handful of requests, it counts the hint, and
- * once it has caught up the fleet forwards nothing more for it.
- * Against a daemon without the hint the handle keeps its two members for
- * the whole run.
- * Usage: movedhinttest host port secret   (see movedhinttest.sh) */
+/* movedhinttest.c - a forwarded reply's MOVED stamp makes a routing client with a stale map (pushes
+ * ignored, periodic refresh an hour away) re-learn the members within a handful of requests. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>

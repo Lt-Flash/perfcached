@@ -1,19 +1,10 @@
 #!/bin/sh
-# coltest.sh - S69: collections created and dropped while the daemon serves,
-# and the RESP door's index-to-name map.  A standalone node: the gate refuses
-# by default and allows when set; a created collection takes writes; a
-# duplicate is refused; a drop refuses a non-empty collection until forced,
-# and every lookup after it says "no such collection"; the created set
-# survives a restart and a dropped one stays dropped; the RESP door reaches
-# a collection by the index mapped to its name, and INFO keyspace reports
-# every reachable collection with its real key count.  Then a two-node fleet:
-# a create on one node reaches the other, and a node started AFTER the create
-# picks it up from its peers.  Fail-first: a daemon before S69 answers
-# method-not-found to create, and its RESP door reports one empty database.
+# coltest.sh - collections created, resized, renamed and dropped while the daemon serves, across a
+# restart and a two-node fleet, and the RESP door's index-to-name map with its INFO keyspace.
 BIN=${1:-./perfcached}
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 D=$(mktemp -d /var/tmp/pccol.XXXXXX)
-# S129: j() dials once per call and privilege is per connection, so
+# j() dials once per call and privilege is per connection, so
 # it raises `enable` on each link when this is set.
 PC_ENABLE=col-enable-secret
 export PC_ENABLE
@@ -58,10 +49,8 @@ import json, pcnative, socket, sys
 port, method = int(sys.argv[1]), sys.argv[2]
 params = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None
 s = socket.create_connection(("127.0.0.1", port), timeout=20); f = pcnative.wrap(s)
-# S129: privilege is PER CONNECTION and this helper dials once per call,
-# so DDL needs `enable` on THIS link first.  Harmless for the rest - a
-# daemon without an enable secret refuses it and the real request still
-# goes, which is what the unprivileged assertions want.
+# privilege is per connection and this helper dials once per call, so DDL needs enable on
+# this link first; a daemon without an enable secret refuses it and the request still goes
 import os
 _es = os.environ.get("PC_ENABLE")
 if _es:
@@ -234,21 +223,8 @@ i=0; while [ $i -lt 100 ] && ! grep -q "joined as node" "$D/n2.log"; do sleep 0.
 j 17761 create '{"col":"fleetwide","buckets_log2":8}' > /dev/null
 i=0; while [ $i -lt 60 ]; do case "$(cols 17762)" in *fleetwide*) break;; esac; sleep 0.1; i=$((i+1)); done
 case "$(cols 17762)" in *fleetwide*) ok "a create on node 1 reached node 2 (after $((i / 10))s)";; *) bad "node 2 has: $(cols 17762)";; esac
-# A RESIZE MUST REACH THE FLEET AS A RESIZE.  NOTE: this pair runs in
-# `mode = store`, and store mode does NOT reproduce the announce bug
-# below - the unfixed binary passes these three.  The guard that fails
-# on it is test/colresizetest.sh, which needs an EAGER pair with the
-# collection declared in both configs.  These stay as store-mode
-# coverage, not as that bug's regression test.
-#
-# The history: the announce
-# took an int named `drop` and folded it to
-# `op = drop ? CLCOL_OP_DROP : CLCOL_OP_SET`, while every caller passed
-# the CLCOL_OP_* value.  create (0) and drop (1) survived that by
-# coincidence; RESIZE (3) is merely truthy, so every online resize was
-# broadcast as a DROP and the collection vanished fleet-wide - from a
-# call that returned {"resizing":true}.  Found on 245-247 on 2026-09-15
-# against an EMPTY collection; with records in it that was data loss.
+# a resize must reach the fleet as a resize; in store mode this is coverage only - the regression
+# guard for a resize announced as a drop is test/colresizetest.sh (an eager pair)
 j 17761 resize '{"col":"fleetwide","buckets_log2":10}' > /dev/null
 i=0; while [ $i -lt 60 ]; do [ "$(bkt 17762 fleetwide)" = 1024 ] && break; sleep 0.1; i=$((i+1)); done
 case "$(cols 17762)" in
@@ -258,11 +234,8 @@ esac
 [ "$(bkt 17762 fleetwide)" = 1024 ] \
 	&& ok "and the peer is at the new size (1024 buckets, after $((i / 10))s)" \
 	|| bad "node 2 buckets for 'fleetwide': $(bkt 17762 fleetwide), want 1024"
-# The ORIGINATOR resizes incrementally - pc_store_resize_tick() copies a
-# budget per maintenance tick - while the peer adopts the announced size
-# on receipt.  The wait above was for the PEER only; asserting node 1 with
-# no wait of its own is the race colresizetest had, and it fell over here
-# under ASAN on GitHub (node 1 still at 256 when read).
+# the originator resizes incrementally per maintenance tick while the peer adopts on receipt,
+# so node 1 gets its own wait
 i=0; while [ $i -lt 60 ]; do [ "$(bkt 17761 fleetwide)" = 1024 ] && break; sleep 0.5; i=$((i+1)); done
 [ "$(bkt 17761 fleetwide)" = 1024 ] \
 	&& ok "the originating node resized too (after $(echo "$i" | awk '{printf "%.1f", $1/2}')s)" \

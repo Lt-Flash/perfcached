@@ -1,33 +1,6 @@
 #!/bin/sh
-# tombresynctest.sh - S455: a member the fleet cannot vouch for record by
-# record resyncs - drops what it stored before its absence and pulls the
-# fleet's state - instead of keeping (and spreading) keys deleted while it
-# was away.
-#
-# A returning eager member's records are ruled on by a WITNESS: a peer up,
-# and complete, 30 s before the absence began (WITNESS_GRACE_MS).  With
-# none, S223 skips the reconcile and keeps everything - the safe side when
-# the fleet may be incomplete, and wrong for a member back after a long
-# absence while the fleet lived on (rolled to a new build meanwhile).
-# Four arms, four fresh eager fleets:
-#   A. a RESTART after an absence past resync_after_s (20 s) during which
-#      the fleet rolled - no witness at all: node 3's backup, 200 deletes
-#      confirmed and forgotten, node 3 stopped, nodes 1 and 2 rolled and
-#      serving 30 s and more, node 3 restored from the backup - it
-#      resyncs: none of the 200 anywhere, all 100 kept on it
-#   B. a SPLIT with no witness (cut ~10 s after the starts, the peers too
-#      young to witness it): asked to rebuild, it resyncs - none of the 200
-#      deleted, all 100 kept, and the 50 it wrote while cut off kept
-#   C. AWAY LONGER than resync_after_s (5 s), witnesses present: stopped
-#      cleanly 8 s, it resyncs anyway and holds the fleet's 100 after
-#   D. a RESTART with no witness INSIDE resync_after_s still skips (S223):
-#      nothing dropped, no resync - the safe side when boot times cannot
-#      tell a rolled fleet from an incomplete survivor (outagetest)
-# FAIL-FIRST: before S455 arm A's node 3 skipped its reconcile and held the
-# 200 (nodes 1 and 2 got them back - rc8's tombrestoretest); arm B's
-# rebuild skipped and node 3 kept the 200; arm C reconciled by the
-# witness, no resync.
-# Usage: test/tombresynctest.sh [./perfcached] [./netcutshim.so]
+# tombresynctest.sh - a returning member the fleet cannot vouch for (no witness, or away past resync_after_s)
+# drops what it held and pulls the fleet's state.  Usage: test/tombresynctest.sh [./perfcached] [./netcutshim.so]
 set -u
 BIN=${1:-./perfcached}
 SHIM=${2:-./netcutshim.so}
@@ -182,7 +155,7 @@ mkconf B "tombstone_retain_s = 20"
 start 1; start 2; start 3 shim
 gate
 ops 1 set r 0 300 > /dev/null; sleep 3
-echo "cut 127.0.156.1 127.0.156.2 mcast" > "$D/B/cut3"
+echo "cut 127.0.156.1 127.0.156.2 mcast rst" > "$D/B/cut3"
 sleep 3
 D1=$(ops 1 del r 0 200); W3=$(ops 3 set w 0 50)
 sleep 32
@@ -215,7 +188,7 @@ RS=$(st 3 'c.get("resyncs")'); L3=$(held 3 c 0 100)
 	bad "C. resyncs ${RS:-?} (want 1 or more), node 3 holds $L3 of 100; $(grep -h 'resync -\|reconcile -' "$D/C/n3.log" | tail -2 | tr '\n' ' ' | cut -c1-300)"
 stopall
 
-# ---- D. a restart, no witness, inside resync_after_s: S223's skip ----
+# ---- D. a restart, no witness, inside resync_after_s: the reconcile is skipped ----
 # peers 30 s old are witnesses: a slow host misses the window and the arm runs again
 for try in 1 2 3; do
 	rm -rf "$D/D"
@@ -225,7 +198,8 @@ for try in 1 2 3; do
 	ops 1 set d 0 100 > /dev/null; sleep 2
 	stopn 3; sleep 3
 	start 3
-	k=0; while [ $k -lt 75 ] && ! grep -q "reconcile SKIPPED\|reconcile - \|resync -" "$D/D/n3.log"; do sleep 0.2; k=$((k+1)); done
+	# the decision waits while a peer is cold: a blank founder is, for 30 s past its ready
+	k=0; while [ $k -lt 225 ] && ! grep -q "reconcile SKIPPED\|reconcile - \|resync -" "$D/D/n3.log"; do sleep 0.2; k=$((k+1)); done
 	ready 3 > /dev/null
 	RS=$(st 3 'c.get("resyncs")'); SK=$(st 3 'c.get("reconcile_skipped")'); L3=$(held 3 d 0 100)
 	[ "$RS" = 0 ] && [ "$SK" != True ] && [ "$L3" = 100 ] && [ $try -lt 3 ] || break

@@ -6,14 +6,16 @@ perfcached. Both are written to be re-runnable against a DIFFERENT
 rtpengine version — which is exactly what you should do before adding
 any RESP command for it.
 
-Requires `rtpengine` and `redis-cli`/`redis-server` on the box.
+Requires `rtpengine` at `/usr/bin/rtpengine` and `python3` on the
+box, and for `capture-redis.sh` a container runtime (podman, nerdctl
+or docker): its Redis runs from the `redis:8` image.
 
 ## 1. `capture-redis.sh` — what does rtpengine actually issue?
 
-Starts an isolated Redis (port 6399, own dir) and an isolated
-rtpengine (`table = -1`, ng on 22223, media 41000–41020) pointed at
-it, records `redis-cli MONITOR`, and drives a full call lifecycle
-(offer → answer → re-offer → delete) through the ng protocol.
+Starts an isolated Redis container (published on 127.0.0.1:6399 only)
+and an isolated rtpengine (`table = -1`, ng on 22223, media
+41000–41020) pointed at it, records `MONITOR`, and drives a full call
+lifecycle (offer → answer → re-offer → delete) through the ng protocol.
 
 **A live rtpengine and a live Redis on the same host are never
 touched** — different table, different ports, different database.
@@ -39,10 +41,26 @@ every startup.
 
 ## 2. `interop-perfcached.sh` — does rtpengine run on perfcached?
 
-Same isolated rtpengine, backend swapped to a perfcached listening on
-`127.0.0.1:6499` with collections named `0` and `1` (rtpengine is
-configured for db 1). Legs: start, a call lifecycle, then an rtpengine
-restart to force the `KEYS *` + `GET` restore path.
+Same isolated rtpengine (ng on 22224, media 41100-41120), backend
+swapped to a perfcached listening on `127.0.0.1:6499` with collections
+named `0` and `1` (rtpengine is configured for db 1). Legs: start, a
+call lifecycle, then an rtpengine restart to force the `KEYS *` +
+`GET` restore path. The script also reads the call back through the
+native door without a secret (`test/pcnative.py`), so 6499 is the
+native listener with plaintext allowed on loopback:
+
+    [secrets]
+    client = CHANGE-ME-client
+
+    [listen]
+    tcp = 127.0.0.1:6499
+    plaintext = loopback
+
+    [collection 0]
+    buckets_log2 = 14
+
+    [collection 1]
+    buckets_log2 = 14
 
 Result (2026-08-27): all three pass — rtpengine connects "in master
 mode", the call lands in perfcached with the TTL rtpengine asked for,
@@ -63,10 +81,11 @@ perfcached's `INFO` therefore reports a `# Replication` section with
 
 ### Reaching it over a network
 
-A Redis client cannot speak the Noise channel, so RESP only works on a
-plaintext listener, and `plaintext` is `never | loopback`. Run the
-client on the same host as a perfcached node (it clusters onward over
-the encrypted peer plane), or tunnel — the interop run used
-`ssh -L 6499:127.0.0.1:6499 <daemon-host>` because rtpengine and the
-daemon lived on different machines. Serving RESP across a LAN would
-need a new listener policy; that decision has not been taken.
+A Redis client cannot speak the Noise channel, so on the native
+listener RESP works only where `plaintext = loopback` lets it. The
+interop run tunnelled (`ssh -L 6499:127.0.0.1:6499 <daemon-host>`)
+because rtpengine and the daemon lived on different machines. Across
+a LAN, give the node a dedicated RESP listener: `resp = <addr>:<port>`
+in `[listen]`, with `resp_allow` (required off loopback) and, if
+wanted, a password in `[secrets] resp` - see
+`contrib/perfcached.conf.example`.

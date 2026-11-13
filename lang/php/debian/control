@@ -10,7 +10,7 @@ Rules-Requires-Root: no
 
 Package: php8.3-perfcached
 Architecture: any
-Depends: libperfd0 (>= 0.7.4.4~),
+Depends: libperfd0 (>= 0.7.5~),
          php8.3-common,
          phpapi-20230831,
          ${shlibs:Depends},

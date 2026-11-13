@@ -1,14 +1,5 @@
-/* clmeshtest.c - the unicast mesh's known addresses (clmesh.c), CH-14's
- * trial lifetime: on a clock the test supplies; no seeds, no resolver.
- *
- *   A  an address heard on trial is kept CLMESH_TRIAL_MS, and gone then
- *   B  confirmed after a trial start (an admitted node's ALIVE, the map),
- *      it is kept CLMESH_KNOWN_MS from then
- *   C  a confirmed address heard again on trial stays confirmed
- *   D  "new": the first hearing, and again once it lapsed - a lapsed
- *      confirmed address heard on trial is on trial again
- *   E  the targets a control frame goes to skip a lapsed trial address
- */
+/* clmeshtest.c - the unicast mesh's known addresses (clmesh.c) and the trial lifetime, on a clock
+ * the test supplies; no seeds, no resolver. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,24 +54,24 @@ int main(void)
 	pc_addr tg[CLMESH_MAX_KNOWN];
 	int i, n, has;
 
-	/* A */
+	/* A: an address heard on trial is kept CLMESH_TRIAL_MS, and gone then */
 	clmesh_heard(&a, t, 1);
 	CHK(known(&a, t + CLMESH_TRIAL_MS - 1) && !known(&a, t + CLMESH_TRIAL_MS),
 		"A: on trial - kept %d s, gone then", CLMESH_TRIAL_MS / 1000);
 
-	/* B */
+	/* B: confirmed after a trial start (an admitted node's ALIVE, the map): CLMESH_KNOWN_MS */
 	clmesh_heard(&b, t, 1);
 	clmesh_heard(&b, t + 10000, 0);
 	CHK(known(&b, t + 10000 + CLMESH_KNOWN_MS - 1) && !known(&b, t + 10000 + CLMESH_KNOWN_MS),
 		"B: confirmed 10 s after its trial began - kept %d min from then", CLMESH_KNOWN_MS / 60000);
 
-	/* C */
+	/* C: a confirmed address heard again on trial stays confirmed */
 	clmesh_heard(&c, t, 0);
 	clmesh_heard(&c, t + 300000, 1);
 	CHK(known(&c, t + 300000 + CLMESH_KNOWN_MS - 1),
 		"C: confirmed, then heard on trial - still confirmed");
 
-	/* D */
+	/* D: "new" - the first hearing, and again once lapsed (then on trial again) */
 	CHK(clmesh_heard(&d, t, 0) == 1 && clmesh_heard(&d, t + 1000, 1) == 0,
 		"D: new the first time, not the second");
 	CHK(clmesh_heard(&d, t + 1000 + CLMESH_KNOWN_MS, 1) == 1 &&
@@ -88,7 +79,7 @@ int main(void)
 		!known(&d, t + 1000 + CLMESH_KNOWN_MS + CLMESH_TRIAL_MS),
 		"D: lapsed, then heard on trial - new, and on trial again (%d s)", CLMESH_TRIAL_MS / 1000);
 
-	/* E */
+	/* E: the targets a control frame goes to skip a lapsed trial address */
 	n = clmesh_targets(tg, CLMESH_MAX_KNOWN, &self, t + CLMESH_TRIAL_MS + 1);
 	for (has = 0, i = 0; i < n; i++)
 		has |= pc_addr_eq(&tg[i], &a) ? 1 : pc_addr_eq(&tg[i], &b) ? 2 : 0;

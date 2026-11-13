@@ -1,19 +1,6 @@
 #!/bin/sh
-# S29 proof obligation 1: capture the EXACT Redis command stream that
-# rtpengine issues, so the perfcached RESP command list is settled from
-# the wire and not from guesswork.
-#
-# ISOLATION (this host runs a LIVE rtpengine on table 0 / ng 2223 /
-# ports 30000-40000 - none of them are touched): our redis is a
-# CONTAINER, redis 8, the same image every other bench here uses,
-# published on 127.0.0.1:6399 and nowhere else; our rtpengine runs
-# table = -1 (userspace only, no kernel table), ng on 22223, media ports
-# 41000-41020, all in this scratch dir, all removed on exit.
-#
-# rtpengine stays a HOST binary, deliberately: it is the subject under
-# test and the whole point is to capture what the host's own rtpengine
-# sends.  That is why redis publishes a port rather than living on a
-# bench network - the client cannot be moved onto the network with it.
+# capture-redis.sh - capture the exact Redis command stream rtpengine issues (MONITOR), from an isolated
+# redis container and a userspace-only rtpengine, so the RESP command list is settled from the wire.
 set -u
 D=$(cd "$(dirname "$0")" && pwd)
 . "$D/../containerlib.sh"

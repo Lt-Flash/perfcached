@@ -1,26 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * wedgetest.c — a failed request must not disable the handle (task S72).
- *
- * The defect this exists to catch: the pipeline counters (nids/idhead,
- * qlen) were cleared ONLY on the successful collect path, so a request
- * that was sent but whose reply never arrived left the handle
- * permanently "mid-pipeline".  Every later call was then refused
- * locally with "pipeline in progress" - without touching the socket,
- * without setting `poisoned`, and therefore without ever reaching the
- * failover that would have rescued it.  The guard blocked its own
- * recovery.
- *
- * Reproduced in production on 2026-09-04 by restarting a perfcached:
- * one EOF, then "pipeline in progress" for the life of the process.
- *
- * The test drives it with NO standbys (spares=0) on purpose.  With
- * standbys the failover path adopts a fresh connection and hides the
- * bug; the bare handle is where the unwind has to be correct.
- *
- * usage: wedgetest <host> <port> <secret> <col>
- */
+/* wedgetest.c - a request whose reply never arrives must unwind the pipeline, not leave the handle
+ * refusing every later call with "pipeline in progress".  No standbys: failover would hide it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,9 +55,8 @@ int main(int argc, char **argv)
 	fflush(stdout);
 	sleep(8);
 
-	/* First request after the restart: expected to fail, and expected
-	 * to say something about the CONNECTION, not about a pipeline the
-	 * caller never opened. */
+	/* the first request after the restart fails, and its error is about the connection, not
+	 * about a pipeline the caller never opened */
 	if (perfd_get(p, col, "wedge_probe", &v, &vl, &gttl) >= 0) {
 		free(v); v = NULL;
 		printf("  (the first post-restart request succeeded - "
@@ -88,21 +68,8 @@ int main(int argc, char **argv)
 				perfd_error(p));
 	}
 
-	/*
-	 * THE ASSERTIONS.  libperfd deliberately does NOT reconnect by
-	 * itself - that is the caller's decision, made through
-	 * perfd_state() - so the contract after a failure is:
-	 *
-	 *   1. the pipeline is unwound (nothing left outstanding),
-	 *   2. the handle says it is FAILED rather than inventing a
-	 *      pipeline the caller never opened,
-	 *   3. a caller that acts on that can reconnect and carry on.
-	 *
-	 * Before the fix, (1) was false, which made (2) impossible: the
-	 * stale counters made every later call return "pipeline in
-	 * progress" without touching the socket, so `poisoned` was never
-	 * reached and the handle was dead for good.
-	 */
+	/* libperfd does not reconnect by itself: after a failure the pipeline is unwound, the
+	 * handle says FAILED, and a caller acting on perfd_state() can reconnect and carry on */
 	if (perfd_pending(p) != 0)
 		bad("a failed one-shot left replies outstanding",
 			"perfd_pending() != 0");

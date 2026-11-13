@@ -1,7 +1,5 @@
-/* fopenmapshim.c - LD_PRELOAD for test/cleardoortest.sh: fopen() of the one
- * path in PC_FOPEN_FROM opens PC_FOPEN_TO instead, so a test can show
- * perfcli a config at a system path (/etc/perfcached.conf, S339) without
- * writing to the host's /etc.  Every other path opens as asked. */
+/* fopenmapshim.c - LD_PRELOAD: fopen() of PC_FOPEN_FROM opens PC_FOPEN_TO instead, so a test can
+ * show perfcli a config at a system path without writing to the host's /etc. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>

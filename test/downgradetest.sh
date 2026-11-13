@@ -1,26 +1,6 @@
 #!/bin/sh
-# downgradetest.sh - UP3 (0.6.5): no silent downgrade.  A build that meets
-# state a NEWER build wrote refuses to start, says why, and leaves the
-# state as it found it - it never treats a newer format as damage and
-# starts as if new.
-#  1. A snapshot whose format is one past this build's (re-sealed, so its
-#     CRC is good: the version alone must be what refuses it): -R says
-#     newer-format, the start refuses with a CRIT naming the format, the
-#     directory is byte-for-byte unchanged; the original file back, the
-#     node starts and every key is there.
-#  2. A WAL record of a type this build does not know, well framed, with
-#     a known record AFTER it: -W names it and reads on past it; the start
-#     refuses (the WAL unchanged); [wal] unknown_records = skip starts
-#     without it and the record after it IS replayed; with skip removed
-#     again the next start passes - the skip start's snapshot lies above
-#     the unknown record, so it is covered.
-#  3. A cluster-id file whose header is version 2: the start refuses
-#     rather than joining or founding as if new; the same id under
-#     version 1 starts and reports that id (the control).
-# FAIL-FIRST: 0.6.4 takes 1 as a corrupt snapshot and starts from the WAL
-# alone, 2 as a torn log (the record after it lost, no word said), and 3
-# as no cluster id at all - every arm below fails against it.
-# Usage: test/downgradetest.sh [./perfcached]
+# downgradetest.sh - no silent downgrade: a build meeting state a NEWER build wrote (snapshot format, WAL
+# record type, cluster-id version) refuses to start, says why, and leaves the state as it found it.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -109,7 +89,7 @@ PY
 }
 val() { call "r = c('get', col='th', key='$1')['result']; print(r.get('value') if r.get('found') else None)" 2>/dev/null; }
 # the state a refusal must not touch: every file but the directory lock,
-# which the first start in a directory creates (S290)
+# which the first start in a directory creates
 sums() { (cd "$1" && find . -type f ! -name perfcached.lock | sort | xargs sha256sum) | sha256sum | cut -c 1-16; }
 # CRC32C as the WAL and the snapshot seal with it (Castagnoli, reflected)
 cat > "$D/crc.py" <<'PY'
@@ -168,9 +148,8 @@ c('set', col='th', key='a', value='1')
 c('set', col='th', key='after', value='v1')
 time.sleep(1.2)" || bad "2. writes"
 hardkill
-# after the last record: one of type 200 that does not parse as any of this
-# build's layouts, then a copy of the last record ('after') with its value
-# v2 and its seq and version one higher - then a zero length, the log's end
+# after the last record: one of type 200 that parses as none of this build's layouts, then a copy of
+# the last record (value v2, seq and version one higher), then a zero length, the log's end
 python3 - "$D/w2" "$D/crc.py" <<'PY'
 import glob, struct, sys
 exec(open(sys.argv[2]).read())

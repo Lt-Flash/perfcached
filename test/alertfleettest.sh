@@ -1,35 +1,6 @@
 #!/bin/sh
-# alertfleettest.sh - S352c: the fleet side of the alerts (DESIGN 12le).  A
-# node without [mail] hands what it would mail to the ELECTED mailer (the
-# lowest ready node id whose ALIVE says it can mail), which mails it naming
-# the origin; a FLEET event - a member gone, missing, the fleet below a
-# majority - is mailed by that one node, once, however many members see it.
-# Three nodes, eager, [mail] on node 1 only, against test/fakesmtp.py
-# (STARTTLS on a self-signed cert, AUTH) and test/fakeupstream.py, with
-# PERFCACHED_ALERT_FAST=20 (every hold and clear time / 20).  "Node 1..3"
-# are the three configs, started in that order; the fleet gives them their
-# ids, which the checks read back:
-#  1. node 1 mails itself; nodes 2 and 3 relay to it: alerts.mailer "this
-#     node" / "node 1", fleet_mailer 1 on all three
-#  a. node 3's read-through upstream is down (nodes 1 and 2 reach theirs - a
-#     read-through collection's upstream is the node's own, not the fleet's,
-#     though its name is the fleet's): the alert arrives by mail via
-#     node 1, naming node 3 (S377: its Host line, and the footer "sent by
-#     node 1 for node 3, which has no [mail] of its own"); node 3's ring
-#     says "relayed to node 1", node 1's holds it from node 3;
-#     mail.relayed_out on 3, relayed_in on 1
-#  b. node 2 is stopped: exactly ONE mail says it left, sent by node 1;
-#     node 3 keeps it as "mailed by node 1"
-#  c. node 1 is stopped too: node 3 logs "no mailer reachable", keeps it so
-#     in its ring, and its alerts.mailer says none
-#  d. the SMTP password is in no log, no /stats and no page
-# Node 1 runs a PC_MAIL=libcurl build of this tree (made here when the
-# binary under test has no SMTP client and libcurl's development files are
-# installed; SKIPPED, loudly, when not); nodes 2 and 3 run the binary under
-# test - a build without an SMTP client relays like any node without [mail].
-# Fail-first: on d98cb48 (S352b, a PC_MAIL=libcurl build) every check but the
-# fleet forming and d fails - nothing relays, nothing reports the fleet.
-# Usage: test/alertfleettest.sh [./perfcached]
+# alertfleettest.sh - a node without [mail] relays alerts to the elected mailer; a fleet event is mailed once
+# by it (test/fakesmtp.py); the SMTP password shows nowhere.  Usage: test/alertfleettest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -147,8 +118,7 @@ PY
 waitfor() { # waitfor <seconds> <shell condition>
 	w=0; while [ $w -lt $(($1 * 10)) ]; do eval "$2" && return 0; sleep 0.1; w=$((w+1)); done; return 1
 }
-# S377: a mail is MIME, its parts quoted-printable; these read the subject
-# and the text/plain part, decoded
+# a mail is MIME, its parts quoted-printable: these decode the subject and the text/plain part.
 # mails <regex> - how many mails' subject or text match
 mails() { python3 - "$D/m" "$1" <<'PY'
 import email, glob, json, re, sys
@@ -161,8 +131,7 @@ for f in glob.glob(sys.argv[1] + "/*.json"):
 print(n)
 PY
 }
-# mailof <regex> - the first mail that matches: its subject, the text line
-# that matches, its Host line and its "Sent by" line (which node sent it)
+# mailof <regex> - the first match: subject, matching text line, Host line and "Sent by" line
 mailof() { python3 - "$D/m" "$1" <<'PY'
 import email, glob, json, re, sys
 from email import policy

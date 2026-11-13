@@ -1,39 +1,6 @@
 #!/bin/sh
-# stalltest.sh - S216: a node whose cluster thread has wedged says so.
-#
-# ONE thread applies every replicated record, answers every pull and runs
-# the control plane; ANOTHER keeps the heartbeat going when the first is
-# heads-down, by re-sending the last frame it built.  So a cluster thread
-# that blocks for good leaves a node that goes on heartbeating READY,
-# stays in every client's selection, and serves nothing on the cluster
-# plane - for ever.  Nothing told anybody.
-#
-# The fault is made with test/threadfreeze.c: the daemon's parent stops
-# exactly ONE of its threads (pc-cluster) with ptrace; the heartbeat
-# thread and the workers go on running, which is the whole point.
-#
-# A two-node fleet, node B under the freezer, apply_stall_ms = 2000:
-#  - B is READY and the fleet replicates (the control);
-#  - the thread is frozen for 9 s - CONFIRMED by the kernel: that task
-#    reads "t" (tracing stop) in /proc while pc-beat of the same process
-#    does not;
-#  - B says STALLED within the limit plus a beat, with a reason that
-#    names the cluster thread, in its own stats;
-#  - A - which hears it only from B's heartbeat thread - lists B as
-#    stalled with that reason, and B never stops being a MEMBER (no
-#    purge, no rejoin: nothing re-shards over a stall);
-#  - B still answers a read for a key it holds;
-#  - released, B is READY again by itself after a steady apply_stall_ms,
-#    A sees it, and the stall is counted with its length.
-# A third arm, the false positive that must not happen: the WHOLE process
-# stopped (SIGSTOP, as a VM pause would) for longer than the limit, then
-# continued - every thread's clock is old for the same reason, and that is
-# not a wedged thread: B must not report a stall.
-# A second arm, apply_stall_ms = 0: the same freeze, B stays READY - the
-# detector is off when it is switched off.
-# STALLTEST_LEGACY=1 omits the key and freezes past the 10 s default, so
-# the suite can be pointed at a daemon from before the detector.
-# Usage: test/stalltest.sh [./perfcached] [./threadfreeze] [./perfcli]
+# stalltest.sh - a wedged cluster thread (test/threadfreeze.c) reports STALLED, the node stays a member; a pause
+# or apply_stall_ms = 0 reports nothing.  Usage: test/stalltest.sh [./perfcached] [./threadfreeze] [./perfcli]
 set -u
 BIN=${1:-./perfcached}
 TF=${2:-./threadfreeze}
@@ -244,15 +211,8 @@ if [ "${STALLTEST_LEGACY:-0}" != 1 ]; then
 	stop_arm
 fi
 
-# ---- the whole process paused is not a wedged thread ---------------------
-# Built so that ONLY the guard can pass it.  A plain STOP/CONT proves
-# nothing: on CONT the cluster thread wakes and stamps its clock before
-# the heartbeat thread looks, guard or no guard (tried: the arm stayed
-# green with the guard disabled).  So the thread is ALSO frozen, from just
-# before the stop until 0.4 s after the continue: when the process
-# resumes the clock is 4.6 s old and nothing has stamped it, yet the
-# thread itself was unable to run for only ~0.7 s of the process's own
-# time - under the 2 s limit.
+# ---- the whole process paused is not a wedged thread.  Only the guard can pass this: the thread
+# is also frozen around the stop, so its clock is 4.6 s old yet it lost only ~0.7 s of process time.
 if [ "${STALLTEST_LEGACY:-0}" != 1 ]; then
 	echo "--- apply_stall_ms = 2000, the WHOLE daemon stopped (SIGSTOP) for 4 s, its cluster thread frozen across the resume"
 	conf 3 1 "apply_stall_ms = 2000"; conf 3 2 "apply_stall_ms = 2000"

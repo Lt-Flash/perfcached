@@ -1,29 +1,5 @@
-/*
- * psengine.c - the pub/sub engine in isolation: how publish throughput
- * scales with the number of publishing workers, what patterns cost, and
- * how long a SUBSCRIBE waits while publishers run.
- *
- * Why this exists.  The engine was reviewed as "one mutex for every
- * publish, subscribe and delivery", and the fix for that is a redesign.
- * A redesign chosen without a number is a guess, so this links the real
- * src/pubsub.o against stubs for the three things around it (the relay,
- * the connection writer, the worker id) and measures only the engine:
- * no sockets, no framing cost on the wire, no network.
- *
- *   psengine <workers> <secs> <patterns> [churn 0|1|2]
- *
- * Each worker thread owns CHANNELS fake subscriber connections, one per
- * channel, so every channel has one subscriber on every worker and every
- * publish is delivered once per worker - half of the work lands on other
- * workers' queues, which is the path the lock sits on.  <patterns> adds
- * that many pattern subscriptions with distinct literal prefixes on
- * worker 1, plus four that start with '*' (no prefix to index).  With
- * churn, one extra thread subscribes and unsubscribes on its own worker
- * id in a loop and reports how long each call took.  With churn 2 it churns
- * channels and patterns the publishers ARE hitting and nobody else holds, so
- * shared entries are retired while readers use them - the case to run under
- * AddressSanitizer.
- */
+/* psengine.c - the pub/sub engine alone (the real pubsub.o, stubs around it): publish scaling by
+ * workers, pattern cost, SUBSCRIBE latency.  Churn 2 retires entries in use: run it under ASan. */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -96,9 +72,8 @@ static void *worker(void *arg)
 		int k;
 
 		for (k = 0; k < 64; k++) {
-			/* with churn, one publish in four goes to a channel that
-			 * ONLY the churner subscribes to, so the shared entries it
-			 * creates and retires are read while they are retired */
+			/* churn 2: one publish in four goes to a channel ONLY the churner
+			 * subscribes to, so its shared entries are read while retired */
 			if (g_solo && (k & 3) == 0)
 				n = snprintf(chan, sizeof chan, "solo%d", (int)(rand_r(&seed) % 8));
 			else

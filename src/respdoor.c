@@ -1,14 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respdoor.c - the RESP door's framing (S29): one command from the
- * connection's input - multibulk from real clients, an inline line from
- * netcat - run through pc_verb_resp, timed and counted (S53), parked on
- * a pull or a forward, or a cooperative walk begun.  Moved from proto.c
- * unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md); the
- * connection, the reply staging and the parking are proto.c's
- * (protoint.h).
- */
+/* respdoor.c - RESP door framing: one multibulk or inline command from the input,
+ * run through pc_verb_resp, timed and counted, parked, or begun as a walk */
 #include <string.h>
 
 #include "compat/timer.h"                /* get_ticks */
@@ -17,13 +10,10 @@
 #include "verbs.h"                      /* pc_verb_resp */
 #include "proto.h"
 #include "protoint.h"
-#include "mgetfan.h"                    /* G8 */
+#include "mgetfan.h"
 
-/* ---- RESP dialect (task S29) --------------------------------------------
- * Frames one RESP2 command - multibulk ('*') from real clients, inline
- * (bare words + newline) from netcat - into argv spans over the in
- * buffer, then answers through pc_verb_resp.  Same consumed/0/-1
- * contract as bin_frame; compaction is the caller's. */
+/* ---- RESP dialect --------------------------------------------------------
+ * same consumed/0/-1 contract as bin_frame; compaction is the caller's */
 
 int resp_ll_span(const char *p, size_t n, long long *out)
 {
@@ -61,12 +51,12 @@ static int resp_execute_inner(struct pc_conn *c, char **argv,
 		return -1;
 	pc_jw_init(&rw, resbuf, JW_REPLY_CAP);
 	memset(&es, 0, sizeof es);
-	ev_origin(c, "resp");                        /* S153 */
+	ev_origin(c, "resp");
 	if (pc_verb_resp(argv, argl, nargs, &rw, scratch, JW_REPLY_CAP,
 	        &park_req, &col, &collen, &key, &klen,
 	        c->resp_col, &c->resp_collen, &quit, &c->resp_authed,
 	        &es, c->obs, c) < 0) {
-		pc_mget_free(pc_mget_take());  /* G8: never the next command's */
+		pc_mget_free(pc_mget_take());  /* never the next command's */
 		return -1;
 	}
 	if (es.start) {
@@ -79,9 +69,8 @@ static int resp_execute_inner(struct pc_conn *c, char **argv,
 		return 0;                      /* reply comes chunk by chunk */
 	}
 	{
-		/* G8: an MGET waits on lookups of keys on other nodes - its
-		 * reply comes when they answer, and what the client pipelined
-		 * behind it waits for that (RESP replies are ordered) */
+		/* an MGET across nodes replies when the lookups answer, and what was
+		 * pipelined behind it waits (RESP replies are ordered) */
 		struct pc_mget *mg = pc_mget_take();
 
 		if (mg) {
@@ -99,9 +88,7 @@ static int resp_execute_inner(struct pc_conn *c, char **argv,
 	if (park_req && col && key &&
 	        park_add(c, park_req, NULL, col, collen, key, klen,
 	                PARK_RESP, 0) == 0) {
-		/* S332: the reply comes on completion, and what the client
-		 * pipelined behind it waits for it - it used to run at once
-		 * and could be answered first */
+		/* the reply comes on completion; what was pipelined behind it waits */
 		c->park_hold = 1;
 		return 0;
 	}
@@ -126,22 +113,8 @@ static int resp_execute_inner(struct pc_conn *c, char **argv,
 }
 
 
-/* S53: every RESP command is timed and counted around the real
- * dispatch.  A walk-starting command is timed to the point it left this
- * worker - honest for what the worker PAID, understated for what the
- * client waited; the slow log records the former.  0.6.2: a command that
- * PARKED (a read-through fetch, a write to the master) runs again when
- * that completes and is counted then, once - it was counted at both.
- * 0.6.0: a command's clock starts where the previous one in the same
- * drain stopped (obs_carry, as the native door has since S159) - one
- * clock read a command, not two.  The read is the expensive part on a
- * VM (the paravirtual clock): two a command were 7-8% of a pipelined
- * worker's CPU on 224.  Its time now includes parsing its own request,
- * which the worker paid too. */
-/* S467: the stats row of a command, from the last four this worker ran -
- * matched on the name's bytes as sent, so the fold and hash
- * pc_obs_cmd_slot pays are paid when a new name or case comes in, not on
- * every command (1.4% of a pipelined SET's CPU on 207) */
+/* the stats row from the last four names this worker ran, matched on the bytes
+ * as sent, so pc_obs_cmd_slot's fold and hash run only for a new name or case */
 static void *resp_obs_slot(const char *name, size_t nlen)
 {
 	static __thread char nm[4][16];
@@ -161,15 +134,17 @@ static void *resp_obs_slot(const char *name, size_t nlen)
 	return slot[i];
 }
 
+/* a command's clock starts where the previous one in the drain stopped: one clock
+ * read per command (costly on a VM); a parked command is counted on its re-run */
 static int resp_execute(struct pc_conn *c, char **argv, size_t *argl,
 		int nargs)
 {
 	unsigned long long t0 = obs_carry ? obs_carry : pc_obs_usec_now(), dt;
-	size_t o0 = c->out_len;            /* S65: where this reply starts */
+	size_t o0 = c->out_len;            /* where this reply starts */
 	int rc = resp_execute_inner(c, argv, argl, nargs);
 
 	if (nargs > 0) {
-		obs_carry = pc_obs_usec_now();     /* S159 */
+		obs_carry = pc_obs_usec_now();
 		dt = obs_carry - t0;
 		if (c->up_hold)
 			return rc;                     /* parked: counted on its re-run */
@@ -228,9 +203,9 @@ int resp_one(struct pc_conn *c, size_t off)
 		if (na && resp_execute(c, argv, argl, na) < 0)
 			return -1;
 		if (c->up_hold)
-			return 0;          /* S331: parked - left in the buffer */
+			return 0;          /* parked - left in the buffer */
 		c->up_verdict = 0;
-		c->up_lost = 0;                /* S435 */
+		c->up_lost = 0;
 		return (int)((size_t)(nl - base) + 1);
 	}
 
@@ -276,8 +251,8 @@ int resp_one(struct pc_conn *c, size_t off)
 	if (nargs && resp_execute(c, argv, argl, (int)nargs) < 0)
 		return -1;
 	if (c->up_hold)
-		return 0;                      /* S331: parked - left in the buffer */
+		return 0;                      /* parked - left in the buffer */
 	c->up_verdict = 0;
-	c->up_lost = 0;                        /* S435 */
+	c->up_lost = 0;
 	return (int)pos;
 }

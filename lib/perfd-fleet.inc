@@ -3,23 +3,10 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * perfd-fleet.inc - part of perfd.c, which #includes it in order: one translation
- * unit, so every static stays file-local and consumers still compile
- * perfd.c alone.  Not a compilation unit of its own.
- *
- * Holds the fleet: the member list (S34), per-key routing (S35, S127), the proxy
- * holder table (S295), standbys and failover.
- */
-/* ---- cluster awareness (task S34) ---------------------------------------
- * The daemon already knows the fleet; a client that learns it can keep
- * STANDBY connections open and swap onto one when a node dies, instead
- * of discovering the failure and then paying a TCP + Noise handshake.
- *
- * The design rule that keeps this safe: nothing here is load-bearing
- * for correctness.  A stale member list, a policy that picks a busy
- * node, a failover that lands somewhere unexpected - all of it costs a
- * hop at worst, because the daemon re-checks ownership itself. */
+/* perfd-fleet.inc - part of perfd.c, #included in order (one translation unit): the fleet - the
+ * member list, per-key routing, the proxy holder table, standbys and failover. */
+/* ---- cluster awareness: STANDBY links to swap onto when a node dies.  Nothing here is
+ * load-bearing for correctness: a stale view costs a hop at worst; the daemon re-checks owners. */
 
 static long long now_ms_lib(void)
 {
@@ -29,12 +16,8 @@ static long long now_ms_lib(void)
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* the verbs that may be REPLAYED after a failover.  The store is
- * absolute-upsert, so a repeated set/del/expire is the same as one, and
- * so is a jset or jdel (a path written or removed twice is the same
- * document) - but add/sub and jincr are NOT idempotent and a silent
- * replay would double an increment.  Those surface the error instead;
- * the caller decides. */
+/* the verbs that may be REPLAYED after a failover: the store is absolute-upsert, so set/del/expire
+ * and jset/jdel twice are once; add/sub and jincr would double, so they surface the error */
 static int method_idempotent(const char *m)
 {
 	static const char *const ok[] = { "get", "set", "del", "exists",
@@ -50,13 +33,11 @@ static int method_idempotent(const char *m)
 
 static int bin_verb_idempotent(int verb)
 {
-	/* the counter verbs double on a replay; a conditional set replayed
-	 * after its reply was lost reads its OWN write and answers
-	 * "declined" - a lock the caller holds, reported as lost (S279b).
-	 * setnx/setxx are likewise absent from method_idempotent(). */
+	/* the counter verbs double on a replay; a conditional set replayed after its reply was lost
+	 * reads its OWN write and answers "declined" - a lock the caller holds, reported as lost */
 	return verb != BV_ADD && verb != BV_SUB && verb != BV_SETNX &&
-		verb != BV_SETXX && verb != BV_RLHIT &&  /* S314: a hit twice */
-		verb != BV_HCMD;               /* S313: HINCRBY twice is not once */
+		verb != BV_SETXX && verb != BV_RLHIT &&  /* a hit twice */
+		verb != BV_HCMD;               /* HINCRBY twice is not once */
 }
 
 /* parse a members reply tree into p->mem[] */
@@ -75,7 +56,7 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 		pc_tv_free(&v);
 		return -1;
 	}
-	/* S70: the daemon's version rides the same reply; absent on a
+	/* the daemon's version rides the same reply; absent on a
 	 * daemon older than the field, and then it stays "" */
 	{
 		int vl = pc_tv_get_str(&v, 0, "version", p->srv_version,
@@ -110,9 +91,8 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 			? (int)mb : 0;
 		p->mem[n].total_mb = pc_tv_get_int(&v, m, "total_mb", &mb) == 0
 			? (int)mb : 0;
-		/* C7: "ready" | "recovering" | "starting" | "draining".
-		 * DRAINING counts as usable: it is being emptied, not doubted,
-		 * and still answers for what it holds. */
+		/* "ready" | "recovering" | "starting" | "draining"; DRAINING is usable: being
+		 * emptied, not doubted, it still answers for what it holds */
 		sl = pc_tv_get_str(&v, m, "state", state, sizeof state - 1);
 		p->mem[n].ready = sl < 0 ||
 			(sl == 5 && !memcmp(state, "ready", 5)) ||
@@ -123,10 +103,8 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 			continue;      /* a node that cannot be dialled */
 		n++;
 	}
-	/* the ROUTING CONTRACT: only route when the daemon names an
-	 * algorithm we actually implement, and a mode where routing means
-	 * something.  An unknown algo or a proxy cluster simply leaves
-	 * routing off - the client still works, it just pays the forward. */
+	/* the ROUTING CONTRACT: route only when the daemon names an algorithm known here, in a mode
+	 * where routing means something; else it stays off and the forward is paid */
 	{
 		int tr = pc_tv_get(&v, 0, "routing");
 
@@ -138,12 +116,8 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 			int epoch_ok = their_epoch == PERFD_WIRE_EPOCH;
 			int algo_ok = pc_tv_streq(&v, pc_tv_get(&v, tr, "algo"),
 				PERFD_ROUTE_ALGO);
-			/* S127: `spread` routes too - the holders are the top K
-			 * of the same rendezvous ranking, so shard is this with
-			 * K = 1.  An OLDER library does not know the word, fails
-			 * this test, turns routing off and dials any node; the
-			 * daemon forwards, so it stays correct and only pays a
-			 * pull per read. */
+			/* `spread` routes too, its holders the ranking's top K (shard is K = 1); a
+			 * library not knowing a mode leaves routing off */
 			int tmd = pc_tv_get(&v, tr, "mode");
 			int mode_ok = pc_tv_streq(&v, tmd, "shard") ||
 				pc_tv_streq(&v, tmd, "spread") ||
@@ -156,7 +130,7 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 				p->route_k = 1;
 			if (pc_tv_get_int(&v, tr, "cport", &cp) == 0)
 				p->route_cport = (int)cp;
-			/* RV-10: which map this list belongs to */
+			/* which map this list belongs to */
 			tmap = pc_tv_get(&v, tr, "map");
 			p->map_known = tmap >= 0 &&
 				pc_tv_get_int(&v, tmap, "term", &mt) == 0 &&
@@ -175,37 +149,11 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 	return n;
 }
 
-/* ---- per-key routing (task S35) -----------------------------------------
- * With the member list in hand a client can compute WHERE a key
- * belongs and send the request straight there, so the daemon's forward
- * hop disappears.  Two rules, and they exist for different reasons:
- *
- *   shard - the owner is computable, so routing removes a network hop;
- *   store - there is no owner, but hashing each key to ONE node makes
- *           this client a de-facto single writer for it, which is what
- *           keeps concurrent writers from forking a key (par 6.5b).
- *           Spreading and key-stickiness pull opposite ways here, and
- *           stickiness wins for correctness.
- *
- * proxy is NOT routed: its placement depends on live free space and
- * history, so there is nothing a client can compute.
- *
- * THE INVARIANT: none of this is load-bearing for ONE request.  The
- * daemon re-checks ownership and forwards a wrong guess, so a stale
- * member list, an unrecognised algorithm or a missing standby costs one
- * hop and never correctness.  That is why every failure path below
- * simply returns the active handle.  What IS load-bearing is that every
- * keyed verb decides the same way (see roundtrip_key): two requests on
- * one key from one client are ordered because they meet at one node,
- * not because either was routed (S211). */
+/* ---- per-key routing: shard sends a key to its computable owner, store to ONE node per key as its
+ * de-facto single writer; proxy is not routed.  A wrong guess costs a hop, never correctness. */
 
-/* The placement input: the Redis SLOT, from the KEY ALONE.
- *
- * The collection is deliberately not mixed in.  A RESP client knows
- * nothing about collections, so anything it and we can both compute has
- * to ignore them - and the daemon's pc_shard_owner() ignores them for
- * the same reason.  Feeding col in here would put this client on a
- * different node from every Redis client for the same key. */
+/* the placement input: the Redis SLOT of the KEY ALONE - a RESP client knows no collections and the
+ * daemon's pc_shard_owner() ignores them, so mixing col in would part ways with Redis clients */
 static unsigned long long route_keyhash(const char *col, const char *key)
 {
 	(void)col;
@@ -213,7 +161,7 @@ static unsigned long long route_keyhash(const char *col, const char *key)
 }
 
 /* xorshift over the handle's own cursor: independent per client, which
- * is what makes uncoordinated spreading work (par 5.6) */
+ * is what makes uncoordinated spreading work */
 static unsigned int pd_rand(perfd_t *p)
 {
 	unsigned int x = p->rr ? p->rr : 2463534242u;
@@ -225,9 +173,8 @@ static unsigned int pd_rand(perfd_t *p)
 	return x;
 }
 
-/* The @n-th ranked member for @key (0 = the owner), or -1.  Selection
- * rather than a sort: n is at most the copy factor, which is small, and
- * a per-request sort of the whole member list is not worth it. */
+/* the @n-th ranked member for @key (0 = the owner), or -1; selection rather than a sort, as n is at
+ * most the small copy factor */
 static int route_rank_nth(perfd_t *p, const char *col, const char *key, int n)
 {
 	unsigned long long kh, best = 0;
@@ -294,25 +241,15 @@ static int route_owner(perfd_t *p, const char *col, const char *key)
 	return owner;
 }
 
-/* Public: which member should hold @key, or -1 when routing does not
- * apply (no member list learned, fewer than two members, or the cluster
- * did not advertise a contract this client implements).  Pair it with
- * perfd_member_info() to get the node's address.
- *
- * This exists because per-key routing inside the library needs standby
- * CONNECTIONS, and those are unreachable on the async API - an async
- * caller drives one fd per handle and the library cannot open more
- * behind its back.  An async application therefore opens its own handle
- * per node and asks this which one to use, which is the same
- * computation the blocking path does internally. */
+/* which member should hold @key, or -1 when routing does not apply: for async callers, who drive
+ * one fd per handle and so keep a handle per node themselves (address: perfd_member_info) */
 int perfd_owner_of(perfd_t *p, const char *col, const char *key)
 {
 	return p ? route_owner(p, col, key) : -1;
 }
 
-/* a standby died under a routed request: drop it, so the next request
- * does not keep trying a corpse.  The member is marked down too, which
- * makes route_owner() pick the next-best node instead. */
+/* a standby died under a routed request: drop it, and mark its member down so route_owner()
+ * picks the next-best node */
 static void route_retire(perfd_t *p, perfd_t *dead)
 {
 	int i, j;
@@ -330,13 +267,8 @@ static void route_retire(perfd_t *p, perfd_t *dead)
 		}
 }
 
-/* ---- S295: the holder table ------------------------------------------
- * key -> the node that last answered for it, until the record's TTL runs
- * out.  Allocated once at connect, never per entry.  Set-associative, 4
- * ways: direct-mapped, 200 keys already lost 8 to collisions in 4,096
- * slots (hinttest), and each colliding pair then costs two hops a round.
- * A new key goes in front and pushes the set's oldest out (newest wins -
- * DESIGN 12hn's TTL-aware rule was to be measured first; not adopted). */
+/* ---- the holder table: key -> the node that last answered for it, until its TTL; allocated at
+ * connect, 4-way set-associative, a new key in front pushing the set's oldest out */
 static unsigned long long hint_hash(const char *col, const char *key)
 {
 	unsigned long long h = 1469598103934665603ULL;
@@ -431,9 +363,8 @@ static void hint_after(perfd_t *p, perfd_t *u, int verb, const char *col,
 	}
 }
 
-/* the handle that should carry this request: ours, a standby already
- * open to the owner, or - when we are not connected to the owner -
- * ours anyway, which just costs the forward we were trying to avoid */
+/* the handle that should carry this request: ours, a standby already open to the owner, or ours
+ * anyway when not connected to the owner, paying the forward */
 static perfd_t *route_pick(perfd_t *p, const char *col, const char *key)
 {
 	int owner, i, r;
@@ -441,7 +372,7 @@ static perfd_t *route_pick(perfd_t *p, const char *col, const char *key)
 	if (p->is_child)
 		return p;
 	p->hinted = 0;
-	/* S295: a key whose holder a reply named goes straight there */
+	/* a key whose holder a reply named goes straight there */
 	if (p->route_hints && p->hints && col && key) {
 		unsigned long long h = hint_hash(col, key);
 		int hn = hint_lookup(p, h);
@@ -459,11 +390,8 @@ static perfd_t *route_pick(perfd_t *p, const char *col, const char *key)
 			hint_drop(p, h);
 		}
 	}
-	/* S127: under spread any of the K holders can answer, so walk the
-	 * ranking and take the best one we already have a connection to.
-	 * K = 1 makes this exactly the shard behaviour it replaces.  Being
-	 * connected to the SECOND-ranked holder beats forwarding through a
-	 * node that holds nothing. */
+	/* under spread any of the K holders can answer: the best-ranked one already connected
+	 * (shard is K = 1); a second-ranked holder beats forwarding via a node holding nothing */
 	for (r = 0; r < p->route_k; r++) {
 		owner = route_rank_nth(p, col, key, r);
 		if (owner < 0)
@@ -488,7 +416,7 @@ static int learn_members(perfd_t *p)
 	size_t n;
 	int rc, own;
 
-	/* S284: owned, not borrowed - this runs inside after_success,
+	/* owned, not borrowed - this runs inside after_success,
 	 * while the caller's own reply still sits in the handle's buffer */
 	own = p->own_reply;
 	p->own_reply = 1;
@@ -502,10 +430,10 @@ static int learn_members(perfd_t *p)
 	return rc;
 }
 
-/* S104: the bound on a fresh dial to any member, when nothing else works: a member
+/* the bound on a fresh dial to any member, when nothing else works: a member
  * gone dark costs it a second, not the handle's whole connect_timeout_ms */
 #define REDIAL_CONNECT_MS 1000
-#define DIAL_SETTLE_MIN_MS 50          /* S476: conn_ready's least wait for its standbys */
+#define DIAL_SETTLE_MIN_MS 50          /* conn_ready's least wait for its standbys */
 #define DIAL_LOOK_MS 200
 
 /* what a link to another member is dialled with: the secrets from @first round */
@@ -521,9 +449,9 @@ static void child_opts(perfd_t *p, perfd_opts *o, const char **sec, int connect_
 	o->connect_timeout_ms = connect_ms > 0 ? connect_ms : p->o_connect_ms;
 	o->io_timeout_ms = p->o_io_ms;
 	o->spares = PERFD_SPARES_NONE;  /* children never recurse */
-	o->keepalive_s = p->keepalive_s ? p->keepalive_s : -1;   /* S104 */
+	o->keepalive_s = p->keepalive_s ? p->keepalive_s : -1;
 	o->idle_ping_ms = -1;           /* a child is pinged by its parent */
-	o->encrypt = p->want_enc;                                  /* S468 */
+	o->encrypt = p->want_enc;
 }
 
 /* open a link to @m in the caller's time: redial_any, whose caller has no other */
@@ -559,7 +487,7 @@ static void dial_failed(struct pd_member *m, const char *why)
 	if (!m)
 		return;
 	m->down = 1;
-	/* S70: the reason, cut to the field - the bound is explicit so the
+	/* the reason, cut to the field - the bound is explicit so the
 	 * compiler can see the truncation is meant */
 	snprintf(m->why, sizeof m->why, "re-dial: %.*s",
 		(int)sizeof m->why - 10, why ? why : "");
@@ -567,7 +495,7 @@ static void dial_failed(struct pd_member *m, const char *why)
 	m->retry_ms = now_ms_lib() + m->backoff_ms;
 }
 
-/* S476: a standby's dial must not hold a caller: a member can accept and then say
+/* a standby's dial must not hold a caller: a member can accept and then say
  * nothing, as a frozen daemon's kernel does.  Started here, run by dials_run */
 static int dial_start_try(perfd_t *p, struct pd_member *m, int arm, int tries, int secn)
 {
@@ -600,7 +528,7 @@ static int dial_start(perfd_t *p, struct pd_member *m, int arm)
 	return dial_start_try(p, m, arm, 0, 0);
 }
 
-/* the handshake is done: a plain blocking link from here on.  S460's look at where
+/* the handshake is done: a plain blocking link from here on.  Its look at where
  * it landed is one round trip on a link that has just answered, under a short bound */
 static void dial_done(perfd_t *p, struct pd_dial d)
 {
@@ -702,10 +630,8 @@ static void dials_run(perfd_t *p, int wait_ms)
 	}
 }
 
-/* keep up to want_spares standbys open, on members other than the
- * active one.  Which ones is a RANDOM subset per client: independent
- * random choices spread a big fleet without any coordination.
- * @arm: a member this adds gets its share of the traffic (S474), not the one just left. */
+/* up to want_spares standbys on members other than the active one, a RANDOM subset per client
+ * (spreads with no coordination); @arm: one added gets its share of traffic, not the one left */
 static void warm_spares(perfd_t *p, int arm)
 {
 	int want = p->want_spares, i, tries;
@@ -758,17 +684,16 @@ static void adopt_conn(perfd_t *dst, perfd_t *src)
 	src->rlen = src->rcap = src->qlen = src->qcap = 0;
 	src->roff = 0;
 	src->nids = src->idhead = src->idcap = 0;
-	/* 0.6.6: privilege was the old connection's - raised again before
+	/* privilege was the old connection's - raised again before
 	 * the next call (enable_replay), not here, inside a call's retry */
 	if (dst->enable_sec)
 		dst->enable_due = 1;
-	if (dst->conn_name)                 /* 0.7.0: the new connection is named too */
+	if (dst->conn_name)                 /* the new connection is named too */
 		dst->name_due = 1;
 }
 
-/* a cheap roundtrip on a link under a short bound, the io timeout
- * restored after.  0 = it answered.  Shared by the idle scan and the
- * failover, which must never adopt a link it has not just seen alive. */
+/* a cheap roundtrip under a short bound, the io timeout restored after: 0 = it answered.  The
+ * failover must never adopt a link it has not just seen alive. */
 static int probe_child(perfd_t *p, perfd_t *c)
 {
 	int bound = p->io_ms < 500 ? p->io_ms : 500, rc;
@@ -791,7 +716,7 @@ static int pick_spare(perfd_t *p)
 	int i, best = -1, pass;
 	long long bt = -1;
 
-	/* S474: a member the fleet says is serving first; any link beats none */
+	/* a member the fleet says is serving first; any link beats none */
 	for (pass = 0; pass < 2 && best < 0; pass++)
 		for (i = 0; i < p->nspare; i++) {
 			const struct pd_member *m = member_of(p, p->spare[i]->active_node);
@@ -827,19 +752,15 @@ static void member_down(perfd_t *p, int node, const char *prefix,
 			snprintf(p->mem[j].why, sizeof p->mem[j].why, "%s%.*s",
 				prefix, (int)(sizeof p->mem[j].why - 1 - strlen(prefix)),
 				why ? why : "");
-			/* S107: retried in the background from now on */
+			/* retried in the background from now on */
 			if (!p->mem[j].backoff_ms)
 				p->mem[j].backoff_ms = 1000;
 			p->mem[j].retry_ms = now_ms_lib() + p->mem[j].backoff_ms;
 		}
 }
 
-/* S104: a FRESH dial to any member this handle has learned - the ones
- * not marked down first, the one that just died last - under a short
- * connect bound (REDIAL_CONNECT_MS, above), adopted on the first
- * handshake that completes.  The members are the whole fleet as last
- * reported, so this reaches a fleet whose seed is the one node still
- * down.  0 = usable again. */
+/* a FRESH dial to any learned member, the ones not down first and the dead one last, bounded by
+ * REDIAL_CONNECT_MS, adopting the first handshake that completes: 0 = usable again */
 
 static int redial_any(perfd_t *p)
 {
@@ -874,25 +795,50 @@ static int redial_any(perfd_t *p)
 	return -1;
 }
 
-/* The dead connection is replaced.  S104: never by adoption alone - a
- * standby is PROBED first, most recently alive first, and one that
- * fails is closed and its member marked down; when none is alive the
- * handle re-dials fresh to any member it has learned, inside this same
- * failover, so the operation that found the dead active is the only
- * one that can fail - and with the replay under it, not even that.
- * Returns 0 when the handle is usable again. */
+/* a pinned handle comes back to its own node or not at all */
+static int redial_own(perfd_t *p)
+{
+	int i, node = p->active_node;
+
+	for (i = 0; i < p->nmem; i++) {
+		struct pd_member *m = &p->mem[i];
+		perfd_t *c;
+
+		if (m->node != node)
+			continue;
+		c = open_child(p, m, p->o_connect_ms > 0 &&
+			p->o_connect_ms < REDIAL_CONNECT_MS
+			? p->o_connect_ms : REDIAL_CONNECT_MS);
+		if (!c)
+			return errk(p, PERFD_E_TRANSPORT, "re-dial: node %d did not answer - %s",
+				node, perfd_error(NULL));
+		adopt_conn(p, c);
+		perfd_free(c);
+		p->active_node = node;
+		m->down = 0;
+		m->why[0] = 0;
+		p->last_reply_ms = now_ms_lib();
+		p->next_refresh_ms = 0;
+		return 0;
+	}
+	return errk(p, PERFD_E_TRANSPORT, "re-dial: node %d, the one this pinned handle "
+		"is on, is not in its member list", node);
+}
+
+/* the dead connection is replaced: a standby PROBED first (most recently alive first), else a fresh
+ * dial to any learned member, so only the call that found it dead can fail.  0 = usable again. */
 static int failover(perfd_t *p)
 {
 	int k;
 
-	if (p->is_child)
+	if (p->is_child || p->pin)             /* the error stays the dialled node's */
 		return -1;
 	member_down(p, p->active_node, "", "the link died");
 	while ((k = pick_spare(p)) >= 0) {
 		perfd_t *c = p->spare[k];
 
 		if (probe_child(p, c) == 0) {
-			/* PS5: the stream belonged to the connection that died */
+			/* the stream belonged to the connection that died */
 			if (p->udp)
 				udp_drop(p, 0);
 			adopt_conn(p, c);
@@ -920,6 +866,8 @@ int perfd_redial(perfd_t *p)
 		return 0;
 	if (p->is_child)
 		return -1;
+	if (p->pin)
+		return redial_own(p);
 	while (p->nspare) {
 		/* whatever standbys are still held died with the active, or
 		 * would have been adopted; a fresh dial is the honest start */
@@ -951,19 +899,14 @@ static void maybe_refresh(perfd_t *p)
 	if (now_ms_lib() < p->next_refresh_ms)
 		return;
 	learn_members(p);
-	/* S474: a standby this refresh adds is a member the push did not tell */
+	/* a standby this refresh adds is a member the push did not tell */
 	warm_spares(p, 1);
 	p->spread_left = -1;
 	spread_leave(p);
 }
 
-/* S104: a standby is the link most likely to have died unnoticed - it
- * carries nothing until a failover, and a failover used to adopt it
- * blind.  After a successful call, at most once a second, every
- * standby idle longer than idle_ping_ms is pinged under a short bound
- * (a corpse must not hold the caller for the io timeout); one that
- * fails is retired and its member marked down with the reason, so the
- * next failover cannot pick it.  A child is never the pinger. */
+/* a standby carries nothing until a failover, so it may have died unnoticed: idle ones are pinged
+ * under a short bound at most once a second, a failing one retired and its member marked down */
 static void maybe_ping(perfd_t *p)
 {
 	long long now = now_ms_lib();

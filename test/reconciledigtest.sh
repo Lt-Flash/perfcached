@@ -1,32 +1,6 @@
 #!/bin/sh
-# reconciledigtest.sh - S261: the post-restart reconcile asks only about
-# the slots that differ from the witness.
-#
-# A node back from an outage probes every key it replayed, 64 a second,
-# to find the ones the fleet deleted while it was down: 2,000 keys took
-# 31 s, 1M would take 4.3 h, and every deleted key is readable on this
-# node until its probe comes round.  Now the node first compares S260's
-# slot digests with the witness and probes only the keys in slots that
-# differ.  Three eager nodes, 2,000 keys authored by node 3 (its WAL
-# replays only what it authored), everyone up past the 30 s witness
-# grace, node 3 killed -9, 40 of its keys deleted through node 1, node 3
-# restarted from its WAL:
-#   1. the 40 are gone from node 3, the other 1,960 are all there;
-#   2. it probed at most a tenth of the 2,000 and skipped the rest on
-#      matching digests, and the pass finished inside 10 s;
-#   3. the same with `sweep_digests = no` on node 3: every key probed
-#      ONCE (S263: a probe budget that ran out mid-window made the next
-#      tick re-ask the whole window - 2,752 probes for 2,000 keys), the
-#      40 gone - the old path is still whole;
-#   4. S262: the legacy config - [cluster] mode = eager with no
-#      `collections` list - leaves the collection a plain store that is
-#      never replicated.  Node 3 must keep all 2,000 of its keys and ask
-#      about none: every peer's "absent" is the truth about a copy it was
-#      never sent, not evidence of a delete.
-# Fail-first: the build before S261 probes all 2,000 in case 1 (31 s);
-# the build before S262 DELETES all 2,000 in case 4; the build before
-# S263 probes 2,752 in case 3.
-# Usage: test/reconciledigtest.sh [./perfcached]
+# reconciledigtest.sh - the post-restart reconcile probes only keys in slots whose digests differ
+# from the witness; sweep_digests = no probes each key once; a legacy eager store keeps its keys.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -190,10 +164,8 @@ run() { # run <label> <node 3's cluster lines> <probes: max:N | once:N> <max ms>
 	max:*)	[ "${Q:-99999}" -le "${3#max:}" ] 2>/dev/null \
 			&& ok "$1: $Q of $N keys probed (at most ${3#max:}); digests $G" \
 			|| bad "$1: $Q of $N keys probed, want at most ${3#max:}; digests $G";;
-	# the old path asks about every key still there, and each once.  The
-	# low end is N - DEL: the peers' retained tombstones remove most of
-	# the deleted keys before the walk reaches them, and a key already
-	# gone is not asked about.  2% slack above.
+	# the old path asks about every key still there, each once; the low end is N - DEL because retained
+	# tombstones remove most deleted keys before the walk reaches them.  2% slack above.
 	once:*)	M=${3#once:}
 		[ "${Q:-0}" -ge $((M - DEL)) ] 2>/dev/null && [ "$Q" -le $((M + M / 50)) ] \
 			&& ok "$1: $Q probes for $N keys - every key asked about once; digests $G" \

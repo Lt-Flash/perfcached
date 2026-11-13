@@ -1,20 +1,6 @@
 #!/bin/sh
-# shardtest.sh — mode=shard: deterministic ownership (HRW over stable
-# addresses).  Asserted:
-#  - a fill through ONE ingress spreads across all nodes and the fleet
-#    census is EXACT (each key on exactly its owner);
-#  - reads through ANY node return the value (owner unicast) and store
-#    nothing anywhere (census unchanged);
-#  - BLIND re-writes through other nodes can never fork - deterministic
-#    ownership needs no locator, no probe, no birth-race demoter;
-#  - counters serialize at the owner across ingresses (exact total);
-#  - misses are AUTHORITATIVE and fast: the owner answers found=0
-#    explicitly, so a fleet of misses produces ZERO pull timeouts;
-#  - jincr forwards to the owner (exact), mset refuses loudly;
-#  - the JOIN RESHARD: a third node joins a loaded 2-node fleet, keys
-#    whose HRW owner it is MOVE to it (census conserved), and reads
-#    during the move never miss (the grace-window broadcast fallback).
-# Usage: test/shardtest.sh [./perfcached]
+# shardtest.sh - mode=shard, HRW ownership over stable addresses: an exact census, reads that store nothing,
+# no fork from blind re-writes, authoritative misses, and a join reshard during which no read misses.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -83,6 +69,17 @@ entc() { call $1 '{"method":"stats","params":{"col":"sh"}}' \
 cstat() { call $1 '{"method":"stats"}' \
 	| python3 -c "import json,sys; print(json.load(sys.stdin)[\"cluster\"][\"$2\"])"; }
 census() { echo $(( $(entc 17021) + $(entc 17022) + $(entc 17023) )); }
+# a joiner is CONNECTING until its links answer: wait for every node ready and seeing the others
+st() { call $1 '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null; }
+formed() { # formed <port>...: up to 30 s
+	i=0
+	while [ $i -lt 300 ]; do
+		f=0; for p in "$@"; do [ "$(st $p)" = "ready $(($# - 1))" ] || f=1; done
+		[ $f = 0 ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
 
 # ---- phase 1: the full trio ---------------------------------------------
 node 1 17021
@@ -91,7 +88,7 @@ node 3 17023
 start 1
 start 2
 start 3
-sleep 3.5   # membership
+formed 17021 17022 17023
 
 # fill 300 keys through ONE ingress
 for i in $(seq 0 299); do
@@ -164,7 +161,7 @@ kill -TERM $P1 $P2 $P3 2>/dev/null; wait 2>/dev/null; P1= P2= P3=
 rm -f "$D"/n*.log
 start 1
 start 2
-sleep 2.5
+formed 17021 17022
 for i in $(seq 0 399); do
 	printf '{"method":"set","params":{"col":"sh","key":"jk%03d","value":"j%03d"}}\n' $i $i
 done | python3 "$CLI" 17021 > /dev/null
@@ -172,7 +169,7 @@ S0=$(( $(entc 17021) + $(entc 17022) ))
 [ "$S0" -eq 400 ] && ok || bad "2-node fill census $S0 != 400"
 
 start 3
-sleep 2   # joined, reshard beginning - the GRACE window is live
+formed 17021 17022 17023   # joined, reshard beginning - the GRACE window is live
 
 # reads during the move must not miss: grace falls back to broadcast
 MISS=0

@@ -1,19 +1,6 @@
 #!/bin/sh
-# pintest.sh - S167: [memory] pin and huge_pages.
-#
-# Both knobs exist because the daemon used to decide alone and only
-# report in prose.  Pinning is attempted on every start and degrades to
-# a WARNING, so a node can believe it is resident while it is swappable
-# - and it is RLIMIT_MEMLOCK that refuses, which in an unprivileged
-# container is the CONTAINER's limit, not the unit's.  The page tier was
-# probed with no override, so "plain 4K" could not be asked for; 4K
-# matters because growing the arena then costs many cheap faults instead
-# of one 2 MB fault that may wait for compaction (S166).
-#
-# The daemon runs as an unprivileged uid for the failing cases: root
-# bypasses RLIMIT_MEMLOCK through CAP_IPC_LOCK, so `ulimit -l 0` alone
-# would prove nothing (a trap this suite paid for once already).
-# Usage: test/pintest.sh [./perfcached]
+# pintest.sh - [memory] pin and huge_pages: what cannot be honoured is refused, 4K can be asked for, and
+# pin = no leaves the arena unlocked so give-back works.
 set -u
 
 BIN=${1:-./perfcached}
@@ -46,11 +33,11 @@ EOF
 	chmod 644 "$1"
 }
 
-# start as an unprivileged uid with no memlock allowance, or as we are
+# start as an unprivileged uid with no memlock allowance (root bypasses RLIMIT_MEMLOCK through
+# CAP_IPC_LOCK), or as we are
 start() { # start <conf> <log> <unpriv 0|1>
-	# emptied HERE, before the loop reads it: a `> log &` empties it in
-	# the child, and the loop could read the previous start's refusal
-	# first, return, and leave the next check an empty log (rc8)
+	# emptied HERE, before the loop reads it: a `> log &` empties it in the child, so the loop could
+	# read the previous start's refusal first
 	: > "$2"
 	if [ "$3" = 1 ] && [ "$(id -u)" = 0 ]; then
 		setpriv --reuid=65534 --regid=65534 --clear-groups \
@@ -79,7 +66,7 @@ PYEOF
 # ---- 1. the config refuses what it cannot honour ---------------------
 conf "$D/bad.conf" "pin = sometimes"
 "$BIN" -f "$D/bad.conf" -C > "$D/bad.log" 2>&1
-grep -q "pin: auto|require" "$D/bad.log" \
+grep -q "pin: auto|require|no" "$D/bad.log" \
 	&& ok "an unknown pin value is refused, naming the choices" \
 	|| bad "pin = sometimes was not refused: $(tail -1 "$D/bad.log")"
 conf "$D/bad2.conf" "huge_pages = maybe"
@@ -111,14 +98,7 @@ fi
 for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; PIDS=""; sleep 0.3
 
 # ---- 3. pin = require refuses a start it cannot honour ---------------
-#
-# The PREMISE is that an unprivileged uid under `ulimit -l 0` cannot
-# lock 32 MB.  A host that grants the lock anyway - a container with
-# CAP_IPC_LOCK reaching the child, or a kernel that does not charge the
-# tier this arena landed on - cannot test the refusal at all, and the
-# GitLab runner is such a host (rc14, check and check-asan).  Detect it
-# and SKIP loudly: a skip is not a pass, and pretending otherwise would
-# make this suite green for the wrong reason.
+# a host that grants an unprivileged uid the lock anyway (CAP_IPC_LOCK reaching it) SKIPS loudly
 conf "$D/req.conf" "pin = require"
 if start "$D/req.conf" "$D/req.log" 1 && [ "$(stats 'm["locked_bytes"]')" != 0 ]; then
 	echo "  ..   SKIP the refusal half: this host locked the arena for an"
@@ -137,7 +117,7 @@ else
 fi
 for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; PIDS=""; sleep 0.3
 
-# ---- 4. pin = auto keeps the old behaviour: a warning, and it runs ----
+# ---- 4. pin = auto: a warning, and it runs ----------------------------
 conf "$D/auto.conf" "pin = auto"
 if [ "${PINSKIP:-0}" = 1 ]; then
 	echo "  ..   SKIP the unpinned half for the same reason"
@@ -156,12 +136,7 @@ fi
 for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; PIDS=""; sleep 0.3
 
 # ---- 5. where locking works, it is reported ---------------------------
-# Root is not enough: inside a container root has no CAP_IPC_LOCK (the
-# default capability set drops it), and RLIMIT_MEMLOCK is the CONTAINER's
-# - a rootless engine cannot raise it past its caller's 8 MB, whatever
-# --ulimit asks (seen on GitHub's Alpine job, 2026-10-06).  The daemon
-# then refuses pin = require, as it must; that is the setting, not a
-# defect, so the leg runs only where locking can work.
+# root is not enough: a container drops CAP_IPC_LOCK and a rootless engine caps RLIMIT_MEMLOCK
 can_lock() {
 	cap=$(awk '/^CapEff:/ {print $2}' /proc/$$/status 2>/dev/null)
 	[ -n "$cap" ] && [ $(( (0x$cap >> 14) & 1 )) = 1 ] && return 0  # CAP_IPC_LOCK
@@ -195,6 +170,20 @@ elif [ "$(id -u)" = 0 ]; then
 else
 	echo "  ..   not root: the locking half is skipped"
 fi
+
+# ---- 6. pin = no: never locked, as root too, so idle groups can go back -----
+for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; PIDS=""; sleep 0.3     # 5's node holds the port
+conf "$D/no.conf" "pin = no
+huge_pages = off"
+if start "$D/no.conf" "$D/no.log" 0; then
+	L=$(stats 'm["locked_bytes"]'); G=$(stats 'm["reclaim"]["giveback_off"]')
+	[ "$L" = 0 ] && [ "$G" = False ] && grep -q "pin = no: the arena is not locked" "$D/no.log" \
+		&& ok "pin = no: nothing locked (locked_bytes 0), give-back on, and the start says so" \
+		|| bad "pin = no: locked_bytes $L, giveback_off $G; $(grep -i 'pin' "$D/no.log" | tail -1)"
+else
+	bad "pin = no did not start: $(tail -2 "$D/no.log")"
+fi
+for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; PIDS=""; sleep 0.3
 
 echo "pintest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

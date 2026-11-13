@@ -1,13 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clwire.c - the sealed datagram and the beat frames (M6).  See clwire.h.
- *
- * The bodies came out of seal_send(), open_dgram(), nonce_next() and
- * beat_store() unchanged.  What differs: the key arrives as an
- * argument, sealing no longer sends, and the two beat frames are named
- * slots in a struct instead of file-static arrays passed by name.
- */
+/* clwire.c - the sealed datagram and the beat frames.  See clwire.h. */
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,14 +11,10 @@
 #include "clwire.h"
 
 #define PC_CL_MAGIC   0xA1
-#define PC_CL_VER     6                /* = cluster.h's; CH-8: the 24-byte nonce; CH-1: the stream position */
+#define PC_CL_VER     6                /* = cluster.h's */
 
-/* S105: the 12-byte datagram nonce.  randombytes_buf is one getrandom(2)
- * per call (1.05 us measured); each thread instead keeps a ChaCha20
- * keystream under a key the OS gave it once and takes twelve bytes per
- * datagram.  The values are what a random 256-bit key produces, so
- * they are as unique as random nonces - the 96-bit collision bound is
- * unchanged - and the receiver needs nothing. */
+/* the nonce comes from a per-thread ChaCha20 keystream under a key the OS gave once: as unique
+ * as random nonces, without one getrandom(2) per datagram */
 void clwire_nonce(unsigned char out[CLWIRE_NONCE_LEN])
 {
 	static __thread unsigned char key[32], ks[4096], ctr[12];
@@ -49,15 +38,13 @@ void clwire_nonce(unsigned char out[CLWIRE_NONCE_LEN])
 	off += CLWIRE_NONCE_LEN;
 }
 
-/* S302: the id is written bytes-first and published by the state's
- * release store; a sealer acquires the state, then reads bytes that no
- * longer change.  A clear (the provisional id given up on a yield) can
- * race a seal into one datagram that matches nobody - one dropped beat. */
+/* the id is written bytes-first and published by the state's release store; a clear racing a
+ * seal can make one datagram that matches nobody - one dropped beat */
 static unsigned char cw_cid[CLWIRE_CID_LEN];
 static int cw_state;
 
-static int cw_reconciling;              /* ST8 */
-static unsigned cw_lanes;              /* S461: lanes handed out */
+static int cw_reconciling;
+static unsigned cw_lanes;              /* lanes handed out */
 static __thread unsigned char cw_lane; /* this thread's, 0 = none */
 
 void clwire_take_lane(void)
@@ -94,7 +81,7 @@ int clwire_cid(unsigned char out[CLWIRE_CID_LEN])
 	return st;
 }
 
-/* CH-1: each sealing thread is a stream with its own sequence; a thread
+/* each sealing thread is a stream with its own sequence; a thread
  * that exits hands both on, so a stream's sequence only ever rises */
 #define CW_POOL 1024
 struct cw_tls { uint64_t seq; uint16_t stream; };

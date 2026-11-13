@@ -1,19 +1,6 @@
 #!/bin/sh
-# datagatetest.sh - CH-12/CH-14: the data plane (pulls, forwards,
-# migrations, replication, tombstones, publishes, demotes) is taken from an
-# address the node knows.  A stranger's PULL_REQ drew the value back to the
-# address it named; S302's bounce still has its slot, and a node just
-# admitted announces itself to every member before its first pull.  A
-# three-node unicast fleet, collection 0 stored where written and pulled
-# on a miss; frames from 127.0.142.9 sealed with the fleet's secret.
-#   1  node 3 joins last, seeded with node 1 only; read on node 3 the moment
-#      it knows both peers, a key only node 2 holds is pulled from node 2 -
-#      the join's own data plane is not refused
-#   2  a PULL_REQ for that key from 127.0.142.9 (unknown) draws no reply,
-#      counted in sender_refused
-#   3  the same address made known (an ALIVE from it): its PULL_REQ is
-#      answered - the gate tells a known sender from a stranger
-# Usage: test/datagatetest.sh [./perfcached] [./clinject]
+# datagatetest.sh - the data plane is taken only from an address the node knows: a stranger's PULL_REQ
+# draws no reply (sender_refused), a known one is answered, and a joining node's own pull is not refused.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -92,11 +79,8 @@ wait_for 30 '[ "$(up 1)$(up 2)" = 11 ] && [ "$(ready 2)" = ready ]' \
 CID=$(st 1 'r["cluster"]["cluster_id"]')
 W=$(call 2 '{"method":"set","params":{"col":"0","key":"dk","value":"held-by-2"}}')
 start 3
-# ready AND knowing node 2: seeded with node 1 only, a node 3 that has not
-# heard of node 2 yet asks node 1 alone and is told "absent" - which says
-# nothing about the gate (GitHub 40074218338, v0.7.2-rc1: null, once in
-# many runs).  What is under test is node 2 taking the pull of a node it
-# admitted moments ago
+# ready AND knowing node 2: a node 3 that has not heard of it asks node 1 alone and is told absent,
+# which says nothing about the gate
 wait_for 30 '[ "$(ready 3)" = ready ] && [ "$(up 3)" = 2 ]' \
 	|| bad "node 3 did not join (state $(ready 3), peers $(up 3))"
 R2=$(st 2 'r["cluster"]["sender_refused"]')
@@ -116,11 +100,11 @@ echo "$O" | grep -q '^replies 0' \
 	|| bad "sender_refused $R0 -> $(st 2 'r["cluster"]["sender_refused"]')"
 
 echo "--- 3: the same address, known"
-inj alive 88 > /dev/null
+A=$(inj alive 88)
 sleep 0.5
 O=$(inj pullreq 0 dk)
 echo "$O" | grep -q '^reply 3 ' \
-	&& ok "an ALIVE from it (node 88), then its PULL_REQ - answered (PULL_RSP)" \
+	&& ok "an ALIVE from it (node 88, $(echo "$A" | grep -c '^reply ') frames back in its second), then its PULL_REQ - answered (PULL_RSP)" \
 	|| bad "the known sender's PULL_REQ: $O"
 
 echo "datagatetest: $pass passed, $fail failed"

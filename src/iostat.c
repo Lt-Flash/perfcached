@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * iostat.c - 0.6.0 step 1: system calls against the work they moved
- * (iostat.h).  The per-thread counters are summed when read; a read races
- * the writers by design and sees each counter either before or after an
- * increment, never torn (one aligned 64-bit load each).
- */
+/* iostat.c - system calls against the work they moved (iostat.h): per-thread counters summed when
+ * read, racing the writers by design - one aligned 64-bit load each, never torn */
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,8 +12,8 @@
 
 struct pc_iostat_w pc_iostat_slots[PC_IOSTAT_SLOTS];
 _Static_assert(sizeof(struct pc_iostat_w) == 64, "one thread's counters, one cache line");
-struct pc_io_backend pc_io_backend;         /* S361 */
-struct pc_iobusy_w pc_iobusy_slots[PC_IOSTAT_SLOTS];   /* S379 */
+struct pc_io_backend pc_io_backend;
+struct pc_iobusy_w pc_iobusy_slots[PC_IOSTAT_SLOTS];
 
 const char *pc_io_backend_name(int b)
 {
@@ -28,7 +24,7 @@ static unsigned long long tx_calls[PC_UDP_N], tx_dgrams[PC_UDP_N];
 static unsigned long long rx_calls[PC_UDP_N], rx_dgrams[PC_UDP_N];
 
 static pthread_mutex_t base_mx = PTHREAD_MUTEX_INITIALIZER;
-static struct pc_iostat base;               /* S358: at the last reset */
+static struct pc_iostat base;               /* at the last reset */
 
 void pc_iostat_udp_tx(int which, unsigned long long calls,
 		unsigned long long dgrams)
@@ -122,7 +118,7 @@ void pc_iostat_reset(void)
 	pthread_mutex_unlock(&base_mx);
 }
 
-/* ---- S379: the workers' busy share, a sample a second for five minutes */
+/* ---- the workers' busy share, a sample a second for five minutes */
 #define BRING 301
 
 static pthread_mutex_t busy_mx = PTHREAD_MUTEX_INITIALIZER;

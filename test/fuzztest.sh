@@ -1,55 +1,13 @@
 #!/bin/sh
-# fuzztest.sh - RV-7 part 1: the doors under hostile input.
-#
-# The operator's list asks for fuzzing of the RESP parser and the tree
-# parser behind CMD frames, malformed frames on the binary plane, and
-# the size ceilings (key, value, pipeline depth, argument count).
-# `prototest` already covers a few hand-written bad frames; this drives
-# thousands, generated, and asserts the property that matters for all
-# of them at once:
-#
-#   THE DAEMON SURVIVES EVERY ONE.  It answers or closes deliberately,
-#   it never hangs, it never dies, and a good request on a fresh
-#   connection works afterwards - checked after EVERY case, so the case
-#   that broke it is named rather than inferred from a later failure.
-#
-# What is NOT asserted: which error a given malformation returns.  That
-# is the parser's business and pinning it would freeze what is allowed
-# to improve.  What IS pinned is the contract the README states - the
-# value ceiling, and that a refusal keeps the connection usable.
-#
-# Cases, all three doors on one daemon:
-#  resp      truncated frames, bad and negative and huge multibulk
-#            counts, bulk lengths that disagree with the bytes, missing
-#            CRLF, embedded NUL, inline commands, unterminated bulk,
-#            a bulk header with no body, non-numeric lengths
-#  deep      pipeline depth and argument count: 10,000 commands in one
-#            write, and a 100,000-argument multibulk
-#  size      the key and value ceilings from both sides: the largest
-#            value the README allows must store and read back byte for
-#            byte; one byte more must be refused, not truncated
-#  tree      malformed parameter trees inside CMD frames (S317: the
-#            native door speaks binary frames only, the JSON-RPC text
-#            dialect is gone): unknown tags, lengths past the frame,
-#            nesting past PT_DEPTH (32), u32 counts that lie, a 70 KB
-#            bulk, method lengths of 0 and 255, a NUL inside a key,
-#            numbers that do not fit, 5,000 pings in one write
-#  binary    frame headers that lie: a length longer than the body,
-#            longer than the maximum, zero, a truncated header, a bad
-#            type or version - and what is no frame at all (a PNG, an
-#            HTTP request, a TLS hello) at the native door
-#  random    500 frames of random bytes at each door, seeded and printed
-#            so a failure is reproducible
-# Usage: test/fuzztest.sh [./perfcached] [seed]
+# fuzztest.sh - generated hostile input at the RESP, CMD-tree and binary doors, plus the size ceilings:
+# the daemon survives every case, checked after each; which error comes back is not pinned.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
 SEED=${2:-$(date +%s)}
 D=$(mktemp -d /var/tmp/pcfuzz.XXXXXX)
 P=
-# a TERM from an outer timeout must END this, not just clean up: dash
-# runs the trap and CARRIES ON, which left every assertion below reading
-# a tree that had just been removed
+# a TERM from an outer timeout must END this: dash runs the trap and carries on, reading a removed tree
 trap '[ -n "$P" ] && kill -9 "$P" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'echo "fuzztest: interrupted"; exit 143' INT TERM
 pass=0 fail=0
@@ -241,9 +199,7 @@ out("BIG_KEY", "reply=%r" % r[:48])
 out("ALIVE_SIZE", alive() or "ok")
 
 # ---- CMD frames with malformed parameter trees, at the native door ---
-# [verb 19][mlen u8][method][tree]: the tree parser (src/ptree.c) must
-# refuse every one of these with 'bad params' (or 'invalid request' for a
-# method field that is missing or past the frame) and keep the link.
+# [verb 19][mlen u8][method][tree]: each refused ('bad params' or 'invalid request'), the link kept
 def hdr(plen, ftype=1, rid=1, ver=1, magic=0x9E, flags=0):
     return struct.pack("<BBBBIQ", magic, ver, ftype, flags, plen, rid)
 def fr(payload, **kw):

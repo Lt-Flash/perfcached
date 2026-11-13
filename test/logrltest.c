@@ -1,15 +1,5 @@
-/* logrltest.c - the limit on network-driven log lines (logrl.c, CH-17), on
- * a clock the test moves; the log captured.
- *
- *   A  one line per reason and address a minute: the first said, the
- *      repeats held and counted, and the next said a minute on - after a
- *      line giving how many were held
- *   B  another address, another reason, no address at all: keys of
- *      their own
- *   C  at most LOGRL_CAP lines a minute across every key: the next one
- *      held, and the next said after the window carries the cap's count
- *   D  more keys than slots: still answered, the oldest slot reused
- */
+/* logrltest.c - the limit on network-driven log lines, on a clock the test moves, the log
+ * captured: one line per reason and address a minute, a global cap, slots reused. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -61,7 +51,7 @@ int main(void)
 	long long t = 1000000;
 	int i, n;
 
-	/* A */
+	/* A: the first line said, repeats held and counted, the next a minute on with the held count */
 	quiet();
 	CHK(pc_logrl_ok_at(LRL_JOIN_HELD, &a, t), "A: the first line - said");
 	n = 0;
@@ -74,7 +64,7 @@ int main(void)
 		strstr(logbuf, "log limit: 6 more 'join identity held' line(s) about 10.0.0.1 held back since the last one"),
 		"A: a minute on - said, after the count of the six held");
 
-	/* B */
+	/* B: another address, another reason, no address at all - keys of their own */
 	quiet();
 	CHK(pc_logrl_ok_at(LRL_JOIN_HELD, &b, t + LOGRL_WINDOW_MS + 1) && lines == 0,
 		"B: another address - its own key, said");
@@ -83,7 +73,7 @@ int main(void)
 		!pc_logrl_ok_at(LRL_HS_AUTH, NULL, t + LOGRL_WINDOW_MS + 4),
 		"B: no address (a unix-socket client) - one key of its own");
 
-	/* C */
+	/* C: at most LOGRL_CAP lines a minute over all keys; the next window says the cap's count */
 	t += 10 * LOGRL_WINDOW_MS;                  /* a fresh window */
 	quiet();
 	for (n = 0, i = 0; i < LOGRL_CAP; i++) {
@@ -104,7 +94,7 @@ int main(void)
 			"C: the window over - said, after the cap's count and its own");
 	}
 
-	/* D */
+	/* D: more keys than slots - still answered, the oldest slot reused */
 	t += 10 * LOGRL_WINDOW_MS;
 	for (n = 0, i = 0; i < LOGRL_SLOTS + 40; i++) {
 		pc_addr x = v4(10, 3, (unsigned)i >> 8, (unsigned)i & 0xff);

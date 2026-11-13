@@ -1,31 +1,13 @@
 #!/bin/sh
-# backupsynctest.sh — the standby, and what it is for.
-#
-# A backup that is only a NAME buys nothing: the point is that when the
-# master dies, the node taking over already holds the state the fleet
-# cannot reconstruct.  The piece that matters is the IDENTITY HISTORY -
-# only a master ever learns which identities this cluster has seen, so a
-# promotion without it calls every returning node NEW, backfilling nodes
-# that only needed reconciling.
-#
-#  1. a standby is designated, and every node agrees who it is
-#  2. it holds the control state; a plain member does not
-#  3. publications are acknowledged BEFORE they are broadcast
-#  4. losing the STANDBY degrades to picking another one, not to a
-#     wedged control plane - which is the risk of gating publication on
-#     an ack at all
-#  5. losing the MASTER promotes the standby WITH the history, and the
-#     new master claims a HIGHER term - never a reused one
-# Usage: test/backupsynctest.sh [./perfcached]
+# backupsynctest.sh - the standby holds the identity history the fleet cannot rebuild: designated and
+# agreed, acked before broadcast, replaced if lost, and promoted WITH the history under a higher term.
 set -u
 
 BIN=${1:-./perfcached}
 SEC=bs-client-secret
 D=$(mktemp -d /var/tmp/pcbsy.XXXXXX)
-# daemons die by the pids this script started - each checked against its
-# command line, so a reused pid never hits a stranger - and the name-bound
-# pattern stays as a fallback; a pattern alone let a renamed daemon outlive
-# its suite (2026-09-09)
+# daemons die by the pids this script started, each checked against its command line so a reused pid
+# never hits a stranger; the name pattern is only a fallback
 PIDS=""
 trap 'for p in $PIDS; do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; pkill -9 -f "[p]erfcached -f $D" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
@@ -91,7 +73,16 @@ idx_of_node() {
 
 mk 1; mk 2; mk 3
 start 1 && start 2 && start 3 || { echo "fleet did not start"; exit 1; }
-sleep 10
+# a joiner is CONNECTING until its links answer: up to 60 s for every node ready, seeing the
+# others, and naming the same standby
+st() { ./perfcli -h 127.0.70.$1 -p 1792$1 -a $SEC -q -j '{"method":"stats"}' 2>/dev/null \
+	| python3 -c 'import json,sys; d=json.load(sys.stdin); c=d["cluster"]; print(d.get("state"), c.get("peers_up"), c["map"].get("backup"))' 2>/dev/null; }
+i=0
+while [ $i -lt 600 ]; do
+	a=$(st 1); b=$(st 2); c=$(st 3)
+	[ "$a" = "$b" ] && [ "$b" = "$c" ] && case "$a" in "ready 2 0"|"ready 2 None") ;; "ready 2 "*) break;; esac
+	sleep 0.1; i=$((i+1))
+done
 
 # ---- 1. a standby is designated and everyone agrees -------------------
 B1=$(q 1 map.backup); B2=$(q 2 map.backup); B3=$(q 3 map.backup)

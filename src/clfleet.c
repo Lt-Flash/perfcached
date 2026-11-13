@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * clfleet.c - one collection's figures for the whole fleet (M15).  See
- * clfleet.h.  Moved from pc_cluster_col_fleet() (S164) unchanged in what
- * it computes; the peer walk stays in cluster.c.
- */
+/* clfleet.c - one collection's figures for the whole fleet (see clfleet.h);
+ * the peer walk stays in cluster.c. */
 #include <string.h>
 
 #include "clfleet.h"

@@ -3,19 +3,8 @@
  * Part of libperfd - see lib/LICENSE.  This file must stay
  * free of src/core includes; tools/sync-libperfd.sh exports
  * exactly the MIT set to consumers. */
-/*
- * json.h — the in-house JSON codec (task S7).
- *
- * A jsmn-style span tokenizer (no allocations, tokens point into the
- * input buffer) and an escaping writer.  Since S317 JSON is data, never
- * the wire: the HTTP door renders the stats/members/clients trees with
- * it, the RESP writers in obs.c and verbs.c build their text through
- * pc_jw, the document type is parsed with it (jsonpath.c), and libperfd
- * converts JSON text to and from trees at its API edge (ptree.c).  The
- * old base64 "enc" convention went with the text dialect: values are
- * bytes on the wire.  cJSON is banned here by scar tissue (it truncates
- * at NULs).
- */
+/* json.h - the in-house JSON codec: a jsmn-style span tokenizer (no allocations) and an escaping
+ * writer.  JSON is data here, never the wire; cJSON is banned (it truncates at NULs). */
 #ifndef PC_JSON_H
 #define PC_JSON_H
 
@@ -39,9 +28,8 @@ int pc_json_parse(const char *buf, size_t len, struct pc_jtok *t, int maxt);
 int pc_json_get(const char *buf, const struct pc_jtok *t, int ntok,
 		int obj, const char *key);
 
-/* unescape a PC_J_STR token into out; NUL-safe: the backslash-u0000
- * escape becomes a real NUL byte in out.  Returns the byte length or -1
- * (bad escape / overflow). */
+/* unescape a PC_J_STR token into out, NUL-safe (the backslash-u0000 escape becomes a real NUL):
+ * the byte length, or -1 (bad escape / overflow) */
 int pc_json_unescape(const char *buf, const struct pc_jtok *tok,
 		char *out, size_t outcap);
 
@@ -54,20 +42,13 @@ struct pc_jw {
 	char *buf;
 	size_t len, cap;
 	int overflow;
-	/* 1 = buf is heap memory this writer owns and may GROW.  Replies
-	 * normally go into a fixed per-worker scratch, which is right for
-	 * everything whose size a request bounds.  CLUSTER SLOTS is not
-	 * bounded that way - it enumerates the slot space, so a 64-node
-	 * fleet is ~1.5MB - and it would otherwise be refused as "reply
-	 * too large" on any fleet past three nodes.  The caller must
-	 * pc_jw_free() when this is set. */
+	/* 1 = buf is heap memory this writer owns and may GROW, for a reply no request bounds (CLUSTER
+	 * SLOTS: ~1.5MB at 64 nodes); the caller must pc_jw_free() it */
 	int owned;
 };
 
-/* JW_HEAP_MAX: a bound is still needed, or a bug becomes an OOM.  Set
- * well above the worst-case slot map (16384 ranges x ~101 bytes) and
- * well below PC_MAX_OUTQ, so an overrun is reported as overflow rather
- * than killing the connection at the output queue. */
+/* a heap writer's bound, or a bug becomes an OOM: above the worst slot map (16384 x ~101 bytes)
+ * and below PC_MAX_OUTQ, so an overrun is an overflow, not a killed connection */
 #define JW_HEAP_MAX (4u << 20)
 
 void pc_jw_init(struct pc_jw *w, char *buf, size_t cap);
@@ -75,12 +56,8 @@ void pc_jw_init(struct pc_jw *w, char *buf, size_t cap);
  * valid before anything has been written (asserted by w->len == 0). */
 int  pc_jw_init_heap(struct pc_jw *w, size_t cap);
 void pc_jw_free(struct pc_jw *w);
-/* S322: the append, inline for the common case - the bytes fit.  A
- * literal's length is then a constant and its copy compiles to a few
- * moves instead of a memcpy call: a RESP bulk reply made four calls of
- * 1-3 bytes ("$", the digits, two CRLFs), and on musl every memcpy call
- * enters a `rep movs` routine (DESIGN 12ip).  Growing a heap writer and
- * refusing past a fixed one's capacity stay out of line, unchanged. */
+/* the append, inline while the bytes fit, so a literal's copy compiles to a few moves (musl's
+ * memcpy call is a `rep movs` routine); growing and refusing stay out of line */
 void pc_jw_raw_slow(struct pc_jw *w, const char *s, size_t n);
 static inline void pc_jw_raw(struct pc_jw *w, const char *s, size_t n)
 {
@@ -91,18 +68,15 @@ static inline void pc_jw_raw(struct pc_jw *w, const char *s, size_t n)
 	}
 	pc_jw_raw_slow(w, s, n);
 }
-/* inline so a string LITERAL's length is folded at compile time: the
- * out-of-line version called strlen at run time for each of the ~900
- * literals the replies are built from - 5% of a `members` */
+/* inline so a string LITERAL's length folds at compile time (a strlen per literal cost 5% of
+ * a `members`) */
 static inline void pc_jw_lit(struct pc_jw *w, const char *s)
 {
 	pc_jw_raw(w, s, __builtin_strlen(s));
 }
 void pc_jw_str(struct pc_jw *w, const char *s, size_t n);   /* escapes */
-/* S182: as pc_jw_str, for a string carrying CLIENT bytes - a byte that
- * cannot be part of valid UTF-8 becomes U+FFFD.  JSON text must be
- * valid UTF-8, and a slow-log sample of a binary value otherwise makes
- * the whole of /stats unparseable to a strict reader. */
+/* as pc_jw_str for CLIENT bytes: a byte that cannot be valid UTF-8 becomes U+FFFD, or one binary
+ * sample makes all of /stats unparseable to a strict reader */
 void pc_jw_str_utf8(struct pc_jw *w, const char *s, size_t n);
 void pc_jw_i64(struct pc_jw *w, long long v);
 

@@ -6,6 +6,7 @@ Build-Depends: debhelper-compat (= 13),
                libsodium-dev,
                libcurl4-openssl-dev,
                libmicrohttpd-dev,
+               libssl-dev,
                pkg-config,
 Standards-Version: 4.6.2
 Rules-Requires-Root: no

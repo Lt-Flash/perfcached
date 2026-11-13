@@ -1,4 +1,4 @@
-/* S150 step B: per-thread quiescent state - see quiesce.h */
+/* per-thread quiescent state - see quiesce.h */
 #include "quiesce.h"
 
 struct qs_line {
@@ -21,16 +21,13 @@ void pc_qs_attach(void)
 	if (i >= PC_QS_LINES) {
 		__atomic_fetch_sub(&nlines, 1, __ATOMIC_ACQ_REL);
 		return;                    /* uncounted: never blocks, never
-		                            * protected - the daemon has far
-		                            * fewer threads than lines */
+		                            * protected - far fewer threads than lines */
 	}
 	me = (int)i;
 }
 
-/* The store and the fence together make this a Dekker pair with the
- * retirer's stamp: either our epoch is visible to a retirer that
- * stamped after we entered, or its unpublish is visible to us and the
- * pointer we take is the new one. */
+/* the store and the fence make a Dekker pair with the retirer's stamp: either a later retirer sees
+ * our epoch, or we see its unpublish and take the new pointer */
 void pc_qs_enter(void)
 {
 	if (me < 0)

@@ -21,11 +21,16 @@ the "why" is the point, not the ceremony.
 - [ ] **`LimitMEMLOCK=infinity`** (the shipped unit sets it). The arena
       is pinned so it cannot be swapped — a swapped cache is worse than
       no cache.
-- [ ] **Pinning and give-back are mutually exclusive.** A pinned node
-      cannot return memory to the host: `MADV_DONTNEED` is refused on
-      locked pages. Expect `perfcached_reclaim_giveback_disabled 1` and
-      a flat `arena_held` there; set `reclaim_floor_mb` only where
-      give-back actually happens.
+- [ ] **A pinned arena gives memory back too.** An idle 2 MB group is
+      unlocked before it goes back to the host and locked again when a
+      carve brings it back (measured 2026-11-11 on the THP tier:
+      resident and locked memory fell with the records under `pin =
+      auto` as under `pin = no`, `perfcached_reclaim_giveback_disabled`
+      0).  A reserved huge-page pool stays reserved whatever the arena
+      returns, so the host gains nothing there.  `reclaim_floor_mb`
+      keeps a floor resident.  `pin = no` (0.7.5) never locks the
+      arena, so the kernel may swap it (GUIDE.md, "Two ways to run the
+      memory").
 
 ## 2. Huge pages
 
@@ -44,8 +49,10 @@ the "why" is the point, not the ceremony.
       when it detects tmpfs: that protects against a process crash
       only, never against host or power loss.
 - [ ] **Let the probe run** (`probe = auto`) unless you have measured
-      this device yourself. It picks `wal_fsync` and the segment
-      geometry from the storage's actual behaviour, and reports both
+      this device yourself. It recommends an `fsync` policy (and warns
+      when `fsync = always` is set against it - it never changes the
+      policy you set), picks the segment size and the `fsync = always`
+      ring depth from the storage's actual behaviour, and reports both
       the identity it resolved and what it measured — a mismatch (a
       "SAS spinner" measuring NVMe-fast) is a controller cache, and is
       worth knowing.
@@ -57,8 +64,7 @@ the "why" is the point, not the ceremony.
       p50 and 236/s** on that same mount.  A short probe never fills the
       HOST page cache, so it measures the cache.  **Verify with fio
       before enabling `fsync = always`**, or set the disk to `cache =
-      none` (O_DIRECT) so guest fsync latency is honest.  See DESIGN
-      section 12am.
+      none` (O_DIRECT) so guest fsync latency is honest.
 - [ ] **Put the WAL on ext4 rather than btrfs.**  Same Ceph volume,
       same host, identical fio job (4K randrw, QD1, `--fdatasync=1`,
       4 threads): **ext4 773 IOPS at 4.75 ms sync p50; btrfs 490 IOPS
@@ -74,10 +80,15 @@ the "why" is the point, not the ceremony.
       an acknowledged write that never reached the WAL. Under
       `everysec` and `no` workers are never blocked, so pressure shows
       up here rather than as latency (under `fsync = always` a full
-      ring makes the writer wait instead: `wal.ring_waits`) - and the FIRST drop marks the node FAILED (reads only,
-      refuses writes, stays a member) until an operator restarts it with
-      a deeper `ring_kb`, `everysec`, or less load.  With `probe = no`
-      nothing sizes the ring: set `ring_kb` yourself on such storage.
+      ring makes the writer wait instead: `wal.ring_waits`) - and the
+      FIRST drop takes the node out of write service: it goes HEALING
+      (refuses writes, serves reads, stays a member), takes a snapshot
+      that makes the lost records durable again and returns to `ready`
+      by itself; where it cannot heal (no snapshot, a device that
+      refused a write, a failed heal) it is FAILED until an operator
+      restarts it.  Either way the fix is a deeper `ring_kb`,
+      `everysec`, or less load.  With `probe = no` nothing sizes the
+      ring: set `ring_kb` yourself on such storage.
 - [ ] **`sync` is a barrier, not a guarantee of completeness.** Its
       reply carries `dropped` — a receipt that covers survivors only is
       not a full barrier.
@@ -111,8 +122,11 @@ the "why" is the point, not the ceremony.
 - [ ] **In a cloud VPC or Kubernetes: `discovery = unicast`.**  The
       network carries no multicast.  Open between every pair of nodes:
       the cluster port (UDP and TCP), the frame lane (TCP, the cluster
-      port + 2), the relay port (pub/sub and replication; UDP, the
-      cluster port + 1).  Address the nodes directly (instance or pod IPs), never through a
+      port + 2), the relay port (pub/sub and replication; UDP, and TCP
+      for replication groups larger than `max_datagram`, the cluster
+      port + 1).  A joiner whose path to a member is closed is held
+      `connecting`, refusing clients, and the master raises
+      `cluster.admission_stuck` naming the path.  Address the nodes directly (instance or pod IPs), never through a
       load balancer or a Service's virtual IP.  Seed with names that
       resolve to several members - for Kubernetes a headless Service
       with `publishNotReadyAddresses: true`.  Set `expect` to the fleet
@@ -120,7 +134,7 @@ the "why" is the point, not the ceremony.
       `PERFCACHED_PLATFORM_KEY` = `metadata.uid` for a Deployment, the
       identity file on a persistent volume for a StatefulSet.  Watch for
       `cluster.foreign_clusters` (a second cluster on your seeds) and
-      `lane.udp_blocked_saves` (UDP filtered on some path).  The mesh
+      `cluster.lane.udp_blocked_saves` (UDP filtered on some path).  The mesh
       sends one heartbeat per node per peer per second: it suits a fleet
       of a few dozen nodes.
 - [ ] **Check unicast discovery on the running fleet**, not only the
@@ -162,6 +176,14 @@ the "why" is the point, not the ceremony.
 - [ ] **Upgrade by a rolling restart, one node at a time** (section
       8): mixed versions are for the roll, not for running - the page
       says "mixed versions" until every node is on the new build.
+      0.7.5 is the exception: from 0.7.4 every node stops and starts
+      on 0.7.5 (section 8).
+- [ ] **Joiners are admitted one at a time (0.7.5).**  The master
+      admits joiners from a queue, and an admitted node is `connecting`
+      (live, refusing client data, holding no share of the keyspace)
+      until every link between it and each member has answered both
+      ways; one still held after 10 s is named in the log and raises
+      the `cluster.admission_stuck` alert.
 - [ ] `net.core.rmem_max` ≥ 8 MB, or leave `CAP_NET_ADMIN` in place so
       the daemon can force its own receive buffer. A dropped forward
       datagram is a refused client write — forwards have no retry.
@@ -173,15 +195,23 @@ the "why" is the point, not the ceremony.
 - [ ] **Client and cluster secrets must differ** — the daemon refuses
       to start otherwise. Keep the config `0640`; it warns when the
       file is world-readable.
-- [ ] **The RESP door is plaintext and has no handshake.** Off-box it
-      requires `resp_allow`, and it should also have a password. It
-      reads *and writes* data.
-- [ ] **The HTTP door is plaintext.** It serves `/stats`, `/members`,
-      `/clients`, `/metrics` and `/health` - JSON and text, no page since
-      0.7.0 (the dashboard is its own process).  Off-box it requires
-      `http_allow`; prefer binding it to loopback with a TLS-terminating
-      proxy in front — that also buys better auth than we would write
-      (OIDC, mTLS, whatever you already run).
+- [ ] **The RESP door has no handshake, and is plaintext unless given
+      `tls` (0.7.5).** Off-box it requires `resp_allow`, and it should
+      also have a password - over TLS, or with `auth_needs_tls = yes` so
+      it is refused in the clear off loopback. It reads *and writes* data.
+- [ ] **The HTTP door is plaintext unless given `tls` (0.7.5).** It
+      serves `/stats`, `/members`, `/clients`, `/metrics` and
+      `/health` - JSON and text, no page since 0.7.0 (the dashboard is
+      its own process).  Off-box it requires `http_allow`; prefer
+      binding it to loopback with a TLS-terminating proxy in front —
+      that also buys better auth than we would write (OIDC, mTLS,
+      whatever you already run).
+- [ ] **A password or token on a plaintext door off loopback crosses
+      the network in the clear**, and `perfcached -C` warns about it
+      (0.7.5).  Give the door `tls` (`resp = <addr:port> tls`, with
+      `[listen] tls_cert` and `tls_key`), and `auth_needs_tls = yes`
+      refuses AUTH and the token on plaintext connections from another
+      host.
 - [ ] **`[secrets] http` is a second layer, not the first.** Over
       plaintext the token is replayable by anyone who can see the
       traffic. It exists so one mis-scoped firewall rule does not
@@ -189,6 +219,9 @@ the "why" is the point, not the ceremony.
 - [ ] **Rotate secrets with the list form**: clients accept several
       passwords at once, so add the new one everywhere, then drop the
       old one — no flag day.
+- [ ] **A TLS door's certificate is renewed by a reload** (0.7.5):
+      replace the files at `tls_cert` and `tls_key`, then `systemctl
+      reload perfcached`.  The alert `tls.cert` warns 14 days ahead.
 
 ## 6. If you front the fleet with HAProxy
 
@@ -238,6 +271,15 @@ the "why" is the point, not the ceremony.
         ones that count.
 - [ ] **irqbalance running** (or the queues' interrupts spread by hand),
       so the queues land on different CPUs.
+- [ ] **No `link:` warning at start (0.7.5).**  The daemon reads the
+      NIC under its address (a VLAN followed to its bond's active
+      slave) and warns when it has fewer receive queues than workers -
+      or than cores, when there are fewer cores - and when all its
+      interrupts land on one CPU.  `/stats` `alerts.host.link` shows
+      `rx_queues`, `irqs` and `irq_cpus`, null for a device that is not
+      a NIC (a bond spreading over its slaves, a bridge, a container's
+      veth), and `tcp_retrans_s`, the host's TCP retransmits a second,
+      beside `udp_rcvbuf_errors_s`.
 - [ ] RPS (`rps_cpus`) is **not** a substitute: with one hardware queue,
       its interrupt still lands on one CPU.
 - [ ] **Leave the daemon unpinned.**  With irqbalance moving queue
@@ -305,15 +347,15 @@ Ansible play would otherwise restart three members at once.  Pin the
 version so an unattended upgrade cannot pull a new build underneath you:
 
     apt-mark hold perfcached
-    apt install perfcached=0.7.0-1        # when you mean it
+    apt install ./perfcached_<version>-1+deb13_amd64.deb   # when you mean it
     systemctl restart perfcached          # on this node, when the fleet says it is safe
 
 `perfcached-dashboard` is stateless and keeps the automatic restart (its
 `session_key` keeps sessions valid across it).  A package install is
 upgraded by the package manager only: `upgrade_stage` refuses it (the
 daemon reports `install_mode` in `upgrade_status`), and the self-upgrade
-of DESIGN 12ne applies to the `/opt/perfcached-<version>` prefix layout
-of the release tarballs.
+below applies to the `/opt/perfcached-<version>` prefix layout of the
+release tarballs.
 
 **The tarball prefixes.**  An install from the release tarballs lives
 under `/opt/perfcached-<version>` behind the `/opt/perfcached` link: stage
@@ -322,6 +364,19 @@ the signed build on one node (`perfcli upgrade-stage`, or the dashboard's
 on each node switches the link and starts the new build when asked,
 switching back if it never reports ready (GUIDE.md, "The upgrade
 helper").  The same order applies: members first, the master last.
+
+**The wire epoch.**  A roll never changes what the fleet speaks on the
+wire: when every node runs a build that speaks a newer epoch beside the
+old one, raise it with `perfcli -E <enable> upgrade commit epoch=<n>`
+(the master carries it out, and refuses by name while a live member
+cannot speak it; `stats` `cluster.epoch` shows `committed`, `min` and
+`max`).  **0.7.5 is no roll from 0.7.4:** it speaks epoch 4 alone, so
+stop every node (`perfcli -E <enable> fleetstop`), install 0.7.5
+everywhere and start them all - the state is kept (GUIDE.md, "0.7.5
+speaks wire epoch 4 alone").  Move clients to libperfd 0.7.6 or later
+with it: an older libperfd does not route by key against epoch 4, so
+every request takes the forward hop, and a value larger than a forward
+carries (58,000 bytes) is refused.
 
 ## 9. Before you call it done
 

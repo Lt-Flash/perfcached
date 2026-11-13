@@ -1,23 +1,6 @@
 #!/bin/sh
-# arenafreetest.sh - S445: a dropped table's index goes back where it can.
-#
-# Index regions are carved downward from the zone's frontier (rtop) and a
-# retired one goes to the zone's own free set, for the next index; records
-# are never carved there.  rtop only grew down, so a dropped index stayed
-# out of the records' room until a restart, and arena_used kept counting
-# it (245-247, 2026-10-23: thbench's 4,194,304 buckets, 286 MB).  One node:
-#   1. create big at 2^18 (~71 slots), then small at 2^12 (one segment) -
-#      small's index lands below big's;
-#   2. drop big: its slots are the zone's - arena_free_tables holds them,
-#      arena_used no longer counts them, and arena_free has not moved
-#      (small's slot sits between them and the frontier);
-#   3. drop small: the frontier rises over both - arena_free_tables back to
-#      nothing, arena_free back where it started, arena_regions_raised
-#      counting the slots.
-# The reclaim tick is kept away (600 s): a zone punch in flight holds its
-# slots in neither free map, and this test reads the maps, not the punch.
-# FAIL-FIRST: the build before S445 has no arena_free_tables and keeps
-# both indexes' room as used.
+# arenafreetest.sh - a dropped table's index goes back where it can: to the zone's free set while a lower
+# index holds the frontier, and the frontier rises over both once that one drops too.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

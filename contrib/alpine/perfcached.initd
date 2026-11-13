@@ -1,8 +1,6 @@
 #!/sbin/openrc-run
-# perfcached - the OpenRC service (PD-11).  The same shape as
-# contrib/perfcached.service: its own account, the state directory, the
-# DMI uuid copied where a non-root daemon can read it (S326), the memlock
-# and descriptor limits.  Not enabled by default: rc-update add perfcached.
+# perfcached - the OpenRC service, shaped like contrib/perfcached.service; not enabled by
+# default: rc-update add perfcached
 description="perfcached cache daemon"
 command=/usr/bin/perfcached
 cfgfile=${cfgfile:-/etc/perfcached/perfcached.conf}
@@ -25,7 +23,7 @@ start_pre() {
 	checkpath -d -m 0700 -o perfcached:perfcached /var/lib/perfcached || return 1
 	checkpath -d -m 0755 -o perfcached:perfcached /run/perfcached || return 1
 	checkpath -f -m 0640 -o perfcached:perfcached /var/log/perfcached.log || return 1
-	# S326: the identity comes from the machine's DMI uuid, 0400 root; an
+	# the identity comes from the machine's DMI uuid, 0400 root; an
 	# empty copy (a container, no DMI) lets the daemon fall back to the MAC
 	cat /sys/class/dmi/id/product_uuid > /run/perfcached/dmi-product-uuid 2>/dev/null || : > /run/perfcached/dmi-product-uuid
 	chown perfcached:perfcached /run/perfcached/dmi-product-uuid

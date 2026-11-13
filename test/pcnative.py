@@ -1,4 +1,4 @@
-"""pcnative.py - the suites' client for the native door (S317).
+"""pcnative.py - the suites' client for the native door.
 
 The JSON-RPC dialect is gone: the native door speaks the binary protocol
 only.  Every method rides PC_VERB_CMD - [verb 19][mlen u8][method] then
@@ -182,7 +182,7 @@ class Wire:
 
     def __init__(self, sock, membership=False):
         self.s = sock
-        # S462: a member's joins and state changes are pushed to every client;
+        # a member's joins and state changes are pushed to every client;
         # kept only when asked for, or a suite takes one for its reply
         self.membership = membership
         self.wbuf = b""
@@ -314,7 +314,7 @@ def call(f, method, **params):
     readline() serves f.lines first, so appending a skipped line straight
     back onto it handed the same unsolicited NOTIFY (a membership push
     arriving mid-call) to this loop again, forever, at 100% CPU - the
-    "hung fill" of upgradeloadtest in shard mode (225, 2026-10-16)."""
+    "hung fill" of upgradeloadtest in shard mode."""
     rid = f.send(method, params or None)
     kept = []
     while True:

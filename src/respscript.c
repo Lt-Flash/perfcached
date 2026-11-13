@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * respscript.c - EVAL, EVALSHA and SCRIPT on the RESP door (S170a): the
- * approved Symfony Lock scripts, named by their bodies' SHA1, run as C
- * through op_slock; any other script is refused.  Moved from verbs.c
- * unchanged (the 0.7.2 split, wave 1 - doc/MODULARITY.md).
- */
+/* respscript.c - EVAL, EVALSHA and SCRIPT on the RESP door: only the approved Symfony Lock
+ * scripts run, as C through op_slock; clients never run code of their own. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,10 +12,7 @@
 #include "respout.h"
 #include "verbsint.h"
 
-/* ---- S170a: EVAL / EVALSHA / SCRIPT - the approved Symfony scripts only.
- * A script is named by the SHA1 of its body, as Redis names it; one on
- * this list runs as C (slock_local), anything else is refused - clients
- * never run code of their own (DESIGN 12hp, 12il). */
+/* ---- the approved scripts, each named by the SHA1 of its body as Redis names it */
 static const struct {
 	const char *sha;
 	int script;

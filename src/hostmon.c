@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * hostmon.c - S380's host monitor: CPU busy, the state device's busy time
- * and host memory, read from /proc and /sys once a second and kept a
- * minute.  Moved from alerts.c unchanged but for its two inputs (the
- * 0.7.2 split, wave 1 - doc/MODULARITY.md); the alarms on these figures
- * stay in alerts.c.
- */
+/* hostmon.c - the host monitor: CPU busy, the state device's busy time and host memory, read from
+ * /proc and /sys once a second and kept a minute; the alarms on them stay in alerts.c */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -16,10 +11,8 @@
 #include <sys/sysmacros.h>
 #include "hostmon.h"
 
-/* CPU busy from /proc/stat, the state device's busy time (what iostat shows
- * as %util) from its io_ticks, host memory from MemAvailable - sampled once
- * a second; CPU and disk are averaged over the last minute.  NOT iowait or
- * PSI io: on io_uring before kernel 6.15 those read ~100% at idle (12lx). */
+/* CPU from /proc/stat, the state device's %util from its io_ticks, memory from MemAvailable; NOT
+ * iowait or PSI io, which on io_uring before kernel 6.15 read ~100% at idle */
 struct hostmon HM = { .cpu_pct = -1, .cpu_self_pct = -1, .io_pct = -1, .mem_pct = -1 };
 
 static int hm_proc_stat(unsigned long long *busy, unsigned long long *total,
@@ -268,10 +261,8 @@ void hm_apply(const struct hm_obs *o, int fast)
 		}
 	}
 	if (o->mem_ok) {
-		/* the huge-page pool is reserved memory, never available
-		 * (MemAvailable leaves it out) - most often the arena's own.
-		 * Measured beside it, or a pool for a 1 GB arena on a 2 GB
-		 * host reads as 70% used by something else */
+		/* the huge-page pool is reserved, never available (MemAvailable
+		 * leaves it out) - most often the arena's own, so not "used" */
 		unsigned long long base = o->mem_total_kb;
 
 		if (o->huge_kb && o->huge_kb < base)

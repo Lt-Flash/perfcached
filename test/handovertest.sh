@@ -1,27 +1,6 @@
 #!/bin/sh
-# handovertest.sh - CH-9: the operator moves mastership before a restart.
-#
-# Three nodes; the founder (highest address) is master.  `master_prefer
-# <node>` on the master names that member standby, and once the published
-# map says so the master sends M_HANDOVER: the member promotes at the next
-# term and the old master steps down on its beacon.
-#  - refused without the enable secret, on a member, and for a node that
-#    is not a live member;
-#  - the named member is master within a few seconds, the old master and
-#    the third node are members, and all three agree;
-#  - at no sample was the fleet without a master (no election's silence);
-#  - the new master's term is above the old one's; the logs name the
-#    handover on both sides; a key reads back everywhere and a write
-#    through the new master lands everywhere.
-# Fail-first: without CH-9 the verb is unknown and nothing moves.
-#
-# A second fleet: a rival's beacon at the OLD term, every 20 ms through the
-# handover - what the old master's last beacon is, landing after the promotion
-# and before the new master's first map.  The new master stays; the same beacon
-# a term above it makes it step down, the control that the beacons arrive.
-# Fail-first (GitLab 112691, both builds): it yielded to the rival, and on the
-# plain build to the real old master, which had yielded to it: both joining.
-# Usage: test/handovertest.sh [./perfcached] [./perfcli] [./clinject]
+# handovertest.sh - master_prefer moves mastership before a restart: the named member promotes at the
+# next term with no masterless sample, and a stale beacon at the old term cannot unseat it.
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -190,7 +169,8 @@ python3 "$DRV" "$CLI" "$SEC" "$EN" > "$D/out" 2>&1
 	&& ok "refused without the enable secret ($(val NOPRIV | cut -c1-40)), on a member ($(val ONMEMBER | cut -c1-40)) and for node 999 - the master stays" \
 	|| bad "the refusals: noprivilege '$(val NOPRIV)', on a member '$(val ONMEMBER)', node 999 '$(val NOTMEMBER)', master now $(val STILL_MASTER)"
 H=$(num "$(val HANDOVER_MS)")
-[ "$(val ASKED)" = True ] && [ "$H" -ge 0 ] && [ "$H" -le 8000 ] \
+# done = the old master a member again, which it becomes through admission: 12 s, of the 15 polled
+[ "$(val ASKED)" = True ] && [ "$H" -ge 0 ] && [ "$H" -le 12000 ] \
 	&& ok "master_prefer: the named member is master in $H ms, the old master and the third node follow it" \
 	|| bad "the handover: asked $(val ASKED), done after $(val HANDOVER_MS) ms"
 G=$(num "$(val GAP_MS)")

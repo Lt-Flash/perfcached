@@ -1,25 +1,5 @@
-/*
- * clpendtest.c - parked requests and the completion queues (M2).
- *
- * The parked-request id is a HANDLE, not a ticket, and almost every case
- * here is a way that distinction could be lost:
- *   - a reply arriving after its slot was recycled, completing somebody
- *     else's request (the ABA guard, A4)
- *   - occupancy drifting, so a peak sized from measurement can never be
- *     reached and "full" has to be special-cased (B2)
- *   - a completion dropped into a full queue, leaving a request to
- *     resolve only by timing out - which the CQ/table sizing is what
- *     makes unreachable (D2)
- *   - a deadline that fires against a real clock, which is the same
- *     class of flake as a device-dependent fsync count (E, all injected)
- *
- * Case group H (the answers state machine) is NOT here: deciding what a
- * peer's reply means still reaches the locator, the peer table, the wire
- * and the store inside cluster.c, so clpend_answer() waits on M3 and M6.
- * doc/MODULARITY.md's appendix carries the full catalogue.
- *
- * Build: cc -o clpendtest test/clpendtest.c src/clpend.o -lpthread
- */
+/* clpendtest.c - parked requests and the completion queues: the id is a handle (ABA-guarded),
+ * occupancy exact, no completion dropped, expiry on an injected clock, and the answer path. */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,7 +126,7 @@ int main(void)
 	chk(clpend_peak(&P) == CAP, "B5 and peak is unchanged");
 	clpend_fini(&P);
 
-	/* ---- B6. S212: occupancy by kind ------------------------------- */
+	/* ---- B6. occupancy by kind -------------------------------------- */
 	clpend_init(&P, CAP);
 	{
 		struct pending *r1, *r2, *r3;
@@ -315,32 +295,16 @@ int main(void)
 		chk(clpend_find(&P, req) == sl,
 			"H1 the slot LINGERS so a second positive can be seen");
 
-		/* H1b  a later positive posts NO second completion.  The
-		 * appendix said IGNORE; the tree demotes instead, which is
-		 * the behaviour asserted here - see doc/MODULARITY.md. */
+		/* H1b  a later positive posts NO second completion: the tree demotes rather than
+		 * ignores (doc/MODULARITY.md) */
 		r = clpend_answer(&P, req, 1, 9, 0, 0, 9999, &a);
 		chk(r == CLPEND_ANS_RACE,
 			"H1 a second positive is a birth race, not a completion");
 		chk(a.winner == 9 && a.loser == 42,
 			"H1 the lower node id wins and the other is demoted");
 
-		/* ---- H1c  TWO HOLDERS IS NOT AUTOMATICALLY A CONFLICT ----
-		 *
-		 * This is the bug that cost the 245-247 fleet 78% of its
-		 * redundancy on 2026-09-14, upgrading 0.3.5 -> 0.3.7-rc4.
-		 * A second positive used to mean "birth race" on its own.
-		 * In EAGER mode two holders is the NORMAL state - every key
-		 * is on every node by design - so after a simultaneous cold
-		 * restart, where every node recovers the same keyspace from
-		 * its own RDB, every reconcile probe drew two positives and
-		 * all but one node shed its copy.  Measured: two of three
-		 * nodes went 1988 -> ~425 records, and it did NOT heal,
-		 * because the eager sweep re-sends only what a node
-		 * AUTHORED.
-		 *
-		 * The version is what separates "the same record" from "the
-		 * holders disagree".
-		 */
+		/* ---- H1c  two holders is not a conflict by itself: in EAGER mode every key is on
+		 * every node, so only the version tells one record from a disagreement ---- */
 		req = park(3, 0, 2, 1000, &sl);
 		chk(clpend_answer(&P, req, 1, 42, 7000, 0, 0, &a) == CLPEND_ANS_HIT,
 			"H1c the first positive is still a hit");
@@ -350,16 +314,8 @@ int main(void)
 			"record, not a race - this is the normal eager state "
 			"and demoting on it destroys redundancy on recovery");
 
-		/* A real disagreement still resolves, and the NEWER write
-		 * wins - a property of the DATA, where "lower node id" is a
-		 * property of who happens to be asking.
-		 *
-		 * THE NEWER VERSION IS DELIBERATELY ON THE HIGHER NODE ID.
-		 * With the newer version on the LOWER id both schemes pick
-		 * the same winner and the assertion proves nothing: a
-		 * mutation resolving purely by id passed this test until the
-		 * ids were arranged to disagree with the versions.
-		 */
+		/* a real disagreement resolves to the NEWER write; the newer version sits on the
+		 * HIGHER node id on purpose, so resolving by id alone cannot pass */
 		req = park(3, 0, 2, 1000, &sl);
 		chk(clpend_answer(&P, req, 1, 9, 7000, 0, 0, &a) == CLPEND_ANS_HIT,
 			"H1c setup: node 9 (lower id) holds the OLDER version");
@@ -402,16 +358,8 @@ int main(void)
 			"H1c CH-16: no version to name - 0, the loser removes "
 			"as before");
 
-		/* ---- H1d  S439: EQUAL VERSIONS, DIFFERENT BYTES ----
-		 *
-		 * A version is a Lamport count with no writer in it: two nodes
-		 * cut from each other write from the same clock and can stamp
-		 * DIFFERENT writes with one version.  H1c's rule took them for
-		 * the same record and a partition's fork never healed
-		 * (splitbraintest, 2026-10-23).  The value's checksum rides
-		 * the answer: equal versions are the same record only when the
-		 * bytes agree too; with a checksum missing on either side the
-		 * old reading stands (a hold-check carries no value). */
+		/* ---- H1d  equal versions, different bytes: a version names no writer, so equal
+		 * versions are one record only when the value checksums agree too ---- */
 		req = park(3, 0, 2, 1000, &sl);
 		chk(clpend_answer(&P, req, 1, 42, 7000, 0xAAAA, 0, &a) == CLPEND_ANS_HIT,
 			"H1d setup: node 42 holds version 7000, bytes A");
@@ -465,12 +413,8 @@ int main(void)
 			"H4 and the live request is untouched by it");
 		clpend_release(&P, sl2);
 
-		/* H5  THE REGRESSION.  Everything the answer hands back is
-		 * copied out of the slot.  cluster.c used to keep
-		 * `rec_col = p->col` - a bare pointer - and read it after
-		 * the release and after the lock was dropped, so a worker
-		 * reusing the slot changed which collection was deleted
-		 * from.  Reuse the slot here and the copy must not move. */
+		/* H5  everything the answer hands back is copied out of the slot: reuse the
+		 * slot and the copy must not move */
 		req = park(1, 0, 0, 1000, &sl);
 		sl->kind = PC_DONE_RECONCILE;
 		memcpy(sl->col, "orders", 6);
@@ -530,11 +474,8 @@ int main(void)
 	}
 	clpend_fini(&P);
 
-	/* ---- I. clpend_retire: the forward-ack completion (M11 slice 2) ---
-	 * The FWD ack and the JSON ack retire a parked request the same way
-	 * except for one thing: the FWD ack refuses one already answered.
-	 * That difference used to be split across two handlers three
-	 * thousand lines apart; here it is a parameter, and testable. */
+	/* ---- I. clpend_retire, the forward-ack completion: the FWD ack refuses a request
+	 * already answered, the JSON ack does not --------------------------- */
 	clpend_init(&P, CAP);
 	{
 		struct pending *sl;
@@ -556,9 +497,8 @@ int main(void)
 			"I2 a duplicate ack retires nothing");
 		chk(w == -1, "I2 and leaves the caller's worker untouched");
 
-		/* I3. only_unanswered REFUSES an answered request - the case
-		 * that stops a stray second ack completing a probe-forward
-		 * twice */
+		/* I3. only_unanswered refuses an answered request, so a stray second ack cannot
+		 * complete a probe-forward twice */
 		req = park(1, 0, 3, 1000, &sl);
 		sl->answered = 1;
 		chk(clpend_retire(&P, req, 1, &w, &kd) == 0,

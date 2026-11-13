@@ -1,21 +1,6 @@
 #!/bin/sh
-# hashtest.sh - S313: Redis hashes, as one typed record per key.
-#
-#   1  one node: every H command's reply and Redis's errors (arity, not an
-#      integer / float, overflow, syntax), TYPE hash and WRONGTYPE both
-#      ways, the last HDEL deletes the key, HSET keeps the key's TTL, a
-#      restart keeps the hash typed, and the native hcmd door
-#   2  an eager fleet of three: HSETs of DIFFERENT fields of one hash
-#      through all three nodes all land (one node decides each key, so
-#      whole-value replication cannot drop one), every node reads the
-#      same hash, and an HDEL through another node empties it everywhere
-#   3  a shard fleet of three: reads and writes through non-owners are
-#      forwarded and answered right - on RESP and the native door
-#   4  the 0.4.4 gate: beside a member without the feature byte (a variant
-#      of this tree built by the test, as ratelimittest does) HSET is
-#      refused naming it
-# Fail-first: before S313 every H command is "unknown command".
-# Usage: test/hashtest.sh [./perfcached] [older-perfcached-for-part-4]
+# hashtest.sh - Redis hashes as one typed record per key: every H command and error, concurrent fields through
+# eager, forwards in shard, the member gate.  Usage: test/hashtest.sh [./perfcached] [older-perfcached-for-part-4]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -115,6 +100,18 @@ fleet() {
 	done
 	return 1
 }
+formed() { # every listed node ready and seeing the others (a CONNECTING joiner is listed already), up to 30 s
+	i=0; while [ $i -lt 300 ]; do
+		good=1
+		for x in "$@"; do
+			fs=$(curl -s "http://127.0.0.1:1859$x/stats" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null)
+			[ "$fs" = "ready $(($# - 1))" ] || good=0
+		done
+		[ $good = 1 ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
 eq() { # eq <label> <got> <want>
 	[ "$2" = "$3" ] && ok "$1: $2" || bad "$1: got '$2', want '$3'"
 }
@@ -189,7 +186,7 @@ echo "part 2: an eager fleet of three"
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n eager; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the eager fleet did not form"; echo "hashtest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+formed 1 2 3
 for i in 1 2 3 4 5 6 7 8 9; do n=$(( (i - 1) % 3 + 1 )); r $n HSET eh "f$i" "v$i" > /dev/null; done
 sleep 1
 a="$(r 1 HLEN eh) $(r 2 HLEN eh) $(r 3 HLEN eh)"
@@ -207,7 +204,7 @@ echo "part 3: a shard fleet of three"
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n shard; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the shard fleet did not form"; echo "hashtest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+formed 1 2 3
 for k in sa sb sc sd se; do r 1 HSET $k x 1 y 2 > /dev/null; done
 a=""; for k in sa sb sc sd se; do a="$a$(r 2 HGET $k y)$(r 3 HLEN $k)"; done
 eq "five hashes written through node 1, read through nodes 2 and 3" "$a" 2222222222
@@ -223,14 +220,8 @@ if [ -z "$OLD" ]; then
 	mkdir -p "$D/t"
 	tar -cf - --exclude=./.git --exclude='*.o' --exclude='*.a' . 2>/dev/null |
 		(cd "$D/t" && tar -xf -) || { bad "cannot copy the tree"; exit 1; }
-	# the frame 0.4.3 sends ends reason, epoch: S314's features byte,
-	# 0.5.7.1's sole_witness (2) and AR11's settings group behind it all go
-	# - left in, a stock reader takes sole_witness' high byte for the
-	# features byte, and a witness id over 255 reads as a node that has the
-	# feature (the 0.5.7.1 red).  The reason byte is counted from the FRONT
-	# since AR11, so only the shortest-frame guard moves.  12ny AT-4's
-	# group (features32 and the marks) rides behind the settings, opened by
-	# the same guard (in->ext): both go
+	# the older frame ends reason, epoch: the features byte, sole_witness and everything behind them
+	# go (left in, a stock reader takes sole_witness' high byte for features); only the length guard moves
 	sed -i '/pc_w8(&c, (unsigned)in->features);/d; /pc_w16(&c, (uint16_t)in->sole_witness);/d;
 		s/if (in->ncfg > 0 || in->ext) {/if (0) {/; s/if (in->ext) {/if (0) {/;
 		s/if (len < 88 + 15)/if (len < 88 + 12)/' \
@@ -253,7 +244,7 @@ if [ -n "$OLD" ] && [ -x "$OLD" ]; then
 	for n in 1 2 3; do rm -rf "$D/s$n"; conf $n eager; done
 	start 1 "$BIN" && start 2 "$BIN" && start 3 "$OLD" || exit 1
 	fleet 1 2 3 || { bad "the mixed fleet did not form"; echo "hashtest: $pass passed, $fail failed"; exit 1; }
-	sleep 2
+	formed 1 2 3
 	g=$(r 1 HSET gk f v)
 	case "$g" in *"hash commands need every node in the fleet on 0.4.4 or later - node "*) ok "4. with an older member: $g";;
 		*) bad "4. with an older member HSET answered: $g";; esac

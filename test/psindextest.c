@@ -1,12 +1,5 @@
-/*
- * psindextest.c - the pub/sub name index (src/psindex.[ch]).  The pattern
- * index must find EXACTLY the patterns a brute-force glob over every
- * pattern finds, for literal prefixes shorter than, equal to and longer
- * than PSI_K, for patterns that start with a metacharacter, before and
- * after removals, in a private table that grows and a shared one that
- * does not.  Exact-name lookups must find what was inserted and nothing
- * that was removed.
- */
+/* psindextest.c - the pub/sub name index: patterns found are EXACTLY what a brute-force glob finds,
+ * across prefix lengths, removals and table growth; exact names find what was inserted. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

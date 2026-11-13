@@ -1,13 +1,5 @@
-/* respouttest.c - the RESP door's reply writers (respout.c; the 0.7.2
- * split, wave 1): the exact bytes each writes, and the two shared readers.
- *
- *   A  -ERR, -<code>, -<line>, +simple, :integer (negative and the
- *      largest), the null bulk, a bulk (binary-safe, empty, a literal
- *      through resp_bulk_lit), an array's header; writes append
- *   B  resp_is: a command word without case, never a prefix either way
- *   C  resp_ll: a whole decimal integer, signed; trailing junk, an empty
- *      or a too-long field refused
- */
+/* respouttest.c - the RESP door's reply writers (respout.c): the exact bytes each writes, and the
+ * two shared readers. */
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,7 +30,7 @@ int main(void)
 {
 	long long v = 0;
 
-	/* A */
+	/* A: errors, +simple, :integer, null and binary-safe bulks, array headers; writes append */
 	reset(); resp_err(&w, "unknown command");
 	CHK(IS("-ERR unknown command\r\n"), "A: resp_err");
 	reset(); resp_err_code(&w, "TRYAGAIN", "busy");
@@ -62,13 +54,13 @@ int main(void)
 	reset(); resp_arr(&w, 2); resp_bulk_lit(&w, "k"); resp_int(&w, 1);
 	CHK(IS("*2\r\n$1\r\nk\r\n:1\r\n"), "A: resp_arr, then its elements appended");
 
-	/* B */
+	/* B: resp_is - a command word without case, never a prefix either way */
 	CHK(resp_is("get", 3, "GET") && resp_is("GeT", 3, "GET"), "B: resp_is - case ignored");
 	CHK(!resp_is("GETX", 4, "GET"), "B: a longer word is not the command");
 	CHK(!resp_is("GE", 2, "GET"), "B: a prefix of the command is not it");
 	CHK(!resp_is("SET", 3, "GET"), "B: another word");
 
-	/* C */
+	/* C: resp_ll - a whole signed decimal; trailing junk, an empty or too-long field refused */
 	CHK(resp_ll("123", 3, &v) == 0 && v == 123, "C: resp_ll 123");
 	CHK(resp_ll("-7", 2, &v) == 0 && v == -7, "C: resp_ll -7");
 	CHK(resp_ll("12a", 3, &v) == -1, "C: trailing junk refused");

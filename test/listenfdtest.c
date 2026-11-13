@@ -1,16 +1,5 @@
-/* listenfdtest.c - the listener sockets (listenfd.c; the 0.7.2 split, wave
- * 1): a unix socket in a directory of its own, TCP on 127.0.0.1 at a port
- * the kernel picked; the log stubbed.
- *
- *   A  the unix socket: made, non-blocking, accepting; a second instance
- *      on the same path refused while the first accepts, and the first
- *      unharmed; a stale file (its listener gone) replaced; a path too
- *      long, a directory that is not there - refused, said
- *   B  TCP: a listener without SO_REUSEPORT already on the port - the
- *      probe sees it, and a worker's socket cannot join it; the port free
- *      - the probe says so, and two workers' sockets share it; with them
- *      there, the probe sees them - a second instance would be caught
- */
+/* listenfdtest.c - the listener sockets (listenfd.c): a unix socket in a directory of its own and
+ * TCP on 127.0.0.1 at a port the kernel picked, the log stubbed. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,7 +87,7 @@ int main(void)
 	struct pc_listener l;
 	int fd, fd2, w1, w2, port = 0;
 
-	/* A */
+	/* A: the unix socket - accepting; a second instance refused, a stale file replaced */
 	snprintf(dir, sizeof dir, "/tmp/listenfdtest.XXXXXX");
 	if (!mkdtemp(dir))
 		return 2;
@@ -129,7 +118,7 @@ int main(void)
 		"A: a directory that is not there - refused, said");
 	rmdir(dir);
 
-	/* B */
+	/* B: TCP - the probe sees a plain listener, a free port, and workers sharing one */
 	fd = plain_listener(&port);
 	if (fd < 0)
 		return 2;

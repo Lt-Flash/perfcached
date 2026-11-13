@@ -1,33 +1,5 @@
-/* netcutshim.c - RV-4a: an LD_PRELOAD shim that cuts a node off from
- * named peers, armed at runtime, with no root and no firewall.
- *
- * The local cluster suites run three daemons on 127.0.13.x without root,
- * so nft is out; the fault run on 245-247 (RV-5, F3) cut a node with nft,
- * and that is what this reproduces per process.  PC_NETCUT_CTL names a
- * file, re-read at most every 50 ms, holding one line of tokens:
- *
- *   cut <ipv4> [<ipv4>...]  the peers this node can no longer reach
- *   mcast                   its multicast sends are cut too (the group
- *                           address is not a peer's)
- *   eperm                   a cut send FAILS with EPERM, as a local
- *                           firewall's OUTPUT drop does - without it the
- *                           send "succeeds" and is lost, as on a network
- *                           cut further away.  The two differ in the
- *                           daemon: a map it could not send it does not
- *                           adopt (S233).
- *
- * An empty or missing file is no cut.  What is cut, both ways:
- *   sendto()             to a cut peer (or the group, with mcast)
- *   recvmsg()/recvfrom() a datagram FROM a cut peer is consumed and
- *                        never returned - the next one is read instead
- *   connect()            to a cut peer: ECONNREFUSED
- *   accept()             from a cut peer: closed, EAGAIN
- * Counts go to PC_NETCUT_LOG ("out N in M conn K"), rewritten at every
- * re-read, so a test can prove the cut was DELIVERED - a partition test
- * whose shim never fired proves nothing.
- *
- * Real calls are raw syscalls, as in syncfailshim.c (no RTLD_NEXT, which
- * needs a feature-test macro this tree does not use). */
+/* netcutshim.c - an LD_PRELOAD shim cutting a node off from the peers PC_NETCUT_CTL names, both
+ * ways, no root; PC_NETCUT_LOG's counts prove the cut fired.  Raw syscalls: no RTLD_NEXT. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -46,10 +18,10 @@
 static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
 static struct {
 	in_addr_t cut[MAXCUT];
-	int ncut, mcast, eperm;
+	int ncut, mcast, eperm, rst, tcp;
 } cfg;
 static long long last_ms = -1000;
-static unsigned long n_out, n_in, n_conn;
+static unsigned long n_out, n_in, n_conn, n_rst;
 
 static long long mono_ms(void)
 {
@@ -71,13 +43,14 @@ static void write_log(void)
 		O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0)
 		return;
-	n = snprintf(line, sizeof line, "out %lu in %lu conn %lu\n",
-		n_out, n_in, n_conn);
-	if (n > 0 && write(fd, line, (size_t)n) < 0) { }
+	n = snprintf(line, sizeof line, "out %lu in %lu conn %lu rst %lu\n",
+		n_out, n_in, n_conn, n_rst);
+	if (n > 0 && syscall(SYS_write, fd, line, (size_t)n) < 0) { }
 	close(fd);
 }
 
-/* under mx: re-read the control file if 50 ms have passed */
+/* under mx: re-read the control file if 50 ms have passed.  Tokens: cut <ipv4>..., mcast, eperm
+ * (a cut send fails, as a local drop), rst (cut TCP connections reset), tcp (TCP alone) */
 static void refresh(void)
 {
 	const char *ctl = getenv("PC_NETCUT_CTL");
@@ -96,7 +69,7 @@ static void refresh(void)
 	fd = (int)syscall(SYS_openat, AT_FDCWD, ctl, O_RDONLY, 0);
 	if (fd < 0)
 		return;
-	n = read(fd, buf, sizeof buf - 1);
+	n = syscall(SYS_read, fd, buf, sizeof buf - 1);   /* read() is ours */
 	close(fd);
 	if (n <= 0)
 		return;
@@ -111,13 +84,18 @@ static void refresh(void)
 			cfg.mcast = 1;
 		else if (!strcmp(tok, "eperm"))
 			cfg.eperm = 1;
+		else if (!strcmp(tok, "rst"))
+			cfg.rst = 1;
+		else if (!strcmp(tok, "tcp"))
+			cfg.tcp = 1;
 		else if (cfg.ncut < MAXCUT && inet_aton(tok, &a))
 			cfg.cut[cfg.ncut++] = a.s_addr;
 	}
 }
 
-/* is @sa cut?  @out: a destination (the group counts with mcast) */
-static int is_cut(const struct sockaddr *sa, int out, int *eperm)
+/* is @sa cut?  @out: a destination (the group counts with mcast); @dgram: a datagram's, which
+ * passes under tcp */
+static int is_cut(const struct sockaddr *sa, int out, int *eperm, int dgram)
 {
 	const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
 	int i, hit = 0;
@@ -131,6 +109,8 @@ static int is_cut(const struct sockaddr *sa, int out, int *eperm)
 			hit = 1;
 	if (out && cfg.mcast && IN_MULTICAST(ntohl(in->sin_addr.s_addr)))
 		hit = 1;
+	if (dgram && cfg.tcp)
+		hit = 0;
 	if (eperm)
 		*eperm = cfg.eperm;
 	pthread_mutex_unlock(&mx);
@@ -144,12 +124,59 @@ static void count(unsigned long *c)
 	pthread_mutex_unlock(&mx);
 }
 
+/* with rst: is @fd a TCP connection to a cut peer?  1 = reset (errno set) */
+static int fd_cut(int fd)
+{
+	struct sockaddr_in sa;
+	socklen_t sl = sizeof sa, tl = sizeof(int);
+	int on, type = 0, e = errno;
+
+	pthread_mutex_lock(&mx);
+	refresh();
+	on = cfg.rst;
+	pthread_mutex_unlock(&mx);
+	if (!on || syscall(SYS_getpeername, fd, &sa, &sl) != 0 ||
+	    syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0 ||
+	    type != SOCK_STREAM || !is_cut((struct sockaddr *)&sa, 0, NULL, 0)) {
+		errno = e;                     /* a file's read sees no ENOTSOCK */
+		return 0;
+	}
+	count(&n_rst);
+	errno = ECONNRESET;
+	return 1;
+}
+
+ssize_t send(int fd, const void *buf, size_t len, int flags)
+{
+	return fd_cut(fd) ? -1 : syscall(SYS_sendto, fd, buf, len, flags, NULL, 0);
+}
+
+ssize_t recv(int fd, void *buf, size_t len, int flags)
+{
+	return fd_cut(fd) ? -1 : syscall(SYS_recvfrom, fd, buf, len, flags, NULL, NULL);
+}
+
+ssize_t sendmsg(int fd, const struct msghdr *mh, int flags)
+{
+	return fd_cut(fd) ? -1 : syscall(SYS_sendmsg, fd, mh, flags);
+}
+
+ssize_t read(int fd, void *buf, size_t n)
+{
+	return fd_cut(fd) ? -1 : syscall(SYS_read, fd, buf, n);
+}
+
+ssize_t write(int fd, const void *buf, size_t n)
+{
+	return fd_cut(fd) ? -1 : syscall(SYS_write, fd, buf, n);
+}
+
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
 		const struct sockaddr *to, socklen_t tolen)
 {
 	int eperm = 0;
 
-	if (is_cut(to, 1, &eperm)) {
+	if (is_cut(to, 1, &eperm, 1)) {
 		count(&n_out);
 		if (eperm) {
 			errno = EPERM;
@@ -166,7 +193,7 @@ ssize_t recvmsg(int fd, struct msghdr *mh, int flags)
 		ssize_t r = syscall(SYS_recvmsg, fd, mh, flags);
 
 		if (r < 0 || !mh->msg_name ||
-		    !is_cut((const struct sockaddr *)mh->msg_name, 0, NULL))
+		    !is_cut((const struct sockaddr *)mh->msg_name, 0, NULL, 1))
 			return r;
 		count(&n_in);
 		mh->msg_namelen = sizeof(struct sockaddr_in);
@@ -181,7 +208,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 		socklen_t sl = sizeof sa;
 		ssize_t r = syscall(SYS_recvfrom, fd, buf, len, flags, &sa, &sl);
 
-		if (r < 0 || !is_cut((struct sockaddr *)&sa, 0, NULL)) {
+		if (r < 0 || !is_cut((struct sockaddr *)&sa, 0, NULL, 1)) {
 			if (r >= 0 && from && fromlen) {
 				if (*fromlen > sl)
 					*fromlen = sl;
@@ -196,11 +223,15 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 int connect(int fd, const struct sockaddr *to, socklen_t tolen)
 {
 	struct sockaddr_in *in = (struct sockaddr_in *)to;
+	socklen_t tl = sizeof(int);
+	int type = 0;
 
 	/* a UDP connect to the group (the advertise-address probe) is
 	 * not a peer connection: only unicast is refused here */
 	if (to && to->sa_family == AF_INET &&
-	    !IN_MULTICAST(ntohl(in->sin_addr.s_addr)) && is_cut(to, 0, NULL)) {
+	    !IN_MULTICAST(ntohl(in->sin_addr.s_addr)) &&
+	    syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_TYPE, &type, &tl) == 0 &&
+	    is_cut(to, 0, NULL, type == SOCK_DGRAM)) {
 		count(&n_conn);
 		errno = ECONNREFUSED;
 		return -1;
@@ -216,7 +247,7 @@ int accept(int fd, struct sockaddr *addr, socklen_t *alen)
 
 	if (c < 0)
 		return c;
-	if (is_cut((struct sockaddr *)&sa, 0, NULL)) {
+	if (is_cut((struct sockaddr *)&sa, 0, NULL, 0)) {
 		count(&n_conn);
 		close(c);
 		errno = EAGAIN;

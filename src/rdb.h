@@ -1,37 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/*
- * rdb.h — the RDB snapshot (task S14).
- *
- * A fuzzy, lock-free walk of every collection (the S9 walk core)
- * streamed to a temp file, then rename + DIRECTORY fsync - a torn
- * snapshot can never exist under the final name.  The file records the
- * WAL sequence AT WALK START: recovery (S15) loads the snapshot and
- * replays the WAL from that marker - records the walk raced are simply
- * re-applied, idempotent by the absolute-upsert rule.  No fork, no COW:
- * jitter-free by construction.
- *
- * The writer is RATE LIMITED (a checkpoint must never own the link and
- * blow the WAL's fsync latency): budget = the configured MB/s, or a
- * quarter of the probed sequential bandwidth when the config leaves it
- * at 0.  Triggers are Redis-style OR'd rules "SECS CHANGES, ..."
- * evaluated against the WAL sequence delta, plus the explicit `save`
- * verb.  Expired entries are skipped at write time; TTLs are stored as
- * absolute wall-clock seconds.
- *
- * File format (explicit LE):
- *   u32 magic 'PCRD' | u32 ver | u64 wal_marker | u64 wall_time
- *   entries:  u8 tag: 1 = collection [u8 len][name]
- *                     2 = record [u32 klen][u32 vlen][u64 expires]
- *                                [u64 lamport-ver, format 2+]
- *                                [u8 flags - the type, format 3+][k][v]
- *             0xFF = end, followed by u32 crc32c of everything before it
- *
- * Format 2 (A1) adds each record's Lamport version, so a snapshot puts a
- * record back as it was rather than renumbering it.  Format 1 still
- * loads; its records come back versioned 0 - unnumbered, which a peer's
- * copy outranks - rather than being refused.
- */
+/* rdb.h - the RDB snapshot: a fuzzy lock-free walk, rate limited so the WAL keeps the disk, to a
+ * temp file renamed into place; it records the WAL seq at walk start, recovery's replay point */
 #ifndef PC_RDB_H
 #define PC_RDB_H
 
@@ -42,10 +12,12 @@
 
 #include "rdb_rules.h"
 
+/* LE: u32 magic, u32 ver, u64 wal_marker, u64 wall_time, then u8-tagged entries (1 = collection
+ * [u8 len][name], 2 = record), 0xFF = end + u32 crc32c of all before it; TTLs in wall-clock s */
 #define PC_RDB_MAGIC 0x44524350u       /* 'PCRD' LE */
 #define PC_RDB_FILE  "dump.rdb"
-#define PC_RDB_FMT   3                 /* 1 = pre-A1, no per-record version;
-                                        * 3 = S280, the record's type */
+#define PC_RDB_FMT   3                 /* format 1 still loads: records versioned 0,
+                                        * which a peer's copy outranks */
 /* a record's fixed header: [klen4][vlen4][exp8], + [ver8] from format 2,
  * + [flags1] (PCACHE_F_JSON) from format 3 */
 #define PC_RDB_RHDR(fmt) ((fmt) >= 3 ? 25u : (fmt) >= 2 ? 24u : 16u)
@@ -53,14 +25,14 @@
 struct pc_rdb_stats {
 	int enabled, running;
 	unsigned long long saves, last_bytes, last_marker;
-	/* S215: last_marker is the last ATTEMPT's; safe_marker the last
+	/* last_marker is the last ATTEMPT's; safe_marker the last
 	 * PUBLISHED snapshot's - the one WAL recycling goes by */
 	unsigned long long safe_marker, save_errors;
 	long long last_dur_ms, last_unix;
-	/* RV-12: seconds since the last COMPLETED snapshot, on the
+	/* seconds since the last COMPLETED snapshot, on the
 	 * monotonic clock; -1 before this process has completed one */
 	long long last_age_s;
-	/* S229: when the last completed snapshot STARTED, on pc_rdb_mono_us() */
+	/* when the last completed snapshot STARTED, on pc_rdb_mono_us() */
 	long long last_start_us;
 };
 
@@ -76,9 +48,8 @@ int pc_rdb_max_interval_s(void);
  * safe boundary for WAL-recycle accounting */
 unsigned long long pc_rdb_safe_marker(void);
 
-/* S334: the marker of the snapshot recovery LOADED - a completed one on
- * disk, so what it covers is safe for recycling until this process
- * completes its own (raises only) */
+/* the marker of the snapshot recovery LOADED: safe for recycling until
+ * this process completes its own (raises only) */
 void pc_rdb_seed_marker(unsigned long long marker);
 
 /* the RDB thread body: evaluates triggers ~1/s, runs saves.  Returns
@@ -92,22 +63,17 @@ int pc_rdb_request_save(void);
  * before the RDB thread exists) */
 PC_MUST_CHECK int pc_rdb_save_sync(void);
 
-/* S222: the snapshot a clean stop takes, after every thread has been
- * joined - the table is quiet, the WAL is flushed, the RDB thread is
- * gone.  Unthrottled: the budget exists to leave the disk to the WAL,
- * and at this point the WAL is finished.  Same tmp + rename as any
- * save, so a stop that systemd kills part-way leaves the previous
- * snapshot whole and loses nothing - the WAL still holds it all. */
+/* the unthrottled snapshot a clean stop takes once every thread is joined; tmp + rename as
+ * any save, so a stop killed part-way leaves the previous one whole and the WAL holds the rest */
 PC_MUST_CHECK int pc_rdb_save_on_stop(void);
 
 void pc_rdb_get_stats(struct pc_rdb_stats *out);
-/* S229: an unthrottled snapshot for the WAL's heal, and the clock its
- * start is stamped on */
+/* an unthrottled snapshot for the WAL's heal, and the clock its start is stamped on */
 void pc_rdb_request_urgent(void);
 long long pc_rdb_mono_us(void);
 const char *pc_rdb_dir(void);      /* "" until pc_rdb_init */
 
-/* validate + summarize a snapshot (tests, -R; S15 builds load on it).
+/* validate + summarize a snapshot (tests, -R).
  * Returns record count, or -1 (missing/corrupt - *why says which). */
 long pc_rdb_validate(const char *dir, unsigned long long *marker,
 		long *ncols, const char **why);

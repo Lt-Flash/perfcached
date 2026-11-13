@@ -1,46 +1,6 @@
 #!/bin/sh
-# spreadbench.sh - spread mode at CAPACITY, from an off-box farm: throughput
-# and latency by K and P, routed and un-routed, with eager on the same fleet
-# as the yardstick.  Neither of the two spread measurements before this was
-# a speed: Z6 (DESIGN 12cz) measured apply RATIOS at a fixed rate, and the
-# 2026-09-14 RESP run drove one node at pipeline 1 from one host - "what
-# one client gets per request", bounded by the round trip.
-#
-# Shape (the Z6 rig): P bare daemons from THIS tree's binary on the server
-# host, distinct ports, advertise 127.0.7.i, multicast on the host; natbench
-# (this tree's, over libperfd - the data verbs on their fixed-layout frames,
-# the only wire since S317 - pipelined) on the client host(s), which must
-# not be the server host - see the client-bound lesson.  route=0 sends every
-# request to node 1, which forwards writes to the holders and pulls reads
-# from them; route=1 lets libperfd compute each key's holders and send to
-# one - the shape a cluster-aware client has.
-#
-# Every cell records the server's CPU-seconds per node, so a figure can be
-# read as a server ceiling or as a client-bound one, and the forward / pull
-# / spread counters, so the mode's mechanics are visible beside its rate.
-#
-# Addresses: P daemons on one host need P distinct addresses for their peer
-# sockets, and the advertise address is ALSO what the members reply hands a
-# routed client - 127.0.7.i (the Z6 rig) is loopback on the server and a
-# routed client on another host is refused.  So the server gets P private
-# addresses VNET.1..P on its NIC and every client host a route to VNET/24
-# via the server; both are removed on exit, and the harness refuses to
-# start if either already exists and is not its own.
-#
-# Cells: route=0 runs one natbench per node, conns split evenly - the shape
-# of a dumb load-balanced client, where a spread node holds a key K of P
-# times and pulls the rest; route=1 runs ONE natbench that lets libperfd
-# send each key to a holder.  eager has no route=1 cell: libperfd does not
-# route it, and every node holds everything anyway.
-#
-# Usage (from a client host; drives the server host over ssh as root):
-#   SERVER=<server ip> CLIENTS="<this host's ip> [<more client ips>]" \
-#       bench/spreadbench.sh                   # ARMS below, REPS=1, ~30 min
-#   ... ARMS="spread:3:6" REPS=3 bench/spreadbench.sh
-#   ... DRY=1 bench/spreadbench.sh             # one arm up, one 5 s cell, down
-# The daemons' HTTP doors admit every client host's /24; the client
-# secret is the harness's own and the doors bind the private addresses.
-# Results: /var/tmp/spreadbench/results.tsv (appended), logs beside it.
+# spreadbench.sh - spread mode at capacity from off-box natbench clients, by K and P, routed and not,
+# eager as the yardstick.  Usage: SERVER=<ip> CLIENTS="<ips>" [ARMS=..] [REPS=..] [DRY=1] bench/spreadbench.sh
 set -u
 SERVER=${SERVER:-}
 CLIENTS=${CLIENTS:-}
@@ -84,7 +44,8 @@ for h in $SERVER $CLIENTS; do
 	[ "$h" = "$SERVER" ] && [ "${2:-0}" != 0 ] && die "$SERVER already runs $2 perfcached process(es)"
 done
 
-# ---- the private addresses on the server, and a route to them on every client ----
+# ---- private addresses VNET.1..P on the server (the advertise address must be reachable from a
+# routed client), a route to them on every client; both removed on exit ----
 [ -n "$SNIC" ] || SNIC=$($SSH root@$SERVER "ip -o -4 addr show | awk -v ip=$SERVER '\$4 ~ ip\"/\" {print \$2; exit}'")
 [ -n "$SNIC" ] || die "cannot find the NIC carrying $SERVER"
 MAXP=$(echo "$ARMS" | tr ' ' '\n' | awk -F: '{if ($3+0 > m) m = $3+0} END{print m}')
@@ -231,9 +192,8 @@ while i < len(raw):
 print(" ".join(str(tot[w]) for w in want))'
 }
 
-# ---- one cell: natbench on every client host, in parallel ----
-# route=0: one instance per node, conns split - a dumb load-balanced client.
-# route=1: one instance at node 1 that lets libperfd fan out to the holders.
+# ---- one cell: natbench on every client host, in parallel.  route=0: one instance per node, conns
+# split (a dumb load-balanced client); route=1: one instance that lets libperfd pick holders.
 nb() {   # <client> <host> <port> <conns> <threads> <getpct> <route> <secs> <outfile>
 	# natbench's trailing positionals: kv=1 (fixed-layout frames), latrate=50, spares=-1, route
 	c=$1; h=$2; pt=$3; cn=$4; th=$5; gp=$6; rt=$7; sc=$8; of=$9

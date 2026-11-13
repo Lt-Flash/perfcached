@@ -1,16 +1,6 @@
 #!/bin/sh
-# clitest.sh — perfcli end to end: word commands, quoting, raw-JSON
-# request passthrough (-j and '{' lines; the library frames them as CMD
-# requests - the daemon speaks the binary protocol only, S317), pipe
-# mode, exit codes - over BOTH transports:
-#  - a plaintext-loopback daemon (no auth), including -P / the pretty
-#    command and a REAL PTY session driving the in-house line editor
-#    (history recall via Up-arrow, backspace editing, the persisted
-#    0600 history file with duplicate collapse);
-#  - a plaintext=never daemon: perfcli -a runs the Noise handshake
-#    (client principal) - the CLI is the first out-of-tree consumer of
-#    the client-side channel; a wrong secret must fail loudly.
-# Usage: test/clitest.sh [./perfcached] [./perfcli]
+# clitest.sh - perfcli end to end over both transports: word commands, quoting, raw-JSON passthrough,
+# pipe mode, exit codes, a real PTY line-editor session, and the Noise handshake (-a).
 set -u
 
 BIN=${1:-./perfcached}
@@ -89,15 +79,23 @@ R=$(pc jset c doc '$' '{"n":1,"s":"x"}')
 echo "$R" | grep -q '"set":true' && ok || bad "jset: $R"
 R=$(pc jincr c doc '$.n' 4)
 echo "$R" | grep -q '"value":5' && ok || bad "jincr: $R"
-R=$(pc jget c doc '$.s')
-echo "$R" | grep -q '"x"' && ok || bad "jget: $R"
+# jget prints the documented {"found":true,"value":<fragment>} - valid JSON, the fragment itself under
+# "value" and nothing else, with and without -P
+jg() { # jg <the fragment as JSON> <perfcli args...>
+	X=$1; shift
+	R=$(pc "$@")
+	printf '%s' "$R" | python3 -c '
+import json, sys
+sys.exit(0 if json.load(sys.stdin) == {"found": True, "value": json.loads(sys.argv[1])} else 1)' "$X" 2>/dev/null \
+		&& ok || bad "$*: $R"
+}
+jg '"x"' jget c doc '$.s'
+jg '{"n":5,"s":"x"}' jget c doc
+jg '{"n":5,"s":"x"}' -P jget c doc
 R=$(pc stats)
 echo "$R" | grep -q '"arena_total"' && ok || bad "stats: $R"
-# S76: perfcli speaks the binary protocol (CMD frames) to the native door;
-# by now this session has made several requests, and the daemon must say
-# so per dialect - every native request is binary since S317 (the json
-# block is gone), so the counters are under native.binary.  Read as JSON,
-# not by field order: S351 put each counter's win_ window beside it
+# the daemon counts this session's requests per dialect, all under native.binary; read as JSON, not
+# by field order (each counter has its win_ window beside it)
 echo "$R" | python3 -c '
 import json, sys
 s = json.load(sys.stdin)
@@ -132,14 +130,8 @@ python3 - "$CLI" "$D" <<'EOF'
 import json, os, pty, select, subprocess, sys, time
 cli = sys.argv[1]
 m, sl = pty.openpty()
-# HOME MUST BE THIS RUN'S OWN.  It used to be TMPDIR or /var/tmp - a
-# fixed path - so the history file was /var/tmp/.perfcli_history for
-# every concurrent run.  `check` and `check-asan` execute in PARALLEL on
-# the same CI runner and both run this suite, and both unlink that file
-# at the start and the end: one job deleted it while the other sat
-# between perfcli writing it and this test reading it.  The tag pipeline
-# for v0.3.7-rc3 failed exactly there, with every assertion above this
-# one passing.  Cleanup by a shared name kills concurrent instances.
+# HOME must be this run's own: parallel CI jobs running this suite would delete
+# each other's shared history file
 env = dict(os.environ, HOME=sys.argv[2])
 hist = env["HOME"] + "/.perfcli_history"
 try: os.unlink(hist)
@@ -161,10 +153,8 @@ def drain(t=0.4):
             except OSError: break
 def send(b, t=0.35):
     os.write(m, b); drain(t)
-# Wait for the PROMPT, not for a fixed 0.7s.  Under ASan perfcli runs
-# several times slower, and every send after a too-short wait races the
-# editor.  This is the same failure shape as a fixed sleep in a fleet
-# test: it passes on a fast machine and fails on the CI runner.
+# wait for the PROMPT, not a fixed delay: under ASan perfcli runs several times
+# slower, and a send after a too-short wait races the editor
 end = time.time() + 15
 while time.time() < end and b">" not in out:
     drain(0.2)
@@ -205,13 +195,13 @@ echo "$R" | grep -q '"value":"pv"' && ok || bad "noise pipe: $R"
 "$CLI" -p 17046 ping >/dev/null 2>&1 \
 	&& bad "plaintext on never-listener accepted" || ok
 
-# S67: the write stream's sizes ride stats - a mean, a distribution, no walk
+# the write stream's sizes ride stats - a mean, a distribution, no walk
 pc set c big1 "$(python3 -c 'print("x"*3000)')" >/dev/null 2>&1
 R=$(pc -q -j '{"method":"stats","params":{"col":"c"}}' 2>/dev/null | python3 -c '
 import json,sys; d=json.load(sys.stdin); c=[x for x in d["collections"] if x["name"]=="c"][0]
 h=c.get("size_hist"); print("ok" if c.get("stored_n",0)>=1 and c.get("stored_bytes",0)>3000 and h and len(h)==8 and sum(h)==c["stored_n"] and h[3]>=1 else "bad:%s"%{k:c.get(k) for k in ("stored_n","stored_bytes","size_hist")})')
 [ "$R" = ok ] && ok || bad "S67: stored_bytes/stored_n/size_hist: $R"
-# S88: the browsing verbs
+# the browsing verbs
 R=$(pc -q -j '{"method":"collections"}' 2>/dev/null | python3 -c '
 import json,sys; d=json.load(sys.stdin); cs=d.get("collections",[])
 print("ok" if any(c.get("name")=="c" and "mode" in c and "entries" in c and "buckets" in c for c in cs) else "bad:%s"%cs)')
@@ -233,7 +223,7 @@ import json,sys; d=json.load(sys.stdin); print("ok" if d.get("truncated") is Tru
 [ "$R" = ok ] && ok || bad "S88: the limit applies across the whole result: $R"
 printf 'quit\n' | pc >/dev/null 2>&1 && ok || bad "S88: quit is not a way out"
 printf 'exit\n' | pc 2>&1 | grep -q "unknown command" && bad "S88: exit is still unknown" || ok
-# S89: stats names the doors, and a RESP greeting on the native door is named
+# stats names the doors, and a RESP greeting on the native door is named
 R=$(pc -q -j '{"method":"stats"}' 2>/dev/null | python3 -c '
 import json,sys
 d=json.load(sys.stdin); ls=d.get("listeners",[])
@@ -254,19 +244,19 @@ sleep 0.3
 grep -q "sent a RESP command to the native door on port 17046" "$D/nx.log" && ok \
 	|| bad "S89: redis-cli on the Noise port is not named: $(grep -E 'RESP|handshake' "$D/nx.log" | tail -1)"
 grep -q "disconnected (RESP on the native door)" "$D/nx.log" && ok || bad "S89: the disconnect line does not carry the real cause"
-# S70: who connected and who left, one line each, dialect and channel named
-# (the dialect is binary for every native client that spoke, S317)
+# who connected and who left, one line each, dialect and channel named (binary for every native
+# client that spoke)
 grep -qE "client 127\.0\.0\.1:[0-9]+ connected \(binary, plaintext\)" "$D/pt.log" && ok \
 	|| bad "S70: no 'connected' line for a plaintext binary client"
 grep -qE "client 127\.0\.0\.1:[0-9]+ disconnected \((peer closed|quit)\) after [0-9]+s, [0-9]+ requests" "$D/pt.log" && ok \
 	|| bad "S70: no 'disconnected' line: $(grep client "$D/pt.log" | tail -1)"
 grep -qE "connected \(binary, encrypted\)" "$D/nx.log" && ok || bad "S70: an encrypted session is not logged as encrypted"
-# S468: the others asked for plaintext after the handshake, and got it
+# the others asked for plaintext after the handshake, and got it
 grep -qE "connected \(binary, authenticated, plaintext\)" "$D/nx.log" && ok \
 	|| bad "S468: an authenticated plaintext session is not logged as one"
 grep -qE "disconnected \(handshake failed" "$D/nx.log" && ok \
 	|| bad "S70: the no-secret / wrong-secret drop is not named: $(grep -c client "$D/nx.log") client lines"
-# S71: five ways to get it wrong, five answers that name the mistake
+# five ways to get it wrong, five answers that name the mistake
 "$CLI" -h 2>/dev/null | grep -q "^usage:" && ok || bad "S71: -h alone is not help"
 "$CLI" -H ping 2>&1 | grep -q "unknown option '-H'" && ok || bad "S71: an unknown option is not refused"
 "$CLI" -p 2>&1 | grep -q "\-p needs a value" && ok || bad "S71: a valueless -p is not named"
@@ -277,13 +267,14 @@ echo "$R" | grep -q "'help' for commands" && bad "S71: the banner is printed bef
 "$CLI" -p 17046 stats -a cli-test-secret 2>&1 | grep -q "after the command 'stats' is an argument" && ok \
 	|| bad "S71: an option after the command is not called out"
 "$CLI" -p 17046 -a wrong-secret stats 2>&1 | grep -q "wrong secret?" && ok || bad "S71: a wrong secret is not suggested"
+# bare perfcli reads the node's config as the daemon does: an inline '# note' is not part of a value
+sed -e 's/^\(tcp = .*\)$/\1   # the node'"'"'s own door/' -e 's/^\(client = .*\)$/\1   # rotated yearly/' "$D/nx.conf" > "$D/nxc.conf"
+R=$(env -u PERFCLI_AUTH PERFCACHED_CONF="$D/nxc.conf" "$CLI" ping 2>&1)
+echo "$R" | grep -q pong && ok || bad "an inline comment in the config broke bare perfcli: $(echo "$R" | head -1)"
 
 kill -TERM $P1 $P2 2>/dev/null; wait 2>/dev/null; P1= P2=
-# ---- S65: the query log ---------------------------------------------------
-# all + full keys: one line per request naming dialect ("bin" for a CMD
-# request, S317), verb, collection and key; sampled:3 + hashed: one line
-# in three, tagged with the rate, the key as a hash.  Off is the default
-# and the two daemons above have logged no query lines at all.
+# ---- the query log ---------------------------------------------------
+# all + full: a line per request naming dialect, verb, collection, key; sampled:3 + hashed: one in three
 grep -q "^.*query:" "$D/pt.log" && bad "S65: query lines with query_log off" || ok
 mkconf "$D/ql.conf" 17047 loopback
 # the keys are [daemon] keys: put them THERE, not after the last section
@@ -298,14 +289,13 @@ sleep 0.3
 grep -q "query: bin .* set c key=qk1 " "$D/ql.log" && ok || bad "S65: no set line: $(grep 'query:' "$D/ql.log" | head -2) $(grep -E "ERROR" "$D/ql.log" | head -1)"
 grep -q "query: bin .* get c key=qk1 " "$D/ql.log" && ok || bad "S65: no get line"
 grep -q "query: bin .* del c key=qk1 " "$D/ql.log" && ok || bad "S65: no del line"
-# S65 remainder: the line says what happened - a get that hit, a get that missed
+# the line says what happened - a get that hit, a get that missed
 grep -qE "query: bin .* get c key=qk1 hit [0-9]+ us" "$D/ql.log" && ok || bad "S65: the get line does not say hit: $(grep 'get c key=qk1' "$D/ql.log" | head -1)"
 "$CLI" -p 17047 get c never-stored >/dev/null 2>&1
 grep -qE "query: bin .* get c key=never-stored miss [0-9]+ us" "$D/ql.log" && ok || bad "S65: a missed get does not say miss"
 grep -c "query: bin" "$D/ql.log" | grep -qE "^[3-9]|^[1-9][0-9]" && ok || bad "S65: fewer than 3 query lines"
 kill -TERM $QP 2>/dev/null; wait $QP 2>/dev/null
 mkconf "$D/qs.conf" 17048 loopback
-# the keys are [daemon] keys: put them THERE, not after the last section
 sed -i 's/^log_level = notice$/log_level = info\nquery_log = sampled:3\nquery_log_keys = hashed/' "$D/qs.conf"
 "$BIN" -f "$D/qs.conf" > "$D/qs.log" 2>&1 &
 QP=$!

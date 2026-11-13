@@ -1,22 +1,5 @@
-/* enumwalktest.c - the cooperative KEYS walk (enumwalk.c; the 0.7.2 split,
- * wave 1): the key chunks, the registry's publish generation and the
- * connection's life are stubbed; replies are staged on each connection's
- * own buffer.
- *
- *   A  the list: walks begin and join this worker's list (pending), one
- *      ended from the middle leaves the others, abort without a walk is
- *      harmless
- *   B  the step: one chunk per walking connection per turn - two walks
- *      advance together; a walk that ends answers "*N" and its keys in
- *      one ordered reply, then the input behind it is served and the
- *      connection flushed; walks and turns counted
- *   C  a walk at its LIMIT answers what it has; a reply too large is
- *      refused by name; a table the registry republished since the walk
- *      began ends it with what was emitted, counted as ended on a swap
- *   D  the connection's end: a reply that cannot be staged, the input
- *      behind it a protocol error, a write error, or QUIT already
- *      answered - each destroys it, with the reason
- */
+/* enumwalktest.c - the cooperative KEYS walk, with the key chunks, the registry's publish generation
+ * and the connection's life stubbed; replies are staged on each connection's own buffer. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,7 +113,7 @@ int main(void)
 	unsigned long long walks, turns;
 	int turns_n;
 
-	/* A */
+	/* A: the list - walks begin and join, one ended from the middle, abort without a walk */
 	CHK(!pc_enum_pending(), "A: no walk - nothing pending");
 	a = conn(0);
 	b = conn(1);
@@ -149,7 +132,7 @@ int main(void)
 	enum_abort(x);
 	CHK(!pc_enum_pending(), "A: all ended - nothing pending");
 
-	/* B */
+	/* B: the step - one chunk per walk a turn; an ended walk answers in one reply */
 	a = conn(0);
 	b = conn(1);
 	walk(a, 1000);
@@ -168,7 +151,7 @@ int main(void)
 	pc_enum_figures(&walks, &turns);
 	CHK(walks == 2 && turns == 6, "B: 2 walks, 6 turns counted");
 
-	/* C */
+	/* C: a walk at its LIMIT; a reply too large refused; a republished table ends the walk */
 	a = conn(0);
 	walk(a, 3);
 	for (turns_n = 0; a->enum_active && turns_n < 10; turns_n++)
@@ -187,7 +170,7 @@ int main(void)
 	CHK(replied(a, "*2\r\n$2\r\nk0\r\n$2\r\nk1\r\n") && pc_enum_ended_on_swap() == 1,
 		"C: the table republished mid-walk - ended with the 2 emitted, counted as a swap");
 
-	/* D */
+	/* D: the connection's end - unstageable reply, protocol error, write error, QUIT answered */
 	ndestroyed = 0;
 	a = conn(0);
 	walk(a, 1000);

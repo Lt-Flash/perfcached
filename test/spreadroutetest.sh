@@ -1,23 +1,6 @@
 #!/bin/sh
-# spreadroutetest.sh — S127 Z3/Z6: libperfd routes a `spread` fleet.
-#
-# WHY THIS IS ITS OWN SUITE.  spreadtest.sh drives everything through
-# line-oriented JSON over a `plaintext = loopback` listener, because its
-# assertions read per-collection entry counts and that is the cheapest
-# client that can do it.  libperfd speaks the ENCRYPTED native wire and
-# does a Noise handshake, which that listener refuses - so the client
-# half of Z3 could not live there and was asserted only at the contract
-# level (routing.mode / routing.replicas published).  This closes it:
-# same fleet shape, encrypted door, a real libperfd.
-#
-# WHAT IT CATCHES.  libperfd only routes for a mode it RECOGNISES.
-# Before S127 it knew `shard` and `store`; a spread fleet therefore
-# turned client routing OFF entirely and every read paid a pull.  That
-# is CORRECT - the daemon forwards, there are no MOVED redirects - so
-# nothing fails loudly, throughput just quietly halves.  A contract-level
-# check cannot see it; only a real client can.
-#
-# Usage: test/spreadroutetest.sh [./perfcached] [./failovertest]
+# spreadroutetest.sh - libperfd routes a `spread` fleet over the encrypted native wire: a client
+# that did not recognise the mode would pay a pull on every read and fail nothing.
 set -u
 BIN=${1:-./perfcached}
 FT=${2:-./failovertest}
@@ -98,11 +81,8 @@ except Exception:
 print(d.get(sys.argv[2], ""))' "$1" "$2" 2>/dev/null
 }
 
-# Wait for EVERY node to be ready, not just the one we poll.  A routed
-# client sends to the key's HOLDER, so a peer still RECOVERING refuses
-# the write with "node is not READY" - which reads like a routing
-# failure and is not one.  Checking only node 1 is how this suite first
-# reported "routed write 0 failed" against a healthy fleet.
+# wait for EVERY node to be ready: a routed client sends to the key's holder, and a peer still
+# RECOVERING refuses with "node is not READY", which reads like a routing failure
 i=0
 while [ $i -lt 200 ]; do
 	u=$(cfield 18451 peers_up); m=$(cfield 18451 master)
@@ -124,16 +104,14 @@ echo "$OUT" | grep -q "client is routing by key" \
 	|| bad "libperfd is not routing - mode_ok does not accept spread"
 echo "$OUT" | grep -q "200 routed writes" \
 	&& ok "200 routed writes accepted" || bad "routed writes failed"
-# the reads matter twice over: they prove routing works AND that exact-K
-# retention did not lose anything - a non-holder drops its copy, so a
-# read that lands on one must still resolve through a holder
+# the reads prove routing works AND that exact-K retention lost nothing: a non-holder drops
+# its copy, so a read landing on one must still resolve through a holder
 echo "$OUT" | grep -q "200 routed reads all hit" \
 	&& ok "200 routed reads all hit (exact-K retention lost nothing)" \
 	|| bad "a routed read missed - retention or routing dropped a record"
 
-# ROUTE-MISSED counts requests whose owner was known but not connected.
-# With spares=-1 the client opens every member, so a spread fleet should
-# find a holder it is connected to for essentially every key.
+# ROUTE-MISSED counts requests whose owner was known but not connected: with spares=-1 the
+# client opens every member, so a spread fleet finds a connected holder for nearly every key
 RM=$(echo "$OUT" | sed -n 's/^ROUTE-MISSED //p' | tail -1)
 [ -n "$RM" ] && [ "$RM" -le 20 ] \
 	&& ok "the client reached a holder directly for nearly every key (route_missed=$RM of 400)" \

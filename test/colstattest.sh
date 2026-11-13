@@ -1,20 +1,6 @@
 #!/bin/sh
-# colstattest.sh - S237: a collection's write-stream counters count every
-# write, from every worker.
-#
-# stored_bytes / stored_n / size_hist (S67, the page's "are we storing
-# what we think we are") were plain `+=` in the collection's registry
-# entry - so writes on different workers lost counts to each other, and
-# every SET dirtied the lines every request's collection lookup reads
-# (23% of a saturated SET at 12 workers, DESIGN 12ga).  They are now
-# per-thread stripes, summed on read.
-#
-# Eight connections spread over four workers write 30,000 values each,
-# in three sizes, at once; the counters must say exactly 240,000 writes,
-# exactly the bytes sent, a histogram that sums to the count - and a
-# reset must zero all of it.  FAIL-FIRST: the build before S237 loses
-# counts under the same storm.
-# Usage: test/colstattest.sh [./perfcached]
+# colstattest.sh - a collection's write-stream counters (per-thread stripes) count every write from
+# every worker exactly, and reset to zero.  Usage: test/colstattest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -50,8 +36,8 @@ PID=$!
 i=0; while [ $i -lt 300 ]; do grep -q "perfcached ready" "$D/n.log" && break; sleep 0.1; i=$((i+1)); done
 R=$(python3 - "$PORT" <<'PY'
 import json, pcnative, socket, sys
-# S270: fork, spelled out - Python 3.14 made forkserver the Linux default,
-# which re-imports the main script, and this one is fed on stdin
+# fork, spelled out: Python 3.14 made forkserver the Linux default, which re-imports
+# the main script, and this one is fed on stdin
 from multiprocessing import get_context
 Process = get_context("fork").Process
 port = int(sys.argv[1])

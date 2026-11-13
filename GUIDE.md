@@ -6,12 +6,155 @@ measured numbers.  The [README](README.md) is the short tour; every
 option is annotated in
 [contrib/perfcached.conf.example](contrib/perfcached.conf.example).
 
+## What it promises
+
+The contract in one place.  The sections named have the detail and
+the measurements.
+
+### What it is, and what it is not
+
+perfcached is an in-memory key-value cache: one multithreaded daemon a
+host, a write-ahead log and snapshots when you ask for them, and, when
+one machine is not enough, a fleet that shares the keyspace in one of
+five modes.  It is not a database, and does not try to be one:
+
+- **No cross-key transactions.**  perfcached runs no `MULTI`/`EXEC`
+  or `WATCH` of its own, and no mode changes two keys as one.
+- **No lists, sets, sorted sets or streams**
+  ([REDIS-COMMANDS.md](REDIS-COMMANDS.md) lists what is refused).  A
+  new data type comes only with a named user of it.
+- **No sync between data centres.**  A fleet is one network, and two
+  fleets never merge (below, "A cluster has an id").
+- **No redirect a client must handle.**  Any node serves any key and
+  forwards what it does not hold; RESP answers `-MOVED` only under
+  `resp_redirect = moved`.
+- **No acknowledgement that waits for the disk** (below).
+
+### A record's life
+
+**A write** goes into the table of the node that took it, then into
+that worker's ring for the write-ahead log, and is acknowledged there.
+The WAL thread writes the ring out and syncs it as `[wal] fsync` says;
+a snapshot later covers it and its log segment is reused.  In `eager`
+and `spread` the write also goes to the other holders as it lands,
+without waiting for them; in `shard` and `proxy` a node that does not
+hold the key forwards the write and answers once the holder has taken
+it.  One node logs a write - the one that took it, or the holder it was
+forwarded to.  The other holders keep their copies in memory, and a
+snapshot carries them (Durability, "What a replica does NOT give
+you").
+
+So an acknowledgement means "in memory, and in the log's queue".  A
+`kill -9` loses what the ring still held - at the defaults up to the
+last 200 ms or so of that node's writes, more while the log is
+behind - and a power cut also loses what was written but not yet
+synced, up to about a second under `fsync = everysec`.  `fsync =
+always` syncs sooner; it does not make the acknowledgement wait.  A
+client that needs a write on disk sends the `sync` verb after it
+(`perfcli sync`), a barrier for everything acknowledged before.  A ring
+that fills makes the writer wait (`on_full = wait`, the default since
+0.7.4) rather than drop.  A collection that writes through to Redis
+acknowledges a write once Redis has applied it (Write-through).
+
+**A delete** removes the key, is numbered and logged by the node that
+made it, and goes to every peer.  Each node remembers it, and refuses
+an older copy of the key while it does (A cluster, "Deletes survive a
+partition").  With acknowledgements (0.7.3, the default) a node forgets
+a delete once every member holds it; without them, after
+`tombstone_retain_s`.  Either way `tombstone_retain_max` caps the
+memory, and three cases can still bring a delete back (A cluster,
+"Three cases can still bring a delete back").
+
+**Two writes of one key** order by version: a write made after another
+was seen is newer and wins on every holder, and so does a write after a
+delete.  Two writes of one key made through two nodes at the same
+moment race, and which one survives is arbitrary.  Before 0.7.5 a tie -
+two writes at one version - could leave eager holders disagreeing; now
+every holder settles it the same way, and the repair sweep mends a
+holder left with the losing copy ("0.7.5 speaks wire epoch 4 alone").
+Writing a key through one node - libperfd's `route_keys` does it -
+avoids the race.
+
+### The modes, side by side
+
+| mode | holds a record | a miss | a write is acknowledged | holders agree |
+|---|---|---|---|---|
+| `store` | the node that took it, and each node that pulled it | asks every peer, and keeps what comes | by the node that took it | never: a pulled copy keeps the version it came with until it expires; a later write elsewhere does not reach it, a delete does |
+| `eager` | every node | answered "absent" once the node has settled | by the node that took it, before its peers have it | milliseconds after the push lands; the repair sweep mends a lost one |
+| `spread` | K nodes chosen by placement | asks the best-ranked holder | by the node that took it, before the holders have it | as eager, among the K |
+| `shard` | one node, chosen by placement | the owner answers for it | by the owner | one copy: nothing to agree on |
+| `proxy` | one node, chosen by free memory | asks the node the locator remembers, else every peer | by the holder | one copy: nothing to agree on |
+
+A collection with an upstream answers its misses from Redis
+(Read-through).  The one thing that does not vary: a replication
+factor is availability, never durability.  Whatever the mode, one node
+logs a record.  The choice between the modes is in "Which mode to
+run".
+
+### What a collection keeps
+
+Three combinations, named here, in a start line for each collection,
+and in `/stats` (0.7.5): `collections[].keeps` says which holds now -
+fleet-delete-safe only while every live member acknowledges deletes -
+and `copies` how many copies the mode keeps: `1`, the copy factor K,
+`all` (eager) or `pulled` (store).
+
+- **ephemeral**: no `[wal]`, or `durable = no` on the collection.  A
+  restart starts it empty on that node.  In a fleet the copies its
+  peers hold come back the ordinary ways (the sweep, a pull on a
+  miss), so in `eager` only a restart of every node at once empties it
+  everywhere.
+- **recoverable**: a `[wal]`.  A node comes back from its last snapshot
+  and its log, losing only what a crash takes from the ring (above).
+  After the whole fleet goes down together, each node replays its own
+  share and the snapshots carry the copies - which is why the daemon
+  warns at start about `mode = eager` with `save = off`.
+- **fleet-delete-safe**: recoverable, in a fleet whose every member
+  acknowledges deletes (0.7.3, `tombstone_acks = yes`, the default).
+  A delete is kept until every member holds it, so a member that was
+  restarting, frozen or cut off gets it on return - within
+  `tombstone_retain_s` and `tombstone_retain_max`.  Past them, an eager
+  member back without a restart is asked to rebuild instead.
+
+### When things fail
+
+| mode | a node crashes | a peer is slow |
+|---|---|---|
+| `store` | the keys only it held are out of reach until it returns | a read only it could answer waits for it, up to `pull_timeout_ms` |
+| `eager` | nothing is lost but what its ring held and it had not pushed; it returns from its log and asks the fleet what changed | it applies late, quietly (the `replica intake` card), and the sweep mends what it drops |
+| `spread` | its keys survive while one of their K holders is up | as eager |
+| `shard` | its slice is out of reach until it returns | the keys it owns wait for it |
+| `proxy` | its keys are out of reach until it returns | the keys it holds wait for it |
+
+**A split.**  Both sides keep serving and taking writes: the fleet
+favours availability, and no side waits for a majority.  On the heal
+one master remains, the newer version of each key wins, and the deletes
+made meanwhile are replayed, within `tombstone_retain_s` ("Deletes
+survive a partition").  **An upgrade** is a rolling restart, one node at
+a time, each once `stats.cluster.restart.safe` says so (Rolling
+restarts) - except one to a release that changes the cluster wire, as
+0.7.5 does: then every node stops and they all start on the new build
+("0.7.5 speaks wire epoch 4 alone").
+
+In every mode a node that stalls says `stalled` and is steered around,
+and a node whose log failed says `failed` and refuses writes ("What a
+node says about itself").  A member back after longer than
+`resync_after_s`, or from a split nobody witnessed, drops what it held
+and pulls the fleet's state again ("A member back after a long
+absence").  The whole fleet down at once is the WAL's and the
+snapshots' to bring back (Durability).  A release whose cluster
+header changes cannot talk to the one before it: its ChangeLog entry
+says so, and the fleet moves together - `fleetstop`, install, start
+(0.7.4.3 was one).  [PRODUCTION.md](PRODUCTION.md), "Upgrading", has
+the order of a rolling restart.
+
 ## Running it
 
 Every option lives, annotated, in
 [contrib/perfcached.conf.example](contrib/perfcached.conf.example);
-the snippets below are complete working configs, and
-[contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md) has ten whole
+the single node below is a complete working config, the snippets after
+it are what each feature adds to one, and
+[contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md) has eleven whole
 files - single nodes and fleets in every mode - each validated with
 `perfcached -C`.
 
@@ -228,7 +371,10 @@ everything as datagrams): each sending worker holds a connection a
 peer, and the relay threads read them.  So a unicast fleet needs the cluster port on UDP and TCP, the
 lane port on TCP, and optionally the relay port on UDP and TCP - all
 three addressed to the nodes themselves, never through a load balancer
-or a Kubernetes Service's virtual IP.
+or a Kubernetes Service's virtual IP.  Every one of these a node uses -
+the relay port among them while it is open - must answer before a joiner
+serves (0.7.5, "Ordered joining" below): a blocked one holds the joiner
+`connecting` rather than falling back.
 
 Nodes that die and come back rejoin by themselves; a partitioned
 master steps down when it sees a bigger fleet.  **Deletes survive a
@@ -334,7 +480,9 @@ expires again unless it was written with a longer TTL.
 Failure detection
 runs on 1 Hz heartbeats with real margin - a master is presumed dead
 after 8 s of silence, a peer after 10, so jitter is not death - beat
-emission is watchdog-backed, and datagram ingest is fairness-bounded
+emission is watchdog-backed (`stats cluster.hb_sent` counts the beats
+sent, `hb_watchdog` the ones the watchdog re-sent, 0.7.5), and datagram
+ingest is fairness-bounded
 so a migration burst cannot deafen membership.  Watch it settle:
 
     perfcli -p 6479 -a '...' -P stats
@@ -367,7 +515,6 @@ thread is demonstrably the bottleneck.  A hot key pins one thread, and
 `apply_dispatched`, `apply_blocks` (receiver waits on a full ring) and
 `apply_backlog` (bytes queued).
 
-
 **Hot keys (0.7.1).**  Each node samples one request in 64 - per thread,
 at random, so a client cycling through 64 keys is not aliased onto one -
 into a space-saving sketch of the 32 heaviest keys per collection.  A
@@ -385,10 +532,12 @@ err` under 2) is noise and is not listed.  The counts halve every minute, so the
 minutes, as the page's other tables are; reset-stats empties it.  The
 status page lists the keys of every collection, the hottest share first.
 Nothing is exported to `/metrics`: a key is not a label.
+
 **What the repair walks cost.** The eager repair sweep walks the whole
 table every cycle (sending only what the watermark says a peer is
 owed), and a node that replays a WAL after a restart probes every
-replayed key against the fleet at 64 a second, to drop what was deleted
+replayed key against the fleet, 64 to `reconcile_rate_max` a second
+("Asking key by key", below), to drop what was deleted
 while it was down.  Both are O(N) in the keyspace; `stats.cluster`
 shows what the last completed pass of each cost - `repl_sweep_ms` with
 `repl_sweep_scanned` and `repl_sweep_sent`, and `reconcile_ms` with
@@ -396,8 +545,12 @@ shows what the last completed pass of each cost - `repl_sweep_ms` with
 not guessed.
 
 **What a node says about itself.** `stats` carries `state` and
-`state_reason`, and `members` carries both for every node as the others
-hear them: `starting`, `recovering`, `ready`, `draining`, `failed` (its
+`state_reason`, and `/members` carries them for every node as the others
+hear them (`state` and `reason`): `starting`, `connecting` (admitted and still
+proving its links - client data refused, 0.7.5), `recovering`, `ready`, `draining`,
+`healing` (its log missed a record: reads served, writes refused until
+a snapshot makes every acknowledged write durable again - Durability,
+"When the log cannot keep up"), `failed` (its
 WAL lost or could not store acknowledged writes: reads served, writes
 refused, until restarted) and `stalled`.  **Stalled** means the node's
 cluster thread - the one that applies replicated records, answers pulls
@@ -408,7 +561,7 @@ healthy for ever; with it that heartbeat says `stalled`, peers and
 routing clients steer new work elsewhere, and the node returns to `ready`
 by itself once the thread has moved steadily for the same interval.  A
 stalled node stays a member, so nothing re-shards over it, and it refuses
-nothing.  One apply thread of several (`apply_threads`, below) wedged
+nothing.  One apply thread of several (`apply_threads`, above) wedged
 with records queued on it is reported the same way.  A stalled *master* is replaced: its claim is not repeated, the
 others do not consider it in the election, and it steps down when it
 returns and hears the higher term.  Only `ready` (and `draining`, which still answers for what it
@@ -428,6 +581,16 @@ as it lands - on the write path, fire-and-forget, whatever the TTL - and
 a background sweep repairs what a push did not reach.  Replicas are held
 off the WAL: a record is durable where it was written, and a node that
 restarts holds its own writes until the sweep refills the rest.
+
+**Reading your own write (0.7.5).**  An eager write is acknowledged by
+the node that took it before its peers have it.  So a client reads its
+own write back from that node at once, and from any other node once the
+push has landed - a few milliseconds.  Across that node's death or stall
+the promise ends: a client that moves to another member may read the
+value before its write, and if the node died before pushing, the write
+is gone until the node returns with its WAL.  Nothing on the client can
+close that window.  Shard mode reads a key at its one owner, so it has no
+such lag, but a key is out of reach while its owner is.
 
 **One copy, in every mode.**  The replica count is availability, never
 durability: only the node that took a write logs it, so the fleet's
@@ -510,23 +673,70 @@ member older than 0.6.5), each card on the status page shows it, and the
 header turns amber with `mixed versions: 0.6.4 x1, 0.6.5 x2` while the
 live members run more than one build: an upgrade in progress, or one that
 stopped half way.  **The wire epoch (0.7.1).**  A build speaks a range of
-wire epochs (`cluster.epoch.min..max` in `stats`; both 2 today) and the
-fleet speaks one committed epoch (`cluster.epoch.committed`, carried in the
-master's keepalive and persisted on every node).  A roll never changes it:
-when every member runs a build that speaks a newer epoch, `perfcli -E ...
-upgrade commit epoch=<n>` asks the master to raise it, and the master
-refuses by name while any live member cannot speak it.  A member that
-cannot speak the committed epoch is refused by name.  `upgrade plan`
+wire epochs (`cluster.epoch.min..max` in `stats`) and the fleet speaks one
+committed epoch (`cluster.epoch.committed`, carried in the master's
+keepalive and kept in every node's `state_dir` as `node-epoch`).  A member
+that cannot speak the committed epoch is refused by name.  When a release
+speaks a newer epoch beside the old one, a roll leaves the fleet where it
+was and `perfcli -E ... upgrade commit epoch=<n>` asks the master to raise
+it, refused by name while any live member cannot speak it.  `upgrade plan`
 finds that before the roll: every release tarball carries
 `share/perfcached/RELEASE` (version, revision, edition, the wire epochs it
 speaks), and the plan refuses a candidate whose range leaves out the
-fleet's committed epoch.  A rollback to a
-build that cannot speak the committed epoch is refused by the driver until
-the epoch is committed back down, which the master allows while every
-member still speaks the old one.  A datagram from a build whose cluster header version
+fleet's committed epoch.  A rollback to a build that cannot speak the
+committed epoch is refused by the driver until the epoch is committed
+back down, which the master allows while every member still speaks the
+old one.  A datagram from a build whose cluster header version
 differs is counted as `cluster.wire_ver_refused` and logged once a minute
 by address - "builds this far apart cannot talk" - rather than as a
 failed authentication.
+
+**0.7.5 speaks wire epoch 4 alone.**  It keeps no codec of an earlier
+release's: a 0.7.4 node (epoch 2) and a 0.7.5 node refuse each other by
+name, so moving a fleet to 0.7.5 stops every node and starts them all on
+it - the state is kept, the WAL and the snapshot did not change.  A node
+whose `node-epoch` still names 2 logs, on its first start, that the whole
+fleet moves.  Epoch 4 brings two changes, on from a fleet's first start:
+the eager repair sweep compares each record's value checksum as well as
+its version, so a holder left with the losing copy of a tie ("A record's
+life" - two nodes writing one key at one version) is sent the winner; and
+joining is ordered (below).  A libperfd older than 0.7.6 does not route
+by key against epoch 4: every request then takes the forward.
+
+**Ordered joining (0.7.5).**  Joining is ordered:
+
+- **Who founds.**  A node that hears no master - a new fleet, or one after
+  a whole-fleet stop - founds only at the end of a settle window -
+  3 s, stretched while new joiners keep appearing (until 1 s with none), at
+  most 10 s - and each live joiner with a lower identity puts it off 3 s
+  more, so the lowest identity founds and the rest join it.  A member
+  whose master has missed 3 beats tells a joiner the fleet is electing, and
+  the joiner waits for the new master instead of founding beside it.
+- **One at a time.**  The master admits joiners from a queue in order of
+  arrival - one in flight up to 16 members, four above 16 - and tells each
+  queued joiner its place.  A newly elected master admits nobody until it
+  has heard every live member since its election.  The member list a
+  joiner is sent goes in numbered parts once it passes one datagram
+  (`max_datagram`), not as one frame that fragments.
+- **Every link before it serves.**  An admitted node is `connecting`: live,
+  but refusing client data, holding no share of the keyspace and standing
+  for no election.  Every pair of it and a member must answer both ways on
+  the cluster port, on the pub/sub relay port where one is open, and - by
+  a TCP connect, both ways - on each TCP path the configuration uses: the
+  frame lane (`discovery = unicast` with `max_datagram` above 0), the
+  relay port's TCP where replication groups ride it (`max_datagram` above
+  0 and a relay port), and, from a joiner that will pull a bootstrap, each
+  member's cluster port on TCP (the bulk channel).  Then the master moves
+  it ONLINE and it goes `ready` (`recovering` while it pulls a
+  bootstrap).  If a pair has not answered after 10 s the master logs
+  which pairs and the first path missing on each (`the cluster socket`,
+  `the relay port`, `the frame lane`, `clrpt` - the relay port's TCP - or
+  `the bulk listener` `did not answer`), keeps it `connecting` and
+  probing, raises `cluster.admission_stuck` and admits the next.
+- **A member that misses a peer.**  A member whose list of members differs
+  from the master's for 3 beats asks the master for it (`stats
+  cluster.members_asked`, and the master's `members_sent`): a member it did
+  not know is added, one it dropped for silence in the last 30 s is not.
 
 Every sealed cluster frame names its sender, the sending thread's stream
 and its place in that stream, inside the authenticated header, and each
@@ -536,6 +746,14 @@ process while the new one is heard is dropped and counted in
 `cluster.replay` (`dup`, `old`, `incarn`; `unchecked` counts frames let
 through past the receiver's tables).  A steady `old` count is a path
 reordering more than that - a lane or relay backlog - and worth a look.
+Since 0.7.5 a frame is admitted only after the sender checks, and only
+from the host its header names (`host` counts the others): a holder of
+the cluster secret elsewhere cannot speak for a member.  The windows have
+a budget (4,096 streams in all, 64 MiB); past it frames go unchecked, as
+past the tables.  What the rule does not cover: a frame from a sender's
+previous process is taken again once the new process has been silent
+60 s - the allowance for a clock stepped back at a restart - so traffic
+recorded from a node's last run replays while that node stays down.
 
 **Rolling restarts: one node at a time, and only when it is safe.**  The
 peers that were up throughout a node's absence are its WITNESSES; restart
@@ -574,7 +792,8 @@ the old master steps down on its first beacon, with no silent interval.
 A handover not taken within 20 s is given up (the log says so), as is one
 whose member leaves; `master_auto` cancels one still pending.
 
-Applying those copies is ONE thread per node while the sending side is
+Applying eager's copies takes a few threads per node - the relay
+threads since 0.7.4, or `apply_threads` - while the sending side is
 every worker in the fleet, so under enough write pressure a receiver
 falls behind, and it falls behind QUIETLY: it keeps heartbeating, stays
 a member, and its client door stays fast; the only symptom is a read of
@@ -780,7 +999,7 @@ startup:
 `fsync = always` the per-writer ring has to absorb everything that
 arrives while it sits in `fdatasync`.  On storage whose fdatasync takes
 milliseconds the shipped 1 MB ring is not enough, and an overflowing
-ring used to drop acknowledged writes *silently* — measured at up to
+ring used to drop acknowledged writes *silently* - measured at up to
 13% of a 20,000-key fill, present in the live table and absent after a
 restart.  The probe now derives the depth from the measured p99 and the
 daemon applies it (set `ring_kb` yourself to override; with `probe = no`
@@ -859,8 +1078,9 @@ and the start says how many.  In a fleet the peers' copies still reach a
 restarted node the ordinary ways - the repair sweep, a pull on a miss -
 so only a restart of every node at once leaves it empty everywhere.
 `/stats` reports `"durable": false` for it, the members compare which
-collections are caches (`config.caches`), and a reload refuses the
-change - it takes a restart.
+collections are caches (a member that differs is named in `/members`
+`config_differs` as `[collection] durable = no`), and a reload refuses
+the change - it takes a restart.
 
 **When the device says no.** A WAL append, a segment rotation or an
 `fdatasync` that the device refuses (EIO, ENOSPC...) fails the node the
@@ -959,7 +1179,8 @@ upstream_prefixes = tok:*, cid:*
 
 `upstream_prefixes` is required: only keys matching one of its patterns
 (Redis glob syntax, comma-separated, up to 32) ever fall through - say
-`*` to mean all of them.  `upstream = redis://[user@]host:port[/db]`;
+`*` to mean all of them.  `upstream = redis://[user@]host:port[/db]`
+(`rediss://` over TLS, below);
 the password is the collection's `upstream_password` (0.6.1; it was
 `[secrets] upstream`, which is now refused with that advice), never in
 the URL - so one perfcached can front several Redis servers, a
@@ -968,7 +1189,7 @@ them all through it (`SELECT` picks the collection at the RESP door).
 The password appears in no log line, `/stats` field, page or `-E`
 dump.
 
-**Several upstreams (0.6.1).**  `upstream` takes up to eight, and with
+**Several upstreams (0.6.1).**  `upstream` takes up to 32 (eight before 0.7.5), and with
 `upstream_role = replica` each must say so by `ROLE` (a master is not
 read - list it anyway, so the collection follows a failover: it shows
 greyed on the page and raises no alert; `upstream_master_fallback = yes`
@@ -1003,9 +1224,133 @@ warning (mailed); an allowed one is tagged "chained - one hop"; and the
 node read that way warns (`chain.<collection>`, mailed) and says on its
 read-through line that those reads got only what it holds.
 
+**A master names its replicas (0.7.5).**  A listed master's `ROLE`
+names its replicas, and `upstream_discover` decides what is done with
+them.  `auto` (the default) adds them as upstreams - read as
+`upstream_role` says, tagged "named by its master" on the page and
+origin `role` in `/stats` - only
+when the master answers at the address dialled (`CLIENT INFO`'s
+`laddr`); behind a proxy such as HAProxy in front of Sentinel the
+addresses it names are the servers behind the proxy, so they are shown
+(`behind`) and not used.  Nor does `auto` add them to a write-through
+collection: its reads stay on the upstreams its config names, so an
+upgrade moves none of them to a replica no lag check guards.  `yes` dials
+them directly whatever stands in front; `no` neither uses nor shows them.  A replica the master stops
+naming is "gone from the topology": not used, not dialled, its place kept
+for its return.  A node holds 32 upstreams (eight before 0.7.5).  Once all
+are taken, or the arena has no room for another's copies, a new address
+takes the place of the discovered one gone longest - after twice
+`upstream_timeout_ms` and a second, so nothing still talks to the old
+address - and the log says whose place it took and why; more than fit at
+once is logged and the rest not used.
+
+**A Sentinel (0.7.5).**  An upstream whose `INFO server` says
+`redis_mode:sentinel` is a sentinel, and is never read from.  A thread
+of the collection asks the sentinels every 10 s which master they watch
+(`SENTINEL MASTERS`: the only one, or the one `upstream_sentinel_master`
+names when they watch several - until it is set, nothing is added and
+the collection's `sentinel` line in `/stats` says which to name), where
+it is, its replicas and the other sentinels (`GET-MASTER-ADDR-BY-NAME`,
+`REPLICAS`, `SENTINELS`).  The master and the replicas become the
+collection's upstreams, origin `sentinel`, read as `upstream_role`
+says; a replica the sentinels hold down is left out, and a server they
+stop naming is gone from the topology.  The other sentinels are
+remembered, so the one named may go away.  The node also subscribes to
+a sentinel's events (`+switch-master`, `+sdown`, `+odown`, `+slave`,
+`+sentinel` and their pairs), so a failover is followed at once, and a
+write-through collection's writer follows the master the sentinels
+name.  `upstream_sentinel_password` is the sentinels' own password,
+when they ask for one.  What was learned is kept in `state_dir` and
+tried at a start with the seed down.  `upstream_discover = no` adds
+nothing.
+
+**A Sentinel as the upstream (0.7.5).**  An upstream whose `INFO server`
+says `redis_mode:sentinel` is never read from.  The collection asks it,
+every 10 s and at once on its events (a failover, a server held down or
+back, a replica or a sentinel added), which master it watches, where
+that master is, its replicas and the other sentinels, and makes the
+master and the replicas its upstreams - "named by a sentinel" on the
+page, `origin` `sentinel` in `/stats` - read as `upstream_role` says.  A
+replica the sentinel holds down is not read, and a server it stops
+naming is gone from the topology, as above; but one sentinel saying
+every replica is down retires none until another sentinel agrees.  A
+sentinel watching several masters needs `upstream_sentinel_master =
+<name>`; until it is set the collection's `sentinel` field in `/stats`
+says which masters it saw.  `upstream_sentinel_password` is the
+sentinels' own `AUTH` password, where they have one.  When the sentinel
+stops answering, the others it named are asked; they and the servers
+are kept in `state_dir` and tried at a start with the seed down.  Under
+`upstream_writes = through` the writer takes the master the sentinels
+name.  With `upstream_discover = no` what they say is shown and none of
+it used.
+
+    [collection 0]
+    upstream = redis://reader@10.0.0.20:26379
+    upstream_sentinel_master = mymaster
+
+**TLS to the upstreams (0.7.5).**  `rediss://` in place of `redis://`
+reaches the upstreams over TLS - all of a collection's or none, since
+what is found from one (a master's replicas, a sentinel's servers and
+the other sentinels) is dialled the same way.  The certificate is
+checked against `upstream_tls_ca` (a PEM file; the system's store when
+not given) and against the URL's host - an IP address against the
+certificate's IP addresses - or against `upstream_tls_name`, which is
+also sent as the server name; that is the one to set when the
+certificate names a host and the URL an address.  A Redis with
+`tls-auth-clients yes` (its default once TLS is on) wants a client
+certificate: `upstream_tls_cert` and `upstream_tls_key`.  A self-signed
+certificate can be named in `upstream_tls_ca`; `upstream_tls_verify =
+no` skips the check altogether and is warned about at start, since
+anyone on the path can then pose as the upstream.  The files are read at
+start (`-C` checks them).  A reload (`systemctl reload perfcached`)
+reads them again: a renewed CA, client certificate or key is used by the
+next connection, and a file that does not load fails the reload and
+changes nothing; naming other files takes a restart.  `/stats` shows a
+`tls` block for the collection: what is checked, the handshakes, the
+failures and the last reason, which the log says too.
+
+    [collection 0]
+    upstream = rediss://reader@10.0.0.12:6380/0
+    upstream_tls_ca = /etc/perfcached/redis-ca.pem
+    upstream_tls_cert = /etc/perfcached/redis-client.pem
+    upstream_tls_key = /etc/perfcached/redis-client.key
+
+**A Redis Cluster (0.7.5).**  One node of it is enough: an upstream
+whose `INFO server` says `redis_mode:cluster` puts the collection in
+cluster mode.  A thread asks a node for `CLUSTER SHARDS` (`CLUSTER
+SLOTS` before Redis 7) every 10 s, adds every master and replica it
+names as an upstream (origin `cluster`), drops the ones it stops naming,
+and keeps the slot map: each key's fetch goes to its slot's shard, and
+`upstream_role` and `upstream_master_fallback` choose within the shard.
+A replica connection sends `READONLY` first.  A `MOVED` is followed to
+the node it names - read there once, the map asked again at once - and
+an `ASK` there after `ASKING`, three hops at most; `TRYAGAIN` and
+`CLUSTERDOWN` are fetch errors.  `/stats` gives the collection a
+`redis_cluster` block (what the cluster said, the slots no node serves,
+`moved`, `asked`) and each upstream its `shard` and `slots`.  The
+nodes are kept in `state_dir` and tried at a start with the seed down.
+A cluster has database 0 only: a URL ending `/1` is refused by its
+`SELECT`, and the log says so.  A cluster has at most 32 nodes here
+(`upstream` takes 32 now); a larger one is logged and its nodes past
+32 are not used.  Under `upstream_writes = through` the writer holds a
+connection to each master and sends each write to the master of its
+key's slot, a run of writes to one master pipelined; a write whose keys
+are in different slots is refused as Redis refuses it (`CROSSSLOT`, use
+a hash tag), a `MOVED` (not applied) is sent once more to the node it
+names, and an `ASK` - a slot migrating - is refused, not applied.  A
+command perfcached does not know is not passed to a cluster
+(`upstream_unknown = pass` does not reach one).  The drain sweep SCANs
+each shard on a server that serves it, a replica first; the upfill
+writes each key through the writer, so to its slot's master; `upfill
+check` reads one master and is refused for a cluster.  A
+perfcached saying `redis_mode:cluster` (its RESP door's cluster mode)
+is a perfcached, under the rule above.
+
 **One way only.**  perfcached sends the upstream nothing but the
-handshake (`HELLO`, `AUTH`, `SELECT`, `INFO server`, `CLIENT ID`,
-`CLIENT TRACKING`)
+handshake (`HELLO`, `AUTH`, `SELECT`, `INFO server`, `CLIENT INFO`,
+`CLIENT ID`, `CLIENT TRACKING`; a cluster's `READONLY`, `ASKING` and
+`CLUSTER SHARDS` or `SLOTS`), the checks (`ROLE` and `INFO replication`,
+`PING`; a sentinel's `SENTINEL` queries and `SUBSCRIBE`)
 and reads (`TYPE`, `PTTL`, `GET`, `HGETALL`, `JSON.GET`, and `SCAN` for
 the drain sweep).  Nothing it
 does changes the upstream's data, so anything perfcached handles
@@ -1014,8 +1359,13 @@ replica (a Redis replica refuses writes) and give it an ACL user that
 can only read:
 
 ```
-ACL SETUSER reader on >password ~* +@read +hello +auth +select +ping +info +client|id +client|tracking
+ACL SETUSER reader on >password ~* +@read +hello +auth +select +ping +info +role +client|id +client|info +client|tracking
 ```
+
+`+role` is what `upstream_role = replica` and a master's list of its
+replicas are read by, and `+client|info` the proxy check of
+`upstream_discover = auto`; a Redis Cluster also needs
+`+readonly +asking +cluster|shards +cluster|slots`.
 
 **What a command does with a key it does not hold:**
 
@@ -1093,7 +1443,8 @@ rarely, and each time just after a replica's echo of a write.  Now a pure
 read (GET, MGET, EXISTS, TYPE, TTL, PTTL, the hash reads, JSON.GET) whose
 key went while it ran is answered again from a fetch, twice a command at
 most.  When nothing was removed meanwhile this costs two atomic reads;
-`read_lost` in the read-through stats counts the reads answered again.
+`read_lost` in the read-through stats counts the reads answered again, and
+`read_lost_spent` (0.7.5) the ones still lost after both, answered as read.
 
 Tracking needs every connection on ONE server.  A fetching connection
 names the dedicated one by its client id, and a client id means something
@@ -1153,9 +1504,10 @@ lookups; keep the default when tracking is off.
 Each node fetches its own copies; what changes a key is a real write, and
 it replicates.  A read on another node in the instant before a change
 reaches it may answer the upstream's older value - the same window in
-which an eager fleet without an upstream would answer a miss.  `proxy`,
-`shard` and `spread` collections refuse an upstream, because another node
-decides their keys.
+which an eager fleet without an upstream would answer a miss.  A `proxy`
+collection refuses an upstream at start, because another node decides
+its keys; `shard` and `spread` fetch at the key's owner or holders
+("Where read-through and write-through are proven", below).
 
 **Watching it, and finishing.**  `stats` has an `upstream` block per
 collection: connections and tracking, fetches and fills by type, absent
@@ -1183,12 +1535,23 @@ restart them.  The companion collection is not created again, and its
 records are dropped at recovery as orphans.
 
 **Where read-through and write-through are proven.**  Their suites run
-on single nodes and eager fleets, and 245-247 run them in eager.  In
-`shard` (0.7.1, DESIGN 12nt) a read-through collection fetches at the
+on single nodes and eager fleets, and a three-node test fleet runs them
+in eager.  In `shard` (0.7.1) a read-through collection fetches at the
 key's OWNER: a miss on any node pulls from the owner, which fetches from
 the upstream and keeps the one copy, so the fleet holds each key once
 and no node fetches a key it does not own; the daemon refused the
-combination before 0.7.1.  Write-through in `shard` (0.7.1) runs at the
+combination before 0.7.1.  That holds with or without
+`upstream_writes = through` since 0.7.5 - before it, an owner fetched
+for a pull only when the collection wrote through, and a read-only one
+answered absent every key the node asked on did not own.  A hash read
+(HGET, HGETALL and the rest) and a JSON GET on a node that does not own
+the key pull the record from the owner the same way and are answered
+here (0.7.5); before, they asked the owner's table only, and a key it
+held no copy of read as empty.  In `spread` a node that holds no copy of
+a key pulls a hash or a document from a holder as it pulls a string
+(0.7.5; before, it read its own table, which holds K of the keys).  On
+RESP a JSON command on a key another node holds is still refused, except
+that JSON.GET pulls as above.  Write-through in `shard` (0.7.1) runs at the
 key's OWNER too: a write on any other node is forwarded to the owner as
 every shard write is, the owner sends it to the master, reads the key
 back and keeps the one copy, and the client gets the master's answer
@@ -1199,7 +1562,7 @@ setxx, del, add, sub, expire and their RESP forms.  A hash write, a JSON
 write and mset still run through on the node the client wrote on.  In
 `spread` (0.7.1) a through collection lives at the key's K HOLDERS: a
 miss on any other node pulls from a holder, which fetches from the
-upstream and keeps the copy (a second holder fills on its own demand -
+upstream (read-only or written through, since 0.7.5) and keeps the copy (a second holder fills on its own demand -
 at most K copies, never one per node); a write-through runs on the node
 the client wrote on and its read-back is pushed to the K holders.  The
 drain sweep (`updrain`) on every node takes over its own share only -
@@ -1429,9 +1792,10 @@ Each write costs a round trip to the master, and one node sends a
 collection's writes to it one at a time: at a 0.4-0.7 ms round trip that
 is about 1,500-2,500 writes a second per node and collection, whatever
 Redis can take, and a slow write holds the ones behind it.  `MULTI`/`EXEC`
-stay unsupported.  The RESP door is plaintext and no TLS is planned for it
-for now: under `through` it can write to Redis, so keep it on a trusted
-segment, behind `resp_allow` and `[secrets] resp`.
+stay unsupported.  Under `through` the RESP door can write to Redis, so
+keep a plaintext one on a trusted segment, behind `resp_allow` and
+`[secrets] resp`, or serve it over TLS (0.7.5, "TLS on the RESP and
+HTTP doors" below).
 
 ### Other settings worth knowing
 
@@ -1495,10 +1859,11 @@ segment, behind `resp_allow` and `[secrets] resp`.
   cannot honour is logged once and shown as `replicas_short` on
   `/stats`, `/metrics` and the status page.
 - `plaintext = loopback` under `[listen]` allows plaintext binary
-  frames and RESP on 127.0.0.1/unix only - handy for debugging (netcat
-  or redis-cli can drive the RESP side; the native protocol needs
-  perfcli or libperfd); the LAN stays on the Noise channel.  The
-  default (`never`) asks every client for the secret.
+  frames and RESP on loopback listeners (127.0.0.0/8, `[::1]`) and unix
+  sockets only - handy for debugging (netcat or redis-cli can drive the
+  RESP side; the native protocol needs perfcli or libperfd); the LAN
+  stays on the Noise channel.  The default (`never`) asks every client
+  for the secret.
 - **`encrypt = no | yes`** under `[listen]` (0.7.4): whether the native
   door's requests are encrypted once a client is in.  Every connection
   still opens with the client secret's Noise handshake - the secret is
@@ -1520,9 +1885,12 @@ segment, behind `resp_allow` and `[secrets] resp`.
   that must reach the cluster over a network.  It is RESP2 ONLY - the
   native protocol (and with it the admin verbs) is refused on it -
   and because a Redis client cannot speak the Noise channel it is
-  plaintext, so it is guarded instead: `resp_allow = <cidr>[,...]` is
+  plaintext unless given `tls` (below), so it is guarded instead: `resp_allow = <cidr>[,...]` is
   REQUIRED off-box (the daemon refuses to start without it),
-  `[secrets] resp` adds a Redis `AUTH` password, and
+  `[secrets] resp` adds a Redis `AUTH` password (without one, `-C` and
+  the start warn, 0.7.5: any client the allow-list admits reads and
+  writes; an HTTP door off loopback without `[secrets] http` is warned
+  about the same way), and
   `resp_collections` bounds which collections it can see and maps the
   Redis database index onto them: an entry `0:sessions` makes `SELECT 0`
   reach the collection `sessions`, and a bare name is reachable by that
@@ -1552,6 +1920,48 @@ segment, behind `resp_allow` and `[secrets] resp`.
   on `/stats`, `perfcached_command_calls_total{cmd}` /
   `perfcached_command_usec_total{cmd}` and the
   `perfcached_command_latency_seconds{cmd}` histogram on `/metrics`.
+- **TLS on the RESP and HTTP doors (0.7.5).**  `resp = <addr:port> tls`
+  and `http = <addr:port> tls` serve the same door over TLS, so the
+  Redis `AUTH` password and the HTTP token stay off the wire; a
+  plaintext loopback door can stay beside a TLS one.  `[listen] tls_cert`
+  (PEM, the chain after the certificate) and `tls_key` name the pair -
+  the certificate must name the address clients dial, an IP SAN for an
+  IP - and `tls_min = 1.2 | 1.3` (1.2) the oldest version taken.  It
+  needs a build with OpenSSL: `PC_TLS = auto`, the default, uses it when
+  pkg-config finds it, and `perfcached -V` prints `tls: OpenSSL ...` or
+  `tls: off`.  The native door has Noise and takes no `tls`.  `-C` and
+  the start load the pair and check that the key matches.  A reload reads
+  the pair again, so a renewal is `systemctl reload perfcached`: the next
+  connection gets the new certificate, the open ones keep theirs, and a
+  pair that does not load keeps the old one and fails the reload with
+  OpenSSL's reason.  `/stats` has a `tls` block (the library, the
+  certificate, `days_left`, handshakes, failed ones and the last reason;
+  the dashboard's `tls` card shows the days left, amber inside 14),
+  and the alert `tls.cert` is a warning inside 14 days of the expiry,
+  critical once it has passed.  A plaintext RESP or HTTP door off loopback
+  with `[secrets] resp` or `http` is warned about at start;
+  `auth_needs_tls = yes` refuses `AUTH` and the token there (`-ERR AUTH
+  needs TLS here ...`, HTTP 403) and takes them over TLS and from
+  loopback.  Clients:
+
+      redis-cli --tls --cacert /etc/ssl/perfcached-ca.pem -h 192.0.2.31 -p 6380 --askpass
+
+      # redis-py
+      redis.Redis(host="192.0.2.31", port=6380, password=pw,
+                  ssl=True, ssl_ca_certs="/etc/ssl/perfcached-ca.pem")
+
+      // phpredis 5.3 or later
+      $r->connect("tls://192.0.2.31", 6380, 2.5, null, 0, 0,
+                  ["stream" => ["cafile" => "/etc/ssl/perfcached-ca.pem"]]);
+      // predis
+      new Predis\Client("tls://192.0.2.31:6380?ssl[cafile]=/etc/ssl/perfcached-ca.pem");
+
+      # Prometheus
+      - job_name: perfcached
+        scheme: https
+        tls_config: { ca_file: /etc/prometheus/perfcached-ca.pem }
+        authorization: { credentials_file: /etc/prometheus/perfcached-token }
+        static_configs: [{ targets: ["192.0.2.31:8443"] }]
 - **IPv6 on the client doors (0.7.2).**  `tcp`, `resp` and `http` take
   an IPv6 address: `[::1]:6480` listens on IPv6 loopback, `[::]:6480` on
   every address of both families - an IPv4 client of it arrives as
@@ -1575,6 +1985,22 @@ segment, behind `resp_allow` and `[secrets] resp`.
 - `arena_cap_mb` lets the arena grow elastically under pressure - by
   2 MB group inside one address-space reservation, on the same tier as
   the initial commit; `reclaim_*` returns idle groups to the kernel.
+- **Two ways to run the memory (0.7.5).**  *Held*, the default: the
+  arena is locked (`pin = auto`, or `require` to refuse a start that
+  cannot lock it), on huge pages where the host has them - never
+  swapped.  The give-back still runs: an idle 2 MB group is unlocked
+  before it goes back to the kernel and locked again when records bring
+  it back, so on transparent huge pages `arena_committed` follows the
+  load and `perfcached_reclaim_giveback_disabled` stays 0 (it turns 1
+  only once the kernel has refused a give-back).  *Unlocked*: `pin = no`
+  with `huge_pages = off`, `arena_mb` at the steady working set and
+  `arena_cap_mb` for the bursts - nothing is locked, at the price of
+  pages the kernel may swap and growth that faults pages in.  Either
+  way `reclaim_*` returns free 2 MB groups once they have been quiet for
+  `reclaim_quiet_s` (5 s) and nothing was carved for `reclaim_cooloff_s`
+  (10 s), keeping `reclaim_keep` (1) drained chunk per size class.  A
+  reserved huge-page pool stays reserved whatever the arena hands back -
+  the host gains nothing - so the unlocked way runs on the 4K tier.
 - A reserved hugepage pool makes the arena's top tier deterministic -
   see [contrib/sysctl-perfcached.conf](contrib/sysctl-perfcached.conf),
   and read back `HugePages_Total` after applying: live hosts routinely
@@ -1604,10 +2030,10 @@ daemon's exact figures; this is how to do it before the daemon exists.
 
    | buckets_log2 | buckets | index | per bucket |
    |---|---|---|---|
-   | 4 .. 12 | 16 .. 4,096 | 1.25 MB | - |
-   | 16 | 65,536 | 5.0 MB | 80 B |
-   | 18 | 262,144 | 17.8 MB | 71 B |
-   | 20 | 1,048,576 | 68.8 MB | 69 B |
+   | 4 .. 12 | 16 .. 4,096 | 1.0 MB | - |
+   | 16 | 65,536 | 4.75 MB | 76 B |
+   | 18 | 262,144 | 17.5 MB | 70 B |
+   | 20 | 1,048,576 | 68.5 MB | 68.5 B |
    | 24 | 16,777,216 | 1.1 GB | 68 B |
 
    So anything below 12 buys nothing over 12, and the top of the range
@@ -1668,11 +2094,23 @@ daemon's exact figures; this is how to do it before the daemon exists.
    holds other modes.  The sizing itself stays each member's: under `auto`
    a member sizes the table for the share of the keys it holds.  A create or a resize whose index would not fit under
    the ceiling in item 4 is refused, naming both figures.
+   A read-through collection carves one more table for each upstream
+   server, configured or discovered (a Redis Cluster's nodes, the servers
+   a Sentinel or a master's ROLE names): its fetched copies, sized like
+   the collection's own - 1.0 MB at the least.  A six-node cluster
+   behind three collections is 18 such tables, 18 MB, before a copy is
+   held.  A server whose table does not fit is not used, and the log
+   says so; a copy that does not fit is not kept: the read that fetched
+   it is answered the value all the same, and the next read of the key
+   fetches again (`fill_failed` in the collection's upstream block counts
+   them).  A change to such a key needs room for it here, and is refused
+   without it.
 2. **Records.**  A record is its key, its value and a 28-byte header,
-   rounded UP to a cell class.  The classes step by 1.5 and 1.33 from
-   64 bytes to 64 KB (64, 96, 128, 192, 256, 384, 512, 768, 1 K, 1.5 K,
-   2 K, 3 K, 4 K, 6 K, 8 K, 12 K, 16 K, 24 K, 32 K, 48 K, 64 K) and then
-   to 96 K and 255.9 K, so the rounding is anywhere from 0 to 50 % - and
+   rounded UP to a cell class.  The classes step by at most 1.5 from
+   64 bytes to 64 KB (64, 96, 128, 192, 256, 320, 384, 448, 512, 640,
+   768, 896, 1 K, 1.5 K, 2 K, 3 K, 4 K, 6 K, 8 K, 12 K, 16 K, 24 K, 32 K,
+   48 K, 64 K) and then to 96 K and 255.9 K - 27 classes - so the
+   rounding is anywhere from 0 to 50 % - and
    up to a whole 256 KB chunk for the last two, which are cut one and
    two cells to a chunk.  **The largest record is 262,080 bytes**, key
    and header included: one cell per chunk, which is the most a 256 KB
@@ -1681,8 +2119,8 @@ daemon's exact figures; this is how to do it before the daemon exists.
    94 MB.  Budget 1.5 x the key+value bytes for a mixed set, or bin by
    bin from your own size histogram.
 3. **Residue after a burst.**  About 10 MB of warm free slots kept
-   resident for the next growth, and up to 10.5 MB of chunks the size
-   classes own (two 256 KB chunks per class).
+   resident for the next growth, and up to 13.5 MB of chunks the size
+   classes own (two 256 KB chunks for each of the 27 classes).
 4. **The ceiling.**  1 + 2 + 3 at the PEAK must fit under `arena_mb` (or
    `arena_cap_mb`): a full arena refuses writes and evicts nothing.  An
    overwrite whose value fits the cell the key already holds still
@@ -1710,7 +2148,7 @@ chunks, warm free), the budget card, and `resident` from the kernel.
 
 ### Example configurations
 
-[contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md) - ten complete
+[contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md) - eleven complete
 files, each validated with `perfcached -C`:
 
 - **single node**: minimal; for Redis clients (the RESP door with its
@@ -1721,16 +2159,19 @@ files, each validated with `perfcached -C`:
 - **fleets**: eager; store (pull-on-miss); proxy (the capacity plane);
   shard behind cluster-aware Redis clients; spread with `replicas`.
 - **two fleets on one host**: a second daemon in a second cluster.
+- **a cloud or Kubernetes**: an eager fleet found by unicast seeds, no
+  multicast.
 
 ## Operating it
 
 ### Watching it
 
-`http = <addr:port>` under `[listen]` serves the status page - one page
-per node, the fleet's view - and beside it `/stats` (what the `stats`
-verb answers, as JSON), `/metrics` for Prometheus, `/members`, and
+`http = <addr:port>` under `[listen]` serves `/stats` (what the `stats`
+verb answers, as JSON), `/metrics` for Prometheus, `/members`,
 `/clients` (this node's connections: the table behind the page's clients
-strip).  The page's headline strip reads `clients 123 / 1,000
+strip) and `/health`.  The status page - one page per node, the fleet's
+view - is perfcached-dashboard's since 0.7.0 (below; `GET /` on the
+daemon answers 410).  The page's headline strip reads `clients 123 / 1,000
 fleet-wide` - this node over the fleet, the denominator summed from the
 map every member gossips its count into, absent on a standalone daemon
 - and clicking it opens this node's connections (door, dialect, wire,
@@ -1746,7 +2187,8 @@ figure shows the fleet's total first and this node's share beside it
 gossips (its own client hits and misses, so a pull served for a peer
 counts once), joined by the name's hash; entries summed that way count
 copies, and the cell says so.
-`http_allow` bounds who may reach it and `[secrets] http` adds a token -
+`http_allow` bounds who may reach it and `[secrets] http` adds a token (over
+TLS with `http = <addr:port> tls`, under "TLS on the RESP and HTTP doors") -
 sent as `Authorization: Bearer <token>`, or by a browser as its own login
 (any user name, the token as the password: the 401 asks for it).
 `http_rate` (20 requests a second per address, loopback exempt) answers
@@ -1787,7 +2229,7 @@ addresses.
 Sending runs on its own thread with a bounded queue, so a slow or dead
 mail server never holds a worker; `timeout_s` (30) bounds one send.
 `perfcli -E <enable secret> mailtest` sends one mail now and prints the
-server's answer - `{"sent": true, "reply": "250 ..."}`, or `false` with
+server's answer - `{"sent":true,"reply":"250 ..."}`, or `false` with
 what the server or the connection said (a wrong password's `535`, a
 server offering no STARTTLS, a timeout).  `/stats` `mail` carries
 `built`, `ready`, `sent`, `failed`, `dropped` (the queue was full),
@@ -1801,7 +2243,8 @@ max_datagram` (0.7.4: a member that sends larger datagrams depends on
 fragmentation the others avoid), and for each
 read-through collection `upstream_writes`, `upstream_prefixes`,
 `upstream_role` and `upstream_unknown` - a member on `allow` beside
-members on `through` takes writes that never reach Redis.  Per setting,
+members on `through` takes writes that never reach Redis - and which
+collections are caches (`durable = no`, `config.caches`).  Per setting,
 the value most live members hold is the fleet's (with two members, each
 holds its own); every node raises `config.<setting>` naming the member
 that holds another, its fleet card says "settings differ from this node",
@@ -1820,9 +2263,14 @@ it already keeps:
 | WAL fsync's mean over the last minute above 4x the start-up probe | warning | after 5 minutes of it | after a minute below |
 | the WAL filling faster than snapshots free it - the whole log fills faster than one snapshot takes, or its free segments last under twice the last snapshot's duration (`wal.capacity`, 0.7.2) | warning | after a minute of the first, 5 minutes of the second | after 5 minutes without |
 | writes refused, the arena full | critical | the second it happens | after 5 quiet minutes |
-| the arena under 10% free (under 1%: at its ceiling) | warning (critical) | after 30 s | after a minute above |
+| the arena holding over `[alerts] arena_warn_pct` (65) / `arena_crit_pct` (75) of its ceiling (`memory.arena`) | warning / critical | after a minute | after a minute below |
+| the host's CPU, the disk holding the WAL (else the `state_dir`) or the host's memory over `[alerts] cpu_warn_pct`, `io_warn_pct`, `memory_warn_pct` (65) / the `_crit_pct` (75) over the last minute (`host.cpu`, `host.io`, `host.memory`) | warning / critical | after 5 minutes (memory: a minute) | after a minute below |
+| the TLS doors' certificate within 14 days of its expiry, or past it (`tls.cert`, 0.7.5) | warning / critical | at once | a minute after a renewal |
 | new connections refused at the memory floor (`clients.refused`, 0.7.4) - what is available, the floor, the arena's reserve and the limit with where it comes from | warning | the second the guard refuses | after a minute admitting again |
 | a read-through upstream unreachable, or its tracking off | warning | after a minute | after a minute back |
+| no upstream of a read-through collection serves, of several (`upstream.<col>`) | critical | after a minute | after a minute back |
+| a read-through collection failed over from its primary (`upstream.<col>.failover`), or reading from the master because no replica serves (`upstream.<col>.master`) | warning | after 10 s | after 10 s back |
+| another perfcached reads a read-through collection through this node - a daisy-chain (`chain.<col>`) | warning | at once | after 5 quiet minutes |
 | a write-through collection without a master: every write refused (`write.<col>`) | critical | after 10 s | after 10 s back |
 | no RedisJSON on the write-through master (`write.<col>.json`) | warning | after 10 s | after a minute back |
 | writes refused at a full write-through queue, or not applied after waiting too long in it (`write.<col>.queue`) | warning | after 10 s | after 5 minutes without |
@@ -1833,8 +2281,11 @@ it already keeps:
 | deletes or expiries the tombstone cap dropped before `tombstone_retain_s` in the last 5 minutes, the text saying how many of each (`cluster.tombstones`) | warning | after 10 s | 5 minutes after the 5-minute count is back to 0 |
 | a member back after a silence longer than the retained deletes cover (`cluster.peer_absent`) - or, where members acknowledge deletes (0.7.3), one asked to rebuild for it | warning | once | - |
 | a member whose mark of a node's deletes has stood still for 30 s while the others confirm them - every delete since is kept for it (`cluster.acks_stuck`, 0.7.3) | warning | after 10 s | after a minute moving |
+| on the master, a joiner still `connecting` 10 s after its admission - a pair of links with it has not answered both ways; the text names the pairs and what did not answer: the cluster socket, the relay port, the frame lane, the relay port's TCP (`clrpt`) or a member's bulk listener (`cluster.admission_stuck`, 0.7.5) | warning | at once | 30 s after none is held |
+| a member silent, failed, stalled, gone or dropped (`fleet.node<id>`); members missing against the fleet's size (`fleet.missing`); fewer ready than a majority (`fleet.majority`) | warning; warning; critical | after 30 s (a goodbye: a minute); after a minute; after a minute | after 30 s |
 | a setting the fleet must agree on held differently by a member (`config.<setting>`, 0.6.5) | warning | after a minute | after a minute agreeing |
 | a member holding other autoscale modes than this node's, or one too old to take them while modes are set (`cluster.autoscale`, 0.7.2) | warning | after 30 s | after a minute agreeing |
+| the TLS doors' certificate inside 14 days of its expiry, or past it (`tls.cert`, 0.7.5) | warning (critical once expired) | at once | after a minute outside the 14 days |
 | the node started (ready to serve) | info; warning after an unclean stop | once | - |
 
 A level says how soon a person must act, not how bad the event was:
@@ -1859,8 +2310,8 @@ A mail has a plain-text part and an HTML part (inline styles, no
 images or links to fetch) and reads like this:
 
 ```
-From: "au-dev-perfcached1" <perfcached@example.net>
-Subject: WARNING: WAL fsync slow on au-dev-perfcached1
+From: "cache1" <perfcached@example.net>
+Subject: WARNING: WAL fsync slow on cache1
 ```
 
 The subject is `<STATE>: <title> on <host>`, at most 78 characters -
@@ -1868,7 +2319,7 @@ CRITICAL, WARNING, INFO, or RESOLVED - with `(+N)` when the mail carries
 N more; From's name is the host the alerts are about.  The body says,
 per alert, what happened, its status (a new problem, still open,
 resolved, or an event), when it started, what the node does by itself,
-what to do, and the alert's ID (`wal.fsync`, `upstream.0`, ...).  A
+what to do, and the alert's ID (`wal.fsync`, `upstream.sessions`, ...).  A
 RESOLVED mail says what was wrong at its worst, the value now and how
 long it lasted, and answers its problem's mail (`In-Reply-To`), so a mail
 client shows the two together.
@@ -1902,16 +2353,16 @@ A collection can be created and dropped while the daemon serves, so a
 new keyspace does not need a config edit on every node and a fleet
 restart:
 
-    perfcli create sessions            # 2^12 buckets by default
-    perfcli create sessions 16         # or say the size
-    perfcli drop sessions              # refused while it holds records
-    perfcli drop sessions force        # dropped with them
+    perfcli -E <enable> create sessions        # 2^12 buckets by default
+    perfcli -E <enable> create sessions 16     # or say the size
+    perfcli -E <enable> drop sessions          # refused while it holds records
+    perfcli -E <enable> drop sessions force    # dropped with them
 
 A collection can also be resized in either direction and renamed, both
 while it serves:
 
-    perfcli resize sessions 16         # either direction
-    perfcli rename sessions_restored sessions
+    perfcli -E <enable> resize sessions 16     # either direction
+    perfcli -E <enable> rename sessions_restored sessions
 
 A resize fills a second table at the new size from the live one, swaps
 the two in one step, and collects what the swap window left behind; the
@@ -1957,11 +2408,11 @@ off-box and would put the highest-value secret in the fleet on the wire
 in the clear. The privilege lives on that connection, dies with it, is
 never replicated, and is never consulted when a peer applies DDL the
 fleet already agreed. Failed attempts are counted as
-`stats.door.enable_fails`, and after `enable_lockout_after` of them from
+`stats.resp.enable_fails`, and after `enable_lockout_after` of them from
 one address within `enable_lockout_s` seconds (5 in 60 by default) that
 address's `enable` is refused for the window - "too many wrong enable
-secrets from this address" - whatever sends them; `door.enable_lockouts`
-and `door.enable_refused` count the lockouts and the refusals.
+secrets from this address" - whatever sends them; `resp.enable_lockouts`
+and `resp.enable_refused` count the lockouts and the refusals.
 
 **Fail-closed:** with no `enable` secret configured, `enable` always
 fails and those verbs are unreachable from the client door **however
@@ -1994,7 +2445,15 @@ again and applies what a running daemon can take, without a restart:
 - `[secrets] http`, `resp` and `enable` - the next request or AUTH;
 - `[secrets] client` - every handshake after the reload needs one of the
   new secrets; a connection already open keeps its session;
-- `[daemon] log_level` and `slowlog_usec`.
+- `[daemon] log_level` and `slowlog_usec`;
+- `[listen] auth_needs_tls` - the next AUTH or request (0.7.5);
+- `[listen] tls_cert`, `tls_key` and `tls_min` - read again on every
+  reload while a TLS door is open, changed or not, since a renewal
+  changes the files and not the config; the next connection gets the new
+  pair (0.7.5);
+- the files a `rediss://` upstream names (`upstream_tls_ca`, `_cert`,
+  `_key`) - read again on every reload; naming other files takes a
+  restart (0.7.5).
 
 Anything else that changed - the cluster mode, a listener's address, a
 collection, the memory, `[secrets] cluster`, ... - refuses the reload
@@ -2173,16 +2632,17 @@ there, no helper there, a request already waiting), and
 `upgrade_status.asked` on the asking node shows the answer.  A member's
 ask is never forced.
 
-**Rolling a fleet (0.7.0, DESIGN 12ns).**  `perfcli upgrade` is the roll
+**Rolling a fleet (0.7.0).**  `perfcli upgrade` is the roll
 driver: a program with a journal and no state of its own, reading the
 fleet before every step.
 
-    perfcli -h <seed> -E <enable> upgrade plan perfcached-0.7.0.tar.gz version=0.7.0
-    perfcli -h <seed> -E <enable> upgrade start
-    perfcli -h <seed> -E <enable> upgrade status | abort | resume | rollback
+    perfcli -h <seed host> -p <port> -E <enable> upgrade plan perfcached-0.7.0.tar.gz version=0.7.0
+    perfcli -h <seed host> -p <port> -E <enable> upgrade start
+    perfcli -h <seed host> -p <port> -E <enable> upgrade status | abort | resume | rollback
 
 `plan` records the artifact, its sha256, the version and the seed in
-`~/.perfcached/upgrade-<seed>.journal` (`journal=` names another).
+`~/.perfcached/upgrade-<host>_<port>.journal` (the seed's address;
+`journal=` names another).
 `start` stages the build on the seed, waits until every member holds it
 (the daemons relay and verify it), then rolls one node at a time:
 members by id, the backup, the master last - the order recomputed before
@@ -2203,9 +2663,14 @@ skipped: the roll stops until it is back.  `switch_cmd=<program>` replaces
 the daemon's switch and revert verbs with a program of yours (`<program>
 switch|revert <addr> <port> <node> <artifact> <sha256>`) - what the CI
 roll uses with a loopback fleet, and what a package host could use with
-its package manager.
+its package manager.  A roll leaves the fleet on its committed wire
+epoch: once every node runs a build that speaks a newer one beside it,
+`upgrade commit epoch=<n>` raises it ("The wire epoch" above).  A release
+that speaks no epoch of the fleet's, as 0.7.5 does not of 0.7.4's, is no
+roll: `upgrade plan` refuses it, and every node is stopped and started on
+the new build.
 
-**Going back (0.7.0, UP7b).**  The helper keeps the prefix it switched
+**Going back (0.7.0).**  The helper keeps the prefix it switched
 away from, and `upgrade_status` says so: `previous` is its last switch
 (`from`, `to`, `at`, read from its results), `live_prefix` the prefix this
 process runs from, and `switching` a request the helper has taken and not
@@ -2219,8 +2684,8 @@ newest ok result switched from - and then takes the same path as a
 switch: stop, carry the state, switch the link, start, wait for ready,
 and switch forward again if the previous build does not come up.  A
 revert's result becomes the new `previous`, so a revert of a revert goes
-forward again.  This is what the roll driver (12ns) uses when a gate
-fails on a node.
+forward again.  This is what the roll driver uses when a gate fails on
+a node.
 
 Every node writes `<state_dir>/upgrade/node`: its pid, version,
 revision, node state and since when.  That is how the helper knows the
@@ -2260,10 +2725,10 @@ line, Ctrl-D quits.
 `pretty on` (or `-P`) re-indents every JSON result - together with the
 JSON path verbs:
 
-    $ perfcli -p 6479 jset sessions user:17 '$' \
+    $ perfcli -p 6479 jset sessions user:18 '$' \
         '{"name":"ann","roles":["admin","ops"],"quota":{"used":3,"max":10}}'
     {"set":true}
-    $ perfcli -p 6479 -P jget sessions user:17 '$.quota'
+    $ perfcli -p 6479 -P jget sessions user:18 '$.quota'
     {
       "found": true,
       "value": {
@@ -2307,15 +2772,18 @@ dumps.
 ### perfload
 
 The loader, the reverse of perfdump: every record goes back with the
-value, the VERSION and the absolute expiry the dump held, through the
+value, its type (string, JSON, hash, rate limit or lock), the VERSION and
+the absolute expiry the dump held, up to the store's record limit, through the
 daemon's write path (the WAL, the eager push), so a fleet of any size
 or mode takes it as if a client had written it - only with the dump's
 history.  Load a three-node eager fleet's dump into a two-node shard
-fleet, or the other way round.
+fleet, or the other way round.  The dump format is version 2 from 0.7.5;
+perfload and `perfdump --inspect` refuse an older dump - take it again
+from the source.
 
-    perfload /var/backups/pc-2026-09-09 --to 192.0.2.10:6479 -a <client secret>
+    perfload /var/backups/pc-2026-09-09 --to 192.0.2.10:6479 -a <client secret> --enable <enable>
     perfload /var/backups/pc-2026-09-09 --to 192.0.2.10:6479 -a <client secret> --dry-run
-    perfload /var/backups/pc-2026-09-09 --to 192.0.2.10:6479 -a <client secret> --collection-map sessions=sessions_restored
+    perfload /var/backups/pc-2026-09-09 --to 192.0.2.10:6479 -a <client secret> --enable <enable> --collection-map sessions=sessions_restored
 
 Every chunk's count and checksum is verified before anything is sent
 (`--no-verify` skips it).  `--threads` (default 4) connections stream
@@ -2337,7 +2805,7 @@ already have the collection.
 
 A chunk is marked done in `DIR/perfload.done` once its last batch is
 acknowledged, and the next run skips it (`--restart` reloads
-everything); with the default policy a re-run over a finished load
+everything); with the default policy a `--restart` over a finished load
 stores nothing and counts everything older, so a loader killed halfway
 is simply run again.  The final line has records, bytes, elapsed,
 records per second and the counts (stored, older, existing, expired,
@@ -2353,7 +2821,7 @@ eight threads, 1.4x faster than plain SET on the same connections.
 ### perfcached-dashboard
 
 The status page, served by its own process (0.6.6).  The daemon's HTTP
-door serves the same page today, but every action a dashboard offers
+door served the same page until 0.7.0, but every action a dashboard offers
 would have widened the daemon's largest attack surface, and a dashboard
 under attack would have stalled the daemon serving it.  So the page
 moved: `perfcached-dashboard` is a client of the fleet's native door
@@ -2518,22 +2986,28 @@ deriving their own.  A server that forks its workers can derive before
 the fork - `perfd_psk_prepare(secrets)` in the parent - and no worker
 derives at all.
 
-**Cluster-aware.** Set `opts.spares` and the library learns the
+**Cluster-aware.** By default (`opts.spares` 0) the library learns the
 fleet on connect, keeps standby connections open to the other nodes,
 and swaps onto one when the node it is using dies - a failover costs a
-`send()` on an established socket, not a TCP+Noise handshake.
+`send()` on an established socket, not a TCP+Noise handshake;
+`PERFD_SPARES_NONE` makes a bare handle.
 `opts.policy` picks where a client works: `FAILOVER` (default),
 `ROUND_ROBIN` (independent random start per client - a thousand
 clients spread with no coordination), `LEAST_CONN` or `WEIGHTED` (by
-the free arena each node reports).  Idempotent verbs are replayed
+the free arena each node reports); these three also move a live handle -
+when a member comes up, one handle in N goes to it at its next call
+(libperfd 0.7.5).  Idempotent verbs are replayed
 across a failover; `add`/`sub` are NOT - the caller is told, because a
 double increment is worse than a visible error.  A member that is back
-up but not READY yet (restarted, replaying and pulling its bootstrap)
-refuses every request with "node is not READY (recovering) - retry, or
+up but not READY yet (restarted, replaying and pulling its bootstrap, or
+still `connecting` after its admission, 0.7.5)
+refuses every request with "node is not READY (recovering or connecting) - retry, or
 use another member"; nothing was applied, so the library (0.7.0) takes
 the request to another member - any verb, a counter update too - and
 marks the refusing one down until the next members refresh sees it
-ready.  `perfd_member_count`,
+ready.  A handle with `opts.pin` (0.7.6; perfcli sets it) never moves:
+every call goes to the node it dialled, and the refusal is the caller's.
+`perfd_member_count`,
 `perfd_active_node`, `perfd_spare_count` and `perfd_failovers` let a
 caller see what it is doing.
 
@@ -2583,7 +3057,8 @@ Every door publishes and subscribes on one global channel space:
 as on Redis, with Redis's subscribed-mode rules and message frames, and
 a subscriber that cannot keep up is closed at the output cap the way
 Redis closes it.  The
-native door has the same five methods, with messages delivered as
+native door has five methods - `subscribe`, `psubscribe`,
+`unsubscribe`, `punsubscribe` and `publish` - with messages delivered as
 NOTIFY frames so a native connection stays multiplexed, and libperfd
 wraps them as
 `perfd_publish`, `perfd_subscribe` and friends with delivery on its
@@ -2628,9 +3103,10 @@ block on `/stats` and `/metrics`.
 
 > **0.4.0's numbers**, except the `spread` farm table, which is still
 > 0.3.7's (re-taking it means a high packet rate across the lab's
-> shared network; it waits for a quiet window).
+> shared network; it waits for a quiet window), and the TLS table,
+> which is 0.7.5's.
 
-Every table below is the tagged 0.4.0 daemon (`570067a`), measured
+Every other table is the tagged 0.4.0 daemon (`570067a`), measured
 2026-10-01, on one server host - a 16-vCPU Debian 13 VM - with the load
 generated elsewhere wherever the harness allows it: the wire table and
 the keys/scan table drive the server from other hosts; the cluster
@@ -2722,8 +3198,7 @@ stored.  Checked with OpenResty 1.25.3.2 on this configuration: the
 second and third requests for a URL were hits and the application saw
 one, each key held a 120-second TTL, and a 300 KB page was served twice
 and stored never.  A module that speaks the native door - encrypted to
-remote nodes, routed to a key's owner - is G7b in DESIGN 12nh, not built
-yet.
+remote nodes, routed to a key's owner - is not built yet.
 
 ### One server against one server, over the wire
 
@@ -2914,7 +3389,7 @@ keys in three) by the boot pull, so it pulls the rest like any
 non-holder: 380,409 GET/s.  0.3.7's run of this table read 2,657,723
 here because its boot pull handed the returning node the WHOLE keyspace
 and the bench window fell before the reclaim trimmed it - that was the
-defect (S156, fixed in 0.4.0), not a speed.  The two modes that have to
+defect (fixed in 0.4.0), not a speed.  The two modes that have to
 go and get the key differ in how: shard unicasts to the one owner,
 proxy consults a locator and broadcasts on a miss.
 
@@ -3017,11 +3492,63 @@ its median is less than half Redis's; and three single cells (one rep
 each) came in far below their siblings - the client host was shared -
 which the medians do not use; the results file keeps them.
 
+### TLS on the RESP door (0.7.5)
+
+What TLS costs a RESP door: `redis-benchmark` 8.0.2 against one node's
+plaintext door and its TLS door, the same process, arms alternated.
+2026-11-06, the 0.7.5 development daemon (`c611430e`, OpenSSL 3.5.7)
+on a bare-metal 2x E5-2690 v2 (one NUMA node, 4 workers, no WAL), the
+client on another of the same model over 10G; 64 connections, 32-byte
+values, a million keys, median of 3
+([bench/results/tlsbench-0.7.5.tsv](bench/results/tlsbench-0.7.5.tsv)).
+TLS 1.3 with AES-256-GCM and the X25519MLKEM768 key exchange, which
+OpenSSL 3.5 picks by default at both ends.  Server CPU is the process's
+own, over each cell.
+
+**No pipelining:**
+
+| | SET (requests/s) | GET (requests/s) | server CPU, SET (us/request) | server CPU, GET (us/request) | SET p50 / p99 (ms) | GET p50 / p99 (ms) |
+|---|---|---|---|---|---|---|
+| plaintext | 315,590 | 324,044 | 11.58 | 11.23 | 0.143 / 0.327 | 0.143 / 0.311 |
+| TLS | 196,194 (-38%) | 199,402 (-38%) | 20.38 (+76%) | 19.68 (+75%) | 0.255 / 0.519 | 0.239 / 0.527 |
+
+**Pipeline 16:**
+
+| | SET (requests/s) | GET (requests/s) | server CPU, SET (us/request) | server CPU, GET (us/request) | SET p50 / p99 (ms) | GET p50 / p99 (ms) |
+|---|---|---|---|---|---|---|
+| plaintext | 2,959,894 | 3,074,086 | 1.33 | 1.29 | 0.287 / 0.559 | 0.247 / 0.535 |
+| TLS | 1,997,004 (-33%) | 2,214,349 (-28%) | 1.98 (+49%) | 1.79 (+39%) | 0.447 / 0.687 | 0.407 / 0.671 |
+
+TLS costs the server 8.5-8.8 us of CPU a request without pipelining and
+0.5-0.65 us at depth 16: a record each way per round trip, so pipelining
+spreads it.  The four workers were the limit in the TLS cells and the
+pipelined plaintext ones (3.8-4.0 cores busy); the plaintext depth-1
+cells ran at 3.5-3.75, so there the throughput drop overstates the
+server's share a little - size by the CPU column.  A profile of the TLS
+depth-1 cell puts 31% of the server's CPU in OpenSSL (libcrypto 19%,
+libssl 12%), with no single hot spot.
+
+**Full handshakes** (8 `openssl s_time -new` clients for 10 s, twice):
+
+| certificate | handshakes (/s) | server CPU (us/handshake) |
+|---|---|---|
+| RSA 2048 | 3,277 | 936 |
+| ECDSA P-256 | 6,931 | 405 |
+
+The server was 2.8-3.1 cores busy, so these rates are bounded by the
+clients as much as by the server; a client that keeps its connections
+pays the handshake once.
+
 ## Compatibility
 
-perfcached is pre-1.0 and makes no compatibility promise between
-releases.  The native protocols, the cluster wire, the write-ahead log
-and the snapshot format can change in any release.  An upgrade across
-such a change means stopping every node, clearing its state and
-starting the new version empty, as from 0.3.x to 0.4.0.  Run one
-version across a fleet, and read a release's notes before upgrading.
+perfcached is pre-1.0.  The native protocols, the cluster wire, the
+write-ahead log and the snapshot format can change in any release, and
+its notes say so.  A change to the cluster wire is a new wire epoch
+(0.7.1).  A build that still speaks the fleet's epoch rolls onto it and
+takes the new one with `upgrade commit epoch=<n>`; one that does not -
+0.7.5, which speaks 4 alone, against 0.7.4's 2 - is a whole-fleet
+restart, named in its notes.  State from 0.4.1 or later has been kept
+across every upgrade since; the upgrades that stopped a fleet whole
+were 0.4.5, 0.7.4.3 (from 0.7.3) and 0.7.5, and there is no path from 0.3.x.  Mixed versions
+are for a roll, not for running: read a release's notes before
+upgrading.

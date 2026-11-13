@@ -1,49 +1,6 @@
 #!/bin/sh
-# mgetfantest.sh - G8 (DESIGN 12nh): an mget across owners.  The node a
-# client asks reads the keys it holds and looks up the rest the way a get
-# does, all at once under one deadline; a key whose node does not answer
-# in time is reported as such, never as a miss.  Five three-node fleets,
-# collection 0 (RESP's database 0), values "v-<key>":
-#  shard   60 keys written through node 1 land on their owners; through
-#          node 1, with 5 keys nobody holds:
-#          A  native mget: 60 found, 5 absent, every value exact
-#          B  RESP MGET: the 60 values and 5 nils, in order
-#          C  MGET then PING in one write: the array first, then +PONG -
-#             the connection waits for the lookups (pipeline order); and
-#             S332, the same for single keys: 60 GETs (the 46 on other
-#             nodes each wait on a pull) and a PING in one write come
-#             back in order, PING last - before 0.7.2 the PING and every
-#             local hit overtook the waiting GETs
-#          D  libperfd: perfd_mget and perfd_mget_ex agree (found / absent)
-#          E  1,600 keys nobody holds - over 1,000 to look up on other
-#             nodes: refused by name, nothing answered as a miss
-#          F  node 3 frozen (SIGSTOP; still a member for seconds): its keys
-#             come back unanswered, the rest found, in one pull timeout -
-#             native and RESP each under twice pull_timeout_ms, not one
-#             per key (24 keys: over 7 s), and not on the old 1 s beat
-#             (300 ms read as 803-1,103; under 600 on both about one run
-#             in eleven); RESP answers -TRYAGAIN naming how many;
-#             perfd_mget fails (PERFD_E_REFUSED), perfd_mget_ex says
-#             which; counted
-#  store   (pull = 1 - without it a get does not ask the fleet either)
-#          10 keys written through each node; through node 1 all 30
-#          found, and asked again nobody is asked (store keeps the copy).
-#          max_pending = 64, both peers frozen so no pull's slot comes
-#          back early: an mget whose lookups would leave the pending
-#          table below its quarter reserve is refused -TRYAGAIN (busy); a
-#          smaller one is taken, and its keys come back unanswered.  (On
-#          a fleet that answers, slots come back while the lookups go
-#          out - the guard reads the table as each takes its slot - so
-#          the 60 are asked and answered: the run before this showed it)
-#  proxy   10 keys through each node; through node 1 all 30 found, twice
-#          (the second time the locator knows where they are)
-#  spread  K = 2: 40 keys through node 1; through each node all 40 found
-#  eager   a fresh fleet, not yet settled: an mget of keys nobody holds
-#          asks (mget_fanout moves) and answers them absent
-# Fail-first: a build without G8 answers the keys on other nodes as
-# misses (A, B, D, store, proxy, spread), has no counters (E, F, eager)
-# and no perfd_mget_ex (the client does not build).
-# Usage: test/mgetfantest.sh [./perfcached] [./mgetextest]
+# mgetfantest.sh - an mget across owners: the asked node reads what it holds and looks up the rest
+# at once under one deadline; a key whose node does not answer is reported so, never as a miss.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -59,16 +16,8 @@ PT=300                                  # pull_timeout_ms
 
 DRV="$D/drv.py"
 cat > "$DRV" <<'EOF'
-# fill <port> <prefix> <from> <to>: native sets of <prefix>NNN = v-<key>
-# nmget <port> <prefix> <n> <m> [<absent-prefix>]: native mget of n keys
-#   and m nobody holds -> found= absent= unanswered= bad= ms=, or err=<text>
-# rmget <port> <prefix> <n> <m> [<absent-prefix>]: RESP MGET -> found=
-#   nil= bad= ms=, or err=<the error line> ms=
-# rpipe <port> <prefix> <n>: RESP MGET + PING in one write -> first= second=
-# rgets <port> <prefix> <n>: n RESP GETs + PING in one write -> inorder=
-#   (replies matching their GET, counted until the first that does not) last=
-# cstat <port> <field>: stats.cluster.<field>;  ent <port>: collection 0's entries
-# state <port>: <peers up>/<node state>
+# drv.py fill|nmget|rmget|rpipe|rgets|cstat|ent|state <port> ...: native and RESP fill,
+# MGET and pipelining probes, each printing KEY=VALUE fields
 import json, pcnative, socket, sys, time
 
 def keys(prefix, n, m, absent="zz"):

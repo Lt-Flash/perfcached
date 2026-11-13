@@ -1,23 +1,6 @@
 #!/bin/sh
-# ratelimittest.sh - S314: RL.HIT, an atomic sliding-window rate limiter.
-#
-# One command for what a Redis client does as MULTI { ZADD k now now;
-# ZREMRANGEBYSCORE k -inf now-window; ZCOUNT; EXPIRE } (DESIGN 12aa / 12ic):
-# record the hit, drop what fell out of the window, answer [count, allowed].
-#   1  one node: the count and allowed at the limit's edge; TYPE ratelimit,
-#      GET WRONGTYPE; the window expiring; the TTL; the native rlhit verb;
-#      bad arguments; a restart keeps the record, typed, still counting
-#   2  an eager fleet of three: hits through ALL THREE nodes on one key are
-#      counted in ONE table (the deciding node - a forwarded hit's reply
-#      comes back on RESP and on the native door), and the record reaches
-#      every node typed
-#   3  the 0.4.4 gate: a member that does not advertise the type keeps
-#      RL.HIT refused, naming it; when it leaves, RL.HIT works.  The older
-#      member is the second argument, or - by default, so CI runs it - a
-#      variant of THIS tree built without the ALIVE feature byte, which is
-#      exactly the frame 0.4.3 sends (epochtest's way of testing two builds)
-# Fail-first: before S314 there is no RL.HIT at all.
-# Usage: test/ratelimittest.sh [./perfcached] [older-perfcached-for-part-3]
+# ratelimittest.sh - RL.HIT, an atomic sliding-window rate limiter: one node, an eager fleet counting in
+# one table, and the gate keeping it refused while a member does not advertise the type.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -116,6 +99,18 @@ fleet() { # every listed node sees all the others
 	done
 	return 1
 }
+formed() { # every listed node ready and seeing the others (a CONNECTING joiner is listed already), up to 30 s
+	i=0; while [ $i -lt 300 ]; do
+		good=1
+		for x in "$@"; do
+			fs=$(curl -s "http://127.0.0.1:1875$x/stats" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), d["cluster"].get("peers_up"))' 2>/dev/null)
+			[ "$fs" = "ready $(($# - 1))" ] || good=0
+		done
+		[ $good = 1 ] && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	return 1
+}
 
 # ---- 1. one node ----------------------------------------------------------
 echo "part 1: one node"
@@ -151,7 +146,7 @@ echo "part 2: an eager fleet of three"
 for n in 1 2 3; do rm -rf "$D/s$n"; conf $n yes; done
 for n in 1 2 3; do start $n "$BIN" || exit 1; done
 fleet 1 2 3 || { bad "the fleet did not form"; echo "ratelimittest: $pass passed, $fail failed"; exit 1; }
-sleep 2
+formed 1 2 3
 out=""
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do n=$(( (i - 1) % 3 + 1 )); out="$out $(r $n RL.HIT shared 30000 10)"; done
 want=" [1,1] [2,1] [3,1] [4,1] [5,1] [6,1] [7,1] [8,1] [9,1] [10,1] [11,0] [12,0]"
@@ -166,20 +161,14 @@ e=$(cat "$D"/n*.log | grep -cE ' (ERROR|CRIT)')
 [ "$e" = 0 ] && ok "   no ERROR/CRIT" || bad "   $e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/n*.log | head -2)"
 for n in 1 2 3; do stopn $n; done
 
-# ---- 3. the 0.4.4 gate ----------------------------------------------------
+# ---- 3. the type gate: an older member is argument 2, else this tree built without its feature byte
 if [ -z "$OLD" ]; then
 	echo "--- building the no-features variant (the frame 0.4.3 sends)"
 	mkdir -p "$D/t"
 	tar -cf - --exclude=./.git --exclude='*.o' --exclude='*.a' . 2>/dev/null |
 		(cd "$D/t" && tar -xf -) || { bad "cannot copy the tree"; exit 1; }
-	# the frame 0.4.3 sends ends reason, epoch: S314's features byte,
-	# 0.5.7.1's sole_witness (2) and AR11's settings group behind it all go
-	# - left in, a stock reader takes sole_witness' high byte for the
-	# features byte, and a witness id over 255 reads as a node that has the
-	# feature (the 0.5.7.1 red).  The reason byte is counted from the FRONT
-	# since AR11, so only the shortest-frame guard moves.  12ny AT-4's
-	# group (features32 and the marks) rides behind the settings, opened by
-	# the same guard (in->ext): both go
+	# the older frame ends at reason, epoch: the features byte, sole_witness, the settings group and the
+	# marks group behind it all go (left in, sole_witness' high byte would read as the features byte)
 	sed -i '/pc_w8(&c, (unsigned)in->features);/d; /pc_w16(&c, (uint16_t)in->sole_witness);/d;
 		s/if (in->ncfg > 0 || in->ext) {/if (0) {/; s/if (in->ext) {/if (0) {/;
 		s/if (len < 88 + 15)/if (len < 88 + 12)/' \
@@ -202,7 +191,7 @@ if [ -n "$OLD" ] && [ -x "$OLD" ]; then
 	for n in 1 2 3; do rm -rf "$D/s$n"; conf $n yes; done
 	start 1 "$BIN" && start 2 "$BIN" && start 3 "$OLD" || exit 1
 	fleet 1 2 3 || { bad "the mixed fleet did not form"; echo "ratelimittest: $pass passed, $fail failed"; exit 1; }
-	sleep 2
+	formed 1 2 3
 	g=$(r 1 RL.HIT gk 10000 5)
 	case "$g" in *"RL.HIT needs every node in the fleet on 0.4.4 or later - node "*) ok "3. with an older member: $g";;
 		*) bad "3. with an older member RL.HIT answered: $g";; esac

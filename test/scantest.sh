@@ -1,11 +1,6 @@
 #!/bin/sh
-# scantest.sh — S9 verification: keys/scan over a live daemon.
-# The core obligation: a cursored scan loop run DURING a concurrent
-# write/delete storm (with linear-hash growth happening underneath)
-# returns every stable key at least once.  Plus: glob correctness against
-# python's fnmatch as an independent reference, limit/truncated, values
-# mode with binary keys+values, TTL filtering, and the red paths.
-# Usage: test/scantest.sh [./perfcached]
+# scantest.sh - keys/scan over a live daemon: a cursored scan during a write/delete storm (with growth
+# underneath) returns every stable key at least once; plus globs vs fnmatch, limits, values, TTL, red paths.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 
@@ -97,10 +92,8 @@ def full_scan(**kw):
 def buckets():
     return c.call("stats", col="th")["result"]["collections"][0]["buckets"]
 
-# S330: a storm miss is a race, gone by the time anyone looks - so say on
-# the spot whether each missed key is still in the table (a walk that
-# passed it by) or gone (a write lost), and what the leg and the resize
-# were doing.  The daemon log's tail follows from the shell on a failure.
+# a storm miss is a race gone by the time anyone looks: say on the spot whether each
+# missed key is still in the table (a walk passed it by) or gone (a write lost)
 def explain(missing):
     try:
         for k in missing[:5]:
@@ -115,9 +108,8 @@ def explain(missing):
         print("   (could not explain: %r)" % e)
 
 try:
-    # round 0 immediately, then WAIT for linear-hash growth to start (the
-    # maintenance tick is 1/s), then two more rounds that provably overlap
-    # live bucket splitting - the resize-stability half of the guarantee
+    # round 0 now, then WAIT for linear-hash growth to start (the maintenance tick is
+    # 1/s), then two more rounds that overlap live bucket splitting
     seen = set(full_scan())
     missing = [k for k in STABLE if k not in seen]
     check("storm scan 0: all stable keys seen", not missing,
@@ -158,10 +150,8 @@ r = c.call("keys", col="th", match="no-such-*")["result"]
 check("no match: empty, not truncated",
       r["keys"] == [] and r["truncated"] is False, r)
 
-# values mode + a genuinely binary KEY (a real NUL: the key goes out as
-# its UTF-8 bulk) and a binary VALUE (written b64 with enc, which
-# pcnative decodes and drops - the bytes go as bytes): the scan reply
-# carries both as bulks, the bytes themselves and no k_enc/enc sibling
+# values mode with a binary KEY (a real NUL) and a binary VALUE: the scan reply carries
+# both as bulks, the bytes themselves and no k_enc/enc sibling
 raw_k = "zk\x00ey"           # the daemon stores a real NUL
 raw_v = b"val\xff\x00!"
 r = c.call("set", col="th", key=raw_k,
@@ -184,14 +174,8 @@ time.sleep(2.2)
 r = c.call("keys", col="th", match="dying")["result"]
 check("expired key filtered", r["keys"] == [], r)
 
-# S88 CROSS-COLLECTION: the limit is PER COLLECTION, so a large first
-# collection must not hide the others.  It used to.  One budget shared
-# across the result and drawn down in registry order meant `th` - which
-# holds 5000 keys here - spent all of it, the outer loop stopped, and
-# the reply named neither zz1 nor zz2.  Worse, `matched` was counted
-# inside that loop, so a glob that matched THREE collections reported
-# matched=1: the reply did not merely omit them, it said they did not
-# match.  Reported from the field 2026-09-14.
+# CROSS-COLLECTION: the limit is PER COLLECTION, so a large first collection
+# must not hide the others
 for i in range(5):
     c.call("set", col="zz1", key="z%d" % i, value="v", ttl=600)
     c.call("set", col="zz2", key="z%d" % i, value="v", ttl=600)
@@ -199,10 +183,8 @@ r = c.call("keys", col="*", limit=10)["result"]
 cols = r.get("collections", {})
 check("keys * lists every matched collection, not just the first",
       set(cols) >= {"th", "zz1", "zz2"}, sorted(cols))
-# matched must be the number of collections the GLOB matched - three
-# here - not the number the walk happened to reach.  Comparing it to
-# len(cols) would be self-consistent on the broken code and catch
-# nothing: it listed one and reported one.
+# matched is the number of collections the GLOB matched (three here), not the number
+# the walk reached: compared to len(cols) it would agree with itself and catch nothing
 check("keys * reports every collection the glob matched",
       r.get("matched") == 3, (r.get("matched"), sorted(cols)))
 check("keys * caps EACH collection at the limit",

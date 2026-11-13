@@ -1,35 +1,6 @@
 #!/bin/sh
-# delprobetest.sh - RV-11: a delete that lands on a node which does not
-# hold the key looks where the record IS.
-#
-# A write taken by node A is applied and acknowledged there while its
-# push to the peers batches for up to REPL_FLUSH_MS (3 ms).  A delete of
-# the same key that a balancer lands on node B inside that window found
-# nothing at B, answered "absent" with no tombstone, and the push then
-# put the record on every member - a deleted key alive everywhere.  The
-# client cannot carry the ordering across: the one that does this here
-# is a Redis client behind HAProxy, and RESP has nowhere to put it.  So
-# B asks the fleet, the node that HOLDS the record deletes it and
-# tombstones under its own clock (which has observed the record's
-# version, so the tombstone is newer than every copy, landed or in
-# flight), and B answers what really happened.  Spread unicasts its
-# best-ranked holder; store has the same hole without the push - the
-# record simply stayed on its home node.
-#
-# The driver holds a connection to EACH node before it starts and sends
-# the write to one and the delete to the other with nothing between -
-# tens of microseconds on loopback, far inside the window.  Arms, each
-# its own fleet, every node asserted at every sample for 2.5 s:
-#   eager  - native set@A del@B, RESP SET@A DEL@C, native jset@A jdel@B;
-#            a delete of a key nobody has answers false, and the second
-#            miss of the same key sends no probe (the negative cache);
-#            a delete a second after the write still works (control);
-#            no probe was mistaken for a birth race (several holders
-#            answering yes is eager's normal state);
-#   store  - set@A del@B removes it from A;
-#   spread - K=2: deletes via every node answer true, no copy survives.
-# Before the fix: every pair answers false and the keys are everywhere.
-# Usage: test/delprobetest.sh [./perfcached]
+# delprobetest.sh - a delete landing on a node that does not hold the key asks the fleet, and the
+# holder deletes and tombstones it, in eager, store and spread.  Usage: test/delprobetest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -43,15 +14,8 @@ bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 
 DRV="$D/drv.py"
 cat > "$DRV" <<'EOF'
-# pairs <dialect> <portA> <portB> <n> <prefix> : write on A, delete on B, nothing
-#        between; prints how many deletes answered "deleted".  <dialect> is
-#        resp | native | json - "json" means the DOCUMENT verbs (jset/jdel)
-#        over the native door, not a wire dialect: the native door speaks
-#        the binary protocol only, and class J frames each call through
-#        pcnative
-# absent <n> <prefix> <port>... : 5 samples over 2.5 s, every key on every node;
-#        prints the offenders (empty = absent everywhere, every sample)
-# one <port> <json> : one native call (the request as a JSON object), prints the result
+# drv.py pairs <dialect> <portA> <portB> <n> <prefix> | absent <n> <prefix> <port>... | one <port> <json>
+# <dialect> is resp | native | json, json being the document verbs over the native door
 import json, pcnative, socket, sys, time
 
 class J:

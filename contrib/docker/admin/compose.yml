@@ -1,5 +1,5 @@
-# compose.yml - two perfcached-admin replicas behind one nginx (DESIGN
-# 12no, S416; nginx throughout, as the operator chose).  podman compose / docker compose, from this directory:
+# compose.yml - two perfcached-admin replicas behind one nginx.
+# podman compose / docker compose, from this directory:
 #
 #   cp pcd.secret.example pcd.secret   # the fleet's client secret, one line
 #   mkdir tls && cp ... tls/dashboard.pem tls/dashboard.key   # the certificate and its key

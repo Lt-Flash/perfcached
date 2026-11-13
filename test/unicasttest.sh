@@ -1,22 +1,6 @@
 #!/bin/sh
-# unicasttest.sh - S36 step a: [cluster] discovery = unicast - a fleet
-# with no multicast at all, found through seeds.
-#
-# Seven sends went to the multicast group (beats, joins, maps,
-# goodbyes); in unicast mode they go to every seed and every known
-# address.  A member that hears an address its master does not know
-# tells it (M_PEER_HINT), and a master answers a hinted address at once,
-# so a joiner that knows only one member still reaches the master.
-#   1  three nodes, node 1 the only seed and started LAST: one cluster,
-#      one id, every node sees two peers - and no node has a multicast
-#      receive socket (the wildcard bind of the cluster port)
-#   2  an eager write on node 3 reads on node 1: the data planes ride
-#      the same unicast as before
-#   3  kill -9 the master: the other two elect, same cluster id; the
-#      killed node restarts and rejoins
-#   4  a fourth node whose ONLY seed is a member that is not the master
-#      joins: the member hints the master, the master answers
-# Usage: test/unicasttest.sh [./perfcached]
+# unicasttest.sh - [cluster] discovery = unicast: a fleet with no multicast at all, found through
+# seeds and peer hints, that elects and rejoins after a kill.  Usage: test/unicasttest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}

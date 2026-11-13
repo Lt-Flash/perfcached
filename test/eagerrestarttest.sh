@@ -1,28 +1,6 @@
 #!/bin/sh
-# eagerrestarttest.sh - S305: an eager node restarted after a crash must
-# not answer "absent" for a record it lost.
-#
-# An eager node keeps the copies it RECEIVES off its WAL (the author
-# persists them), so after a kill -9 it replays only what it authored and
-# lacks every copy written since its last snapshot.  The authors re-send
-# those by the repair sweep - at most 4 MB per peer per collection per
-# sweep tick.  Until then the node must ask its peers on a miss.  It did
-# not in two cases:
-#   1  the per-collection layout ([collection] mode = eager, no [cluster]
-#      mode): pull was never enabled for the collection, so the node
-#      answered "absent" until the sweep came round (300 of 300 keys
-#      read wrong through it, on 0.4.1 and the merged 0.4.2 tree alike)
-#   2  the fleet-wide layout with more to repair than one 30 s window
-#      carries: S303 made a miss final 30 s after the start, while the
-#      sweep was still sending (24,000 keys of 1 KB from one author take
-#      ~60 s to re-send: 12,293 of 30,050 held at t+35 s, measured)
-# Each part: node 2 authors 50 keys of its own (so it restarts RECOVERED,
-# not cold - a cold node pulls a bootstrap before it reports ready), node
-# 1 authors the rest; node 2 is killed -9, restarted, and every key is
-# read through it - part 1 at once, part 2 after the 30 s window.
-# Fail-first: before S305 part 1 reads 300 wrong, part 2 reads the keys
-# the sweep had not re-sent yet as absent.
-# Usage: test/eagerrestarttest.sh [./perfcached] [part2-keys]
+# eagerrestarttest.sh - an eager node restarted after a crash lacks the copies it received since its last
+# snapshot, and must ask its peers on a miss until the repair sweep re-sends them, never answer absent.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -74,12 +52,8 @@ fsync = everysec
 segment_mb = 64
 segments = 4
 save = off
-# part 2's 24 MB arrives in 500-record (~500 KB) batches; the default 1 MB
-# ring holds two, and when the pump stalls on a slow disk - ASan on a
-# shared runner, GitHub v0.5.6 - it drops acknowledged records, the node
-# goes HEALING and refuses a batch: "stored 50 + 23500", and every check
-# after it fails for a reason this suite is not about.  A drop is
-# walringsizetest's and healtest's subject; here the ring holds the burst.
+# part 2's 24 MB arrives in ~500 KB batches: a 16 MB ring holds the burst even when the
+# pump stalls on a slow disk (a drop is walringsizetest's and healtest's subject)
 ring_kb = 16384
 C
 	chmod 600 "$D/n$1.conf"
@@ -111,10 +85,8 @@ formed() {
 	done
 	return 1
 }
-# setk <n> <prefix> <count> <value bytes> [pause s per 500]: prints how
-# many stored.  The pause keeps one client inside the WAL ring's drain
-# rate: an unpaced 30,000 x 1 KB burst dropped 713 records from node 1's
-# WAL, sent it HEALING and had ~2,000 writes refused.
+# setk <n> <prefix> <count> <value bytes> [pause s per 500]: prints how many stored; the pause keeps
+# one client inside the WAL ring's drain rate (an unpaced burst sends node 1 HEALING)
 setk() { python3 - "1898$1" "$2" "$3" "$4" "${5:-0}" <<'PY'
 import json, pcnative, socket, sys, time
 port, pre, n, vb, pause = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5])
@@ -173,9 +145,7 @@ formed || { bad "fleet did not form"; exit 1; }
 [ "$(setk 2 own 50 64)" = 50 ] && [ "$(setk 1 k 300 64)" = 300 ] && spread own 50 64 20 && spread k 300 64 20 \
 	&& ok "350 keys on all three nodes" || bad "keys did not reach every node"
 killn 2; start 2 || exit 1
-# until it is READY a recovering node answers "not READY - retry", an
-# error a client can act on; the first READY read is the one that used
-# to say "absent"
+# until it is READY a recovering node answers "not READY - retry", an error a client can act on
 i=0; while [ "$(st 2 'r["state"]')" != ready ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
 w=$(wrongk 2 k 300 64)
 [ "$w" = 0 ] && ok "restarted node answers all 300 of node 1's keys at once (holds $(ent 2) of 350)" \

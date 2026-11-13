@@ -1,21 +1,6 @@
 #!/bin/sh
-# keysyieldtest.sh — S40: a KEYS walk must not hold the worker.
-#
-# Deterministic oracle, not a latency threshold: ONE worker, a KEYS
-# whose walk takes tens of milliseconds, and a PING sent on a second
-# connection while the walk runs.  Serial worker (the old behaviour):
-# the PONG cannot arrive until the whole KEYS reply is out.  Cooperative
-# walk: the PONG overtakes it.  The margin is structural - the walk is
-# hundreds of chunks long, the PING needs one turn - so neither verdict
-# rides on machine speed.
-#
-# Also asserted, because the walk must not break what it optimises:
-#  - KEYS answers are exactly right (a MATCH that hits nothing walks
-#    everything and returns *0; a MATCH that hits 5 returns those 5);
-#  - replies on ONE connection stay ordered: a PING pipelined BEHIND a
-#    KEYS must answer after it, however long the walk takes;
-#  - a client that vanishes mid-walk does not hurt the daemon.
-# Usage: test/keysyieldtest.sh [./perfcached]
+# keysyieldtest.sh - a KEYS walk does not hold the worker: on one worker a PING on another connection
+# overtakes it; answers stay exact and ordered per connection, and a vanished client hurts nothing.
 set -u
 
 BIN=${1:-./perfcached}
@@ -104,9 +89,7 @@ ok("filled %d keys" % (NKEYS + 5))
 s.close()
 
 # ---- 1. the yield itself: PING on conn B overtakes KEYS on conn A ----
-# KEYS zzz* walks EVERY key (the filter runs post-snapshot) but
-# matches none: a full-length walk with a 4-byte reply, so neither
-# build can shortcut it through reply-size limits.
+# KEYS zzz* walks every key but matches none: a full-length walk with a 4-byte reply
 a, b = conn(), conn()
 a.sendall(cmd([b"KEYS", b"zzz*"]))
 time.sleep(0.01)                 # the walk is several times longer
@@ -114,11 +97,8 @@ b.sendall(cmd([b"PING"]))
 t0 = time.time()
 pong = b.recv(64)
 t_pong = time.time() - t0
-# The ordering ORACLE, not a stopwatch: on a serial worker the KEYS
-# reply was fully written BEFORE the PING was even read, so at PONG
-# time conn A is already readable.  On a cooperative worker the walk
-# (hundreds of chunks) cannot have finished, so A is silent.  This is
-# an order-of-events fact; no machine-speed threshold decides it.
+# an ordering oracle, not a stopwatch: a serial worker has written the KEYS reply before it
+# reads the PING, so A is readable at PONG time; a cooperative worker's walk is not done
 a_ready = bool(select.select([a], [], [], 0)[0])
 if not pong.startswith(b"+PONG"):
     bad("PING got %r" % pong[:30])

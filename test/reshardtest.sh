@@ -1,41 +1,6 @@
 #!/bin/sh
-# reshardtest.sh — S42d: a hand-over whose receiver never receives, while
-# ownership changes underneath.
-#
-# THE INVARIANT UNDER TEST (doc/DESIGN.md, "fork-impossibility"):
-#
-#   stub-first, never reinstate - under the bucket lock the value is
-#   swapped for a forwarding stub, THEN sent; on transfer failure the
-#   key is simply gone.  A miss beats a fork, because a write may
-#   already have landed at the receiver.
-#
-# So the failure this hunts is not lost data - losing the key is the
-# DESIGNED outcome of a failed transfer, and the test asserts nothing
-# against it.  The failure is the same key existing in two places at
-# once, which is what a send-then-delete, or a delete-with-reinstate-on-
-# error, would produce the moment a write reached the receiver first.
-#
-# THE FAULT.  A partition is the wrong instrument here: it cuts both
-# ways, so the donor stops hearing the receiver, drops it from the
-# membership within PEER_UP_MS, and never tries to hand anything over.
-# What is needed is one-directional loss - part_mute - so the donor goes
-# on believing the receiver is alive and keeps handing keys to a peer
-# that will never receive them.  That also puts the two ends in genuine
-# disagreement about who is alive, which is the "ownership changes
-# underneath" half of the scenario.
-#
-# THE SHAPE.
-#   1. shrink the fleet to {1,2} and fill the shard collection
-#   2. bring node3 back - ownership recomputes, keys are owed to it
-#   3. MUTE node1 -> node3: node1's hand-overs vanish; node2's do not
-#   4. rewrite every key through node2, so the new owner takes a NEWER
-#      value while node1 is still trying to hand over the old one -
-#      exactly the "a write may already have landed" case
-#   5. unmute, settle, and take a LOCAL inventory of all three nodes
-#      (scan is a local table walk - no forwarding, so it shows what a
-#      node really holds rather than what the cluster would answer)
-#
-# Usage: test/reshardtest.sh [runtime] [nkeys]
+# reshardtest.sh - a hand-over whose receiver never receives (one-way part_mute) while ownership
+# changes: stub-first may lose a key but must never leave it in two places.
 set -u
 
 RT=${1:-${RUNTIME:-}}       # the argument, else $RUNTIME (CI), else nerdctl or docker
@@ -60,9 +25,8 @@ part_init "$RT" || { echo "reshardtest: SKIPPED - no fault injection"; exit "${P
 cli()  { $RT exec -i pcnode$1 perfcli -q 2>/dev/null; }        # stdin batch
 cli1() { $RT exec pcnode$1 perfcli -q -j "$2" 2>/dev/null | head -1; }
 
-# The collection has to be SHARD mode or none of this means anything:
-# store and proxy never recompute ownership, so nothing is ever handed
-# over and every assertion below would pass on an idle fleet.
+# SHARD mode or nothing here means anything: store and proxy never recompute ownership, so nothing
+# is handed over
 MODE=$(cli1 1 "{\"method\":\"stats\",\"params\":{\"col\":\"$COL\"}}" |
 	python3 -c 'import json,sys
 try:
@@ -77,21 +41,15 @@ except Exception: print("none")' 2>/dev/null || echo none)
 peers() { cli1 "$1" '{"method":"stats"}' | python3 -c 'import json,sys
 try: print((json.load(sys.stdin).get("cluster") or {}).get("peers_up",-1))
 except Exception: print(-1)' 2>/dev/null || echo -1; }
+nstate() { cli1 "$1" '{"method":"stats"}' | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("state","?"))
+except Exception: print("?")' 2>/dev/null || echo "?"; }
 mlost() { cli1 "$1" '{"method":"stats"}' | python3 -c 'import json,sys
 try: print((json.load(sys.stdin).get("cluster") or {}).get("migrate_lost",-1))
 except Exception: print(-1)' 2>/dev/null || echo -1; }
 
-# LOCAL inventory of one node: "<key> <value>" per line, straight from
-# that node's own table.
-#
-# THE CURSOR MUST BE DRAINED.  scan's `count` is MAX BUCKETS, not max
-# items (pcache_ht_scan_ex: "from bucket *cursor it visits up to
-# @max_buckets buckets... then sets *cursor to the bucket to resume
-# from - or 0 once the walk is complete").  A single call over a
-# 65536-bucket collection therefore reports whatever happens to live in
-# the first slice and NOTHING else - which is a fork detector that
-# cannot see a fork, the exact false green this suite exists to avoid.
-# The loop below is bounded so a bug in the cursor cannot hang the run.
+# LOCAL inventory of one node, "<key> <value>" per line.  scan's count is max BUCKETS, so the cursor
+# must be drained or a fork outside the first slice is invisible; bounded against a cursor bug.
 inv() { # inv <node>
 	iv_cur=0
 	iv_round=0
@@ -134,9 +92,7 @@ B1=$(peers 1); B2=$(peers 2); B3=$(peers 3)
 	     echo "reshardtest: $pass passed, $fail failed"; exit 1; }
 
 # ---- 1. shrink to {1,2} ---------------------------------------------
-# Long enough for BOTH survivors to purge node3 (PEER_UP_MS 10000), or
-# the fill below would be placed under three-member ownership and the
-# rejoin would move nothing.
+# long enough for both survivors to purge node3 (PEER_UP_MS 10000), or the rejoin would move nothing
 echo "  stopping pcnode3 and waiting for the fleet to shrink"
 $RT kill pcnode3 >/dev/null 2>&1
 i=0
@@ -151,16 +107,13 @@ done
 	     placed under the wrong ownership and nothing would move"
 
 # ---- 2. fill under two-member ownership -----------------------------
-# One perfcli session, N lines: a per-key exec would cost minutes and
-# the write burst has to be short next to the fault window.
+# one perfcli session: the write burst has to be short next to the fault window
 j=1
 while [ $j -le "$N" ]; do
 	echo "set $COL $R-$j v1-$j"
 	j=$((j + 1))
 done | cli 1 > /tmp/reshard-fill.$$ 2>&1
-# `grep -c` exits 1 when the count is ZERO, so `|| echo 0` would append
-# a second line and make this "0\n0" - which then fails "= 0" and kills
-# the next arithmetic.  `|| true` keeps grep's own printed count.
+# `grep -c` exits 1 on a zero count, so `|| echo 0` would print "0\n0"; `|| true` keeps grep's count
 FERR=$(/bin/grep -c '"error"' /tmp/reshard-fill.$$ 2>/dev/null || true)
 FERR=${FERR:-0}
 [ "$FERR" = 0 ] \
@@ -179,9 +132,13 @@ while [ $i -lt 30 ]; do
 	[ "$(peers 1)" = 2 ] && break
 	sleep 1; i=$((i + 1))
 done
-[ "$(peers 1)" = 2 ] \
-	&& ok "node1 sees node3 again after ${i}s - ownership now includes it" \
-	|| bad "node1 never saw node3 return - no hand-over would be owed"
+# a rejoiner holds no share until its links are proven and it is ready: cut only after that
+while [ $i -lt 30 ] && [ "$(nstate 3)" != ready ]; do
+	sleep 1; i=$((i + 1))
+done
+[ "$(peers 1)" = 2 ] && [ "$(nstate 3)" = ready ] \
+	&& ok "node1 sees node3 again and node3 is ready after ${i}s - ownership now includes it" \
+	|| bad "node3 never came back ready (peers $(peers 1), state $(nstate 3)) - no hand-over would be owed"
 part_mute pcnode1 pcnode3 || bad "could not mute node1 -> node3"
 MR=$(part_rules pcnode3)
 [ "${MR:-0}" -ge 1 ] \
@@ -189,9 +146,7 @@ MR=$(part_rules pcnode3)
 	|| bad "no DROP rule on node3 - the fault was never applied"
 
 # ---- 4. a newer write reaches the receiver, through node2 -----------
-# node2 is unmuted in both directions, so each key lands on whichever
-# node OWNS it now - including node3, the very peer node1 is trying and
-# failing to hand the old copy to.
+# node2 is unmuted, so each key lands on its owner now, node3 included
 sleep 2
 j=1
 while [ $j -le "$N" ]; do
@@ -202,8 +157,7 @@ WERR=$(/bin/grep -c '"error"' /tmp/reshard-rewrite.$$ 2>/dev/null || true)
 WERR=${WERR:-0}
 echo "  rewrote through node2: $((N - WERR)) accepted, $WERR refused"
 
-# let node1 keep trying (and keep failing) until it gives a hand-over up - 12 s
-# was not enough on 0.7.4.3-rc1's GitLab fault2 (lost 0 -> 0); 60 s at most
+# let node1 keep trying (and failing) until it gives a hand-over up: 60 s at most
 i=0
 while [ $i -lt 30 ]; do
 	sleep 2; i=$((i + 1))
@@ -250,12 +204,7 @@ SURV=$(V SURVIVORS); MISS=$(V MISSING)
 echo "  survivors=$SURV missing=$MISS duplicated=$DUP forked=$FORK stale-v1=$STALE"
 
 # ---- 6. the fault must have been REAL ---------------------------------
-# Two independent signals, either of which proves hand-overs failed:
-# node1's own migrate_lost counter, and keys that are simply gone (with
-# a clean fill and no TTLs, a key can only vanish by being stubbed for a
-# hand-over that never arrived).  Both at zero means the mute did not
-# bite - the fleet was never disturbed and every assertion below would
-# pass on an idle cluster.
+# node1's migrate_lost, or keys simply gone (no TTLs here); both zero means the mute did not bite
 if [ "$LOST" -gt 0 ] || [ "${MISS:-0}" -gt 0 ]; then
 	ok "the hand-over really failed: migrate_lost +$LOST, $MISS key(s) gone"
 	[ "${MISS:-0}" = 0 ] && [ "$LOST" -gt 0 ] && echo "       (nothing went
@@ -281,8 +230,7 @@ else
 fi
 
 # ---- 7. a lost key must read as an honest MISS ------------------------
-# The other half of "a miss beats a fork": what the fleet lost, it says
-# it lost - it does not serve a stale value in its place.
+# what the fleet lost, it says it lost - never a stale value in its place
 BADREAD=0; CHECKED=0
 j=1
 while [ $j -le "$N" ] && [ $CHECKED -lt 40 ]; do

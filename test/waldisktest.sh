@@ -1,13 +1,6 @@
 #!/bin/sh
-# waldisktest.sh — a WAL that does not fit must be refused, not attempted.
-#
-# Segments are provisioned with REAL zero writes (fallocate does not
-# commit thin/sparse/COW backends), so without a pre-flight check the
-# check IS the write: the daemon fills the filesystem and only then
-# discovers it cannot finish - and, before this, left the partial
-# segment behind, so a refused start took the whole volume down with it
-# and every supervisor retry re-filled whatever had been freed.
-# Usage: test/waldisktest.sh [./perfcached]
+# waldisktest.sh - a WAL that does not fit is refused, not attempted: segments are real zero
+# writes, so filling the volume first and leaving a partial segment would take it down.
 set -u
 
 BIN=${1:-./perfcached}
@@ -26,9 +19,8 @@ ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 
 echo "=== waldisktest ==="
-# A small filesystem, built for the test.  Gate on the fixture BUILDING,
-# not on the tools existing: a container without loop devices must SKIP
-# loudly, never pass silently.
+# a small filesystem built for the test, gated on the fixture BUILDING: a container without
+# loop devices must SKIP loudly, never pass silently
 if ! command -v losetup >/dev/null || ! command -v mkfs.ext4 >/dev/null; then
 	echo "  SKIP no losetup/mkfs.ext4 (fixture not buildable - NOT a pass)"
 	echo "waldisktest: 0 passed, 0 failed"; exit 0

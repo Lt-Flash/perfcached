@@ -1,10 +1,6 @@
 #!/bin/sh
-# resptest.sh - func_perfd's RESP client (resp.c) against Redis, no Asterisk.
-#
-#   contrib/asterisk/test/resptest.sh <resptool binary> [redis-server]
-#
-# LOCAL REDIS ONLY: every Redis here is started by this script on 127.0.0.1,
-# with no persistence, and killed by pid on exit.  Nothing else is contacted.
+# resptest.sh <resptool binary> [redis-server] - func_perfd's RESP client (resp.c) against Redis, no
+# Asterisk; LOCAL Redis only: started here on 127.0.0.1, no persistence, killed by pid on exit.
 set -u
 
 TOOL=${1:?usage: resptest.sh <resptool> [redis-server]}

@@ -1,27 +1,6 @@
 #!/bin/sh
-# resizeheldtest.sh - S255: a fleet resize reaches every node, even one that
-# was busy or missed the announce.
-#
-# A resize reaches the peers as ONE datagram (M_COL_SET, op RESIZE).  Two
-# ways it used to stop short, each leaving a node at the old size for good
-# while the rest of the fleet moved on - nothing ever reconciled the size:
-#   - held:  a peer still running the PREVIOUS resize refused the new one
-#            (pc_store_resize_start -2), and the refusal was discarded;
-#   - lost:  a peer that did not receive the datagram never heard of it.
-# Three eager nodes, collection c at 2^12, 400 keys:
-#   1. held - node 3's maintenance thread (pc-maint, which runs resizes) is
-#      frozen (test/threadfreeze.c); resize to 2^14 through node 1, so node
-#      3 STARTS it and cannot finish; once nodes 1 and 2 are done, resize to
-#      2^10 through node 2.  Node 3 must end at 1,024 when it is released;
-#   2. lost - node 3 cut off from node 1 (test/netcutshim.so) for 2 s around
-#      a resize to 2^13 through node 1, then healed: node 3 must reach 8,192
-#      from the announce's repeats;
-#   3. order - a repeat of an OLDER resize must not undo a newer one: right
-#      after (2), resize to 2^11 through node 2 while node 1's repeats of
-#      2^13 are still going; every node must settle at 2,048 and stay.
-#   and every step: all 400 keys on every node, reading right.
-# Fail-first: rc48 leaves node 3 at 16,384 in (1) and at 4,096... in (2).
-# Usage: test/resizeheldtest.sh [./perfcached] [./threadfreeze] [./netcutshim.so]
+# resizeheldtest.sh - a fleet resize reaches every node, even one busy with the previous resize
+# (held) or cut off from the announce (lost), and an older resize's repeat never undoes a newer one.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -45,10 +24,8 @@ for p in 18861 18862 18863 18871 18872 18873; do
 	ss -ltn 2>/dev/null | grep -q ":$p[[:space:]]" && { echo "resizeheldtest: port $p busy" >&2; exit 1; }
 done
 [ -x "$TF" ] && [ -f "$SHIM" ] || { echo "resizeheldtest: needs $TF and $SHIM" >&2; exit 1; }
-# a dynamic sanitizer runtime (gcc's check-asan) must come FIRST in the
-# preload list, the shim after it - as spreadparttest and eagerparttest do.
-# rc49's check-asan: "ASan runtime does not come first in initial library
-# list", and node 1 did not start.
+# a dynamic sanitizer runtime (gcc's check-asan) must come FIRST in the preload list, the shim
+# after it, or the daemon does not start
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 PRELOAD="${SANRT:+$SANRT }$SHIM"
 
@@ -180,7 +157,7 @@ report "held" 1024 30
 
 echo "--- 2. lost: a peer that missed the announce"
 B3=$(bk 3)
-echo "cut 127.0.21.1" > "$D/cut3"; echo "cut 127.0.21.3" > "$D/cut1"
+echo "cut 127.0.21.1 rst" > "$D/cut3"; echo "cut 127.0.21.3 rst" > "$D/cut1"
 sleep 0.3
 R=$(resize 1 13); case "$R" in *'"resizing":true'*) ok "resize c 13 accepted through node 1, node 3 cut off from it";; *) bad "resize 13 refused: $R";; esac
 sleep 2
