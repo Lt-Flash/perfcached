@@ -64,7 +64,9 @@ conf 1; conf 2
 start 1; sleep 2; start 2
 wait_for 30 '[ "$(up 1)$(up 2)" = 11 ] && [ "$(ready 1)$(ready 2)" = readyready ]' \
 	|| bad "the fleet did not form: peers $(up 1)/$(up 2)"
-CID=$(st 1 'r["cluster"]["cluster_id"]')
+# the claim is sealed under the fleet's id: read once both nodes hold the same one
+wait_for 10 'CID=$(st 1 "r[\"cluster\"][\"cluster_id\"]"); [ ${#CID} = 36 ] && [ "$(st 2 "r[\"cluster\"][\"cluster_id\"]")" = "$CID" ]' \
+	|| bad "no one cluster id: node 1 '$CID', node 2 '$(st 2 'r["cluster"]["cluster_id"]')'"
 N2=$(st 2 'r["cluster"]["node"]')
 
 echo "--- 1: node $N2's id claimed from 127.0.143.9"

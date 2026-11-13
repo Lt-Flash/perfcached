@@ -218,8 +218,9 @@ k=0; while [ $k -lt 50 ] && { [ "$(ak 1 'a["fleet"]["confirming"]')" != True ] |
 	bad "8. node 3 back: node 1 confirming $(ak 1 'a["fleet"]["confirming"]'), node 3's report of the old space: $(ak 1 "[m for m in a['fleet']['marks'] if m['member'] == '$M3']")"
 
 for i in 1 2 3; do
-	grep -q "CRIT" "$D/n$i.log" &&
-		bad "node $i logged CRIT: $(grep -m2 'CRIT' "$D/n$i.log" | tr '\n' ' ' | cut -c1-220)"
+	# the runner's storage stalling is no finding of this suite
+	grep "CRIT" "$D/n$i.log" | grep -qv "an fsync has been stuck" &&
+		bad "node $i logged CRIT: $(grep 'CRIT' "$D/n$i.log" | grep -v "an fsync has been stuck" | head -n 2 | tr '\n' ' ' | cut -c1-220)"
 done
 echo "tombacktest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

@@ -89,6 +89,10 @@ wait_for 30 '[ "$(up 1)$(up 2)" = 11 ] && [ "$(cid 1)" = "$(cid 2)" ]' \
 [ "$(st 2 'r["cluster"]["discovery"]["seeds_resolved"]')" = 1 ] && ok "node 2 resolved its one seed" \
 	|| bad "node 2's seeds_resolved is $(st 2 'r["cluster"]["discovery"]["seeds_resolved"]')"
 C2=$(cid 2)
+# part 2 wants node 2's cluster established: an id stays provisional for 30 s, and two provisional
+# founders rank as equals, so node 2 could yield to node 3's
+cst() { st "$1" 'r["cluster"]["cluster_id_state"]'; }
+wait_for 40 '[ "$(cst 2)" = established ]' || bad "node 2's cluster id still $(cst 2) after 40 s"
 
 echo "--- 2: the name moves; the running node follows it"
 kill -9 "$(cat "$D/n1.pid")"; rm -f "$D/n1.pid"
