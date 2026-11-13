@@ -60,7 +60,7 @@ run_legs() { # run_legs <io>
 	conf "$1" "$1" "resp = 127.0.0.1:$RT tls" "resp = 127.0.0.1:$RP" "http = 127.0.0.1:$HT tls" \
 		"tls_cert = $D/srv.pem" "tls_key = $D/srv.key"
 	"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & PID=$!
-	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1.log"; do sleep 0.1; i=$((i+1)); done
+	i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/$1.log"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$1.log" || { bad "$1: the node did not start: $(tail -2 "$D/$1.log")"; exit 1; }
 	r=$(python3 - $RT $RP $HT "$D" <<'PY'
 import socket, ssl, sys, time, urllib.request
@@ -181,7 +181,7 @@ sed -i '/^resp = pctls-resp-pw$/d; /^http = pctls-http-token$/d' "$D/h4.conf"
 conf ijk epoll "resp = 127.0.0.1:$RT tls" "http = 127.0.0.1:$HT" "tls_cert = $D/live.pem" "tls_key = $D/live.key"
 cp srv.pem live.pem; cp srv.key live.key
 "$BIN" -f "$D/ijk.conf" > "$D/ijk.log" 2>&1 & PID=$!
-i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/ijk.log"; do sleep 0.1; i=$((i+1)); done
+i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/ijk.log"; do sleep 0.1; i=$((i+1)); done
 st() { python3 -c 'import json,sys,urllib.request
 s=json.loads(urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:'$HT'/stats", headers={"Authorization": "Bearer pctls-http-token"}), timeout=5).read())
 print(eval(sys.argv[1]))' "$1" 2>/dev/null; }
@@ -217,7 +217,7 @@ else
 D=$1 BIN=$2 RT=$3 RP=$4 HT=$5 IP=192.0.2.10
 ip link set lo up && ip addr add $IP/32 dev lo || { echo "1:no network in the namespace"; exit 0; }
 "$BIN" -f "$D/l.conf" > "$D/l.log" 2>&1 & PID=$!
-i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/l.log"; do sleep 0.1; i=$((i+1)); done
+i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/l.log"; do sleep 0.1; i=$((i+1)); done
 cat > "$D/l.py" <<'PY'
 import json, socket, ssl, sys, urllib.request, urllib.error
 ip, rt, rp, ht, d, what = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]

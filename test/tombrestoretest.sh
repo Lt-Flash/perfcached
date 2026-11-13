@@ -78,7 +78,10 @@ held() { # held <node> <from> <to>
 import socket, sys, pcnative
 n, a, b = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 f = pcnative.wrap(socket.create_connection(("127.0.155.%d" % n, 19590 + n), 10))
-print(sum(1 for i in range(a, b) if (pcnative.call(f, "get", col="c", key="z:%d" % i).get("result") or {}).get("found")))
+r = [pcnative.call(f, "get", col="c", key="z:%d" % i) for i in range(a, b)]
+# a refused read (the node not READY) is no answer: print nothing
+if all("result" in x for x in r):
+    print(sum(1 for x in r if (x["result"] or {}).get("found")))
 PY
 }
 gate() {
@@ -119,13 +122,16 @@ WHY=$(st 3 'c.get("reconcile_fast_why")')
 case "$WHY" in *forgot*|*"do not reach back"*) ok "3. node 3 restored from the older backup: its fast path was refused - $WHY" ;;
 	*) bad "3. node 3's fast path after the restore: '${WHY:-none}' (want it refused because deletes were forgotten past its marks); fast $(st 3 'c.get("reconcile_fast")'); $(grep -m2 -h 'fast path\|forgot' "$D/n3.log" "$D/n1.log" "$D/n2.log" | tr '\n' ' ' | cut -c1-300)" ;; esac
 
-# 4. it walked: none of the 200 anywhere
+# 4. it walked: none of the 200 anywhere.  Step 3's verdict can come before node 3 is READY; the
+# walk's end is its own line, logged once every key has a verdict
+python3 "$T/waitready.py" -t 30 127.0.155.3:19593 || bad "4. node 3 not READY after the restore"
+k=0; while [ $k -lt 300 ] && ! grep -q "cluster: reconcile pass finished asking" "$D/n3.log"; do sleep 0.2; k=$((k+1)); done
 k=0; while [ $k -lt 150 ] && [ "$(held 3 0 200)" != 0 ]; do sleep 0.2; k=$((k+1)); done
 sleep 2
 G3=$(held 3 0 200); L3=$(held 3 200 300); G1=$(held 1 0 200); G2=$(held 2 0 200)
 [ "$G3" = 0 ] && [ "$L3" = 100 ] && [ "$G1 $G2" = "0 0" ] &&
 	ok "4. node 3 walked: it holds none of the 200 deleted keys and all 100 kept; nodes 1 and 2 hold none of the 200" ||
-	bad "4. after the restore: node 3 holds $G3 of the 200 deleted (want 0) and $L3 of the 100 kept (want 100); nodes 1/2 hold $G1/$G2 of the 200 (want 0 0)"
+	bad "4. after the restore: node 3 holds ${G3:-?} of the 200 deleted (want 0) and ${L3:-?} of the 100 kept (want 100); nodes 1/2 hold ${G1:-?}/${G2:-?} of the 200 (want 0 0); node 3's walk: $(grep -c "reconcile pass finished asking" "$D/n3.log") end line(s), $(grep -c "reconcile stops asking" "$D/n3.log") give-up(s), reconcile_open $(st 3 'c.get("reconcile_open")'), reconcile_pending $(st 3 'c.get("reconcile_pending")')"
 
 for i in 1 2 3; do
 	# the runner's storage stalling is no finding of this suite
