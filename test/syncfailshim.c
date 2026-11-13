@@ -1,5 +1,5 @@
 /* syncfailshim.c - LD_PRELOAD shim: the classes the file PC_SYNCFAIL_CTL names, read at each sync,
- * make those syncs or WAL appends fail or stall; every refusal is logged to PC_SYNCFAIL_LOG. */
+ * make those syncs, WAL appends or term stores fail or stall; each refusal goes to PC_SYNCFAIL_LOG. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -240,9 +240,29 @@ static int nodir(const char *path, int flags)
 	return 1;
 }
 
+/* "term": the term file's temp copy cannot be created, so the term store fails */
+static int noterm(const char *path, int flags)
+{
+	char want[32];
+	const char *base;
+
+	if (!(flags & O_CREAT))
+		return 0;
+	base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	if (strncmp(base, "node-term.tmp", 13) != 0)
+		return 0;
+	armed(want, sizeof want);
+	if (!has(want, "term"))
+		return 0;
+	note("term", path);
+	errno = EIO;
+	return 1;
+}
+
 static int open_common(const char *path, int flags, mode_t mode)
 {
-	if (nodir(path, flags))
+	if (nodir(path, flags) || noterm(path, flags))
 		return -1;
 	return real_open(path, flags, mode);
 }

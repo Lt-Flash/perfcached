@@ -111,6 +111,16 @@
           for a peer still loading that reports records.  A member short
           of deletes its origin had forgotten kept those keys until
           their TTL: the rebuild a floor asks for walked no record.
+        * [cluster] A mastership term a node followed but could not
+          write to its state directory is no longer claimed again when
+          that node next takes mastership - it claimed the last term it
+          had written plus one, which the master it followed had used.
+          Until the term is on disk the node follows and serves but
+          takes no mastership, retries every beat and raises the
+          critical alert cluster.term_unpersisted (/stats
+          cluster.term_unpersisted).  The term, the cluster id, the
+          identity and the node salt count as written only once their
+          directory is synced: a refused directory sync was ignored.
         * [security] A cluster frame reaches the replay window only
           after the sender checks and only from the host its header
           names (/stats cluster.replay.host), under a budget of 4,096

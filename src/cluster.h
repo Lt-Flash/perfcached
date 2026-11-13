@@ -160,6 +160,8 @@ struct pc_cl_stats {
 	unsigned long long joins, assigns, elections, demotions;
 	unsigned long long members_asked, members_sent;   /* the member-list repair */
 	unsigned long long admission_stuck;  /* joiners held CONNECTING past CONNECT_MS (a gauge) */
+	unsigned int term_unpersisted;     /* the followed term not yet on disk, 0 = none */
+	int term_errno;                    /* why its store was refused */
 	/* the RECEIVE plane's lag: rx_drops_ps is PER SOCKET (SO_RXQ_OVFL); rx_queue comes from
 	 * SO_MEMINFO, since FIONREAD on a UDP socket answers only the first datagram */
 	unsigned long long rx_applied, rx_drops;

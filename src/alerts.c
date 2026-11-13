@@ -436,6 +436,11 @@ static const struct acat {
 	  "Fix the path the text names between the joiner and that member: a firewall "
 	  "rule, an advertise address or port the other cannot reach, or a closed "
 	  "relay port (UDP or TCP), frame lane or cluster port TCP.", NULL },
+	{ "cluster.term_unpersisted", "a mastership term not persisted", NULL,
+	  "Follows its master and serves, but takes no mastership: a term it cannot remember "
+	  "is one it could claim again after a restart.  It retries every beat.",
+	  "Fix the state directory the text names - full, read-only, or a failing disk; the "
+	  "alert clears once the term is written.", NULL },
 	{ "fleet.majority", "fleet below majority", NULL,
 	  "Without a majority the fleet elects no master and changes no map "
 	  "until members return.",
@@ -1458,6 +1463,11 @@ static void check_node(void)
 			cond("cluster.admission_stuck", cs.admission_stuck > 0,
 				PC_AL_WARNING, 0, S(30), t);
 		}
+		snprintf(t, sizeof t, "mastership term %u is not persisted (%s): this node takes "
+			"no mastership until it is - check %s", cs.term_unpersisted,
+			strerror(cs.term_errno), pc_cluster_state_dir() ? pc_cluster_state_dir() : "the state directory");
+		cond("cluster.term_unpersisted", cs.term_unpersisted != 0,
+			PC_AL_CRITICAL, 0, S(10), t);
 	}
 	/* PERFCACHED_ALERT_TEST_EVENT=<text> raises one test event once ready (level
 	 * PERFCACHED_ALERT_TEST_LEVEL, warning by default): what a mail does with any text */

@@ -188,6 +188,54 @@ int main(void)
 			"a term file with a trailing line was accepted");
 	}
 
+	/* ---- 11. a term seen while the state dir cannot take it is still claimed above: the
+	 * master that sent it published under it, so a claim at it repeats it --------- */
+	{
+		char away[300];
+
+		snprintf(away, sizeof away, "%s.away", dir);
+		rm_state();
+		CHK(pc_term_init(dir) == 0 && pc_term_observe(5) == 1,
+			"a fresh term file did not take term 5");
+		CHK(rename(dir, away) == 0, "could not move the state dir away");
+		pc_term_observe(6);
+		CHK(rename(away, dir) == 0, "could not put the state dir back");
+		t = pc_term_claim();
+		CHK(t > 6, "claimed %u after seeing 6 it could not persist - the "
+			"term the master that sent 6 published under", t);
+		CHK(pc_term_init(dir) == 0 && pc_term_current() == t,
+			"the claim %u did not survive a reload (term %u)", t,
+			pc_term_current());
+	}
+
+	/* ---- 12. the unstored term is reported, retried, and cleared once on disk -------- */
+	{
+		char away[300];
+		int r;
+
+		snprintf(away, sizeof away, "%s.away", dir);
+		rm_state();
+		CHK(pc_term_init(dir) == 0 && pc_term_observe(5) == 1 &&
+			pc_term_unpersisted() == 0, "a stored term 5 was reported unpersisted");
+		CHK(rename(dir, away) == 0, "could not move the state dir away");
+		r = pc_term_observe(6);
+		CHK(r == PC_TERM_UNSAVED, "an unstored term returned %d, not "
+			"PC_TERM_UNSAVED", r);
+		CHK(pc_term_current() == 6 && pc_term_unpersisted() == 6,
+			"term %u, unpersisted %u - want 6 and 6", pc_term_current(),
+			pc_term_unpersisted());
+		CHK(pc_term_store_errno() != 0, "the refused store kept no errno");
+		CHK(pc_term_retry() == -1 && pc_term_unpersisted() == 6,
+			"a retry with the dir still gone did not fail, or cleared it");
+		CHK(rename(away, dir) == 0, "could not put the state dir back");
+		CHK(pc_term_retry() == 1 && pc_term_unpersisted() == 0,
+			"a retry with the dir back did not store term 6");
+		CHK(pc_term_retry() == 0, "a retry with nothing pending did something");
+		CHK(pc_term_init(dir) == 0 && pc_term_current() == 6,
+			"the retried term did not survive a reload (term %u)",
+			pc_term_current());
+	}
+
 	rm_state();
 	rmdir(dir);
 	printf("cltermtest: %d passed, %d failed\n", pass, fail);

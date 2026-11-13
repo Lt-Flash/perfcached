@@ -1,0 +1,31 @@
+# redisx, 2026-11-01: Redis 8.0.2 Cluster against a perfcached shard fleet, bare metal.
+# perfcached: a 0.7.4 development build, 5a02babb (perfcached -V: 0.7.4.1), 3 nodes x 12 workers, one per NUMA node
+#   (two on host A, one on host B), discovery = unicast, no [wal] unless the arm says wal; native door encrypt = no (the default).
+# Redis: 8.0.2, 30 masters (10 per NUMA node), no replicas; --save '' --appendonly no, checked on every instance; aof arms:
+#   --appendonly yes --appendfsync everysec and the default save rules.
+# Servers: 2x E5-2690 v2 hosts, 10G; root filesystem in RAM on both, so a durable arm pays its CPU but no device fsync.
+# Clients: host B's other NUMA node and a third host; redis-benchmark 8.0.2, one per owner per client host, -P 32,
+#   explicit key:{tag}:__rand_int__ with one hash tag per owner (routed); native cells: bench/natbench, 128 connections,
+#   16 threads, depth 32, routed by key, 40 s.  1,000,000 keys.
+# rate = what the servers answered in a 15 s window with every client alive (Redis cmdstat calls, perfcached resp.requests),
+#   or the natbench clients' sum (native).  cores = the server processes' CPU over 20 s inside the cell, both hosts.
+# us_per_op = cores x 1e6 / rate.  link = host A's busiest direction, Gbit/s (a 10G link reads full at ~9.9).
+server	door	value_b	durable	op	ops_per_s	cores	us_per_op	link_a_gbit
+redis	resp	32	no	set	15436372	29.8	1.93	6.03
+redis	resp	32	no	get	17507764	29.2	1.67	3.82
+perfcached	resp	32	no	set	17349351	30.0	1.73	7.32
+perfcached	resp	32	no	get	18358974	23.6	1.29	4.16
+perfcached	native	32	no	set	21970101	29.4	1.34	9.23
+perfcached	native	32	no	get	24565627	25.1	1.02	7.52
+redis	resp	200	no	set	10976055	21.5	1.96	9.96
+redis	resp	200	no	get	12442066	21.6	1.73	9.95
+perfcached	resp	200	no	set	9873605	20.4	2.07	9.92
+perfcached	resp	200	no	get	12289357	17.0	1.38	9.95
+perfcached	native	200	no	set	11373825	20.9	1.84	9.92
+perfcached	native	200	no	get	14661528	17.2	1.17	9.95
+redis	resp	200	aof-everysec	set	8132599	30.3	3.72	9.56
+redis	resp	200	aof-everysec	get	12398776	21.5	1.73	9.95
+perfcached	resp	200	wal-everysec	set	8694185	24.1	2.77	9.92
+perfcached	resp	200	wal-everysec	get	12331014	17.3	1.41	9.95
+perfcached	native	200	wal-everysec	set	8913455	22.6	2.54	9.92
+perfcached	native	200	wal-everysec	get	14656512	16.6	1.13	9.95

@@ -2,6 +2,7 @@
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* clterm.c - the mastership term: persistence and the three rules, free of cluster.c so the
  * rules (pure functions over one small file) can be exercised without a fleet. */
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 
 #include "clterm.h"
 #include "fnv1a.h"
+#include "statefile.h"
 
 #define TERM_MAGIC 0x4D544350u             /* 'PCTM' LE - the legacy form */
 
@@ -16,9 +18,11 @@
  * bytes>" (a torn-write detector).  The legacy 8-byte form (magic + term) is read, rewritten. */
 #define TERM_HEADER "perfcached-node-term 1"
 
+/* term = the highest adopted (claimed, or seen and followed), which a claim goes above; unsaved = an
+ * adopted term its store refused, until a later store lands (set only on a failure: stats read it) */
 static struct {
-	uint32_t term;
-	int durable;
+	uint32_t term, unsaved;
+	int durable, err;
 	char dir[512];
 } T;
 
@@ -95,39 +99,20 @@ static int term_parse(const unsigned char *buf, size_t len, uint32_t *out)
 	return 0;
 }
 
-/* Through a temp file and a rename: the term is rewritten on every mastership change, and a
- * torn term is an arbitrary one.  The directory fsync makes the rename itself durable. */
+/* Through a temp file and a rename (statefile.c): the term is rewritten on every mastership change,
+ * and a torn term is an arbitrary one.  1 stored; 0 not, the errno kept */
 static int term_store(uint32_t t)
 {
-	char tmp[600], fin[600], buf[96];
-	int fd, dirfd, n, ok = 0;
+	char buf[96];
+	int n;
 
 	if (!T.dir[0])
 		return 0;
-	snprintf(tmp, sizeof tmp, "%s/" PC_TERM_FILE ".tmp.%d", T.dir, (int)getpid());
-	snprintf(fin, sizeof fin, "%s/" PC_TERM_FILE, T.dir);
-
 	n = snprintf(buf, sizeof buf, TERM_HEADER "\nterm %u\ncheck %016llx\n",
 		(unsigned)t, (unsigned long long)term_check(t));
-
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0)
+	if (pc_state_write(T.dir, PC_TERM_FILE, buf, (size_t)n) != 0) {
+		T.err = errno;
 		return 0;
-	if (write(fd, buf, (size_t)n) == (ssize_t)n && fsync(fd) == 0)
-		ok = 1;
-	close(fd);
-	if (!ok) {
-		unlink(tmp);
-		return 0;
-	}
-	if (rename(tmp, fin) != 0) {
-		unlink(tmp);
-		return 0;
-	}
-	dirfd = open(T.dir, O_RDONLY);
-	if (dirfd >= 0) {
-		fsync(dirfd);
-		close(dirfd);
 	}
 	return 1;
 }
@@ -189,13 +174,35 @@ int pc_term_observe(uint32_t seen)
 		return 0;
 	if (!pc_term_plausible(seen))
 		return -1;
-	/* persist BEFORE adopting: a term we have acknowledged but cannot
-	 * remember is one we could contradict after a restart */
-	if (T.dir[0] && !term_store(seen))
-		return -1;
+	/* adopted even unstored - the node follows it, and a claim must go above it; while it is
+	 * not on disk the node stands for nothing (pc_term_unpersisted) and a tick retries it */
 	T.term = seen;
+	if (!T.dir[0])
+		return 1;
+	if (!term_store(seen)) {
+		__atomic_store_n(&T.unsaved, seen, __ATOMIC_RELEASE);
+		return PC_TERM_UNSAVED;
+	}
+	__atomic_store_n(&T.unsaved, 0, __ATOMIC_RELEASE);
 	return 1;
 }
+
+uint32_t pc_term_unpersisted(void)
+{
+	return __atomic_load_n(&T.unsaved, __ATOMIC_ACQUIRE);
+}
+
+int pc_term_retry(void)
+{
+	if (!pc_term_unpersisted())
+		return 0;
+	if (!term_store(T.term))
+		return -1;
+	__atomic_store_n(&T.unsaved, 0, __ATOMIC_RELEASE);
+	return 1;
+}
+
+int pc_term_store_errno(void) { return T.err; }
 
 uint32_t pc_term_claim(void)
 {
@@ -206,6 +213,7 @@ uint32_t pc_term_claim(void)
 	if (T.dir[0]) {
 		if (!term_store(next))
 			return 0;          /* cannot remember it: must not use it */
+		__atomic_store_n(&T.unsaved, 0, __ATOMIC_RELEASE);
 	} else if (T.durable) {
 		return 0;                  /* claimed durable with nowhere to
 		                            * write - a contradiction, refuse */

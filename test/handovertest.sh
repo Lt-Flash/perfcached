@@ -94,8 +94,9 @@ if len(sys.argv) > 4:                  # the second fleet: the stale beacon
     out("REACHED", until(lambda: cl(A).get("sender_refused", 0) > ref0, 20) >= 0)
     r = call(M, {"method": "master_prefer", "params": {"node": idA}}, True)
     out("ASKED", r.get("handover_to") == idA)
+    # the old master is a member again only through admission (CONNECTING): 15 s, as the first fleet
     done = until(lambda: role(A) == "master" and role(M) == "member" and role(B) == "member"
-                 and cl(B).get("master") == idA, 8)
+                 and cl(B).get("master") == idA, 15)
     out("DONE_MS", int(done * 1000) if done >= 0 else -1)
     time.sleep(2)
     p.kill(); p.wait()

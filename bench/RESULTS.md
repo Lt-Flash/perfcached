@@ -733,6 +733,68 @@ message, took 3.73-3.74 server cores for the same 1.28M plaintext
 deliveries a second - 2.90-2.93 now - and delivered 206-213k a second
 of 1 KB payloads to 8 subscribers, against 525-605k now.
 
+## Against Redis Cluster on bare metal — the rig (2026-11-01)
+
+GUIDE's Redis Cluster table has no harness script in `bench/` yet: the
+run was driven by a lab script tied to its hosts, and the header of
+`results/redisx-0.7.4.tsv` records the rig.  Two bare-metal 2x E5-2690
+v2 hosts on 10G, root filesystems in RAM; three server slots, one per
+NUMA node (both of host A's, host B's node 1); clients on host B's node
+0 and on a third host.  perfcached `5a02babb` (a 0.7.4 development
+build, `perfcached -V`: 0.7.4.1), each node pinned to its NUMA node
+with `numactl --cpunodebind --membind`:
+
+    [daemon]
+    workers = 12
+    [memory]
+    arena_mb = 4096
+    [listen]
+    tcp = <node-ip>:6479
+    resp = <node-ip>:6380
+    resp_allow = <rig-net>/24
+    [cluster]
+    discovery = unicast
+    seeds = <the three node addresses>
+    mode = shard
+    collections = 0
+    [collection 0]
+    buckets_log2 = 9
+    autoscale = auto
+
+The WAL arm adds `[wal] fsync = everysec`, `segments = 32` and
+`segment_mb = 256`.  Redis 8.0.2: 10 `redis-server --cluster-enabled
+yes` a NUMA node, pinned the same way, `redis-cli --cluster create`
+over the 30 with `--cluster-replicas 0`, and `--save '' --appendonly
+no` checked on every instance with `CONFIG GET` before the cells (the
+AOF arm: `--appendonly yes --appendfsync everysec` and the save rules
+`3600 1 300 100 60 10000`, checked the same way, and `rdb_saves` and
+`aof_enabled` read after).
+
+The clients: `redis-benchmark` 8.0.2, one process per owner per client
+host (60 for Redis, 6 for perfcached), `-P 32`, `SET`/`GET
+key:{tag}:__rand_int__` with one hash tag per owner, found from
+`CLUSTER NODES` and checked with `CLUSTER KEYSLOT` (`--cluster` would
+pick a fresh tag per request and miss most GETs).  1,000,000 keys,
+filled before the cells.  The native cells are `natbench <seed> 6479
+<secret> 0 128 16 32 40 1000000 <bytes> <get%> 1 50 -1 1` from both
+client hosts: 128 connections, 16 threads, depth 32, 40 s, routed by
+key.  A cell's rate is what the servers answered in a 15-second window
+with every client alive (Redis's `cmdstat` calls summed over the
+masters, perfcached's `resp.requests`); a native cell's is the two
+clients' sum.  A sampler on each host read every server thread's
+utime + stime for 20 s inside the cell and the NIC counters beside it;
+us/op is those cores over the rate.  60 keys read back from their
+owners after each arm.
+
+What each server logged: no ERROR or CRIT line in any arm; the warnings
+were the rig's (no `state_dir`, configs world-readable, a RESP door with
+no password inside the allow-list) and, in the WAL arm, "close to FULL
+... requesting a snapshot" 30 times across the three nodes and, once,
+the master passing over a standby that had not acknowledged a
+control-state sync within 1000 ms.  The WAL arm's `/stats wal` after
+the cells: `dropped`, `overruns` and `heals` 0 on every node,
+`ring_waits` 0, and `writer_pauses` 17,760 on one node.
+
 ## TLS on the RESP door — the rig (0.7.5)
 
 GUIDE's TLS table has no harness script in `bench/`; the header of

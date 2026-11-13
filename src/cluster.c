@@ -74,6 +74,7 @@
 #include "clapply.h"                 /* apply sharded by key hash */
 #include "clplat.h"                  /* platform-derived identity */
 #include "clcid.h"                   /* the cluster id */
+#include "statefile.h"               /* the state dir's small files */
 #include "clmesh.h"                  /* discovery = unicast */
 #include "cladmit.h"
 #include "clddl.h"                   /* the collection DDL */
@@ -3252,43 +3253,18 @@ static void ident_hex(const unsigned char *id, char *out)
 /* @n bytes from 2n hex characters; -1 on anything that is not hex */
 #define hex2bin clinit_hex2bin
 
-/* temp file, fsync, rename, directory fsync: a crash never leaves an empty or torn file.
- * 0 written, -1 failed with errno set. */
+/* temp file, fsync, rename, directory fsync (statefile.c; 0600 - it names this node to its
+ * peers): a crash never leaves an empty or torn file.  0 written, -1 failed with errno set */
 static int ident_store(const char *dir, const unsigned char *id)
 {
-	char hex[33], fin[600], tmp[620], buf[128];
-	int fd, dfd, n, e;
+	char hex[33], buf[128];
+	int n;
 
 	ident_hex(id, hex);
 	n = snprintf(buf, sizeof buf,
 		IDENT_HEADER "\nidentity %s\ncheck %016llx\n", hex,
 		(unsigned long long)fnv1a64(id, 16));
-	snprintf(fin, sizeof fin, "%s/" IDENT_FILE, dir);
-	snprintf(tmp, sizeof tmp, "%s.tmp.%d", fin, (int)getpid());
-	/* 0600: it names this node to its peers */
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0)
-		return -1;
-	if (write(fd, buf, (size_t)n) != n || fsync(fd) != 0) {
-		e = errno;
-		close(fd);
-		unlink(tmp);
-		errno = e;
-		return -1;
-	}
-	close(fd);
-	if (rename(tmp, fin) != 0) {
-		e = errno;
-		unlink(tmp);
-		errno = e;
-		return -1;
-	}
-	dfd = open(dir, O_RDONLY | O_DIRECTORY);
-	if (dfd >= 0) {
-		fsync(dfd);
-		close(dfd);
-	}
-	return 0;
+	return pc_state_write(dir, IDENT_FILE, buf, (size_t)n);
 }
 
 /* 1 = text form valid, 0 = legacy 16 raw bytes (@id filled either way), -1 = invalid (@why).
@@ -3299,14 +3275,15 @@ static int ident_parse(const unsigned char *buf, size_t len,
 	return clinit_ident_parse(buf, len, id, why, wlen);
 }
 
-/* carry state file @name from @from_dir (a WAL dir that served as state_dir) into @to_dir if
- * absent; temp + fsync + rename + dir fsync.  1 carried, 0 nothing to do, -1 failed (logged). */
+/* carry state file @name (a few lines) from @from_dir (a WAL dir that served as state_dir) into
+ * @to_dir if absent, through pc_state_write.  1 carried, 0 nothing to do, -1 failed (logged) */
 static int carry_file(const char *from_dir, const char *to_dir,
 		const char *name)
 {
-	char src[512], dst[512], tmp[532], buf[4096];
-	int in, out, dfd;
-	ssize_t n;
+	char src[512], dst[512], buf[4096];
+	int in;
+	ssize_t n = 0;
+	size_t len = 0;
 
 	if (!from_dir || !to_dir || !*from_dir || !*to_dir ||
 	        strcmp(from_dir, to_dir) == 0)
@@ -3318,38 +3295,25 @@ static int carry_file(const char *from_dir, const char *to_dir,
 	in = open(src, O_RDONLY);
 	if (in < 0)
 		return 0;
-	snprintf(tmp, sizeof tmp, "%s.carry", dst);
-	out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (out < 0) {
+	while (len < sizeof buf && (n = read(in, buf + len, sizeof buf - len)) > 0)
+		len += (size_t)n;
+	if (len < sizeof buf && n < 0) {
 		LM_ERR("cannot carry %s into %s: %s\n", name, to_dir,
 			strerror(errno));
 		close(in);
 		return -1;
 	}
-	while ((n = read(in, buf, sizeof buf)) > 0)
-		if (write(out, buf, (size_t)n) != n) {
-			n = -1;
-			break;
-		}
+	n = len == sizeof buf ? read(in, buf, 1) : 0;
 	close(in);
-	if (n < 0 || fsync(out) != 0) {
-		LM_ERR("cannot carry %s into %s: %s\n", name, to_dir,
-			strerror(errno));
-		close(out);
-		unlink(tmp);
+	if (n != 0) {
+		LM_ERR("cannot carry %s into %s: larger than %zu bytes, not a "
+			"state file\n", name, to_dir, sizeof buf);
 		return -1;
 	}
-	close(out);
-	if (rename(tmp, dst) != 0) {
+	if (pc_state_write(to_dir, name, buf, len) != 0) {
 		LM_ERR("cannot carry %s into %s: %s\n", name, to_dir,
 			strerror(errno));
-		unlink(tmp);
 		return -1;
-	}
-	dfd = open(to_dir, O_RDONLY | O_DIRECTORY);
-	if (dfd >= 0) {
-		fsync(dfd);
-		close(dfd);
 	}
 	LM_NOTICE("carried %s from %s into state_dir %s\n", name, from_dir,
 		to_dir);
@@ -3362,10 +3326,10 @@ static int carry_file(const char *from_dir, const char *to_dir,
 static int node_salt(const char *state_dir, const char *legacy_dir,
 		unsigned char key[32])
 {
-	char path[600], tmp[620], buf[160], hex[65];
+	char path[600], buf[160], hex[65];
 	size_t bl = 0;
 	ssize_t n;
-	int fd, dfd;
+	int fd;
 
 	if (legacy_dir)
 		(void)carry_file(legacy_dir, state_dir, SALT_FILE);
@@ -3392,27 +3356,13 @@ static int node_salt(const char *state_dir, const char *legacy_dir,
 	}
 	randombytes_buf(key, 32);
 	sodium_bin2hex(hex, sizeof hex, key, 32);
-	snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid());
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0 || write(fd, hex, 64) != 64 || write(fd, "\n", 1) != 1 ||
-	        fsync(fd) != 0) {
-		LM_ERR("cluster: cannot write %s: %s\n", tmp, strerror(errno));
-		if (fd >= 0)
-			close(fd);
-		unlink(tmp);
-		return -2;
-	}
-	close(fd);
-	if (rename(tmp, path) != 0) {
+	hex[64] = '\n';
+	if (pc_state_write(state_dir, SALT_FILE, hex, 65) != 0) {
 		LM_ERR("cluster: cannot write %s: %s\n", path, strerror(errno));
-		unlink(tmp);
+		sodium_memzero(hex, sizeof hex);
 		return -2;
 	}
-	dfd = open(state_dir, O_RDONLY | O_DIRECTORY);
-	if (dfd >= 0) {
-		fsync(dfd);
-		close(dfd);
-	}
+	sodium_memzero(hex, sizeof hex);
 	return 0;
 }
 
@@ -5366,6 +5316,21 @@ static int clmap_membership_moved(void)
 	return want != C.map.nnodes;       /* or someone went away */
 }
 
+/* fold in a peer's term; one it could not persist is still followed, and said once per term -
+ * the node stands for no election until the tick's retry stores it */
+static void term_seen(uint32_t t)
+{
+	static uint32_t said;
+
+	if (pc_term_observe(t) == PC_TERM_UNSAVED && said != t) {
+		said = t;
+		LM_CRIT("cluster: could not persist mastership term %u (%s) - "
+			"following it, but this node takes no mastership until "
+			"it is on disk (check the state directory)\n", t,
+			strerror(pc_term_store_errno()));
+	}
+}
+
 /* build, stage to the standby, broadcast only once it acked: the standby is never BEHIND the
  * fleet.  No standby = publish at once; a hung stage is abandoned and its seq never reused. */
 static void clmap_stage(void)
@@ -5703,7 +5668,7 @@ static void handle_clmap(const unsigned char *pt, size_t n,
 				pc_term_current());
 		return;
 	}
-	pc_term_observe(m.term);
+	term_seen(m.term);
 
 	if (C.map_valid &&
 	        pc_clmap_epoch_cmp(m.term, m.seq, C.map.term, C.map.seq) <= 0) {
@@ -5846,6 +5811,21 @@ static void send_assign(const pc_addr *to, uint64_t tok, int your_id)
 
 static void become_master(int founded)
 {
+	static long long said_ms;
+	uint32_t unsaved = pc_term_unpersisted();
+
+	/* its claim's floor is not on disk: after a restart it could claim the term it follows */
+	if (unsaved) {
+		if (!said_ms || now_ms() - said_ms >= 10000) {
+			said_ms = now_ms();
+			LM_CRIT("cluster: not taking mastership - term %u, which this "
+				"node follows, is not persisted (%s); retrying it every "
+				"beat\n", unsaved, strerror(pc_term_store_errno()));
+		}
+		if (founded)
+			C.join_deadline_ms = now_ms() + 1000;  /* re-announcing meanwhile */
+		return;
+	}
 	/* found under the id this identity always proposes, so a whole-fleet restart
 	 * keeps its ids; with no durable identity the proposal is 0 and the scan gives 1 */
 	if (!C.node_id)
@@ -6678,7 +6658,7 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 			}
 			/* seen, so a later claim is above it: it yields here before any map from
 			 * the winner arrives, and must not promote at the term it yielded to */
-			pc_term_observe(theirs_t);
+			term_seen(theirs_t);
 			if (pc_term_must_stepdown(1, mine_t, theirs_t)) {
 				LM_WARN("cluster: stepping down - node %d holds "
 					"term %u and we hold %u\n", their_id,
@@ -6723,7 +6703,7 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 	/* the term of the master followed is seen, as its map's is - a
 	 * member that must promote before its first map claims above it */
 	if ((m.have & CLMEMB_M_TERM) && pc_term_plausible(m.term))
-		pc_term_observe(m.term);
+		term_seen(m.term);
 	C.master_id = their_id;
 	C.master_addr = *from;
 	C.master_seen_ms = now_ms();
@@ -7462,6 +7442,9 @@ static void membership_tick(void)
 	}
 
 	pc_cid_tick(now);                      /* provisional -> established */
+	if (pc_term_retry() == 1)
+		LM_NOTICE("cluster: mastership term %u persisted - this node may "
+			"take mastership again\n", pc_term_current());
 	eager_settle_tick(now);
 	mesh_hint_tick(now);
 	lane_retry_tick(now);
@@ -11365,10 +11348,15 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	C.rec_cursor = 0;
 	C.recon.witness = 0;
 	C.recon.death_mono = reconcile_death_mono();
-	LM_NOTICE("cluster: mastership term %u (%s)\n", pc_term_current(),
-		pc_term_durable() ? "persisted"
-		: "EPHEMERAL - nothing persisted here, so nothing to "
-		  "contradict either");
+	if (pc_term_durable() || !(state_dir && *state_dir))
+		LM_NOTICE("cluster: mastership term %u (%s)\n", pc_term_current(),
+			pc_term_durable() ? "persisted"
+			: "EPHEMERAL - nothing persisted here, so nothing to "
+			  "contradict either");
+	else
+		LM_ERR("cluster: mastership term %u (NOT persisted - %s refused "
+			"it: %s)\n", pc_term_current(), state_dir,
+			strerror(pc_term_store_errno()));
 	memcpy(C.psk, psk, PC_NOISE_KEYLEN);
 	C.pull_timeout_ms = pull_timeout_ms;
 	C.negative_ms = negative_ms;
@@ -11753,6 +11741,8 @@ void pc_cluster_get_stats(struct pc_cl_stats *out)
 	out->reserved_ids = clres_count(&reserved, now_ms());
 	out->peers_up = clpeers_count_live(&C.pt, now_ms());
 	out->replicas_short = clspread_short_now(&replicas_short);
+	out->term_unpersisted = pc_term_unpersisted();
+	out->term_errno = out->term_unpersisted ? pc_term_store_errno() : 0;
 }
 
 int pc_cluster_peers(struct pc_cl_peer_info *out, int max)

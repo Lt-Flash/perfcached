@@ -54,7 +54,8 @@ CLUSTER_OBJS = src/cluster.o src/clmap.o src/clterm.o src/clsync.o src/clhist.o 
 	src/clmemb.o src/clpull.o src/clhold.o src/clrecon.o src/clepoch.o src/clcol.o src/clplat.o src/clsend.o \
 	src/clfleet.o src/clps.o src/clspread.o src/clcid.o \
 	src/clmesh.o src/clane.o src/clorder.o src/clrp.o src/clrpt.o src/clreplay.o \
-	src/clrecv.o src/cltomb.o src/cladmit.o src/clfound.o src/clddl.o src/clconn.o
+	src/clrecv.o src/cltomb.o src/cladmit.o src/clfound.o src/clddl.o src/clconn.o \
+	src/statefile.o
 ifeq ($(PC_EDITION),standalone)
 EDITION_OBJS = src/cluster_stub.o
 CFLAGS += -DPC_EDITION_STANDALONE
@@ -191,8 +192,8 @@ pagedump: test/pagedump.c src/statuspage.o src/statuspage.h
 	$(CC) $(CFLAGS) -o $@ test/pagedump.c src/statuspage.o
 
 # the mastership term: persistence plus the three ordering rules
-cltermtest: test/cltermtest.c src/clterm.o
-	$(CC) $(CFLAGS) -o $@ test/cltermtest.c src/clterm.o
+cltermtest: test/cltermtest.c src/clterm.o src/statefile.o
+	$(CC) $(CFLAGS) -o $@ test/cltermtest.c src/clterm.o src/statefile.o
 
 # the peer table: liveness at the boundary, slot reuse, duplicate ids
 clpeerstest: test/clpeerstest.c src/pcaddr.o src/clpeers.o
@@ -469,8 +470,8 @@ clseltest: test/clseltest.c src/clsel.o src/clmap.o
 
 # the mastership state machine under seed-replayable schedules, linking the SHIPPED decision
 # functions: the simulation is the protocol around them, never a reimplementation of them.
-clustersim: test/clustersim.c src/clterm.o src/clmap.o
-	$(CC) $(CFLAGS) -o $@ test/clustersim.c src/clterm.o src/clmap.o
+clustersim: test/clustersim.c src/clterm.o src/clmap.o src/statefile.o
+	$(CC) $(CFLAGS) -o $@ test/clustersim.c src/clterm.o src/clmap.o src/statefile.o
 
 # the reply writer, including the heap mode CLUSTER SLOTS needs
 jwtest: test/jwtest.c src/json.o src/compat/compat.o
@@ -1299,6 +1300,8 @@ check-g-cluster1: check-edition-guard $(CHECK_BINS)
 # a clean stop snapshots, so a node restarted ALONE after the fleet was
 # stopped serves the whole keyspace; and the privileged fleetstop verb.
 	sh test/stoptest.sh ./perfcached ./perfcli
+# a term followed but not persisted is never claimed again; a refused directory sync fails a store
+	sh test/termsavetest.sh ./perfcached ./syncfailshim.so
 	sh test/lifeguardtest.sh ./perfcached
 	sh test/idsrctest.sh ./perfcached
 	sh test/boottest.sh ./perfcached

@@ -227,16 +227,20 @@ f.flush()
 for _ in range(3): f.readline()
 EOF
 hardkill
-# corrupt the SECOND record (keepB stays valid, lostC is beyond the tear)
-python3 - "$D/wal" <<'EOF'
+# corrupt keepB's own record, found by its key: a segment may rotate between the three writes
+# (keepA stays valid, lostC is beyond the tear)
+python3 - "$D/wal" > "$D/tear.txt" <<'EOF'
 import glob, struct, sys
-def records(path):          # bounded: a segment just rotated in may hold none (ASan 113382)
+def records(path):          # (offset, collection, key); bounded - a just-rotated segment may hold none
     data = open(path, "rb").read()
     off, out = 8, []
     while off + 12 <= len(data):
         ln = struct.unpack("<I", data[off:off+4])[0]
-        if ln == 0 or off + 12 + ln > len(data): break
-        out.append(off)
+        if ln < 8 or off + 12 + ln > len(data): break
+        p = data[off+12:off+12+ln]
+        cl, kl, vl = p[1], struct.unpack("<H", p[2:4])[0], struct.unpack("<I", p[4:8])[0]
+        h = ln - cl - kl - vl
+        out.append((off, p[h:h+cl], p[h+cl:h+cl+kl]))
         off += 12 + ln
     return out
 cands = []
@@ -245,14 +249,15 @@ for seg in glob.glob(sys.argv[1] + "/wal-*.seg"):
         h = f.read(8)
     if len(h) == 8 and struct.unpack("<I", h[:4])[0] == 0x4C574350:
         cands.append((struct.unpack("<I", h[4:])[0], seg))
-seg, recs = None, []
-for gen, path in sorted(cands, reverse=True):   # the newest that holds the last writes
-    recs = records(path)
-    if len(recs) >= 3:
-        seg = path
+seg = tgt = None
+for gen, path in sorted(cands, reverse=True):   # keepB's newest record
+    rs = [r for r in records(path) if r[1:] == (b"th", b"keepB")]
+    if rs:
+        seg, tgt = path, rs[-1][0]
+        print("keepB at %d in gen %d, the segment ending %s" % (tgt, gen,
+            [k.decode("ascii", "replace") for _, _, k in records(path)[-5:]]))
         break
-assert seg and len(recs) >= 3, (cands, recs)
-tgt = recs[-2]                       # the middle of the last three
+assert seg, cands
 with open(seg, "r+b") as f:
     f.seek(tgt + 20)
     b = f.read(1)
@@ -277,7 +282,7 @@ assert call("get", col="th", key="keepB")["result"]["found"] is False
 assert call("get", col="th", key="lostC")["result"]["found"] is False
 print("tear gated replay exactly where the CRC said")
 EOF
-[ $? -eq 0 ] && ok || bad "tear gating"
+[ $? -eq 0 ] && ok || bad "tear gating ($(cat "$D/tear.txt"); snapshots: $(grep -h "rdb:" "$D"/log* | tail -2 | tr '\n' ' ' | cut -c1-200))"
 hardkill
 
 # ---- 5. corrupt snapshot: cold start, WAL-alone rebuild ----------------

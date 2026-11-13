@@ -77,16 +77,21 @@ r = pcnative.call(f, "stats")["result"]; c = r["cluster"]
 print(eval(sys.argv[2]))
 PY
 }
-ops() { # ops <node> <set|del> <prefix> <n>: prints how many succeeded
+ops() { # ops <node> <set|del> <prefix> <n> [retry]: prints how many succeeded; retry = a refused op again, 10 s
 	python3 - "$@" <<'PY'
-import socket, sys, pcnative
+import socket, sys, time, pcnative
 n, op, pfx, cnt = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+retry = len(sys.argv) > 5
 f = pcnative.wrap(socket.create_connection(("127.0.174.%d" % (9 if n == 1 else n), 19710 + n), 10))
 ok = 0
 for i in range(cnt):
     k = "%s:%d" % (pfx, i)
-    r = pcnative.call(f, "set", col="c", key=k, value="v" * 64) if op == "set" else pcnative.call(f, "del", col="c", key=k)
-    ok += "error" not in r
+    for _ in range(200 if retry else 1):
+        r = pcnative.call(f, "set", col="c", key=k, value="v" * 64) if op == "set" else pcnative.call(f, "del", col="c", key=k)
+        if "error" not in r:
+            ok += 1
+            break
+        time.sleep(0.05)
 print(ok)
 PY
 }
@@ -101,8 +106,10 @@ PY
 kept() { st 1 'c["tombstones_retained"]["numbered"]'; }
 stuck() { st "$1" '[a["key"] for a in (r.get("alerts") or {}).get("active", []) if a["key"] == "cluster.acks_stuck"]'; }
 N=3000
+# the setup's writes retry: node 2's 16 KB ring can overflow under load with nothing armed, and a
+# healing node refuses writes for the heal's few ms
 round() { # round <prefix>: node 2 writes N keys, then node 1 deletes them with node 2's WAL slowed
-	S=$(ops 2 set "$1" $N)
+	S=$(ops 2 set "$1" $N retry)
 	k=0; while [ $k -lt 100 ] && [ "$(held 1 "$1" $N)" != $N ]; do sleep 0.2; k=$((k+1)); done
 	sleep 2                                  # everysec: node 2's writes synced
 	[ "$S" = $N ] && [ "$(held 1 "$1" $N)" = $N ] || { bad "setup $1: node 2 took $S of $N, node 1 holds $(held 1 "$1" $N)"; done_; }

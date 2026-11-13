@@ -12,6 +12,7 @@
 
 #include "compat/dprint.h"
 #include "clwire.h"
+#include "statefile.h"
 #include "clcid.h"
 
 #define CID_HEADER "perfcached-cluster-id 1"
@@ -93,31 +94,14 @@ static void pin_bytes(const char *pin, unsigned char out[16])
 
 static int cid_store(const unsigned char cid[16])
 {
-	char tmp[600], fin[600], buf[96], s[37];
-	int fd, dfd, n, ok = 0;
+	char buf[96], s[37];
+	int n;
 
 	if (!K.dir[0])
 		return 1;                      /* nothing persists: said at init */
 	pc_cid_str(cid, s);
-	snprintf(tmp, sizeof tmp, "%s/" PC_CID_FILE ".tmp.%d", K.dir, (int)getpid());
-	snprintf(fin, sizeof fin, "%s/" PC_CID_FILE, K.dir);
 	n = snprintf(buf, sizeof buf, CID_HEADER "\n%s\n", s);
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0)
-		return 0;
-	if (write(fd, buf, (size_t)n) == (ssize_t)n && fsync(fd) == 0)
-		ok = 1;
-	close(fd);
-	if (!ok || rename(tmp, fin) != 0) {
-		unlink(tmp);
-		return 0;
-	}
-	dfd = open(K.dir, O_RDONLY);
-	if (dfd >= 0) {
-		fsync(dfd);
-		close(dfd);
-	}
-	return 1;
+	return pc_state_write(K.dir, PC_CID_FILE, buf, (size_t)n) == 0;
 }
 
 static int cid_load(unsigned char out[16])

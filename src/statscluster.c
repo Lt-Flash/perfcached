@@ -427,6 +427,9 @@ void stats_tree_cluster(struct pc_tw *out)
 		pc_tw_key(out, "term");
 		pc_tw_i64(out, (long long)pc_term_current());
 		pc_tw_ctr(out, "cluster.term_rejected", "term_rejected", (unsigned long long)(pc_term_rejected));
+		/* a followed term the state dir refused: the node takes no mastership until it lands */
+		pc_tw_key(out, "term_unpersisted");
+		pc_tw_i64(out, (long long)cs.term_unpersisted);
 		pc_tw_key(out, "eager");
 		pc_tw_bool(out, (pc_cluster_eager()));
 		pc_tw_key(out, "mode");

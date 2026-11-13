@@ -29,9 +29,20 @@ int pc_term_durable(void);
  * counted in pc_term_rejected; ours does not move (a frame with such a term is refused whole) */
 int pc_term_plausible(uint32_t seen);
 
-/* Fold in a term seen from a peer.  Returns 1 if ours moved, 0 if not,
- * -1 if the value was refused as implausible (counted, never silent). */
+/* Fold in a term seen from a peer.  1 = ours moved, and is persisted; PC_TERM_UNSAVED = ours moved
+ * but could not be persisted; 0 = not moved; -1 = refused as implausible (counted, never silent) */
+#define PC_TERM_UNSAVED 2
 int pc_term_observe(uint32_t seen);
+
+/* an adopted term its store refused, until a later store lands, else 0: a node holding one must not
+ * claim (it could not remember the claim's floor across a restart) - membership retries each tick */
+uint32_t pc_term_unpersisted(void);
+
+/* store the unpersisted term again: 1 stored now, 0 nothing pending, -1 still refused */
+int pc_term_retry(void);
+
+/* the errno of the last refused term store */
+int pc_term_store_errno(void);
 
 /* the next term for a promotion: above everything EVER seen, not just our own last, PERSISTED
  * BEFORE IT IS RETURNED; 0 if it could not be, and then the caller must NOT promote */

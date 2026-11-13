@@ -2282,6 +2282,7 @@ it already keeps:
 | a member back after a silence longer than the retained deletes cover (`cluster.peer_absent`) - or, where members acknowledge deletes (0.7.3), one asked to rebuild for it | warning | once | - |
 | a member whose mark of a node's deletes has stood still for 30 s while the others confirm them - every delete since is kept for it (`cluster.acks_stuck`, 0.7.3) | warning | after 10 s | after a minute moving |
 | on the master, a joiner still `connecting` 10 s after its admission - a pair of links with it has not answered both ways; the text names the pairs and what did not answer: the cluster socket, the relay port, the frame lane, the relay port's TCP (`clrpt`) or a member's bulk listener (`cluster.admission_stuck`, 0.7.5) | warning | at once | 30 s after none is held |
+| a mastership term this node follows could not be written to its state directory (full, read-only, a failing disk) - it serves and follows, but takes no mastership until the term is on disk, retrying every beat (`cluster.term_unpersisted`, 0.7.5) | critical | at once | 10 s after it is written |
 | a member silent, failed, stalled, gone or dropped (`fleet.node<id>`); members missing against the fleet's size (`fleet.missing`); fewer ready than a majority (`fleet.majority`) | warning; warning; critical | after 30 s (a goodbye: a minute); after a minute; after a minute | after 30 s |
 | a setting the fleet must agree on held differently by a member (`config.<setting>`, 0.6.5) | warning | after a minute | after a minute agreeing |
 | a member holding other autoscale modes than this node's, or one too old to take them while modes are set (`cluster.autoscale`, 0.7.2) | warning | after 30 s | after a minute agreeing |
@@ -3103,8 +3104,9 @@ block on `/stats` and `/metrics`.
 
 > **0.4.0's numbers**, except the `spread` farm table, which is still
 > 0.3.7's (re-taking it means a high packet rate across the lab's
-> shared network; it waits for a quiet window), and the TLS table,
-> which is 0.7.5's.
+> shared network; it waits for a quiet window), the TLS table,
+> which is 0.7.5's, and the Redis Cluster table, a 0.7.4 build on bare
+> metal (2026-11-01).
 
 Every other table is the tagged 0.4.0 daemon (`570067a`), measured
 2026-10-01, on one server host - a 16-vCPU Debian 13 VM - with the load
@@ -3125,6 +3127,74 @@ the readings that changed as the harnesses improved are in
 [bench/RESULTS.md](bench/RESULTS.md); raw rows are in
 [bench/results/](bench/results/), every earlier run's included.
 Numbers rot: quote from a run, not from here.
+
+### Against Redis Cluster, on bare metal (0.7.4)
+
+Two fleets on the same two servers, 2026-11-01: Redis 8.0.2 Cluster with
+30 masters (10 per NUMA node, no replicas), and a perfcached `shard`
+fleet of three nodes with 12 workers each, one node per NUMA node - a
+0.7.4 development build (`5a02babb`; it reports 0.7.4.1), so 0.7.5's
+admission and cluster wire are not in it.  The servers are two
+bare-metal 2x E5-2690 v2 hosts on 10G, with their root filesystems in
+RAM.  The clients ran on the second host's other NUMA node and on a
+third host: `redis-benchmark` 8.0.2, one process per owner per client
+host at pipeline 32, each sending one hash tag so that every request
+reaches its owner directly; 1,000,000 keys.  The native rows are
+`bench/natbench` over libperfd, routed by key, with the native door's
+default `encrypt = no` (the Noise handshake, then requests in the
+clear).  The rate is what the servers answered over 15 s with every
+client running; server CPU is the server processes' own over 20 s inside
+the cell, so it compares the two daemons whatever bounded the cell
+([bench/results/redisx-0.7.4.tsv](bench/results/redisx-0.7.4.tsv)).
+
+**32-byte values** - the wire has room, so CPU decides:
+
+| | SET (ops/s) | GET (ops/s) | server CPU, SET (us/op) | server CPU, GET (us/op) |
+|---|---|---|---|---|
+| **Redis Cluster, 30 masters** | 15.44M | 17.51M | 1.93 | 1.67 |
+| perfcached, RESP door | 17.35M | 18.36M | 1.73 (-10%) | 1.29 (-23%) |
+| perfcached, native door | **21.97M** | **24.57M** | **1.34 (-31%)** | **1.02 (-39%)** |
+
+**200-byte values** - the first server's link was full (9.9 Gbit/s) in
+every cell, so read the CPU columns:
+
+| | SET (ops/s) | GET (ops/s) | server CPU, SET (us/op) | server CPU, GET (us/op) |
+|---|---|---|---|---|
+| **Redis Cluster, 30 masters** | 10.98M | 12.44M | **1.96** | 1.73 |
+| perfcached, RESP door | 9.87M | 12.29M | 2.07 (+6%) | 1.38 (-20%) |
+| perfcached, native door | 11.37M | 14.66M | 1.84 (-6%) | **1.17 (-32%)** |
+
+**Durable, 200-byte values** - Redis with `appendonly yes`,
+`appendfsync everysec` and the default save rules; perfcached with
+`[wal] fsync = everysec`, 32 x 256 MB segments a node and the default
+save rules:
+
+| | SET (ops/s) | GET (ops/s) | server CPU, SET (us/op) | server CPU, GET (us/op) |
+|---|---|---|---|---|
+| **Redis Cluster, AOF** | 8.13M | 12.40M | 3.72 | 1.73 |
+| perfcached, RESP door, WAL | 8.69M | 12.33M | 2.77 (-26%) | 1.41 (-18%) |
+| perfcached, native door, WAL | **8.91M** | **14.66M** | **2.54 (-32%)** | **1.13 (-35%)** |
+
+Through the same RESP protocol, a perfcached SET cost 10% less server CPU
+than Redis's and a GET 23% less at 32 bytes; through the native door,
+31% and 39% less, and the native SET cell reached 9.2 Gbit/s on the first
+server's link.  At 200 bytes the link set the rate of every cell, and
+the one cell where Redis cost less was SET through the RESP door, by 6%.
+With logging on, Redis's SET cell became CPU-bound - 30 cores at
+3.72 us a SET - while both perfcached arms stayed at the link with a
+quarter to a third less CPU a SET.  No WAL record was dropped, no
+segment overran and no node healed; one node's writer paused 17,760
+times on a full ring, which is the ring making writers wait rather than
+drop.  The filesystems were in RAM, so the durable rows measure what
+logging costs the CPU, not a disk: a real disk sets its own ceiling
+("The write-ahead log has a ceiling" in the README).
+
+Read the shapes with the figures: Redis ran as 30 single-threaded
+processes and perfcached as three multithreaded ones on the same three
+NUMA nodes, neither with replicas, and both CPU columns cover every
+server process.  With `encrypt = yes` a native request costs about
+twice the CPU (see `encrypt` under `[listen]`).  To be re-taken on
+0.7.5; the rig is in [bench/RESULTS.md](bench/RESULTS.md).
 
 ### nginx in front: caching responses (0.7.1, no module of our own)
 
