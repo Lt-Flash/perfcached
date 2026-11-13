@@ -113,6 +113,15 @@ PY
 }
 
 clean() { st 1 'x.get("sweep_gate", {}).get("clean", 0)'; }
+asked() { st 1 '(x.get("sweep_gate") or {}).get("asked", 0)'; }
+judged() { st 1 '(lambda g: g.get("answered", 0) + g.get("unanswered", 0))(x.get("sweep_gate") or {})'; }
+judged_reach() { # judged_reach <n> <s>: until node 1 has judged <n> gate rounds, then 1 s for a walk one began
+	k=0; while [ $k -lt $2 ]; do
+		[ "$(judged)" -ge "$1" ] 2>/dev/null && { sleep 1; return 0; }
+		sleep 1; k=$((k+1))
+	done
+	return 1
+}
 steady() { # once the one-time re-send has drained, two more sweep rounds refuse almost nothing
 	P=; i=0; while [ $i -lt 30 ]; do
 		Q="$(older 2)/$(older 3)"; [ "$Q" = "$P" ] && break
@@ -136,12 +145,13 @@ run() { # run <label> <copies> <cluster lines> <collection lines> [walk]
 	for n in 1 2 3; do start $n || { bad "$1: node $n did not start"; return; }; done
 	ready3 || { bad "$1: the fleet did not form"; return; }
 	F=$(fill 0 3000); [ "$F" = 3000 ] && ok "$1: 3,000 keys stored through node 1" || bad "$1: stored $F of 3,000"
+	# a round whose digests were taken before the burst reached a peer re-sends what was in flight,
+	# once: the count starts when every round asked so far is judged and walked
+	A1=$(asked)
+	judged_reach "${A1:-0}" 30
 	O2=$(older 2); O3=$(older 3)
-	# two sweep cycles (10 s each) and the answer between them
-	i=0; while [ $i -lt 45 ]; do
-		[ "$(clean)" -ge 2 ] 2>/dev/null && break
-		sleep 1; i=$((i+1))
-	done
+	# then two rounds asked after the burst (10 s ticks: the question, then its answer)
+	judged_reach $(( ${A1:-0} + 2 )) 45
 	R2=$(( $(older 2) - O2 )); R3=$(( $(older 3) - O3 ))
 	# spread re-sends a node's share once when the map first places it: one share, no more
 	A2=150; A3=150; [ "${5:-}" = walk ] && { A2=$(( $(ent 2) + 150 )); A3=$(( $(ent 3) + 150 )); }
