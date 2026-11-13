@@ -197,8 +197,11 @@ echo "    rate trigger: overruns $O, full-log waits $FW0, snapshots $SAVES (last
 grep -q "filling faster than a snapshot can keep up" "$D/n.log" \
 	&& ok "the rate trigger fired: $(grep -m1 "filling faster" "$D/n.log" | sed 's/.*wal: //' | cut -c1-90)..." \
 	|| bad "the rate trigger never fired"
-[ "$O" = 0 ] && [ "$FW0" = 0 ] && ok "and the log never filled: $SAVES snapshots kept up, no writer held" \
-	|| bad "the log filled: $O overrun(s), writers held $FW0 time(s)"
+# a stalled disk holds the writers by itself (no snapshot can finish): then only an overrun is a finding
+S=$(grep -c "an fsync has been stuck" "$D/n.log")
+if [ "$O" = 0 ] && [ "$FW0" = 0 ]; then ok "and the log never filled: $SAVES snapshots kept up, no writer held"
+elif [ "$O" = 0 ] && [ "$S" != 0 ]; then echo "  ..   writers held $FW0 time(s) while the runner's storage stalled ($S line(s)): not counted"
+else bad "the log filled: $O overrun(s), writers held $FW0 time(s)"; fi
 case "$FILL" in ''|'?'|0|0.0) bad "no fill rate published mid-load ($FILL)";;
 	*) ok "stats.wal published it while it ran: filling at $FILL MB/s, full in $FULL s";; esac
 # ---- 6. the rule fired under the load, and agrees with /stats ----------------
