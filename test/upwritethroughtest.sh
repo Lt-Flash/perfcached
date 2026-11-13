@@ -386,15 +386,15 @@ PY
 )
 set -- $r
 # "not applied" (never sent) or "may or may not" (sent, its deadline passed on the wire) is the
-# runner's timing: together they are the ten queued
-[ "${1:-0}" -ge 20 ] && [ $(( ${2:-0} + ${3:-0} )) -ge 5 ] && [ "${2:-0}" -ge 1 ] && [ "${4:-1}" = 0 ] && ok "10. 40 writes at a 3 s master: $1 refused at once (the queue is full), $2 answered not applied after their deadline, $3 may-or-may-not, none OK" ||
-	bad "10. full $1, expired $2, maybe $3, ok $4 (want >= 20 full, >= 5 expired, 0 OK)"
+# runner's timing - one pipelined round may take all ten: together they are the ten queued
+[ "${1:-0}" -ge 20 ] && [ $(( ${2:-0} + ${3:-0} )) -ge 5 ] && [ "${4:-1}" = 0 ] && ok "10. 40 writes at a 3 s master: $1 refused at once (the queue is full), $2 answered not applied after their deadline, $3 may-or-may-not, none OK" ||
+	bad "10. full $1, expired $2, maybe $3, ok $4 (want >= 20 full, >= 5 expired or may-or-may-not, 0 OK)"
 awk -v m="${5:-99}" 'BEGIN { exit !(m < 2.5) }' && ok "10. no client waited longer than its timeout and a half (slowest ${5}s)" ||
 	bad "10. the slowest reply took ${5}s - writes waited in line past their deadline"
 n=$(grep -c '^SET q:' "$D/upm/writes" 2>/dev/null)
 [ "${n:-9}" -le 2 ] && ok "10. the master saw $n of the 40 - the expired and the refused were never sent" || bad "10. the master saw $n SETs"
-w=$(wt '(w["queue_max"], w["queue_full"] >= 20, w["queue_expired"] >= 1)')
-[ "$w" = "(10, True, True)" ] && ok "10. /stats: queue_max 10, the refusals and the expiries counted" || bad "10. /stats: $w"
+w=$(wt '(w["queue_max"], w["queue_full"] >= 20, w["queue_expired"] == '"${2:-0}"', w["timeouts"] >= '"$(( ${3:-0} > 0 ))"')')
+[ "$w" = "(10, True, True, True)" ] && ok "10. /stats: queue_max 10, the refusals counted, $2 expiries as the clients saw them, a round timed out if one was sent" || bad "10. /stats: $w (queue_max, queue_full >= 20, queue_expired = $2, timeouts >= 1 if $3 maybe)"
 waitfor 15 '[ "$(alert write.0.queue)" = warning ]'
 [ "$(alert write.0.queue)" = warning ] && ok "10. the alert write.0.queue is a warning" || bad "10. alert write.0.queue: $(alert write.0.queue)"
 stop

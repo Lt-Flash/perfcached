@@ -1,5 +1,6 @@
 /* quietlinktest.c - a quiet link closed by its node's death still takes a counter update; a routed
  * one whose node froze mid-request is not sent again.  Args: host1-4 port secret pid1 pid3 pid4 */
+#include <dirent.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,43 @@ static perfd_t *dial(const char *host, int port, const char *const *sec, int rou
 	o.io_timeout_ms = route ? 1000 : 0;    /* a frozen node's add gives up in 1 s */
 	o.spares = spares;
 	return perfd_connect(host, port, &o);
+}
+
+/* kill(SIGSTOP) returns before every thread has stopped: 1 once all of @pid's have, within 2 s */
+static int frozen(int pid)
+{
+	char path[32];
+	double t0 = now_ms();
+
+	snprintf(path, sizeof path, "/proc/%d/task", pid);
+	while (now_ms() - t0 < 2000) {
+		DIR *d = opendir(path);
+		struct dirent *e;
+		int all = d != NULL;
+
+		while (d && all && (e = readdir(d))) {
+			char sp[320], buf[256], *rp;
+			FILE *f;
+
+			if (e->d_name[0] == '.')
+				continue;
+			snprintf(sp, sizeof sp, "%s/%s/stat", path, e->d_name);
+			if (!(f = fopen(sp, "r")))
+				continue;          /* the thread is gone */
+			if (!fgets(buf, sizeof buf, f))
+				buf[0] = 0;
+			fclose(f);
+			rp = strrchr(buf, ')');
+			if (!rp || rp[1] != ' ' || (rp[2] != 'T' && rp[2] != 't'))
+				all = 0;
+		}
+		if (d)
+			closedir(d);
+		if (all)
+			return 1;
+		usleep(1000);
+	}
+	return 0;
 }
 
 /* a key @r routes to @host, written as "<pfx><n>" into @k */
@@ -97,7 +135,8 @@ int main(int argc, char **argv)
 	perfd_t *a, *b, *r, *m;
 	char kr[16], kc[16];
 	long long nv = -1;
-	int port, rc;
+	unsigned long long miss;
+	int port, rc, fz;
 	double deadline, t;
 
 	if (argc != 10)
@@ -126,14 +165,21 @@ int main(int argc, char **argv)
 	rc = perfd_add(a, "c", "n", 1, 0, &nv);
 	OK(rc == 0 && nv == 1 && perfd_jset(b, "c", "j", "$", "{\"x\":0}", 0) == 0 &&
 		perfd_jset(r, "c", kr, "$", "{\"x\":0}", 0) == 0, "the counter and both documents written");
+	/* the same push window: node 4 must not die before it has passed the document on */
+	nv = settled(m, kr, "$.x", 0, 3, &t);
+	OK(nv == 0, "node 2 has %s (x = %lld) before node 4 is killed, after %.0f ms", kr, nv, t);
 
 	kill((pid_t)atoi(argv[8]), SIGSTOP);
+	fz = frozen(atoi(argv[8]));
+	miss = perfd_route_missed(r);
 	t = now_ms();
 	rc = perfd_add(r, "c", kc, 1, 0, &nv);
 	t = now_ms() - t;
+	miss = perfd_route_missed(r) - miss;
 	kill((pid_t)atoi(argv[8]), SIGCONT);
-	OK(rc != 0, "a routed add, its node frozen past the timeout: after %.0f ms %s", t,
-		rc ? perfd_error(r) : "sent again on the active link");
+	OK(fz && rc != 0, "a routed add, its node frozen past the timeout: after %.0f ms %s", t,
+		!fz ? "- node 3 did not stop within 2 s" : rc ? perfd_error(r) :
+		miss ? "- sent on the active link, not routed" : "- answered by the frozen node");
 
 	kill((pid_t)atoi(argv[9]), SIGKILL);
 	usleep(QUIET_US);
