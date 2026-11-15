@@ -288,7 +288,6 @@ static int rdb_save(void)
 	}
 	close(dirfd);
 
-	R.saves++;
 	R.safe_marker = R.last_marker;  /* coverage is real only now */
 	/* the marks that go with it; failing them is not a failed save - a restart rebuilds its
 	 * marks from the replay alone, lower */
@@ -306,6 +305,8 @@ static int rdb_save(void)
 	R.last_unix = (long long)time(NULL);
 	R.seq_at_last = ws.last_seq;
 	R.last_save_mono_s = mono_us() / 1000000;
+	/* counted last: a stats read that sees this save sees its duration and age with it */
+	__atomic_store_n(&R.saves, R.saves + 1, __ATOMIC_RELEASE);
 	LM_NOTICE("rdb: snapshot %ld records, %llu bytes, %lld ms, wal "
 		"marker %llu\n", ctx.written, w.total, R.last_dur_ms,
 		R.last_marker);
@@ -518,10 +519,12 @@ const char *pc_rdb_dir(void)
 
 void pc_rdb_get_stats(struct pc_rdb_stats *out)
 {
+	unsigned long long saves = __atomic_load_n(&R.saves, __ATOMIC_ACQUIRE);
+
 	memset(out, 0, sizeof *out);
 	out->enabled = R.enabled;
 	out->running = R.running;
-	out->saves = R.saves;
+	out->saves = saves;
 	out->last_bytes = R.last_bytes;
 	out->last_marker = R.last_marker;
 	out->safe_marker = R.safe_marker;
@@ -529,7 +532,7 @@ void pc_rdb_get_stats(struct pc_rdb_stats *out)
 	out->last_dur_ms = R.last_dur_ms;
 	out->last_unix = R.last_unix;
 	out->last_start_us = R.last_start_us;
-	out->last_age_s = R.saves ? mono_us() / 1000000 - R.last_save_mono_s : -1;
+	out->last_age_s = saves ? mono_us() / 1000000 - R.last_save_mono_s : -1;
 }
 
 /* ---- validate (tests, -R; the loader builds on this walk) -------------- */

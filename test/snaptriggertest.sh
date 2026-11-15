@@ -214,12 +214,12 @@ set -- $(cat "$D/sampler.out")
 [ "${6:-0}" -gt 0 ] 2>/dev/null \
 	&& ok "RV-12: perfcached_rdb_in_progress showed the snapshots running ($6 samples)" \
 	|| bad "RV-12: in_progress never read 1 across $SAVES snapshots"
-# /stats and /metrics back to back, bracketed by a second /stats: a snapshot finishing between the
-# reads moves both, and is a retry, not a disagreement
+# /stats and /metrics back to back between two idle /stats reads that agree on the count and the
+# duration: a snapshot finishing mid-way moves one of them, and is a retry, not a disagreement
 i=0
 while [ $i -lt 5 ]; do
-	S1=$(wal saves); D1=$(wal last_dur_ms); A=$(alert); S2=$(wal saves)
-	[ "$S1" = "$S2" ] && [ "$(wal running)" = False ] && break
+	R1=$(wal running); S1=$(wal saves); D1=$(wal last_dur_ms); A=$(alert); S2=$(wal saves); D2=$(wal last_dur_ms)
+	[ "$R1" = False ] && [ "$S1" = "$S2" ] && [ "$D1" = "$D2" ] && [ "$(wal running)" = False ] && break
 	sleep 2; i=$((i+1))
 done
 DURS=$(python3 -c "print('%g' % (int('$D1') / 1000))" 2>/dev/null)
