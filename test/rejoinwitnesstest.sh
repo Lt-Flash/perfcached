@@ -181,9 +181,11 @@ after 1 2 | grep -q "rdb: snapshot" \
 start 1 4 || exit 1
 readyn 1
 H=$(held 27491)
-[ "$H" = "3000 0 150 0 50" ] \
-	&& ok "2d. restarted alone, node 1 holds what its files held before the copy: w at b, not the fleet's c; the 50 keys deleted meanwhile still there" \
-	|| bad "2d. node 1 holds (w at b, w at c, k present, k0000-49, k0050-99) = $H (want 3000 0 150 0 50)"
+# k0050-99's deletes may reach it before the kill (the tombstone catch-up), kept in its WAL: either is right
+set -- $H
+[ "${1:-}" = 3000 ] && [ "${2:-}" = 0 ] && [ "${4:-}" = 0 ] && [ $((${3:-0} - ${5:-0})) = 100 ] \
+	&& ok "2d. restarted alone, node 1 holds what its files held before the copy: w at b, not the fleet's c, k0100-199 all there; ${5} of k0050-99, deleted meanwhile, too (the rest replayed to it as deletes)" \
+	|| bad "2d. node 1 holds (w at b, w at c, k present, k0000-49, k0050-99) = $H (want 3000 0 100+N 0 N)"
 
 E=$(errs)
 [ "$(echo "$E" | tail -n 1)" = 0 ] && { echo "$E" | sed '$d'; ok "3. no ERROR/CRIT line on any node"; } \

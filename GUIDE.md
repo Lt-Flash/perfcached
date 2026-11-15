@@ -622,8 +622,9 @@ it.  The copy is taken from survivors only, the next one if a source
 fails; no snapshot runs until it is complete, and one follows it, so
 the files from before it go.  If every survivor is gone before it
 finishes, the node stops without a snapshot (exit status 75 - the
-packaged service restarts it) and comes back from its own files; with
-no survivor then, it keeps them.  With no survivor at all - the whole
+packaged service restarts it) and comes back from its own files - with
+any delete the survivors replayed to it meanwhile, which its WAL kept;
+with no survivor then, it keeps them.  With no survivor at all - the whole
 fleet went down, or every live peer restarted while it was away - it
 keeps what it replayed and nothing is deleted
 (`stats.cluster.reconcile_skipped`): a key deleted or expired meanwhile
