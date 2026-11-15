@@ -192,22 +192,26 @@ start 2 2 && start 3 2 || exit 1               # back with node 1 up, which boot
 readyn 2; readyn 3
 i=0; while [ $i -lt 90 ] && [ "$(st 1 'c["restart"]["witnesses"]')" != 2 ]; do sleep 1; i=$((i+1)); done
 [ "$(st 1 'c["restart"]["witnesses"]')" = 2 ] || { echo "rejoinwitnesstest: node 1 never counted 2 witnesses again"; exit 1; }
+# deletes node 1 missed in 2 may be a hole in node 2's ended run: floored 30 s on, with a copy of node
+# 2's state (12ol) - done, no hole left, before the writes; step 3's own copy is counted from N0
+i=0; while [ $i -lt 120 ] && [ "$(st 1 'r["state"]')$(st 1 'c.get("resyncing")')$(st 1 'sum(m["confirmed"] < m["hi"] for m in c["acks"]["marks"])')" != readyFalse0 ]; do sleep 0.5; i=$((i+1)); done
 put 27491 z 100 z                              # node 1's own: in its WAL, only copies on 2 and 3
 sleep 2.5
+N0=$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log"); W=$((N0 + 1))
 stop1 1
 start 1 5 PERFCACHED_TEST_BOOT_DELAY_MS=10000 || exit 1
 P1=$(cat "$D/n1.pid")
-i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt 3 ]; do sleep 0.25; i=$((i+1)); done
+i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt "$W" ]; do sleep 0.25; i=$((i+1)); done
 kill -9 "$(cat "$D/n2.pid")" "$(cat "$D/n3.pid")" 2>/dev/null
 rm -f "$D/n3.pid"
 start 2 3 || exit 1                            # its new self answers the delayed pull with its own files
 i=0; while [ $i -lt 120 ] && kill -0 "$P1" 2>/dev/null; do sleep 0.5; i=$((i+1)); done
 if kill -0 "$P1" 2>/dev/null; then kill -9 "$P1" 2>/dev/null; wait "$P1" 2>/dev/null; RC="none: still running after 60 s"; else wait "$P1" 2>/dev/null; RC=$?; fi
 rm -f "$D/n1.pid"
-[ "$RC" = 75 ] && after 1 3 | grep -q "cluster: rejoin - node [0-9]* restarted after it was picked" \
-	&& ! after 1 3 | grep -q "is still the survivor that served the copy" \
-	&& ok "3a. node 1 took the restarted survivor's copy for what it was and exited 75: $(after 1 3 | grep "restarted after it was picked" | sed 's/.*cluster: //' | cut -c1-120)" \
-	|| bad "3a. node 1 exited ${RC} (want 75, refusing the copy): $(after 1 3 | grep -E "rejoin -|bootstrapped|stopping" | tail -3 | cut -c1-160 | tr '\n' ' ')"
+[ "$RC" = 75 ] && after 1 $W | grep -q "cluster: rejoin - node [0-9]* restarted after it was picked" \
+	&& ! after 1 $W | grep -q "is still the survivor that served the copy" \
+	&& ok "3a. node 1 took the restarted survivor's copy for what it was and exited 75: $(after 1 $W | grep "restarted after it was picked" | sed 's/.*cluster: //' | cut -c1-120)" \
+	|| bad "3a. node 1 exited ${RC} (want 75, refusing the copy; copy $W): $(after 1 $N0 | grep -E "rejoin -|bootstrapped|stopping|floored" | cut -c1-160 | tr '\n' ' ')"
 start 1 6 || exit 1
 readyn 1
 Z=$(python3 - <<'PY2'

@@ -125,6 +125,16 @@ stop_all() {
 	rm -rf "$D"/w1 "$D"/w2 "$D"/w3
 }
 
+# a red fill says why: node1's replies to it, each node's pid, state and peers, its last notable lines
+diag() {
+	note "node1's replies to the fill: $(sort "$D/fill.$ra_label.out" | uniq -c | sort -rn | head -3 | cut -c1-100 | tr '\n' ';')"
+	for n in 1 2 3; do
+		pn=$(pidof_node $n)
+		note "node$n: pid ${pn:-none}, $(call $n '{"method":"stats"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state"), "peers_up", (d.get("cluster") or {}).get("peers_up"))' 2>/dev/null)"
+		grep -hE 'NOTICE|WARN|ERROR|CRIT' "$D/n$n.$ra_label-a.log" | tail -4 | cut -c1-160 | sed 's/^/          /'
+	done
+}
+
 # Returns via the globals A_BACK (keys alive on the returned node) and
 # A_PEER (keys alive on a survivor that deleted them).
 run_arm() { # run_arm <label> <eager> <tombstone_ms> <wait_before_return_s> [retain_s]
@@ -133,7 +143,7 @@ run_arm() { # run_arm <label> <eager> <tombstone_ms> <wait_before_return_s> [ret
 	stop_all
 	for i in 1 2 3; do mk $i "$ra_eager" "$ra_tomb" "$ra_ret"; done
 	for i in 1 2 3; do start $i "$ra_label-a" || return 1; done
-	formed
+	formed || note "arm $ra_label: not formed in time"
 
 	# fill through node1, then make sure a SURVIVOR has them too, so the
 	# delete below is a delete of data the fleet really holds
@@ -141,7 +151,7 @@ run_arm() { # run_arm <label> <eager> <tombstone_ms> <wait_before_return_s> [ret
 	while [ $j -le "$N" ]; do
 		echo "{\"method\":\"set\",\"params\":{\"col\":\"c\",\"key\":\"tk-$j\",\"value\":\"v-$j\"}}"
 		j=$((j + 1))
-	done | cli 1 >/dev/null
+	done | timeout 30 ./perfcli -h 127.0.49.1 -p 17961 -a $SEC -q > "$D/fill.$ra_label.out" 2>&1
 	i=0
 	while [ $i -lt 40 ]; do
 		[ "$(alive_on 2)" = "$N" ] && break
@@ -151,7 +161,7 @@ run_arm() { # run_arm <label> <eager> <tombstone_ms> <wait_before_return_s> [ret
 	note "before the kill: node2 answers for $ra_pre2/$N keys"
 	[ "$ra_pre2" = "$N" ] || { bad "arm $ra_label: the fleet never held all
 	     $N keys ($ra_pre2) - the delete would not be a real delete"
-	     return 1; }
+	     diag; return 1; }
 
 	# node1's reconcile runs only with a WITNESS up 30 s before it died; its death reads up to 10 s
 	# early, so wait 46 s - killed earlier, the deletes come back by design
