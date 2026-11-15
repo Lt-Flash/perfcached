@@ -97,7 +97,8 @@ BI=$(idx_of_node "$B1")
 	&& ok "the standby holds the control state" \
 	|| bad "the standby (index ${BI:-?}) holds nothing - a promotion
          would start from scratch"
-IDS=$(q $BI sync.held_identities)
+# the third joiner's identity reaches the standby with the next sync
+i=0; while [ $i -lt 100 ]; do IDS=$(q $BI sync.held_identities); [ "${IDS:-0}" -ge 3 ] 2>/dev/null && break; sleep 0.2; i=$((i+1)); done
 [ "${IDS:-0}" -ge 3 ] 2>/dev/null \
 	&& ok "it holds the identity history ($IDS identities)" \
 	|| bad "the standby holds $IDS identities - without them a promoted

@@ -116,6 +116,9 @@ p, a, b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 for i in range(a, b):
     print(json.dumps({"method": "del", "params": {"col": "c", "key": "%s%03d" % (p, i)}}))' "$@"; }
 # view <n>: what node n holds, as "m=<ok> i=<ok> base=<ok> gone=<absent of 50> dbl=<digest>"
+# what each node did about the cut, for a red run: its state and the cluster lines that decide a heal
+diag() { for n in 1 2 3; do echo "    node $n: $(st $n)"
+	grep -hE "rejoin -|resync -|reconcile|rebuild|bootstrapped|is back after|caught up" "$D/n$n.log" | tail -n 6 | cut -c1-200 | sed "s/^/      n$n: /"; done; }
 view() { timeout 60 python3 -c '
 import hashlib, json, socket, sys, pcnative
 f = pcnative.wrap(socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=20))
@@ -201,7 +204,7 @@ run() { # run <eperm|silent>
 	done
 	[ "$e1" = 570 ] && [ "$e2" = 570 ] && [ "$e3" = 570 ] \
 		&& ok "$mode: with NO reads, all three settled at 570 entries in $(( $(date +%s) - t0 )) s - the other side's deletes replayed, none swept back" \
-		|| bad "$mode: with no reads the nodes hold $e1 / $e2 / $e3 (want 570 each: 50 deletes applied everywhere)"
+		|| { bad "$mode: with no reads the nodes hold $e1 / $e2 / $e3 (want 570 each: 50 deletes applied everywhere)"; diag; }
 	t0=$(date +%s); i=0
 	while [ $i -lt 120 ]; do
 		v1=$(view 1); v2=$(view 2); v3=$(view 3)
@@ -212,7 +215,7 @@ run() { # run <eperm|silent>
 	el=$(( $(date +%s) - t0 ))
 	[ "$v1" = "$v2" ] && [ "$v1" = "$v3" ] && case "$v1" in "m=200 i=100 base=200 gone="*" dbl=50/"*) true;; *) false;; esac \
 		&& ok "$mode: healed in ${el} s - every node holds both sides' writes, the untouched keys, and one value per doubly-written key ($v1)" \
-		|| bad "$mode: after ${el} s the fleet disagrees or lost data: node 1 $v1 | node 2 $v2 | node 3 $v3"
+		|| { bad "$mode: after ${el} s the fleet disagrees or lost data: node 1 $v1 | node 2 $v2 | node 3 $v3"; diag; }
 	G=$(field "$v1" gone); NW=$(field "$v1" nw)
 	[ "$G" = 50 ] && [ "$(field "$v2" gone)" = 50 ] && [ "$(field "$v3" gone)" = 50 ] \
 		&& ok "$mode: S238 - all 50 deletes made while cut held after the heal, with reads, on every node" \

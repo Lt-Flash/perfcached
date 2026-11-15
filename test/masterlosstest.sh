@@ -195,7 +195,10 @@ EOF
 		|| bad "$label: after node $M returned: '$s1' | '$s2' | '$s3'"
 	[ "$A1" = "$A2" ] && [ "$A1" = "$A3" ] && [ "$(hits "$A1")" = $((N + 100)) ] && [ "$T" = $((K * (N + 100))) ] \
 		&& ok "$label: in $((i / 2)) s every key reads the same from all three, and the fleet holds $T copies - exactly $K per key (reclaimed $RC)" \
-		|| bad "$label: after $((i / 2)) s: hits $(hits "$A1")/$(hits "$A2")/$(hits "$A3") of $((N + 100)), same=$([ "$A1" = "$A2" ] && [ "$A1" = "$A3" ] && echo y || echo n), copies $T (want $((K * (N + 100))))"
+		|| { bad "$label: after $((i / 2)) s: hits $(hits "$A1")/$(hits "$A2")/$(hits "$A3") of $((N + 100)), same=$([ "$A1" = "$A2" ] && [ "$A1" = "$A3" ] && echo y || echo n), copies $T (want $((K * (N + 100))))"
+			# for a red run: each node's entries and what it last said about the map and its records
+			for n in 1 2 3; do echo "    node $n: $(st $n)"
+				grep -hE " (NOTICE|WARN|ERROR)" "$D/n$n.log" | grep -vE "an fsync has been stuck" | tail -n 8 | cut -c1-200 | sed "s/^/      n$n: /"; done; }
 	for n in 1 2 3; do stop_kill $n; done
 }
 

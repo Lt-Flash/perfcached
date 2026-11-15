@@ -331,6 +331,13 @@ static struct {
 	int boot_prefer;
 	int rejoin_on;
 	int snap_due;
+	/* the copy counts once the node that served it (rejoin_src, the bulk thread's) is heard
+	 * again at the incarnation it had when picked, still a survivor */
+	int rejoin_src;
+	long long rejoin_end_ms;
+	int rejoin_ncand;
+	int rejoin_cand[BOOT_MAX_CAND];
+	unsigned int rejoin_inc[BOOT_MAX_CAND];
 	/* when this node raises its own SIGTERM (0 = not scheduled): written by a worker
 	 * or the cluster thread, read by the cluster thread's tick */
 	long long stop_self_at_ms;
@@ -4662,6 +4669,7 @@ static void rejoin_begin(const struct peer *s)
 
 	C.boot_prefer = node;
 	C.rejoin_on = 1;
+	__atomic_store_n(&C.rejoin_src, 0, __ATOMIC_RELEASE);
 	C.st.rejoins++;
 	pc_rdb_hold(1);
 	resync_arm();
@@ -4677,13 +4685,47 @@ static void rejoin_begin(const struct peer *s)
 
 /* every survivor gone before the copy finished: start again from this node's own files, which
  * no snapshot has touched since the copy began; with no survivor then, it keeps them */
-static void rejoin_lost(void)
+static void rejoin_lost(const char *why)
 {
-	LM_WARN("cluster: rejoin - no peer that was up through this node's "
-		"absence is left to copy from: stopping without a snapshot to "
-		"start again from this node's own files\n");
+	LM_WARN("cluster: rejoin - %s: stopping without a snapshot to start again "
+		"from this node's own files\n", why ? why : "no peer that was up "
+		"through this node's absence is left to copy from");
 	C.rejoin_on = -1;                  /* stopping: the bootstrap is not re-picked */
 	pc_daemon_restart_from_files();
+}
+
+/* a pull completed: its source must still be the survivor picked - a peer restarted since
+ * serves what it replayed, not the fleet's state; ready only once it says so */
+static void rejoin_verify(void)
+{
+	int node = __atomic_load_n(&C.rejoin_src, __ATOMIC_ACQUIRE), i;
+	long long end = __atomic_load_n(&C.rejoin_end_ms, __ATOMIC_ACQUIRE);
+	struct peer *p = peer_by_node(node);
+	unsigned int inc = 0;
+	char why[160];
+
+	for (i = 0; i < C.rejoin_ncand; i++)
+		if (C.rejoin_cand[i] == node)
+			inc = C.rejoin_inc[i];
+	if (!p || p->alive_ms <= end) {
+		if (now_ms() - end < PEER_UP_MS)
+			return;                    /* its next ALIVE says */
+		snprintf(why, sizeof why, "node %d, which served the copy, has not "
+			"been heard from since", node);
+		rejoin_lost(why);
+		return;
+	}
+	if (!inc || p->incarn != inc || !is_witness(p)) {
+		snprintf(why, sizeof why, "node %d restarted after it was picked, so "
+			"the copy it served is what it replayed, not a survivor's state",
+			node);
+		rejoin_lost(why);
+		return;
+	}
+	__atomic_store_n(&C.rejoin_src, 0, __ATOMIC_RELEASE);
+	LM_NOTICE("cluster: rejoin - node %d is still the survivor that served the "
+		"copy; ready\n", node);
+	pc_node_state_set(PC_NST_READY);
 }
 
 struct rs_ctx {
@@ -5248,6 +5290,9 @@ static void reconcile_tick(void)
 	clwire_set_reconciling(C.rec_hold && C.cfg_eager);
 	/* a resync is over once its pull has made this node READY; then a snapshot holds the
 	 * fleet's state, and the files from before it go (12ol) */
+	if (C.rejoin_on > 0 && pc_node_state() == PC_NST_RECOVERING &&
+	    __atomic_load_n(&C.rejoin_src, __ATOMIC_ACQUIRE))
+		rejoin_verify();
 	if (C.st.resyncing && !C.resync_on &&
 	    pc_node_state() >= PC_NST_READY) {
 		/* a rejoin ends only by its copy: READY or CONNECTING any other way is not that, and
@@ -5256,7 +5301,7 @@ static void reconcile_tick(void)
 			return;                    /* stopping, to start again from its files */
 		if (C.rejoin_on && !clboot_done(&C.bt)) {
 			if (pc_node_state() != PC_NST_DRAINING)
-				rejoin_lost();
+				rejoin_lost(NULL);
 			return;
 		}
 		C.st.resyncing = 0;
@@ -7187,6 +7232,15 @@ static int boot_request(void)
 	if (!n || (!anyent && held_unready && !C.rejoin_on))
 		return 0;
 	acks_boot_floors(id, n);
+	if (C.rejoin_on) {
+		for (j = 0; j < n; j++) {
+			struct peer *q = peer_by_node(id[j]);
+
+			C.rejoin_cand[j] = id[j];
+			C.rejoin_inc[j] = q ? q->incarn : 0;
+		}
+		C.rejoin_ncand = n;
+	}
 	if (!anyent)
 		return 2;                      /* every ready peer holds nothing:
 		                                * there is nothing to pull */
@@ -7213,7 +7267,7 @@ static void boot_tick(long long now)
 	if (act == CLBOOT_PICK)
 		act = clboot_after_pick(&C.bt, now, failed_round, boot_request());
 	if (C.rejoin_on && (act == CLBOOT_GIVE_UP || act == CLBOOT_DEADLINE)) {
-		rejoin_lost();             /* no survivor left to copy from */
+		rejoin_lost(NULL);             /* no survivor left to copy from */
 		return;
 	}
 	if (act == CLBOOT_GIVE_UP) {
@@ -10656,13 +10710,21 @@ static void bulk_pull(void)
 		int rc = bulk_pull_from(&cand[k], &streamed, &stored, &older);
 
 		if (rc == 0) {
+			int rj = __atomic_load_n(&C.rejoin_on, __ATOMIC_ACQUIRE) > 0;
+
 			__atomic_fetch_add(&C.px.boot_in, stored, __ATOMIC_RELAXED);
 			clboot_pull_ok(&C.bt, clbulk_lock(&C.bk));
 			LM_NOTICE("cluster: bootstrapped from node %d - %u record(s) "
 				"streamed, %u stored, %u already held at the same or a "
-				"newer version, in %lld ms; ready\n", node[k], streamed,
-				stored, older, now_ms() - t0);
-			if (pc_node_state() == PC_NST_RECOVERING)
+				"newer version, in %lld ms; %s\n", node[k], streamed,
+				stored, older, now_ms() - t0, rj ? "ready once it is "
+				"heard again as the survivor picked" : "ready");
+			if (rj) {
+				__atomic_store_n(&C.rejoin_end_ms, now_ms(),
+					__ATOMIC_RELEASE);
+				__atomic_store_n(&C.rejoin_src, node[k],
+					__ATOMIC_RELEASE);
+			} else if (pc_node_state() == PC_NST_RECOVERING)
 				pc_node_state_set(PC_NST_READY);
 			return;
 		}

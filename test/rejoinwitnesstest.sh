@@ -1,7 +1,7 @@
 #!/bin/sh
 # rejoinwitnesstest.sh - an eager node restarting into a fleet with a survivor (a peer up through its
-# absence) copies that state whole (12ol); with every survivor gone mid-copy it starts again from its
-# own files.  Usage: test/rejoinwitnesstest.sh [./perfcached]
+# absence) copies that state whole (12ol); with every survivor gone mid-copy, or one restarted since it
+# was picked, it starts again from its own files.  Usage: test/rejoinwitnesstest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -111,8 +111,8 @@ k = [val("k%04d" % i) is not None for i in range(200)]
 print(w.count("b"), w.count("c"), sum(k), sum(k[:50]), sum(k[50:100]))
 PY
 }
-after() { # after <n> <nth rejoin line>: the log from that line on
-	awk -v want="$2" '/cluster: rejoin - node / { seen++ } seen >= want' "$D/n$1.log"
+after() { # after <n> <nth copy begun>: the log from that line on
+	awk -v want="$2" '/cluster: rejoin - node [0-9]+ has been up/ { seen++ } seen >= want' "$D/n$1.log"
 }
 # the runner's storage stalling is no finding of this suite: shown, not counted
 errs() {
@@ -136,8 +136,8 @@ del 27492 0 50
 
 echo "--- 1. node 1 restarts with survivors up: it copies their state whole"
 start 1 2 || exit 1
-i=0; while [ $i -lt 30 ] && ! grep -q "cluster: rejoin - node " "$D/n1.log"; do sleep 0.5; i=$((i+1)); done
-L=$(grep "cluster: rejoin - node " "$D/n1.log")
+i=0; while [ $i -lt 30 ] && ! grep -q "cluster: rejoin - node [0-9]* has been up" "$D/n1.log"; do sleep 0.5; i=$((i+1)); done
+L=$(grep "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")
 [ "$(echo "$L" | grep -c .)" = 1 ] && echo "$L" | grep -q "rejoin - node [0-9]* has been up since before this node went down" \
 	&& ok "1a. node 1 copies a survivor's state: $(echo "$L" | sed 's/.*cluster: //' | cut -c1-150)" \
 	|| bad "1a. rejoin lines $(echo "$L" | grep -c .) (want 1, from a survivor): $(grep -E "rejoin -|reconcile|resync -" "$D/n1.log" | tail -2 | cut -c1-160 | tr '\n' ' ')"
@@ -162,9 +162,9 @@ put 27492 w 3000 c
 del 27492 50 100
 start 1 3 PERFCACHED_TEST_BOOT_DELAY_MS=6000 || exit 1
 P1=$(cat "$D/n1.pid")
-i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node " "$D/n1.log")" -lt 2 ]; do sleep 0.25; i=$((i+1)); done
+i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt 2 ]; do sleep 0.25; i=$((i+1)); done
 kill -9 "$(cat "$D/n2.pid")" "$(cat "$D/n3.pid")" 2>/dev/null
-[ "$(grep -c "cluster: rejoin - node " "$D/n1.log")" = 2 ] \
+[ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" = 2 ] \
 	&& ok "2a. node 1 began a second copy, and both survivors were killed before its pull" \
 	|| bad "2a. node 1 never began the second copy: $(grep -E "rejoin -|reconcile|resync -" "$D/n1.log" | tail -2 | cut -c1-160 | tr '\n' ' ')"
 i=0; while [ $i -lt 120 ] && kill -0 "$P1" 2>/dev/null; do sleep 0.5; i=$((i+1)); done
@@ -187,9 +187,42 @@ set -- $H
 	&& ok "2d. restarted alone, node 1 holds what its files held before the copy: w at b, not the fleet's c, k0100-199 all there; ${5} of k0050-99, deleted meanwhile, too (the rest replayed to it as deletes)" \
 	|| bad "2d. node 1 holds (w at b, w at c, k present, k0000-49, k0050-99) = $H (want 3000 0 100+N 0 N)"
 
+echo "--- 3. a survivor restarted mid-copy serves what it replayed: node 1 refuses it and starts from its files"
+start 2 2 && start 3 2 || exit 1               # back with node 1 up, which booted after they died: they keep their files
+readyn 2; readyn 3
+i=0; while [ $i -lt 90 ] && [ "$(st 1 'c["restart"]["witnesses"]')" != 2 ]; do sleep 1; i=$((i+1)); done
+[ "$(st 1 'c["restart"]["witnesses"]')" = 2 ] || { echo "rejoinwitnesstest: node 1 never counted 2 witnesses again"; exit 1; }
+put 27491 z 100 z                              # node 1's own: in its WAL, only copies on 2 and 3
+sleep 2.5
+stop1 1
+start 1 5 PERFCACHED_TEST_BOOT_DELAY_MS=10000 || exit 1
+P1=$(cat "$D/n1.pid")
+i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt 3 ]; do sleep 0.25; i=$((i+1)); done
+kill -9 "$(cat "$D/n2.pid")" "$(cat "$D/n3.pid")" 2>/dev/null
+rm -f "$D/n3.pid"
+start 2 3 || exit 1                            # its new self answers the delayed pull with its own files
+i=0; while [ $i -lt 120 ] && kill -0 "$P1" 2>/dev/null; do sleep 0.5; i=$((i+1)); done
+if kill -0 "$P1" 2>/dev/null; then kill -9 "$P1" 2>/dev/null; wait "$P1" 2>/dev/null; RC="none: still running after 60 s"; else wait "$P1" 2>/dev/null; RC=$?; fi
+rm -f "$D/n1.pid"
+[ "$RC" = 75 ] && after 1 3 | grep -q "cluster: rejoin - node [0-9]* restarted after it was picked" \
+	&& ! after 1 3 | grep -q "is still the survivor that served the copy" \
+	&& ok "3a. node 1 took the restarted survivor's copy for what it was and exited 75: $(after 1 3 | grep "restarted after it was picked" | sed 's/.*cluster: //' | cut -c1-120)" \
+	|| bad "3a. node 1 exited ${RC} (want 75, refusing the copy): $(after 1 3 | grep -E "rejoin -|bootstrapped|stopping" | tail -3 | cut -c1-160 | tr '\n' ' ')"
+start 1 6 || exit 1
+readyn 1
+Z=$(python3 - <<'PY2'
+import pcnative, socket
+f = pcnative.wrap(socket.create_connection(("127.0.0.1", 27491), 10))
+print(sum(1 for i in range(100) if (pcnative.call(f, "get", col="0", key="z%04d" % i).get("result") or {}).get("value") == "z"))
+PY2
+)
+[ "$Z" = 100 ] \
+	&& ok "3b. restarted, node 1 holds its own 100 z keys from its files - none lost to the restarted node's copy" \
+	|| bad "3b. node 1 holds ${Z:-?} of its 100 z keys (want 100: the restarted node never held them on disk)"
+
 E=$(errs)
-[ "$(echo "$E" | tail -n 1)" = 0 ] && { echo "$E" | sed '$d'; ok "3. no ERROR/CRIT line on any node"; } \
-	|| bad "3. $(echo "$E" | tail -n 1) ERROR/CRIT line(s): $(grep -hE ' (ERROR|CRIT)' "$D"/n*.log | grep -v 'an fsync has been stuck' | head -2 | cut -c1-160)"
+[ "$(echo "$E" | tail -n 1)" = 0 ] && { echo "$E" | sed '$d'; ok "4. no ERROR/CRIT line on any node"; } \
+	|| bad "4. $(echo "$E" | tail -n 1) ERROR/CRIT line(s): $(grep -hE ' (ERROR|CRIT)' "$D"/n*.log | grep -v 'an fsync has been stuck' | head -2 | cut -c1-160)"
 
 echo "rejoinwitnesstest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

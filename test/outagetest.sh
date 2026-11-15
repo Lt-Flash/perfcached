@@ -229,14 +229,20 @@ sc_onebyone() { # <binary> <save>
 }
 
 sc_staggered() { # <binary>: node 1 dies and reboots while 2 and 3 are
-	# still up; 2 and 3 die ten seconds later and come back one by one
+	# still up; 2 and 3 die once it has copied their state, under the grace, and come back one by one
 	load_fleet off "$1" || { echo "    fleet did not load"; return 1; }
 	sleep 46                          # 2 and 3 are up past the grace:
 	                                  # they can witness for node 1.
 	# 46, not 35: the death estimate (last `alive` stamp) can read 10 s early; the grace is up to 40 s
 	kill -9 "$(cat "$D/n1.pid")" 2>/dev/null; rm -f "$D/n1.pid"; sleep 1
 	start 1 "$1" || return 1          # node 1 back among complete peers
-	sleep 10                          # up 10 s: LESS than the grace
+	# its copy done before 2 and 3 go (one cut short stops it, exit 75), and up LESS than the grace
+	i=0; while [ $i -lt 40 ]; do
+		[ "$(cl 17351 rejoins)" != 0 ] && [ "$(cl 17351 rejoins)" != "?" ] && \
+			[ "$(cl 17351 resyncing)$(st 17351)" = "Falseready2" ] && break
+		sleep 0.5; i=$((i+1))
+	done
+	[ $i -lt 40 ] || echo "    node 1 had not finished its copy after 20 s: $(cl 17351 rejoins) rejoin(s), resyncing $(cl 17351 resyncing), $(st 17351)"
 	for n in 2 3; do
 		kill -9 "$(cat "$D/n$n.pid")" 2>/dev/null; rm -f "$D/n$n.pid"
 	done
@@ -276,7 +282,7 @@ J1=$(cl 17351 rejoins)
 lost && bad "keys lost: $P1/$P2/$P3 of $TOT (dropped $R1/$R2/$R3)" \
 	|| ok "all $TOT on all three - node 1 booted before 2 and 3 died, but under the grace before, and was not taken for a survivor"
 [ "$K2" = True ] && [ "$K3" = True ] \
-	&& ok "nodes 2 and 3 skipped their passes (node 1 had been up 10 s, under the 30 s grace)" \
+	&& ok "nodes 2 and 3 skipped their passes (node 1 had been up under the 30 s grace)" \
 	|| bad "nodes 2 and 3 did not both skip (skipped $K1/$K2/$K3) - the early riser was taken for a witness"
 case "$J1" in ''|0|'?') bad "node 1 copied no survivor's state - 2 and 3 were up 46 s before it died (rejoins $J1)";;
 	*) ok "and node 1 DID copy the fleet's state from a survivor (rejoins $J1) - up throughout, and complete";; esac

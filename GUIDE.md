@@ -619,9 +619,12 @@ them, keeping what it wrote since.  A write the node took and had not
 pushed when it died - a few milliseconds' worth, or a push the repair
 sweep had not yet mended - goes with its files: the survivor never had
 it.  The copy is taken from survivors only, the next one if a source
-fails; no snapshot runs until it is complete, and one follows it, so
-the files from before it go.  If every survivor is gone before it
-finishes, the node stops without a snapshot (exit status 75 - the
+fails, and counts only once its source is heard again unrestarted: a
+survivor that restarted since it was picked answers with what it
+replayed, not the fleet's state.  No snapshot runs until the copy is
+complete, and one follows it, so the files from before it go.  If every
+survivor is gone before it finishes, or the one that served it had
+restarted, the node stops without a snapshot (exit status 75 - the
 packaged service restarts it) and comes back from its own files - with
 any delete the survivors replayed to it meanwhile, which its WAL kept;
 with no survivor then, it keeps them.  With no survivor at all - the whole

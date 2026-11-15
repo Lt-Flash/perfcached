@@ -45,6 +45,13 @@ wait_peers() { wp=0; while [ $wp -lt $(( $3 * 5 )) ]; do
 
 K=sb-$(date +%s)
 echo "=== splitbraintest ($RT, key suffix $K) ==="
+nstate() { $RT exec pcnode$1 perfcli -q -j '{"method":"stats"}' 2>/dev/null |
+	python3 -c 'import json,sys
+try: d = json.load(sys.stdin); print("%s%s" % (d.get("state"), (d.get("cluster") or {}).get("peers_up")))
+except Exception: print("?")' 2>/dev/null || echo "?"; }
+# a node back from the previous suite's heal may still be copying a survivor's state (12ol): RECOVERING refuses reads
+i=0; while [ $i -lt 240 ] && [ "$(nstate 1)$(nstate 2)$(nstate 3)" != ready2ready2ready2 ]; do sleep 0.5; i=$((i+1)); done
+[ $i -lt 240 ] || echo "       note: the fleet was not ready and meshed after 120 s ($(nstate 1) $(nstate 2) $(nstate 3))"
 
 # ---- 0. fail-first: the harness must be able to SEE agreement -------
 set_k 1 px "healthy-$K" "one-value" >/dev/null
