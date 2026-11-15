@@ -25,16 +25,25 @@ conf() { # conf <id> <port> [cluster-advertise]
 	} > "$D/n$1.conf"
 	chmod 640 "$D/n$1.conf"
 }
+# a start that hangs says where: each thread's state, kernel wait and syscall, then its stacks
+stuck() { # stuck <pid>
+	[ -d "/proc/$1/task" ] || { echo "  ..   pid $1 is gone"; return; }
+	for t in /proc/$1/task/*; do
+		echo "  ..   thread ${t##*/}: state $(sed 's/^.*) //; s/ .*//' "$t/stat" 2>/dev/null) wchan $(cat "$t/wchan" 2>/dev/null) syscall $(cut -d' ' -f1 "$t/syscall" 2>/dev/null)"
+	done
+	command -v gdb >/dev/null && timeout 20 gdb -p "$1" -batch -ex 'thread apply all bt 12' 2>/dev/null \
+		| grep -E '^(#|Thread)' | sed -n '1,60p' | sed 's/^/        /'
+}
 start() { # start <id>
 	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
-	PIDS="$PIDS $!"
+	pid=$!; PIDS="$PIDS $pid"
 	i=0
 	while [ $i -lt 100 ]; do
 		grep -q "perfcached ready" "$D/n$1.log" 2>/dev/null && return 0
 		sleep 0.1; i=$((i+1))
 	done
-	echo "node $1 did not start"; tail -3 "$D/n$1.log"; exit 1
+	echo "node $1 did not start in 10 s, $(date +%T):"; sed 's/^/      /' "$D/n$1.log"; stuck $pid; exit 1
 }
 j() { # j <port> <method> [json params]  - privileged per link, as coltest
 	python3 - "$@" <<'PYEOF'
