@@ -287,6 +287,8 @@ set -- $RJ
 # ---- THE GRACE PERIOD: a blip must not re-replicate the keyspace -----
 # kill node 4: its slots are held for the grace, so the survivors' total must not climb
 SURV0=$(( ${A1:-0} + ${A2:-0} + ${A3:-0} ))
+# counted from the kill: a peer that joins after node 1's first 10-s sweep moves the set in formation
+REP0=$(( $(cstat 18401 spread_repaired) + $(cstat 18402 spread_repaired) + $(cstat 18403 spread_repaired) ))
 echo "  killing node 4 (held ${A4}); survivors hold $SURV0 (repairs so far: $(cstat 18401 spread_repaired)/$(cstat 18402 spread_repaired)/$(cstat 18403 spread_repaired))"
 kill -9 "$P4" 2>/dev/null; P4=
 w=0
@@ -303,10 +305,10 @@ echo "  16s after the kill: ${G1}/${G2}/${G3} = $SURV1 (was $SURV0), repairs $(c
 
 # the repair fingerprint hashes what placement hashes (address + cluster port), not the node id
 # peer_gone() zeroes, so no repair arms inside the grace
-REP=$(( $(cstat 18401 spread_repaired) + $(cstat 18402 spread_repaired) + $(cstat 18403 spread_repaired) ))
+REP=$(( $(cstat 18401 spread_repaired) + $(cstat 18402 spread_repaired) + $(cstat 18403 spread_repaired) - REP0 ))
 [ "$REP" = "0" ] \
 	&& ok "no repair was armed inside the grace (the set fingerprint held)" \
-	|| bad "$REP repair(s) armed inside the grace - the fingerprint is moving on something that is not the set"
+	|| bad "$REP repair(s) armed inside the grace ($REP0 before the kill) - the fingerprint is moving on something that is not the set"
 
 # ---- PAST THE GRACE: the set legitimately changes ---------------------
 # once the grace expires node 4's slots go to the survivors: K*N over three nodes
