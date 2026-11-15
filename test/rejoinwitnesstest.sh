@@ -135,6 +135,7 @@ put 27492 w 3000 b
 del 27492 0 50
 
 echo "--- 1. node 1 restarts with survivors up: it copies their state whole"
+L0=$(($(wc -l < "$D/n1.log") + 1))
 start 1 2 || exit 1
 i=0; while [ $i -lt 30 ] && ! grep -q "cluster: rejoin - node [0-9]* has been up" "$D/n1.log"; do sleep 0.5; i=$((i+1)); done
 L=$(grep "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")
@@ -155,6 +156,13 @@ i=0; while [ $i -lt 30 ] && ! after 1 1 | grep -q "rdb: snapshot"; do sleep 1; i
 after 1 1 | grep -q "rdb: snapshot" \
 	&& ok "1d. a snapshot followed the copy, so the files from before it go" \
 	|| bad "1d. no snapshot after the copy: $(grep "rdb: " "$D/n1.log" | tail -2 | cut -c1-140 | tr '\n' ' ')"
+# the copy is decided once the master has the links proved (ONLINE), and nothing is served before it
+S1=$(sed -n "$L0,\$p" "$D/n1.log")
+ON=$(echo "$S1" | grep -n "cluster: ONLINE - every link" | head -n 1 | cut -d: -f1)
+CP=$(echo "$S1" | grep -n "cluster: rejoin - node [0-9]* has been up" | head -n 1 | cut -d: -f1)
+[ -n "$ON" ] && [ -n "$CP" ] && [ "$ON" -lt "$CP" ] && ! echo "$S1" | grep -q "node state ready -> recovering" \
+	&& ok "1e. node 1 went ONLINE (every link proved) before its copy began, and was not ready in between" \
+	|| bad "1e. ONLINE at line ${ON:-none}, the copy at ${CP:-none} (want ONLINE first, no ready -> recovering): $(echo "$S1" | grep -E "admitted as|ONLINE|node state|rejoin - node" | cut -c1-120 | tr '\n' '|')"
 
 echo "--- 2. every survivor gone mid-copy: node 1 starts again from its own files"
 stop1 1

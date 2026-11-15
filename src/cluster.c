@@ -330,6 +330,7 @@ static struct {
 	 * a snapshot follows any resync */
 	int boot_prefer;
 	int rejoin_on;
+	int rec_decide;                    /* RECOVERING until reconcile_tick decides its replayed records */
 	int snap_due;
 	/* the copy counts once the node that served it (rejoin_src, the bulk thread's) is heard
 	 * again at the incarnation it had when picked, still a survivor */
@@ -5274,6 +5275,16 @@ static void reconcile_walk(void)
 	}
 }
 
+/* joined with its replayed records undecided (joined_state): READY now, unless a copy began */
+static void rec_decided(void)
+{
+	if (!C.rec_decide)
+		return;
+	C.rec_decide = 0;
+	if (!C.st.resyncing && pc_node_state() == PC_NST_RECOVERING)
+		pc_node_state_set(PC_NST_READY);
+}
+
 static void reconcile_tick(void)
 {
 	/* the beat decides afresh whether the slices may walk */
@@ -5313,18 +5324,22 @@ static void reconcile_tick(void)
 	if (C.snap_due && pc_rdb_request_save() == 0)
 		C.snap_due = 0;
 	if (!C.reconcile_on || !C.cfg_eager) {
+		rec_decided();
 		clrecon_nowit_stop(&C.recon);
 		C.st.reconcile_no_witness_s = 0;
 		return;
 	}
 	if (C.resync_on)
 		return;                    /* the drop runs (reconcile_pump) */
-	if (C.role == PC_ROLE_JOINING)
-		return;                    /* nobody to ask yet */
+	if (C.role == PC_ROLE_JOINING || pc_node_state() == PC_NST_CONNECTING)
+		return;                    /* nobody to ask yet: CONNECTING, its links are not proved */
 	if (any_live_peer_cold())
 		return;                    /* their "no" is not evidence yet */
 	if (!C.recon.witness) {
-		if (!reconcile_find_witness())
+		int w = reconcile_find_witness();
+
+		rec_decided();
+		if (!w)
 			return;            /* nobody was watching */
 	} else if (!reconcile_witness_live()) {
 		C.st.reconcile_deferred++;
@@ -6405,6 +6420,15 @@ void joined_state(int members)
 	if (C.st.resyncing) {              /* a copy under way: its pull reports ready */
 		LM_NOTICE("cluster: joined as node %d (master is node %d, %d "
 			"member(s)) - still copying the fleet's state\n", C.node_id,
+			C.master_id, members);
+		return;
+	}
+	/* its replayed records are decided now its links are proved: a copy, or READY; nothing served before */
+	if (C.reconcile_on && C.cfg_eager && !C.recon.witness) {
+		C.rec_decide = 1;
+		pc_node_state_set(PC_NST_RECOVERING);
+		LM_NOTICE("cluster: joined as node %d (master is node %d, %d member(s)) - "
+			"deciding on its replayed records before reporting ready\n", C.node_id,
 			C.master_id, members);
 		return;
 	}
