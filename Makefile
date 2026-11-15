@@ -1464,6 +1464,7 @@ check-g-fault3: check-edition-guard $(CHECK_BINS)
 	sh test/shardhandovertest.sh ./perfcached
 	sh test/rejointest.sh ./perfcached
 	sh test/restartwitnesstest.sh ./perfcached
+	sh test/rejoinwitnesstest.sh ./perfcached
 
 check-g-fault4: check-edition-guard $(CHECK_BINS)
 	sh test/reconcileresizetest.sh ./perfcached

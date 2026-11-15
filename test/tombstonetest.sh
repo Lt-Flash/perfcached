@@ -4,6 +4,9 @@
 set -u
 
 BIN=${1:-./perfcached}
+# the one-by-one reconcile a restart or a floor ran before 12ol is this suite's subject; the default
+# now copies a survivor's state whole (rejoinwitnesstest)
+export PERFCACHED_TEST_RECONCILE=1
 N=${N:-200}
 SEC=tb-client-secret
 pass=0 fail=0

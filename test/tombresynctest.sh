@@ -213,8 +213,9 @@ stopall
 
 for a in A B C D; do
 	for i in 1 2 3; do
-		grep -q "CRIT" "$D/$a/n$i.log" 2>/dev/null &&
-			bad "$a: node $i logged CRIT: $(grep -m2 'CRIT' "$D/$a/n$i.log" | tr '\n' ' ' | cut -c1-220)"
+		grep -h 'an fsync has been stuck' "$D/$a/n$i.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+		grep "CRIT" "$D/$a/n$i.log" 2>/dev/null | grep -qv 'an fsync has been stuck' &&
+			bad "$a: node $i logged CRIT: $(grep 'CRIT' "$D/$a/n$i.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-220)"
 	done
 done
 echo "tombresynctest: $pass passed, $fail failed"

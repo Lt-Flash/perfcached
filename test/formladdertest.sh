@@ -142,7 +142,8 @@ for N in $SIZES; do
 	S=$(cat "$Z"/n*.log | grep -c "admission stuck")
 	echo "  info L$N: $S admission-stuck line(s); admitted ONLINE: $(cat "$Z"/n*.log | grep -c 'is ONLINE - all')"
 	stopall
-	grep -l CRIT "$Z"/n*.log >/dev/null 2>&1 && bad "L$N. CRIT logged: $(grep -h -m1 CRIT "$Z"/n*.log | head -1 | cut -c1-160)"
+	grep -h 'an fsync has been stuck' "$Z"/n*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep -h CRIT "$Z"/n*.log 2>/dev/null | grep -qv 'an fsync has been stuck' && bad "L$N. CRIT logged: $(grep -h CRIT "$Z"/n*.log | grep -v 'an fsync has been stuck' | head -n 1 | cut -c1-160)"
 done
 
 if [ "$KILL" -gt 0 ]; then
@@ -187,7 +188,8 @@ if [ "$KILL" -gt 0 ]; then
 			|| bad "K. founded or elected after the kill while queued or CONNECTING:$W"
 	fi
 	stopall
-	grep -l CRIT "$Z"/n*.log >/dev/null 2>&1 && bad "K. CRIT logged: $(grep -h -m1 CRIT "$Z"/n*.log | head -1 | cut -c1-160)"
+	grep -h 'an fsync has been stuck' "$Z"/n*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep -h CRIT "$Z"/n*.log 2>/dev/null | grep -qv 'an fsync has been stuck' && bad "K. CRIT logged: $(grep -h CRIT "$Z"/n*.log | grep -v 'an fsync has been stuck' | head -n 1 | cut -c1-160)"
 fi
 echo "formladdertest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

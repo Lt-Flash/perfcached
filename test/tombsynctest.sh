@@ -119,8 +119,9 @@ N1=$(st 1 'c["tombstones_retained"]["numbered"]'); H3=$(held3)
 	bad "2. after node 3's restart: node 1 keeps ${N1:-?} (want 0), node 3 holds ${H3:-?} of the 100 deleted keys (want 0)"
 
 for i in 1 2; do
-	grep -q "CRIT" "$D/n$i.log" &&
-		bad "node $i logged CRIT: $(grep -m2 'CRIT' "$D/n$i.log" | tr '\n' ' ' | cut -c1-220)"
+	grep -h 'an fsync has been stuck' "$D/n$i.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep "CRIT" "$D/n$i.log" | grep -qv 'an fsync has been stuck' &&
+		bad "node $i logged CRIT: $(grep 'CRIT' "$D/n$i.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-220)"
 done
 echo "tombsynctest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

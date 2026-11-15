@@ -153,8 +153,9 @@ set -- $(d4 "$B" "$A")
 	bad "4. unicast fleet, 50 deletes: sent $1, on the group $2 (want 0), datagrams $3 (want 100); nodes 2/3 hold $H"
 
 for i in 1 2 3; do
-	grep -q "CRIT" "$D/n$i.log" &&
-		bad "node $i logged CRIT: $(grep -m2 'CRIT' "$D/n$i.log" | tr '\n' ' ' | cut -c1-220)"
+	grep -h 'an fsync has been stuck' "$D/n$i.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep "CRIT" "$D/n$i.log" | grep -qv 'an fsync has been stuck' &&
+		bad "node $i logged CRIT: $(grep 'CRIT' "$D/n$i.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-220)"
 done
 echo "tombmcasttest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

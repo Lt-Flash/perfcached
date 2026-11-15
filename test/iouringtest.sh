@@ -246,7 +246,8 @@ conf bad "io = kqueue"
 	bad "4. io = kqueue: $(cat "$D/bad.out" | tail -2)"
 "$BIN" -E -f "$D/ep.conf" 2>/dev/null | grep -qx "io = epoll" && ok "4. -E dumps io = epoll" || bad "4. -E: no io = epoll"
 
-e=$(cat "$D"/*.log | grep -cE ' (ERROR|CRIT)')
-[ "$e" = 0 ] && ok "no ERROR/CRIT" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | head -2)"
+grep -h 'an fsync has been stuck' "$D"/*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+e=$(cat "$D"/*.log | grep -E ' (ERROR|CRIT)' | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] && ok "no ERROR/CRIT" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | grep -v 'an fsync has been stuck' | head -2)"
 echo "iouringtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

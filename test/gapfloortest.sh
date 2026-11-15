@@ -154,15 +154,16 @@ done
 [ "$L" = "[]" ] && [ "$(st 2 'c["acks"]["gap_floored"]')" -ge 1 ] 2>/dev/null \
 	&& ok "2. node 2 floored node 3's mark (gap_floored $(st 2 'c["acks"]["gap_floored"]')), at the head after $((k / 2)) s" \
 	|| bad "2. node 3's mark still short after $((k / 2)) s: $L, gap_floored $(st 2 'c["acks"]["gap_floored"]'), asked $(st 3 'c["acks"]["gap_asked"]'), node 2 resent $(st 2 'c["acks"]["gap_resent"]')"
-# 3: the pass opens at a beat, so what says it ran is its drops
-k=0; while [ $k -lt 240 ] && [ "$(held 3 0 3000)" != 0 ]; do sleep 0.5; k=$((k+1)); done
+# 3: the floor opens at a beat; with a survivor it copies that state whole (12ol), and a copying
+# node refuses reads, so ready and done first
+k=0; while [ $k -lt 240 ] && { [ "$(st 3 'r.get("state")')" != ready ] || [ "$(st 3 'c.get("resyncing")')" != False ] || [ "$(held 3 0 3000)" != 0 ]; }; do sleep 0.5; k=$((k+1)); done
 k=0; while [ $k -lt 240 ] && { [ "$(st 3 'c.get("reconcile_open")')" != False ] || [ "$(st 3 'c.get("reconcile_pending")')" != 0 ]; }; do sleep 0.5; k=$((k+1)); done
 G3=$(held 3 0 3000); K3=$(held 3 3000 3300); G1=$(held 1 0 3000)
 [ "$G3" = 0 ] && [ "$K3" = 300 ] && [ "$G1" = 0 ] \
 	&& ok "3. node 3 holds none of the 3,000 deleted keys and all 300 that live; node 1 none" \
-	|| bad "3. node 3 holds $G3 of the 3,000 deleted and $K3 of the 300 live, node 1 $G1 of the deleted; dropped $(st 3 'c.get("reconciled")'), witness $(st 3 'c.get("reconcile_witness")'), skipped $(st 3 'c.get("reconcile_skipped")')"
+	|| bad "3. node 3 holds $G3 of the 3,000 deleted and $K3 of the 300 live, node 1 $G1 of the deleted; rejoins $(st 3 'c.get("rejoins")'), dropped $(st 3 'c.get("reconciled")'), witness $(st 3 'c.get("reconcile_witness")'), skipped $(st 3 'c.get("reconcile_skipped")')"
 [ "$(st 3 'c.get("resyncs")')" = 0 ] && [ "$(st 3 'r.get("state")')" = ready ] \
-	&& ok "3. no resync: node 3 stayed ready" \
+	&& ok "3. no resync: node 3 ready (rejoins $(st 3 'c.get("rejoins")'))" \
 	|| bad "3. node 3: resyncs $(st 3 'c.get("resyncs")'), state $(st 3 'r.get("state")')"
 # 4
 k=0; while [ $k -lt 200 ]; do

@@ -396,6 +396,8 @@ void stats_tree_cluster(struct pc_tw *out)
 		pc_tw_i64(out, (long long)cs.resync_dropped);
 		pc_tw_key(out, "resyncing");
 		pc_tw_bool(out, cs.resyncing);
+		pc_tw_key(out, "rejoins");
+		pc_tw_i64(out, (long long)cs.rejoins);
 		/* would a restart of this node NOW be witnessed */
 		pc_tw_key(out, "restart");
 		pc_tw_map(out);

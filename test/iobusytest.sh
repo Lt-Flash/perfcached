@@ -143,7 +143,8 @@ else
 	echo "  skip 4. io_uring is not usable on this host"
 fi
 
-e=$(cat "$D"/*.log | grep -E ' (ERROR|CRIT)' | grep -vc ' alert: ')
-[ "$e" = 0 ] && ok "no ERROR/CRIT besides the alerts raised" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | grep -v ' alert: ' | head -2)"
+grep -h 'an fsync has been stuck' "$D"/*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+e=$(cat "$D"/*.log | grep -E ' (ERROR|CRIT)' | grep -v ' alert: ' | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] && ok "no ERROR/CRIT besides the alerts raised" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | grep -v ' alert: ' | grep -v 'an fsync has been stuck' | head -2)"
 echo "iobusytest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

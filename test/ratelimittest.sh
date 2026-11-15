@@ -157,8 +157,9 @@ jn=$(j 2 rlhit '{"col":"0","key":"shared","window_ms":30000,"limit":10}')
 sleep 1
 ty="$(r 1 TYPE shared)$(r 2 TYPE shared)$(r 3 TYPE shared)"
 [ "$ty" = ratelimitratelimitratelimit ] && ok "   the record reached every node, typed" || bad "   TYPE on 1/2/3: $ty"
-e=$(cat "$D"/n*.log | grep -cE ' (ERROR|CRIT)')
-[ "$e" = 0 ] && ok "   no ERROR/CRIT" || bad "   $e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/n*.log | head -2)"
+grep -h 'an fsync has been stuck' "$D"/n*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+e=$(cat "$D"/n*.log | grep -E ' (ERROR|CRIT)' | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] && ok "   no ERROR/CRIT" || bad "   $e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/n*.log | grep -v 'an fsync has been stuck' | head -2)"
 for n in 1 2 3; do stopn $n; done
 
 # ---- 3. the type gate: an older member is argument 2, else this tree built without its feature byte

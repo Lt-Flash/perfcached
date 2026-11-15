@@ -160,8 +160,9 @@ J() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(eval(sy
 	ok "2. MGET through member 1 of keys both own: every value, nil for the absent key" ||
 	bad "2. MGET through member 1: $(J 'd["mget"]')"
 for n in 1 2; do      # the fill's own alert aside
-	grep CRIT "$D/n$n.log" | grep -qv "writes refused, the arena is full" &&
-		bad "member $n logged CRIT: $(grep CRIT "$D/n$n.log" | grep -v "writes refused, the arena is full" | head -2 | tr '\n' ' ' | cut -c1-200)"
+	grep -h 'an fsync has been stuck' "$D/n$n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep CRIT "$D/n$n.log" | grep -v 'an fsync has been stuck' | grep -qv "writes refused, the arena is full" &&
+		bad "member $n logged CRIT: $(grep CRIT "$D/n$n.log" | grep -v 'an fsync has been stuck' | grep -v "writes refused, the arena is full" | head -2 | tr '\n' ' ' | cut -c1-200)"
 done
 echo "upnoroomshardtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

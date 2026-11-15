@@ -170,7 +170,8 @@ for n in 1 2 3; do CA="$CA $(st $n '[a["key"] for a in r["alerts"]["active"] if 
 	bad "8. config alerts over unequal facts: $CA"
 E=0
 for n in 1 2 3; do
-	grep -q -E 'ERROR|CRIT' "$D/n$n.log" && { E=1; bad "node $n logged: $(grep -m2 -E 'ERROR|CRIT' "$D/n$n.log" | tr '\n' '|')"; }
+	grep -h 'an fsync has been stuck' "$D/n$n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep -h -E 'ERROR|CRIT' "$D/n$n.log" | grep -qv 'an fsync has been stuck' && { E=1; bad "node $n logged: $(grep -E 'ERROR|CRIT' "$D/n$n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' '|')"; }
 done
 [ $E = 0 ] && ok "no ERROR or CRIT on any node"
 

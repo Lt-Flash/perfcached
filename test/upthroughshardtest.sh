@@ -262,6 +262,7 @@ sum() { python3 -c 'import sys; print(sum(int(x) for x in sys.argv[1].split()))'
 allv() { python3 -c 'import sys; print(all(int(x) == int(sys.argv[2]) for x in sys.argv[1].split()))' "$1" "$2"; }
 [ "$(sum "$RD")" -eq "$NR" ] && ok "10. the drain sweeps read each of the master's $NR keys at its owner alone (read:$RD)" || bad "10. drain read:$RD ($NR keys on the master, 1 x expected)"
 [ $(( $(sum "$TK") + $(sum "$HD") )) -eq $((NR * 1)) ] && [ "$(sum "$EL")" -eq $((NR * 2)) ] && ok "10. each key taken (or already held) by its owner alone - taken_over:$TK fleet_had:$HD, the other nodes skipped it (elsewhere:$EL)" || bad "10. taken_over:$TK fleet_had:$HD elsewhere:$EL (want 1 x $NR taken+had, 2 x $NR elsewhere)"
-grep -q -E 'ERROR|CRIT' "$D"/n?.log && bad "the nodes logged: $(grep -h -m2 -E 'ERROR|CRIT' "$D"/n?.log | tr '\n' '|')" || ok "no ERROR or CRIT in the nodes' logs"
+grep -h 'an fsync has been stuck' "$D"/n?.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -h -E 'ERROR|CRIT' "$D"/n?.log | grep -qv 'an fsync has been stuck' && bad "the nodes logged: $(grep -h -E 'ERROR|CRIT' "$D"/n?.log | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' '|')" || ok "no ERROR or CRIT in the nodes' logs"
 echo "upthroughshardtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

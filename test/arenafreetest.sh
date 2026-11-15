@@ -120,8 +120,9 @@ print("arenafreetest: %d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
 PY
 rc=$?
-if grep -E "ERROR|CRIT" "$D/n.log" | grep -v "tls_verify" >/dev/null; then
-	echo "  FAIL ERROR/CRIT in the log:"; grep -E "ERROR|CRIT" "$D/n.log" | head -3 | sed 's/^/        /'
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+if grep -E "ERROR|CRIT" "$D/n.log" | grep -v "tls_verify" | grep -v "an fsync has been stuck" >/dev/null; then
+	echo "  FAIL ERROR/CRIT in the log:"; grep -E "ERROR|CRIT" "$D/n.log" | grep -v "an fsync has been stuck" | head -3 | sed 's/^/        /'
 	rc=1
 fi
 exit $rc

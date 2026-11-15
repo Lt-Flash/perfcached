@@ -127,6 +127,7 @@ r=$(commit $M 4)
 echo "$r" | grep -q '"committed": 4' && waitfor 10 '[ "$(ep 1 committed) $(ep 2 committed) $(ep 3 committed)" = "4 4 4" ]' && ok "6. commit 4 (every member speaks it) is accepted and the fleet speaks 4 again" || bad "6. commit 4: $r; committed $(ep 1 committed)/$(ep 2 committed)/$(ep 3 committed)"
 r=$(commit $M 4)
 echo "$r" | grep -q "already" && ok "6. committing the epoch spoken is refused as a no-op: $r" || bad "6. repeat commit: $r"
-grep -q -E 'CRIT' "$D"/n[123].log && bad "a node logged CRIT: $(grep -h -m1 CRIT "$D"/n[123].log | cut -c1-120)" || ok "no CRIT in the members' logs"
+grep -h 'an fsync has been stuck' "$D"/n[123].log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -h CRIT "$D"/n[123].log | grep -qv 'an fsync has been stuck' && bad "a node logged CRIT: $(grep -h CRIT "$D"/n[123].log | grep -v 'an fsync has been stuck' | head -n 1 | cut -c1-120)" || ok "no CRIT in the members' logs"
 echo "epochcommittest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

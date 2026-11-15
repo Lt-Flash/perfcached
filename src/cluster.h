@@ -132,6 +132,9 @@ struct pc_cl_stats {
 	unsigned long long resyncs;
 	unsigned long long resync_dropped;
 	int resyncing;
+	/* rejoins: a restart, floor or split that copied a survivor's state whole (12ol); its
+	 * drops count in resync_dropped, its run in resyncing */
+	unsigned long long rejoins;
 	/* would a restart now find a reconcile witness?  safe_in_ms = until the first qualifies,
 	 * -1 = never */
 	int restart_witnesses;

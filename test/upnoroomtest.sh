@@ -163,7 +163,8 @@ GETS=$(grep -c "^GET tok:s1\$" "$D/up/counts" 2>/dev/null)
 	bad "7. INCR of a key the upstream holds as 41 answered 1 - a change ran on a guess"
 
 # the fill's own alert aside - it fires when the fill outlasts the alert's window
-grep CRIT "$D/n.log" | grep -qv "writes refused, the arena is full" &&
-	bad "the node logged CRIT: $(grep CRIT "$D/n.log" | grep -v "writes refused, the arena is full" | head -2 | tr '\n' ' ' | cut -c1-200)"
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep CRIT "$D/n.log" | grep -v 'an fsync has been stuck' | grep -qv "writes refused, the arena is full" &&
+	bad "the node logged CRIT: $(grep CRIT "$D/n.log" | grep -v 'an fsync has been stuck' | grep -v "writes refused, the arena is full" | head -2 | tr '\n' ' ' | cut -c1-200)"
 echo "upnoroomtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

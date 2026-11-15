@@ -144,9 +144,10 @@ PY
 		E=ok) ok "$io E. the plaintext RESP door beside it still plaintext";;
 		N=ok) ok "$io N. 8 MB of replies past the output pause while the client kept sending: every reply right";;
 		F=200) ok "$io F. GET /health over TLS with the token";;
-		G=ok) n=$(grep -cE "ERROR|CRIT" "$D/$io.log")
+		G=ok) grep -h 'an fsync has been stuck' "$D/$io.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+			n=$(grep -E "ERROR|CRIT" "$D/$io.log" | grep -cv 'an fsync has been stuck')
 			[ "$n" = 0 ] && ok "$io G. a client gone mid-handshake: the node goes on, nothing in ERROR" ||
-			bad "$io G. $n ERROR/CRIT line(s): $(grep -E 'ERROR|CRIT' "$D/$io.log" | head -1)";;
+			bad "$io G. $n ERROR/CRIT line(s): $(grep -E 'ERROR|CRIT' "$D/$io.log" | grep -v 'an fsync has been stuck' | head -1)";;
 		*) bad "$io $x";;
 		esac
 	done

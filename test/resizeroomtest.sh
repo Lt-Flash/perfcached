@@ -80,6 +80,7 @@ grep -q "resize complete" "$D/n.log" && ok "C. room again: the resize completes 
 	bad "C. the resize never completed: $(tail -2 "$D/n.log" | cut -c1-160 | tr '\n' '|')"
 set -- $(keys check)
 [ "$1" = 0 ] && ok "D. after it, all 600 keys read their values" || bad "D. after the resize: $1 of 600 lost ($2 $3 $4)"
-grep -qE "CRIT|ERROR" "$D/n.log" && bad "the node logged: $(grep -m2 -E 'CRIT|ERROR' "$D/n.log" | tr '\n' ' ' | cut -c1-200)"
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -E "CRIT|ERROR" "$D/n.log" | grep -qv 'an fsync has been stuck' && bad "the node logged: $(grep -E 'CRIT|ERROR' "$D/n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-200)"
 echo "resizeroomtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

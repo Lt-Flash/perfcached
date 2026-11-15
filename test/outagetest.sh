@@ -1,6 +1,6 @@
 #!/bin/sh
-# outagetest.sh - a whole-fleet outage must not make the fleet delete its own data: the reconcile
-# runs only with a witness peer, and a build that skips the witness check must lose keys.
+# outagetest.sh - a whole-fleet outage must not make the fleet delete its own data: a returning node
+# takes the fleet's state only from a survivor (a witness), and a build that skips that check must lose keys.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -272,14 +272,14 @@ killall3
 
 echo "--- 4. a STAGGERED failure: node 1 dies and reboots, then 2 and 3 go"
 sc_staggered "$BIN"; report "staggered"
-W1=$(cl 17351 reconcile_witness)
+J1=$(cl 17351 rejoins)
 lost && bad "keys lost: $P1/$P2/$P3 of $TOT (dropped $R1/$R2/$R3)" \
-	|| ok "all $TOT on all three - node 1 booted before 2 and 3 died, but had not been re-sent their records, and was not taken for a witness"
+	|| ok "all $TOT on all three - node 1 booted before 2 and 3 died, but under the grace before, and was not taken for a survivor"
 [ "$K2" = True ] && [ "$K3" = True ] \
 	&& ok "nodes 2 and 3 skipped their passes (node 1 had been up 10 s, under the 30 s grace)" \
 	|| bad "nodes 2 and 3 did not both skip (skipped $K1/$K2/$K3) - the early riser was taken for a witness"
-case "$W1" in ''|0|'?') bad "node 1 found no witness - 2 and 3 were up 46 s before it died (witness $W1)";;
-	*) ok "and node 1 DID run its pass, witnessed by node $W1 - which was up throughout, and complete";; esac
+case "$J1" in ''|0|'?') bad "node 1 copied no survivor's state - 2 and 3 were up 46 s before it died (rejoins $J1)";;
+	*) ok "and node 1 DID copy the fleet's state from a survivor (rejoins $J1) - up throughout, and complete";; esac
 killall3
 
 # ---- 5. the fail-first: the same runs without the witness check ------

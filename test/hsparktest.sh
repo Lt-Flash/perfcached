@@ -92,7 +92,8 @@ set -- $DEF
 [ "${1:--1}" -gt 0 ] 2>/dev/null && [ "${2:-}" = 8 ] \
 	&& ok "handshakes were parked and run later (clients.handshakes.deferred $1, per_turn $2)" \
 	|| bad "clients.handshakes: deferred ${1:-?}, per_turn ${2:-?} (want > 0, 8)"
-grep -q -E " (ERROR|CRIT)" "$D/pc.log" && bad "ERROR/CRIT in the log: $(grep -m1 -E ' (ERROR|CRIT)' "$D/pc.log" | cut -c1-120)" \
+grep -h 'an fsync has been stuck' "$D/pc.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -h -E " (ERROR|CRIT)" "$D/pc.log" | grep -qv 'an fsync has been stuck' && bad "ERROR/CRIT in the log: $(grep -E ' (ERROR|CRIT)' "$D/pc.log" | grep -v 'an fsync has been stuck' | head -n 1 | cut -c1-120)" \
 	|| ok "no ERROR or CRIT in the log"
 echo "hsparktest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

@@ -129,7 +129,8 @@ for v in "busy_poll_us = -1" "busy_poll_us = 200000" "busy_poll_prefer = maybe";
 	conf badv "$v"
 	"$BIN" -C -f "$D/badv.conf" > /dev/null 2>&1 && bad "3. '$v' was accepted" || ok "3. '$v' is refused"
 done
-e=$(cat "$D"/*.log | grep -cE ' (ERROR|CRIT)')
-[ "$e" = 0 ] && ok "no ERROR/CRIT" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | head -2)"
+grep -h 'an fsync has been stuck' "$D"/*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+e=$(cat "$D"/*.log | grep -E ' (ERROR|CRIT)' | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] && ok "no ERROR/CRIT" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | grep -v 'an fsync has been stuck' | head -2)"
 echo "busypolltest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

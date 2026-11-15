@@ -121,7 +121,7 @@ and `copies` how many copies the mode keeps: `1`, the copy factor K,
 | mode | a node crashes | a peer is slow |
 |---|---|---|
 | `store` | the keys only it held are out of reach until it returns | a read only it could answer waits for it, up to `pull_timeout_ms` |
-| `eager` | nothing is lost but what its ring held and it had not pushed; it returns from its log and asks the fleet what changed | it applies late, quietly (the `replica intake` card), and the sweep mends what it drops |
+| `eager` | nothing is lost but what it had not pushed; it returns and copies the state of a peer that was up throughout (0.7.5), or, with none, returns from its log | it applies late, quietly (the `replica intake` card), and the sweep mends what it drops |
 | `spread` | its keys survive while one of their K holders is up | as eager |
 | `shard` | its slice is out of reach until it returns | the keys it owns wait for it |
 | `proxy` | its keys are out of reach until it returns | the keys it holds wait for it |
@@ -138,7 +138,9 @@ restarts) - except one to a release that changes the cluster wire, as
 
 In every mode a node that stalls says `stalled` and is steered around,
 and a node whose log failed says `failed` and refuses writes ("What a
-node says about itself").  A member back after longer than
+node says about itself").  An eager node back while a peer was up
+throughout its absence copies that peer's state whole ("Copying a
+survivor's state", 0.7.5).  A member back after longer than
 `resync_after_s`, or from a split nobody witnessed, drops what it held
 and pulls the fleet's state again ("A member back after a long
 absence").  The whole fleet down at once is the WAL's and the
@@ -421,9 +423,10 @@ after a long split:
   (0.6.5) naming the member and how long it was away.  In an eager
   fleet whose members acknowledge deletes (0.7.3), a member back
   without a restart that may lack a delete nobody holds any more is
-  asked to rebuild instead: it reconciles every record it stored before
-  it went silent with the fleet, keeps what it wrote since, and the
-  alert says so - nothing to re-issue.  When no member was up 30 s
+  asked to rebuild instead: it copies the state of a member that was up
+  through the split over every record it stored before it went silent
+  (0.7.5; before, it asked the fleet about each), keeps what it wrote
+  since, and the alert says so - nothing to re-issue.  When no member was up 30 s
   before the split began - long enough to witness it - the records
   cannot be ruled on one by one, and the member resyncs instead (see
   "A member back after a long absence" below).
@@ -441,8 +444,9 @@ after a long split:
   dropped expiry matters less than a dropped delete: the copy that
   comes back expires again, unless it was written with a longer TTL.
 - **A node restarts during the partition.**  The memory is not kept on
-  disk.  The node's own data comes back through the restart reconcile,
-  but it can no longer send the other side the deletes it made.
+  disk.  The node's data comes back through the restart (an eager node
+  copies a peer's that was up throughout, 0.7.5), but it can no longer
+  send the other side the deletes it made.
   Restart one node at a time, and never the whole fleet during a split.
 
 **Sizing the memory.**  While the fleet acknowledges deletes (0.7.3,
@@ -580,7 +584,8 @@ converges on the working set.  Each node's ceiling is its own arena.
 as it lands - on the write path, fire-and-forget, whatever the TTL - and
 a background sweep repairs what a push did not reach.  Replicas are held
 off the WAL: a record is durable where it was written, and a node that
-restarts holds its own writes until the sweep refills the rest.
+restarts with no peer up throughout holds its own writes until the
+sweep refills the rest; with one, it copies that peer's state (0.7.5).
 
 **Reading your own write (0.7.5).**  An eager write is acknowledged by
 the node that took it before its peers have it.  So a client reads its
@@ -588,7 +593,9 @@ own write back from that node at once, and from any other node once the
 push has landed - a few milliseconds.  Across that node's death or stall
 the promise ends: a client that moves to another member may read the
 value before its write, and if the node died before pushing, the write
-is gone until the node returns with its WAL.  Nothing on the client can
+is gone - for good when the node returns while a peer was up throughout,
+since it then copies that peer's state (0.7.5); only a node that returns
+to no such peer brings it back from its WAL.  Nothing on the client can
 close that window.  Shard mode reads a key at its one owner, so it has no
 such lag, but a key is out of reach while its owner is.
 
@@ -597,12 +604,39 @@ durability: only the node that took a write logs it, so the fleet's
 data is the UNION of the WALs and no single node's is complete.  After a
 whole-fleet outage - a power cut, not a rolling restart - each node
 replays its own share and the fleet re-shares the rest over the repair
-sweep.  A returning node still asks the fleet whether each replayed key
-survives, so that a key deleted, or expired, while it was away is not
-resurrected - but only if some peer was up throughout its absence.
-Until the fleet has answered for a key, the returning node neither
-sweeps its recovered copy to its peers nor answers their pulls with it
-(`repl_held_recovered`, `pull_held_recovered`).
+sweep.
+
+**Copying a survivor's state (0.7.5).**  An eager node that returns
+while some peer was up throughout its absence - a survivor: live, ready,
+and up at least 30 s before the node went down - does not trust what it
+replayed.  It drops the replayed records and copies that survivor's
+state whole, so a key deleted, expired or rewritten while it was away
+reads as the fleet has it.  It is RECOVERING while it copies: a client
+is refused rather than answered from a half-copied store.  The same
+happens when a floor or a split's rebuild (below) puts the records it
+stored in question: it drops those and copies a survivor's state over
+them, keeping what it wrote since.  A write the node took and had not
+pushed when it died - a few milliseconds' worth, or a push the repair
+sweep had not yet mended - goes with its files: the survivor never had
+it.  The copy is taken from survivors only, the next one if a source
+fails; no snapshot runs until it is complete, and one follows it, so
+the files from before it go.  If every survivor is gone before it
+finishes, the node stops without a snapshot (exit status 75 - the
+packaged service restarts it) and comes back from its own files; with
+no survivor then, it keeps them.  With no survivor at all - the whole
+fleet went down, or every live peer restarted while it was away - it
+keeps what it replayed and nothing is deleted
+(`stats.cluster.reconcile_skipped`): a key deleted or expired meanwhile
+can come back.  Boot times cannot tell a fleet that rolled from the one
+survivor of a staggered failure, and keeping is the safe side.
+`stats.cluster.rejoins` counts the copies, `resync_dropped` the records
+they dropped, and `resyncing` is true while one runs; the log names the
+survivor.
+
+Before 0.7.5 the returning node instead asked the fleet whether each
+replayed key survives, holding its recovered copies until answered
+(`repl_held_recovered`, `pull_held_recovered`), as the next two
+paragraphs describe.
 
 **The fast path (0.6.4).**  A node keeps no copy and no delete it
 receives from its peers, so what a restart can bring back is the deletes
@@ -647,7 +681,9 @@ boot times cannot tell a fleet that rolled (complete) from the one
 survivor of a staggered failure (which may lack records only this node
 holds).  `resync_after_s` (below) bounds how long that can last.
 
-**A member back after a long absence (0.7.3).**  A node that returns -
+**A member back after a long absence (0.7.3).**  From 0.7.5 an eager node
+with a survivor copies it instead (above), unless it was away longer than
+`resync_after_s`.  A node that returns -
 after a restart or a split - and whose records the fleet cannot rule on
 one by one resyncs, as a node joins a Galera cluster by state transfer:
 it drops every record it stored before its absence and pulls the
@@ -756,18 +792,17 @@ previous process is taken again once the new process has been silent
 recorded from a node's last run replays while that node stays down.
 
 **Rolling restarts: one node at a time, and only when it is safe.**  The
-peers that were up throughout a node's absence are its WITNESSES; restart
-a witness while that node is still asking, and its question can lose the
-only node able to answer it.  Every node says, in `stats.cluster.restart`,
+peers that were up throughout a node's absence are its WITNESSES - from
+0.7.5 its survivors, whose state it copies.  Every node says, in `stats.cluster.restart`,
 whether restarting IT now is safe: `safe` is false until a restart of it
 would be witnessed (`safe_in_ms` says how long), and while any peer's
 reconcile is still open - `waits_for` names those peers.  Restart a node
-only once it says `safe`, then wait for the next one to say so too.  A
-pass left with no witness at all - every peer restarted since the node
-went down - waits rather than guess: the node holds its replayed copies,
-`stats.cluster.reconcile_no_witness_s` counts the time, and the log says
-once, after 30 seconds, to restart that node itself (its peers have been
-up long enough by then to witness it).  A snapshot is what makes a single node independently
+only once it says `safe`, then wait for the next one to be ready and say
+so too.  A node restarted with no witness keeps what it replayed; one
+whose survivors all restart while it copies goes back to its own files
+and keeps them (above) - it never waits for a witness.  Before 0.7.5 its
+pass waited instead, holding its replayed copies, and said after 30
+seconds to restart that node (`reconcile_no_witness_s`).  A snapshot is what makes a single node independently
 recoverable, because the snapshot walk stores the copies too - so `save`
 rules are the difference between recovering from any one node and
 recovering only from the fleet.
@@ -2258,7 +2293,7 @@ it already keeps:
 | alert | level | raised | cleared |
 |---|---|---|---|
 | the node FAILED / HEALING | critical / warning (critical after 10 minutes HEALING) | at once | when it is not |
-| the node's reconcile has no witness - every live peer restarted after it went down: restart this node (`node.reconcile`, 0.6.4) | warning | after 30 s | 30 s after it resumes or ends |
+| the node's reconcile has no witness - every live peer restarted after it went down: restart this node (`node.reconcile`, 0.6.4; from 0.7.5 a restart copies a survivor's state or keeps its own, and no pass waits) | warning | after 30 s | 30 s after it resumes or ends |
 | the WAL dropped or overran records | warning (critical for the third loss within an hour) | the second it happens | after 5 quiet minutes |
 | WAL fsync's mean over the last minute above 4x the start-up probe | warning | after 5 minutes of it | after a minute below |
 | the WAL filling faster than snapshots free it - the whole log fills faster than one snapshot takes, or its free segments last under twice the last snapshot's duration (`wal.capacity`, 0.7.2) | warning | after a minute of the first, 5 minutes of the second | after 5 minutes without |

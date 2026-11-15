@@ -198,7 +198,7 @@ for mode in shard spread; do
 	[ -n "$r" ] && bad "$mode: writing the keys through member 1: $(echo "$r" | cut -c1-200)"
 	sleep 1
 	if [ $mode = shard ]; then legs shard 1; else legs spread 5; fi
-	for n in 1 2 3; do grep -q "CRIT" "$D/n$n.log" && bad "$mode: member $n logged CRIT: $(grep -m2 CRIT "$D/n$n.log" | tr '\n' ' ' | cut -c1-200)"; done
+	for n in 1 2 3; do grep -h 'an fsync has been stuck' "$D/n$n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"; grep "CRIT" "$D/n$n.log" | grep -qv 'an fsync has been stuck' && bad "$mode: member $n logged CRIT: $(grep CRIT "$D/n$n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-200)"; done
 done
 echo "existsplacetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

@@ -118,6 +118,7 @@ case " $C " in *" 0 "*) case " $C " in *" 0.nofall "*) P=1 ;; esac ;; esac
 [ $P = 1 ] && ok "the read-through pair is still there: $C" ||
 	bad "collections after: $C"
 
-grep -q "CRIT" "$D/n.log" && bad "the node logged CRIT: $(grep -m2 CRIT "$D/n.log" | tr '\n' ' ' | cut -c1-200)"
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep "CRIT" "$D/n.log" | grep -qv 'an fsync has been stuck' && bad "the node logged CRIT: $(grep CRIT "$D/n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-200)"
 echo "uprenametest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

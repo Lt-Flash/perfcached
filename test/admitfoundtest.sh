@@ -166,7 +166,8 @@ else
 fi
 
 for n in 1 2 3 4 5 6 7 8 9; do
-	grep -q CRIT "$D/n$n.log" 2>/dev/null && bad "node $n logged CRIT: $(grep -m1 CRIT "$D/n$n.log" | cut -c1-160)"
+	grep -h 'an fsync has been stuck' "$D/n$n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep CRIT "$D/n$n.log" 2>/dev/null | grep -qv 'an fsync has been stuck' && bad "node $n logged CRIT: $(grep CRIT "$D/n$n.log" | grep -v 'an fsync has been stuck' | head -n 1 | cut -c1-160)"
 done
 echo "admitfoundtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

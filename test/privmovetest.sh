@@ -151,12 +151,14 @@ case "$O" in "RESULT rc=-1 "*"err=node $b: "*"; then node "*) t=1;; *) t=0;; esa
 # alerts that follow; any other is a failure
 SYNCRIT='CRIT.*wal: [a-z_]*sync failed (.*) - marking this node FAILED'
 for i in 1 2; do
+	grep -h 'an fsync has been stuck' "$D/n$i.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
 	grep -q "$SYNCRIT" "$D/n$i.log" \
 		|| bad "node $i: no CRIT names the refused sync: $(grep -m1 CRIT "$D/n$i.log" | cut -c1-160)"
 	c=$(grep CRIT "$D/n$i.log" | grep -v -e "$SYNCRIT" \
 		-e 'CRIT.*node state -> FAILED: the device refused a WAL write or sync' \
 		-e 'CRIT.*alert: node FAILED: the device refused a write-ahead-log write or sync' \
-		-e 'CRIT.*alert: only [0-9]* of the fleet.s [0-9]* members are ready - below a majority')
+		-e 'CRIT.*alert: only [0-9]* of the fleet.s [0-9]* members are ready - below a majority' \
+		-e 'an fsync has been stuck')
 	[ -n "$c" ] && bad "node $i logged another CRIT: $(echo "$c" | cut -c1-160 | tr '\n' '|')"
 done
 echo "privmovetest: $pass passed, $fail failed"

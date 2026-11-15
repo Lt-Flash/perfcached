@@ -58,6 +58,11 @@ void pc_rdb_thread(volatile int *stop);
 
 /* the `save` verb: returns 0 = save requested, 1 = already running */
 int pc_rdb_request_save(void);
+/* no snapshot while held, not even a clean stop's: a copy of the fleet's state is incomplete,
+ * and the files must keep what the node held before it.  _busy: a save is walking now */
+void pc_rdb_hold(int on);
+int pc_rdb_held(void);
+int pc_rdb_busy(void);
 
 /* synchronous save - the post-recovery checkpoint (startup only,
  * before the RDB thread exists) */

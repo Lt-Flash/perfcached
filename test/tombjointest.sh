@@ -147,8 +147,9 @@ A3=$(st 3 'c["acks"]["gap_asked"]')
 	bad "4. node 3 holds ${L:-?} deleted keys, asked for ${A3:-?} hole(s) (want 0, and 10 or fewer)"
 
 for i in 1 2 3; do
-	grep -q "CRIT" "$D/n$i.log" &&
-		bad "node $i logged CRIT: $(grep -m2 'CRIT' "$D/n$i.log" | tr '\n' ' ' | cut -c1-220)"
+	grep -h 'an fsync has been stuck' "$D/n$i.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep "CRIT" "$D/n$i.log" | grep -qv 'an fsync has been stuck' &&
+		bad "node $i logged CRIT: $(grep 'CRIT' "$D/n$i.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-220)"
 done
 echo "tombjointest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

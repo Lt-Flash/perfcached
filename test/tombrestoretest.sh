@@ -3,6 +3,9 @@
 # path refused and walks, so no deleted key comes back.  Usage: test/tombrestoretest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
+# the one-by-one reconcile a restart or a floor ran before 12ol is this suite's subject; the default
+# now copies a survivor's state whole (rejoinwitnesstest)
+export PERFCACHED_TEST_RECONCILE=1
 T=$(cd "$(dirname "$0")" && pwd)
 PYTHONPATH=$T${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 D=$(mktemp -d /var/tmp/pctrest.XXXXXX)

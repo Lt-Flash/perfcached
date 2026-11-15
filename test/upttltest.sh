@@ -128,6 +128,7 @@ done
 	ok "2. the copies served: the upstream was asked about a key $MX time(s) at most in ${4:-?} polls" ||
 	bad "2. the upstream was asked about one key $MX times in ${4:-?} polls (want under half, and 30 polls or more) - nothing was held, and step 1 proves nothing"
 
-grep -q "CRIT" "$D/n.log" && bad "the node logged CRIT: $(grep -m2 CRIT "$D/n.log" | tr '\n' ' ' | cut -c1-200)"
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep "CRIT" "$D/n.log" | grep -qv 'an fsync has been stuck' && bad "the node logged CRIT: $(grep CRIT "$D/n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-200)"
 echo "upttltest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

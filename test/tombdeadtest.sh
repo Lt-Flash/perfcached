@@ -156,17 +156,16 @@ done
 [ "$L" = 0 ] && [ "$(st 3 'c["acks"].get("gap_dead", 0)')" -ge 1 ] 2>/dev/null \
 	&& ok "3. node 3 floored the run that was over itself, after $((k / 2)) s (gap_dead $(st 3 'c["acks"].get("gap_dead")'))" \
 	|| bad "3. node 3's mark still short after $((k / 2)) s: $(st 3 '[(m["confirmed"], m["hi"]) for m in c["acks"]["marks"] if m["confirmed"] < m["hi"]]'), gap_dead $(st 3 'c["acks"].get("gap_dead")'), asked $(st 3 'c["acks"]["gap_asked"]'), node 1 resent $(st 1 'c["acks"]["gap_resent"]')"
-# 4. node 3 holds none of the 201 deleted keys and all 99 live, without a resync; the pass opens at
-# a beat, so what says it ran is its drops
-k=0; while [ $k -lt 120 ] && [ "$(st 3 'c.get("reconciled", 0)')" -lt 200 ] 2>/dev/null; do sleep 0.5; k=$((k+1)); done
-k=0; while [ $k -lt 240 ] && { [ "$(st 3 'c.get("reconcile_open")')" != False ] || [ "$(st 3 'c.get("reconcile_pending")')" != 0 ]; }; do sleep 0.5; k=$((k+1)); done
+# 4. a floor with a survivor (node 1, up throughout) copies its state whole (12ol), so node 3 holds
+# none of the 201 deleted keys and all 99 live, without a resync
+k=0; while [ $k -lt 120 ] && { [ "$(st 3 'c.get("rejoins", 0)')" -lt 1 ] 2>/dev/null || [ "$(st 3 'c.get("resyncing")')" != False ] || [ "$(st 3 'r.get("state")')" != ready ]; }; do sleep 0.5; k=$((k+1)); done
 G3=$(held 3 0 201); K3=$(held 3 201 300); G1=$(held 1 0 201)
 [ "$G3" = 0 ] && [ "$K3" = 99 ] && [ "$G1" = 0 ] \
 	&& ok "4. node 3 holds none of the 201 deleted keys and all 99 that live; node 1 holds none" \
-	|| bad "4. node 3 holds $G3 of the 201 deleted and $K3 of the 99 live, node 1 $G1 of the deleted; probed $(st 3 'c.get("reconcile_probed")'), dropped $(st 3 'c.get("reconciled")'), witness $(st 3 'c.get("reconcile_witness")'), skipped $(st 3 'c.get("reconcile_skipped")')"
-[ "$(st 3 'c.get("resyncs")')" = 0 ] && [ "$(st 3 'r.get("state")')" = ready ] \
-	&& ok "4. no resync: node 3 stayed ready" \
-	|| bad "4. node 3: resyncs $(st 3 'c.get("resyncs")'), state $(st 3 'r.get("state")')"
+	|| bad "4. node 3 holds $G3 of the 201 deleted and $K3 of the 99 live, node 1 $G1 of the deleted; rejoins $(st 3 'c.get("rejoins")'), skipped $(st 3 'c.get("reconcile_skipped")'): $(grep -E "rejoin -|reconcile SKIPPED" "$D/n3.log" | tail -1 | cut -c1-160)"
+[ "$(st 3 'c.get("rejoins")')" = 1 ] && [ "$(st 3 'c.get("resyncs")')" = 0 ] && [ "$(st 3 'r.get("state")')" = ready ] \
+	&& ok "4. node 3 copied a survivor's state (rejoins 1), no resync, ready again" \
+	|| bad "4. node 3: rejoins $(st 3 'c.get("rejoins")') (want 1), resyncs $(st 3 'c.get("resyncs")'), state $(st 3 'r.get("state")')"
 # 5. no cluster.acks_stuck is left on any node
 k=0; while [ $k -lt 200 ]; do
 	[ "$(stuck 1)$(stuck 2)$(stuck 3)" = "[][][]" ] && break

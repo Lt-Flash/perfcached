@@ -4,6 +4,9 @@
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
+# the one-by-one reconcile a restart or a floor ran before 12ol is this suite's subject; the default
+# now copies a survivor's state whole (rejoinwitnesstest)
+export PERFCACHED_TEST_RECONCILE=1
 D=$(mktemp -d /var/tmp/pcrw.XXXXXX)
 trap 'kill -9 $(cat "$D"/*.pid 2>/dev/null) 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM

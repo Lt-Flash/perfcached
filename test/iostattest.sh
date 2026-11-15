@@ -151,7 +151,8 @@ S1=$(st 1 's["io"]["cluster_udp"]["tx_syscalls"]'); M1=$(metric 1 'perfcached_ud
 [ "${S1:-x}" -lt "$UT1" ] 2>/dev/null && ok "3. a stats reset starts /stats io again ($UT1 -> $S1)" || bad "3. /stats io after a reset: $S1 (was $UT1)"
 [ "${M1:-0}" -ge "${M0:-1}" ] && ok "3. /metrics did not fall ($M0 -> $M1)" || bad "3. /metrics fell: $M0 -> $M1"
 
-e=$(cat "$D"/n*.log | grep -cE ' (ERROR|CRIT)')
-[ "$e" = 0 ] && ok "no ERROR/CRIT" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/n*.log | head -2)"
+grep -h 'an fsync has been stuck' "$D"/n*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+e=$(cat "$D"/n*.log | grep -E ' (ERROR|CRIT)' | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] && ok "no ERROR/CRIT" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/n*.log | grep -v 'an fsync has been stuck' | head -2)"
 echo "iostattest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

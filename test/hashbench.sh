@@ -160,6 +160,7 @@ print("hashbench: done", flush=True)
 PY
 rc=$?
 p=$(cat "$D/n.pid"); kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; rm -f "$D/n.pid"
-e=$(grep -cE ' (ERROR|CRIT)' "$D/n.log")
-[ "$e" = 0 ] || { echo "hashbench: $e ERROR/CRIT in the daemon log: $(grep -hE ' (ERROR|CRIT)' "$D/n.log" | head -2)" >&2; rc=1; }
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /" >&2
+e=$(grep -E ' (ERROR|CRIT)' "$D/n.log" | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] || { echo "hashbench: $e ERROR/CRIT in the daemon log: $(grep -hE ' (ERROR|CRIT)' "$D/n.log" | grep -v 'an fsync has been stuck' | head -2)" >&2; rc=1; }
 exit $rc

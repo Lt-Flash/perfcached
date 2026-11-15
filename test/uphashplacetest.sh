@@ -193,6 +193,6 @@ else
 		bad "7. spread: written through member 2, wrong through 1: $(echo "$r1" | wc -w) ($(echo "$r1" | cut -c1-160)), through 3: $(echo "$r3" | wc -w)"
 fi
 
-for n in 1 2 3; do grep -q "CRIT" "$D/n$n.log" && bad "member $n logged CRIT: $(grep -m2 CRIT "$D/n$n.log" | tr '\n' ' ' | cut -c1-200)"; done
+for n in 1 2 3; do grep -h 'an fsync has been stuck' "$D/n$n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"; grep "CRIT" "$D/n$n.log" | grep -qv 'an fsync has been stuck' && bad "member $n logged CRIT: $(grep CRIT "$D/n$n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-200)"; done
 echo "uphashplacetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

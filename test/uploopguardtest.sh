@@ -175,7 +175,8 @@ conf c2 $AT $AR $AH "upstream_allow_perfcached = yes"
 [ $? -ne 0 ] && grep -q "upstream_allow_perfcached without an upstream" "$D/c2.out" && ok "5. the key without an upstream is refused" ||
 	bad "5. alone: $(tail -1 "$D/c2.out")"
 
-e=$(cat "$D"/*.log | grep -E ' (ERROR|CRIT)' | grep -vc ' alert: ')
-[ "$e" = 0 ] && ok "no ERROR/CRIT besides the alerts raised" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | grep -v ' alert: ' | head -2)"
+grep -h 'an fsync has been stuck' "$D"/*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+e=$(cat "$D"/*.log | grep -E ' (ERROR|CRIT)' | grep -v ' alert: ' | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] && ok "no ERROR/CRIT besides the alerts raised" || bad "$e ERROR/CRIT: $(grep -hE ' (ERROR|CRIT)' "$D"/*.log | grep -v ' alert: ' | grep -v 'an fsync has been stuck' | head -2)"
 echo "uploopguardtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

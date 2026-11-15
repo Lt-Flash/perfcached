@@ -39,6 +39,7 @@ static struct {
 	 * its losses; and an urgent request's flag */
 	long long last_start_us;
 	volatile int urgent;
+	volatile int hold;                 /* a copy of the fleet's state is incomplete */
 } R;
 
 #define PC_RDB_RETRY_S 10
@@ -398,7 +399,7 @@ void pc_rdb_thread(volatile int *stop)
 		int fire = 0, i;
 
 		usleep(250 * 1000);
-		if (!R.enabled)
+		if (!R.enabled || R.hold)
 			continue;
 		if (R.save_req)
 			fire = 1;
@@ -425,9 +426,14 @@ void pc_rdb_thread(volatile int *stop)
 			int urgent = R.urgent;
 			double budget = R.budget_mb_s;
 
+			/* running first, then the hold: pc_rdb_hold's caller reads them the other way */
+			__atomic_store_n(&R.running, 1, __ATOMIC_SEQ_CST);
+			if (__atomic_load_n(&R.hold, __ATOMIC_SEQ_CST)) {
+				R.running = 0;
+				continue;          /* the request waits for the hold to end */
+			}
 			R.urgent = 0;
 			R.save_req = 0;
-			R.running = 1;
 			if (urgent)
 				R.budget_mb_s = 0;
 			if (rdb_save() != 0) {
@@ -480,6 +486,21 @@ void pc_rdb_request_urgent(void)
 long long pc_rdb_mono_us(void)
 {
 	return mono_us();
+}
+
+void pc_rdb_hold(int on)
+{
+	__atomic_store_n(&R.hold, on, __ATOMIC_SEQ_CST);
+}
+
+int pc_rdb_held(void)
+{
+	return __atomic_load_n(&R.hold, __ATOMIC_SEQ_CST);
+}
+
+int pc_rdb_busy(void)
+{
+	return __atomic_load_n(&R.running, __ATOMIC_SEQ_CST);
 }
 
 int pc_rdb_request_save(void)

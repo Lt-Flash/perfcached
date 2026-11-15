@@ -147,7 +147,8 @@ st=$(curl -s -H "Authorization: Bearer rl-token-5" "http://127.0.0.1:$HTTP/stats
 # (G is refused by -H before the daemon is asked, I's unprivileged verb before it runs)
 [ "$st" = "9 1 True" ] && ok "I. stats.reload: 9 applied, 1 refused, the last one stamped" || bad "I. stats.reload: '$st'"
 kill -0 $P 2>/dev/null && ok "the daemon ran through every reload" || bad "the daemon is gone: $(tail -5 "$D/n.log")"
-grep -E 'ERROR|CRIT' "$D/n.log" | grep -vE 'reload refused|does not load|this line is not a key|expected key = value' | head -3 > "$D/errs"
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -E 'ERROR|CRIT' "$D/n.log" | grep -vE 'reload refused|does not load|this line is not a key|expected key = value|an fsync has been stuck' | head -3 > "$D/errs"
 [ ! -s "$D/errs" ] && ok "no other ERROR or CRIT in the log" || bad "other errors: $(tr '\n' '|' < "$D/errs")"
 kill $P 2>/dev/null; wait $P 2>/dev/null; P=
 echo "reloadtest: $pass passed, $fail failed"

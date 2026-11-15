@@ -326,6 +326,11 @@ static struct {
 	int resync_on;
 	int resync_floor;
 	unsigned long long resync_dropped_now;  /* this resync's drops */
+	/* a rejoin's pull asks this survivor first (0 = none), takes survivors only while rejoin_on;
+	 * a snapshot follows any resync */
+	int boot_prefer;
+	int rejoin_on;
+	int snap_due;
 	/* when this node raises its own SIGTERM (0 = not scheduled): written by a worker
 	 * or the cluster thread, read by the cluster thread's tick */
 	long long stop_self_at_ms;
@@ -395,6 +400,12 @@ static int self_no_holdq;
 /* PERFCACHED_TEST_NO_PROMOTE: never take mastership, so a suite can stand up the higher address
  * the bounded deferral exists for */
 static int self_no_promote;
+/* PERFCACHED_TEST_RECONCILE: a restart's or a floor's records are ruled on one by one with a
+ * witness, as before 12ol, so the suites of that pass and its hold can reach it */
+static int self_test_reconcile;
+/* PERFCACHED_TEST_BOOT_DELAY_MS: this node's first bootstrap pull waits, so a suite can stop its
+ * sources mid-copy */
+static int self_boot_delay_ms;
 /* a member's election defers to a live higher address; since when,
  * and to which.  Cleared by a master beacon followed, and by promoting */
 static long long elect_defer_ms;
@@ -4601,20 +4612,78 @@ static struct peer *resync_source(long long now)
 	return best;
 }
 
-static void resync_begin(const struct peer *src, const char *why)
+static void resync_arm(void)
 {
 	C.resync_on = 1;
 	C.resync_dropped_now = 0;
 	C.rec_col = 0;
 	C.rec_cursor = 0;
 	C.recon.witness = 0;
-	C.st.resyncs++;
 	C.st.resyncing = 1;
 	pc_node_state_set(PC_NST_RECOVERING);
+}
+
+static void resync_begin(const struct peer *src, const char *why)
+{
+	C.boot_prefer = 0;
+	C.st.resyncs++;
+	resync_arm();
 	LM_WARN("cluster: resync - %s: dropping every record this node stored "
 		"before its absence and pulling the fleet's state (node %d holds "
 		"%u record(s)); RECOVERING until it holds it\n", why,
 		__atomic_load_n(&src->node, __ATOMIC_ACQUIRE), src->entries);
+}
+
+/* 12ol: a survivor - live, READY, and up since before this node's absence (a witness), the
+ * fullest.  Its state is the fleet's */
+static struct peer *survivor(long long now)
+{
+	struct peer *best = NULL;
+	int i;
+
+	for (i = 0; i < C.pt.n_peers; i++) {
+		struct peer *p = &C.pt.peers[i];
+
+		if (!__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
+		    !clpeers_live(p, now) || p->nstate != PC_NST_READY ||
+		    !is_witness(p))
+			continue;
+		if (!best || p->entries > best->entries)
+			best = p;
+	}
+	return best;
+}
+
+/* 12ol: drop the records in question and copy the survivor's state whole (a write this node
+ * never pushed goes with them); no snapshot until the copy is complete */
+static void rejoin_begin(const struct peer *s)
+{
+	int node = __atomic_load_n(&s->node, __ATOMIC_ACQUIRE);
+
+	C.boot_prefer = node;
+	C.rejoin_on = 1;
+	C.st.rejoins++;
+	pc_rdb_hold(1);
+	resync_arm();
+	LM_NOTICE("cluster: rejoin - node %d has been up since before %s "
+		"(%lld s before), so it holds the fleet's state: dropping the "
+		"%s and copying that state whole (%u record(s)); RECOVERING "
+		"until it holds it\n", node, C.rec_floored ? "the deletes in "
+		"question were lost" : C.rec_rebuild ? "this node was cut off"
+		: "this node went down", (C.recon.death_mono - s->boot_ms) / 1000,
+		C.rec_floored || C.rec_rebuild ? "records stored before then"
+		: "replayed records", s->entries);
+}
+
+/* every survivor gone before the copy finished: start again from this node's own files, which
+ * no snapshot has touched since the copy began; with no survivor then, it keeps them */
+static void rejoin_lost(void)
+{
+	LM_WARN("cluster: rejoin - no peer that was up through this node's "
+		"absence is left to copy from: stopping without a snapshot to "
+		"start again from this node's own files\n");
+	C.rejoin_on = -1;                  /* stopping: the bootstrap is not re-picked */
+	pc_daemon_restart_from_files();
 }
 
 struct rs_ctx {
@@ -4657,6 +4726,8 @@ static int resync_cb(const str *key, const str *val, unsigned int exp,
 /* the drop done: the hold off, the pass replaced by a joiner's pull */
 static void resync_pull(void)
 {
+	const char *what = C.rec_floored ? "in question" : "stored before the absence";
+
 	C.resync_on = 0;
 	C.reconcile_on = 0;
 	C.rec_rebuild = 0;
@@ -4664,8 +4735,9 @@ static void resync_pull(void)
 	C.resync_floor = 1;                /* the floors, in boot_request */
 	clrecon_walk_stop(&C.recon);
 	clboot_rearm(&C.bt, now_ms());
-	LM_NOTICE("cluster: resync - dropped %llu record(s) stored before the "
-		"absence; pulling the fleet's state now\n", C.resync_dropped_now);
+	LM_NOTICE("cluster: %s - dropped %llu record(s) %s; pulling the fleet's "
+		"state now\n", C.rejoin_on ? "rejoin" : "resync",
+		C.resync_dropped_now, what);
 }
 
 /* a ~2 ms slice of the drop.  No tombstone (the fleet deleted them, or the pull brings them
@@ -4675,6 +4747,8 @@ static void resync_step(long long now)
 	struct rs_ctx r;
 	int i;
 
+	if (C.rejoin_on && pc_rdb_busy())
+		return;                    /* a snapshot begun before the hold walks: let it land */
 	memset(&r, 0, sizeof r);
 	while (C.rec_col < pc_store_count()) {
 		pcache_htable_t *ht = pc_store_ht(C.rec_col);
@@ -4730,7 +4804,17 @@ static int reconcile_find_witness(void)
 		return 0;
 	}
 	p = clrecon_first_witness(&C.recon, &C.pt, now, WITNESS_GRACE_MS, &live);
+	/* 12ol: a survivor holds the fleet's state - take it whole.  With none READY there is
+	 * nobody to copy from or to ask: a split resyncs, a restart or a floor keeps all, below */
+	if (!self_test_reconcile) {
+		struct peer *s = survivor(now);
 
+		if (s) {
+			rejoin_begin(s);
+			return 0;
+		}
+		p = NULL;
+	}
 	if (p) {
 		int node = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
 
@@ -4755,9 +4839,10 @@ static int reconcile_find_witness(void)
 		C.reconcile_on = 0;
 		C.st.reconcile_skipped = 1;
 		LM_NOTICE("cluster: reconcile SKIPPED - none of the %d live "
-			"peer(s) was up while this node was down, so the fleet "
-			"came back together and a \"no\" from any of them would "
-			"only mean it lost its copy too.  Nothing is deleted.  "
+			"peer(s) was up and ready through this node's absence, "
+			"so the fleet came back together and a \"no\" from any "
+			"of them would only mean it lost its copy too.  Nothing "
+			"is deleted.  "
 			"A key deleted during the outage, if there was one, "
 			"stays\n", live);
 	}
@@ -5161,10 +5246,27 @@ static void reconcile_tick(void)
 	C.rec_hold = C.reconcile_on ||
 		clpend_used_kind(&C.pd, PC_DONE_RECONCILE) > 0;
 	clwire_set_reconciling(C.rec_hold && C.cfg_eager);
-	/* a resync is over once its pull has made this node READY */
+	/* a resync is over once its pull has made this node READY; then a snapshot holds the
+	 * fleet's state, and the files from before it go (12ol) */
 	if (C.st.resyncing && !C.resync_on &&
-	    pc_node_state() >= PC_NST_READY)
+	    pc_node_state() >= PC_NST_READY) {
+		/* a rejoin ends only by its copy: READY or CONNECTING any other way is not that, and
+		 * a stop under way keeps the hold, so no snapshot replaces the files */
+		if (C.rejoin_on < 0)
+			return;                    /* stopping, to start again from its files */
+		if (C.rejoin_on && !clboot_done(&C.bt)) {
+			if (pc_node_state() != PC_NST_DRAINING)
+				rejoin_lost();
+			return;
+		}
 		C.st.resyncing = 0;
+		C.boot_prefer = 0;
+		C.rejoin_on = 0;
+		pc_rdb_hold(0);
+		C.snap_due = 1;
+	}
+	if (C.snap_due && pc_rdb_request_save() == 0)
+		C.snap_due = 0;
 	if (!C.reconcile_on || !C.cfg_eager) {
 		clrecon_nowit_stop(&C.recon);
 		C.st.reconcile_no_witness_s = 0;
@@ -5860,7 +5962,7 @@ static void become_master(int founded)
 		LM_NOTICE("cluster: founding with %d live peer(s) while holding "
 			"nothing - pulling a bootstrap before reporting ready\n",
 			clpeers_count_live(&C.pt, now_ms()));
-	} else
+	} else if (!C.st.resyncing)        /* a copy under way: its pull reports ready */
 		pc_node_state_set(PC_NST_READY);
 	C.master_id = C.node_id;
 	C.master_addr = C.self_addr;
@@ -6255,6 +6357,12 @@ int cl_will_bootstrap(void)
 /* a member at last: RECOVERING for a bootstrap, or READY */
 void joined_state(int members)
 {
+	if (C.st.resyncing) {              /* a copy under way: its pull reports ready */
+		LM_NOTICE("cluster: joined as node %d (master is node %d, %d "
+			"member(s)) - still copying the fleet's state\n", C.node_id,
+			C.master_id, members);
+		return;
+	}
 	/* the candidates come from heartbeats not all sent yet: picked on the tick, bounded */
 	if (cl_will_bootstrap()) {
 		pc_node_state_set(PC_NST_RECOVERING);
@@ -7037,8 +7145,9 @@ static int boot_request(void)
 {
 	long long now = now_ms();
 	pc_addr addr[BOOT_MAX_CAND];
-	int id[BOOT_MAX_CAND], n = 0, i, j, held_unready = 0;
+	int id[BOOT_MAX_CAND], n = 0, i, j, held_unready = 0, anyent = 0;
 	unsigned int ent[BOOT_MAX_CAND];
+	int pref = C.boot_prefer;
 
 	for (i = 0; i < C.pt.n_peers; i++) {
 		struct peer *p = &C.pt.peers[i];
@@ -7048,11 +7157,13 @@ static int boot_request(void)
 		if (pid && clpeers_live(p, now) && p->nstate != PC_NST_READY && pe)
 			held_unready = 1;      /* still replaying, or not admitted yet */
 		if (!pid || !clpeers_live(p, now) ||
-		        p->nstate != PC_NST_READY)
+		        p->nstate != PC_NST_READY || (C.rejoin_on && !is_witness(p)))
 			continue;
-		/* insertion sort: (holds records) desc, id asc */
+		anyent |= pe > 0;
+		/* insertion sort: a rejoin's survivor first, then (holds records) desc, id asc */
 		for (j = n; j > 0; j--) {
-			int before = (ent[j - 1] > 0) != (pe > 0)
+			int before = id[j - 1] == pref ? 0 : pid == pref ? 1
+				: (ent[j - 1] > 0) != (pe > 0)
 				? (pe > 0) : pid < id[j - 1];
 
 			if (!before)
@@ -7073,10 +7184,10 @@ static int boot_request(void)
 	}
 	/* empty ready peers say nothing while one not ready yet holds records: after a whole-fleet
 	 * restart only the authors' WALs hold the keyspace, and done here, nobody backfills us */
-	if (!n || (!ent[0] && held_unready))
+	if (!n || (!anyent && held_unready && !C.rejoin_on))
 		return 0;
 	acks_boot_floors(id, n);
-	if (!ent[0])
+	if (!anyent)
 		return 2;                      /* every ready peer holds nothing:
 		                                * there is nothing to pull */
 	clboot_handoff(&C.bt, clbulk_lock(&C.bk), addr, id, n);
@@ -7094,24 +7205,27 @@ static void boot_tick(long long now)
 
 	/* a joiner that is still waiting to pull - the first
 	 * heartbeats may not have reached it at ASSIGN time */
-	if (pc_node_state() != PC_NST_RECOVERING || clboot_done(&C.bt))
+	if (pc_node_state() != PC_NST_RECOVERING || clboot_done(&C.bt) ||
+	    C.rejoin_on < 0)
 		return;
 	clboot_tick_state(&C.bt, clbulk_lock(&C.bk), &pending, &failed_round);
 	act = clboot_before_pick(&C.bt, now, pending, failed_round);
+	if (act == CLBOOT_PICK)
+		act = clboot_after_pick(&C.bt, now, failed_round, boot_request());
+	if (C.rejoin_on && (act == CLBOOT_GIVE_UP || act == CLBOOT_DEADLINE)) {
+		rejoin_lost();             /* no survivor left to copy from */
+		return;
+	}
 	if (act == CLBOOT_GIVE_UP) {
 		LM_WARN("cluster: no peer served a bootstrap in %d "
 			"rounds - reporting ready and relying on the push "
 			"backfill (the keyspace arrives over the next "
 			"sweeps)\n", C.bt.rounds);
 		pc_node_state_set(PC_NST_READY);
-		return;
-	}
-	if (act != CLBOOT_PICK)
-		return;
-	act = clboot_after_pick(&C.bt, now, failed_round, boot_request());
-	if (act == CLBOOT_EMPTY) {
-		LM_NOTICE("cluster: every ready peer reports "
-			"holding nothing - nothing to pull; ready\n");
+	} else if (act == CLBOOT_EMPTY) {
+		LM_NOTICE("cluster: every %s reports holding nothing - "
+			"nothing to pull; ready\n", C.rejoin_on ? "survivor"
+			: "ready peer");
 		pc_node_state_set(PC_NST_READY);
 	} else if (act == CLBOOT_DEADLINE) {
 		LM_WARN("cluster: no ready peer to pull a "
@@ -9735,6 +9849,14 @@ void gap_floor_over(const struct pc_ack_hole *h, long long death)
 		return;
 	C.st.acks_floors++;
 	C.st.gap_dead++;
+	/* store keeps a pulled copy's version until it expires (GUIDE): no pass to run */
+	if (!C.cfg_eager) {
+		LM_NOTICE("cluster: origin %016llx's run %u is over and nobody "
+			"resends its deletes %llu..%llu - this node's mark floored "
+			"there\n", (unsigned long long)h->oid, h->incarn,
+			(unsigned long long)h->from, (unsigned long long)floor);
+		return;
+	}
 	LM_WARN("cluster: origin %016llx's run %u is over and nobody resends its "
 		"deletes %llu..%llu - this node's mark floored there; reconciling "
 		"the records stored so far with the fleet\n",
@@ -10524,6 +10646,10 @@ static void bulk_pull(void)
 	int node[BOOT_MAX_CAND], n, k;
 
 	n = clboot_take_cands(&C.bt, clbulk_lock(&C.bk), cand, node);
+	if (n && self_boot_delay_ms > 0) {
+		usleep((useconds_t)self_boot_delay_ms * 1000);
+		self_boot_delay_ms = 0;
+	}
 	for (k = 0; k < n; k++) {
 		unsigned int streamed, stored, older;
 		long long t0 = now_ms();
@@ -11312,6 +11438,18 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 		self_no_promote = 1;
 		LM_WARN("cluster: PERFCACHED_TEST_NO_PROMOTE - this member never "
 			"takes mastership (a test flag)\n");
+	}
+	if (getenv("PERFCACHED_TEST_RECONCILE")) {
+		self_test_reconcile = 1;
+		LM_WARN("cluster: PERFCACHED_TEST_RECONCILE - a restart's or a "
+			"floor's records are ruled on one by one instead of taken "
+			"whole from a survivor (a test flag)\n");
+	}
+	if (getenv("PERFCACHED_TEST_BOOT_DELAY_MS")) {
+		self_boot_delay_ms = atoi(getenv("PERFCACHED_TEST_BOOT_DELAY_MS"));
+		LM_WARN("cluster: PERFCACHED_TEST_BOOT_DELAY_MS - this node's first "
+			"bootstrap pull waits %d ms (a test flag)\n",
+			self_boot_delay_ms);
 	}
 	if (getenv("PERFCACHED_TEST_NO_HOLDQ")) {
 		self_no_holdq = 1;

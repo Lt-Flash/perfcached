@@ -10,6 +10,9 @@
 #include "pcaddr.h"
 
 int pc_daemon_run(struct pc_config *cfg);
+/* stop as SIGTERM does, with no shutdown snapshot when rdb is held, and exit 75 so the
+ * supervisor starts the node again from its files (a copy of the fleet's state that failed) */
+void pc_daemon_restart_from_files(void);
 
 /* re-run the WAL storage probe (the `probe` verb); blocks the caller ~1-2 s (longer with
  * @secs); -1 = no WAL configured or the probe failed */

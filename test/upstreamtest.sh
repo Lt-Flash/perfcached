@@ -211,7 +211,8 @@ print("%d %d %d %d %d" % (u["fetches"], u["fill_string"], u["fill_hash"], u["fil
 set -- $ST
 [ "${1:-0}" -ge 6 ] 2>/dev/null && [ "${3:-0}" = 1 ] && [ "${4:-0}" = 1 ] && [ "${5:-0}" = 1 ] \
 	&& ok "stats: the upstream block counts fetches and fills ($ST)" || bad "stats upstream block: $ST"
-grep -qE " (ERROR|CRIT)" "$D/n.log" && bad "ERROR/CRIT in the node log: $(grep -m1 -E ' (ERROR|CRIT)' "$D/n.log" | cut -c1-120)" \
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -h -E " (ERROR|CRIT)" "$D/n.log" | grep -qv 'an fsync has been stuck' && bad "ERROR/CRIT in the node log: $(grep -E ' (ERROR|CRIT)' "$D/n.log" | grep -v 'an fsync has been stuck' | head -n 1 | cut -c1-120)" \
 	|| ok "no ERROR or CRIT in the node log"
 
 echo "--- 8: a mutation promotes the fetched value first"

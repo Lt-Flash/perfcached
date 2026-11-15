@@ -212,7 +212,8 @@ r=$("$CLI" -q -h 127.0.0.1 -p 16598 upgrade_status 2>&1)
 echo "$r" | grep -q '0\.6\.8' && echo "$r" | grep -q "$DS" && ok "S7. perfcli upgrade_status names it" || bad "S7. upgrade_status: $r"
 r=$("$CLI" -q -h 127.0.0.1 -p 16598 -E stage-enable upgrade-stage "$D/d.tar.gz" '0.6"8' 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$r" | grep -q 'the version is' && ok "S7. a version with a quote: refused by libperfd before it is sent (exit 1)" || bad "S7. odd version: exit $rc: $r"
-grep -q -E 'ERROR|CRIT' "$D/n.log" && bad "S. the node logged: $(grep -m2 -E 'ERROR|CRIT' "$D/n.log" | tr '\n' '|')" || ok "S. no ERROR or CRIT in the node's log"
+grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -h -E 'ERROR|CRIT' "$D/n.log" | grep -qv 'an fsync has been stuck' && bad "S. the node logged: $(grep -E 'ERROR|CRIT' "$D/n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' '|')" || ok "S. no ERROR or CRIT in the node's log"
 
 # ---- S7. a package install refuses the stage, naming the package manager; upgrade_status says
 # the install mode

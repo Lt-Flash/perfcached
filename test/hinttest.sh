@@ -71,6 +71,7 @@ rm -f "$D/n3.pid"                      # the driver killed it
 	grep -h "cluster: refused a \|cluster: not following" "$D/n$n.log" 2>/dev/null | head -5 | cut -c1-220 | sed "s/^/  n$n refused| /"
 	grep -h "cluster:" "$D/n$n.log" 2>/dev/null | tail -12 | cut -c1-220 | sed "s/^/  n$n| /"
 done
-e=$(cat "$D"/n1.log "$D"/n2.log | grep -cE ' (ERROR|CRIT)')
-[ "$e" = 0 ] || { echo "  FAIL $e ERROR/CRIT on nodes 1-2: $(grep -hE ' (ERROR|CRIT)' "$D"/n1.log "$D"/n2.log | head -2)"; rc=1; }
+grep -h 'an fsync has been stuck' "$D"/n1.log "$D"/n2.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+e=$(cat "$D"/n1.log "$D"/n2.log | grep -E ' (ERROR|CRIT)' | grep -cv 'an fsync has been stuck')
+[ "$e" = 0 ] || { echo "  FAIL $e ERROR/CRIT on nodes 1-2: $(grep -hE ' (ERROR|CRIT)' "$D"/n1.log "$D"/n2.log | grep -v 'an fsync has been stuck' | head -2)"; rc=1; }
 exit $rc

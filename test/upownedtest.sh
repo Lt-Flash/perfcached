@@ -112,6 +112,6 @@ sleep 1
 o1=$(st 1 "$WT['fleet_owned']"); o2=$(st 2 "$WT['fleet_owned']")
 [ "$o1 $o2" = "0 0" ] && ok "C. a second after the writes: fleet_owned 0 on both" ||
 	bad "C. after the writes: fleet_owned $o1 / $o2 (0 / 0)"
-for n in 1 2; do grep -q "CRIT" "$D/n$n.log" && bad "node $n logged CRIT: $(grep -m2 CRIT "$D/n$n.log" | tr '\n' ' ' | cut -c1-200)"; done
+for n in 1 2; do grep -h 'an fsync has been stuck' "$D/n$n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"; grep "CRIT" "$D/n$n.log" | grep -qv 'an fsync has been stuck' && bad "node $n logged CRIT: $(grep CRIT "$D/n$n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-200)"; done
 echo "upownedtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

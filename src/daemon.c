@@ -189,6 +189,7 @@ const char *pc_resp_collections(void)
 	return CFG ? CFG->resp_collections : NULL;
 }
 static volatile sig_atomic_t stop_flag;
+static volatile int stop_for_files;    /* pc_daemon_restart_from_files */
 /* workers whose listeners are open - "ready" waits for all of them */
 static int workers_listening;
 static int unix_fd = -1;
@@ -1068,6 +1069,12 @@ static void on_signal(int sig)
 	for (i = 0; i < n_threads; i++)
 		if (threads[i].efd >= 0)
 			if (write(threads[i].efd, &one, sizeof one) < 0) { /* best effort */ }
+}
+
+void pc_daemon_restart_from_files(void)
+{
+	stop_for_files = 1;
+	on_signal(SIGTERM);
 }
 
 /* SIGHUP asks for a config reload, which the maintenance thread runs; the signal's
@@ -1992,7 +1999,11 @@ int pc_daemon_run(struct pc_config *cfg)
 	}
 	/* a clean stop leaves a snapshot: the WAL holds only what this node WROTE (received copies
 	 * are not logged), and the snapshot walk stores the copies too */
-	if (rt) {
+	if (rt && pc_rdb_held()) {
+		LM_WARN("perfcached: stopping WITHOUT the shutdown snapshot - a copy of the "
+			"fleet's state did not finish, so the files keep what this node held "
+			"before it\n");
+	} else if (rt) {
 		LM_NOTICE("perfcached: stopping - taking the shutdown snapshot\n");
 		if (pc_rdb_save_on_stop() != 0)
 			LM_ERR("perfcached: the shutdown snapshot FAILED - the WAL "
@@ -2001,6 +2012,11 @@ int pc_daemon_run(struct pc_config *cfg)
 				"peers\n");
 	}
 	pcache_arena_destroy();
+	if (stop_for_files) {
+		LM_WARN("perfcached: stopped to start again from its own files (exit 75: a "
+			"supervisor restarts it)\n");
+		return 75;
+	}
 	LM_NOTICE("perfcached: clean shutdown\n");
 	return 0;
 }

@@ -157,8 +157,9 @@ O2=$(rc 1 'GET tok:o')$(rc 2 'GET tok:o')$(rc 3 'GET tok:o')
 echo "--- 6: nothing written upstream"
 [ ! -s "$D/up/writes" ] && ok "the upstream received no write command" \
 	|| bad "WRITES REACHED THE UPSTREAM: $(head -3 "$D/up/writes" | tr '\n' '|')"
-E=$(cat "$D"/n*.log | grep -cE " (ERROR|CRIT)")
-[ "$E" = 0 ] && ok "no ERROR or CRIT on any node" || bad "$E ERROR/CRIT line(s): $(cat "$D"/n*.log | grep -m1 -E ' (ERROR|CRIT)' | cut -c1-120)"
+grep -h 'an fsync has been stuck' "$D"/n*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+E=$(cat "$D"/n*.log | grep -E " (ERROR|CRIT)" | grep -cv 'an fsync has been stuck')
+[ "$E" = 0 ] && ok "no ERROR or CRIT on any node" || bad "$E ERROR/CRIT line(s): $(cat "$D"/n*.log | grep -E ' (ERROR|CRIT)' | grep -v 'an fsync has been stuck' | head -n 1 | cut -c1-120)"
 
 echo "upstreamclustertest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

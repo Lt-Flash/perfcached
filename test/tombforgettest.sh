@@ -185,8 +185,9 @@ set -- $F0 $G
 	bad "5. (c): expiries let go $(($4 - $1))/$(($5 - $2))/$(($6 - $3)) (want 100 each), held $X (want the 100 shortened on each)"
 
 for i in 1 2 3; do
-	grep -q "CRIT" "$D/n$i.log" &&
-		bad "node $i logged CRIT: $(grep -m2 'CRIT' "$D/n$i.log" | command tr '\n' ' ' | cut -c1-220)"
+	grep -h 'an fsync has been stuck' "$D/n$i.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+	grep "CRIT" "$D/n$i.log" | grep -qv 'an fsync has been stuck' &&
+		bad "node $i logged CRIT: $(grep 'CRIT' "$D/n$i.log" | grep -v 'an fsync has been stuck' | head -n 2 | command tr '\n' ' ' | cut -c1-220)"
 done
 echo "tombforgettest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

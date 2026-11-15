@@ -1,6 +1,6 @@
 #!/bin/sh
 # rebuildfloortest.sh - a rebuild a floor asks for (age 0xffffffff) is not an absence: the member
-# takes it without a resync and stays ready.  Usage: test/rebuildfloortest.sh [./perfcached] [./clinject]
+# takes it without a resync - with a survivor up, by copying that state (12ol).  Usage: test/rebuildfloortest.sh [./perfcached] [./clinject]
 set -u
 T=$(cd "$(dirname "$0")" && pwd)
 PYTHONPATH=$T${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -77,7 +77,7 @@ PY
 inj() { "$INJ" -s "$SECRET" -c "$CID" -f 127.0.164.9:25199 -t 127.0.164.2:$PORT "$@" 2>&1; }
 
 arm() { # arm <name> <age hex, LE> <what the ask stands for> <seconds to watch>
-	RS=? RB=? STATE=? HELD=? BACK=? TOOK=0
+	RS=? RB=? RJ=? STATE=? HELD=? BACK=? TOOK=0
 	down; rm -rf "$D"/s* "$D"/w* "$D"/n*.log
 	conf 1; conf 2
 	start 1
@@ -102,12 +102,12 @@ arm() { # arm <name> <age hex, LE> <what the ask stands for> <seconds to watch>
 		|| { bad "$1: the ask never reached node 2's handler (rebuilds $(st 2 'r["cluster"]["acks"]["rebuilds"]'), peers_up $(st 2 'r["cluster"]["peers_up"]')): $(tail -n +$((B + 1)) "$D/n2.log" | tail -3 | cut -c1-200 | tr '\n' ' ')"; return; }
 	wait_for "$4" '[ "$(st 2 "r[\"cluster\"][\"resyncs\"]")" -ge 1 ] 2>/dev/null' || true
 	TOOK=$(($(date +%s) - T1))
-	RS=$(st 2 'r["cluster"]["resyncs"]'); RB=$(st 2 'r["cluster"]["acks"]["rebuilds"]')
+	RS=$(st 2 'r["cluster"]["resyncs"]'); RB=$(st 2 'r["cluster"]["acks"]["rebuilds"]'); RJ=$(st 2 'r["cluster"].get("rejoins")')
 	STATE=$(st 2 'r["state"]')
 	HELD=$(st 2 'sum(c["entries"] for c in r["collections"] if c["name"] == "c")')
 	BACK=$(tail -n +$((B + 1)) "$D/n2.log" | grep -c "ready -> recovering")
-	SAID=$(tail -n +$((B + 1)) "$D/n2.log" | grep -E "resync -|says this node was away|no longer holds deletes|reconcile SKIPPED|reconcile - node" | head -3 | cut -c1-170 | tr '\n' ' ')
-	echo "  ..   $1 ($3): after $TOOK s rebuilds $RB, resyncs $RS, state $STATE, holds $HELD, ready->recovering $BACK; $SAID"
+	SAID=$(tail -n +$((B + 1)) "$D/n2.log" | grep -E "resync -|rejoin -|says this node was away|no longer holds deletes|reconcile SKIPPED|reconcile - node" | head -3 | cut -c1-170 | tr '\n' ' ')
+	echo "  ..   $1 ($3): after $TOOK s rebuilds $RB, resyncs $RS, rejoins $RJ, state $STATE, holds $HELD, ready->recovering $BACK; $SAID"
 }
 
 echo "--- A. an ask 25 s old, past resync_after_s (20 s): the premise"
@@ -122,9 +122,10 @@ w=$((ATOOK + 3)); [ $w -lt 15 ] && w=15
 arm B ffffffff "a floor - no absence" $w
 [ "$RB" = 1 ] 2>/dev/null && ok "B. node 2 took the floor's rebuild (rebuilds 1)" \
 	|| bad "B. node 2's rebuilds ${RB:-?} after the floor's ask (want 1)"
-[ "$RS" = 0 ] && [ "$BACK" = 0 ] && [ "$STATE" = ready ] \
-	&& ok "B. no resync for a floor: node 2 stayed ready (resyncs 0, never back to recovering)" \
-	|| bad "B. a floor taken as an absence: resyncs ${RS:-?}, ready->recovering $BACK, state ${STATE:-?}"
+# node 1, up through the floor, is a survivor: the floor copies its state (RECOVERING meanwhile)
+[ "$RS" = 0 ] && [ "$RJ" = 1 ] && [ "$STATE" = ready ] \
+	&& ok "B. no resync for a floor: node 2 copied the survivor's state instead and is ready again (resyncs 0, rejoins 1, ready->recovering $BACK)" \
+	|| bad "B. a floor taken as an absence: resyncs ${RS:-?} (want 0), rejoins ${RJ:-?} (want 1), ready->recovering $BACK, state ${STATE:-?}"
 [ "$HELD" = 100 ] && ok "B. node 2 holds all 100 keys after the rebuild" \
 	|| bad "B. node 2 holds ${HELD:-?} of 100 keys after the rebuild"
 
