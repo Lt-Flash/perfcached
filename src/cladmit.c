@@ -56,6 +56,7 @@ _Static_assert(sizeof ((struct peer *)0)->link_tcp_ms == CLCONN_PATHS * sizeof (
 static struct lchk {
 	pc_addr a;
 	int node, stuck, npr, again;       /* again: begun on its own CONNECTING report */
+	int seen;                          /* its own report said CONNECTING: it took the ASSIGN */
 	long long start_ms;
 	struct { int node; unsigned char jb, mb; } pr[PC_CL_MAXPEER + 1];   /* its view, theirs */
 } lc[LCHK_MAX];
@@ -286,8 +287,17 @@ static void link_eval(long long now)
 			*l = lc[--lc_n];
 			continue;
 		}
-		if (l->again && jp->nstate != PC_NST_CONNECTING && jp->nstate != PC_NST_STARTING) {
-			*l = lc[--lc_n];               /* that report was older than its ONLINE */
+		/* out of CONNECTING with no ONLINE from here: a report older than its ONLINE, or a
+		 * restart's copy (RECOVERING, then READY) - it is no longer this check's */
+		if ((l->again || l->seen) && jp->nstate != PC_NST_CONNECTING &&
+		        jp->nstate != PC_NST_STARTING) {
+			if (!l->again)
+				LM_NOTICE("cluster: node %d (%s) left CONNECTING without an ONLINE, now %s - "
+					"its link check ends%s\n", l->node, pc_addr_str(&l->a),
+					pc_node_state_name(jp->nstate), l->stuck ? ", and its hold" : "");
+			if (q && !l->again)
+				*q = aq[--aq_n];
+			*l = lc[--lc_n];
 			continue;
 		}
 		bad += !link_pair_ok(l, cl_node_id(), why, sizeof why);
@@ -356,6 +366,8 @@ static void link_apply(int rnode, int rconn, const unsigned char *rec, size_t n,
 		if (p && clpeers_live(p, now) && (l = lchk_new(&p->addr, rnode, now)) != NULL)
 			l->again = 1;
 	}
+	if (rconn && (l = lchk_find(rnode)) != NULL)
+		l->seen = 1;
 	pc_rcur_init(&c, rec, n);
 	for (i = 0; i < count && pc_rfits(&c, 3); i++) {
 		int x = pc_ru16(&c);

@@ -137,6 +137,7 @@ del 27492 0 50
 echo "--- 1. node 1 restarts with survivors up: it copies their state whole"
 L0=$(($(wc -l < "$D/n1.log") + 1))
 start 1 2 || exit 1
+T1=$(date +%s)
 i=0; while [ $i -lt 30 ] && ! grep -q "cluster: rejoin - node [0-9]* has been up" "$D/n1.log"; do sleep 0.5; i=$((i+1)); done
 L=$(grep "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")
 [ "$(echo "$L" | grep -c .)" = 1 ] && echo "$L" | grep -q "rejoin - node [0-9]* has been up since before this node went down" \
@@ -156,13 +157,14 @@ i=0; while [ $i -lt 30 ] && ! after 1 1 | grep -q "rdb: snapshot"; do sleep 1; i
 after 1 1 | grep -q "rdb: snapshot" \
 	&& ok "1d. a snapshot followed the copy, so the files from before it go" \
 	|| bad "1d. no snapshot after the copy: $(grep "rdb: " "$D/n1.log" | tail -2 | cut -c1-140 | tr '\n' ' ')"
-# the copy is decided once the master has the links proved (ONLINE), and nothing is served before it
-S1=$(sed -n "$L0,\$p" "$D/n1.log")
-ON=$(echo "$S1" | grep -n "cluster: ONLINE - every link" | head -n 1 | cut -d: -f1)
-CP=$(echo "$S1" | grep -n "cluster: rejoin - node [0-9]* has been up" | head -n 1 | cut -d: -f1)
-[ -n "$ON" ] && [ -n "$CP" ] && [ "$ON" -lt "$CP" ] && ! echo "$S1" | grep -q "node state ready -> recovering" \
-	&& ok "1e. node 1 went ONLINE (every link proved) before its copy began, and was not ready in between" \
-	|| bad "1e. ONLINE at line ${ON:-none}, the copy at ${CP:-none} (want ONLINE first, no ready -> recovering): $(echo "$S1" | grep -E "admitted as|ONLINE|node state|rejoin - node" | cut -c1-120 | tr '\n' '|')"
+# a copy begun while CONNECTING ends the master's link check too: past its 10 s, nobody is held
+while [ $(($(date +%s) - T1)) -lt 14 ]; do sleep 0.5; done
+HS="$(st 1 'c.get("admission_stuck")') $(st 2 'c.get("admission_stuck")') $(st 3 'c.get("admission_stuck")')"
+AL=$(for n in 1 2 3; do st $n '" ".join(a.get("key", "") for a in r.get("alerts", {}).get("active", []) if isinstance(a, dict))'; done | grep -c admission_stuck)
+HOW=$(cat "$D"/n2.log "$D"/n3.log | grep -c "left CONNECTING without an ONLINE")
+[ "$HS" = "0 0 0" ] && [ "$AL" = 0 ] \
+	&& ok "1e. 14 s after node 1's restart no node holds it: admission_stuck $HS, no alert ($HOW master line(s) 'left CONNECTING without an ONLINE', $(sed -n "$L0,\$p" "$D/n1.log" | grep -c "cluster: ONLINE - every link") ONLINE)" \
+	|| bad "1e. admission_stuck $HS, $AL node(s) alerting (want 0 0 0, none): $(cat "$D"/n2.log "$D"/n3.log | grep -E "admission stuck|left CONNECTING" | cut -c1-160 | tr '\n' '|')"
 
 echo "--- 2. every survivor gone mid-copy: node 1 starts again from its own files"
 stop1 1

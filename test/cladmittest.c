@@ -54,6 +54,7 @@ unsigned int cl_self_total_mb(void) { return 200; }
 unsigned int cl_self_live_kb(void) { return 300; }
 int cl_max_datagram(void) { return maxdg; }
 int pc_node_state(void) { return nst; }
+const char *pc_node_state_name(int st) { return st == PC_NST_RECOVERING ? "recovering" : st == PC_NST_READY ? "ready" : "?"; }
 uint32_t pc_term_current(void) { return 7; }
 int clmesh_heard(const pc_addr *a, long long ms, int trial) { (void)a; (void)ms; (void)trial; return 0; }
 uint64_t member_digest(void) { return digest; }
@@ -832,6 +833,58 @@ int main(void)
 	CHK(report_bits(&master_a, 2) == CS && report_bits(&master_a, 3) == CS,
 		"I. each connect taken: nothing missing (0x%x, 0x%x)", report_bits(&master_a, 2),
 		report_bits(&master_a, 3));
+
+	printf("--- J: a restart's copy takes the joiner out of CONNECTING with no ONLINE\n");
+	role = PC_ROLE_MASTER;
+	nst = PC_NST_READY;
+	wboot = maxdg = lane_off = 0;
+	now += 10000;
+	fleet(3);
+	cladmit_master_begin(now - 1);
+	next_id = 9;
+	nsent = joins = 0;
+	stuck_gauge = 0;
+	logbuf[0] = 0;
+	cladmit_hold(jf, sizeof jf, &j1, 1);       /* node 9: node 3's relay port never answers */
+	{
+		pc_addr m2 = addr(10), m3 = addr(11);
+		int x9[] = { 9 }, xj[] = { 1, 2, 3 };
+		unsigned ok1[] = { CS }, rn[] = { CS | RN }, okj[] = { CS, CS, CS };
+		long long t0;
+
+		p = clpeers_by_addr(&PT, &j1);
+		report(&m2, 0, 1, x9, ok1, 1);
+		report(&m3, 0, 1, x9, rn, 1);
+		report(&j1, 1, 3, xj, okj, 3);
+		for (t0 = now; now <= t0 + 10000; ) {
+			ticks(1);
+			cladmit_probe_answered(p, now);
+		}
+		CHK(stuck_gauge == 1 && !count_sent(M_ONLINE, &j1, NULL), "J. node 9 held at 10 s (%llu)",
+			stuck_gauge);
+		p->nstate = PC_NST_RECOVERING;         /* its ALIVE: a copy began */
+		ticks(1);
+		pc_cluster_admission_stuck_text(txt, sizeof txt);
+		CHK(stuck_gauge == 0 && !txt[0] && !count_sent(M_ONLINE, &j1, NULL) &&
+			strstr(logbuf, "node 9 (10.0.0.100) left CONNECTING without an ONLINE, now recovering - "
+			"its link check ends, and its hold"),
+			"J. its ALIVE says RECOVERING: the check and the hold end, said, no ONLINE (%llu, '%s')",
+			stuck_gauge, txt);
+		p->nstate = PC_NST_READY;
+		ticks(24);
+		CHK(stuck_gauge == 0 && !count_sent(M_ONLINE, &j1, NULL), "J. READY 12 s on: none held (%llu)",
+			stuck_gauge);
+
+		cladmit_hold(jf, sizeof jf, &j2, 2);   /* node 10: admitted, never says CONNECTING */
+		CHK(joins == 2, "J. the next admitted (%d)", joins);
+		p = clpeers_by_addr(&PT, &j2);
+		p->nstate = PC_NST_RECOVERING;
+		for (t0 = now; now <= t0 + 10000; )
+			ticks(1);
+		CHK(stuck_gauge == 1 && !strstr(logbuf, "node 10 (10.0.0.101) left CONNECTING"),
+			"J. one that never reported CONNECTING is not let go on the master's view alone (%llu)",
+			stuck_gauge);
+	}
 
 	printf("cladmittest: %s\n", fails ? "FAILED" : "all passed");
 	return fails != 0;
