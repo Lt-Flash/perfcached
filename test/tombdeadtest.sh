@@ -172,5 +172,8 @@ k=0; while [ $k -lt 200 ]; do
 	sleep 0.5; k=$((k+1))
 done
 [ "$(stuck 1)$(stuck 2)$(stuck 3)" = "[][][]" ] && ok "5. no cluster.acks_stuck on any node" \
-	|| bad "5. cluster.acks_stuck stands: node 1 $(st 1 '(r.get("alerts") or {}).get("active")' | cut -c1-200), node 2 $(stuck 2), node 3 $(stuck 3)"
+	|| { bad "5. cluster.acks_stuck stands: node 1 $(st 1 '(r.get("alerts") or {}).get("active")' | cut -c1-200), node 2 $(stuck 2), node 3 $(stuck 3)"
+	# who the stuck member is and what each node holds of the run: the alert names an id only
+	for n in 1 2 3; do echo "    node $n: id $(st $n 'c.get("node")'), marks $(st $n '[(m["origin"], m["incarn"], m["confirmed"], m["hi"]) for m in c["acks"]["marks"]]' | cut -c1-240), held_by $(st $n 'c["acks"].get("held_by") or c["acks"].get("fleet", {}).get("held_by")' | cut -c1-300)"; done
+	grep -hE "run |floor|rejoin|copied|resync|mark|recover" "$D/n2.log" | tail -8 | cut -c1-170 | sed 's/^/    n2: /'; }
 done_

@@ -114,9 +114,13 @@ grep -q -E "REFUSING master keepalive .* speaks cluster wire epoch 5 and we spea
 kill -9 $P4ID 2>/dev/null; P4ID=
 # ---- 5. the master restarted: the committed epoch survives ------------------------------------------
 eval "mp=\$P${M}ID"; kill $mp 2>/dev/null; wait $mp 2>/dev/null; eval "P${M}ID="
-sleep 3
-NEWM=$(for n in 1 2 3; do [ $n = $M ] && continue; [ "$(st $n "s['cluster']['role']")" = master ] && { echo $n; break; }; done)
-[ -n "$NEWM" ] && [ "$(ep $NEWM committed)" = 5 ] && ok "5. the master is gone: node $NEWM leads and the fleet still speaks 5" || bad "5. new master '${NEWM:-none}', committed $( [ -n "$NEWM" ] && ep $NEWM committed)"
+# an election takes two beats after the goodbye, and a missed goodbye waits out the master's death (8 s)
+T5=$(date +%s); NEWM=
+while [ -z "$NEWM" ] && [ $(($(date +%s) - T5)) -lt 20 ]; do
+	sleep 0.5
+	NEWM=$(for n in 1 2 3; do [ $n = $M ] && continue; [ "$(st $n "s['cluster']['role']")" = master ] && { echo $n; break; }; done)
+done
+[ -n "$NEWM" ] && [ "$(ep $NEWM committed)" = 5 ] && ok "5. the master is gone: node $NEWM leads after $(($(date +%s) - T5)) s and the fleet still speaks 5" || bad "5. new master '${NEWM:-none}' after $(($(date +%s) - T5)) s, committed $( [ -n "$NEWM" ] && ep $NEWM committed)"
 node $M 5
 waitfor 20 '[ "$(st '$M' "s[\"state\"]")" = ready ]' || bad "5. node $M did not come back"
 sleep 2

@@ -242,6 +242,16 @@ if [ "$MOVED" != 1 ] || [ "$LANDED" != "$B1" ]; then
 		echo "  --- node $n: map, placement, reshard, state"
 		grep -E "map|reshard|placement|migrat|failed|FAILED|state|master|elect|WARN|ERROR|CRIT" \
 			"$D/n$n.log" | tail -25 | cut -c1-220 | sed 's/^/      /'
+		# which placement each node used, and what it moved: the log says neither
+		call $n '{"method":"stats"}' | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)["result"]; c=d["cluster"]; m=c.get("map") or {}
+    print("      stats: %s %s, map (term,seq,nodes,master) %s usable %s place_map %s place_hrw %s; out %s dgrams %s retx %s lost %s; peers %s" % (
+        d.get("state"), c.get("role"), (m.get("term"), m.get("seq"), m.get("nodes"), m.get("master")),
+        m.get("usable"), m.get("place_map"), m.get("place_hrw"), c.get("migrated_out"), c.get("migrate_dgrams"),
+        c.get("migrate_retx"), c.get("migrate_lost"), [(p.get("node"), p.get("up")) for p in c.get("peers") or []]))
+except Exception as e: print("      stats unreadable: %s" % e)'
+		call $n '{"method":"members"}' | cut -c1-600 | sed 's/^/      members: /'
 	done
 fi
 echo "shardhandovertest: $pass passed, $fail failed"
