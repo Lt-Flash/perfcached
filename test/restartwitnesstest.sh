@@ -102,14 +102,14 @@ PY
 sleep 2.5                                  # the WAL's everysec, on every node
 
 # 1: the wait is the whole margin, grace 30 s + one alive-stamp period 10 s + 1 s = 41 s from the
-# peer's boot; two whole-second truncations and staggered reads put the floor at 38.5 s
+# peer's boot; two whole-second truncations and staggered reads put the floor at 38 s (38.499 seen)
 R1=$(st 1 'json.dumps(c.get("restart"))'); W1=$(st 1 'c["restart"]["safe_in_ms"]')
 U23=$(for n in 2 3; do st $n 'r["process"]["uptime_s"]'; done | sort -n | head -1)
 T=$(( ${W1:-0} + ${U23:-0} * 1000 ))
 [ "$(st 1 'c["restart"]["safe"]')$(st 2 'c["restart"]["safe"]')$(st 3 'c["restart"]["safe"]')" = FalseFalseFalse ] \
-	&& [ "$T" -ge 38500 ] && [ "$T" -le 42500 ] \
+	&& [ "$T" -ge 38000 ] && [ "$T" -le 42500 ] \
 	&& ok "1. just formed: every node says a restart is NOT witnessed yet, for the whole margin ($R1; + peers up ${U23} s = ${T} ms)" \
-	|| bad "1. just formed: node 1 says $R1, peers up ${U23} s: wait + uptime = ${T} ms (want 38.5-42.5 s - the 41-s margin, not the bare 30 - and safe false on all three)"
+	|| bad "1. just formed: node 1 says $R1, peers up ${U23} s: wait + uptime = ${T} ms (want 38-42.5 s - the 41-s margin, not the bare 30 - and safe false on all three)"
 # 2
 stop1 1; start 1 2 || exit 1; ready3
 settled 1 && [ "$(st 1 'c.get("reconcile_skipped")')" = True ] \

@@ -147,6 +147,14 @@ case "$HOLE" in "[("*)
 	ok "2. node 2 restarted with node 3 short of its run: $HOLE";;
 	*) bad "2. node 3 has no hole to test ($HOLE): the kill came too late, gap_floored by node 2 $(st 2 'c["acks"]["gap_floored"]')"; done_;;
 esac
+# 2b. node 2's restart copies a survivor's state: node 1's, never node 3's - node 3 holds more
+# records because it is short of node 2's deletes, and its copy would bring those keys back
+k=0; while [ $k -lt 100 ] && ! grep -q "cluster: rejoin - node [0-9]* has been up since" "$D/n2.log"; do sleep 0.2; k=$((k+1)); done
+SRC=$(grep -m1 -o "cluster: rejoin - node [0-9]* has been up since" "$D/n2.log" | sed 's/[^0-9]//g')
+ID1=$(st 1 'c.get("node")'); ID3=$(st 3 'c.get("node")')
+[ -n "$SRC" ] && [ "$SRC" = "$ID1" ] \
+	&& ok "2b. node 2's restart copied node 1's state (node $SRC), not node 3's (node $ID3, short of node 2's run)" \
+	|| bad "2b. node 2's restart copied node ${SRC:-nobody} (node 1 is $ID1, node 3 is $ID3, short of node 2's run): $(grep -E "rejoin -" "$D/n2.log" | head -2 | cut -c1-200 | tr '\n' ' ')"
 k=0; L=1
 while [ $k -lt 240 ]; do
 	L=$(st 3 'len([m for m in c["acks"]["marks"] if m["confirmed"] < m["hi"]])')
@@ -162,7 +170,10 @@ k=0; while [ $k -lt 120 ] && { [ "$(st 3 'c.get("rejoins", 0)')" -lt 1 ] 2>/dev/
 G3=$(held 3 0 201); K3=$(held 3 201 300); G1=$(held 1 0 201)
 [ "$G3" = 0 ] && [ "$K3" = 99 ] && [ "$G1" = 0 ] \
 	&& ok "4. node 3 holds none of the 201 deleted keys and all 99 that live; node 1 holds none" \
-	|| bad "4. node 3 holds $G3 of the 201 deleted and $K3 of the 99 live, node 1 $G1 of the deleted; rejoins $(st 3 'c.get("rejoins")'), skipped $(st 3 'c.get("reconcile_skipped")'): $(grep -E "rejoin -|reconcile SKIPPED" "$D/n3.log" | tail -1 | cut -c1-160)"
+	|| { bad "4. node 3 holds $G3 of the 201 deleted and $K3 of the 99 live, node 1 $G1 of the deleted; rejoins $(st 3 'c.get("rejoins")'), skipped $(st 3 'c.get("reconcile_skipped")'): $(grep -E "rejoin -|reconcile SKIPPED" "$D/n3.log" | tail -1 | cut -c1-160)"
+	# where each copy came from, and what node 2 held when node 3 copied
+	echo "    ids: node 1 $(st 1 'c.get("node")'), node 2 $(st 2 'c.get("node")'), node 3 $(st 3 'c.get("node")'); node 2 holds $(held 2 0 201) of the deleted"
+	for i in 2 3; do grep -hE "rejoin -|pulling a bootstrap|floored" "$D/n$i.log" | tail -5 | cut -c1-200 | sed "s/^/    n$i: /"; done; }
 [ "$(st 3 'c.get("rejoins")')" = 1 ] && [ "$(st 3 'c.get("resyncs")')" = 0 ] && [ "$(st 3 'r.get("state")')" = ready ] \
 	&& ok "4. node 3 copied a survivor's state (rejoins 1), no resync, ready again" \
 	|| bad "4. node 3: rejoins $(st 3 'c.get("rejoins")') (want 1), resyncs $(st 3 'c.get("resyncs")'), state $(st 3 'r.get("state")')"

@@ -330,6 +330,8 @@ static struct {
 	 * a snapshot follows any resync */
 	int boot_prefer;
 	int rejoin_on;
+	int rejoin_whole;              /* the survivor picked is short of no delete: so are its fallbacks */
+	long long surv_since;          /* a survivor's pick waits on marks too fresh to judge, since (ms) */
 	int snap_due;
 	/* the copy counts once the node that served it (rejoin_src, the bulk thread's) is heard
 	 * again at the incarnation it had when picked, still a survivor */
@@ -4641,13 +4643,85 @@ static void resync_begin(const struct peer *src, const char *why)
 		__atomic_load_n(&src->node, __ATOMIC_ACQUIRE), src->entries);
 }
 
-/* 12ol: a survivor - live, READY, and up since before this node's absence (a witness), the
- * fullest.  Its state is the fleet's */
-static struct peer *survivor(long long now)
+#define SURVIVOR_STILL_MS 3000
+
+struct spcs { struct { uint64_t oid; uint32_t incarn; } v[256]; int n; };
+
+static int spcs_cb(uint64_t member, uint32_t incarn, uint64_t oid,
+		uint32_t sincarn, uint64_t mark, void *ctx)
 {
-	struct peer *best = NULL;
+	struct spcs *s = ctx;
 	int i;
 
+	(void)member; (void)incarn; (void)mark;
+	for (i = 0; i < s->n; i++)
+		if (s->v[i].oid == oid && s->v[i].incarn == sincarn)
+			return 0;
+	if (s->n == (int)(sizeof s->v / sizeof s->v[0]))
+		return 1;
+	s->v[s->n].oid = oid;
+	s->v[s->n++].incarn = sincarn;
+	return 0;
+}
+
+/* short of deletes: its mark of a space below the highest any member reports, and still for
+ * SURVIVOR_STILL_MS - its state lacks them, so copying it brings keys back.  -1: a mark below it
+ * that moved since, or none yet (a delete in flight, a table just filling); @final reads those as
+ * moving (not short) and missing (short) */
+static int peer_short(const struct peer *p, const struct spcs *s, long long now,
+		int final)
+{
+	uint64_t member, m, hi, applied;
+	long long moved;
+	int i, open = 0;
+
+	if (!p->has_ident || !p->acks)
+		return 0;                      /* nothing to judge it by */
+	member = fnv1a64(p->ident, sizeof p->ident);
+	for (i = 0; i < s->n; i++) {
+		uint64_t oid = s->v[i].oid, head;
+		uint32_t inc = s->v[i].incarn;
+
+		if (oid == member && inc == p->incarn)
+			continue;              /* its own run's deletes are its own */
+		head = pc_ack_fleet_max(oid, inc, NULL, 0);
+		if (pc_ack_known(oid, inc, &applied, &hi) && hi > head)
+			head = hi;
+		if (!head)
+			continue;
+		if (!pc_ack_fleet_mark(member, oid, inc, &m)) {
+			if (final)
+				return 1;
+			open = 1;
+			continue;
+		}
+		if (m >= head)
+			continue;
+		if (pc_ack_fleet_moved(member, oid, inc, &moved) &&
+		    now - moved < SURVIVOR_STILL_MS)
+			open |= !final;
+		else
+			return 1;
+	}
+	return open ? -1 : 0;
+}
+
+/* 12ol: a survivor - live, READY, and up since before this node's absence (a witness), the
+ * fullest of those short of no delete (*whole), else the fullest.  Its state is the fleet's.
+ * *wait: a witness's marks are too fresh to judge yet - ask again next tick, for at most
+ * SURVIVOR_STILL_MS */
+static struct peer *survivor(long long now, int *whole, int *wait)
+{
+	struct peer *best = NULL, *full = NULL;
+	struct spcs s;
+	int i, final, sh;
+	long long open = -1;               /* the most records an undecided witness holds */
+
+	if (!C.surv_since || now - C.surv_since > 4 * SURVIVOR_STILL_MS)
+		C.surv_since = now;            /* this pick's first ask, not an earlier pass's */
+	final = now - C.surv_since >= SURVIVOR_STILL_MS;
+	s.n = 0;
+	(void)pc_ack_fleet_each(spcs_cb, &s);
 	for (i = 0; i < C.pt.n_peers; i++) {
 		struct peer *p = &C.pt.peers[i];
 
@@ -4655,20 +4729,37 @@ static struct peer *survivor(long long now)
 		    !clpeers_live(p, now) || p->nstate != PC_NST_READY ||
 		    !is_witness(p))
 			continue;
-		if (!best || p->entries > best->entries)
+		if (!full || p->entries > full->entries)
+			full = p;
+		sh = peer_short(p, &s, now, final);
+		if (sh < 0 && (long long)p->entries > open)
+			open = p->entries;
+		if (!sh && (!best || p->entries > best->entries))
 			best = p;
 	}
-	return best;
+	*whole = best != NULL;
+	/* only an undecided witness that would be picked over the best one judged holds the pick */
+	*wait = open >= 0 && (!best || open > (long long)best->entries);
+	if (*wait)
+		return NULL;
+	C.surv_since = 0;
+	if (best && best != full)
+		LM_NOTICE("cluster: rejoin - node %d holds more records (%u) but is short "
+			"of deletes the fleet made; node %d (%u) is copied instead\n",
+			__atomic_load_n(&full->node, __ATOMIC_ACQUIRE), full->entries,
+			__atomic_load_n(&best->node, __ATOMIC_ACQUIRE), best->entries);
+	return best ? best : full;
 }
 
 /* 12ol: drop the records in question and copy the survivor's state whole (a write this node
  * never pushed goes with them); no snapshot until the copy is complete */
-static void rejoin_begin(const struct peer *s)
+static void rejoin_begin(const struct peer *s, int whole)
 {
 	int node = __atomic_load_n(&s->node, __ATOMIC_ACQUIRE);
 
 	C.boot_prefer = node;
 	C.rejoin_on = 1;
+	C.rejoin_whole = whole;
 	__atomic_store_n(&C.rejoin_src, 0, __ATOMIC_RELEASE);
 	C.st.rejoins++;
 	pc_rdb_hold(1);
@@ -4849,10 +4940,13 @@ static int reconcile_find_witness(void)
 	/* 12ol: a survivor holds the fleet's state - take it whole.  With none READY there is
 	 * nobody to copy from or to ask: a split resyncs, a restart or a floor keeps all, below */
 	if (!self_test_reconcile) {
-		struct peer *s = survivor(now);
+		int whole, wait;
+		struct peer *s = survivor(now, &whole, &wait);
 
+		if (wait)
+			return 0;              /* a witness's marks too fresh to judge: next tick */
 		if (s) {
-			rejoin_begin(s);
+			rejoin_begin(s, whole);
 			return 0;
 		}
 		p = NULL;
@@ -7194,7 +7288,11 @@ static int boot_request(void)
 	int id[BOOT_MAX_CAND], n = 0, i, j, held_unready = 0, anyent = 0;
 	unsigned int ent[BOOT_MAX_CAND];
 	int pref = C.boot_prefer;
+	struct spcs sp;
 
+	sp.n = 0;
+	if (C.rejoin_on && C.rejoin_whole)
+		(void)pc_ack_fleet_each(spcs_cb, &sp);
 	for (i = 0; i < C.pt.n_peers; i++) {
 		struct peer *p = &C.pt.peers[i];
 		int pid = __atomic_load_n(&p->node, __ATOMIC_ACQUIRE);
@@ -7203,7 +7301,9 @@ static int boot_request(void)
 		if (pid && clpeers_live(p, now) && p->nstate != PC_NST_READY && pe)
 			held_unready = 1;      /* still replaying, or not admitted yet */
 		if (!pid || !clpeers_live(p, now) ||
-		        p->nstate != PC_NST_READY || (C.rejoin_on && !is_witness(p)))
+		        p->nstate != PC_NST_READY || (C.rejoin_on && !is_witness(p)) ||
+		        (C.rejoin_on && C.rejoin_whole && pid != pref &&
+		         peer_short(p, &sp, now, 1) == 1))
 			continue;
 		anyent |= pe > 0;
 		/* insertion sort: a rejoin's survivor first, then (holds records) desc, id asc */
