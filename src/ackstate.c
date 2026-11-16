@@ -498,6 +498,18 @@ int pc_ack_fleet_mark(uint64_t member, uint64_t oid, uint32_t sincarn,
 	return rc;
 }
 
+int pc_ack_fleet_incarn(uint64_t member, uint32_t *incarn)
+{
+	int rc;
+
+	if (!F)
+		return 0;
+	pthread_mutex_lock(&A_mx);
+	rc = clackf_incarn(F, member, incarn);
+	pthread_mutex_unlock(&A_mx);
+	return rc;
+}
+
 uint64_t pc_ack_fleet_min(uint64_t oid, uint32_t sincarn,
 		const uint64_t *members, int n)
 {

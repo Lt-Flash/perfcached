@@ -150,6 +150,16 @@ void clackf_forget(struct clackf *f, uint64_t member)
 	*m = f->mb[--f->n];
 }
 
+int clackf_incarn(const struct clackf *f, uint64_t member, uint32_t *incarn)
+{
+	const struct fmember *m = mfind(f, member);
+
+	if (!m)
+		return 0;
+	*incarn = m->incarn;
+	return 1;
+}
+
 int clackf_mark(const struct clackf *f, uint64_t member, uint64_t oid,
 		uint32_t sincarn, uint64_t *mark)
 {

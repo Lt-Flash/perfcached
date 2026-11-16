@@ -93,8 +93,9 @@
 /* ucast to the elected mailer, twice: [node2][seq4][level1][flags1][klen1][key][hlen1][host]
  * [tlen2][text], an alert it cannot mail itself; flags bit 0 a clear; (node, seq) de-duplicates */
 #define M_ALERT_RELAY   42
-/* the reconcile's fast path: a restarted node asks a witness [req4][age4] for deletes planted
- * since; M_TOMB_RPL [req4][seq4] + an M_TOMBSTONE each, then M_TOMB_DONE [req4][status1][n4] */
+/* the reconcile's fast path: a restarted node asks a witness [req4][age4][incarn4] (no incarn from
+ * an older build) for deletes planted since; M_TOMB_RPL [req4][seq4] + an M_TOMBSTONE each, then
+ * M_TOMB_DONE [req4][status1][n4] */
 #define M_TOMB_REQ      43
 #define M_TOMB_RPL      44
 #define M_TOMB_DONE     45

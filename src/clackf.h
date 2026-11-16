@@ -35,6 +35,8 @@ void clackf_forget(struct clackf *f, uint64_t member);
  * no new incarnation means it was cut off, not restarted.  A new incarnation keeps the stamp. */
 long long clackf_heard(struct clackf *f, uint64_t member, long long now);
 
+/* 1 and the incarnation its marks belong to; 0 for an unknown member */
+int clackf_incarn(const struct clackf *f, uint64_t member, uint32_t *incarn);
 /* 1 and its mark of the space; 0 when it has reported none */
 int clackf_mark(const struct clackf *f, uint64_t member, uint64_t oid,
 		uint32_t sincarn, uint64_t *mark);

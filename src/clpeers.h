@@ -113,7 +113,7 @@ struct peer {
 	int tomb_owed;
 	/* a fast-path replay owed to it as witness: request, window start (s, this node's
 	 * clock), sent so far, window size, next number, open.  Peer thread only. */
-	uint32_t fp_req;
+	uint32_t fp_req, fp_incarn;    /* the asker's incarnation, 0 from an older build */
 	unsigned int fp_from, fp_mark, fp_win, fp_seq;
 	int fp_on;                     /* 2 = held for its marks */
 	/* owed a rebuild (1: asked until taken), and since when

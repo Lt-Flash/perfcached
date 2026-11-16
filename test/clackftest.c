@@ -36,11 +36,23 @@ int main(void)
 	CHK(clackf_min(f, 0x1111, 7, two, 0) == 0, "A: no members: 0");
 
 	/* ---- B: a new incarnation forgets what the old one said */
+	{
+		uint32_t inc = 0;
+
+		CHK(clackf_incarn(f, 0xB, &inc) && inc == 1 && !clackf_incarn(f, 0xEE, &inc),
+			"B: the incarnation B's marks belong to is 1; an unknown member has none");
+	}
 	CHK(clackf_member(f, 0xB, 1) == 0 && clackf_mark(f, 0xB, 0x1111, 7, &v),
 		"B: the same incarnation again keeps its marks");
 	CHK(clackf_member(f, 0xB, 2) == 1 && !clackf_mark(f, 0xB, 0x1111, 7, &v) &&
 		clackf_min(f, 0x1111, 7, two, 2) == 0,
 		"B: B restarted (incarnation 2): its marks are gone, nothing confirmed");
+	{
+		uint32_t inc = 0;
+
+		CHK(clackf_incarn(f, 0xB, &inc) && inc == 2,
+			"B: ... and the incarnation its marks belong to is now 2, before it reports any");
+	}
 	clackf_report(f, 0xB, 0x1111, 7, 90, 0);
 	CHK(clackf_min(f, 0x1111, 7, two, 2) == 90, "B: it reports again (90): the lowest is 90");
 

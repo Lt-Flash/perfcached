@@ -4964,13 +4964,14 @@ static struct peer *fp_witness(void)
 /* "every delete planted since my snapshot began, @age seconds ago" */
 static void fp_ask(struct peer *w, unsigned int age)
 {
-	unsigned char m[9];
+	unsigned char m[13];
 	long long now = now_ms();
 	uint32_t req = clrecon_fp_asked(&C.fp, w->node, now);
 
 	m[0] = M_TOMB_REQ;
 	fp_put32(m + 1, req);
 	fp_put32(m + 5, age);
+	fp_put32(m + 9, C.self_incarn);
 	(void)seal_send(&w->addr, m, sizeof m);
 	if (!C.rec_start_ms)
 		C.rec_start_ms = now;          /* the pass's clock */
@@ -9890,6 +9891,14 @@ static void rebuild_pass(unsigned int bt, int floor, long long death,
 	fp_fall_back(why);
 }
 
+/* a rebuild folded into a pass under way: its deletes are held nowhere, and the fast path replays
+ * only retained ones, so it may not end the pass - the pass walks */
+static void rebuild_into_pass(const char *why)
+{
+	if (C.reconcile_on && C.fp.state != FPS_WALK)
+		fp_fall_back(why);
+}
+
 /* nobody will resend these, so the mark goes past them, and every record
  * stored so far is re-checked: a key whose delete was in the hole is among them */
 void gap_floor_over(const struct pc_ack_hole *h, long long death)
@@ -9916,8 +9925,11 @@ void gap_floor_over(const struct pc_ack_hole *h, long long death)
 		"the records stored so far with the fleet\n",
 		(unsigned long long)h->oid, h->incarn,
 		(unsigned long long)h->from, (unsigned long long)floor);
-	if ((C.reconcile_on && C.rec_tick >= bt) || (C.rb_cover && C.rb_cover >= bt))
+	if ((C.reconcile_on && C.rec_tick >= bt) || (C.rb_cover && C.rb_cover >= bt)) {
+		rebuild_into_pass("an origin's finished run left deletes past this "
+			"node's marks that nobody resends");
 		return;
+	}
 	C.rb_cover = bt;
 	C.st.rebuilds++;
 	if (C.reconcile_on) {
@@ -9925,6 +9937,8 @@ void gap_floor_over(const struct pc_ack_hole *h, long long death)
 		C.rec_col = 0;
 		C.rec_cursor = 0;
 		clrecon_rounds_reset(&C.recon);
+		rebuild_into_pass("an origin's finished run left deletes past this "
+			"node's marks that nobody resends");
 		return;
 	}
 	rebuild_pass(bt, 1, death, "the deletes of an origin's finished run are "
@@ -9938,6 +9952,7 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 	struct pc_rcur c;
 	unsigned int kind, age_ms, nowt, bt;
 	int floor;
+	char why[128];
 
 	if (!p || !__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
 	    n < M_REBUILD_LEN)
@@ -9961,8 +9976,16 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 	nowt = get_ticks();
 	/* a floor's is every record stored so far: its age was no absence, and as one it walked none */
 	bt = floor ? nowt : nowt > age_ms / 1000 ? nowt - age_ms / 1000 : 0;
+	if (floor)
+		snprintf(why, sizeof why, "node %d forgot deletes past this "
+			"node's marks - no replay brings them back", p->node);
+	else
+		snprintf(why, sizeof why, "node %d no longer holds every delete "
+			"made while this node was away (~%u s)", p->node,
+			age_ms / 1000);
 	if ((C.reconcile_on && C.rec_tick >= bt) || (C.rb_cover && C.rb_cover >= bt)) {
 		C.st.rebuild_covered++;
+		rebuild_into_pass(why);
 		rebuild_send(from, M_REBUILD_TAKEN, 0);
 		return;
 	}
@@ -9975,6 +9998,7 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 		C.rec_col = 0;
 		C.rec_cursor = 0;
 		clrecon_rounds_reset(&C.recon);
+		rebuild_into_pass(why);
 		rebuild_send(from, M_REBUILD_TAKEN, 0);
 		if (floor)
 			LM_WARN("cluster: node %d no longer holds deletes this "
@@ -10047,10 +10071,14 @@ static int fp_marks_cb(uint64_t oid, uint32_t incarn, uint64_t through,
 static int fp_vouch_marks(const struct peer *p, unsigned int from_s)
 {
 	struct fpm f = { 0, from_s, TOMBFP_OK };
+	uint32_t inc;
 
 	if (!p->has_ident)
 		return TOMBFP_OK;              /* an older build forgets nothing */
 	f.member = fnv1a64(p->ident, sizeof p->ident);
+	/* marks its earlier run reported say nothing of what a restore brought back: not in yet */
+	if (p->fp_incarn && (!pc_ack_fleet_incarn(f.member, &inc) || inc != p->fp_incarn))
+		return -1;
 	clretain_forgot_each(fp_marks_cb, &f);
 	return f.st;
 }
@@ -10174,6 +10202,7 @@ static void handle_tomb_req(const unsigned char *pt, size_t n,
 	if (p->fp_on && p->fp_req == req)
 		return;                        /* replaying it already */
 	age = fp_get32(pt + 5);
+	p->fp_incarn = n >= 13 ? fp_get32(pt + 9) : 0;
 	from_s = age < now_s && now_s - age > TOMBFP_MARGIN_S ?
 		now_s - age - TOMBFP_MARGIN_S : 0;
 	st = fp_vouch(from_s, now_s);

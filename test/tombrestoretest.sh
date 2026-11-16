@@ -134,7 +134,9 @@ sleep 2
 G3=$(held 3 0 200); L3=$(held 3 200 300); G1=$(held 1 0 200); G2=$(held 2 0 200)
 [ "$G3" = 0 ] && [ "$L3" = 100 ] && [ "$G1 $G2" = "0 0" ] &&
 	ok "4. node 3 walked: it holds none of the 200 deleted keys and all 100 kept; nodes 1 and 2 hold none of the 200" ||
-	bad "4. after the restore: node 3 holds ${G3:-?} of the 200 deleted (want 0) and ${L3:-?} of the 100 kept (want 100); nodes 1/2 hold ${G1:-?}/${G2:-?} of the 200 (want 0 0); node 3's walk: $(grep -c "reconcile pass finished asking" "$D/n3.log") end line(s), $(grep -c "reconcile stops asking" "$D/n3.log") give-up(s), reconcile_open $(st 3 'c.get("reconcile_open")'), reconcile_pending $(st 3 'c.get("reconcile_pending")')"
+	{ bad "4. after the restore: node 3 holds ${G3:-?} of the 200 deleted (want 0) and ${L3:-?} of the 100 kept (want 100); nodes 1/2 hold ${G1:-?}/${G2:-?} of the 200 (want 0 0); node 3's walk: $(grep -c "reconcile pass finished asking" "$D/n3.log") end line(s), $(grep -c "reconcile stops asking" "$D/n3.log") give-up(s), reconcile_open $(st 3 'c.get("reconcile_open")'), reconcile_pending $(st 3 'c.get("reconcile_pending")')"
+	# who vouched and on what: the witness's verdict, the origin's floor, the rebuild it asked for
+	for i in 1 2 3; do grep -hE "fast path|snapshot began|floor|rebuild|marks reach|cannot vouch" "$D/n$i.log" | tail -6 | cut -c1-200 | sed "s/^/    n$i: /"; done; }
 
 for i in 1 2 3; do
 	# the runner's storage stalling is no finding of this suite

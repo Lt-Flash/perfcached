@@ -71,6 +71,7 @@ int pc_ack_member_rows(uint64_t member, int self, struct pc_ack_row *out,
 		int max);
 int pc_ack_fleet_mark(uint64_t member, uint64_t oid, uint32_t sincarn,
 		uint64_t *mark);
+int pc_ack_fleet_incarn(uint64_t member, uint32_t *incarn);
 uint64_t pc_ack_fleet_min(uint64_t oid, uint32_t sincarn,
 		const uint64_t *members, int n);
 int pc_ack_fleet_each(clackf_each_cb cb, void *ctx);
