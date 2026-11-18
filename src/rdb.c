@@ -543,6 +543,38 @@ static uint32_t rd32(const unsigned char *p)
 	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* a read() returns at most ~2 GiB on Linux: a file is read in as many as it takes.
+ * PERFCACHED_TEST_READ_MAX caps each lower, so a small snapshot takes many too */
+static size_t read_max(void)
+{
+	static size_t m;
+
+	if (!m) {
+		const char *e = getenv("PERFCACHED_TEST_READ_MAX");
+		long long v = e ? atoll(e) : 0;
+
+		m = v > 0 ? (size_t)v : (size_t)-1;
+	}
+	return m;
+}
+
+ssize_t pc_rdb_read_all(int fd, void *buf, size_t n)
+{
+	size_t got = 0;
+
+	while (got < n) {
+		size_t want = n - got < read_max() ? n - got : read_max();
+		ssize_t r = read(fd, (char *)buf + got, want);
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		got += (size_t)r;
+	}
+	return (ssize_t)got;
+}
+
 long pc_rdb_validate(const char *dir, unsigned long long *marker,
 		long *ncols, const char **why)
 {
@@ -568,7 +600,7 @@ long pc_rdb_validate(const char *dir, unsigned long long *marker,
 	}
 	n = (size_t)st.st_size;
 	data = malloc(n);
-	if (!data || read(fd, data, n) != (ssize_t)n) {
+	if (!data || pc_rdb_read_all(fd, data, n) != (ssize_t)n) {
 		free(data);
 		close(fd);
 		*why = "read";

@@ -56,6 +56,7 @@
 #include "metrics.h"
 #include "respmap.h"
 #include "daemon.h"
+#include "rpcq.h"
 #include "upstream.h"
 #include "mail.h"
 #include "alerts.h"
@@ -97,17 +98,12 @@ extern int pcache_reclaim_keep, pcache_reclaim_quiet_s,
 #define EPOLLEXCLUSIVE (1u << 28)
 #endif
 
-#define PC_RPCQ 8
-
 struct pc_thread {
 	pthread_t tid;
 	int efd;
 	int idx;                            /* this worker's index; also the vendored core's process_no */
-	/* tiny locked RPC queue - broadcast is rare control-plane traffic */
-	pthread_mutex_t mx;
-	ipc_rpc_f fn[PC_RPCQ];
-	void *arg[PC_RPCQ];
-	int head, tail;
+	pthread_mutex_t mx;                 /* guards rq */
+	struct pc_rpcq rq;
 	int live;
 	struct pc_conn **conns;             /* this worker's client list, read on this worker only */
 };
@@ -308,13 +304,10 @@ static void rpc_drain(struct pc_thread *t)
 
 	for (;;) {
 		pthread_mutex_lock(&t->mx);
-		if (t->head == t->tail) {
+		if (!pc_rpcq_take(&t->rq, &fn, &arg)) {
 			pthread_mutex_unlock(&t->mx);
 			return;
 		}
-		fn = t->fn[t->head % PC_RPCQ];
-		arg = t->arg[t->head % PC_RPCQ];
-		t->head++;
 		pthread_mutex_unlock(&t->mx);
 		fn(t->idx, arg);
 	}
@@ -335,11 +328,7 @@ static void pc_broadcast(void (*fn)(int sender, void *param), void *param)
 			continue;
 		}
 		pthread_mutex_lock(&t->mx);
-		if (t->tail - t->head < PC_RPCQ) {
-			t->fn[t->tail % PC_RPCQ] = fn;
-			t->arg[t->tail % PC_RPCQ] = param;
-			t->tail++;
-		}
+		(void)pc_rpcq_put(&t->rq, fn, param);
 		pthread_mutex_unlock(&t->mx);
 		if (write(t->efd, &one, sizeof one) < 0) { /* wake is best-effort */ }
 	}
@@ -401,12 +390,9 @@ void pc_clients_notify(const char *payload, size_t n)
 			continue;
 		}
 		pthread_mutex_lock(&t->mx);
-		if (t->tail - t->head < PC_RPCQ) {
-			__atomic_add_fetch(&m->refs, 1, __ATOMIC_ACQ_REL);
-			t->fn[t->tail % PC_RPCQ] = notify_rpc;
-			t->arg[t->tail % PC_RPCQ] = m;
-			t->tail++;
-		}
+		__atomic_add_fetch(&m->refs, 1, __ATOMIC_ACQ_REL);
+		if (!pc_rpcq_put(&t->rq, notify_rpc, m))
+			__atomic_sub_fetch(&m->refs, 1, __ATOMIC_ACQ_REL);
 		pthread_mutex_unlock(&t->mx);
 		if (write(t->efd, &one, sizeof one) < 0) { /* best effort */ }
 	}

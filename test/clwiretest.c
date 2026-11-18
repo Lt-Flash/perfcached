@@ -107,6 +107,27 @@ int main(void)
 	}
 	chk(clwire_open(k1, sealed, len, pt, &ptlen) == 0,
 		"B8 and the original frame is undamaged");
+	/* every receiver opens into MAX_DGRAM + 16 bytes from a buffer of HDR_LEN + MAX_DGRAM + 64;
+	 * a frame between the two would write past the plaintext, so open must refuse it */
+	{
+		static unsigned char big[HDR_LEN + MAX_DGRAM + 64], out[MAX_DGRAM + 256];
+		static unsigned char body[MAX_DGRAM + 64];
+		size_t bl;
+
+		memset(body, 'p', sizeof body);
+		bl = seal_with_hdr(k1, 0xA1, 6, body, MAX_DGRAM, big);
+		chk(clwire_open(k1, big, bl, out, &ptlen) == 0 && ptlen == MAX_DGRAM,
+			"B9 a frame of exactly MAX_DGRAM opens");
+		bl = seal_with_hdr(k1, 0xA1, 6, body, MAX_DGRAM + 1, big);
+		chk(clwire_open(k1, big, bl, out, &ptlen) != 0,
+			"B9 one byte over MAX_DGRAM is refused, sealed with the right key");
+		bl = seal_with_hdr(k1, 0xA1, 6, body, MAX_DGRAM + 48, big);
+		chk(bl <= sizeof big && clwire_open(k1, big, bl, out, &ptlen) != 0,
+			"B9 the largest frame a receive buffer takes is refused");
+		big[HDR_LEN + 5] ^= 1;
+		chk(clwire_open(k1, big, bl, out, &ptlen) != 0,
+			"B9 and so is the same frame with a bad tag (no key needed)");
+	}
 
 	/* ---- C. the nonce --------------------------------------------------- */
 	for (i = 0; i < 64; i++)

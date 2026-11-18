@@ -133,7 +133,7 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 	}
 	n = (size_t)fst.st_size;
 	data = malloc(n);
-	if (!data || read(fd, data, n) != (ssize_t)n) {
+	if (!data || pc_rdb_read_all(fd, data, n) != (ssize_t)n) {
 		free(data);
 		close(fd);
 		return -1;
@@ -658,7 +658,7 @@ int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 	}
 	n = (size_t)fst.st_size;
 	data = malloc(n);
-	if (!data || read(fd, data, n) != (ssize_t)n) {
+	if (!data || pc_rdb_read_all(fd, data, n) != (ssize_t)n) {
 		free(data);
 		close(fd);
 		return -1;

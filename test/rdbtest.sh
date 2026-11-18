@@ -132,6 +132,26 @@ EOF
 [ $? -eq 0 ] && ok || { bad "save verb + rate budget"; echo "--- the daemon's log:"; tail -20 "$D/log"; }
 stop
 
+# ---- round 3: a snapshot larger than one read() returns ----------------
+# Linux hands at most ~2 GiB to a read(); the test knob caps each at 64 KB, so this ~3 MB
+# snapshot takes many: it must load whole, not as "corrupt" with the WAL alone left
+PERFCACHED_TEST_READ_MAX=65536; export PERFCACHED_TEST_READ_MAX
+R=$("$BIN" -R "$D/wal" 2>&1)
+echo "$R" | grep -q "crc ok" && ok || bad "validate, 64 KB a read: $R"
+start
+client <<'EOF'
+import json, pcnative, socket
+s = socket.create_connection(("127.0.0.1", 16486), timeout=10)
+f = pcnative.wrap(s)
+f.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"get","params":{"col":"th","key":"big0749"}}).encode()+b"\n"); f.flush()
+r = json.loads(f.readline())["result"]
+assert r.get("found") and r["value"] == "z"*4000, r
+EOF
+[ $? -eq 0 ] && ok || bad "a 3 MB snapshot read 64 KB at a time did not load: $(grep -i 'snapshot\|recover' "$D/log" | tail -3 | tr '\n' '|')"
+grep -q "missing pieces or corrupt" "$D/log" && bad "the snapshot was judged corrupt for needing more than one read()" || ok
+stop
+unset PERFCACHED_TEST_READ_MAX
+
 # ---- reds --------------------------------------------------------------
 # corrupt one byte -> validate must refuse
 python3 - "$D/wal/dump.rdb" <<'EOF'

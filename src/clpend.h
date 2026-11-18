@@ -63,8 +63,8 @@ struct cqueue {
 	pthread_mutex_t mx;
 	/* pend_cap entries, malloc'd at worker registration: it MUST match the parked table, as
 	 * post_done_ex() silently DROPS a completion into a full queue */
-	struct pc_pull_done *q;
-	int head, tail;
+	struct pc_pull_done *q;          /* qmask + 1 entries, a power of two */
+	unsigned int head, tail;       /* free-running; the slot is & qmask */
 	int efd;
 };
 
@@ -74,6 +74,7 @@ struct clpend {
 	pthread_mutex_t mx;
 	struct pending *pend;          /* cap entries, allocated once */
 	int cap;
+	unsigned int qmask;            /* each completion ring: cap rounded up to 2^k, less 1 */
 	int used;                      /* EXACT occupancy; see clpend_release */
 	int peak;
 	struct pc_winmax wpeak;        /* the peak of the last 5 min */

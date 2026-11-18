@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "rdb_rules.h"
 
@@ -80,6 +81,9 @@ const char *pc_rdb_dir(void);      /* "" until pc_rdb_init */
 
 /* validate + summarize a snapshot (tests, -R).
  * Returns record count, or -1 (missing/corrupt - *why says which). */
+/* a whole snapshot file into @buf: @n, or less on a failure */
+ssize_t pc_rdb_read_all(int fd, void *buf, size_t n);
+
 long pc_rdb_validate(const char *dir, unsigned long long *marker,
 		long *ncols, const char **why);
 

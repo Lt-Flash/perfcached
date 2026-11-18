@@ -109,7 +109,14 @@ print(hit)
 PY
 }
 
+down() { # an arm that gave up early left its nodes up, holding the next arm's ports
+	[ -n "$D" ] || return 0
+	P=$(cat "$D"/*.pid 2>/dev/null); kill -9 $P 2>/dev/null
+	for p in $P; do wait "$p" 2>/dev/null; done
+	rm -rf "$D"; D=
+}
 arm() { # arm <term|kill> [pull]
+	down
 	D=$(mktemp -d $BASE/pcxr.XXXXXX)
 	echo "--- arm: node 3 stopped by $1${2:+, then the t keys READ through node 1 while it reconciles}"
 	for n in 1 2 3; do conf $n; done
@@ -202,9 +209,8 @@ DPY
 			&& ok "$1: through node $n - s 0 of 3,000, t 0 of 500, x 500 at the new value, i 1,000" \
 			|| bad "$1: through node $n - s $S (0), t $T (0), x new $X old $XO (500/0), i $I (1000)"
 	done
-	kill -9 $(cat "$D"/*.pid) 2>/dev/null
 	cat "$D"/n3.log.1 > "$BASE/pcxr.$1.n3.log" 2>/dev/null
-	rm -rf "$D"; D=
+	down
 }
 
 arm term

@@ -531,6 +531,30 @@ int main(void)
 	}
 	clpend_fini(&P);
 
+	/* ---- J. the completion ring across its counters' wrap ------------- */
+	/* the counters only grow: seeded 3 short of 2^32 (as int, -3), six posts must still land in
+	 * the array and come out in order - a signed index writes below it from 2^31 on */
+	clpend_init(&P, CAP);
+	clpend_cq_register(&P, 0, -1);
+	P.cq[0].head = P.cq[0].tail = 0u - 3u;
+	for (i = 0; i < 6; i++)
+		clpend_cq_post(&P, 0, (uint32_t)(101 + i), PC_DONE_PULL, 1, 1, 0, 0, 0,
+			NULL, 0, 0, 0, 0, 0);
+	{
+		int found = 0, k, inorder = 1, got = 0;
+
+		for (k = 0; k < CAP; k++)
+			if (P.cq[0].q[k].req >= 101 && P.cq[0].q[k].req <= 106)
+				found++;
+		chk(found == 6, "J1 six posts across the wrap all land inside the ring");
+		while ((n = clpend_cq_drain(&P, 0, d, 4)) > 0)
+			for (k = 0; k < n; k++, got++)
+				if (d[k].req != (uint32_t)(101 + got))
+					inorder = 0;
+		chk(got == 6 && inorder, "J2 and drain in the order posted");
+	}
+	clpend_fini(&P);
+
 	printf("clpendtest: %d passed, %d failed\n", pass, fail);
 	return fail ? 1 : 0;
 }

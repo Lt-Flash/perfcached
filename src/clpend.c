@@ -30,6 +30,10 @@ int clpend_init(struct clpend *p, int cap)
 	 * at a time as requests walk through it */
 	pc_touch_pages(p->pend, (size_t)cap * sizeof *p->pend);
 	p->cap = cap;
+	p->qmask = 1;
+	while (p->qmask < (unsigned int)cap)
+		p->qmask <<= 1;
+	p->qmask--;
 	p->used = 0;
 	p->peak = 0;
 	p->exhausted = 0;
@@ -162,10 +166,10 @@ void clpend_cq_register(struct clpend *p, int worker, int efd)
 		return;
 	if (!p->cq[worker].q)
 	{
-		p->cq[worker].q = calloc((size_t)p->cap,
+		p->cq[worker].q = calloc((size_t)p->qmask + 1,
 			sizeof *p->cq[worker].q);
 		pc_touch_pages(p->cq[worker].q,
-			(size_t)p->cap * sizeof *p->cq[worker].q);
+			((size_t)p->qmask + 1) * sizeof *p->cq[worker].q);
 	}
 	p->cq[worker].efd = efd;
 }
@@ -182,8 +186,8 @@ void clpend_cq_post(struct clpend *p, int worker, uint32_t req, int kind,
 		return;
 	q = &p->cq[worker];
 	pthread_mutex_lock(&q->mx);
-	if (q->q && q->tail - q->head < p->cap) {
-		struct pc_pull_done *d = &q->q[q->tail % p->cap];
+	if (q->q && q->tail - q->head < (unsigned int)p->cap) {
+		struct pc_pull_done *d = &q->q[q->tail & p->qmask];
 
 		d->req = req;
 		d->kind = kind;
@@ -223,7 +227,7 @@ int clpend_cq_drain(struct clpend *p, int worker, struct pc_pull_done *out,
 	q = &p->cq[worker];
 	pthread_mutex_lock(&q->mx);
 	while (q->head != q->tail && n < max) {
-		out[n++] = q->q[q->head % p->cap];
+		out[n++] = q->q[q->head & p->qmask];
 		q->head++;
 	}
 	pthread_mutex_unlock(&q->mx);

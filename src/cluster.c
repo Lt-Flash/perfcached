@@ -11135,6 +11135,8 @@ static int bulk_host_known(const pc_addr *a)
 	return 0;
 }
 
+#define BULK_M1_PAY 16                 /* message 1's payload: the version, the kind */
+
 static void bulk_rx(int cfd)
 {
 	extern void pc_wal_upsert(const char *, const char *, int,
@@ -11156,7 +11158,9 @@ static void bulk_rx(int cfd)
 	if (clbulk_io(cfd, 0, frame, 2) != 0)
 		goto out;
 	flen = (size_t)frame[0] | ((size_t)frame[1] << 8);
-	if (flen < 1 + 48 || flen > PC_NOISE_MAXMSG ||
+	/* message 1 is the principal, e, a payload of a byte or two and the tag: one longer would
+	 * be opened past pay[] below, written even when its tag fails */
+	if (flen < 1 + 48 || flen > 1 + 32 + BULK_M1_PAY + PC_NOISE_TAGLEN ||
 	        clbulk_io(cfd, 0, frame + 2, flen) != 0)
 		goto out;
 	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -11164,7 +11168,7 @@ static void bulk_rx(int cfd)
 		goto out;                      /* cluster principal ONLY */
 	pc_hs_init_responder(&hs, frame + 2, 1);
 	{
-		unsigned char pay[16];
+		unsigned char pay[BULK_M1_PAY];
 		size_t pl2 = 0;
 
 		if (pc_hs_read_msg1(&hs, C.psk, frame + 3, flen - 1, pay,

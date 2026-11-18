@@ -109,5 +109,28 @@ case "$R" in eof*|rst*) [ "${R##* }" -ge 700 ] && [ "${R##* }" -le 2500 ] \
 	|| bad "the member host's idle connection closed after ${R##* } ms (want 0.7-2.5 s)";;
 *) bad "the member host's idle connection: $R";; esac
 
+# an opening message of the largest length the frame field holds, cluster principal, no secret:
+# its payload must never be opened into a buffer sized for the real two bytes
+big() {
+	python3 - "$PORT" <<'EOF'
+import socket, struct, sys
+s = socket.socket(); s.bind(("127.0.76.1", 0)); s.settimeout(10)
+s.connect(("127.0.76.2", int(sys.argv[1])))
+n = 65535
+s.sendall(struct.pack("<H", n) + b"\x01" + b"\x07" * (n - 1))
+try:
+    print("eof" if s.recv(1) == b"" else "data")
+except (ConnectionResetError, socket.timeout) as e:
+    print(type(e).__name__)
+EOF
+}
+R=$(big)
+sleep 1
+kill -0 "${PIDS##* }" 2>/dev/null && kill -0 "$(echo $PIDS | cut -d' ' -f1)" 2>/dev/null \
+	&& grep -q "perfcached ready" "$D/n2.log" && ! grep -qi "AddressSanitizer\|stack smashing\|Segmentation" "$D/n2.log" \
+	&& [ "$(entries 2)" = 201 ] \
+	&& ok "a 65,535-byte opening message from a member's host is refused and the founder lives on ($R)" \
+	|| bad "the founder after a 65,535-byte opening message ($R): $(tail -3 "$D/n2.log" | cut -c1-140 | tr '\n' '|')"
+
 echo "bulkgatetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

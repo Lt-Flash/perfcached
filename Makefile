@@ -481,6 +481,8 @@ jwtest: test/jwtest.c src/json.o src/compat/compat.o
 # the WAL pump's ring copy against the byte loop it replaced
 walringtest: test/walringtest.c src/walring.h
 	$(CC) $(CFLAGS) -Isrc -o $@ test/walringtest.c
+rpcqtest: test/rpcqtest.c src/rpcq.h
+	$(CC) $(CFLAGS) -Isrc -o $@ test/rpcqtest.c
 
 psindextest: test/psindextest.c src/psindex.o
 	$(CC) $(CFLAGS) -Isrc -o $@ test/psindextest.c src/psindex.o
@@ -587,7 +589,7 @@ check-g-fault2: perfcached perfcli
 # must pass; `check` in full rides tag pushes.
 check-fast: pagedump $(DASH_BIN) selftest selftest_broken memprobe noisetest noiseboundtest wipetest perfcached pubsubcli udppushcli \
 		perfcli pcbench clmaptest cltermtest clsynctest clhisttest \
-		clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest asyncbintest routedpairtest movedhinttest hinttest workerbaltest respreadtest frozentest quietlinktest asyncstatetest libperfd.a \
+		clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest asyncbintest routedpairtest movedhinttest hinttest workerbaltest respreadtest frozentest quietlinktest asyncstatetest libperfd.a \
 		clustersim psrelaytest psindextest psqueuetest psinteresttest psudptest rpsbench legmetatest legwalkremovetest htfuzztest cellpoisontest chainhinttest clordertest draincarrytest chainwalktest wintest scanremovetest histtest capracetest verstamptest arenadbgtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc threadfreeze clapplytest evactest respmaptest
 	./clustersim 500
 	./clapplytest
@@ -617,6 +619,7 @@ check-fast: pagedump $(DASH_BIN) selftest selftest_broken memprobe noisetest noi
 	./ptreetest
 	./hashrectest
 	./walringtest
+	./rpcqtest
 	sh test/readmetest.sh
 	# cluster.c, upstream.c and verbs.c within their line budgets
 	sh test/sizeratchet.sh
@@ -949,7 +952,7 @@ CHECK_BINS = $(DASH_BIN) pagedump rollload selftest selftest_broken memprobe noi
 	clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest \
 	clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest \
 	clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest \
-	clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest clustersim \
+	clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest clustersim \
 	reachtest origintest indextest quiesctest regiontest tailflighttest legmetatest \
 	legwalkremovetest htfuzztest cellpoisontest chainhinttest clordertest draincarrytest chainwalktest wintest scanremovetest histtest capracetest verstamptest \
 	arenadbgtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc netcutshim.so lingershim.so threadfreeze clinject clapplytest \
@@ -997,6 +1000,7 @@ check-g-core1: check-edition-guard $(CHECK_BINS)
 	./ptreetest
 	./hashrectest
 	./walringtest
+	./rpcqtest
 	./clmaptest
 	./cltermtest
 	./clsynctest

@@ -221,8 +221,10 @@ size_t clwire_seal(const uint8_t *psk, const unsigned char *pt, size_t n,
 int clwire_open(const uint8_t *psk, const unsigned char *buf, size_t n,
 		unsigned char *pt, unsigned long long *ptlen)
 {
-	if (n < HDR_LEN + CLWIRE_TAG || buf[0] != PC_CL_MAGIC ||
-	        buf[1] != PC_CL_VER)
+	/* every caller's plaintext holds MAX_DGRAM + 16, and libsodium writes the whole length
+	 * even for a failed tag: a frame no sender makes is refused before it */
+	if (n < HDR_LEN + CLWIRE_TAG || n > HDR_LEN + MAX_DGRAM + CLWIRE_TAG ||
+	        buf[0] != PC_CL_MAGIC || buf[1] != PC_CL_VER)
 		return -1;
 	if (crypto_aead_xchacha20poly1305_ietf_decrypt(pt, ptlen, NULL,
 	        buf + HDR_LEN, n - HDR_LEN, buf, HDR_LEN, buf + CLWIRE_NONCE_OFF,
