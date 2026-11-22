@@ -17,10 +17,11 @@ secret equal to a client secret, a RESP listener off loopback without
 `resp_allow`, `spread` without `replicas`.  The ones with a RESP
 password or an HTTP token on a plaintext door off loopback (02, 05,
 08, 09, 11) pass with a warning that it travels in the clear: give the
-door `tls` (GUIDE.md, "TLS on the RESP and HTTP doors") or keep it on a
+door `tls` ([doc/config.md](../doc/config.md#other-settings-worth-knowing), "TLS on the RESP and HTTP doors") or keep it on a
 trusted segment.  The options, annotated, are in
 [perfcached.conf.example](perfcached.conf.example); what the
-sections mean is in [GUIDE.md](../GUIDE.md) under *Running it*.
+sections mean is in [doc/config.md](../doc/config.md), and how to use
+them in [GUIDE.md](../GUIDE.md).
 
 Two rules that every fleet example follows.  **The same file goes on
 every node** - membership is automatic, node ids are assigned by the
@@ -325,7 +326,7 @@ For clients that do not route - behind HAProxy or any VIP - use [an eager fleet]
 # rendezvous hashing, and the RESP door publishes the slot map (CLUSTER
 # SLOTS / SHARDS / KEYSLOT / NODES) so a cluster-aware Redis client
 # sends every key to its owner.  A plain client is forwarded, correctly
-# and slowly - see GUIDE.md's measured tables.
+# and slowly - see doc/benchmarks.md's measured tables.
 [daemon]
 workers = 8
 state_dir = /var/lib/perfcached

@@ -10012,7 +10012,7 @@ void gap_floor_over(const struct pc_ack_hole *h, long long death)
 		return;
 	C.st.acks_floors++;
 	C.st.gap_dead++;
-	/* store keeps a pulled copy's version until it expires (GUIDE): no pass to run */
+	/* store keeps a pulled copy's version until it expires (doc/concepts.md): no pass to run */
 	if (!C.cfg_eager) {
 		LM_NOTICE("cluster: origin %016llx's run %u is over and nobody "
 			"resends its deletes %llu..%llu - this node's mark floored "

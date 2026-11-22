@@ -661,8 +661,8 @@ buckets_log2 = 18
 #[collection counters]
 #buckets_log2 = 14
 
-# Read-through from a Redis upstream (GUIDE: "Read-through: taking over
-# from Redis").  A key this collection does not hold, matching one of the
+# Read-through from a Redis upstream (GUIDE.md: "Read-through: taking
+# over from Redis"; doc/upstream.md in full).  A key this collection does not hold, matching one of the
 # patterns, is read from the upstream on first use - never written to it.
 # A key the fleet writes or deletes is tracked in the companion collection
 # "tokens.nofall", created with it.  Point it at ONE replica (not a

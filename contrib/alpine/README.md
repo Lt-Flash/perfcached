@@ -12,7 +12,8 @@ until 0.6.x it packaged the client library alone):
   (`/etc/init.d/perfcached-dashboard`, its own account, not enabled);
 - `libperfd` - `libperfd.so.0`, and `libperfd-dev` - `perfd.h`,
   `libperfd.a`, the `.so` link and `libperfd.pc`;
-- `perfcached-doc` - GUIDE.md, PRODUCTION.md, the ChangeLog.
+- `perfcached-doc` - GUIDE.md and its reference documents (doc/),
+  PRODUCTION.md, the ChangeLog.
 
 The daemon packages write `/usr/share/perfcached/INSTALL-MODE` = `package`:
 the daemon's `upgrade_stage` then refuses, because `apk` upgrades it.  The

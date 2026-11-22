@@ -1,6 +1,6 @@
 # Measured results — the method, the discussion, the history
 
-[GUIDE.md](../GUIDE.md#measured) carries the tables and one reading each.  This file carries
+[doc/benchmarks.md](../doc/benchmarks.md) carries the tables and one reading each.  This file carries
 the rest: how every table was produced, how to reproduce it, what
 bounds each figure, and the readings that changed as the harnesses
 improved.  Every number here names the build it came from; quote from
@@ -112,7 +112,7 @@ idle box: this rig's run-to-run spread on a single unchanged arm is
 **The output.** `results.tsv` is one row per arm/clients/pipeline cell,
 with a header line naming the build, host, date and workload.  Column
 order is `arm, clients, pipeline, set_rps, get_rps, set_p50ms,
-get_p50ms, set_p99ms, get_p99ms`.  Every number in GUIDE.md's tables
+get_p50ms, set_p99ms, get_p99ms`.  Every number in doc/benchmarks.md's tables
 is one of those cells; the ratio columns are that cell divided by the
 `redis` row at the same clients and pipeline depth.
 
@@ -149,7 +149,7 @@ cores where a single-threaded Redis does not.  The first cross-host
 table (`bench/xhostbench.sh`, build `2db7baf`, `results/xhostbench.tsv`,
 median of 3, arms alternated so drift cannot favour either, MTU 9000
 verified end to end with `ping -M do -s 8972` before anything is
-trusted) is the one a deployment gets; GUIDE's table is the 0.4.0 run
+trusted) is the one a deployment gets; doc/benchmarks.md's table is the 0.4.0 run
 of the same script (`results/xhostbench-0.4.0.tsv`).  Two things to
 take from the first run rather than from the loopback tables:
 
@@ -219,7 +219,7 @@ modes that ran in it, eager and the start of proxy, were re-run:
 Every other mode's rows (single node, store, shard, spread, the routed
 Redis-client arms, and the cold-read rows for store, shard and spread)
 are the full sweep's, which ran outside the incident.  Each mode's
-"vs redis" in GUIDE.md is against its own run's Redis rows, since the
+"vs redis" in doc/benchmarks.md is against its own run's Redis rows, since the
 Redis reference itself moved 2-14% between runs.
 
 **The cold-read row for spread is the honest one now.**  0.4.0's
@@ -722,7 +722,7 @@ of 1 KB payloads to 8 subscribers, against 525-605k now.
 
 ## Against Redis Cluster on bare metal — the rig (2026-11-01)
 
-GUIDE's Redis Cluster table has no harness script in `bench/` yet: the
+doc/benchmarks.md's Redis Cluster table has no harness script in `bench/` yet: the
 run was driven by a lab script tied to its hosts, and the header of
 `results/redisx-0.7.4.tsv` records the rig.  Two bare-metal 2x E5-2690
 v2 hosts on 10G, root filesystems in RAM; three server slots, one per
@@ -784,7 +784,7 @@ the cells: `dropped`, `overruns` and `heals` 0 on every node,
 
 ## TLS on the RESP door — the rig (0.7.5)
 
-GUIDE's TLS table has no harness script in `bench/`; the header of
+doc/benchmarks.md's TLS table has no harness script in `bench/`; the header of
 `results/tlsbench-0.7.5.tsv` records the rig.  One node (`c611430e`,
 OpenSSL 3.5.7) on NUMA node 0 of a bare-metal 2x E5-2690 v2, 4
 workers, no WAL, serving a plaintext RESP door and a TLS one from the

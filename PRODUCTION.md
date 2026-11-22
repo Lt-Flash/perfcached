@@ -29,8 +29,8 @@ the "why" is the point, not the ceremony.
       0).  A reserved huge-page pool stays reserved whatever the arena
       returns, so the host gains nothing there.  `reclaim_floor_mb`
       keeps a floor resident.  `pin = no` (0.7.5) never locks the
-      arena, so the kernel may swap it (GUIDE.md, "Two ways to run the
-      memory").
+      arena, so the kernel may swap it ([doc/config.md](doc/config.md),
+      "Two ways to run the memory").
 
 ## 2. Huge pages
 
@@ -363,8 +363,8 @@ under `/opt/perfcached-<version>` behind the `/opt/perfcached` link: stage
 the signed build on one node (`perfcli upgrade-stage`, or the dashboard's
 "stage a build"), the fleet passes it on and verifies it, and the helper
 on each node switches the link and starts the new build when asked,
-switching back if it never reports ready (GUIDE.md, "The upgrade
-helper").  The same order applies: members first, the master last.
+switching back if it never reports ready ([doc/operations.md](doc/operations.md#upgrades),
+"The upgrade helper").  The same order applies: members first, the master last.
 
 **The wire epoch.**  A roll never changes what the fleet speaks on the
 wire: when every node runs a build that speaks a newer epoch beside the
@@ -373,8 +373,8 @@ old one, raise it with `perfcli -E <enable> upgrade commit epoch=<n>`
 cannot speak it; `stats` `cluster.epoch` shows `committed`, `min` and
 `max`).  **0.7.5 is no roll from 0.7.4:** it speaks epoch 4 alone, so
 stop every node (`perfcli -E <enable> fleetstop`), install 0.7.5
-everywhere and start them all - the state is kept (GUIDE.md, "0.7.5
-speaks wire epoch 4 alone").  Move clients to libperfd 0.7.6 or later
+everywhere and start them all - the state is kept ([doc/modes.md](doc/modes.md#builds-and-wire-epochs),
+"0.7.5 speaks wire epoch 4 alone"; [GUIDE.md](GUIDE.md#upgrade) has the steps).  Move clients to libperfd 0.7.6 or later
 with it: an older libperfd does not route by key against epoch 4, so
 every request takes the forward hop, and a value larger than a forward
 carries (58,000 bytes) is refused.

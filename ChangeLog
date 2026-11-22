@@ -133,7 +133,7 @@
           start warns when the NIC has fewer receive queues than workers
           or all interrupts on one CPU (alerts.host.link: rx_queues,
           irqs, irq_cpus, tcp_retrans_s).  [memory] pin = no runs the
-          arena unlocked (GUIDE.md, "Two ways to run the memory").
+          arena unlocked (doc/config.md, "Two ways to run the memory").
         * [tools] perfdump and perfload carry every record type (a hash
           came back a string) and records over 64 KB; perfcli jget
           prints valid JSON; upgrade plan prints -h HOST -p PORT;

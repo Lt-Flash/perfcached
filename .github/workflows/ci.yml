@@ -16,11 +16,10 @@ on:
 
 jobs:
   # The ratchet: "pushed = check-green" without human discipline.
-  # As SEVEN suite groups (Makefile CHECK_GROUPS), one job each, as on
-  # GitLab (2026-10-03: the single check took 87.5 of its 90 minutes on
-  # v0.4.1 and outgrew it on 0.4.2).  fail-fast off: every group reports.
-  # the GitLab runner (a shell executor on Debian 13, kernel 6.12)
-  # runs every suite on the io_uring backend - check and check-asan both.
+  # As SEVEN suite groups (Makefile CHECK_GROUPS), one job each (the single
+  # check outgrew its 90 minutes).  fail-fast off: every group reports.
+  # A Debian 13 host (kernel 6.12) runs every suite on the io_uring
+  # backend - check and check-asan both.
   # Here the startup check is told to refuse it, so the same suites run
   # on the epoll fallback: each release is green on BOTH backends.
   check:

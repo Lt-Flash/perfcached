@@ -9,7 +9,7 @@ not from memory.  What is not here is not supported, and a client gets
 `-ERR unknown command 'x'` for it.
 
 One exception, from 0.6.2: on a collection that writes through to a
-Redis upstream (`upstream_writes = through`, GUIDE.md "Write-through")
+Redis upstream (`upstream_writes = through`, [doc/upstream.md](doc/upstream.md#write-through))
 with `upstream_unknown = pass`, a command not on this page is classed by
 that Redis and passed to it, and the client gets Redis's own reply.
 
@@ -269,7 +269,7 @@ The door publishes the topology a Redis Cluster client expects, over a
 Redis-compatible slot: `crc16(key) % 16384`, with `{hash tags}` handled
 including the edge cases.  A cluster-aware client therefore places keys
 itself and sends each to its owner - the measured difference is in
-[GUIDE.md](GUIDE.md#measured).  A node forwards a key it does not own,
+[doc/benchmarks.md](doc/benchmarks.md).  A node forwards a key it does not own,
 or answers `-MOVED` with `resp_redirect = moved` (above).
 
 | command | reply | notes |

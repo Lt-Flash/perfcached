@@ -6,190 +6,291 @@
   <br>libperfd
 </h1>
 
-The client library for perfcached, as a self-contained export: a C API
-over the native binary protocol (the fixed-layout data verbs and
-`PC_VERB_CMD`, whose parameters and reply are trees - `src/ptree.[ch]`
-in the source tree), with the Noise handshake, the slot placement and
-the key mixing the daemon uses, so a client can place keys itself.
-JSON appears only at the API edge (`perfd_command` and friends take and
-return JSON text; the library converts), never on the wire.
+The C client for perfcached: **libperfd 0.7.6**, for perfcached 0.7.5.
+Blocking calls with one thread per handle, pipelining, an opt-in
+event-loop surface, and a handle that follows the fleet - standby
+connections, failover, routing each key to its node.  It speaks the
+native binary protocol behind the Noise handshake, with the slot
+placement and key mixing the daemon uses, so a client can place keys
+itself.  JSON appears only at the API edge (`perfd_command` and friends), never on the wire.  The API
+is [perfd.h](perfd.h); this page is the tour.
 
-## Building and linking
+## Build and link
 
-`make libperfd.a libperfd.so` builds both from the same MIT sources;
-`make install-lib` (and `make install`, which runs it) puts
-`libperfd.so.<version>` (SONAME `libperfd.so.0`), `libperfd.a`,
-`perfd.h` and `lib/pkgconfig/libperfd.pc` under the prefix
-(`PREFIX`, `/usr/local` by default; run `ldconfig` after installing
-there).  `perfd.h` is the only header installed: `src/ptree.h`, which
-the tree forms (`perfd_command_tree` and friends) need, stays in the
-source tree, and `libperfd.so` exports no tree functions.  The Debian
-packages split it: `libperfd0` holds the shared library, `libperfd-dev`
-the header, the archive, the development link and the `.pc`, under
-`/usr`.  Link with pkg-config, shared by default:
+Packages: `libperfd0` (the shared library, SONAME `libperfd.so.0`) and
+`libperfd-dev` (`perfd.h`, `libperfd.a`, the development link and
+`libperfd.pc`).  From a perfcached tree: `make libperfd.a libperfd.so`,
+and `make install-lib` (also run by `make install`) installs them under
+`PREFIX` (`/usr/local` by default; run `ldconfig` after).
 
 ```
 cc -o app app.c $(pkg-config --cflags --libs libperfd)                # shared
 cc -o app app.c $(pkg-config --cflags libperfd) $(pkg-config --variable=libdir libperfd)/libperfd.a -lsodium -lpthread   # static
 ```
 
-The SONAME changes only when the ABI breaks (a symbol removed, a struct
-reshaped); a new library version with the same SONAME is a drop-in
-replacement - install it and restart the program.  That holds because:
+`PERFD_VERSION` is the version you compiled against, `perfd_version()`
+the one you linked - compare them to catch a stale archive.  A newer
+library with the same SONAME is a drop-in: install it and restart the
+program ([ABI](#abi)).
 
-- `perfd_opts` carries its size: initialise it with `PERFD_OPTS_INIT`
-  (or `perfd_opts_init()` from C++ or FFI) and the library reads only
-  the fields your build knows;
+## Connect, set, get
+
+```c
+#include <perfd.h>
+#include <stdio.h>
+
+int main(void)
+{
+	const char *secrets[] = { "client-secret-example", NULL };
+	perfd_opts o = PERFD_OPTS_INIT;
+	o.secrets = secrets;
+
+	perfd_t *p = perfd_connect("192.0.2.11", 6479, &o);
+	if (!p) {
+		fprintf(stderr, "connect: %s\n", perfd_error(NULL));
+		return 1;
+	}
+	if (perfd_set(p, "sessions", "user:17", "hello", 5, 300) != 0)
+		fprintf(stderr, "set: %s\n", perfd_error(p));
+
+	void *val; size_t vlen; long long ttl;
+	int r = perfd_get(p, "sessions", "user:17", &val, &vlen, &ttl);
+	if (r == 1) {                       /* 1 found, 0 miss, -1 error */
+		printf("%.*s ttl %lld\n", (int)vlen, (char *)val, ttl);
+		perfd_free_value(val);
+	}
+	perfd_free(p);
+	return 0;
+}
+```
+
+`secrets` is a NULL-terminated list tried in order, so a secret rotates
+by adding the new one first and dropping the old one later; NULL means
+plaintext, for a `plaintext = loopback` door.  Deriving a secret's key
+costs about 150 ms of CPU and a 64 MiB mapping (Argon2id, on purpose);
+the library does it once per secret per process, and a server that
+forks can call `perfd_psk_prepare(secrets)` in the parent so no worker
+derives.  `perfd_connect_unix(path, &o)` dials a Unix socket.
+
+## The options
+
+`perfd_opts`, initialised with `PERFD_OPTS_INIT` (or
+`perfd_opts_init(&o)`; C++ and FFI callers `perfd_opts_init_sz()`); a
+field left 0 takes its default.
+
+| option | default | what it does |
+|---|---|---|
+| `secrets` | NULL (plaintext) | client secrets, tried in order |
+| `connect_timeout_ms` | 5000 | the whole dial, TCP and handshake |
+| `io_timeout_ms` | 5000 | each send and receive |
+| `policy` | `PERFD_POLICY_FAILOVER` | where the handle works: `FAILOVER` stays where it connected; `ROUND_ROBIN` (random start per client), `LEAST_CONN` (most free arena) and `WEIGHTED` (random by free bytes) spread, and move one handle in N to a member that comes up, at its next call |
+| `spares` | 0 = one standby per other member (at most 8) | standby connections; `PERFD_SPARES_NONE` = a bare handle that learns no fleet |
+| `refresh_ms` | 30000 | how often the member list is learned again |
+| `route_keys` | 0 | 1 = send each request to the node that holds its key (`shard`, `spread`, `store`) |
+| `route_hints` | 0 | 1 = in `proxy` mode, remember which node answered each key |
+| `encrypt` | 0 | 0 = ask the node for plaintext after the handshake (the node may refuse, `[listen] encrypt = yes`); 1 = stay encrypted - `perfd_enable` needs it |
+| `pin` | 0 | 1 = every call goes to the node dialled: the fleet is still learned (`perfd_member_*`), but no policy, routing, refusal, dead link or expulsion moves the handle, and `perfd_redial` comes back to that node only (perfcli pins) |
+| `name` | NULL | the name the handle's connections carry on the daemon (`clients`, log lines); printable ASCII, no spaces or quotes, at most 47 characters |
+| `keepalive_s` | 30 (-1 off) | TCP keepalive idle |
+| `idle_ping_ms` | 30000 (-1 off) | a ping on an idle standby; one that fails is retired |
+| `worker_balance` | 0 = on (-1 off) | the kernel gives a connection to one daemon worker by hashing its addresses, for its life; after connecting, the handle asks the daemon (`conninfo`) and dials again (a new source port, up to eight times) while its worker holds more than one connection beyond the least-loaded one - standbys too; Unix sockets and `perfd_connect_async` stay as they land |
+| `eager_push` | 0 | event loop: 1 = write inside every `perfd_submit()` |
+
+## The calls
+
+Every typed call returns -1 on an error (`perfd_error(p)` says why), else
+the value below.  Values are binary-safe; a buffer the library hands out
+is released with `perfd_free_value()`, never libc `free()`.
+
+| call | returns |
+|---|---|
+| `perfd_set(p, col, key, val, vlen, ttl)` | 0 |
+| `perfd_set_cond(..., PERFD_NX \| PERFD_XX)` | 1 stored, 0 declined (the lock idiom) |
+| `perfd_set_if` / `perfd_del_if` (`IFEQ`, `IFNE`) | 1 applied, 0 did not hold |
+| `perfd_get(p, col, key, &val, &vlen, &ttl)` | 1 found (`ttl` -1 = no expiry), 0 miss |
+| `perfd_get_buf`, `perfd_jget_buf`, `perfd_hget_buf` | as `get`, into your buffer: -2 too small (`*vlen` = size needed) - a read that allocates nothing |
+| `perfd_del` | 1 deleted, 0 absent |
+| `perfd_exists` | 1 / 0 |
+| `perfd_ttl` | seconds left, -1 no expiry, -2 no such key (an error is also -1: check `perfd_error_kind`) |
+| `perfd_expire` | 0 the key existed, 1 no such key |
+| `perfd_add` / `perfd_sub` | 0, the new value in `*newval` |
+| `perfd_hset`, `hsetnx`, `hget`, `hdel`, `hexists`, `hlen`, `hincrby`, `hgetall` | as Redis's hash commands; `hgetall` calls you back per field |
+| `perfd_jget`, `jset`, `jdel`, `jincr` | JSON path verbs; fragments travel as JSON text, a NULL path is `$` |
+| `perfd_rl_hit(p, col, key, window_ms, limit, &count)` | 1 within the limit, 0 over (a sliding-window rate limit) |
+| `perfd_keys(p, col, match, limit, &keys)` | the count (`perfd_free_keys` after) |
+| `perfd_ping` | 0 |
+| `perfd_publish`, `perfd_subscribe`, `perfd_psubscribe` and the unsubscribes | pub/sub; deliveries reach the notify hook |
+| `perfd_command(p, method, params_json)` | any method, the reply as JSON text |
+
+**Several keys.**  `perfd_mget` asks one node for many keys; the node
+looks up the ones it does not hold on the nodes that do, all at once
+under one deadline.  A key whose node did not answer in time fails the
+whole call with `PERFD_E_REFUSED` - retry - never reads as a miss.
+`perfd_mget_ex` gives each key its own status instead
+(`PERFD_MGET_FOUND`, `PERFD_MGET_ABSENT`, `PERFD_MGET_UNANSWERED`), so
+only the unanswered ones need asking again.
+
+**Pipelining.**  `perfd_append()` queues requests, `perfd_flush()`
+writes them, `perfd_next_reply()` returns each reply in request order
+(NULL with `perfd_error` for an error); typed calls in between are
+refused.  `perfd_append_tree` and friends are the byte-exact tree forms
+(`src/ptree.h`, in the static archive only).
+
+## The event loop
+
+`perfd_connect_async()` returns a handle in `PERFD_ST_CONNECTING`.
+Watch `perfd_fd(p)` for `perfd_events(p)` (re-read after every call),
+call `perfd_read_ready()` / `perfd_write_ready()`, and once
+`perfd_state(p)` is `PERFD_ST_READY` submit:
+
+```c
+perfd_submit_kv(p, PERFD_V_SET, "sessions", "user:17", "hello", 5, 0, 300, done, ctx);
+perfd_submit(p, "stats", NULL, done, ctx);   /* any method; reply as JSON text */
+```
+
+The callback owns `result` (`perfd_free_value`); NULL means failed and
+`errmsg` says why.  Replies arrive in arrival order; nothing blocks and
+nothing calls back from a thread of its own.  `perfd_push()` writes what
+`perfd_submit()` queued when `eager_push` is 0.  An async handle opens no
+standbys: to route by key, keep a handle per node and pick it with
+`perfd_owner_of()`.  An async handle that routes by key learns the fleet again every
+`refresh_ms`, and at once after a membership push counts another fleet than its own; a member
+that joins or turns ready opens no standby behind its caller, who polls
+one fd.
+
+## In a fleet
+
+By default a handle learns the members on connect and keeps a standby
+connection to the others, so losing its node costs a `send()` on an
+established socket, not a new handshake.
+
+- **Moving.**  A `ROUND_ROBIN`, `LEAST_CONN` or `WEIGHTED` handle moves
+  while connected: one handle in N goes to a member that comes up, at
+  its next call, and a handle leaves a member that stops serving.  A
+  member starting, recovering, healing, failed or stalled stays in the
+  handle's table and gets no traffic.  `FAILOVER` stays where it
+  connected; a handle routing by key follows the owner; one holding
+  subscriptions stays with them.  The daemon tells its clients when its
+  state changes, so handles leave a FAILED or HEALING node on the next
+  beat.  A standby's dial runs in the maintenance after a call, never
+  holding the caller; a new handle waits briefly for the standbys that
+  answer.
+- **Failover.**  Idempotent calls are replayed on the new node;
+  `perfd_add`/`perfd_sub`, conditional sets, hash writes and rate-limit
+  hits are not - the caller gets the error, because a double increment
+  is worse than a visible one.  A routed counter update whose standby
+  dies mid-request fails with `PERFD_E_TRANSPORT` rather than risk a
+  second apply.
+- **Refusals that applied nothing** - a node not READY (recovering,
+  connecting), FAILED or HEALING, or a `forward failed` - are
+  `PERFD_E_REFUSED`, and the handle takes the call to another member at
+  once, whatever the verb, marking the refusing one down until it is
+  ready.  A handle holding subscriptions stays put.  A re-send that
+  fails too reports both members' answers, the first's first.
+- **Dead links.**  Before sending on a link quiet for 100 ms the handle
+  checks it, so a link a restart closed is replaced before anything is
+  sent (a pinned handle fails with `PERFD_E_TRANSPORT`, nothing sent).
+  A replaced link - closed while idle, or its node expelled - raises
+  privilege again before the call.
+- **Routing.**  With `route_keys = 1` each request goes to its key's
+  node and the daemon's forward hop disappears; a wrong guess is
+  forwarded, never wrong (`perfd_route_missed()` counts the forwards; a
+  reply that says the handle is behind makes it re-learn the members,
+  `perfd_moved_hints()`).  `proxy` keys are not computable:
+  `route_hints = 1` remembers who answered each key in a fixed 4,096-entry
+  table (`perfd_hint_hits()`, `perfd_hint_stale()`).  libperfd 0.7.6
+  routes against perfcached 0.7.5 (wire epoch 4); `perfd_wire_epoch()`
+  shows what the daemon advertised.
+- **A frozen member** that accepts the connection and says nothing costs
+  at most `connect_timeout_ms`, reported as `PERFD_E_TRANSPORT`.
+- **Watch it**: `perfd_member_count`, `perfd_member_info`,
+  `perfd_member_state` (active, standby, down with why, not-ready,
+  idle), `perfd_active_node`, `perfd_spare_count`, `perfd_failovers`,
+  `perfd_server_version`, `perfd_routing`.
+- **An idle handle acts on nothing**: call `perfd_maintain(p)` from a
+  timer, a few times a second, to drain pushes and re-dial down members.
+  A handle that FAILED is poisoned; `perfd_redial(p)` tries the members
+  it learned, the seed last.
+
+**Notifications.**  `perfd_set_notify(p, cb, ctx)` hands the hook every
+push as JSON text (not NUL-terminated, valid during the call):
+
+- membership: `{"notify":"membership","event":"joined"|"expelled"|"state","addr","port","node","identity","members","state"}` -
+  the handle has already acted (dialled the newcomer, dropped the
+  expelled one) when the hook sees it;
+- pub/sub: `{"method":"message","params":{"channel","payload"}}` and
+  `{"method":"pmessage","params":{"pattern","channel","payload"}}`.  A
+  payload that is not UTF-8 shows U+FFFD in the hook's text; binary
+  payloads go over UDP pub/sub (`perfd_pubsub_udp()`, then
+  `perfd_pubsub_udp_ready()` on readability and at least once a second;
+  [doc/clients.md](../doc/clients.md#redis-pubsub)).
+
+## Errors
+
+Branch on `perfd_error_kind(p)`, never on the text:
+
+| kind | meaning |
+|---|---|
+| `PERFD_E_TRANSPORT` | connect, send, receive, a lost connection (the handle is poisoned) |
+| `PERFD_E_AUTH` | the handshake: wrong or missing secret |
+| `PERFD_E_REFUSED` | the daemon applied nothing: limits, not READY, busy, a forward lost, an mget timeout - retry |
+| `PERFD_E_SERVER` | any other error the daemon answered (`value too large`, ...) |
+| `PERFD_E_ARG` | a bad argument |
+| `PERFD_E_NOMEM` | out of memory, or the crypto library failed |
+| `PERFD_E_PROTOCOL` | a reply the library could not read |
+| `PERFD_E_STATE` | the call does not fit the handle's state (`perfd_enable` on a plaintext link, a typed call inside a pipeline) |
+
+`perfd_set_log(cb, ctx)`, set once before the first connect, takes the
+library's log lines (errors go to stderr otherwise).
+
+## Privilege and the admin verbs
+
+`perfd_enable(p, "<enable secret>")` raises privilege on a handle with
+`encrypt = 1` (on a plaintext link it fails with `PERFD_E_STATE` and the
+secret is not sent); the handle raises it again by itself after a
+re-dial, and an `enable` or `disable` sent through `perfd_command` is
+kept the same way.
+
+The operations verbs answer the daemon's reply as JSON text
+(`perfd_free_value`) or NULL with its words in `perfd_error()`:
+`perfd_stats(p, col)`, `perfd_members`, `perfd_clients(p, cap)`,
+`perfd_collections`, `perfd_create`, `perfd_drop`, `perfd_resize`,
+`perfd_rename`, `perfd_map` / `perfd_unmap` / `perfd_maps` (the RESP
+door's database map on the running fleet), `perfd_reset_stats` and
+`perfd_reset_stats_fleet` (this node and every live peer as of one
+moment), `perfd_save`, `perfd_sync`, `perfd_load`, `perfd_mailtest`,
+`perfd_upfill` / `perfd_updrain` (`PERFD_SWEEP_RUN`, `_CHECK`, `_STOP`),
+`perfd_cluster_epoch_commit`, `perfd_upgrade_status`,
+`perfd_upgrade_switch(p, sha256, force)`, `perfd_upgrade_revert(p,
+force)` and `perfd_fleetstop(p, timeout_ms)` (it answers once the peers
+have gone - give the handle an io timeout above it).  The DDL, `map`,
+`unmap`, `fleetstop` and `mailtest` need `perfd_enable` first; create,
+drop, rename, map and unmap also `[daemon] allow_create = yes` on the
+node.  `perfd_upgrade_stage` ships a release artifact - begin, 192 KB
+chunks, end - with an optional 64-byte ed25519 signature and a progress
+callback; `perfd_upgrade_stage_file` does it from a file with
+`<path>.sig` beside it (a package install refuses it).  perfcli and
+perfcached-dashboard are built on these calls.
+
+## ABI
+
+The SONAME changes only when the ABI breaks.  A newer library with the
+same SONAME runs an older program because:
+
+- `perfd_opts` carries its size (`PERFD_OPTS_INIT`), and the library
+  reads only the fields the program's build knows;
 - every buffer the library hands out is released with
-  `perfd_free_value()`, never libc `free()`;
-- errors carry a kind, `perfd_error_kind()` - branch on that, not on the
-  text;
-- the library logs through `perfd_set_log()` if you give it a callback
-  (errors to stderr otherwise);
+  `perfd_free_value()`;
+- errors carry a kind (`perfd_error_kind()`);
+- the library logs only through `perfd_set_log()` or to stderr;
 - it exports `perfd_*` and nothing else.
 
 `test/abitest.sh` holds the shared library to that: a caller built
 against the frozen header of its SONAME (`test/abi/`) must still run
 against what the tree builds, and no exported symbol may disappear.
-
-### Reads that allocate nothing (libperfd 0.6.0)
-
-`perfd_get`, `perfd_jget` and `perfd_hget` hand back a value the
-library allocated.  Their `_buf` twins - `perfd_get_buf`,
-`perfd_jget_buf`, `perfd_hget_buf` (`PERFD_HAS_GET_BUF`) - copy it into a
-buffer you own instead, so a read on a warm handle allocates nothing:
-1 found, 0 absent, -1 error, and -2 when the buffer is too small, with
-`*vlen` set to the size needed and the buffer left as it was.  The copy is
-binary-safe and not NUL-terminated.
-
-### A multi-key read across a fleet (libperfd 0.7.2)
-
-`perfd_mget` asks one node for many keys; the node looks up the ones it
-does not hold on the nodes that do, all at once and under one deadline.
-A key whose node did not answer in time fails the whole call
-(`PERFD_E_REFUSED`: retry), never as a miss.  `perfd_mget_ex`
-(`PERFD_HAS_MGET_EX`) says it per key instead: `PERFD_MGET_FOUND`,
-`PERFD_MGET_ABSENT` or `PERFD_MGET_UNANSWERED` in a `status` array the
-caller passes, so the answered keys are kept and only the unanswered
-ones need asking again.
-
-### Connections spread over the daemon's workers (libperfd 0.7.4)
-
-The kernel gives each new connection to one of the daemon's workers by
-hashing its addresses, and a connection stays on that worker for its life.
-A client that opens a few long-lived connections - one per process of a
-proxy, say - can find two on one worker and none on another.  After it
-connects, a handle asks the daemon (`conninfo`) how many connections each
-worker holds; while its own worker holds more than one beyond the
-least-loaded one, it dials again (a new source port hashes elsewhere) and
-keeps a connection that landed well, trying up to eight times a worker.
-Standby connections are placed the same way.  It is on by default;
-`opts.worker_balance = -1` turns it off.  A daemon older than 0.7.4, a
-Unix-socket connection, and the event-loop connect (`perfd_connect_async`)
-are left as they land.
-
-### Plaintext after the handshake (libperfd 0.7.4)
-
-After the Noise handshake a handle asks the node to carry its requests in
-the clear - still authenticated by the handshake, but readable on the
-network.  A node with `[listen] encrypt = yes`, or one older than 0.7.4,
-keeps the connection encrypted.  `opts.encrypt = 1` never asks, and
-`perfd_enable` needs it: on a connection in the clear it fails with
-`PERFD_E_STATE` and the enable secret is not sent.
-
-### Handles that follow the fleet (libperfd 0.7.5)
-
-A handle with `PERFD_POLICY_ROUND_ROBIN`, `LEAST_CONN` or `WEIGHTED` used to
-choose its member only at connect.  It now moves while connected: when a
-member comes up, one handle in N goes to it at its next call, so the shares
-even out with no rush, and a handle leaves a member that stops serving.  A
-member starting, recovering, healing, failed or stalled stays in the handle's
-table and gets no traffic.  `PERFD_POLICY_FAILOVER`, the default, stays where
-it connected; a handle routing by key follows the owner instead, and one
-holding subscriptions stays with them.
-
-A member can take the connection and then say nothing, as a frozen daemon's
-kernel does.  A standby's dial runs in the maintenance after a call, so it no
-longer holds the caller; a new handle waits briefly for the standbys that
-answer.  `connect_timeout_ms` bounds the whole dial, TCP and handshake, within
-`io_timeout_ms`, and no answer is `PERFD_E_TRANSPORT`, not `PERFD_E_AUTH`.
-
-### Refusals and closed links (libperfd 0.7.6)
-
-A write refused by a node that is FAILED or HEALING applied nothing, as a
-not-READY refusal does: the handle moves to another member at once,
-whatever the verb, and both refusals are `PERFD_E_REFUSED` now, not
-`PERFD_E_SERVER`.  So is the daemon's `forward failed`: the node answers
-it before the forward is sent, so nothing was applied - retry.  A handle
-that holds subscriptions is not moved by a refusal, which would end them
-unsaid.
-
-Before it sends on a link that has been quiet for 100 ms, a handle looks
-at it: a link a restart closed is replaced before anything is sent, so
-even a counter update moves (a pinned handle fails with
-`PERFD_E_TRANSPORT`, nothing sent).  A routed counter update
-(`perfd_add`, `perfd_sub`) whose standby dies mid-request is not sent
-again on the active link - it may have been applied - and fails with
-`PERFD_E_TRANSPORT`, as one on a lost active link does.
-
-An event-loop handle that routes by key learns the fleet again every
-`refresh_ms`, and at once after a membership push counts another fleet
-than its own; a member that joins or turns ready opens no standby behind
-its caller, who polls one fd.  The daemon (0.7.5) tells its own clients
-when its state changes, so handles leave a FAILED or HEALING node on the
-next beat, not at the member-list refresh.
-
-A link replaced before a call - closed while idle, or its node expelled -
-is named and raised again as every other move is, so a privileged call
-after a quiet node's restart carries the privilege the handle raised.
-
-libperfd 0.7.6 routes by key against perfcached 0.7.5, which speaks cluster
-wire epoch 4 alone, and against nothing older.  An older libperfd does
-not route against 0.7.5: every request takes the forward hop, and a
-value larger than a forward carries (58,000 bytes) is refused.
-
-### Notifications
-
-`perfd_set_notify(p, cb, ctx)` hands the hook every push the daemon
-sends, as JSON text:
-
-- membership - `{"notify":"membership","event":"joined"|"expelled"|"state",
-  "addr","port","node","identity","members","state"}` - when a node joins,
-  is expelled or changes state (`recovering`, `ready`, `draining`, ...).
-  The handle acts first - a blocking handle dials a newcomer, every handle
-  drops an expelled member's connection, standby and routing weight - and
-  the hook sees it after.
-- pub/sub deliveries - `{"method":"message","params":{"channel","payload"}}`
-  and `{"method":"pmessage","params":{"pattern","channel","payload"}}`.  The
-  payload is bytes on the wire; in the hook's text a payload that is not
-  UTF-8 shows U+FFFD in place of the bad bytes, so binary payloads go over
-  UDP pub/sub or are kept UTF-8.
-
-A handle with no traffic acts on nothing: call `perfd_maintain()` from a
-timer, a few times a second, to drain pushes and run the recovery without
-a request.
-
-### The admin verbs (libperfd 0.6.6)
-
-The upgrade's staging (0.7.0): `perfd_upgrade_stage` ships a release artifact's bytes to the node - begin, 192 KB chunks, end - with an optional 64-byte ed25519 signature and a progress callback, answering the end reply (`sha256`, `signer`, `relayed_to`, `older_members`); `perfd_upgrade_stage_file` does it from a file with `<path>.sig` beside it.  Privileged; a package install refuses it.  `perfcli upgrade-stage` is this call.
-
-The operations verbs (0.7.0): `perfd_collections`, `perfd_create`, `perfd_drop`, `perfd_resize`, `perfd_rename`, `perfd_map` / `perfd_unmap` / `perfd_maps` (0.7.1: the RESP door's DB-index map on the running fleet), `perfd_reset_stats` (and `perfd_reset_stats_fleet`, 0.7.0: this node and every live peer as of one moment - the dashboard's button), `perfd_save`, `perfd_sync`, `perfd_load`, `perfd_mailtest`, `perfd_upgrade_status`, `perfd_upgrade_revert` (0.7.0: `force` as an int), `perfd_upgrade_switch` (0.7.0: the staged build's sha256, `force`), `perfd_fleetstop` - each answers the daemon's reply as JSON text (free it with `perfd_free_value`) or NULL with the daemon's words in `perfd_error()`; the DDL (map and unmap included), `fleetstop` and `mailtest` need `perfd_enable` first, and create, drop, rename, map and unmap also `[daemon] allow_create = yes` on the node asked.  `perfd_fleetstop` answers once the peers have gone - give the handle an io timeout above its `timeout_ms`.
-
-`perfd_opts.name` (0.7.0): the name the handle's connections carry on the daemon - sent after every dial and re-dial, shown by `clients`, and printed in the node's enable, sweep and reset log lines as `name@ip:port`.  A courtesy, not a capability: an older daemon's refusal is not reported.
-
-`perfd_opts.pin` (0.7.6): every call goes to the node the handle dialled.  The fleet is still learned (`perfd_member_*`), but no policy, key routing, not-READY refusal, dead link or expulsion moves the handle, and `perfd_redial` comes back to that node only - its answer is the caller's.  perfcli pins.  An unpinned handle that moves on a refusal or a dead link raises privilege again on the adopted link before the re-send, and a re-send that fails too reports both members' answers, the first's first.
-
-What perfcli and perfcached-dashboard need, typed, so neither builds a
-request by hand: `perfd_stats(p, col)`, `perfd_members(p)` and
-`perfd_clients(p, cap)` answer the trees the status page reads, rendered
-as JSON text (free with `perfd_free_value`); `perfd_enable(p, secret)`
-raises privilege on a handle with `opts.encrypt = 1`, and the handle
-raises it again by itself after a
-re-dial (0.7.6: so does an `enable` sent with `perfd_command`, and a
-`disable` sent there stops it); `perfd_cluster_epoch_commit(p, epoch)` asks the master to commit the
-fleet's wire epoch (0.7.1); `perfd_upfill(p, col, what)` and `perfd_updrain(p, col, what)`
-run, check (upfill) or stop a sweep.  A refusal comes back as NULL or -1
-with the daemon's words in `perfd_error(p)`.
+`perfd.h` is the only header installed; `src/ptree.h`, which the tree
+forms need, stays in the source tree, and `libperfd.so` exports no tree
+functions.
 
 ## Licence
 
@@ -197,24 +298,19 @@ with the daemon's words in `perfd_error(p)`.
 from: `PERFD_SRCS` in the Makefile and every file the compiler reads for
 them (`make print-libperfd` gives the sources and flags).
 `test/mitboundtest.sh`, in `make check-fast`, asks the compiler for that
-list on every push and fails if any file in it lacks an
-`SPDX-License-Identifier: MIT` line, or if the archive holds an object not
-built from `PERFD_SRCS`.
+list and fails if any file in it lacks an `SPDX-License-Identifier: MIT`
+line, or if the archive holds an object not built from `PERFD_SRCS`.
 
 The sources the library shares with the daemon log through
 `#include <compat/dprint.h>`; the include path picks the logger -
 `lib/shim/compat/dprint.h` (MIT, through `lib/perfd-log.c`) for the
 library, the daemon's GPL `src/compat/dprint.h` for the daemon.  The
-library's build never opens the daemon's file.  Before 0.5.0 the archive
-carried the daemon's GPL `compat.o`: a crossing in the shipped `.a`, found
-while building the shared library.
+library's build never opens the daemon's file.
 
-Consumers link the installed library; none carries a
-copy of its source.  The one third-party dependency is libsodium (ISC) -
-see `NOTICE`.  Effective licence of a redistributed libperfd: MIT plus
-that notice.
-
-## Where the rest lives
+Consumers link the installed library; none carries a copy of its
+source.  The one third-party dependency is libsodium (ISC) - see
+`NOTICE`.  Effective licence of a redistributed libperfd: MIT plus that
+notice.
 
 The daemon, the cluster plane and everything else under `src/` are
 GPL-2.0-or-later (`COPYING` at the repository root).  A header that

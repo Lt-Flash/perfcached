@@ -55,6 +55,9 @@ package() {
 	install -Dm644 "$builddir"/LICENSING.md "$pkgdir"/usr/share/licenses/$pkgname/LICENSING.md
 	install -Dm644 "$builddir"/GUIDE.md "$pkgdir"/usr/share/doc/$pkgname/GUIDE.md
 	install -Dm644 "$builddir"/PRODUCTION.md "$pkgdir"/usr/share/doc/$pkgname/PRODUCTION.md
+	for _d in building concepts config cluster modes durability upstream sizing operations alerts tools clients benchmarks compatibility perfdump-format; do
+		install -Dm644 "$builddir"/doc/$_d.md "$pkgdir"/usr/share/doc/$pkgname/doc/$_d.md
+	done
 	install -Dm644 "$builddir"/ChangeLog "$pkgdir"/usr/share/doc/$pkgname/ChangeLog
 }
 

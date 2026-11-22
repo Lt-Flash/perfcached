@@ -8,7 +8,7 @@ to the binary request before anything is sent). This page is every
 command perfcli understands as a word: its accepted arguments, what it
 prints, and where the word-command form is thinner than the method
 underneath it - read out of `cli/perfcli.c`'s argument builder and
-`src/verbs.c`'s handlers, not from memory or GUIDE.md's shorter tour. A
+`src/verbs.c`'s handlers, not from memory or doc/tools.md's shorter tour. A
 method usually takes more parameters than perfcli wires up as words;
 every table below says so where it matters, with the `-j` form that
 reaches the rest.
@@ -438,8 +438,8 @@ all):
 
 - **`dump`/`restore`** are `perfdump`/`perfload`'s own wire protocol - a
   chunked, cursor-driven bulk transfer shaped for a parallel dumper, not
-  a hand-typed command. Use [`perfdump`](GUIDE.md#perfdump) and
-  [`perfload`](GUIDE.md#perfload) instead of `-j`-ing these directly;
+  a hand-typed command. Use [`perfdump`](doc/tools.md#perfdump) and
+  [`perfload`](doc/tools.md#perfload) instead of `-j`-ing these directly;
   the format is documented in
   [doc/perfdump-format.md](doc/perfdump-format.md).
 - **`setnx`, `setxx`, `setifeq`, `setifne`, `delifeq`, `delifne`** -
@@ -498,7 +498,7 @@ above).
 
 ## See also
 
-- [GUIDE.md](GUIDE.md#tools) - perfcli in context next to `perfdump`/`perfload`/libperfd
+- [doc/tools.md](doc/tools.md) - perfcli in context next to `perfdump`/`perfload`/libperfd
 - [REDIS-COMMANDS.md](REDIS-COMMANDS.md) - the RESP-compatible door, a different listener and protocol
 - [doc/perfdump-format.md](doc/perfdump-format.md) - the bulk-transfer file format `dump`/`restore` serve
 - `cli/perfcli.c`, `src/verbs.c` - source of everything on this page

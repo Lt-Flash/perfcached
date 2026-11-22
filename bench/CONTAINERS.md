@@ -188,7 +188,7 @@ daemons: `b` answers the read-scaling question (how a cold replica
 warms, what warm local reads cost), `px` answers the capacity question
 (how 200k keys written through one node end up level across three, and
 what a read through a non-holder costs).  These configs use the legacy
-per-collection `mode =` (accepted with a warning - GUIDE.md, "One
+per-collection `mode =` (accepted with a warning - doc/cluster.md, "One
 cluster is one mode"); a deployment declares one `[cluster] mode` over
 `collections`, and two modes are two fleets.
 

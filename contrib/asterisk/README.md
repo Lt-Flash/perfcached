@@ -1,7 +1,9 @@
 # func_perfd - perfcached from the Asterisk dialplan
 
-An optional Asterisk module with four dialplan functions that read and write
-perfcached - or a standalone Redis - through a pool of connections:
+An optional Asterisk module (Asterisk 22.10.1) with four dialplan
+functions that read and write perfcached 0.7.5 - or a standalone Redis -
+through a pool of connections.  It links libperfd 0.7.6; it carries no
+copy of it.
 
 | Function | Use | Returns |
 |---|---|---|
@@ -11,42 +13,17 @@ perfcached - or a standalone Redis - through a pool of connections:
 | `PERFD_DELETE(collection,key)` | read (deletes) or write (value ignored) | `1` removed, `0` absent |
 
 Every call sets `PERFDSTATUS`: `OK`, `NOTFOUND` (the key was not there) or
-`ERROR` (the reason is logged).  The status is how a stored empty value is told
-from a missing key.  An empty `collection` uses the one in `perfd.conf`.
+`ERROR` (the reason is logged).  The status is how a stored empty value is
+told from a missing key.  An empty `collection` uses the one in
+`perfd.conf`.  `PERFD_SET` and `PERFD_DELETE` are registered as dangerous
+functions, so with `live_dangerously = no` they cannot be reached from
+external interfaces.
 
-```
-same => n,Set(PERFD_SET(calls,${UNIQUEID},3600)=${CALLERID(num)})
-same => n,Set(caller=${PERFD_GET(calls,${UNIQUEID})})
-same => n,GotoIf($["${PERFDSTATUS}" = "NOTFOUND"]?unknown)
-same => n,Set(PERFD_DELETE(calls,${UNIQUEID})=)
-```
+## Build it
 
-`PERFD_SET` and `PERFD_DELETE` are registered as dangerous functions, so with
-`live_dangerously = no` they cannot be reached from external interfaces.
-
-## Protocols
-
-The protocol is chosen in `perfd.conf`, never per call.
-
-- **`binary`** - perfcached's native door through libperfd, the perfcached C
-  client.  Authenticated off loopback by a client secret (the Noise
-  handshake); the requests after it travel in the clear unless the node's
-  listener has `encrypt = yes`.  Fleet-aware: it learns the members from
-  the seed it reaches, fails over to a standby when a node dies, and can
-  route each key to the node that owns it.
-- **`resp`** - RESP2, to perfcached's RESP door or to a standalone Redis
-  (for a replicated pair, the master's VIP).  `AUTH <password>`, or
-  `AUTH <user> <password>` when `username` is set (Redis 6+).  After a
-  failure, or a `-READONLY` from a demoted master, the connection is re-dialled
-  starting at the server after the one that failed and the command is retried
-  once.  Redis Cluster, Sentinel discovery and TLS are not supported.
-
-## Building (Asterisk 22.10.1)
-
-Needs libperfd 0.5.0 or later installed - `libperfd-dev` to build,
-`libperfd0` at run time (perfcached's packages, or `make install-lib` in a
-perfcached checkout) - plus autoconf/automake and pkg-config.  The module
-links the library; it carries no copy of it.
+Install `libperfd-dev` (and `libperfd0` where Asterisk runs) from
+perfcached's packages, or `make install-lib` in a perfcached checkout;
+plus autoconf, automake and pkg-config.
 
 ```
 cd asterisk-22.10.1
@@ -57,54 +34,96 @@ make menuselect        # Dialplan Functions -> func_perfd (off by default)
 make && make install
 ```
 
-For a scripted build, `menuselect/menuselect --enable func_perfd
-menuselect.makeopts` replaces the interactive step.  The patch does not carry
-`configure`; `./bootstrap.sh` regenerates it from the patched `configure.ac`.
-configure finds libperfd through pkg-config (`libperfd >= 0.5.0`); for a
-library under a private prefix, either point pkg-config at it
-(`PKG_CONFIG_PATH=<prefix>/lib/pkgconfig ./configure ...`) or pass
-`--with-perfd=<prefix>`.  Without libperfd, menuselect shows the module as
-unavailable.
+- Scripted: `menuselect/menuselect --enable func_perfd menuselect.makeopts`
+  replaces the interactive step.
+- The patch does not carry `configure`; `./bootstrap.sh` regenerates it
+  from the patched `configure.ac`.
+- configure finds libperfd through pkg-config (`libperfd >= 0.5.0`).  For a
+  library under a private prefix: `PKG_CONFIG_PATH=<prefix>/lib/pkgconfig
+  ./configure ...`, or `--with-perfd=<prefix>`.  Without libperfd,
+  menuselect shows the module as unavailable.
+- The module and its RESP client compile clean under developer mode's
+  warnings (`--enable-dev-mode`).
+- A libperfd update with the same SONAME (`libperfd.so.0`) reaches Asterisk
+  by installing the new `libperfd0` and restarting Asterisk - no rebuild.
 
-Because the module links the shared library, a libperfd update with the
-same SONAME (`libperfd.so.0`) reaches Asterisk by installing the new
-`libperfd0` and restarting Asterisk - no rebuild of the module.
-
-The module and its RESP client compile clean under developer mode's warnings
-(`--enable-dev-mode`); the exception earlier releases needed came from the
-copy of libperfd they compiled in-tree.
-
-The patch is generated, never edited by hand.  For another release, from a
-perfcached checkout:
-
-```
-contrib/asterisk/mkpatch.sh asterisk-X.Y.Z.tar.gz
-```
-
-It adds the module, its RESP client and the sample config, inserts the
+**Another Asterisk release:** the patch is generated, never edited by hand.
+From a perfcached checkout, `contrib/asterisk/mkpatch.sh asterisk-X.Y.Z.tar.gz`
+adds the module, its RESP client and the sample config, inserts the
 libperfd check into `configure.ac`, `makeopts.in` and
 `build_tools/menuselect-deps.in`, and appends the module's build rule to
 `funcs/Makefile`.
 
-## Configuration
+## Configure it
 
-`configs/samples/perfd.conf.sample` documents every setting; `make samples`
-installs it.  [CONFIGURATION.md](CONFIGURATION.md) lists them with examples
-for perfcached and for Redis.  A change applies with `module reload func_perfd`; a file that is
-refused is logged with the setting and line, and a reload keeps the running
-configuration.  `perfd show status` shows the pool and per-operation counters.
+On every perfcached node, the client secret and the collection the
+dialplan uses (on a fleet, also list it in `[cluster] collections`):
+
+```
+[secrets]
+client = client-secret-example
+
+[collection calls]
+buckets_log2 = 16
+```
+
+`perfd.conf` in the Asterisk configuration directory, for the native door
+(fleet-aware: it learns the members from whichever seed answers and fails
+over to a standby when a node dies):
+
+```
+[general]
+protocol = binary
+server = 192.0.2.11:6479
+server = 192.0.2.12:6479
+secret = client-secret-example
+collection = calls
+```
+
+`protocol = resp` speaks RESP2 to perfcached's Redis door or to a
+standalone Redis (for a replicated pair, the master's VIP), with `AUTH
+<password>` or `AUTH <user> <password>`; after a failure or a `-READONLY`
+from a demoted master it re-dials, starting at the next server, and
+retries once.  Redis Cluster, Sentinel discovery and TLS are not
+supported.  Every setting, with examples for perfcached and for Redis:
+[CONFIGURATION.md](CONFIGURATION.md);
+`configs/samples/perfd.conf.sample` documents them too (`make samples`
+installs it).
+
+Load it with `module load func_perfd.so`; apply a change with `module
+reload func_perfd`.  A file that is refused is logged with the setting and
+line, and a reload keeps the running configuration.
+
+## Use it
+
+Illustrative - this dialplan was not run for this page:
+
+```
+exten => s,1,Set(PERFD_SET(calls,${UNIQUEID},3600)=${CALLERID(num)})
+ same => n,GotoIf($["${PERFDSTATUS}" != "OK"]?failed)
+ same => n,Set(caller=${PERFD_GET(calls,${UNIQUEID})})
+ same => n,GotoIf($["${PERFDSTATUS}" = "NOTFOUND"]?unknown)
+ same => n,Set(PERFD_DELETE(calls,${UNIQUEID})=)
+```
+
+**Check it** from both sides: `perfd show status` on the Asterisk CLI
+shows the pool and per-operation counters, and on perfcached the key the
+dialplan wrote reads back with perfcli, in the same form as any other
+(`perfcli -a <client secret> get calls <uniqueid>` answers
+`{"found":true,"value":"...","ttl":...}`, or `{"found":false}` once
+deleted).  `ERROR` in `PERFDSTATUS` always has a log line with the reason.
 
 ## Limits
 
 - **Size.** Inside ordinary dialplan substitution Asterisk reads a function
-  into a 4096-byte buffer, so a value longer than 4095 bytes is `ERROR`, never
-  a truncated value.  `max_value` (default 65536) bounds it too.
+  into a 4096-byte buffer, so a value longer than 4095 bytes is `ERROR`,
+  never a truncated value.  `max_value` (default 65536) bounds it too.
 - **Binary values.** A value containing a NUL byte is `ERROR`; store binary
   data through `BASE64_ENCODE` / `BASE64_DECODE`.
-- **Timeouts.** A stalled server holds a call for `io_timeout_ms` per send and
-  receive (default 300; libperfd's own default is 5000), and a call waits at
-  most `wait_timeout_ms` for a free connection.  With a channel, the wait runs
-  under autoservice.
+- **Timeouts.** A stalled server holds a call for `io_timeout_ms` per send
+  and receive (default 300; libperfd's own default is 5000), and a call
+  waits at most `wait_timeout_ms` for a free connection.  With a channel,
+  the wait runs under autoservice.
 - **Delete after a lost reply.** A delete retried after a lost reply can
   answer `0` for a key the first attempt removed.
 - **Redis collections** are database numbers; a name is refused with
@@ -115,8 +134,8 @@ configuration.  `perfd show status` shows the pool and per-operation counters.
 
 ## Tests
 
-Both run everything locally: servers on loopback, started and stopped by the
-script, never a shared Redis.
+Both run everything locally: servers on loopback, started and stopped by
+the script, never a shared Redis.
 
 - `test/resptest.sh <resptool>` - the RESP client against local Redis
   (`resptool` is `test/resptool.c` built with `resp.c`).

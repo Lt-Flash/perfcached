@@ -10,188 +10,128 @@
   and a Redis-compatible door.  One node to start; a cluster when you need it.
 </p>
 
-perfcached is an in-memory key-value cache.  It runs as one daemon that
-serves requests on every core, keeps data in memory with optional
-write-ahead logging and snapshots, and is watched through its dashboard
-and Prometheus metrics.
+perfcached is an in-memory key-value cache for small, hot state -
+sessions, routing, counters, call state.  One daemon serves requests on
+every core, keeps data in memory with an optional write-ahead log and
+snapshots, and is watched through its dashboard and Prometheus metrics.
+When one machine is not enough, run the same binary on several: they
+find each other, elect a master and share the keyspace.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="contrib/brand/perfd-mark-dark.svg">
   <img src="contrib/brand/perfd-mark-light.svg" width="72" align="right" alt="libperfd - the compass">
 </picture>
 
-Clients speak perfcached's own protocol: binary frames, opened with a
-Noise handshake that proves the client secret, then encrypted or - by
-default, for half the CPU - in the clear.  `libperfd`, the C client
-library (MIT), and `perfcli`, the command-line client, use it; for
-scripts, `perfcli -j` takes a request
-typed as JSON and sends it as the binary request.  For applications
-already written against Redis, it also answers the Redis protocol
-(RESP2), so
-unmodified Redis clients such as `redis-cli` and hiredis work too.
+Clients speak perfcached's own protocol - binary frames opened with a
+Noise handshake that proves the client secret - through `libperfd`, the
+C client library (MIT), or `perfcli`, the command-line client.  Redis
+clients such as `redis-cli` and hiredis work unmodified through the
+Redis door (RESP2).
 
 ```
-$ perfcli -a "$SECRET" set cache greeting hello 60
+$ perfcli -a client-secret-example set sessions user:17 'hello world' 300
 {"stored":true}
-$ perfcli -a "$SECRET" get cache greeting
-{"found":true,"value":"hello","ttl":60}
-$ redis-cli GET greeting
-"hello"
+$ perfcli -a client-secret-example get sessions user:17
+{"found":true,"value":"hello world","ttl":300}
+$ redis-cli -p 6380 -a resp-password-example --no-auth-warning GET user:42
+alice
 ```
 
-When one machine is no longer enough, run the same binary on several:
-they find each other, elect a master and share the keyspace.
+**Current release: 0.7.5** (2026-11-22), with libperfd 0.7.6 and
+php-perfcached 0.1.1.  [GUIDE.md](GUIDE.md) shows how to install it,
+build a cluster, take over from Redis, upgrade, back up and watch it,
+with real output.
 
-## Why perfcached
+## What it does
 
-- **Its own protocol, authenticated at connect.**  Binary frames
-  behind a Noise handshake (libsodium), encrypted per listener
-  (`[listen] encrypt = yes`) - in the clear by default, which anyone on
-  the path can read and alter - with typed verbs, binary-safe values
-  and pipelining in libperfd.
-- **Uses every core.**  Requests are served by a pool of worker threads,
-  not one event loop.  On the same 16-vCPU host, over a real network,
-  four workers answer 2.2x Redis 8's SET rate and 1.4x its GET rate at
-  pipeline depth 64 ([measured](#performance)).
+- **Its own protocol, authenticated at connect.**  Typed verbs,
+  binary-safe values and pipelining; requests in the clear after the
+  handshake by default (half the CPU), or encrypted with `[listen]
+  encrypt = yes`.
+- **Uses every core.**  A pool of worker threads, not one event loop:
+  on one 16-vCPU host over a real network, four workers answer 2.2x
+  Redis 8's SET rate and 1.4x its GET rate at pipeline depth 64
+  ([Performance](#performance)).
 - **Durable when you want it.**  A write-ahead log plus snapshots, with
-  a storage probe that recommends an fsync policy for your disks.  A
-  node that loses log records heals itself from memory instead of going
-  down.
-- **Redis clients work too.**  The Redis door is guarded by an address
-  allow-list and `AUTH`, and answers strings with TTLs, counters,
-  `SET ... NX` locks, RedisJSON documents, pub/sub, keyspace
-  notifications, `SCAN`, `INFO` and `SLOWLOG`.  The full list with every
-  difference is in [REDIS-COMMANDS.md](REDIS-COMMANDS.md).
+  a storage probe that recommends an fsync policy.  A node that loses
+  log records heals itself from memory instead of going down.
+- **Redis clients work too.**  Strings with TTLs, counters, `SET ... NX`
+  locks, RedisJSON documents, hashes, pub/sub, keyspace notifications,
+  `SCAN`, `INFO`, `SLOWLOG`, behind an address allow-list, `AUTH` and
+  optional TLS ([REDIS-COMMANDS.md](REDIS-COMMANDS.md)).
+- **Takes over from Redis** without a big-bang copy: a collection reads
+  a missing key from Redis on first use, or writes through to it
+  ([GUIDE.md](GUIDE.md#read-through-taking-over-from-redis)).
 - **Easy to watch.**  A dashboard (`perfcached-dashboard`, its own
-  process over the native door), `/metrics` for Prometheus (a
-  Grafana dashboard is in [contrib/grafana](contrib/grafana)), and
-  `/stats` as JSON.  A node raises its own alerts - a failed or healing
-  node, lost WAL records, a full arena, an unreachable upstream, a member
-  gone - and, in a build with mail, sends them over SMTP; in a fleet,
-  `[mail]` on one node mails for all ([GUIDE.md](GUIDE.md), "Mail").
-- **Changes while it runs.**  Collections are created, resized,
-  renamed and dropped live.  Memory grows under load and is given back
-  when idle.
-- **A standalone edition** leaves every line of cluster code out of
-  the build, for a cache that will only ever be one node
-  ([choosing a build](#choosing-a-build)).
+  process), `/metrics` for Prometheus (a Grafana dashboard is in
+  [contrib/grafana](contrib/grafana)) and `/stats` as JSON.  A node
+  raises its own alerts and, in a build with mail, sends them over SMTP;
+  in a fleet `[mail]` on one node mails for all
+  ([doc/alerts.md](doc/alerts.md#mail)).
+- **Changes while it runs.**  Collections are created, resized, renamed
+  and dropped live; memory grows under load and is given back when idle.
+- **Clusters without a coordinator.**  Nodes find each other by
+  multicast on one segment, or through seed names where there is none
+  (clouds, Kubernetes - [doc/cluster.md](doc/cluster.md#unicast-discovery-clouds-and-kubernetes)),
+  elect a master and rejoin by themselves.  No node ids or peer lists to
+  configure.  Five ways to place data ([Cluster modes](#cluster-modes)).
+- **Clients that follow the fleet.**  libperfd keeps standby
+  connections, fails over in one `send()` and can send each key to its
+  owner; cluster-aware Redis clients read `CLUSTER SLOTS`.
+- **A standalone edition** leaves every line of cluster code out, for a
+  cache that will only ever be one node.
 
-## When one node is not enough
+## Known limits
 
-- **Clusters without a coordinator.**  Nodes find each other - over
-  multicast on one network segment, or through a few seed names where
-  there is no multicast (clouds, Kubernetes) - elect a master that owns
-  a versioned placement map, and rejoin on their own after a crash.
-  There are no node ids or peer lists to configure.
-- **Five ways to place data**, from every node holding everything to
-  exactly one owner per key.  Choose for availability, memory or write
-  throughput ([the modes](#cluster-modes)).
-- **Clients that follow the fleet.**  libperfd keeps spare connections,
-  fails over in one `send()` and can send each key straight to its
-  owner.  Redis clients that understand Redis Cluster read `CLUSTER
-  SLOTS` and route themselves.
-- **A PHP client.**  `lang/php` is an extension over libperfd for PHP
-  8.1 or later (packaged for 8.3): one handle a worker under PHP-FPM, a
-  list of seeds, and the fleet with no proxy beside it
-  ([its README](lang/php/README.md)).
-- **Pub/sub across the fleet**: a publish on any node reaches the
-  subscribers on every node.
-- **On a LAN or in a cloud.**  By default membership, heartbeats and
-  the placement map travel by multicast on one L2 segment (TTL 1;
-  `[cluster] multicast_ttl` lets multicast routing carry them across
-  segments, verified with one router in a lab rig).  Where there is no
-  multicast - AWS, GCP, Azure, Kubernetes - `discovery = unicast`
-  finds the fleet through seed names, sends anything larger than the
-  path MTU over TCP so nothing fragments, and tells a peer whose UDP is
-  blocked from a dead one (GUIDE.md, "In a cloud or Kubernetes").
-
-## Status
-
-The last tagged release is **0.7.5** (2026-11-22).  It is young
-software and we want to hear how it behaves on your workload.  Please
-[open an issue](https://github.com/Lt-Flash/perfcached/issues) for
-anything odd, and include the output of `perfcached -V`, your config
-(secrets removed) and the log around the event.  A security problem
-goes privately instead, as [SECURITY.md](SECURITY.md) says.
-
-Known limits in 0.7.5:
-
-- A read-through collection's password moved from `[secrets] upstream`
-  into the collection, as `upstream_password` (each collection may now
-  front its own Redis).  0.6.1 and later refuse the old key and `perfcached -C`
-  says where it goes - move it before the restart.
-- From 0.4.4 or earlier, the upgrade replaces a fleet whole: since
-  0.4.5 the native door speaks one binary protocol (the JSON-RPC
-  dialect is gone) and the cluster wire epoch changed, so stop every
-  node, start them all on the new version, and move every client to
-  libperfd 0.3.0 or later (or the RESP door) at the same time.  State
-  from 0.4.1 or later is kept.  No upgrade path from 0.3.x.  From
-  0.4.5 on, every release is a rolling restart within the support
-  window ("Compatibility" below) but two: 0.7.4.3 changed the cluster
-  header, so a fleet on 0.7.3 or earlier moves to it together
-  (`fleetstop`, install, start; clients keep working), and 0.7.5, as
-  the item on cluster wire epoch 4 below says.  Use SET
-  IFEQ/IFNE and DELEX once every node runs 0.5.0 or later.  A node
-  keeps the identity an earlier release minted at random, and its log
-  says how to switch to one derived from the machine.
 - **WARNING - size limits.**  A record (key, value and a 28-byte header)
   is at most 262,080 bytes, so **a value is at most just under 256 KB**;
   larger is refused (`value too large`).  A JSON document is at most
   64 KB, a hash (one value) under 58,000 bytes, a key 4,096 bytes.  In a
   cluster a write this node forwards to the key's owner carries at most
-  58,000 bytes of value.  perfcached holds small, hot state (sessions,
-  routing, counters, call state) - it is not a store for large objects.
-- No lists, sets, sorted sets, streams, bitmaps, HyperLogLog or geo
-  yet.  Keys hold strings, counters, JSON documents or hashes (a hash
-  is one value, under 58,000 bytes).
+  58,000 bytes of value.  perfcached holds small, hot state - it is not
+  a store for large objects or a web page cache.
+- No lists, sets, sorted sets, streams, bitmaps, HyperLogLog or geo.
+  Keys hold strings, counters, JSON documents or hashes.
 - No transactions (`MULTI`/`EXEC`/`WATCH`) and no general scripting:
-  `EVAL`/`EVALSHA` run only the approved Symfony Lock scripts.  An
-  application built on either will not move over unchanged; what the
-  Redis door answers and refuses is in
-  [REDIS-COMMANDS.md](REDIS-COMMANDS.md).
+  `EVAL`/`EVALSHA` run only the approved Symfony Lock scripts.
 - Linux only (x86_64, arm64, arm32, i386), on glibc or musl.
-- The write-ahead log has a ceiling, and the storage sets it: on a test
-  host it keeps up with about 1,000,000 small SETs a second under
-  `fsync = everysec`, but with 1 KB records the log's writer tops out
-  near 180,000 a second, and in front of a disk that absorbed about
-  35 MB/s it fell behind at about 35,000.  A write rate faster than the
-  disk takes, or a log that fills before
-  a snapshot completes, drops acknowledged writes from the log.  They
-  are still in memory; the node logs an ERROR, refuses writes, takes a
-  snapshot that makes them durable again and returns to service by
-  itself.  Size the disk and the log for the write rate, or run without
-  a log where a cache may lose writes on a crash.
-- In a cluster: one L2 segment by default; across routed links only with
-  `multicast_ttl` and multicast routing, not measured over WAN links;
-  `discovery = unicast` (clouds, Kubernetes) is tested in lab network
-  namespaces that drop IP fragments and block UDP, not yet in a real
-  cloud deployment, and suits a fleet of a few dozen nodes; and
-  `spread` mode has not yet carried production traffic.
-- 0.7.5 speaks cluster wire epoch 4 alone and refuses a node of an
-  earlier release: from 0.7.4, stop every node and start them all on
-  0.7.5 (the state is kept).  A libperfd older than 0.7.6 does not route
-  by key against it - every request then takes the forward.
-- `[cluster] tombstone_acks = yes` cannot be switched on by a rolling
-  restart in a fleet running `no`: a node on `yes` among members on `no`
-  loops.  Until 0.7.5.1, leave a fleet that runs `no` on `no` (a switch
-  to `yes` needs every node changed and the fleet restarted whole).
-- Read-through from a Redis upstream carries strings, hashes and
-  RedisJSON documents (a list, set, sorted set or stream answers
-  `WRONGTYPE`); `KEYS` and `SCAN` see only what perfcached holds;
-  `proxy` collections refuse an upstream (in `shard` and `spread` a
-  key is fetched at its owner or holders); and
-  tracking the upstream's changes needs every connection on one Redis
-  server and, from 0.5.6, an upstream user allowed `INFO`.
-  Write-through (0.6.2) does not bridge pub/sub, costs each write a
-  round trip to the master, and two clients writing one key through
-  two nodes at the same moment can leave Redis and the fleet with
-  different winners.
+- The write-ahead log's ceiling is the storage's: about 1,000,000 small
+  SETs a second under `fsync = everysec` on a fast disk, but with 1 KB
+  records the log's writer tops out near 180,000 a second, and a disk
+  that absorbs about 35 MB/s falls behind at about 35,000.  Past that,
+  writers wait for the log ([doc/durability.md](doc/durability.md)).
+- A cluster is one L2 segment by default; across routed links only with
+  `multicast_ttl` and multicast routing, not measured over WAN links.
+  `discovery = unicast` is tested in network namespaces that drop IP
+  fragments and block UDP, not yet in a real cloud deployment, and suits
+  a fleet of a few dozen nodes.  `spread` mode has not carried
+  production traffic.
+- Read-through and write-through carry strings, hashes and RedisJSON
+  documents (a list, set, sorted set or stream answers `WRONGTYPE`);
+  `KEYS` and `SCAN` see only what perfcached holds; `proxy` collections
+  refuse an upstream; tracking Redis's changes needs every connection on
+  one Redis server and an upstream user allowed `INFO`.  Write-through
+  does not bridge pub/sub, costs each write a round trip to the master,
+  and two clients writing one key through two nodes at the same moment
+  can leave Redis and the fleet with different winners.
 - The RESP and HTTP doors are plaintext unless their listener says
-  `tls` (0.7.5, a build with OpenSSL).  Under `upstream_writes =
-  through` the RESP door can write to Redis: keep it on a trusted
-  segment, behind `resp_allow` and `[secrets] resp`, or on TLS.
+  `tls` (a build with OpenSSL).  Under `upstream_writes = through` the
+  RESP door can write to Redis: keep it on a trusted segment, behind
+  `resp_allow` and `[secrets] resp`, or on TLS.
+- **Upgrading to 0.7.5 from 0.7.4.x is a whole-fleet stop**: 0.7.5
+  speaks cluster wire epoch 4 alone and refuses an older node.  Stop
+  every node (`perfcli -E <enable> fleetstop`), install 0.7.5, start
+  them all; the state is kept ([GUIDE.md](GUIDE.md#upgrade)).  Use
+  libperfd 0.7.6 or later with it: an older libperfd does not route by
+  key against 0.7.5 (every request takes a forward hop) and is refused a
+  value over 58,000 bytes.
+- **`[cluster] tombstone_acks`**: a fleet running `no` cannot be
+  switched to `yes` by a rolling restart - a node on `yes` among members
+  on `no` loops.  Until 0.7.5.1, leave a fleet that runs `no` on `no`
+  (a switch to `yes` needs every node changed and the fleet restarted
+  whole).
 
-Known issues in 0.7.5, fixed in **0.7.5.1**, a fix release that is
+**Known issues in 0.7.5**, fixed in **0.7.5.1**, the fix release
 coming next:
 
 - Write-through (`upstream_writes = through`): a value too large for
@@ -211,119 +151,44 @@ coming next:
   such a node can answer as a miss.
 
 0.7.5.1 also carries the fixes from a full code review of 0.7.5:
-memory-safety fixes, refusals for malformed input, and corrections
-in the cluster, the upstream bridge, the client libraries and the
-tools.  The next release notes list them.
+memory-safety fixes, refusals for malformed input, and corrections in
+the cluster, the upstream bridge, the client libraries and the tools.
+
+Report anything odd as an
+[issue](https://github.com/Lt-Flash/perfcached/issues), with `perfcached
+-V`, the config (secrets removed) and the log around the event.  A
+security problem goes privately, as [SECURITY.md](SECURITY.md) says.
 
 ## Install
 
-**Debian and Ubuntu:** `.deb` packages for Debian 13 and 12 and
-Ubuntu 24.04 and 20.04 (amd64) are on the
-[releases page](https://github.com/Lt-Flash/perfcached/releases), in
-both editions (see [Choosing a build](#choosing-a-build)):
-`perfcached` is the clustered daemon and `perfcached-standalone` the
-single-node one.  They install the same files and replace each other.
-The dashboard is a package of its own, `perfcached-dashboard` (Debian
-13 and 12, Ubuntu 24.04).  On Alpine all three come as signed `.apk`
-files.
+**Debian and Ubuntu:** `.deb` packages for Debian 13 and 12 and Ubuntu
+24.04 and 20.04 (amd64) are on the
+[releases page](https://github.com/Lt-Flash/perfcached/releases):
+`perfcached` (the clustered daemon) or `perfcached-standalone` (one
+node only) - they install the same files and replace each other - and
+`perfcached-dashboard` (Debian 13 and 12, Ubuntu 24.04).  On Alpine all
+three come as signed `.apk` files; a release tarball installs under
+`/opt/perfcached-0.7.5`.
 
 ```
 sudo apt install ./perfcached_0.7.5-1+deb13_amd64.deb
-sudo apt install ./perfcached-standalone_0.7.5-1+deb13_amd64.deb   # or this one
 ```
 
-**libperfd**, the client library, has packages of its own from 0.5.8:
-`libperfd0` (the shared library, `libperfd.so.0`) and `libperfd-dev`
-(header, static archive, pkg-config file) as `.deb`, and `libperfd` /
-`libperfd-dev` as signed `.apk` for Alpine.  A program built against
-`libperfd-dev` links the shared library by default; a libperfd update
-with the same SONAME is then an install and a restart, with no rebuild.
-See [lib/README.md](lib/README.md).
+**libperfd** 0.7.6: `libperfd0` (the shared library) and `libperfd-dev`
+(header, static archive, pkg-config file) as `.deb`, `libperfd` /
+`libperfd-dev` as `.apk`.  A program built against `libperfd-dev`
+links the shared library, so a libperfd update with the same SONAME is
+an install and a restart, no rebuild ([lib/README.md](lib/README.md)).
 
-**From source:** needs a C compiler, make and libsodium.  Where
-pkg-config finds OpenSSL (libssl-dev; Alpine `openssl-dev`) the daemon
-is built with TLS for the RESP and HTTP doors and `rediss://`
-upstreams (`make PC_TLS=yes` insists on it, `PC_TLS=no` leaves it out).
-
-```
-make                 # perfcached, perfcli, perfdump, perfload, libperfd.a
-                     # (+ perfcached-dashboard where libmicrohttpd-dev is installed)
-make libperfd.so     # the shared library beside the archive
-sudo make install    # binaries, libperfd, example config, systemd unit
-sudo systemd-sysusers  # the perfcached account the unit runs as
-```
-
-### Choosing a build
-
-`make menuconfig` chooses which daemon `make` builds and saves the
-choice in `config.mk`:
-
-| edition | build it for | what you get |
-|---|---|---|
-| `clustered` (the default) | anything that may grow beyond one node | every cluster mode: eager, store, shard, proxy, spread |
-| `standalone` | a cache that will only ever be one node | no cluster code at all: the binary is about a quarter smaller, its static memory 13 MB less, and a `[cluster]` section in the config is refused rather than ignored |
-
-Without a `config.mk` the build is `clustered`.  The `.deb` packages
-come in both editions: `perfcached` and `perfcached-standalone`.  To
-choose without the menu, for scripts and CI:
-
-```
-make menuconfig                      # interactive (whiptail, dialog or plain prompts)
-sh tools/menuconfig.sh standalone    # the same, non-interactive
-make PC_EDITION=standalone           # one build, without writing config.mk
-```
-
-A standalone daemon reports `standalone` in `perfcached -V` and
-`"edition"` in `/stats`.  Its tests are `make check-standalone`; the
-clustered suites need the cluster code and `make check` says so.
-
-**The allocator** is the second thing `make menuconfig` asks (or `make
-PC_ALLOC=libc|mimalloc|jemalloc`): the C library's own malloc by
-default, or mimalloc 2.x or jemalloc linked ahead of it.  The C library
-itself is the toolchain's - glibc on Debian, musl on Alpine.
-`perfcached -V` names a non-default allocator, and `/stats` carries
-`process.allocator`.  After changing it on the command line rather than
-through `make menuconfig`, `make clean` first.
-
-**The build flavor** is the third question (or `make
-PC_BUILD=release|debug|asan`): `release` (`-O2 -g`, what the packages
-ship) by default; `debug` (`-Og -g3`, frame pointers, the arena's own
-consistency checks); `asan` (debug plus AddressSanitizer and UBSan, their
-runtimes linked statically so the target needs nothing installed; glibc
-only).  A non-release build says so in `perfcached -V`
-(`perfcached 0.7.5 (abc1234, asan)`), in `/stats` `process.build` and in
-the dashboard's header.  `make clean` after changing it.  Release stays at
-`-O2`: `-O3` was measured against it on one commit (single node, native and
-RESP, 32- and 200-byte values) and bought nothing beyond the run-to-run
-spread, for a 15% larger binary; `-Os` cost about 10% more CPU a request
-(3% to 13% by cell) for a 21% smaller one.  The tree builds warning-free
-at `-O3` and `-Os` (gcc 14) for anyone who wants either - set it in the
-environment, `CFLAGS="-O3 -g" make`; on the make command line it would
-replace the warning and feature flags the Makefile adds.  For a test
-node, `contrib/systemd/` has two drop-ins for `perfcached.service.d/`:
-`cores.conf` keeps the newest two cores, and `asan.conf` sends a sanitizer
-report there.
-
-**Alert mail** is the fourth: `none` (the default) or `libcurl` (`make
-PC_MAIL=libcurl`; Debian/Ubuntu `libcurl4-openssl-dev`, Alpine
-`curl-dev`), which lets a node send its alerts over SMTP (STARTTLS or
-TLS).  A build without it refuses a `[mail]` section rather than ignore
-it; its alerts are logged and kept on the dashboard all the same.
-
-**TLS** (0.7.5) is not a `make menuconfig` question: `PC_TLS=auto`, the
-default, links OpenSSL into the daemon when pkg-config finds it (`yes`
-insists, `no` leaves it out; libperfd never links it).  The `tls`
-listeners and `rediss://` upstreams need it, and `perfcached -V` says
-`tls: OpenSSL ...` or `tls: off`.
+**From source:** a C compiler, make and libsodium (OpenSSL for TLS):
+`make && sudo make install && sudo systemd-sysusers`.  The editions, the
+allocator, debug and sanitizer builds, mail and TLS:
+[doc/building.md](doc/building.md).
 
 ## Quick start
 
-### A single node
-
-The native door on the network, and the Redis door on
-localhost.  Save this as
-`/etc/perfcached/perfcached.conf`, owned by root with group
-`perfcached` and mode 640 (the service runs as `perfcached`):
+`/etc/perfcached/perfcached.conf`, owned by root, group `perfcached`,
+mode 640:
 
 ```ini
 [daemon]
@@ -333,96 +198,46 @@ workers = 4                      # the number of cores
 arena_mb = 512                   # memory for keys and values
 
 [secrets]
-client = pick-a-client-secret    # proven at the native protocol's handshake
-enable = pick-an-enable-secret   # privileged commands only (perfcli -E)
+client = client-secret-example   # what applications present
+cluster = cluster-secret-example # only the daemons hold it
+enable = enable-secret-example   # privileged commands (perfcli -E)
+resp = resp-password-example     # the Redis door's AUTH
 
 [listen]
 tcp = 0.0.0.0:6479               # native protocol
-resp = 127.0.0.1:6379            # Redis protocol (optional)
-resp_collections = 0:cache       # Redis database 0 is the collection "cache"
+resp = 127.0.0.1:6380            # Redis protocol (optional)
+resp_collections = 0:sessions    # Redis database 0 is the collection "sessions"
 
-[collection cache]
+[collection sessions]
 buckets_log2 = 16
 ```
 
-Three secrets, all different, none shared with anyone who does not
-need it: `client` is what applications present; `enable` raises one
-connection's privilege (`perfcli -E`) for the commands that change the
-node or the fleet - creating, resizing and dropping collections (with
-`[daemon] allow_create = yes`) and `fleetstop`; the `cluster` secret,
-below, only the daemons hold.  Without an `enable` secret those
-commands cannot be run at all.
-
-Check it and start it:
-
 ```
-perfcached -f /etc/perfcached/perfcached.conf -C    # validate, show what it would run
+perfcached -f /etc/perfcached/perfcached.conf -C    # check it
 sudo systemctl enable --now perfcached
-perfcli -a pick-a-client-secret set cache greeting hello 60
-perfcli -a pick-a-client-secret get cache greeting
-redis-cli -p 6379 GET greeting
+perfcli -a client-secret-example ping
 ```
 
-To serve Redis clients across a network, give the door a LAN address
-plus `resp_allow` and a `[secrets] resp` password; the daemon refuses
-to open it off-box without an allow-list.  With a build that has
-OpenSSL, `resp = <addr:port> tls` keeps the password off the wire too
-(`redis-cli --tls --cacert ca.pem`); GUIDE.md has the rest.
-
-### Growing into a cluster
-
-When one node is no longer enough, add machines.  On one L2 segment
-the nodes find each other by multicast: it is sent with a TTL of 1 and
-does not cross a router unless `[cluster] multicast_ttl` raises it for
-multicast routing (PRODUCTION.md has the checklist).  Add the same
-lines to the config on every machine - the `client` and `enable`
-secrets stay as they are - and start them in any order:
+All secrets differ.  To serve Redis clients across a network, give the
+door a LAN address, `resp_allow` and TLS (`resp = <addr:port> tls`).
+For a cluster, add the same `[cluster]` section to every node and start
+them in any order:
 
 ```ini
 [daemon]
-state_dir = /var/lib/perfcached  # restarts as the same member
+state_dir = /var/lib/perfcached
 
 [cluster]
 multicast = 239.68.68.1:6480     # same group on every node
 mode = eager                     # every node holds every key
-collections = cache
-
-[secrets]
-cluster = a-different-secret     # only the daemons hold this one
+collections = sessions
 ```
 
-Between the nodes, open port 6480 for both UDP (membership,
-replication, reads from peers) and TCP (large records and a new node's
-initial copy), and 6481 for UDP and TCP: it carries pub/sub relays and
-replication on threads of their own, off the membership socket.  A
-joining node serves nothing until 6481 answers both ways with every
-member (0.7.5).
-
-**No multicast** (AWS, GCP, Azure, Kubernetes, or a LAN that filters
-it): name a few members as seeds instead of a group.  Every node
-re-resolves the names, so a seed may be down or move:
-
-```ini
-[cluster]
-discovery = unicast
-port = 6480
-seeds = cache-0.cache, cache-1.cache, cache-2.cache
-expect = 3                       # a cold start waits for all three
-mode = eager
-collections = cache
-```
-
-The ports are the same, plus TCP 6482: frames larger than the network's
-MTU go over a TCP connection between the two nodes instead of as IP
-fragments.  [GUIDE.md](GUIDE.md) ("In a cloud or Kubernetes") covers
-Kubernetes and node identity.
-Within seconds `perfcli -a
-<client secret> stats` shows the members and which node is master.
-Stop a node and the others carry on; start it again and it rejoins.
-
-Complete, validated configurations for single nodes and every cluster
-mode are in [contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md).
-Every option is annotated in
+Open UDP and TCP 6480 and 6481 between the nodes (and TCP 6482 with
+`discovery = unicast`).  `perfcli fleet-status` lists the members.
+Step by step, with the output to expect: [GUIDE.md](GUIDE.md).
+Complete configurations for single nodes and every mode:
+[contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md); every option:
 [contrib/perfcached.conf.example](contrib/perfcached.conf.example).
 
 ## Cluster modes
@@ -438,39 +253,32 @@ key, and which.
 | `proxy` | one holder, by free memory | 1/P | its share is unavailable |
 | `store` | nodes that read it | what each node reads | keys read only there are lost |
 
-In short: use `eager` for three nodes that must not lose anything,
-`spread` for four or more where you want a fixed redundancy, and
-`shard` for throughput with a client that routes by key.  Durability is
-separate from copies.  Only the node that took a write logs it, so
-turn on the WAL and snapshots if the whole fleet may stop at once.
-[GUIDE.md](GUIDE.md#the-modes) has the trade-offs in full.
+Use `eager` for three nodes that must not lose anything, `spread` for
+four or more where you want a fixed redundancy, and `shard` for
+throughput with a client that routes by key.  Durability is separate
+from copies: only the node that took a write logs it, so turn on the
+WAL and snapshots if the whole fleet may stop at once.
+[doc/modes.md](doc/modes.md) has the trade-offs in full.
 
 ## Clients
 
-- **libperfd**, the C client (MIT, so it can go in proprietary code).
-  It authenticates, pipelines (encrypted when the listener or
-  `opts.encrypt` asks), and follows the fleet: it keeps spare
-  connections, fails over in one `send()`, and can route each key
-  straight to its owner.  See [lib/README.md](lib/README.md).
+- **libperfd**, the C client (MIT): authenticates, pipelines and
+  follows the fleet ([lib/README.md](lib/README.md)).
 - **perfcli**, the `redis-cli` of the native protocol
-  ([PERFCLI-COMMANDS.md](PERFCLI-COMMANDS.md)); for scripts, `-j` takes
-  a request typed as JSON and sends it as the binary request (no
-  handshake on localhost with `plaintext = loopback`).
-  Plus **perfdump** and **perfload** for parallel backup and restore
-  between fleets of any size or mode, and **perfcached-dashboard**, the
-  status page served by its own process over libperfd (0.6.6; since
-  0.7.0 the daemon serves no page of its own).
-- **Any Redis client** through the Redis door (RESP2).  Cluster-aware
-  clients read `CLUSTER SLOTS` and send each key to its owner.
-- **Asterisk**: dialplan functions in [contrib/asterisk](contrib/asterisk).
+  ([PERFCLI-COMMANDS.md](PERFCLI-COMMANDS.md)); **perfdump** and
+  **perfload** for parallel backup and restore between fleets of any
+  size or mode; **perfcached-dashboard**, the status page.
+- **PHP**: an extension over libperfd for PHP 8.1 or later
+  ([lang/php/README.md](lang/php/README.md)), with a Symfony cache adapter.
+- **Any Redis client** through the Redis door.
+- **Asterisk**: dialplan functions in [contrib/asterisk](contrib/asterisk/README.md).
 
 ## Performance
 
-**For the best results, turn NIC multiqueue on - one queue per CPU, on
-the nodes and on the clients - and keep the default io_uring backend:
-see [PRODUCTION.md](PRODUCTION.md), section 7.**  With a single receive
-queue, one CPU handles everything a host receives and caps it, whatever
-the daemon does.
+**Turn NIC multiqueue on - one queue per CPU, on the nodes and the
+clients - and keep the default io_uring backend
+([PRODUCTION.md](PRODUCTION.md), section 7).**  With one receive queue,
+one CPU handles everything a host receives and caps it.
 
 `redis-benchmark`, unmodified, against one perfcached 0.4.0 node (4
 workers) and against `redis-server` 8.10.1, each on the same 16-vCPU
@@ -484,82 +292,53 @@ keys of 200 bytes, 50 clients, median of 3:
 | redis-server, pipeline 64 | 760,746 | 948,317 | 5.39 ms | 4.98 ms |
 | perfcached, pipeline 64 | **1,643,385** | **1,314,060** | **1.73 ms** | **1.74 ms** |
 
-With no pipelining, both servers wait on the network round trip.  With
-pipelining the servers themselves are the limit, and perfcached's
-workers pull ahead, at a third of Redis's tail.  The lead comes from the
-workers, not from a cheaper command: per core, a SET and its write-ahead
-log record cost perfcached more than a SET costs a Redis that persists
-nothing, so a node with two workers can trail one Redis thread on SET.
-Three-node fleets through routing clients reach 3.7 to 6.7 million
-GET/s.  A `KEYS` that walks 74,000 keys 50 times a second costs Redis's
-other clients a quarter of their GET rate; perfcached's keep theirs -
-the `KEYS` caller waits longer instead.  Every table, its method and how
-to reproduce it: [GUIDE.md](GUIDE.md#measured) and
+With no pipelining both servers wait on the network round trip; with
+pipelining perfcached's workers pull ahead, at a third of Redis's tail.
+The lead comes from the workers, not from a cheaper command: per core, a
+SET and its write-ahead log record cost perfcached more than a SET costs
+a Redis that persists nothing, so a node with two workers can trail one
+Redis thread on SET.  Three-node fleets through routing clients reach
+3.7 to 6.7 million GET/s.  A `KEYS` that walks 74,000 keys 50 times a
+second costs Redis's other clients a quarter of their GET rate;
+perfcached's keep theirs - the `KEYS` caller waits longer instead.
+Every table, its method and how to reproduce it:
+[doc/benchmarks.md](doc/benchmarks.md) and
 [bench/RESULTS.md](bench/RESULTS.md).
+
+## Upgrading
+
+- **0.7.4.x to 0.7.5**: a whole-fleet stop (above).
+- **Within the support window** - from 0.7.5 to a later 0.7.5.x patch or
+  to the next minor's releases - a rolling restart: members first, the master last,
+  one node at a time, each only once its `stats.cluster.restart.safe`
+  says so and the fleet reads healthy (every node `ready`, peers up,
+  record counts not fallen).  From an older minor, step through the last
+  patch of each minor in between.  Mixed versions are for the roll, not
+  for running; a release note names any exception.
+- Packages do not restart the daemon - install, then restart node by
+  node ([PRODUCTION.md](PRODUCTION.md), section 8).  A tarball install
+  upgrades through the staged build and the helper
+  ([doc/operations.md](doc/operations.md#upgrades), "The upgrade helper").
+- The client library of the same or the previous minor talks to both
+  sides of a roll; against 0.7.5 use libperfd 0.7.6 or later.
+
+What may change between releases: [doc/compatibility.md](doc/compatibility.md).
 
 ## Documentation
 
-- [GUIDE.md](GUIDE.md): running and operating it.  Nodes and fleets, the
-  modes, durability, sizing, the status page, runtime collections, the
-  tools, the clients, and all measurements.
-- [REDIS-COMMANDS.md](REDIS-COMMANDS.md): every Redis command it
-  answers, and what an unsupported one gets.
+- [GUIDE.md](GUIDE.md): how to do the common things - install, a
+  cluster, Redis takeover, TLS, upgrades, backups, watching it,
+  troubleshooting - with real output; it lists the reference documents
+  in [doc/](doc/) (modes, durability, upstream, config, alerts, tools,
+  clients, measurements).
+- [PRODUCTION.md](PRODUCTION.md): the pre-deployment checklist.
+- [REDIS-COMMANDS.md](REDIS-COMMANDS.md) and
+  [PERFCLI-COMMANDS.md](PERFCLI-COMMANDS.md): every command of each door.
 - [contrib/CONFIGURATIONS.md](contrib/CONFIGURATIONS.md): eleven
   complete configurations.
-- [PRODUCTION.md](PRODUCTION.md): the pre-deployment checklist.
-- [PERFCLI-COMMANDS.md](PERFCLI-COMMANDS.md): the perfcli reference.
 - [lib/README.md](lib/README.md): libperfd.
-- [doc/perfdump-format.md](doc/perfdump-format.md): the dump format.
+- [doc/building.md](doc/building.md): building and testing.
 - [ChangeLog](ChangeLog): what each release changed.
-
-## Building and testing
-
-```
-make check             # every test suite (clustered edition)
-make check-asan        # the same under AddressSanitizer + UBSan
-make check-standalone  # the suite for the standalone edition
-tools/matrix.sh        # build and test all four architectures (podman + qemu)
-tools/alpine-check.sh  # Alpine (musl, gcc 15): both editions + check-standalone
-```
-
-Every release candidate passes the full suite, the sanitizer suite,
-the four-architecture matrix and the Alpine check before it is tagged.
-Debian and Alpine - glibc and musl - are both
-built and tested; `bench/Containerfile.alpine` is the small image.
-
-## Compatibility
-
-perfcached is pre-1.0 and its formats may still change - but a change
-rolls, within one support window, unless its release note says
-otherwise (three have, below):
-
-**The support window.**  A fleet on any patch of a minor upgrades by a
-rolling restart to any later patch of that minor and to the next minor's
-releases; from an older minor, step through the last patch of each minor
-in between, each step a rolling restart.  Mixed versions are for the roll,
-not for running: the daemons report their build on the wire, the status
-page says "mixed versions" and blinks the cards still on the older build,
-and a release note names any exception.  The order is members first, the
-master last, one node at a time, reading the fleet between nodes (every
-node `ready`, its peers up, the record counts not fallen, no reconcile
-waiting on the node you are about to restart - the page's header says
-"do not restart" while one is).  The client library of the same or the
-previous minor talks to both sides of a roll - except against 0.7.5,
-where a libperfd older than 0.7.6 does not route by key: every request
-takes the forward hop, and a value over 58,000 bytes is refused.
-
-Packages upgrade through the package manager, which leaves the running
-daemon in place until you restart it (PRODUCTION.md, section 8); a
-tarball install under `/opt/perfcached-<version>` upgrades through the
-staged build and the helper (GUIDE.md, "The upgrade helper").  Two
-releases break the roll: 0.4.5, which replaced the native protocol and
-the cluster wire (from 0.4.4 or earlier the fleet is stopped and started
-whole, "Known limits" above), and 0.7.4.3, whose cluster header cannot
-talk to 0.7.3 (the fleet moves together: `fleetstop`, install, start);
-0.7.5, which speaks cluster wire epoch 4 alone, breaks it a third time
-from 0.7.4 (stop every node, start them all on 0.7.5).
-State from 0.4.1 or later is kept across every upgrade since; there is
-no path from 0.3.x.
 
 ## License
 
@@ -571,7 +350,6 @@ no path from 0.3.x.
 
 [LICENSING.md](LICENSING.md) says which files are on which side.  Every
 file libperfd is built from carries an MIT SPDX line, a file with no
-SPDX line is GPL-2.0-or-later, and CI checks that the MIT side never
-includes GPL code.  libsodium is ISC (see
-[lib/NOTICE](lib/NOTICE)).  Contributions need a DCO sign-off; see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+SPDX line is GPL-2.0-or-later, and the test suite checks that the MIT side
+never includes GPL code.  libsodium is ISC (see [lib/NOTICE](lib/NOTICE)).
+Contributions need a DCO sign-off; see [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -17,7 +17,7 @@
 #
 # It binds 127.0.0.1:8090 unless /etc/perfcached/perfcached-dashboard.conf
 # says otherwise.  TLS, HTTP/2 and anything facing a network belong to a
-# reverse proxy in front of it (nginx, HAProxy, Caddy) - see GUIDE.md.
+# reverse proxy in front of it (nginx, HAProxy, Caddy) - see doc/clients.md.
 
 [Unit]
 Description=perfcached dashboard (the status page, served over libperfd)

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* keeps.h - what a collection keeps, said once: ephemeral, recoverable or fleet-delete-safe, and its
- * copies by mode (GUIDE.md, "What a collection keeps") */
+ * copies by mode (doc/concepts.md, "What a collection keeps") */
 #ifndef PC_KEEPS_H
 #define PC_KEEPS_H
 #include <stddef.h>
