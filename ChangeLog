@@ -674,9 +674,6 @@
           range it speaks (share/perfcached/RELEASE), which the roll
           reads before it starts.
 
-        * [docs] GUIDE: nginx in front: caching responses, with no
-          module of our own.
-
         * [tests] The status page's script runs in CI (node), also as
           the dashboard draws it.
 

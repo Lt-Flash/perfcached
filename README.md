@@ -133,6 +133,13 @@ Known limits in 0.7.5:
   IFEQ/IFNE and DELEX once every node runs 0.5.0 or later.  A node
   keeps the identity an earlier release minted at random, and its log
   says how to switch to one derived from the machine.
+- **WARNING - size limits.**  A record (key, value and a 28-byte header)
+  is at most 262,080 bytes, so **a value is at most just under 256 KB**;
+  larger is refused (`value too large`).  A JSON document is at most
+  64 KB, a hash (one value) under 58,000 bytes, a key 4,096 bytes.  In a
+  cluster a write this node forwards to the key's owner carries at most
+  58,000 bytes of value.  perfcached holds small, hot state (sessions,
+  routing, counters, call state) - it is not a store for large objects.
 - No lists, sets, sorted sets, streams, bitmaps, HyperLogLog or geo
   yet.  Keys hold strings, counters, JSON documents or hashes (a hash
   is one value, under 58,000 bytes).
