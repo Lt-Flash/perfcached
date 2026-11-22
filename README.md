@@ -106,7 +106,7 @@ they find each other, elect a master and share the keyspace.
 
 ## Status
 
-The last tagged release is **0.7.5** (2026-11-13).  It is young
+The last tagged release is **0.7.5** (2026-11-22).  It is young
 software and we want to hear how it behaves on your workload.  Please
 [open an issue](https://github.com/Lt-Flash/perfcached/issues) for
 anything odd, and include the output of `perfcached -V`, your config
@@ -178,6 +178,30 @@ Known limits in 0.7.5:
   `tls` (0.7.5, a build with OpenSSL).  Under `upstream_writes =
   through` the RESP door can write to Redis: keep it on a trusted
   segment, behind `resp_allow` and `[secrets] resp`, or on TLS.
+
+Known issues in 0.7.5, fixed in **0.7.5.1**, a fix release that is
+coming next:
+
+- Write-through (`upstream_writes = through`): a value too large for
+  one record (about 256 KB with its key) is still sent to Redis, which
+  takes it, and the client gets OK, but the fleet cannot hold it.  An
+  older copy of that key may keep answering until tracking invalidates
+  it (for good with `upstream_tracking = off`); after that, reads fail
+  as too large.  Keep write-through values under 256 KB until 0.7.5.1.
+- A node rejoining while a reconcile pass is open can report ready
+  before its copy of the fleet's state has finished, and for that
+  moment answer a read with a key deleted while it was away, or an
+  older value.
+- A collection change that comes from the fleet (a resize, an autoscale
+  or mode change) writes the collections file on the cluster thread.
+  On slow storage that stalls the forwards and pulls the thread
+  carries for as long as the fsync takes, and a read routed through
+  such a node can answer as a miss.
+
+0.7.5.1 also carries the fixes from a full code review of 0.7.5:
+memory-safety fixes, refusals for malformed input, and corrections
+in the cluster, the upstream bridge, the client libraries and the
+tools.  The next release notes list them.
 
 ## Install
 
