@@ -6,11 +6,31 @@ body:
     attributes:
       value: |
         Thanks for reporting.  A security problem goes privately, not here: see SECURITY.md.
-  - type: input
+  - type: textarea
     id: version
     attributes:
-      label: Version
-      description: The output of `perfcached -V` (and `perfcli -V` if a client is involved).
+      label: perfcached version
+      description: The output of `perfcached -V`.
+      render: text
+      placeholder: |
+        perfcached 0.7.5 (89e55817)
+        tls: OpenSSL 3.0.17 1 Jul 2025
+    validations:
+      required: true
+  - type: input
+    id: libperfd
+    attributes:
+      label: libperfd version
+      description: The output of `perfcli -V` (it names its libperfd), or `pkg-config --modversion libperfd` for the libperfd your application links.  Write "none" if no libperfd client is involved.
+      placeholder: perfcli 0.7.5 (libperfd 0.7.6)
+    validations:
+      required: true
+  - type: input
+    id: php
+    attributes:
+      label: PHP extension version
+      description: The output of `php -r 'echo phpversion("perfcached"), " (libperfd ", Perfcached::LIBPERFD, ")\n";'`.  Write "none" if the PHP extension is not involved.
+      placeholder: 0.1.1 (libperfd 0.7.6)
     validations:
       required: true
   - type: dropdown
