@@ -112,10 +112,10 @@ it for every fleet it ever built, and nobody noticed for a month.
 request path, not musl itself: a malloc per reply in libperfd, and in
 the daemon a 256 KB buffer and a document copy per JSON command.
 0.4.0 removed them - the daemon's JSON verbs and libperfd's
-calls on a warm handle now allocate nothing, and CI counts it
+calls on a warm handle now allocate nothing, and tests count it
 (`test/jsonalloctest.sh`, `test/liballoctest.sh`).
-`bench/Containerfile.alpine` builds the small image; CI builds both
-editions and runs `check-standalone` on Alpine
+`bench/Containerfile.alpine` builds the small image; both editions
+build and pass `check-standalone` on Alpine
 ([tools/alpine-check.sh](../tools/alpine-check.sh)).
 `bench/containers-up.sh` still builds the Debian image, which remains
 the base for every number on this page.
@@ -160,7 +160,8 @@ starts the containers, then measures and prints **membership
 convergence**: the elapsed time until every node reports
 `peers_up=2` with an assigned id and an elected master.  Nothing was
 configured to make that happen — the nodes discover each other over
-multicast, the highest address founds as master, ids are assigned at
+multicast, the lowest identity founds (0.7.5; the runs below predate
+it), ids are assigned at
 join.  Nodes can start in any order; a killed node rejoins by itself.
 
 ## 5. Run the matrix
@@ -186,9 +187,10 @@ The matrix exercises both cluster modes side by side on the same
 daemons: `b` answers the read-scaling question (how a cold replica
 warms, what warm local reads cost), `px` answers the capacity question
 (how 200k keys written through one node end up level across three, and
-what a read through a non-holder costs).  There is nothing to switch —
-mode is a per-collection setting, and both collections live in every
-node simultaneously.
+what a read through a non-holder costs).  These configs use the legacy
+per-collection `mode =` (accepted with a warning - GUIDE.md, "One
+cluster is one mode"); a deployment declares one `[cluster] mode` over
+`collections`, and two modes are two fleets.
 
 ## 7. Results
 

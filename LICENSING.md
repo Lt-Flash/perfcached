@@ -23,9 +23,6 @@ print-libperfd); today:
 
 None of them reads anything from the daemon's side (verified on every
 push: test/mitboundtest.sh asks the compiler for the set and fails on any
-On the client side too, the PHP extension - lang/php, with its Symfony
-adapter - is under the MIT License (lang/php/LICENSE).
-
 file in it without an MIT SPDX line).
 
 THE PHP EXTENSION - lang/php, with its Symfony adapter - is MIT as well

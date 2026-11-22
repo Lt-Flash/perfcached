@@ -386,7 +386,7 @@ http_allow = 192.0.2.0/24
 [cluster]
 multicast = 239.68.68.5:6480
 mode = spread
-replicas = 3                         # K; refused at 1 (that is shard) and above the fleet size
+replicas = 3                         # K; refused at 1 (that is shard); more than the live members is logged and shown as replicas_short
 collections = sessions, presence
 pull_timeout_ms = 200
 

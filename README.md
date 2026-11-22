@@ -91,8 +91,9 @@ they find each other, elect a master and share the keyspace.
   owner.  Redis clients that understand Redis Cluster read `CLUSTER
   SLOTS` and route themselves.
 - **A PHP client.**  `lang/php` is an extension over libperfd for PHP
-  8.3: one handle a worker under PHP-FPM, a list of seeds, and the
-  fleet with no proxy beside it ([its README](lang/php/README.md)).
+  8.1 or later (packaged for 8.3): one handle a worker under PHP-FPM, a
+  list of seeds, and the fleet with no proxy beside it
+  ([its README](lang/php/README.md)).
 - **Pub/sub across the fleet**: a publish on any node reaches the
   subscribers on every node.
 - **On a LAN or in a cloud.**  By default membership, heartbeats and
@@ -129,7 +130,7 @@ Known limits in 0.7.5:
   window ("Compatibility" below) but two: 0.7.4.3 changed the cluster
   header, so a fleet on 0.7.3 or earlier moves to it together
   (`fleetstop`, install, start; clients keep working), and 0.7.5, as
-  the next item says.  Use SET
+  the item on cluster wire epoch 4 below says.  Use SET
   IFEQ/IFNE and DELEX once every node runs 0.5.0 or later.  A node
   keeps the identity an earlier release minted at random, and its log
   says how to switch to one derived from the machine.
@@ -170,6 +171,10 @@ Known limits in 0.7.5:
   earlier release: from 0.7.4, stop every node and start them all on
   0.7.5 (the state is kept).  A libperfd older than 0.7.6 does not route
   by key against it - every request then takes the forward.
+- `[cluster] tombstone_acks = yes` cannot be switched on by a rolling
+  restart in a fleet running `no`: a node on `yes` among members on `no`
+  loops.  Until 0.7.5.1, leave a fleet that runs `no` on `no` (a switch
+  to `yes` needs every node changed and the fleet restarted whole).
 - Read-through from a Redis upstream carries strings, hashes and
   RedisJSON documents (a list, set, sorted set or stream answers
   `WRONGTYPE`); `KEYS` and `SCAN` see only what perfcached holds;
@@ -517,10 +522,9 @@ tools/matrix.sh        # build and test all four architectures (podman + qemu)
 tools/alpine-check.sh  # Alpine (musl, gcc 15): both editions + check-standalone
 ```
 
-CI runs lint and the fast suite on every push, and the full suite,
-the sanitizer suite, the four-architecture matrix and the Alpine check
-on every release candidate's tag; a release is tagged on the candidate
-that passed.  Debian and Alpine - glibc and musl - are both
+Every release candidate passes the full suite, the sanitizer suite,
+the four-architecture matrix and the Alpine check before it is tagged.
+Debian and Alpine - glibc and musl - are both
 built and tested; `bench/Containerfile.alpine` is the small image.
 
 ## Compatibility
@@ -540,8 +544,9 @@ master last, one node at a time, reading the fleet between nodes (every
 node `ready`, its peers up, the record counts not fallen, no reconcile
 waiting on the node you are about to restart - the page's header says
 "do not restart" while one is).  The client library of the same or the
-previous minor talks to both sides of a roll (the test and staging
-fleets run libperfd 0.6.0 against 0.6.x daemons).
+previous minor talks to both sides of a roll - except against 0.7.5,
+where a libperfd older than 0.7.6 does not route by key: every request
+takes the forward hop, and a value over 58,000 bytes is refused.
 
 Packages upgrade through the package manager, which leaves the running
 daemon in place until you restart it (PRODUCTION.md, section 8); a

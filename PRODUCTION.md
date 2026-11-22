@@ -335,8 +335,9 @@ master last, one node at a time, reading the fleet between nodes (every
 node `ready`, its peers up, the record counts not fallen, no reconcile
 waiting on the node you are about to restart - the page's header says
 "do not restart" while one is).  The client library of the same or the
-previous minor talks to both sides of a roll (the test and staging
-fleets run libperfd 0.6.0 against 0.6.x daemons).
+previous minor talks to both sides of a roll - except against 0.7.5,
+where a libperfd older than 0.7.6 does not route by key: every request
+takes the forward hop, and a value over 58,000 bytes is refused.
 
 **The packages.**  The daemon packages do **not** restart the daemon on upgrade: `apt install
 perfcached=<version>` leaves the running build in place and the postinst

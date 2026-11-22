@@ -76,7 +76,8 @@ cluster-aware client sends the key to its owner).
 A pattern for `KEYS`/`SCAN MATCH` up to
 255 bytes.  Expiry granularity is one second: `PX`, `PEXPIRE` and
 `PEXPIREAT` round *up* to the next second, `PTTL` is seconds × 1000.
-A key holds a string (counters are strings) or a JSON document.
+A key holds a string (counters are strings), a JSON document, a hash, a
+rate limit (`RL.HIT`) or a Symfony lock.
 
 ## Connection and server
 

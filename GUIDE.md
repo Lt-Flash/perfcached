@@ -268,7 +268,7 @@ them:
   a reboot is not a blocked path.
 - **One cluster from a cold start.**  Set `expect` to the fleet's size:
   a node with no cluster id then founds only when it sees that many
-  blank nodes, and the highest address founds while the rest join it.
+  blank nodes, and the lowest identity founds while the rest join it.
   Nodes that know only one seed learn each other through it.  Without
   `expect`, a node whose seeds are all down founds a cluster of its own
   after 5 s of silence - and once that is 30 s old it never merges.
@@ -414,7 +414,10 @@ to the group once instead of to each peer, when it fits `max_datagram`
 peer).  This needs every member on 0.7.3 or later with `[cluster]
 tombstone_acks = yes` (the default): while one is not, the whole fleet
 keeps the time rule above, and `/stats cluster.acks.fleet` names the
-members it waits for.
+members it waits for.  In 0.7.5 a fleet on `tombstone_acks = no` cannot
+be moved to `yes` by a rolling restart: a node on `yes` among members on
+`no` loops.  Until 0.7.5.1, leave a fleet that runs `no` on `no` (a
+switch to `yes` needs every node changed and the fleet restarted whole).
 
 Three cases can still bring a delete back.  Re-issue deletes that matter
 after a long split:
@@ -483,7 +486,8 @@ expires again unless it was written with a longer TTL.
 
 Failure detection
 runs on 1 Hz heartbeats with real margin - a master is presumed dead
-after 8 s of silence, a peer after 10, so jitter is not death - beat
+after 8 s of silence, a peer is dropped after 6 s (kept on TCP when
+only its UDP is blocked), so jitter is not death - beat
 emission is watchdog-backed (`stats cluster.hb_sent` counts the beats
 sent, `hb_watchdog` the ones the watchdog re-sent, 0.7.5), and datagram
 ingest is fairness-bounded
@@ -612,7 +616,10 @@ and up at least 30 s before the node went down - does not trust what it
 replayed.  It drops the replayed records and copies that survivor's
 state whole, so a key deleted, expired or rewritten while it was away
 reads as the fleet has it.  It is RECOVERING while it copies: a client
-is refused rather than answered from a half-copied store.  The same
+is refused rather than answered from a half-copied store.  (In 0.7.5 a
+node rejoining while a reconcile pass is open can report ready before
+its copy has finished, and for that moment answer a key deleted while it
+was away, or an older value - fixed in 0.7.5.1.)  The same
 happens when a floor or a split's rebuild (below) puts the records it
 stored in question: it drops those and copies a survivor's state over
 them, keeping what it wrote since.  A write the node took and had not
@@ -694,6 +701,9 @@ it drops every record it stored before its absence and pulls the
 fleet's state from a ready member that holds records, as a joining node
 does.  It is RECOVERING while it resyncs: a client is refused rather
 than answered from what it holds, and nothing it drops reaches a peer.
+(In 0.7.5 a node rejoining while a reconcile pass is open can report
+ready before its copy has finished, and for that moment answer a key
+deleted while it was away, or an older value - fixed in 0.7.5.1.)
 Writes it accepted after the absence began are kept.  It resyncs when
 it was away longer than `[cluster] resync_after_s` (default 86400 - a
 day; 0 never by time; at most a year), whatever a witness could say -
@@ -1283,31 +1293,12 @@ takes the place of the discovered one gone longest - after twice
 address - and the log says whose place it took and why; more than fit at
 once is logged and the rest not used.
 
-**A Sentinel (0.7.5).**  An upstream whose `INFO server` says
-`redis_mode:sentinel` is a sentinel, and is never read from.  A thread
-of the collection asks the sentinels every 10 s which master they watch
-(`SENTINEL MASTERS`: the only one, or the one `upstream_sentinel_master`
-names when they watch several - until it is set, nothing is added and
-the collection's `sentinel` line in `/stats` says which to name), where
-it is, its replicas and the other sentinels (`GET-MASTER-ADDR-BY-NAME`,
-`REPLICAS`, `SENTINELS`).  The master and the replicas become the
-collection's upstreams, origin `sentinel`, read as `upstream_role`
-says; a replica the sentinels hold down is left out, and a server they
-stop naming is gone from the topology.  The other sentinels are
-remembered, so the one named may go away.  The node also subscribes to
-a sentinel's events (`+switch-master`, `+sdown`, `+odown`, `+slave`,
-`+sentinel` and their pairs), so a failover is followed at once, and a
-write-through collection's writer follows the master the sentinels
-name.  `upstream_sentinel_password` is the sentinels' own password,
-when they ask for one.  What was learned is kept in `state_dir` and
-tried at a start with the seed down.  `upstream_discover = no` adds
-nothing.
-
 **A Sentinel as the upstream (0.7.5).**  An upstream whose `INFO server`
 says `redis_mode:sentinel` is never read from.  The collection asks it,
-every 10 s and at once on its events (a failover, a server held down or
-back, a replica or a sentinel added), which master it watches, where
-that master is, its replicas and the other sentinels, and makes the
+every 10 s and at once on its events (`+switch-master`, `+sdown`,
+`+odown`, `+slave`, `+sentinel` and their pairs: a failover, a server
+held down or back, a replica or a sentinel added), which master it
+watches, where that master is, its replicas and the other sentinels, and makes the
 master and the replicas its upstreams - "named by a sentinel" on the
 page, `origin` `sentinel` in `/stats` - read as `upstream_role` says.  A
 replica the sentinel holds down is not read, and a server it stops
@@ -1430,8 +1421,9 @@ replicas are read by, and `+client|info` the proxy check of
 - A plain overwrite (`SET`, `SETEX`, `PSETEX`, `JSON.SET` at the root,
   native `set` and `mset`) does not wait.  An ownership check reads the
   key from the upstream in the background.
-- `KEYS`, `SCAN`, `DBSIZE` and `RANDOMKEY` see only what the collection
-  holds.  `RL.HIT` and the lock scripts never fall through.
+- `KEYS`, `SCAN` and `DBSIZE` see only what the collection holds
+  (`RANDOMKEY` is not served).  `RL.HIT` and the lock scripts never
+  fall through.
 
 A RESP pipeline whose first command waits on a fetch is answered in
 order: the connection holds until that command has run.  The native
@@ -1574,9 +1566,8 @@ restart them.  The companion collection is not created again, and its
 records are dropped at recovery as orphans.
 
 **Where read-through and write-through are proven.**  Their suites run
-on single nodes and eager fleets, and a three-node test fleet runs them
-in eager.  In `shard` (0.7.1) a read-through collection fetches at the
-key's OWNER: a miss on any node pulls from the owner, which fetches from
+on single nodes and on eager fleets.  In `shard` (0.7.1) a read-through
+collection fetches at the key's OWNER: a miss on any node pulls from the owner, which fetches from
 the upstream and keeps the one copy, so the fleet holds each key once
 and no node fetches a key it does not own; the daemon refused the
 combination before 0.7.1.  That holds with or without
@@ -1747,7 +1738,7 @@ drop.
 **Reading your own write (0.7.1).**  The master echoes the write at once,
 before the replicas have it, and a fetch from a replica that has not caught
 up answers the value before the write, or none: a client could read nil for
-the key it had just set (about 4% of writes on a staging fleet whose
+the key it had just set (about 4% of writes where the
 replicas lag a few milliseconds).  So inside the same window a fetch of that
 key - the echo's refetch, or a read that misses - goes to the master listed
 among the upstreams, which has the write by definition; outside it reads go
@@ -1761,7 +1752,7 @@ write per tracked upstream, a read on the master that the window costs.
 mark that answers "gone" here while the replicas catch up - but Redis
 echoes a delete too, and the echo took the mark: a read after it could go
 to a replica that had not applied the delete yet and answer the value just
-deleted (once in about 29,000 deletes on a staging fleet whose replicas lag
+deleted (once in about 29,000 deletes where the replicas lag
 a few milliseconds).  A delete now opens the same window as a write, so
 that read goes to the master.  `upstream_echo_ms = 0` turns it off with the
 rest.
@@ -1770,7 +1761,7 @@ rest.
 tracking connection, is a gap: Redis sent invalidations to nobody, so the
 records written through that the node still holds (the WAL replays them)
 cannot be trusted and are dropped.  Before 0.7.1 the node came back cold,
-every held key one fetch on its next read (a roll on the test fleet took
+every held key one fetch on its next read (measured: a restart took
 a node from 1,036 held records to 12).  Now their names go on a re-warm
 list and are fetched again in the background at `upstream_drain_rate`
 (the drain sweep's throttle), newest written first, at most
@@ -1831,9 +1822,13 @@ Each write costs a round trip to the master, and one node sends a
 collection's writes to it one at a time: at a 0.4-0.7 ms round trip that
 is about 1,500-2,500 writes a second per node and collection, whatever
 Redis can take, and a slow write holds the ones behind it.  `MULTI`/`EXEC`
-stay unsupported.  Under `through` the RESP door can write to Redis, so
-keep a plaintext one on a trusted segment, behind `resp_allow` and
-`[secrets] resp`, or serve it over TLS (0.7.5, "TLS on the RESP and
+stay unsupported.  In 0.7.5 a value too large for one record (about
+256 KB with its key) is still sent to Redis, which takes it, and the
+client gets OK, but the fleet cannot hold it: an older copy may answer
+until tracking invalidates it, then reads fail as too large.  Keep
+write-through values under 256 KB until 0.7.5.1.  Under `through` the
+RESP door can write to Redis, so keep a plaintext one on a trusted
+segment, behind `resp_allow` and `[secrets] resp`, or serve it over TLS (0.7.5, "TLS on the RESP and
 HTTP doors" below).
 
 ### Other settings worth knowing
@@ -2325,7 +2320,6 @@ it already keeps:
 | a member silent, failed, stalled, gone or dropped (`fleet.node<id>`); members missing against the fleet's size (`fleet.missing`); fewer ready than a majority (`fleet.majority`) | warning; warning; critical | after 30 s (a goodbye: a minute); after a minute; after a minute | after 30 s |
 | a setting the fleet must agree on held differently by a member (`config.<setting>`, 0.6.5) | warning | after a minute | after a minute agreeing |
 | a member holding other autoscale modes than this node's, or one too old to take them while modes are set (`cluster.autoscale`, 0.7.2) | warning | after 30 s | after a minute agreeing |
-| the TLS doors' certificate inside 14 days of its expiry, or past it (`tls.cert`, 0.7.5) | warning (critical once expired) | at once | after a minute outside the 14 days |
 | the node started (ready to serve) | info; warning after an unclean stop | once | - |
 
 A level says how soon a person must act, not how bad the event was:
@@ -2603,8 +2597,9 @@ master last, one node at a time, reading the fleet between nodes (every
 node `ready`, its peers up, the record counts not fallen, no reconcile
 waiting on the node you are about to restart - the page's header says
 "do not restart" while one is).  The client library of the same or the
-previous minor talks to both sides of a roll (the test and staging
-fleets run libperfd 0.6.0 against 0.6.x daemons).
+previous minor talks to both sides of a roll - except against 0.7.5,
+where a libperfd older than 0.7.6 does not route by key: every request
+takes the forward hop, and a value over 58,000 bytes is refused.
 
 **Staging a build on a node.**  `upgrade_stage` (native door, a
 privileged connection) receives a tarball in order: `begin` with its
@@ -2701,10 +2696,9 @@ the master first; `status` shows the plan, the journal and every node's
 live version, state and roll state.  A node that is unreachable is never
 skipped: the roll stops until it is back.  `switch_cmd=<program>` replaces
 the daemon's switch and revert verbs with a program of yours (`<program>
-switch|revert <addr> <port> <node> <artifact> <sha256>`) - what the CI
-roll uses with a loopback fleet, and what a package host could use with
-its package manager.  A roll leaves the fleet on its committed wire
-epoch: once every node runs a build that speaks a newer one beside it,
+switch|revert <addr> <port> <node> <artifact> <sha256>`) - for a loopback
+test fleet, or a package host's package manager.  A roll leaves the
+fleet on its committed wire epoch: once every node runs a build that speaks a newer one beside it,
 `upgrade commit epoch=<n>` raises it ("The wire epoch" above).  A release
 that speaks no epoch of the fleet's, as 0.7.5 does not of 0.7.4's, is no
 roll: `upgrade plan` refuses it, and every node is stopped and started on
@@ -2973,7 +2967,7 @@ certificate (plain 8080) serves the page but opens no session.
 
 **The admin image.**  `contrib/docker/admin/` builds an image with the
 dashboard, perfcli and nginx in front (`tools/image-admin.sh`, podman or
-docker; CI publishes it as a tar on each tag): `podman run -p 8080:8080
+docker): `podman run -p 8080:8080
 -e PCD_SEEDS=10.0.0.1:6479 -e PCD_SECRET_FILE=/run/secrets/pcd -v
 ./pcd:/run/secrets/pcd:ro perfcached-admin`; mount
 `/etc/perfcached/tls/{cert,key}.pem` and it serves 8443 with TLS and
@@ -3142,8 +3136,7 @@ block on `/stats` and `/metrics`.
 ## Measured
 
 > **0.4.0's numbers**, except the `spread` farm table, which is still
-> 0.3.7's (re-taking it means a high packet rate across the lab's
-> shared network; it waits for a quiet window), the TLS table,
+> 0.3.7's (not re-taken since), the TLS table,
 > which is 0.7.5's, and the Redis Cluster table, a 0.7.4 build on bare
 > metal (2026-11-01).
 
@@ -3430,10 +3423,8 @@ proxy consults a locator and broadcasts on a miss.
 
 ### `spread` at capacity, from an off-box farm
 
-> **Still 0.3.7's numbers** - not re-taken for 0.4.0: the farm drives
-> the server with a high packet rate from two other hosts across the
-> lab's shared network, which waits for a quiet window.  Read it as the
-> previous release's.
+> **Still 0.3.7's numbers** - not re-taken since.  Read it as an older
+> release's.
 
 `bench/spreadbench.sh`, 0.3.7's daemon (`e58ee8e`), 2026-09-16.  P bare
 daemons on the 16-vCPU server host; natbench (this tree's, over

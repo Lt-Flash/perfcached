@@ -34,10 +34,9 @@ vocabulary observed:
 | `EXPIRE <call-id> 86400` | after every write | ✅ |
 
 **No hash commands.** Each call is one opaque JSON blob under its
-call-id, so the HSET/HGETALL mapping question the task was filed with
-is moot for this version. Also worth noting for the project's founding
-motivation: rtpengine fires a blocking `KEYS *` at the shared Redis on
-every startup.
+call-id, so the HSET/HGETALL mapping question is moot for this
+version. Also worth noting: rtpengine fires a blocking `KEYS *` at the
+shared Redis on every startup.
 
 ## 2. `interop-perfcached.sh` — does rtpengine run on perfcached?
 

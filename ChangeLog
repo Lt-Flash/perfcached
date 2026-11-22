@@ -1,6 +1,6 @@
 =========================== Release 0.7.5 ==============================
 
-2026-11-13  Yury Kirsanov
+2026-11-22  Yury Kirsanov
         * [upgrade] 0.7.5 speaks cluster wire epoch 4 alone and refuses
           a 0.7.4 node by name: from 0.7.4.x stop every node (perfcli -E
           <enable> fleetstop), install 0.7.5 everywhere and start them

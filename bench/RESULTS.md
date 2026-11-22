@@ -194,20 +194,12 @@ read-through-an-empty-node table) and a new keys/scan comparison, all
 on the tagged 0.4.0 daemon (`570067a`), on the same 16-vCPU Debian 13
 server host as 0.3.7's, with the same harness settings as 0.3.7's run
 (the containerbench header is field-for-field the same apart from the
-build).  The off-box `spread` farm table was NOT re-taken: it drives
-the server from two other hosts at a high packet rate across the lab's
-shared network, and that network was found that day to flood such
-traffic onto unrelated hosts (below).  It stays labelled as 0.3.7's.
+build).  The off-box `spread` farm table was NOT re-taken; it stays
+labelled as 0.3.7's.
 
-**Three runs behind the cluster tables, and why.**  The full sweep
-(`containerbench-0.4.0.tsv`, 18:44-21:09 local time, 75 rows) overlapped
-a lab-network incident from about 19:14 to 19:41 - a high-packet-rate
-benchmark between two other hosts (the keys/scan bench's stall cells)
-was flooded across the shared VLAN and disturbed hosts that had
-nothing to do with it.  The sweep's own traffic stays inside the server
-host's container bridge, but the host sits on that VLAN, and the
-modes that ran in the window - eager, and the start of proxy - may
-carry it.  So those two modes were re-run:
+**Three runs behind the cluster tables, and why.**  A network incident
+overlapped part of the full sweep (`containerbench-0.4.0.tsv`), so the
+modes that ran in it, eager and the start of proxy, were re-run:
 
 - **eager** (`containerbench-0.4.0-eager.tsv`, 21:10): complete.  Its
   pipeline-1 rows came out 8-13% above the in-incident ones in every
@@ -270,15 +262,10 @@ below their siblings while the `KEYS` client in the same cell measured
 the server as normal - the signature of the client host, which was
 shared; the medians do not use them and the results file keeps them.
 
-**The lesson the incident left for every harness here:** a benchmark
-is not isolated because its endpoints are lab boxes.  Depth-1, many-
-connection cells (keyscanbench's stall cells, a cross-host pcbench at
-depth 1, containerbench with a remote client, spreadbench's farm) send
-hundreds of thousands of small packets a second, and on a network that
-floods unknown unicast that traffic reaches everything on the VLAN.
-Pipelined bulk cells (the wire table) moved far more bytes and disturbed
-nothing - the cost is per packet.  Run such cells on one host, or in a
-window agreed with whoever runs the network.
+**The lesson for every harness here:** depth-1, many-connection cells
+send hundreds of thousands of small packets a second and can disturb
+other hosts on a shared network, so run them on one host or in a quiet
+window.
 
 ## The 0.3.7 tables, one host — the readings (2026-09-16)
 

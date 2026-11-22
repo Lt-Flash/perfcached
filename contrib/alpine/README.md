@@ -1,6 +1,6 @@
 # perfcached for Alpine
 
-`APKBUILD` builds six packages from one release tarball (PD-11, 0.7.0;
+`APKBUILD` builds six packages from one release tarball (0.7.0;
 until 0.6.x it packaged the client library alone):
 
 - `perfcached` - the clustered daemon, `perfcli`, `perfdump`, `perfload`,
@@ -37,6 +37,6 @@ The key's public half is in `keys/` here and on every release page.  To
 build the packages yourself, put the source tarball
 (`perfcached-<version>.tar.gz`, top directory `perfcached-<version>/`)
 beside the APKBUILD and run `abuild checksum && abuild -r` with your own
-key (`abuild-keygen -a`).  `tools/alpine-pkg-check.sh` is what CI runs:
-it builds the packages with abuild in an alpine container, installs them
+key (`abuild-keygen -a`).  `tools/alpine-pkg-check.sh` builds the
+packages with abuild in an alpine container, installs them
 and starts the services through OpenRC.

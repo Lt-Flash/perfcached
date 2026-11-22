@@ -33,8 +33,9 @@ trailer:
 The type is the one the daemon's `dump` names in a record's `t` (none
 for a string) and `restore` takes back, so a hash comes back a hash, not
 a string holding its encoding.  No other type value exists, and klen +
-vlen never exceeds 262,080 bytes, the store's largest record:
-`perfload` and `--inspect` refuse a file that breaks either.
+vlen never exceeds 262,052 bytes (the store's largest record is 262,080
+bytes with its 28-byte header): `perfload` and `--inspect` refuse a file
+whose klen + vlen passes 262,080, or that names another type.
 
 The CRC-32 (IEEE, the zlib polynomial) covers everything from the magic
 to the end of the trailer, uncompressed. `perfdump --inspect DIR` reads
