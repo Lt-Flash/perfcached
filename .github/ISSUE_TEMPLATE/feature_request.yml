@@ -1,0 +1,43 @@
+name: Feature request
+description: Something perfcached, libperfd or a tool should do
+title: "[FEATURE] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What you would like
+      description: How it should behave - a command, a config option, a client call.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - perfcached (daemon)
+        - clustering
+        - Redis door (RESP)
+        - libperfd
+        - PHP extension
+        - perfcli or other tools
+        - dashboard or metrics
+        - docs
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: input
+    id: version
+    attributes:
+      label: Version you run
+      description: The output of `perfcached -V`, if you run it already.

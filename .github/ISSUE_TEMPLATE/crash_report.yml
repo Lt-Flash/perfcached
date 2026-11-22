@@ -1,0 +1,129 @@
+name: Crash report
+description: perfcached, a tool or a program using libperfd crashed (segfault, abort, assertion)
+title: "[CRASH] "
+labels: [bug, crash]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting.  A crash that looks exploitable from the network goes privately, not here: see SECURITY.md.
+        To keep a core next time, install `contrib/systemd/cores.conf` as `/etc/systemd/system/perfcached.service.d/cores.conf` (it says how).
+  - type: textarea
+    id: version
+    attributes:
+      label: perfcached version
+      description: The output of `perfcached -V` on every node involved (they should match).
+      render: text
+      placeholder: |
+        perfcached 0.7.5 (89e55817)
+        tls: OpenSSL 3.0.17 1 Jul 2025
+    validations:
+      required: true
+  - type: input
+    id: libperfd
+    attributes:
+      label: libperfd and perfcli version
+      description: The output of `perfcli -V` (it names its libperfd), and `pkg-config --modversion libperfd` for the libperfd your application links.  Write "none" if no libperfd client is involved.
+      placeholder: perfcli 0.7.5 (libperfd 0.7.6); application linked against libperfd 0.7.6
+    validations:
+      required: true
+  - type: input
+    id: php
+    attributes:
+      label: PHP extension version
+      description: The output of `php -r 'echo phpversion("perfcached"), " (libperfd ", Perfcached::LIBPERFD, ")\n";'` and `php -v | head -1`.  Write "none" if the PHP extension is not involved.
+      placeholder: 0.1.1 (libperfd 0.7.6), PHP 8.3.14 (cli)
+    validations:
+      required: true
+  - type: input
+    id: dashboard
+    attributes:
+      label: Dashboard version
+      description: The output of `perfcached-dashboard -V`.  Write "none" if the dashboard is not involved.
+      placeholder: "perfcached-dashboard 0.7.6 (libperfd 0.7.6, libmicrohttpd 0.9.75, tls: OpenSSL 3.0.17 1 Jul 2025)"
+    validations:
+      required: true
+  - type: input
+    id: asterisk
+    attributes:
+      label: Asterisk and func_perfd version
+      description: The output of `asterisk -rx 'core show version'` and `asterisk -rx 'module show like func_perfd'`.  Write "none" if Asterisk is not involved.
+      placeholder: Asterisk 22.10.1, func_perfd.so Running
+    validations:
+      required: true
+  - type: input
+    id: upstream
+    attributes:
+      label: Redis upstream version
+      description: For a collection with an upstream - `redis-cli -h <upstream> INFO server | grep -E 'redis_version|valkey_version|redis_mode'`, and whether it is one server, replicas, Sentinel or Redis Cluster.  Write "none" if no upstream is configured.
+      placeholder: redis_version 8.0.2, redis_mode cluster (30 masters)
+    validations:
+      required: true
+  - type: textarea
+    id: clients
+    attributes:
+      label: Client applications and versions
+      description: Every program talking to perfcached when it happened, with its version, the door it uses (native or Redis) and, for the Redis door, the client library and its version.
+      placeholder: |
+        rtpengine 10.5.6.4 - Redis door, hiredis 1.2.0
+        Symfony Cache 7.1.5 - PHP extension 0.1.1
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Edition and install
+      options:
+        - perfcached package (clustered)
+        - perfcached-standalone package
+        - Alpine apk
+        - release tarball
+        - built from source
+    validations:
+      required: true
+  - type: textarea
+    id: os
+    attributes:
+      label: OS, kernel and architecture
+      description: The output of `. /etc/os-release; echo "$PRETTY_NAME"; uname -srm`, and whether it runs on bare metal, a VM, LXC or a container.
+      render: text
+      placeholder: |
+        Debian GNU/Linux 13 (trixie)
+        Linux 6.12.48+deb13-amd64 x86_64
+        KVM virtual machine
+    validations:
+      required: true
+  - type: textarea
+    id: backtrace
+    attributes:
+      label: Backtrace
+      description: |
+        From the core: `gdb -batch -ex 'thread apply all bt full' /usr/bin/perfcached <core>`.  Paste the output, or a link to it if it is long.
+        Please do not attach the core file itself: it holds your keys and values.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log before the crash
+      description: The last lines the daemon logged, and any alert it sent.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: traffic
+    attributes:
+      label: What it was doing
+      description: The traffic or command at the time - a client, a restart, a node joining, a snapshot, a reload.
+  - type: textarea
+    id: cluster
+    attributes:
+      label: Cluster
+      description: If clustered - the mode of the collections involved, the number of nodes, discovery (multicast or unicast).
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: perfcached.conf with every secret, password and token removed.
+      render: ini
