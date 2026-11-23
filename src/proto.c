@@ -2363,9 +2363,11 @@ void pc_pull_found_keep(const char *col, size_t collen, const char *key,
 		v.len = d->vlen;
 		/* the HOLDER's version, not a local tick: clocks converge to the fleet maximum, so
 		 * a local one could outrank the holder's next genuine update */
-		pcache_ht_store_ver(ht, &k, &v, exp,
+		/* a through collection's pulled record is Redis's, as a pushed one: marked (T594) */
+		if (pcache_ht_store_ver(ht, &k, &v, exp,
 			(unsigned char)(PCACHE_F_PASSIVE |
-			(d->newval & PCACHE_F_CARRY)), d->ver);
+			(d->newval & PCACHE_F_CARRY)), d->ver) == 0)
+			pc_upstream_note_copy(col, collen, key, klen, exp, d->ver);
 	} else if (ht) {
 		/* proxy mode: serve WITHOUT storing, remember the holder */
 		pc_loc_set(col, collen, key, klen, d->from_node);

@@ -155,5 +155,8 @@
 #define M_LINK_REPORT     58
 #define M_ONLINE          59
 #define M_ONLINE_LEN      5
+/* a node whose upstream tracking had a gap dropped a collection's written-through records and
+ * asks every live peer for that collection whole: M_ASKFILL [collen1][col] */
+#define M_ASKFILL         60
 
 #endif /* PC_CLMSG_H */

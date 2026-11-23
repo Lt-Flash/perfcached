@@ -2026,6 +2026,8 @@ int pc_cluster_col_fleet(int store, int basis, struct pc_col_fleet *out)
 	return 1;
 }
 
+static unsigned int self_entries_bias;  /* PERFCACHED_TEST_ENTRIES_BIAS: a peer ahead for good */
+
 static unsigned int self_entries(void)
 {
 	unsigned long long n = 0;
@@ -3781,6 +3783,7 @@ void peer_publish(struct peer *p, int node, unsigned int free_mb,
 		memset(p->repl_cursor, 0, sizeof p->repl_cursor);
 		memset(p->repl_dirty, 0, sizeof p->repl_dirty);
 		memset(p->repl_bfcycle, 0, sizeof p->repl_bfcycle);
+		memset(p->askfill, 0, sizeof p->askfill);
 		/* the sweep sends only AUTHORED records (copies would echo), so an empty node needs
 		 * a ONE-SHOT pass that includes copies, bounded to one clean cycle */
 		/* armed by the start kind it reports (PC_START_*), never its count; COLD arms only
@@ -4054,7 +4057,7 @@ void send_alive(void)
 	 * the prefix it knows and ignores the rest (clmemb's gates) */
 	a.ident = C.self_ident;
 	a.incarn = C.self_incarn;
-	a.entries = self_entries();
+	a.entries = self_entries() + self_entries_bias;
 	/* the Lamport clock rides the heartbeat: every node folds in every other's at 1 Hz,
 	 * so the fleet converges with no extra traffic */
 	a.lamport = pc_lamport_now();
@@ -4547,10 +4550,18 @@ static int all_live_eager(void)
 	return any;
 }
 
+/* T600: the counts alone never settle while the peers hold records no client reads (a 7k gap
+ * stood on PROD for hours, every miss parked on a pull) - so the pulls' own answers decide too */
+#define CATCHUP_EVIDENCE   1000        /* pull answers per window */
+#define CATCHUP_HIT_PCT    1           /* at most this share found a record: the doubt is spent */
+#define CATCHUP_MIN_MS     (4 * WITNESS_GRACE_MS)  /* the sweeps' re-sends land first */
+
 static void eager_catchup_tick(long long now)
 {
-	unsigned int mine;
-	int i, seen = 0;
+	static unsigned long long h0, m0;
+	unsigned long long dh, dm;
+	unsigned int mine, most = 0;
+	int i, seen = 0, behind = 0;
 
 	if (__atomic_load_n(&eager_caught_up, __ATOMIC_RELAXED))
 		return;
@@ -4567,12 +4578,40 @@ static void eager_catchup_tick(long long now)
 		if (!__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
 		        !clpeers_live(p, now) || p->nstate != PC_NST_READY)
 			continue;
-		if (p->entries > mine)
-			return;                /* behind this peer: keep asking */
+		if (p->entries > mine) {
+			behind = 1;            /* behind this peer: keep asking */
+			if (p->entries > most)
+				most = p->entries;
+		}
 		seen++;
 	}
-	if (!seen)
-		return;                    /* nobody to compare with yet */
+	if (!seen) {
+		h0 = C.st.pull_hits;       /* nobody to compare with yet */
+		m0 = C.st.pull_misses;
+		return;
+	}
+	if (behind) {
+		long long t0 = __atomic_load_n(&eager_settle_ms, __ATOMIC_RELAXED);
+
+		if (!t0 || now - t0 < CATCHUP_MIN_MS) {
+			h0 = C.st.pull_hits;   /* the window opens after it */
+			m0 = C.st.pull_misses;
+			return;
+		}
+		dh = C.st.pull_hits - h0;
+		dm = C.st.pull_misses - m0;
+		if (dh + dm < CATCHUP_EVIDENCE)
+			return;
+		h0 = C.st.pull_hits;
+		m0 = C.st.pull_misses;
+		if (dh * 100 > (dh + dm) * CATCHUP_HIT_PCT)
+			return;            /* the peers still hold what it lacks */
+		__atomic_store_n(&eager_caught_up, 1, __ATOMIC_RELAXED);
+		LM_NOTICE("cluster: caught up - holding %u record(s) to a peer's %u, but %llu of "
+			"the last %llu pull answers found nothing this node lacks; an eager miss "
+			"here is final from now on\n", mine, most, dm, dh + dm);
+		return;
+	}
 	__atomic_store_n(&eager_caught_up, 1, __ATOMIC_RELAXED);
 	LM_NOTICE("cluster: caught up - holding %u record(s), as many as every "
 		"live peer; an eager miss here is final from now on\n", mine);
@@ -4647,6 +4686,8 @@ static void eager_doubt_tick(long long now, int own)
 	__atomic_store_n(&eager_doubt_n, n, __ATOMIC_RELEASE);
 }
 
+static void askfill_tick(long long now);
+
 static void eager_settle_tick(long long now)
 {
 	long long t = __atomic_load_n(&eager_settle_ms, __ATOMIC_RELAXED);
@@ -4655,6 +4696,7 @@ static void eager_settle_tick(long long now)
 		__atomic_store_n(&eager_settle_ms, (t = now), __ATOMIC_RELAXED);
 	eager_doubt_tick(now, now - t < WITNESS_GRACE_MS);
 	eager_catchup_tick(now);
+	askfill_tick(now);
 }
 
 int pc_cluster_eager_miss_final(void)
@@ -5874,6 +5916,7 @@ static int sender_gate(int type, const pc_addr *from)
 	case M_TOMBSTONE:
 	case M_PUBLISH:
 	case M_DEMOTE:
+	case M_ASKFILL:
 		/* ... except on a joiner: restarted inside the purge window it knows nobody,
 		 * yet the map still forwards its keys' writes to it; refused, each times out */
 		return C.role == PC_ROLE_JOINING || sender_known(from);
@@ -6354,6 +6397,82 @@ static void handover_tick(long long now)
 	if (c.ok && seal_send(&p->addr, m, sizeof m) == 0)
 		LM_NOTICE("cluster: handing mastership to node %d, the synced "
 			"standby (term %u)\n", id, C.map.term);
+}
+
+/* ---- T600: a collection asked for whole (M_ASKFILL) ---- */
+static long long askfill_at[PC_MAX_COLLECTIONS];  /* when to ask, 0 = not; workers set it */
+
+static int store_index(const char *col, size_t collen)
+{
+	int c;
+
+	for (c = 0; c < pc_store_count(); c++)
+		if (pc_store_live(c) && strlen(pc_store_name(c)) == collen &&
+		    !memcmp(pc_store_name(c), col, collen))
+			return c;
+	return -1;
+}
+
+/* the drop leaves a negative version for 2 s (pc_verb_forget_local): the peers' copies of the
+ * same version must arrive after it, so the ask waits 3 s */
+void pc_cluster_ask_fill(const char *col, size_t collen)
+{
+	int c;
+
+	if (!C.enabled || (c = store_index(col, collen)) < 0 ||
+	    !pc_store_eager_enabled(pc_store_ht(c)))
+		return;
+	__atomic_store_n(&askfill_at[c], now_ms() + 3000, __ATOMIC_RELEASE);
+}
+
+static void askfill_tick(long long now)
+{
+	unsigned char m[2 + 255];
+	struct pc_wcur w;
+	int c, up;
+
+	for (c = 0; c < pc_store_count(); c++) {
+		long long t = __atomic_load_n(&askfill_at[c], __ATOMIC_ACQUIRE);
+		const char *cn = pc_store_name(c);
+		size_t cl = strlen(cn);
+
+		if (!t || now < t || cl > 255)
+			continue;
+		up = clpeers_count_live(&C.pt, now);
+		if (!up)
+			continue;              /* nobody yet: asked once one is up */
+		pc_wcur_init(&w, m, sizeof m);
+		pc_w8(&w, M_ASKFILL);
+		pc_w8(&w, (unsigned char)cl);
+		pc_wraw(&w, cn, cl);
+		if (!w.ok)
+			continue;
+		(void)clsend_live(&C.pt, m, 2 + cl, now);
+		__atomic_store_n(&askfill_at[c], 0, __ATOMIC_RELEASE);
+		LM_NOTICE("cluster: asked %d peer(s) for collection '%s' whole - its "
+			"records written through went with the upstream tracking gap\n",
+			up, cn);
+	}
+}
+
+static void handle_askfill(const unsigned char *pt, size_t n, const pc_addr *from)
+{
+	struct peer *p = clpeers_by_addr(&C.pt, from);
+	size_t cl;
+	int c;
+
+	if (n < 2 || !p || !p->node || !clpeers_live(p, now_ms()))
+		return;
+	cl = pt[1];
+	if (n < 2 + cl || (c = store_index((const char *)pt + 2, cl)) < 0 ||
+	    !pc_store_eager_enabled(pc_store_ht(c)) || p->askfill[c])
+		return;
+	p->askfill[c] = 1;
+	p->repl_cursor[c] = 0;             /* a whole cycle from its first bucket */
+	p->repl_bfcycle[c] = 0;
+	LM_NOTICE("cluster: node %d asks for collection '%s' whole (its upstream tracking "
+		"had a gap) - sending every record held here, copies included\n",
+		p->node, pc_store_name(c));
 }
 
 static void handle_handover(const unsigned char *pt, size_t n,
@@ -8353,6 +8472,7 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 	case M_GAP_REQ:   handle_gap_req(pt, ptlen, from); break;
 	case M_GAP_FLOOR: handle_gap_floor(pt, ptlen, from); break;
 	case M_HANDOVER: handle_handover(pt, ptlen, from); break;
+	case M_ASKFILL:  handle_askfill(pt, ptlen, from); break;
 	case M_MEMBERS_REQ: cladmit_members_req(pt, ptlen, from); break;
 	case M_MEMBERS:  cladmit_members(pt, ptlen, from); break;
 	case M_LINK_REPORT: cladmit_link_report(pt, ptlen, from); break;
@@ -10030,6 +10150,9 @@ static void eager_repl_tick(void)
 			/* a set repair is a backfill walk without the one-sender rule */
 			if (pr->setrepair[c] && pr->nstate != PC_NST_RECOVERING)
 				bf = 1;
+			/* asked for whole: every peer walks it, the version compare keeps one */
+			if (pr->askfill[c] && pr->nstate != PC_NST_RECOVERING)
+				bf = 1;
 			/* a backfill is a WHOLE cycle as sender: gaining the role mid-cycle
 			 * starts over, losing it leaves the flag to the new sender */
 			if (bf && pr->repl_cursor[c] && !pr->repl_bfcycle[c])
@@ -10110,6 +10233,12 @@ static void eager_repl_tick(void)
 					LM_NOTICE("cluster: re-placed the keys "
 						"node %d now holds (%s)\n",
 						pr->node, pc_store_name(c));
+				}
+				if (pr->repl_bfcycle[c] && pr->askfill[c]) {
+					pr->askfill[c] = 0;
+					LM_NOTICE("cluster: sent collection '%s' whole "
+						"to node %d, as it asked\n",
+						pc_store_name(c), pr->node);
 				}
 				if (pr->repl_bfcycle[c]) {
 					pr->backfill[c] = 0;
@@ -11915,6 +12044,15 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 				PC_CL_EPOCH);
 		}
 		epoch_load();
+	}
+	{
+		const char *e = getenv("PERFCACHED_TEST_ENTRIES_BIAS");
+
+		self_entries_bias = e ? (unsigned int)atoi(e) : 0;
+		if (self_entries_bias)
+			LM_WARN("cluster: PERFCACHED_TEST_ENTRIES_BIAS=%u - this node CLAIMS "
+				"that many more records to its peers (a test flag)\n",
+				self_entries_bias);
 	}
 	if (getenv("PERFCACHED_TEST_NO_RESPMAP")) {
 		self_no_respmap = 1;

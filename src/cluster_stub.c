@@ -920,6 +920,12 @@ int pc_cluster_eager_doubt_one(void)
 	return 0;
 }
 
+void pc_cluster_ask_fill(const char *col, size_t collen)
+{
+	(void)col;
+	(void)collen;
+}
+
 const char *pc_cluster_master_prefer(int node)
 {
 	(void)node;

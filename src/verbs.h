@@ -51,6 +51,8 @@ int pc_glob_match(const char *p, int pn, const char *s, int sn);
 void pc_verb_remove_local(pcache_htable_t *ht, const str *k);
 /* dropped HERE only (Redis changed it): table + WAL, no tombstone */
 void pc_verb_forget_local(pcache_htable_t *ht, const str *k);
+/* the same with no remembered delete: a copy the peers send back is taken (T600) */
+void pc_verb_forget_unguarded(pcache_htable_t *ht, const str *k);
 /* as forget_local, while the record is still at @ver or older */
 void pc_verb_forget_upto(pcache_htable_t *ht, const str *k,
 		unsigned long long ver);

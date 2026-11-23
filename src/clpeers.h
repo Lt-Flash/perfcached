@@ -129,6 +129,8 @@ struct peer {
 	/* set when this peer's incarnation changes: it came back empty, so
 	 * it needs the PASSIVE copies too - once, not for ever */
 	unsigned char backfill[PC_MAX_COLLECTIONS];
+	/* it asked for this collection whole (M_ASKFILL): a backfill walk from every peer */
+	unsigned char askfill[PC_MAX_COLLECTIONS];
 	/* when this peer last arrived empty - the sender holdoff is
 	 * measured from here, not from the flag, which can go stale */
 	long long fresh_ms;

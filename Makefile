@@ -1580,6 +1580,8 @@ check-g-repl3: check-edition-guard $(CHECK_BINS)
 	sh test/proxytest.sh ./perfcached
 	sh test/eagertest.sh ./perfcached
 	sh test/eagerrestarttest.sh ./perfcached
+	# T600: a peer ahead for good - the pulls' empty answers settle the returning node
+	sh test/eagercatchuptest.sh ./perfcached
 	sh test/stalebackfilltest.sh ./perfcached
 	sh test/fwdtest.sh ./perfcached
 	sh test/routedpairtest.sh ./perfcached ./routedpairtest

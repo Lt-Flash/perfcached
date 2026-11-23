@@ -1900,6 +1900,15 @@ void pc_verb_forget_local(pcache_htable_t *ht, const str *k)
 	}
 }
 
+void pc_verb_forget_unguarded(pcache_htable_t *ht, const str *k)
+{
+	const char *cn = col_name_of(ht);
+	unsigned long long dver = 0;
+
+	if (store_remove_ver(ht, k, &dver) == 1)
+		pc_wal_del(cn, k->s, k->len);
+}
+
 /* pc_verb_forget_local of the record at @ver or older only: one stored since then stays */
 void pc_verb_forget_upto(pcache_htable_t *ht, const str *k,
 		unsigned long long ver)

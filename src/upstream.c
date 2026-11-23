@@ -468,16 +468,42 @@ static int nofall_mark(struct up_col *uc, const str *k)
 }
 
 /* a 't' mark without its record (an invalidation landed between the replicated record and
- * its mark) would answer nil: dropped here, the key falls through; 1 it was one, 0 not */
+ * its mark) would answer nil: dropped here, the key falls through; 1 it was one, 0 not.
+ * T594: a writer stores the record BEFORE its mark, so the record is looked for again after the
+ * mark was seen, and only that version of the mark goes - a read that missed the record must not
+ * drop the mark of a write landing meanwhile (the record kept, unmarked, fleet_owned for good) */
 static int nofall_bare_t(struct up_col *uc, const str *k)
 {
 	pcache_htable_t *nf = pc_store_find(uc->nf, uc->nflen);
+	pcache_htable_t *ht;
+	unsigned long long mv = 0;
 
-	if (!nf || nofall_mark(uc, k) != 't')
+	if (!nf || nofall_mark(uc, k) != 't' || pcache_ht_getver(nf, k, &mv) != 0)
 		return 0;
-	pc_verb_forget_local(nf, k);
+	ht = pc_store_find(uc->name, uc->nlen);
+	if (ht && pcache_ht_probe_main(ht, k, NULL) == 0)
+		return 0;                      /* its record landed: the mark is not bare */
+	pc_verb_forget_upto(nf, k, mv);
 	ST_ADD(uc->wt_bare, 1);
 	return 1;
+}
+
+/* tests only: PERFCACHED_TEST_BARE_GAP_US=<us> holds a read between missing the record and
+ * looking at its mark - the window a write's record and mark land in (T594) */
+static void bare_test_gap(void)
+{
+	static int us = -1;
+
+	if (us < 0) {
+		const char *e = getenv("PERFCACHED_TEST_BARE_GAP_US");
+
+		us = e && atoi(e) > 0 ? atoi(e) : 0;
+		if (us)
+			LM_WARN("upstream: PERFCACHED_TEST_BARE_GAP_US=%d - a read waits %d us between "
+				"a missed record and its mark (a test setting)\n", us, us);
+	}
+	if (us)
+		usleep((useconds_t)us);
 }
 
 static int join_key(struct up_col *uc, const char *k, size_t kl,
@@ -737,13 +763,21 @@ static void inv_apply_all(struct up_col *uc)
 	pcache_htable_t *ht = pc_store_find(uc->name, uc->nlen);
 	pcache_htable_t *nf = pc_store_find(uc->nf, uc->nflen);
 	struct inv_keys ik = { NULL, NULL, NULL, 0, 0 };
-	int i;
+	int i, fill;
 
 	if (!nf)
 		return;
 	pcache_ht_iter_meta(nf, inv_collect, &ik);   /* collected, then dropped */
+	/* an eager fleet sends them back whole (pc_cluster_ask_fill): a remembered delete would
+	 * refuse those copies, at the version dropped, for tombstone_retain_s */
+	fill = ht && pc_cluster_enabled() && pc_store_eager_enabled(ht);
 	rm_begin(uc);
 	for (i = 0; i < ik.n; i++) {
+		if (fill) {
+			pc_verb_forget_unguarded(nf, &ik.k[i]);
+			pc_verb_forget_unguarded(ht, &ik.k[i]);
+			continue;
+		}
 		pc_verb_forget_local(nf, &ik.k[i]);
 		if (ht)
 			pc_verb_forget_local(ht, &ik.k[i]);
@@ -756,6 +790,12 @@ static void inv_apply_all(struct up_col *uc)
 			"the upstream when read\n", uc->name, ik.n);
 	if (ik.n && uc->rewarm_max > 0)
 		rewarm_queue(uc, &ik);         /* or re-fetched in the background */
+	/* an eager fleet's peers tracked on: what they hold is current, so it comes back whole
+	 * from them, the marks too (T600) */
+	if (ik.n && fill) {
+		pc_cluster_ask_fill(uc->name, uc->nlen);
+		pc_cluster_ask_fill(uc->nf, uc->nflen);
+	}
 	for (i = 0; i < ik.n; i++)
 		free(ik.k[i].s);
 	free(ik.k);
@@ -1704,6 +1744,7 @@ static int gate_rt(pcache_htable_t *ht, const char *col, size_t collen,
 			own = 1;
 			goto fetch;
 		}
+		bare_test_gap();
 		if (nofall_has(uc, &k) && !nofall_bare_t(uc, &k)) {
 			ST_ADD(uc->nofall_hits, 1);
 			continue;                  /* the fleet's: no fall-through */

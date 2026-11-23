@@ -909,7 +909,8 @@ cstart() { # cstart <n> - its log $D/c<n>.log (appended across restarts: a NEW r
 	# grep -c gives one number either way (grep -c || echo 0 printed "0" twice on no match);
 	# 30 s, as a member on a loaded runner can be slow to come up
 	r0=$(cat "$D/c$1.log" 2>/dev/null | grep -c "perfcached ready")
-	PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/c$1.conf" >> "$D/c$1.log" 2>&1 & eval "CPID$1=\$!"
+	# CENV: extra environment for this start (section 23's test knob); env execs, so $! is the daemon
+	env ${CENV:-PC_NO_EXTRA=1} PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/c$1.conf" >> "$D/c$1.log" 2>&1 & eval "CPID$1=\$!"
 	i=0; while [ $i -lt 300 ] && [ "$(grep -c "perfcached ready" "$D/c$1.log")" -le "$r0" ]; do sleep 0.1; i=$((i+1)); done
 	[ "$(grep -c "perfcached ready" "$D/c$1.log")" -gt "$r0" ]
 }
@@ -1173,9 +1174,15 @@ st=$(rw started); sk=$(rw skipped); sh=$(ust shadow_entries); f=$(ust fetches); 
 grep -q "the tracking had a gap - [0-9]* record" "$D/r.log" && grep -q "re-warming" "$D/r.log" && grep -q "the re-warm is done" "$D/r.log" &&
 	ok "20. (a) the restart dropped the $R0 replayed records at the gap and re-warmed every name - no client asked (log)" ||
 	bad "20. (a) log: $(grep -h -E 'tracking had a gap|re-warm|saved' "$D/r.log" | tail -4 | cut -c1-140 | tr '\n' '|')"
-# a name whose copy landed untracked is queued again (requeued) and fetched once more
-[ "$st" = $((40 + ${rq:-0})) ] && [ "$sk" = 0 ] && [ "$f" = $((40 + ${rq:-0})) ] && [ "$sh" = 40 ] &&
-	ok "20. (a) all 40 fetched again with no client read: 40 copies back (started $st, skipped $sk, fetches $f, requeued $rq, runs $rn)" ||
+# a name whose copy landed untracked is queued again (requeued) and fetched once more.  A key held
+# as a record AND its refetched copy at the stop (S435's overlap) is named by both lists - the saved
+# names and the gap's drop - so the re-warm meets it twice: skipped, or started and joined to the
+# fetch in flight; fetched once either way (ASan core1 115318: 9 + 32, 115323: 17 + 24)
+sv=$(grep -o '[0-9]* key name(s) held saved' "$D/r.log" | tail -1 | cut -d' ' -f1)
+dr=$(grep -o 'the tracking had a gap - [0-9]* record' "$D/r.log" | tail -1 | grep -o '[0-9]*')
+dup=$(( ${sv:-0} + ${dr:-0} - 40 )); [ $dup -lt 0 ] && dup=0
+[ $((st + sk)) = $((40 + ${rq:-0} + dup)) ] && [ "$sk" -le "$dup" ] && [ "$f" = $((40 + ${rq:-0})) ] && [ "$sh" = 40 ] &&
+	ok "20. (a) all 40 fetched again with no client read: 40 copies back (started $st, skipped $sk, fetches $f, requeued $rq, named twice $dup, runs $rn)" ||
 	{ bad "20. (a) started $st, skipped $sk, fetches $f, requeued $rq, shadow_entries $sh, runs $rn"; rwdiag; }
 set -- $(allheld)
 [ "$1" = 40 ] && [ "$2" = 0 ] && ok "20. (a) all 40 read back from the held copies, no fetch (the data, beside the entries gauge)" ||
@@ -1338,6 +1345,97 @@ case "$g" in *"larger than"*|len:300000) gok=1 ;; *) gok= ;; esac
 	ok "21. APPEND past a record at the master (300,000 bytes): the copy here dropped (read-backs released $rr0 -> $rr1) - a read answers '$g', never the old 200,000 bytes" ||
 	bad "21. APPEND past a record: $r, the master holds $(mlen m b:5) bytes; a read here answers '$g' (want no len:200000), read-backs released $rr0 -> $rr1"
 stop
+unfake
+
+# ---- 22. a member whose restart drops its records at the gap gets them back from its peer --------
+# T600: the peer tracked on, so what it holds is current - the restarted member asks for the
+# collection whole (M_ASKFILL) instead of fetching each key from Redis when read.  The master
+# replicates to no replica here, so no invalidation drops a record: both members keep all 40
+crec() { # crec <n> - member n's records in collection 0 named a:*, the scan's cursor followed to 0
+	timeout 30 python3 - 127.0.60.$1 "$T" <<'PY' 2>&1
+import json, socket, sys
+sys.path.insert(0, sys.argv[2])
+import pcnative
+f = pcnative.wrap(socket.create_connection((sys.argv[1], 20881), 10))
+cur, n = 0, 0
+while True:
+    f.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "scan", "params": {"col": "0", "match": "a:*", "cursor": cur, "count": 1000}}) + "\n").encode()); f.flush()
+    r = json.loads(f.readline()).get("result")
+    if not isinstance(r, dict):
+        break
+    n += len(r.get("items", []))
+    cur = r.get("cursor", 0)
+    if not cur:
+        break
+print(n)
+PY
+}
+fakes
+ctl m '{"role": "master", "accept_writes": true}'
+rm -rf "$D/c1" "$D/c2" "$D/c1.log" "$D/c2.log"
+cconf 1; cconf 2
+cstart 1 || bad "22. member 1 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c1.log")"
+cstart 2 || bad "22. member 2 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c2.log")"
+waitfor 30 '[ "$(cst 1 "s[\"state\"]")" = ready ] && [ "$(cst 2 "s[\"state\"]")" = ready ] && [ "$(cst 1 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 2 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 1 "w.get(\"target\")")" = "127.0.0.1:'$PM'" ] && [ "$(cst 2 "w.get(\"bcast\")")" = on ]'
+# written through member 2 itself: member 1 holds received copies, which its sweep never re-sends
+for k in $(seq 1 40); do cresp 2 SET "a:$k" "v$k" > /dev/null; done
+waitfor 15 '[ "$(crec 1)" = 40 ] && [ "$(crec 2)" = 40 ] && [ "$(cmark 1 a:40)" = t ]'
+[ "$(crec 1)" = 40 ] && [ "$(crec 2)" = 40 ] && [ "$(cmark 1 a:7)" = t ] &&
+	ok "22. 40 keys written through on member 2: both members hold all 40 as records, marked" ||
+	bad "22. records before the restart: member 1 $(crec 1), member 2 $(crec 2), member 1's mark of a:7 $(cmark 1 a:7)"
+cstop 2
+cstart 2 || bad "22. member 2 did not come back: $(grep -m2 -E 'ERROR|CRIT' "$D/c2.log")"
+waitfor 20 'grep -q "the tracking had a gap - [0-9]* record" "$D/c2.log"'
+g=$(grep -o "the tracking had a gap - [0-9]* record" "$D/c2.log" | tail -1)
+[ -n "$g" ] && ok "22. member 2 back from its restart dropped its records at the gap ($g(s))" ||
+	bad "22. no gap drop on member 2: $(grep -E 'tracking|gap' "$D/c2.log" | tail -2 | cut -c 17-160 | tr '\n' '|')"
+# the peer sends the collection whole on its next sweep: no client reads a key meanwhile
+waitfor 40 '[ "$(crec 2)" = 40 ] && [ "$(cmark 2 a:7)" = t ]'
+[ "$(crec 2)" = 40 ] && [ "$(cmark 2 a:7)" = t ] &&
+	ok "22. member 2 holds all 40 as records again, marked, with no read - its peer sent them" ||
+	bad "22. member 2 holds $(crec 2) of 40 as records, mark of a:7 $(cmark 2 a:7) (0.7.5: the records stay gone, each fetched from Redis when read)"
+grep -q "asked 1 peer(s) for collection '0' whole" "$D/c2.log" && grep -q "asks for collection '0' whole" "$D/c1.log" &&
+	grep -q "sent collection '0' whole to node" "$D/c1.log" &&
+	ok "22. the logs: member 2 asked for '0' whole, member 1 sent it" ||
+	bad "22. logs: $(grep -h -E 'whole' "$D/c1.log" "$D/c2.log" | cut -c 17-150 | tr '\n' '|')"
+# the replicas never took the writes, so a read answers 'v9' only from the record the peer sent
+[ "$(cresp 2 GET a:9)" = "'v9'" ] && ok "22. a read of a:9 on member 2 answers 'v9' - the record (Redis' replicas never had it)" ||
+	bad "22. GET a:9 on member 2: $(cresp 2 GET a:9)"
+cstop 1; cstop 2
+unfake
+
+# ---- 23. a read that missed the record never drops the mark of a write landing meanwhile --------
+# T594: a write stores its record, then its "t"; a read on member 2 that missed the record and then
+# found the "t" took it for a lone mark and dropped it - the record stayed, unmarked (PROD .67: 14
+# keys "the fleet owned").  PERFCACHED_TEST_BARE_GAP_US holds member 2's read 300 ms in that window
+# while the key is written through member 1; no replica takes the write, so no invalidation drops it
+fakes
+ctl m '{"role": "master", "accept_writes": true}'
+rm -rf "$D/c1" "$D/c2" "$D/c1.log" "$D/c2.log"
+cconf 1; cconf 2
+cstart 1 || bad "23. member 1 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c1.log")"
+CENV=PERFCACHED_TEST_BARE_GAP_US=300000 cstart 2 || bad "23. member 2 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c2.log")"
+waitfor 30 '[ "$(cst 1 "s[\"state\"]")" = ready ] && [ "$(cst 2 "s[\"state\"]")" = ready ] && [ "$(cst 1 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 2 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 1 "w.get(\"target\")")" = "127.0.0.1:'$PM'" ]'
+for i in 1 2 3 4 5; do
+	cresp 2 GET "b:$i" > "$D/b$i.get" &      # misses the record, then waits in the window
+	gp=$!; sleep 0.05
+	cresp 1 SET "b:$i" "v$i" > /dev/null    # record and mark reach member 2 meanwhile
+	wait $gp                                 # not a bare wait: the daemons are children too
+done
+sleep 1
+# the knob logs at the first read that reaches the window, so it is read after the reads
+grep -q "PERFCACHED_TEST_BARE_GAP_US=300000" "$D/c2.log" && ok "23. member 2 holds a read 300 ms between a missed record and its mark (the test knob)" ||
+	bad "23. member 2 never said it runs with the knob"
+n1=0; n2=0; r2=0
+for i in 1 2 3 4 5; do
+	[ "$(cmark 1 b:$i)" = t ] && n1=$((n1 + 1))
+	[ "$(cmark 2 b:$i)" = t ] && n2=$((n2 + 1))
+	[ "$(cresp 2 GET b:$i)" = "'v$i'" ] && r2=$((r2 + 1))
+done
+[ "$n1" = 5 ] && [ "$r2" = 5 ] && ok "23. member 1 marked all 5, member 2 reads all 5" || bad "23. member 1 marked $n1 of 5, member 2 reads $r2 of 5"
+[ "$n2" = 5 ] && ok "23. member 2 kept the mark of all 5 written while its read waited" ||
+	bad "23. member 2 kept $n2 of 5 marks - the read dropped the rest, their records left unmarked (0.7.5: fleet_owned)"
+cstop 1; cstop 2
 unfake
 
 # ---- 9. config --------------------------------------------------------------------------------

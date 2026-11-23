@@ -123,11 +123,14 @@
           good with upstream_tracking = off), then reads failed as too
           large.
         * [upstream] Write-through records no longer lose their
-          write-through mark.  Three paths left a record without it: an
+          write-through mark.  Four paths left a record without it: an
           invalidation racing a fresh copy of the key (a peer's eager
-          push or this node's own read-back), a rejoin's resync, and a
-          local drop replayed to a rejoining peer as a delete.  Such a
-          key read as one the fleet owned before write-through, so
+          push or this node's own read-back), a rejoin's resync, a local
+          drop replayed to a rejoining peer as a delete, and a read that
+          missed the record while a write landed - the write stores its
+          record and then its mark, and the read took the mark for one
+          left without a record and dropped it.  Such a key read as one
+          the fleet owned before write-through, so
           /stats upstream.write_through.fleet_owned and the page's
           upfill warning counted keys without cause.
         * [cluster] The tombstone catch-up to a member back from a
@@ -312,6 +315,17 @@
           refused with PERFD_E_ARG instead of dropping the link and
           marking the node down; and a standby counts only once the node
           says it serves.
+        * [cluster] A restarted eager node whose peers hold more records
+          than it ever will (records no client reads) no longer asks its
+          peers on every miss for good: once, 2 minutes after it settles,
+          1,000 of its pulls' answers show the peers hold nothing it lacks,
+          its misses are final again.  Before, each miss waited on a pull
+          for the life of the process - 50-230 ms reads through it.
+        * [cluster] A node that restarts and drops its records written
+          through to the upstream (the tracking gap) now gets them back
+          from its peers at once, marked: it asks each live peer for
+          the collection whole.  Before, they came back only key by key
+          as clients read them, and the node never caught up.
         * [tools] perfcli upgrade: the lost-records gate summed no
           collection's entries, and on a shard fleet it now compares
           the fleet's sum, as a peer holds an absent owner's records

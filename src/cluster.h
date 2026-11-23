@@ -322,6 +322,8 @@ void pc_cluster_discovery_info(const char **mode, int *seeds,
  * WITNESS_GRACE_MS with no peer newly live, and never short of memory for a replica.  1 = final */
 int pc_cluster_eager_miss_final(void);
 int pc_cluster_eager_doubt_one(void);   /* the one doubted peer, or 0 */
+/* an eager collection's records went (an upstream tracking gap): ask the peers for it whole */
+void pc_cluster_ask_fill(const char *col, size_t collen);
 int pc_cluster_apply_threads(void);
 void pc_cluster_apply_thread(volatile int *stop, int idx);
 
