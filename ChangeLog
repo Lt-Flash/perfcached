@@ -351,6 +351,13 @@
           shard node whose peers are down, instead of true.  A ttl the
           daemon cannot hold is a ValueError before anything is sent,
           and subscribe tries each configured secret in turn.
+        * [dashboard] Behind a proxy that spreads requests over several
+          perfcached-dashboard instances, the page showed whichever
+          node the instance answering each poll defaulted to, and a
+          fleet card linked the node's own HTTP door instead of the
+          dashboard.  A page opened without ?node= now keeps the node
+          its first answer named (the address bar says ?node=N), and a
+          card opens ?node=N through the same proxy.
 
 =========================== Release 0.7.5 ==============================
 

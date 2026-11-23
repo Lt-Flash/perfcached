@@ -166,6 +166,22 @@ cl = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
 (ok if not err and "class=mtog" in cl else bad)(
     "under the dashboard: the collections drawn with the fleet's figures and a members chip each (%s; chip %s)"
     % (err or "clean", "drawn" if "class=mtog" in cl else "MISSING"))
+# behind a proxy that spreads requests over several dashboards, a card names its node as ?node=N
+# (the node's own door is not what the proxy serves), and a page opened without ?node= pins the
+# node its first /session named, so the polls that follow stay on one node
+ctx.execute("__e=null; try{ drawFleet(%s); }catch(e){ __e=String(e); }" % json.dumps(
+    [{"node": 1, "addr": "127.0.0.1", "port": 1, "http": 2, "state": "ready", "self": True, "uptime_s": 10, "gone_s": -1},
+     {"node": 2, "addr": "127.0.0.2", "port": 1, "http": 2, "state": "ready", "uptime_s": 10, "gone_s": -1}]))
+fh = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
+(ok if not ctx.eval("__e") and 'href="?node=2"' in fh and "http://127.0.0.2" not in fh else bad)(
+    "under the dashboard: another node's card links ?node=2, not that node's own door (%s; %s)"
+    % (ctx.eval("__e") or "clean", re.findall(r'href="[^"]*"', fh)))
+ctx.execute("var __rs=[]; var history={replaceState:function(a,b,u){__rs.push(u);}}; NODEQ=''; __e=null;"
+            "try{ pinNode(3); pinNode(5); }catch(e){ __e=String(e); }")
+(ok if not ctx.eval("__e") and ctx.eval("NODEQ") == "3" and ctx.eval("__rs.length") == 1 and "node=3" in (ctx.eval("__rs[0]") or "") else bad)(
+    "under the dashboard: a page without ?node= pins the first node /session named, once (%s; NODEQ %s, url %s)"
+    % (ctx.eval("__e") or "clean", ctx.eval("NODEQ"), ctx.eval("__rs.join(' ')")))
+ctx.execute("NODEQ='';")
 ctx.execute("TOOL=null; FLM=null; FLD=null;")    # the daemon's own page for what follows
 
 # the header alarm: this node's state blinks as its card would, and a chip names the

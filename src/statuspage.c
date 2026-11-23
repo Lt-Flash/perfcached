@@ -444,6 +444,10 @@ const char pc_status_page[] =
 	 * ?node=N names the member reads go to; served by the daemon, TOOL stays null */
 	"var TOOL=null,SESSTOK=null,NODEQ=((location.search||\"\").match(/[?&]node=(\\d+)/)||[])[1]||\"\";\n"
 	"function qn(u){return NODEQ?u+(u.indexOf(\"?\")<0?\"?\":\"&\")+\"node=\"+NODEQ:u;}\n"
+	/* behind a proxy over several dashboards each poll may reach another one: a page opened
+	 * without ?node= keeps the node its first /session named, in the address bar too */
+	"function pinNode(n){n=Number(n);if(NODEQ||!(n>0))return;NODEQ=String(n);\n"
+	"try{history.replaceState(null,\"\",(location.pathname||\"\")+\"?node=\"+NODEQ+(location.hash||\"\"));}catch(e){}}\n"
 	"function abtn(op,col,lab){return ' <button class=\"btn act\" data-op=\"'+op+'\" data-col=\"'+esc(col)+'\">'+lab+'</button>';}\n"
 	/* the DDL buttons on a collection's row (the tool only) */
 	"function dbtn(op,col,lab,ent){return ' <button class=\"btn act ddl\" data-op=\"'+op+'\" data-col=\"'+esc(col)+'\" data-ent=\"'+(ent||0)+'\">'+lab+'</button>';}\n"
@@ -806,7 +810,7 @@ const char pc_status_page[] =
 	"role=d.master?\"master\":d.backup?\"backup\":\"member\",\n"
 	"hp=(d.total_mb?Math.round(100*d.free_mb/d.total_mb):null),\n"
 	"tk=hp===null?\"\":(hp<15?\"crit\":hp<35?\"low\":\"\"),\n"
-	"u=\"http://\"+esc(d.addr)+\":\"+(d.http||HP)+\"/\";\n"
+	"u=TOOL?\"?node=\"+Number(d.node):\"http://\"+esc(d.addr)+\":\"+(d.http||HP)+\"/\";\n"
 	"o+=(d.self?\"<div\":'<a href=\"'+u+'\"')+' class=\"node '+esc(st)+attn+(nw?\" nowit\":lka===\"critical\"?\" linkcrit\":rcn||((old||cdf||lka)&&!attn)?\" attn\":\"\")+(d.self?\" self\":\"\")+\n"
 	"'\" title=\"node '+esc(d.node)+\" — \"+esc(d.addr)+\":\"+esc(d.port)+\" — \"+esc(st)+'\">'+\n"
 	"'<div class=top><span class=id>'+esc(d.node)+'</span><span class=chips>'+\n"
@@ -1430,7 +1434,7 @@ const char pc_status_page[] =
 	"else if(op==='create'){var n=prompt('New collection name:');if(!n)return;var l=prompt('Its size as buckets_log2 (12 = 4,096 buckets):','12');body.col=n;body.buckets_log2=Number(l||12);}\n"
 	"function go(){post(\"ddl\",acted(go,'the node refused the '+op),JSON.stringify(body));}withsess(go);}\n"
 	"document.getElementById(\"newcol\").addEventListener(\"click\",function(){ddl('create','',0);});\n"
-	"get(\"session\",function(d){if(d&&d.tool){TOOL=d;document.getElementById(\"newcol\").hidden=false;document.getElementById(\"newcolsep\").hidden=false;\n"
+	"get(\"session\",function(d){if(d&&d.tool){TOOL=d;pinNode(d.node);document.getElementById(\"newcol\").hidden=false;document.getElementById(\"newcolsep\").hidden=false;\n"
 	"document.getElementById(\"stagewrap\").hidden=false;document.getElementById(\"stagenode\").textContent=\"node \"+(Number(NODEQ)||d.node);\n"
 	"document.getElementById(\"stagebtn\").addEventListener(\"click\",stageBuild);\n"
 	"document.getElementById(\"stagefile\").addEventListener(\"change\",function(){var m=/(\\d+\\.\\d+\\.\\d+(?:-rc\\d+)?)/.exec(this.files[0]?this.files[0].name:\"\"),v=document.getElementById(\"stagever\");if(m&&!v.value)v.value=m[1];});}tick();});setInterval(tick,POLL);\n"
