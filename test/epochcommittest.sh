@@ -81,6 +81,12 @@ M=$(master); [ "$M" != 0 ] && ok "the master is node $M" || bad "no master"
 	ok "1. the fleet speaks wire epoch 4; node 1 speaks 4..4, nodes 2 and 3 speak 4..5 (the test flag)" || bad "1. committed $(ep 1 committed)/$(ep 2 committed)/$(ep 3 committed), max $(ep 1 max)/$(ep 2 max)/$(ep 3 max), min $(ep 1 min)/$(ep 2 min)"
 r=$(st 1 "sorted(tuple(m['wire_epochs']) for m in s['cluster']['members'] if m.get('wire_epochs'))" 2>&1)
 case "$r" in *"(4, 4)"*"(4, 5)"*) ok "1. /members lists every member's range: $r" ;; *) r=$(python3 -c 'import json,urllib.request; m=json.load(urllib.request.urlopen("http://127.0.86.1:18821/members",timeout=5)); print(sorted(tuple(x["wire_epochs"]) for x in (m.get("members") or m) if isinstance(x,dict) and x.get("wire_epochs")))' 2>&1); case "$r" in *"(4, 4)"*"(4, 5)"*) ok "1. /members lists every member's range: $r" ;; *) bad "1. members' wire_epochs: $r" ;; esac ;; esac
+r=$(python3 -c 'import json,urllib.request
+g=lambda p: json.load(urllib.request.urlopen("http://127.0.86.1:18821"+p,timeout=5))
+m=g("/members"); m=[x for x in (m.get("members") if isinstance(m,dict) else m) if isinstance(x,dict)]
+own=g("/stats")["rev"][:8]; revs=[x.get("rev") for x in m]
+print(("ok" if len(m)==3 and len(own)==8 and all(v==own for v in revs) else "bad"), own, revs)' 2>&1)
+case "$r" in ok*) ok "1. /members names every member's build rev, the same as this node's own: ${r#ok }" ;; *) bad "1. members' rev: $r" ;; esac
 grep -q "PERFCACHED_TEST_EPOCH_MAX=5 - this build CLAIMS to speak wire epochs 4..5 (a test flag; the codecs are those of 4)" "$D/n2.log" && ! grep -q "PERFCACHED_TEST_EPOCH_MAX" "$D/n1.log" &&
 	ok "1. the test flag is announced in the log - a claim, the codecs are 4's (node 2; node 1, without it, says nothing)" || bad "1. flag warning: n2.log $(grep -h -m1 PERFCACHED_TEST_EPOCH_MAX "$D/n2.log" | cut -c1-140), n1.log $(grep -c PERFCACHED_TEST_EPOCH_MAX "$D/n1.log")"
 # ---- 2. a commit refused: node 1 cannot speak 5; a non-master cannot commit ------------------

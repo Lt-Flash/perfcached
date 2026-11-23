@@ -86,6 +86,11 @@ wait_for 75 '[ "$(role 2)" = master ]' \
 grep -q "a higher address, has been live for .* without taking mastership - promoting instead" "$D/n2.log" \
 	&& ok "and said why: node 3, live at a higher address, never took it" \
 	|| bad "no bounded-deferral line: $(grep -h 'cluster:' "$D/n2.log" | tail -2 | cut -c1-140 | tr '\n' '|')"
+# the promotion the bound decided waits for its term on disk, not for another 38 s of deferral
+n=$(grep -c "without taking mastership - promoting instead" "$D/n2.log")
+[ "$n" = 1 ] && grep -q "claimed mastership term" "$D/n2.log" \
+	&& ok "the bound ran out once: one promoting-instead line, then the claim" \
+	|| bad "the bound ran out $n times before node 2 claimed a term: $(grep -h -e 'promoting instead' -e 'claimed mastership' "$D/n2.log" | cut -c1-90 | tr '\n' '|')"
 
 echo "--- 2: node 3 follows"
 wait_for 15 '[ "$(role 3)" = member ] && [ "$(st 3 "r[\"cluster\"][\"map\"][\"master\"]")" = "$(st 2 "r[\"cluster\"][\"node\"]")" ]' \

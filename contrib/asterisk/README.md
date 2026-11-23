@@ -1,6 +1,6 @@
 # func_perfd - perfcached from the Asterisk dialplan
 
-An optional Asterisk module (Asterisk 22.10.1) with four dialplan
+An optional Asterisk module (Asterisk 22, 23 and 24) with four dialplan
 functions that read and write perfcached 0.7.5.1 - or a standalone Redis -
 through a pool of connections.  It links libperfd 0.7.6.1 or later; it
 carries no copy of it.
@@ -26,9 +26,12 @@ perfcached's packages, or `make install-lib` in a perfcached checkout;
 plus autoconf, automake and pkg-config.  libperfd older than 0.7.6.1 is
 refused at build time: the module dials through `perfd_url_connect`.
 
+A patch per release, for the supported branches: `asterisk-22.12.0-`,
+`asterisk-23.6.0-` and `asterisk-24.0.0-func_perfd.patch`.
+
 ```
-cd asterisk-22.10.1
-patch -p1 < asterisk-22.10.1-func_perfd.patch
+cd asterisk-24.0.0
+patch -p1 < asterisk-24.0.0-func_perfd.patch
 ./bootstrap.sh
 ./configure <your usual options>
 make menuselect        # Dialplan Functions -> func_perfd (off by default)

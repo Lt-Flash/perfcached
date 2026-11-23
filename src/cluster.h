@@ -670,6 +670,8 @@ int pc_cluster_epoch_commit(int epoch, char *why, size_t n);
 /* the digest of runtime autoscale modes (pc_store_autoscale_sig), in a SPARE slot outside
  * PC_CL_NFACTS: a member whose settings fill the keepalive does not report it */
 #define PC_FACT_AUTOSCALE 0x80000005u
+/* the build's git rev (its first 8 hex digits), in a SPARE slot after the autoscale digest */
+#define PC_FACT_REV       0x80000006u
 
 /* fills @out with up to @max members (self first); returns the count */
 int pc_cluster_members(struct pc_member *out, int max);

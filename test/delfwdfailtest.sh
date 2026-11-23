@@ -108,7 +108,8 @@ case "$R" in "ERR "*) ok "del $K through node 1, the forward unable to start: re
 R=$(rsp 1 DEL "$K")
 case "$R" in -*) ok "RESP DEL $K through node 1: $R";;
 	*) bad "RESP DEL $K through node 1, the forward unable to start: $R (want an error, not :0)";; esac
-O=$(grep -o 'out [0-9]*' "$D/cutlog1" 2>/dev/null)
+# the shim writes its counts at its next send 50 ms on (a beat comes within a second)
+k=0; while [ $k -lt 30 ]; do O=$(grep -o 'out [0-9]*' "$D/cutlog1" 2>/dev/null); [ "${O#out }" -gt 0 ] 2>/dev/null && break; sleep 0.1; k=$((k+1)); done
 [ "${O#out }" -gt 0 ] 2>/dev/null && ok "the cut fired ($O datagrams)" || bad "the cut never fired: $(cat "$D/cutlog1" 2>/dev/null)"
 
 : > "$D/cut1"

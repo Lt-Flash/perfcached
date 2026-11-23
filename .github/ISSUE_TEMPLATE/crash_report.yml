@@ -48,7 +48,7 @@ body:
     attributes:
       label: Asterisk and func_perfd version
       description: The output of `asterisk -rx 'core show version'` and `asterisk -rx 'module show like func_perfd'`.  Write "none" if Asterisk is not involved.
-      placeholder: Asterisk 22.10.1, func_perfd.so Running
+      placeholder: Asterisk 24.0.0, func_perfd.so Running
     validations:
       required: true
   - type: input

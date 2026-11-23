@@ -3952,6 +3952,27 @@ int pc_cluster_cfgsig(const struct pc_cfgsig **e)
 	return ncfgsig;
 }
 
+/* PC_BUILD_REV's first 8 hex digits as a word: 1, or 0 for a rev too short or not hex */
+static int build_rev_word(uint32_t *w)
+{
+	const char *r = PC_BUILD_REV;
+	uint32_t v = 0;
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		char c = r[i];
+
+		if (c >= '0' && c <= '9')
+			v = v << 4 | (uint32_t)(c - '0');
+		else if (c >= 'a' && c <= 'f')
+			v = v << 4 | (uint32_t)(c - 'a' + 10);
+		else
+			return 0;
+	}
+	*w = v;
+	return 1;
+}
+
 /* this node's facts, after its settings, in @name/@val from @at; returns the new count */
 static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int features)
 {
@@ -3971,6 +3992,8 @@ static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int feature
 		name[at] = PC_FACT_AUTOSCALE;
 		val[at++] = pc_store_autoscale_sig(NULL);
 	}
+	if (at < cap && build_rev_word(&val[at]))
+		name[at++] = PC_FACT_REV;
 	return at;
 }
 
@@ -8005,8 +8028,10 @@ static void membership_tick(void)
 				}
 			}
 			if (best) {
-				elect_defer_ms = 0;
+				/* it may come back for its term on disk: the bound stays run out */
 				become_master(0);
+				if (C.role == PC_ROLE_MASTER)
+					elect_defer_ms = 0;
 			} else
 				C.master_seen_ms = now - MASTER_DEAD_MS + 1000;
 				/* re-check in ~1s: the winner's MASTER_ALIVE

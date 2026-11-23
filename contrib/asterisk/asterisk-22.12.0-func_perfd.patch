@@ -100,7 +100,7 @@ diff -ruN a/configure.ac b/configure.ac
  AST_EXT_LIB_SETUP([SPEEX], [Speex], [speex])
  AST_EXT_LIB_SETUP([SPEEX_PREPROCESS], [Speex preprocess routines], [speex])
  AST_EXT_LIB_SETUP([SPEEXDSP], [SpeexDSP], [speexdsp])
-@@ -2678,6 +2679,8 @@
+@@ -2679,6 +2680,8 @@
  AST_EXT_LIB_CHECK([COROSYNC], [cpg], [cpg_join], [corosync/cpg.h], [-lcpg -lcfg])
  AST_EXT_LIB_CHECK([COROSYNC_CFG_STATE_TRACK], [cfg], [corosync_cfg_state_track], [corosync/cfg.h], [-lcfg])
  
@@ -2371,7 +2371,7 @@ diff -ruN a/funcs/perfd/resp.h b/funcs/perfd/resp.h
 diff -ruN a/makeopts.in b/makeopts.in
 --- a/makeopts.in
 +++ b/makeopts.in
-@@ -284,6 +284,8 @@
+@@ -285,6 +285,8 @@
  SPANDSP_INCLUDE=@SPANDSP_INCLUDE@
  SPANDSP_LIB=@SPANDSP_LIB@
  

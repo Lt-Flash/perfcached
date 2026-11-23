@@ -817,7 +817,7 @@ const char pc_status_page[] =
 	"'<span class=\"st '+(st===\"ready\"?\"ready\":st===\"failed\"?\"failed\":st===\"gone\"?(gr===\"silent\"?\"lost\":\"goner\"):\"attn\")+'\">'+(st===\"gone\"?(gr===\"silent\"?\"silent\":gr===\"forgotten\"?\"dropped\":\"left\"):esc(st))+\n"
 	"'</span><span class=\"role '+role+'\">'+role+'</span></span></div>'+\n"
 	/* the build it runs, beside its address (absent from older builds) */
-	"(d.version?'<div class=addr>v'+esc(d.version)+(d.wire_epochs?' \u00b7 wire '+esc(d.wire_epochs[1]):'')+'</div>':'')+\n"
+	"(d.version?'<div class=addr>v'+esc(d.version)+(d.rev?' ('+esc(d.rev)+')':'')+(d.wire_epochs?' \u00b7 wire '+esc(d.wire_epochs[1]):'')+'</div>':'')+\n"
 	"'<div class=addr>'+esc(d.addr)+'</div>'+\n"
 	"'<div class=addr>'+(d.gone_s>=0?'left '+dur(d.gone_s)+' ago':'up '+(d.uptime_s>=0?dur(d.uptime_s):\"\\u2014\"))+'</div>'+\n"
 	"'<div class=hl><span>headroom</span><span class=pct>'+(hp===null?\"-\":hp+\"%\")+'</span></div>'+\n"
