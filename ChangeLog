@@ -313,7 +313,9 @@
           marking the node down; and a standby counts only once the node
           says it serves.
         * [tools] perfcli upgrade: the lost-records gate summed no
-          collection's entries; a node still on its old build after a
+          collection's entries, and on a shard fleet it now compares
+          the fleet's sum, as a peer holds an absent owner's records
+          only until it returns; a node still on its old build after a
           switch timeout is not reverted; a roll reverts a node only
           once the fleet is restart-safe and stops if a peer cannot be
           reached; resume does not switch again a node already on its
@@ -359,8 +361,8 @@
           its first answer named (the address bar says ?node=N), and a
           card opens ?node=N through the same proxy.
         * [page] A fleet card names its member's build beside the
-          version, as perfcached -V does: v0.7.5.1 (2a03d3be).  /stats
-          lists each member's rev; a member older than 0.7.5.1 reports
+          version, by the first 7 digits of its git rev: v0.7.5.1
+          (2a03d3b).  /members lists each member's rev; a member older than 0.7.5.1 reports
           none and its card shows the version alone.
         * [asterisk] func_perfd ships a patch for each supported Asterisk
           branch: 22.12.0, 23.6.0 and 24.0.0, each built clean under

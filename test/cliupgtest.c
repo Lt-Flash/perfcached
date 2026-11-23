@@ -69,10 +69,43 @@ int main(void)
 			"{\"name\":\"b\",\"entries\":7,\"t\":[1,{\"entries\":9}]}],"
 			"\"cluster\":{\"peers_up\":2},\"negative\":{\"entries\":40}}";
 
-		CHK(jentries_sum(st) == 12, "A1 5 + 7 from the two collections (got %lld)",
-			jentries_sum(st));
-		CHK(jentries_sum("{\"collections\":[]}") == 0, "A2 no collection: 0");
-		CHK(jentries_sum("{\"state\":\"ready\"}") == 0, "A3 no collections key: 0");
+		CHK(jcollections(st, NULL) == 12, "A1 5 + 7 from the two collections (got %lld)",
+			jcollections(st, NULL));
+		CHK(jcollections("{\"collections\":[]}", NULL) == 0, "A2 no collection: 0");
+		CHK(jcollections("{\"state\":\"ready\"}", NULL) == 0, "A3 no collections key: 0");
+	}
+
+	printf("--- A'. shard: one peer's count moves, only the fleet's sum must hold\n");
+	{
+		/* rc4's roll (115225): peer 870 held half of node 1's share until the reshard tick */
+		struct unode b[3] = { { .node = 1, .reach = 1, .entries = 1100 },
+			{ .node = 635, .reach = 1, .entries = 1333 },
+			{ .node = 870, .reach = 1, .entries = 1657 } };
+		struct unode a[3];
+		char why[512];
+		int sh = 0;
+
+		jcollections("{\"collections\":[{\"name\":\"a\",\"mode\":\"shard\",\"entries\":3}]}", &sh);
+		CHK(sh == 1, "A'1 a shard collection is seen");
+		jcollections("{\"collections\":[{\"name\":\"a\",\"mode\":\"eager\",\"entries\":3,"
+			"\"t\":{\"mode\":\"shard\"}}]}", &sh);
+		CHK(sh == 0, "A'2 eager, and a nested mode is not the collection's");
+		memcpy(a, b, sizeof a);
+		a[0].entries = 1433; a[2].entries = 1318;
+		CHK(ugate_lost(b, 3, a, 3, 635, why, sizeof why) == 1 && strstr(why, "peer=870 entries 1657 -> 1318"),
+			"A'3 eager: the peer's fall is a loss (%s)", why);
+		b[0].shard = b[1].shard = b[2].shard = 1;
+		CHK(ugate_lost(b, 3, a, 3, 635, why, sizeof why) == 0,
+			"A'4 shard: the records moved to node 1, the sum held (%s)", why);
+		a[0].entries = 1100;
+		CHK(ugate_lost(b, 3, a, 3, 635, why, sizeof why) == 0,
+			"A'5 shard: the sum fell by 8%%, inside the margin (%s)", why);
+		a[0].entries = 600;
+		CHK(ugate_lost(b, 3, a, 3, 635, why, sizeof why) == 1 && strstr(why, "fleet entries 4090 -> 3251"),
+			"A'6 shard: the sum fell by 20%% - a loss (%s)", why);
+		a[2].reach = 0;
+		CHK(ugate_lost(b, 3, a, 3, 635, why, sizeof why) == 1 && strstr(why, "peer=870 unreachable"),
+			"A'7 shard: a peer out is a loss (%s)", why);
 	}
 
 	printf("--- B. a member name from the tarball is never an option to tar\n");

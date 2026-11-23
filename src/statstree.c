@@ -1694,7 +1694,7 @@ void pc_members_tree(struct pc_tw *out)
 				pc_tw_nil(out);
 			pc_tw_key(out, "rev");          /* null: an older build, or no spare slot */
 			if (pc_member_fact(&mem[i], PC_FACT_REV, &fv)) {
-				snprintf(vb, sizeof vb, "%08x", fv);
+				snprintf(vb, sizeof vb, "%07x", fv);
 				pc_tw_str(out, vb);
 			} else
 				pc_tw_nil(out);

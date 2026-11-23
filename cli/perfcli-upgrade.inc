@@ -12,7 +12,7 @@ struct unode {
 	char addr[64];
 	char ver[32], rev[32], state[24], role[16];
 	long long pid, entries;
-	int peers_up, safe, reach;
+	int peers_up, safe, reach, shard;  /* shard: a collection of it is in shard mode */
 	int ecommit, emin, emax;           /* the epoch it speaks, its range */
 };
 
@@ -99,14 +99,17 @@ static const char *jobj(const char *res, const char *key)   /* "key":{ ... */
 }
 
 /* the records a node holds: the top-level "entries" of each object in its stats' "collections",
- * summed - not every "entries" in the text, which mixes in the fleet's and the negative cache's */
-static long long jentries_sum(const char *res)
+ * summed - not every "entries" in the text, which mixes in the fleet's and the negative cache's;
+ * @shard (may be NULL) is set when one of them is in shard mode */
+static long long jcollections(const char *res, int *shard)
 {
 	static const char pat[] = "\"collections\":[";
 	const char *p = res ? strstr(res, pat) : NULL;
 	long long sum = 0;
 	int depth = 0;
 
+	if (shard)
+		*shard = 0;
 	if (!p)
 		return 0;
 	for (p += sizeof pat - 1; *p; p++) {
@@ -122,6 +125,9 @@ static long long jentries_sum(const char *res)
 
 				if (e)
 					sum += strtoll(e, NULL, 10);
+				e = jtop(p, "mode");
+				if (shard && e && !strncmp(e, "\"shard\"", 7))
+					*shard = 1;
 			}
 			depth++;
 		} else if (*p == '[') {
@@ -133,6 +139,50 @@ static long long jentries_sum(const char *res)
 		}
 	}
 	return sum;
+}
+
+/* the post-gate's verdict: 1 when records were lost across @rolled's restart, each finding in
+ * @why.  Eager keeps a full copy on every peer, so each peer must keep 90% of its entries; shard
+ * moves an absent owner's slots to the live nodes and back on the reshard tick (up to 10 s after
+ * it returns), so only the fleet's sum must hold - one peer's count falls by design */
+static int ugate_lost(const struct unode *b, int nb, const struct unode *a, int na, int rolled,
+	char *why, size_t wl)
+{
+	long long bs = 0, as = 0;
+	int i, j, lost = 0, shard = 0;
+	size_t k = 0;
+
+	why[0] = 0;
+	for (i = 0; i < nb; i++)
+		shard |= b[i].shard;
+	for (i = 0; i < nb; i++) {
+		const struct unode *x = NULL;
+
+		for (j = 0; j < na; j++)
+			if (a[j].node == b[i].node)
+				x = &a[j];
+		if (b[i].node != rolled && (!x || !x->reach)) {
+			lost = 1;
+			k += (size_t)snprintf(why + k, k < wl ? wl - k : 0,
+				"peer=%d unreachable after the restart|", b[i].node);
+			continue;
+		}
+		bs += b[i].entries;
+		as += x && x->reach ? x->entries : 0;
+		if (!shard && b[i].node != rolled && b[i].entries >= 50 &&
+		    x->entries < b[i].entries * 9 / 10) {
+			lost = 1;
+			k += (size_t)snprintf(why + k, k < wl ? wl - k : 0,
+				"peer=%d entries %lld -> %lld across the restart|", b[i].node,
+				b[i].entries, x->entries);
+		}
+	}
+	if (shard && !lost && bs >= 50 && as < bs * 9 / 10) {
+		lost = 1;
+		snprintf(why + k, k < wl ? wl - k : 0,
+			"fleet entries %lld -> %lld across the restart (shard)|", bs, as);
+	}
+	return lost;
 }
 
 static perfd_t *udial(const char *addr, int port)
@@ -201,7 +251,7 @@ static int unode_read(struct unode *n)
 			n->ecommit = n->emin = n->emax = 0;
 		}
 	}
-	n->entries = jentries_sum(r);
+	n->entries = jcollections(r, &n->shard);
 	n->reach = 1;
 	perfd_free_value(r);
 	perfd_free(h);
@@ -914,25 +964,12 @@ gates:
 		/* the post-gate: the peers kept their records, every node restart-safe */
 		{
 			struct unode after[UP_MAX_NODES];
-			int na = ufleet_read(after, UP_MAX_NODES), lost = 0;
+			int na = ufleet_read(after, UP_MAX_NODES), lost;
+			char why[1024], *f, *sv = NULL;
 
-			for (i = 0; i < n; i++) {
-				struct unode *b = &before[i], *a;
-
-				if (b->node == u->node)
-					continue;
-				a = ufind(after, na, b->node);
-				if (!a || !a->reach) {
-					lost = 1;
-					ujournal_line(pl, "node=%d peer=%d unreachable after the restart",
-						u->node, b->node);
-				} else if (b->entries >= 50 && a->entries < b->entries * 9 / 10) {
-					lost = 1;
-					ujournal_line(pl, "node=%d peer=%d entries %lld -> %lld across the "
-						"restart", u->node, b->node, b->entries,
-						a->entries);
-				}
-			}
+			lost = ugate_lost(before, n, after, na, u->node, why, sizeof why);
+			for (f = strtok_r(why, "|", &sv); f; f = strtok_r(NULL, "|", &sv))
+				ujournal_line(pl, "node=%d %s", u->node, f);
 			if (lost) {
 				ujournal_line(pl, "node=%d addr=%s:%d event=failed reason=peers-lost-records",
 					u->node, u->addr, u->port);

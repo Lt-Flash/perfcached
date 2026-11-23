@@ -3952,14 +3952,15 @@ int pc_cluster_cfgsig(const struct pc_cfgsig **e)
 	return ncfgsig;
 }
 
-/* PC_BUILD_REV's first 8 hex digits as a word: 1, or 0 for a rev too short or not hex */
+/* PC_BUILD_REV's first 7 hex digits (git's shortest abbreviation, so every build has them) as a
+ * word: 1, or 0 for a rev too short or not hex */
 static int build_rev_word(uint32_t *w)
 {
 	const char *r = PC_BUILD_REV;
 	uint32_t v = 0;
 	int i;
 
-	for (i = 0; i < 8; i++) {
+	for (i = 0; i < 7; i++) {
 		char c = r[i];
 
 		if (c >= '0' && c <= '9')

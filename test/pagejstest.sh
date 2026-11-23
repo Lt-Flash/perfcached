@@ -394,10 +394,10 @@ fv = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
 (ok if not h[3] and h[1] == "hal amber" and "mixed versions: 0.6.4 x1, 0.6.5 x2" in h[2]
     and "v0.6.5 \N{MIDDLE DOT} wire 2" in fv and "v0.6.4</div>" in fv else bad)(
     "UP1: versions on the cards, and 'mixed versions' in the header (%s)" % (h,))
-v1["rev"] = "2a03d3be"
+v1["rev"] = "2a03d3b"
 h = hal([v1, v2, v3])
 fv = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
-(ok if "v0.6.5 (2a03d3be) \N{MIDDLE DOT} wire 2" in fv and "v0.6.4</div>" in fv else bad)(
+(ok if "v0.6.5 (2a03d3b) \N{MIDDLE DOT} wire 2" in fv and "v0.6.4</div>" in fv else bad)(
     "UP1: a card names its member's build rev beside the version, as perfcached -V does")
 v3["version"] = "0.6.5"
 h = hal([v1, v2, v3])

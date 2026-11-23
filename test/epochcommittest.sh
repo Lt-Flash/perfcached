@@ -84,8 +84,8 @@ case "$r" in *"(4, 4)"*"(4, 5)"*) ok "1. /members lists every member's range: $r
 r=$(python3 -c 'import json,urllib.request
 g=lambda p: json.load(urllib.request.urlopen("http://127.0.86.1:18821"+p,timeout=5))
 m=g("/members"); m=[x for x in (m.get("members") if isinstance(m,dict) else m) if isinstance(x,dict)]
-own=g("/stats")["rev"][:8]; revs=[x.get("rev") for x in m]
-print(("ok" if len(m)==3 and len(own)==8 and all(v==own for v in revs) else "bad"), own, revs)' 2>&1)
+own=g("/stats")["rev"][:7]; revs=[x.get("rev") for x in m]
+print(("ok" if len(m)==3 and len(own)==7 and all(v==own for v in revs) else "bad"), own, revs)' 2>&1)
 case "$r" in ok*) ok "1. /members names every member's build rev, the same as this node's own: ${r#ok }" ;; *) bad "1. members' rev: $r" ;; esac
 grep -q "PERFCACHED_TEST_EPOCH_MAX=5 - this build CLAIMS to speak wire epochs 4..5 (a test flag; the codecs are those of 4)" "$D/n2.log" && ! grep -q "PERFCACHED_TEST_EPOCH_MAX" "$D/n1.log" &&
 	ok "1. the test flag is announced in the log - a claim, the codecs are 4's (node 2; node 1, without it, says nothing)" || bad "1. flag warning: n2.log $(grep -h -m1 PERFCACHED_TEST_EPOCH_MAX "$D/n2.log" | cut -c1-140), n1.log $(grep -c PERFCACHED_TEST_EPOCH_MAX "$D/n1.log")"
