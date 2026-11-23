@@ -436,6 +436,7 @@ static long long self_walk_nomem_until;
 /* a member's election defers to a live higher address; since when,
  * and to which.  Cleared by a master beacon followed, and by promoting */
 static long long elect_defer_ms;
+static long long elect_warned_ms;     /* the deferral the bound already said it ran out */
 static pc_addr elect_defer_to;
 
 
@@ -8139,11 +8140,14 @@ static void membership_tick(void)
 					elect_defer_to = higher->addr;
 				} else if (now - elect_defer_ms >=
 				        MPROBE_HOLD_MS + MASTER_DEAD_MS) {
-					LM_WARN("cluster: node %d at %s, a higher address, "
-						"has been live for %lld s without taking "
-						"mastership - promoting instead\n",
-						higher->node, pc_addr_str(&higher->addr),
-						(now - elect_defer_ms) / 1000);
+					/* once: the promotion may wait ticks for its term on disk */
+					if (elect_warned_ms != elect_defer_ms)
+						LM_WARN("cluster: node %d at %s, a higher address, "
+							"has been live for %lld s without taking "
+							"mastership - promoting instead\n",
+							higher->node, pc_addr_str(&higher->addr),
+							(now - elect_defer_ms) / 1000);
+					elect_warned_ms = elect_defer_ms;
 					best = 1;
 				}
 			}
