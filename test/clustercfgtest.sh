@@ -40,6 +40,7 @@ ${5:-}
 EOF
 }
 start() { # start <conf> <pidvar> <log>; 0 = came up
+	: > "$3"
 	"$BIN" -f "$1" > "$3" 2>&1 &
 	eval "$2=\$!"
 	i=0

@@ -34,6 +34,7 @@ CONF
 chmod 600 "$D/a.conf"
 mkdir -p "$D/wal"
 
+: > "$D/a.log"
 "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 &
 P1=$!
 i=0

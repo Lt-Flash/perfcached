@@ -41,6 +41,7 @@ EOF
 }
 
 start() {
+	: > "$D/log"
 	"$BIN" -f "$D/r.conf" > "$D/log" 2>&1 &
 	PID=$!
 	i=0
@@ -227,6 +228,7 @@ open(sys.argv[1], "wb").write(d)
 EOF
 }
 trystart() {
+	: > "$D/log"
 	"$BIN" -f "$D/r.conf" > "$D/log" 2>&1 &
 	PID=$!
 	i=0

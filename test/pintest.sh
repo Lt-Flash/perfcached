@@ -146,6 +146,7 @@ if [ "$(id -u)" = 0 ] && ! can_lock; then
 	echo "  ..   root without CAP_IPC_LOCK and memlock $(ulimit -l) KB (a container's limit): the locking half is skipped"
 elif [ "$(id -u)" = 0 ]; then
 	conf "$D/lock.conf" "pin = require"
+	: > "$D/lock.log"
 	"$BIN" -f "$D/lock.conf" > "$D/lock.log" 2>&1 &
 	PIDS="$PIDS $!"
 	i=0

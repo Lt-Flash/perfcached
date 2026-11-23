@@ -37,6 +37,7 @@ CONF
 	chmod 600 "$1"
 }
 start() { # start <conf> <log> -> pid in $STARTED
+	: > "$2"
 	"$BIN" -f "$1" > "$2" 2>&1 &
 	STARTED=$!
 	i=0
@@ -236,6 +237,7 @@ done < "$RES"
 # PERFCACHED_TEST_METRICS_BUF=8192: the exposition starts in an 8 KB buffer; it must still come whole,
 # every line complete and the last family (UDP datagrams, relay rx) at its end - not cut mid-line
 mkconf "$D/c.conf" 17765 17766 18765 ""
+: > "$D/c.log"
 PERFCACHED_TEST_METRICS_BUF=8192 "$BIN" -f "$D/c.conf" > "$D/c.log" 2>&1 & P3=$!
 i=0; while [ $i -lt 80 ] && ! grep -q "perfcached ready" "$D/c.log"; do sleep 0.1; i=$((i+1)); done
 if grep -q "perfcached ready" "$D/c.log"; then

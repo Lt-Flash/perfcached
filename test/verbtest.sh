@@ -27,6 +27,7 @@ buckets_log2 = 12
 buckets_log2 = 10
 EOF
 
+: > "$D/log"
 "$BIN" -f "$D/v.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0

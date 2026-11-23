@@ -35,6 +35,7 @@ EOF
 chmod 600 "$D/w.conf"
 # a writer of a "stall*" key sleeps 3 s between taking its sequence number and its ring; a "drop*"
 # key's record is dropped as a full ring drops one
+: > "$D/log"
 PERFCACHED_TEST_WAL_STALL_MS=3000 PERFCACHED_TEST_WAL_DROP=1 "$BIN" -f "$D/w.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0

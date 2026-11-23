@@ -39,6 +39,7 @@ C
 	chmod 600 "$D/n$1.conf"
 }
 start() {
+	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 300 ]; do grep -q "perfcached ready" "$D/n$1.log" && return 0; sleep 0.1; i=$((i+1)); done

@@ -79,6 +79,7 @@ LOST=$((FREE0 - FREE1))
 
 # GREEN: the same daemon starts when the WAL does fit
 sed -i 's/^segment_mb = 64$/segment_mb = 4/;s/^segments = 4$/segments = 2/' "$D/c.conf"
+: > "$D/log2"
 "$BIN" -f "$D/c.conf" > "$D/log2" 2>&1 &
 P=$!
 i=0; while [ $i -lt 300 ]; do grep -q "perfcached ready" "$D/log2" && break

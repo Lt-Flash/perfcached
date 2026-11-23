@@ -51,6 +51,7 @@ C
 }
 start() { # start <n> [env]: node 1 runs with the bias - a peer ahead of node 3 for good
 	L="$D/n$1.log"
+	: > "$L"
 	env ${2:-PC_NOTHING=1} "$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 300 ]; do

@@ -140,9 +140,11 @@ num() { case "${1:-}" in ''|*[!0-9]*) echo -1;; *) echo "$1";; esac; }
 
 arm() { # arm <n> <stall-line>
 	conf $1 1 "$2"; conf $1 2 "$2"
+	: > "$D/n${1}1.log"
 	"$BIN" -f "$D/n${1}1.conf" > "$D/n${1}1.log" 2>&1 &
 	PIDS="$PIDS $!"
 	: > "$D/ctl$1"
+	: > "$D/n${1}2.log"
 	"$TF" "$D/ctl$1" -- "$BIN" -f "$D/n${1}2.conf" > "$D/n${1}2.log" 2>&1 &
 	PIDS="$PIDS $!"
 	wait_ready "$D/n${1}1.log" && wait_ready "$D/n${1}2.log" || return 1
@@ -216,9 +218,11 @@ fi
 if [ "${STALLTEST_LEGACY:-0}" != 1 ]; then
 	echo "--- apply_stall_ms = 2000, the WHOLE daemon stopped (SIGSTOP) for 4 s, its cluster thread frozen across the resume"
 	conf 3 1 "apply_stall_ms = 2000"; conf 3 2 "apply_stall_ms = 2000"
+	: > "$D/n31.log"
 	"$BIN" -f "$D/n31.conf" > "$D/n31.log" 2>&1 &
 	PIDS="$PIDS $!"
 	: > "$D/ctl3"
+	: > "$D/n32.log"
 	"$TF" "$D/ctl3" -- "$BIN" -f "$D/n32.conf" > "$D/n32.log" 2>&1 &
 	TFP=$!; PIDS="$PIDS $TFP"
 	if wait_ready "$D/n31.log" && wait_ready "$D/n32.log"; then

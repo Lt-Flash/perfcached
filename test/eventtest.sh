@@ -36,6 +36,7 @@ EOC
 start() {
 	mkdir -p "$D/var"
 	chmod 640 "$D/n.conf"
+	: > "$D/n.log"
 	"$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 	P=$!
 	# not the "perfcached ready" line: at log_level = warn it is not printed

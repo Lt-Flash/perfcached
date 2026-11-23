@@ -38,6 +38,7 @@ upstream_password = mr-up-pass
 upstream_timeout_ms = 2000
 CONF
 chmod 640 "$D/n.conf"
+: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 & P1=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n.log" && break; kill -0 $P1 2>/dev/null || break; sleep 0.1; i=$((i+1)); done
 grep -q "perfcached ready" "$D/n.log" || { bad "the daemon did not start: $(grep -m1 -E 'ERR|CRIT' "$D/n.log" | cut -c1-140)"; echo "metricsresettest: $pass passed, $fail failed"; exit 1; }

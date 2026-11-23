@@ -55,6 +55,7 @@ C
 	chmod 600 "$D/n$1.conf"
 }
 start() {
+	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 & eval "P$1=$!"; PIDS="$PIDS $!"
 	k=0; while [ $k -lt 150 ] && ! grep -q "perfcached ready" "$D/n$1.log"; do sleep 0.1; k=$((k+1)); done
 	grep -q "perfcached ready" "$D/n$1.log" || { bad "node $1 did not start: $(tail -2 "$D/n$1.log" | tr '\n' ' ')"; exit 1; }

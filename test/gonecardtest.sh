@@ -36,8 +36,11 @@ CONF
 node 1 17720 17721
 node 2 17722 17723
 node 3 17724 17725
+: > "$D/n1.log"
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 & P1=$!
+: > "$D/n2.log"
 "$BIN" -f "$D/n2.conf" > "$D/n2.log" 2>&1 & P2=$!
+: > "$D/n3.log"
 "$BIN" -f "$D/n3.conf" > "$D/n3.log" 2>&1 & P3=$!
 i=0
 while [ $i -lt 200 ]; do

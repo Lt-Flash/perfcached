@@ -14,6 +14,7 @@ mk() { # mk <file> <tcp> <resp> <http> <extra [daemon] lines>
 	chmod 640 "$1"
 }
 up() { # up <conf> <log> - start, wait ready; echoes the pid
+	: > "$2"
 	"$BIN" -f "$1" > "$2" 2>&1 & p=$!
 	i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$2" && break; kill -0 $p 2>/dev/null || break; sleep 0.1; i=$((i+1)); done
 	echo $p

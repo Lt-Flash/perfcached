@@ -63,7 +63,9 @@ start() { # start <n> <how many "ready" lines the log holds then> [VAR=value ...
 		[ "$(grep -c "perfcached ready" "$D/n$n.log")" -ge "$want" ] && return 0
 		sleep 0.1; i=$((i+1))
 	done
-	echo "node $n did not start"; return 1
+	P=$(cat "$D/n$n.pid"); kill -0 "$P" 2>/dev/null && w="alive" || { wait "$P" 2>/dev/null; w="exited $?"; }
+	echo "node $n did not start ($w, $(grep -c "perfcached ready" "$D/n$n.log") ready line(s), want $want):"
+	tail -n 8 "$D/n$n.log" | cut -c1-200 | sed "s/^/       n$n: /"; diag; return 1
 }
 stop1() { kill "$(cat "$D/n$1.pid")" 2>/dev/null; i=0; while kill -0 "$(cat "$D/n$1.pid")" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; }
 st() { curl -s -m 3 "http://127.0.0.1:2759$1/stats" | python3 -c '
@@ -226,7 +228,7 @@ del 27492 50 100
 start 1 3 PERFCACHED_TEST_BOOT_DELAY_MS=6000 || exit 1
 P1=$(cat "$D/n1.pid")
 i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt 2 ]; do sleep 0.25; i=$((i+1)); done
-kill -9 "$(cat "$D/n2.pid")" "$(cat "$D/n3.pid")" 2>/dev/null
+K2=$(cat "$D/n2.pid") K3=$(cat "$D/n3.pid"); kill -9 "$K2" "$K3" 2>/dev/null; wait "$K2" "$K3" 2>/dev/null
 [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" = 2 ] \
 	&& ok "2a. node 1 began a second copy, and both survivors were killed before its pull" \
 	|| bad "2a. node 1 never began the second copy: $(grep -E "rejoin -|reconcile|resync -" "$D/n1.log" | tail -2 | cut -c1-160 | tr '\n' ' ')"
@@ -265,7 +267,7 @@ stop1 1
 start 1 5 PERFCACHED_TEST_BOOT_DELAY_MS=10000 || exit 1
 P1=$(cat "$D/n1.pid")
 i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt "$W" ]; do sleep 0.25; i=$((i+1)); done
-kill -9 "$(cat "$D/n2.pid")" "$(cat "$D/n3.pid")" 2>/dev/null
+K2=$(cat "$D/n2.pid") K3=$(cat "$D/n3.pid"); kill -9 "$K2" "$K3" 2>/dev/null; wait "$K2" "$K3" 2>/dev/null
 rm -f "$D/n3.pid"
 start 2 3 || exit 1                            # its new self answers the delayed pull with its own files
 i=0; while [ $i -lt 120 ] && kill -0 "$P1" 2>/dev/null; do sleep 0.5; i=$((i+1)); done

@@ -56,6 +56,7 @@ C
 	chmod 600 "$D/n$1.conf"
 }
 start() {
+	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 150 ]; do

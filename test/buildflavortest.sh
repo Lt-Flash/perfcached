@@ -69,6 +69,7 @@ build_of() { # build_of <binary> -> process.build from a short start
 	printf '[daemon]\nworkers = 1\n[memory]\narena_mb = 32\n[secrets]\nclient = flav-secret\n[listen]\ntcp = 127.0.0.1:%d\nhttp = 127.0.0.1:%d\nplaintext = loopback\n[collection 0]\nbuckets_log2 = 8\n' \
 		$P1 $P2 > "$D/n$2.conf"
 	chmod 600 "$D/n$2.conf"
+	: > "$D/n$2.log"
 	ASAN_OPTIONS=detect_leaks=0${LD_PRELOAD:+:verify_asan_link_order=0} "$1" -f "$D/n$2.conf" > "$D/n$2.log" 2>&1 &
 	PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n$2.log"; do sleep 0.1; i=$((i+1)); done

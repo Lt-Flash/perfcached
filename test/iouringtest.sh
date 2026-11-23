@@ -57,8 +57,10 @@ for l in urllib.request.urlopen("http://127.0.0.1:19741/metrics", timeout=5).rea
 start() { # start <conf> [env assignment] - runs it, waits ready
 	rm -rf "$D/s"; mkdir -p "$D/s"
 	if [ -n "${2:-}" ]; then
+		: > "$D/$1.log"
 		env "$2" "$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & P=$!
 	else
+		: > "$D/$1.log"
 		"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & P=$!
 	fi
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1.log"; do sleep 0.1; i=$((i+1)); done

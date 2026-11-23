@@ -68,6 +68,7 @@ C
 }
 start() { # start <conf>
 	rm -rf "$D/state"; mkdir -p "$D/state"
+	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1.log"; do
 		kill -0 $PID 2>/dev/null || break; sleep 0.1; i=$((i+1)); done

@@ -50,6 +50,7 @@ print(eval(sys.argv[1]))' "$1" 2>/dev/null
 }
 start() {
 	rm -rf "$D/s"; mkdir -p "$D/s"
+	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & P=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1.log"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$1.log"

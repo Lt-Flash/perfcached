@@ -52,6 +52,7 @@ wait_exit() {
 # A: the second worker, the maintenance thread, the WAL thread - each refused in turn
 for c in "2 worker" "3 maintenance" "4 wal"; do
 	nth=${c%% *} what=${c#* }
+	: > "$D/log"
 	LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_THREADFAIL_NTH=$nth "$BIN" -f "$D/s.conf" > "$D/log" 2>&1 &
 	P=$!
 	wait_exit 300
@@ -70,6 +71,7 @@ done
 
 # B: a reload asked (SIGHUP) while start-up is still recovering - the daemon goes on to "ready"
 # and stops clean (the default action of SIGHUP would have ended it)
+: > "$D/log"
 PERFCACHED_TEST_START_HOLD_MS=3000 "$BIN" -f "$D/s.conf" > "$D/log" 2>&1 &
 P=$!
 n=0

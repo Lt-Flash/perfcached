@@ -143,6 +143,7 @@ $4
 EOF
 }
 start() { # start <arm> <n>
+	: > "$D/n$1$2.log"
 	"$BIN" -f "$D/n$1$2.conf" > "$D/n$1$2.log" 2>&1 &
 	PIDS="$PIDS $!"
 	eval "PID$1$2=\$!"

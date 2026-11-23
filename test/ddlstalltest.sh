@@ -60,6 +60,7 @@ C
 	chmod 600 "$D/n$1.conf"
 }
 start() { # start <n>: under the shim, its classes armed by $D/ctl
+	: > "$D/n$1.log"
 	LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/sync.log" \
 		PC_SYNCFAIL_STATE_MS=2500 "$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	echo $! > "$D/n$1.pid"

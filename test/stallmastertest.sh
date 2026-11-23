@@ -152,6 +152,7 @@ num() { case "${1:-}" in ''|*[!0-9]*) echo -1;; *) echo "$1";; esac; }
 
 for n in 9 1 2 3; do conf $n; done
 : > "$D/ctl"
+: > "$D/n9.log"
 "$TF" "$D/ctl" -- "$BIN" -f "$D/n9.conf" > "$D/n9.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n9.log" || { bad "the founder did not start"; echo "stallmastertest: $pass passed, $fail failed"; exit 1; }

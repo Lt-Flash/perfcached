@@ -38,8 +38,10 @@ C
 }
 mkconf "$D/pt.conf" 17155 loopback
 mkconf "$D/nx.conf" 17156 never
+: > "$D/pt.log"
 "$BIN" -f "$D/pt.conf" > "$D/pt.log" 2>&1 &
 P1=$!
+: > "$D/nx.log"
 "$BIN" -f "$D/nx.conf" > "$D/nx.log" 2>&1 &
 P2=$!
 i=0; while [ $i -lt 150 ]; do

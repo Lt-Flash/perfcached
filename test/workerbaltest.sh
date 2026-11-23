@@ -27,6 +27,7 @@ buckets_log2 = 10
 EOF
 chmod 600 "$D/n.conf"
 mkdir -p "$D/state"
+: > "$D/n.log"
 "$BIN" -f "$D/n.conf" -D > "$D/n.log" 2>&1 &
 PID=$!
 i=0

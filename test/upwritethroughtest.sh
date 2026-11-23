@@ -72,6 +72,7 @@ NS=0
 start() { # start <conf> - its log is $D/<conf>.<n>.log, the last one $D/<conf>.log; KEEP=1 keeps the state
 	[ -n "${KEEP:-}" ] || { rm -rf "$D/state"; mkdir -p "$D/state"; }
 	NS=$((NS+1)); L="$D/$1.$NS.log"
+	: > "$L"
 	PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/$1.conf" > "$L" 2>&1 & PID=$!
 	ln -sf "$L" "$D/$1.log"
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$L"; do

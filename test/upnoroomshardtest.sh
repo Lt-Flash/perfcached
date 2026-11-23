@@ -65,6 +65,7 @@ upstream_prefixes = tok:*
 upstream_timeout_ms = 2000
 C
 	chmod 600 "$D/n$1.conf"
+	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P${1}ID=\$!"
 	i=0; while [ $i -lt 150 ] && ! grep -q "perfcached ready" "$D/n$1.log"; do sleep 0.1; i=$((i+1)); done

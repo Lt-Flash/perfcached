@@ -37,8 +37,10 @@ save = 900 1
 buckets_log2 = 10
 EOF
 sed -e 's/17059/17060/' -e '/^\[wal\]/,/^save/d' "$D/w.conf" > "$D/n.conf"
+: > "$D/w.log"
 "$BIN" -f "$D/w.conf" > "$D/w.log" 2>&1 &
 P1=$!
+: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 P2=$!
 i=0
@@ -132,6 +134,7 @@ kill -TERM $P1 $P2 2>/dev/null; wait 2>/dev/null; P1= P2=
 # reply (PERFCACHED_TEST_PROBE_GAP_MS holds that gap open for 8 s; the second starts at 5 s)
 mkdir -p "$D/wal3"
 sed -e 's/17059/17061/' -e "s|$D/wal|$D/wal3|" "$D/w.conf" > "$D/p.conf"
+: > "$D/p.log"
 PERFCACHED_TEST_PROBE_GAP_MS=8000 "$BIN" -f "$D/p.conf" > "$D/p.log" 2>&1 &
 P1=$!
 i=0

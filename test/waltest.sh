@@ -39,6 +39,7 @@ EOF
 }
 
 start() {
+	: > "$D/log"
 	"$BIN" -f "$D/w.conf" > "$D/log" 2>&1 &
 	PID=$!
 	i=0

@@ -56,6 +56,7 @@ C
 	elif [ $i = 1 ]; then
 		PERFCACHED_TEST_FG_FULL=1 "$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 &
 	else
+		: > "$D/n$i.log"
 		"$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 &
 	fi
 	PIDS="$PIDS $!"

@@ -32,6 +32,7 @@ plaintext = never
 buckets_log2 = 10
 C
 chmod 600 "$D/d.conf"
+: > "$D/d.log"
 "$BIN" -f "$D/d.conf" > "$D/d.log" 2>&1 &
 P1=$!
 i=0; while [ $i -lt 150 ] && ! grep -q "perfcached ready" "$D/d.log"; do sleep 0.1; i=$((i+1)); done

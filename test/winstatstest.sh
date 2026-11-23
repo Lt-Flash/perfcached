@@ -38,6 +38,7 @@ buckets_log2 = 10
 mode = eager
 CONF
 	chmod 600 "$D/n$1.conf"
+	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P$1=\$!"
 	i=0

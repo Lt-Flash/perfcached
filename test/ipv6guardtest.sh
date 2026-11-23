@@ -108,6 +108,7 @@ i=0; while [ $i -lt 50 ] && ! { [ -f "$D/q.$mode.ready" ] && [ -f "$D/up.$mode/r
 "$BIN" -C -f "$D/n.conf" > "$D/c.$mode.out" 2>&1
 "$BIN" -C -f "$D/n6.conf" > "$D/c6.$mode.out" 2>&1; echo $? > "$D/c6.$mode.rc"
 rm -rf "$D/state"; mkdir -p "$D/state"
+: > "$D/n.$mode.log"
 "$BIN" -f "$D/n.conf" > "$D/n.$mode.log" 2>&1 & P=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n.$mode.log"; do
 	kill -0 $P 2>/dev/null || break; sleep 0.1; i=$((i+1)); done

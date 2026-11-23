@@ -52,6 +52,7 @@ wait_exit() { # wait_exit <secs> -> 0 if $P exited within the window
 
 echo "--- A: the address appears 3 s after the start"
 fresh_ns; conf 30
+: > "$D/a.log"
 ip netns exec $NS "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 &
 P=$!
 sleep 3

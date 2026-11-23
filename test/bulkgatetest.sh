@@ -80,10 +80,12 @@ EOF
 }
 
 for n in 1 2; do conf $n; done
+: > "$D/n2.log"
 "$BIN" -f "$D/n2.conf" > "$D/n2.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n2.log" || { bad "the founder did not start"; echo "bulkgatetest: $pass passed, $fail failed"; exit 1; }
 N=$(fill)
+: > "$D/n1.log"
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n1.log" || { bad "the joiner did not start"; echo "bulkgatetest: $pass passed, $fail failed"; exit 1; }

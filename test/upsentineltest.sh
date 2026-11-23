@@ -67,6 +67,7 @@ C
 		for l in "$@"; do echo "$l"; done
 	} > "$D/$n.conf"
 	chmod 600 "$D/$n.conf"
+	: > "$D/$n.log"
 	"$BIN" -f "$D/$n.conf" > "$D/$n.log" 2>&1 & PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$n.log"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$n.log" || { bad "the node ($n) did not start: $(tail -2 "$D/$n.log")"; exit 1; }
@@ -127,6 +128,7 @@ else
 	bad "C. S killed, S2's failover: sentinel '$(up 'c["sentinel"]')'"
 fi
 kill -9 $PID; wait $PID 2>/dev/null
+: > "$D/f.log"
 "$BIN" -f "$D/a.conf" > "$D/f.log" 2>&1 & PID=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/f.log"; do sleep 0.1; i=$((i+1)); done
 n=$(grep -c "the last topology - 2 server(s), 2 sentinel(s) - tried at the start" "$D/f.log")

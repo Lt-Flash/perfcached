@@ -43,6 +43,7 @@ C
 }
 mkdir -p "$D/state"
 conf rl-client-1 rl-enable-1 rl-token-1 rl-resp-1 127.0.0.1/32 10000000
+: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 P=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n.log"; do sleep 0.1; i=$((i+1)); done

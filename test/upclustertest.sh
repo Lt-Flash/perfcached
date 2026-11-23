@@ -159,6 +159,7 @@ upstream_timeout_ms = 2000
 C
 chmod 600 "$D/n.conf"
 start() {
+	: > "$D/$1"
 	PERFCACHED_TEST_CL_REFRESH_MS=2000 "$BIN" -f "$D/n.conf" > "$D/$1" 2>&1 & PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$1" || { bad "the node did not start: $(tail -3 "$D/$1")"; exit 1; }

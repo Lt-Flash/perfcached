@@ -27,6 +27,7 @@ CONF
 chmod 640 "$D/pc.conf"
 # the daemon needs a descriptor per client: raise the soft limit toward the hard one
 ulimit -n "$(ulimit -H -n)" 2>/dev/null
+: > "$D/pc.log"
 "$BIN" -f "$D/pc.conf" -D > "$D/pc.log" 2>&1 & P=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/pc.log" && break; sleep 0.1; i=$((i+1)); done
 grep -q "perfcached ready" "$D/pc.log" || { echo "  daemon did not start:"; tail -3 "$D/pc.log"; echo "sweepwalktest: 0 passed, 1 failed"; exit 1; }

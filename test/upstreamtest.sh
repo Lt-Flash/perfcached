@@ -85,6 +85,7 @@ upstream_timeout_ms = 2000
 upstream_negative_ms = 3000
 C
 chmod 600 "$D/n.conf"
+: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n.log" && break
@@ -536,6 +537,7 @@ upstream_timeout_ms = 2000
 upstream_writes = refuse
 C
 chmod 600 "$D/n2.conf"
+: > "$D/n2.log"
 "$BIN" -f "$D/n2.conf" > "$D/n2.log" 2>&1 &
 PID2=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n2.log" && break

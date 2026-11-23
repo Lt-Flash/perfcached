@@ -28,6 +28,7 @@ buckets_log2 = 12
 EOC
 
 start() {
+	: > "$D/n.log"
 	"$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 	PID=$!
 	k=0

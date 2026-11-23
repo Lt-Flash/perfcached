@@ -34,8 +34,10 @@ EOF
 mkconf "$D/pt.conf" 17045 loopback
 mkconf "$D/nx.conf" 17046 never
 sed -i 's/^cluster = cli-cluster-secret$/&\nenable = cli-enable-secret/' "$D/nx.conf"
+: > "$D/pt.log"
 "$BIN" -f "$D/pt.conf" > "$D/pt.log" 2>&1 &
 P1=$!
+: > "$D/nx.log"
 "$BIN" -f "$D/nx.conf" > "$D/nx.log" 2>&1 &
 P2=$!
 i=0
@@ -323,6 +325,7 @@ grep -q "^.*query:" "$D/pt.log" && bad "S65: query lines with query_log off" || 
 mkconf "$D/ql.conf" 17047 loopback
 # the keys are [daemon] keys: put them THERE, not after the last section
 sed -i 's/^log_level = notice$/log_level = info\nquery_log = all\nquery_log_keys = full/' "$D/ql.conf"
+: > "$D/ql.log"
 "$BIN" -f "$D/ql.conf" > "$D/ql.log" 2>&1 &
 QP=$!
 i=0; while [ $i -lt 50 ]; do grep -q "perfcached ready" "$D/ql.log" && break; sleep 0.1; i=$((i+1)); done
@@ -341,6 +344,7 @@ grep -c "query: bin" "$D/ql.log" | grep -qE "^[3-9]|^[1-9][0-9]" && ok || bad "S
 kill -TERM $QP 2>/dev/null; wait $QP 2>/dev/null
 mkconf "$D/qs.conf" 17048 loopback
 sed -i 's/^log_level = notice$/log_level = info\nquery_log = sampled:3\nquery_log_keys = hashed/' "$D/qs.conf"
+: > "$D/qs.log"
 "$BIN" -f "$D/qs.conf" > "$D/qs.log" 2>&1 &
 QP=$!
 i=0; while [ $i -lt 50 ]; do grep -q "perfcached ready" "$D/qs.log" && break; sleep 0.1; i=$((i+1)); done

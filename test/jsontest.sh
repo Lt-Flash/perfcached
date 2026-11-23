@@ -28,6 +28,7 @@ plaintext = loopback
 [collection js]
 buckets_log2 = 10
 EOF
+: > "$D/js.log"
 "$BIN" -f "$D/js.conf" > "$D/js.log" 2>&1 &
 P=$!
 i=0

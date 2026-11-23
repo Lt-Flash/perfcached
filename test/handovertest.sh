@@ -161,6 +161,7 @@ val() { sed -n "s/^$1=//p" "$D/out" | head -1; }
 num() { case "${1:-}" in ''|*[!0-9]*) echo -1;; *) echo "$1";; esac; }
 
 for n in 9 1 2; do conf $n; done
+: > "$D/n9.log"
 "$BIN" -f "$D/n9.conf" > "$D/n9.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n9.log" || { bad "the founder did not start"; echo "handovertest: $pass passed, $fail failed"; exit 1; }
@@ -201,6 +202,7 @@ for n in 9 1 2; do
 	sed -i -e '/^mode = store$/d' -e '/^collections = c$/d' "$D/n$n.conf"
 	echo "mode = store" >> "$D/n$n.conf"
 done
+: > "$D/n9.log"
 "$BIN" -f "$D/n9.conf" > "$D/n9.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n9.log" || { bad "the second founder did not start"; echo "handovertest: $pass passed, $fail failed"; exit 1; }

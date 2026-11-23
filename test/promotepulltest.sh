@@ -43,6 +43,7 @@ C
 }
 start() { # start <n> [VAR=value ...]
 	n=$1; shift
+	: > "$D/n$n.log"
 	env "$@" "$BIN" -f "$D/n$n.conf" > "$D/n$n.log" 2>&1 &
 	echo $! > "$D/n$n.pid"
 	i=0; while [ $i -lt 300 ]; do grep -q "perfcached ready" "$D/n$n.log" && return 0; sleep 0.1; i=$((i+1)); done

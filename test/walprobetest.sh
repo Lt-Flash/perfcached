@@ -71,6 +71,7 @@ EOF
 }
 # 30 s, not 6: a TERM before the daemon's handler kills it silently, losing the startup lines
 startstop() {
+	: > "$D/log"
 	"$BIN" -f "$D/w.conf" > "$D/log" 2>&1 &
 	PID=$!
 	i=0

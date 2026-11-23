@@ -55,8 +55,8 @@ done
 
 start() { # start <n> [VAR=value]: each start logs to its own file, n<n>.log.<k>
 	k=$(ls "$D"/n$1.log.* 2>/dev/null | wc -l); L="$D/n$1.log.$k"
-	if [ -n "${2:-}" ]; then env "$2" "$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
-	else "$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
+	if [ -n "${2:-}" ]; then : > "$L"; env "$2" "$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
+	else : > "$L"; "$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
 	fi
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 200 ]; do

@@ -27,6 +27,7 @@ plaintext = loopback
 [collection c]
 buckets_log2 = 12
 CONF
+: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 P=$!
 i=0

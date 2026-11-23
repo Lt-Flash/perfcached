@@ -85,6 +85,7 @@ PY
 
 # ---- 1, 2. each collection with its own password --------------------------------------
 mkdir -p "$D/state"
+: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 & PID=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n.log"; do
 	kill -0 $PID 2>/dev/null || break; sleep 0.1; i=$((i+1)); done

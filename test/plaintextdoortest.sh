@@ -78,6 +78,7 @@ buckets_log2 = 10
 EOF
 }
 start() {
+	: > "$D/n.log"
 	"$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 	P1=$!
 	i=0

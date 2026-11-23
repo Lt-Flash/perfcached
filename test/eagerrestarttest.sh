@@ -60,6 +60,7 @@ C
 }
 start() {
 	k=$(ls "$D"/n$1.log.* 2>/dev/null | wc -l); L="$D/n$1.log.$k"
+	: > "$L"
 	"$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 300 ]; do

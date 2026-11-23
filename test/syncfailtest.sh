@@ -56,6 +56,7 @@ EOF
 	: > "$D/$1.ctl"; : > "$D/$1.shim"
 }
 start() { # start <arm>
+	: > "$D/$1.log"
 	PC_SYNCFAIL_CTL="$D/$1.ctl" PC_SYNCFAIL_LOG="$D/$1.shim" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
 		"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 &
 	P1=$!

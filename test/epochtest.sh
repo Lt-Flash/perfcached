@@ -91,6 +91,7 @@ EOF
 	chmod 600 "$D/n$1.conf"
 }
 start() { # start <n> <binary>; the pid goes in PIDS and in $D/n<n>.pid
+	: > "$D/n$1.log"
 	"$2" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	echo $! > "$D/n$1.pid"; PIDS="$PIDS $!"
 	i=0

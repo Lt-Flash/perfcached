@@ -41,6 +41,7 @@ CONF
 # is the smaller wherever that allows
 ulimit -n "$(ulimit -H -n)" 2>/dev/null
 start() {  # start <name> - env from the caller
+	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" -D > "$D/$1.log" 2>&1 & P=$!
 	i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/$1.log" && return 0; sleep 0.1; i=$((i+1)); done
 	echo "  daemon $1 did not start:"; tail -5 "$D/$1.log"; return 1

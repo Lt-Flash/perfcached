@@ -23,6 +23,7 @@ plaintext = loopback
 buckets_log2 = 10
 CONF
 chmod 600 "$D/c.conf"
+: > "$D/log"
 "$BIN" -f "$D/c.conf" > "$D/log" 2>&1 &
 P=$!
 i=0

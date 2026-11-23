@@ -237,6 +237,7 @@ for _ in range(3):
 EOF
 [ $? -eq 0 ] || echo "F seed-crashed" >> "$RES"
 
+: > "$D/n1.log"
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 P1=$!
 door 17062 "$D/n1.log"

@@ -59,6 +59,7 @@ buckets_log2 = 14
 EOF
 
 echo "=== waloverruntest ==="
+: > "$D/log"
 "$BIN" -f "$D/c.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 200 ]; do grep -q "perfcached ready" "$D/log" && break
@@ -191,6 +192,7 @@ esac
 
 # what it acknowledged survives - the overwritten records too (healtest covers the ring-drop path)
 kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null; PID=
+: > "$D/log2"
 "$BIN" -f "$D/c.conf" > "$D/log2" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 300 ]; do grep -q "perfcached ready" "$D/log2" && break

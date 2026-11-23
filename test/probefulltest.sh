@@ -39,6 +39,7 @@ buckets_log2 = 10
 mode = proxy
 C
 	chmod 600 "$D/n$i.conf"
+	: > "$D/n$i.log"
 	"$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 &
 	PIDS="$PIDS $!"
 	eval "P$i=$!"

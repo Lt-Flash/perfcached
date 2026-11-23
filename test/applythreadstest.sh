@@ -45,6 +45,7 @@ EOF
 	chmod 600 "$D/n$1$2.conf"
 }
 start() { # <arm> <node>
+	: > "$D/n$1$2.log"
 	"$BIN" -f "$D/n$1$2.conf" > "$D/n$1$2.log" 2>&1 &
 	PIDS="$PIDS $!"
 	i=0
@@ -297,6 +298,7 @@ if [ -x "$TF" ]; then
 	conf 3 1 4 "apply_stall_ms = 2000"; conf 3 2 4 "apply_stall_ms = 2000"
 	: > "$D/ctl3"
 	start 3 1
+	: > "$D/n32.log"
 	"$TF" "$D/ctl3" -- "$BIN" -f "$D/n32.conf" > "$D/n32.log" 2>&1 &
 	PIDS="$PIDS $!"
 	i=0; while [ $i -lt 200 ]; do grep -q "perfcached ready" "$D/n32.log" 2>/dev/null && break; sleep 0.1; i=$((i + 1)); done

@@ -41,7 +41,9 @@ CONF
 }
 conf 1 "enable = en-privilege-secret"
 conf 2 ""
+: > "$D/n1.log"
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 & P1=$!
+: > "$D/n2.log"
 "$BIN" -f "$D/n2.conf" > "$D/n2.log" 2>&1 & P2=$!
 i=0
 while [ $i -lt 200 ]; do

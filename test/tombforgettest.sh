@@ -47,6 +47,7 @@ save = off
 buckets_log2 = 12
 C
 	chmod 600 "$D/n$i.conf"
+	: > "$D/n$i.log"
 	"$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 & PIDS="$PIDS $!"; eval "P$i=$!"
 done
 for i in 1 2 3; do

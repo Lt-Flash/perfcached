@@ -51,6 +51,7 @@ C
 start() { # start <n> [VAR=value ...]
 	n=$1; shift
 	: > "$D/cut$n"
+	: > "$D/n$n.log"
 	env "$@" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut$n" PC_NETCUT_LOG="$D/cutlog$n" \
 		"$BIN" -f "$D/n$n.conf" > "$D/n$n.log" 2>&1 &
 	echo $! > "$D/n$n.pid"

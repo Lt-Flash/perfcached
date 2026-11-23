@@ -36,6 +36,7 @@ autoscale = off
 EOF
 chmod 600 "$D/n.conf"
 : > "$D/nofit"
+: > "$D/n.log"
 PERFCACHED_TEST_RS_COPY_FAIL="$D/nofit" "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 80 ] && ! grep -q "perfcached ready" "$D/n.log"; do sleep 0.1; i=$((i+1)); done

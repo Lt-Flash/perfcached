@@ -73,6 +73,7 @@ upstream_negative_ms = 2000
 C
 chmod 600 "$D/n.conf"
 start() { # start [VAR=value ...]: the node, its log $D/n.log
+	: > "$D/n.log"
 	env "$@" "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 & PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n.log"; do
 		kill -0 $PID 2>/dev/null || break; sleep 0.1; i=$((i+1)); done

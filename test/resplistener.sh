@@ -43,6 +43,7 @@ EOF
 }
 
 start() { # start <conf>; 0 = came up
+	: > "$D/log"
 	"$BIN" -f "$1" > "$D/log" 2>&1 &
 	P1=$!
 	i=0

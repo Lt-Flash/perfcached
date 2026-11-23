@@ -102,6 +102,7 @@ openssl genpkey -algorithm ed25519 -out "$D/other.pem" 2> /dev/null
 conf "trusted_keys = $PUB"
 sed -i -e "s|^\[daemon\]$|&\nstate_dir = $D/st|" -e 's/^client = stage-client-secret$/&\nenable = stage-enable/' "$D/c.conf"
 mkdir -p "$D/st"
+: > "$D/n.log"
 "$BIN" -f "$D/c.conf" > "$D/n.log" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/n.log"; do sleep 0.1; i=$((i+1)); done
@@ -294,6 +295,7 @@ if [ -n "$SHIM" ] && [ -f "$SHIM" ]; then
 	head -c 300000 /dev/urandom > "$D/e.tar.gz"
 	openssl pkeyutl -sign -inkey "$D/k.pem" -rawin -in "$D/e.tar.gz" -out "$D/e.sig" 2> /dev/null
 	echo part > "$D/sf.ctl"
+	: > "$D/n10.log"
 	LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_SYNCFAIL_CTL="$D/sf.ctl" PC_SYNCFAIL_LOG="$D/sf.log" "$BIN" -f "$D/c.conf" > "$D/n10.log" 2>&1 &
 	PID=$!
 	i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/n10.log"; do sleep 0.1; i=$((i+1)); done

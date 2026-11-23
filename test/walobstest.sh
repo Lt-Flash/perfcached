@@ -104,6 +104,7 @@ PY
 
 echo "=== walobstest ==="
 # real fsyncs: the detector below throttles the disk and must see them slow (no PC_NOSYNC preload)
+: > "$D/log"
 LD_PRELOAD= "$BIN" -f "$D/c.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 600 ]; do grep -q "perfcached ready" "$D/log" && break

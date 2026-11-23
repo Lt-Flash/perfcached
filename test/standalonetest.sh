@@ -94,6 +94,7 @@ plaintext = never
 buckets_log2 = 12
 CONF
 	chmod 640 "$D/$1.conf"
+	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" -D > "$D/$1.log" 2>&1 & P1=$!
 	i=0
 	while [ $i -lt 100 ]; do

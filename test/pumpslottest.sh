@@ -54,6 +54,7 @@ r=json.loads(urllib.request.urlopen("http://127.0.0.1:28681/stats",timeout=5).re
 x=r["cluster"]
 print(eval(sys.argv[1]))' "$1" 2>/dev/null || echo "?"; }
 
+: > "$D/n1.log"
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 echo $! > "$D/n1.pid"
 i=0; while [ $i -lt 60 ] && ! { [ "$(st 'x["role"]')" = master ] && [ "$(st 'r["state"]')" = ready ]; }; do sleep 0.5; i=$((i+1)); done

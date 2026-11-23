@@ -38,6 +38,7 @@ EOF
 }
 start() { # start <n>  (truncates the log: readiness must be THIS run's)
 	: > "$D/n$1.log"
+	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P$1=\$!"
 	i=0
