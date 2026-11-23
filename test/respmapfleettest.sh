@@ -49,7 +49,8 @@ buckets_log2 = 10
 buckets_log2 = 10
 C
 	chmod 600 "$D/n$1.conf"
-	n0=$(grep -c "perfcached ready" "$D/n$1.log" 2>/dev/null || echo 0)
+	: >> "$D/n$1.log"   # before the start: the background child may open it after the first grep
+	n0=$(grep -c "perfcached ready" "$D/n$1.log")
 	if [ -n "${2:-}" ]; then PERFCACHED_TEST_NO_RESPMAP=1 "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
 	else "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & fi
 	eval "P${1}ID=\$!"
@@ -232,7 +233,7 @@ buckets_log2 = 8
 buckets_log2 = 8
 C
 chmod 600 "$D/n5.conf"
-solo() { n0=$(grep -c "perfcached ready" "$D/n5.log" 2>/dev/null || echo 0); "$BIN" -f "$D/n5.conf" >> "$D/n5.log" 2>&1 & P5ID=$!
+solo() { : >> "$D/n5.log"; n0=$(grep -c "perfcached ready" "$D/n5.log"); "$BIN" -f "$D/n5.conf" >> "$D/n5.log" 2>&1 & P5ID=$!
 	i=0; while [ $i -lt 100 ] && [ "$(grep -c "perfcached ready" "$D/n5.log")" -le "$n0" ]; do sleep 0.1; i=$((i+1)); done; }
 solo
 r=$(nv 5 map '{"index":0,"col":"prod-redis"}')

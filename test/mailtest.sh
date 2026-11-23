@@ -155,7 +155,8 @@ start_node() { # start_node <smtp url> [extra mail line] [noca] - one node, wait
 		"$1" >> "$D/n.conf"
 	[ "${3:-}" = noca ] || printf 'ca_file = %s\n' "$D/cert.pem" >> "$D/n.conf"
 	[ -n "${2:-}" ] && printf '%s\n' "$2" >> "$D/n.conf"
-	r0=$(grep -c "perfcached ready" "$D/n.log" 2>/dev/null || echo 0)   # the log is shared
+	: >> "$D/n.log"   # the log is shared; made before the start, which may open it after the first grep
+	r0=$(grep -c "perfcached ready" "$D/n.log")
 	"$MBIN" -f "$D/n.conf" >> "$D/n.log" 2>&1 &
 	PID=$!
 	i=0; while [ $i -lt 100 ] && [ "$(grep -c "perfcached ready" "$D/n.log")" -le "$r0" ]; do sleep 0.1; i=$((i+1)); done

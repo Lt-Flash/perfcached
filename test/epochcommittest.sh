@@ -42,7 +42,8 @@ collections = 0
 buckets_log2 = 10
 C
 	chmod 600 "$D/n$1.conf"
-	n0=$(grep -c "perfcached ready" "$D/n$1.log" 2>/dev/null || echo 0)
+	: >> "$D/n$1.log"   # before the start: the background child may open it after the first grep
+	n0=$(grep -c "perfcached ready" "$D/n$1.log")
 	if [ -n "${2:-}" ]; then PERFCACHED_TEST_EPOCH_MAX=$2 "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
 	else "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & fi
 	eval "P${1}ID=\$!"
