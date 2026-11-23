@@ -6,6 +6,6 @@
 extern zend_module_entry perfcached_module_entry;
 #define phpext_perfcached_ptr &perfcached_module_entry
 
-#define PHP_PERFCACHED_VERSION "0.1.1"
+#define PHP_PERFCACHED_VERSION "0.2.0"
 
 #endif

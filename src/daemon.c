@@ -52,11 +52,14 @@
 #include "ackstate.h"
 #include "verbs.h"
 #include "cluster.h"
+#include "clcid.h"
+#include "clterm.h"
 #include "obs.h"
 #include "metrics.h"
 #include "respmap.h"
 #include "daemon.h"
 #include "rpcq.h"
+#include "thrtab.h"
 #include "upstream.h"
 #include "mail.h"
 #include "alerts.h"
@@ -105,6 +108,7 @@ struct pc_thread {
 	pthread_mutex_t mx;                 /* guards rq */
 	struct pc_rpcq rq;
 	int live;
+	int up;                             /* created: joined if start-up gives up */
 	struct pc_conn **conns;             /* this worker's client list, read on this worker only */
 };
 
@@ -113,7 +117,7 @@ struct pc_collection_rt {
 	pcache_htable_t *ht;
 };
 
-static struct pc_thread threads[512 + 3];
+static struct pc_thread threads[PC_THREAD_SLOTS];
 static int n_threads;
 static __thread struct pc_thread *self_slot;
 
@@ -185,7 +189,10 @@ const char *pc_resp_collections(void)
 	return CFG ? CFG->resp_collections : NULL;
 }
 static volatile sig_atomic_t stop_flag;
+static volatile int wal_stop;           /* the WAL pump's own: set once its writers are joined */
 static volatile int stop_for_files;    /* pc_daemon_restart_from_files */
+static volatile int stop_for_worker;   /* a worker left its loop unasked */
+static void worker_lost(void);
 /* workers whose listeners are open - "ready" waits for all of them */
 static int workers_listening;
 static int unix_fd = -1;
@@ -261,10 +268,16 @@ int pc_wal_reprobe(int secs, struct pc_wal_policy *pol)
 
 static struct pc_thread *slot_init(int idx)
 {
-	struct pc_thread *t = &threads[n_threads++];
+	int k = pc_thread_slot_take(&n_threads, PC_THREAD_SLOTS);
+	struct pc_thread *t;
 
+	if (k < 0)
+		return NULL;
+	t = &threads[k];
 	t->idx = idx;
 	t->efd = eventfd(0, EFD_NONBLOCK);
+	if (t->efd < 0)
+		return NULL;
 	pthread_mutex_init(&t->mx, NULL);
 	return t;
 }
@@ -516,7 +529,8 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 		if (rc < 0 && rc != -ETIME && rc != -EINTR && rc != -EBUSY &&
 		    rc != -EAGAIN) {
 			LM_CRIT("worker %d: io_uring_enter: %s - the worker "
-				"stops\n", wa->wid, strerror(-rc));
+				"stops, and the daemon with it\n", wa->wid, strerror(-rc));
+			worker_lost();
 			break;
 		}
 		hs = pc_conn_hs_run(PC_HS_PER_TURN);
@@ -551,6 +565,9 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 					lmore[j] = (unsigned char)pc_conn_accept(-1,
 						lfds[j], plok[j], lresp[j],
 						have_psk ? &PSK : NULL, conns);
+				} else {
+					/* posted after this turn's accept: edge-triggered, ask again */
+					lmore[j] = 1;
 				}
 				continue;
 			}
@@ -576,7 +593,7 @@ static void *worker_main(void *p)
 	struct worker_arg *wa = p;
 	struct epoll_event ev, evs[32];
 	struct pc_conn *conns = NULL;
-	int ep, i, j, n, nlfd = 0, hs;
+	int ep, i, j, n, nlfd = 0, hs, ewait;
 	unsigned int hs_deferred;
 	int lfds[PC_MAX_LISTEN + 1], plok[PC_MAX_LISTEN + 1];
 	int lresp[PC_MAX_LISTEN + 1];
@@ -719,6 +736,7 @@ static void *worker_main(void *p)
 			: pc_conn_paused_open() || pc_conn_deny_open() ? 50
 			: (pc_conn_http_open() || pc_conn_udp_open() ||
 			   pc_conn_bufs_held() || pc_conn_out_paused_open() ? 1000 : -1));
+		ewait = errno;                 /* the sweeps below make system calls */
 		t_wake = wclock();
 		PC_IOBUSY_ADD(wait_ns, t_wake - t_wait);
 		if (n >= 0) {                  /* waits vs events */
@@ -731,8 +749,11 @@ static void *worker_main(void *p)
 		pc_conn_sweep_udp(&conns);
 		pc_conn_sweep_deny();          /* refused HTTP peers */
 		if (n < 0) {
-			if (errno == EINTR)
+			if (ewait == EINTR)
 				continue;
+			LM_CRIT("worker %d: epoll_wait: %s - the worker stops, and the "
+				"daemon with it\n", wa->wid, strerror(ewait));
+			worker_lost();
 			break;
 		}
 		/* the handshakes put off earlier first, oldest first;
@@ -796,6 +817,11 @@ int pc_leg_stuck_pct = 1;                /* [daemon] leg_stuck_pct */
 static void ev_expired_cb(const str *key, unsigned long long ver,
 		unsigned char rflags, void *ctx)
 {
+	/* the copy a running resize already took would come back at the swap */
+	pcache_htable_t *sh = pc_store_resize_shadow(pc_store_ht((int)(long)ctx));
+
+	if (sh)
+		pcache_ht_remove_below(sh, key, ver + 1);
 	pc_ev_expired((int)(long)ctx, key);
 	pc_cluster_note_expired((int)(long)ctx, key->s, key->len, ver,
 		(rflags & PCACHE_F_SHORTENED) != 0);
@@ -864,6 +890,9 @@ static void *maint_main(void *p)
 		/* the commit-ahead window at THIS loop's 100 ms cadence: a bulk load crosses a 2 MB group
 		 * every ~50 ms, and a 1 Hz refill left the crossings to the worker holding the write */
 		pcache_arena_ahead_tick();
+		/* the cluster thread's term and cluster id: a promotion waits on the term's write */
+		(void)pc_term_persist_tick();
+		(void)pc_cid_persist_tick();
 		/* one slice a pass for every collection, the first in turn */
 		gleft = PC_GROW_SLICE_US;
 		n = pc_store_count();
@@ -916,6 +945,8 @@ static void *maint_main(void *p)
 		/* the 1/s duties: reclaim, expiry, single-splitter growth */
 		pcache_arena_reclaim_tick();
 		pc_store_resize_tick();        /* a migration in flight */
+		pc_store_persist_tick();       /* what the cluster thread applied for the fleet */
+		pc_respmap_persist_tick();
 		pc_store_retire_tick();        /* what a resize left, once no thread can still hold it */
 		pc_ev_tick();                  /* refill, report suppression */
 		pc_store_hot_tick();           /* the hot-key counts halve each minute */
@@ -948,6 +979,10 @@ static void *maint_main(void *p)
 			autoscale_advise(i, cht, now);
 		}
 	}
+	pc_store_persist_tick();               /* a fleet change applied just before the stop */
+	pc_respmap_persist_tick();
+	(void)pc_term_persist_tick();
+	(void)pc_cid_persist_tick();
 	return NULL;
 }
 
@@ -1026,7 +1061,7 @@ static void *wal_main(void *p)
 	pc_wal_set_wakeup(self_slot->efd);
 	pf.fd = self_slot->efd;
 	pf.events = POLLIN;
-	while (!stop_flag) {
+	while (!__atomic_load_n(&wal_stop, __ATOMIC_ACQUIRE)) {
 		pc_wal_mark_sleeping(1);
 		poll(&pf, 1, timeout);
 		pc_wal_mark_sleeping(0);
@@ -1041,6 +1076,16 @@ static void *wal_main(void *p)
 	}
 	pc_wal_shutdown();
 	return NULL;
+}
+
+/* the pump's last drain, once nothing can append any more */
+static void wal_stop_join(struct pc_thread *t)
+{
+	uint64_t one = 1;
+
+	__atomic_store_n(&wal_stop, 1, __ATOMIC_RELEASE);
+	if (write(t->efd, &one, sizeof one) < 0) { /* best effort: the poll times out */ }
+	pthread_join(t->tid, NULL);
 }
 
 /* ---- signals ----------------------------------------------------------- */
@@ -1063,12 +1108,46 @@ void pc_daemon_restart_from_files(void)
 	on_signal(SIGTERM);
 }
 
+/* a worker out of its loop leaves its door shut and its registrations undrained: the daemon stops */
+static void worker_lost(void)
+{
+	stop_for_worker = 1;
+	on_signal(SIGTERM);
+}
+
 /* SIGHUP asks for a config reload, which the maintenance thread runs; the signal's
  * default action would end the daemon */
 static void on_hup(int sig)
 {
 	(void)sig;
 	pc_reload_ask();
+}
+
+/* -1 when @t has no slot or eventfd, or the thread cannot be created: said, by its role */
+static int spawn(struct pc_thread *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg,
+		const char *what)
+{
+	int e = t ? pthread_create(&t->tid, a, fn, arg) : 0;
+
+	if (!t || e) {
+		LM_CRIT("could not start the %s thread: %s - refusing to start\n", what,
+			t ? strerror(e) : "no thread slot or eventfd");
+		return -1;
+	}
+	t->up = 1;
+	return 0;
+}
+
+/* a start given up: the threads already running see the stop and are joined */
+static void spawn_unwind(void)
+{
+	int i;
+
+	__atomic_store_n(&wal_stop, 1, __ATOMIC_RELEASE);
+	on_signal(SIGTERM);
+	for (i = 0; i < n_threads; i++)
+		if (threads[i].up)
+			pthread_join(threads[i].tid, NULL);
 }
 
 /* ---- the run ----------------------------------------------------------- */
@@ -1127,7 +1206,7 @@ static void io_decide(const struct pc_config *cfg)
 int pc_daemon_run(struct pc_config *cfg)
 {
 	struct worker_arg wargs[512];
-	struct pc_thread *mt, *wt, *rt = NULL, *ct = NULL, *bt = NULL;
+	struct pc_thread *mt = NULL, *wt = NULL, *rt = NULL, *ct = NULL, *bt = NULL;
 	struct pc_thread *hb = NULL;
 	struct psrx_arg psrx[16];
 	struct psrx_arg apth[16];
@@ -1135,9 +1214,16 @@ int pc_daemon_run(struct pc_config *cfg)
 	struct sigaction sa;
 	sigset_t blocked, old;
 	pthread_attr_t tattr;
-	int i, nw = cfg->workers;
+	int i, nw = cfg->workers, bad = 0;
 	long fd_limit = 0, fd_reserve = 0;      /* logged with the memory guard's figure */
 
+	/* from the first line: a reload asked during recovery waits for maint, a reset peer is an
+	 * EPIPE - either signal's default action would end the daemon; recovery's reads restart */
+	memset(&sa, 0, sizeof sa);
+	sa.sa_flags = SA_RESTART;
+	sa.sa_handler = on_hup;
+	sigaction(SIGHUP, &sa, NULL);
+	signal(SIGPIPE, SIG_IGN);
 	CFG = cfg;
 	__atomic_store_n(&LIVE, live_from(cfg), __ATOMIC_RELEASE);
 	if (!LIVE) {
@@ -1882,6 +1968,18 @@ int pc_daemon_run(struct pc_config *cfg)
 	 * the cluster identity accepted what is on disk, so a refused start has written nothing */
 	pc_upg_set_install_mode(cfg->install_mode);
 	pc_upg_node_init(cfg->state_dir);
+	{
+		const char *e = getenv("PERFCACHED_TEST_START_HOLD_MS");
+
+		if (e && *e) {
+			unsigned long ms = strtoul(e, NULL, 10);
+			struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+
+			LM_NOTICE("test: start-up holds %lu ms before the threads "
+				"(PERFCACHED_TEST_START_HOLD_MS)\n", ms);
+			nanosleep(&ts, NULL);
+		}
+	}
 	/* threads spawn with signals blocked (main alone handles them) and 1 MB stacks: the cluster
 	 * plane keeps ~65-130 KB of buffers on the stack, past some libcs' 128 KB default */
 	pthread_attr_init(&tattr);
@@ -1892,50 +1990,66 @@ int pc_daemon_run(struct pc_config *cfg)
 	sigaddset(&blocked, SIGHUP);            /* the threads leave it to this one */
 	pthread_sigmask(SIG_BLOCK, &blocked, &old);
 
-	for (i = 0; i < nw; i++) {
+	if (pc_thread_slots(nw, cfg->wal_dir != NULL, cfg->cl_enabled, napply, npsrx) >
+	        PC_THREAD_SLOTS) {
+		LM_CRIT("%d workers and the helper threads need more than the %d thread "
+			"slots this build has\n", nw, PC_THREAD_SLOTS);
+		return 1;
+	}
+	for (i = 0; i < nw && !bad; i++) {
 		wargs[i].slot = slot_init(1 + i);
 		wargs[i].wid = i;
-		pthread_create(&wargs[i].slot->tid, &tattr, worker_main,
-			&wargs[i]);
+		bad = spawn(wargs[i].slot, &tattr, worker_main, &wargs[i], "worker");
 	}
-	mt = slot_init(nw + 1);
-	pthread_create(&mt->tid, &tattr, maint_main, mt);
-	wt = slot_init(nw + 2);
-	pthread_create(&wt->tid, &tattr, wal_main, wt);
-	if (cfg->wal_dir) {
+	if (!bad) {
+		mt = slot_init(nw + 1);
+		bad = spawn(mt, &tattr, maint_main, mt, "maintenance");
+	}
+	if (!bad) {
+		wt = slot_init(nw + 2);
+		bad = spawn(wt, &tattr, wal_main, wt, "wal");
+	}
+	if (!bad && cfg->wal_dir) {
 		rt = slot_init(nw + 3);
-		pthread_create(&rt->tid, &tattr, rdb_main, rt);
+		bad = spawn(rt, &tattr, rdb_main, rt, "rdb");
 	}
-	if (cfg->cl_enabled) {
+	if (!bad && cfg->cl_enabled) {
 		ct = slot_init(nw + 4);
-		pthread_create(&ct->tid, &tattr, peer_main, ct);
-		bt = slot_init(nw + 5);
-		pthread_create(&bt->tid, &tattr, bulk_main, bt);
-		hb = slot_init(nw + 6);
-		pthread_create(&hb->tid, &tattr, beat_main, hb);
+		bad = spawn(ct, &tattr, peer_main, ct, "cluster");
+		if (!bad) {
+			bt = slot_init(nw + 5);
+			bad = spawn(bt, &tattr, bulk_main, bt, "bulk");
+		}
+		if (!bad) {
+			hb = slot_init(nw + 6);
+			bad = spawn(hb, &tattr, beat_main, hb, "beat");
+		}
 		/* the apply threads take nw+7.., the relay threads
 		 * follow them - the WAL ring count above depends on it */
-		for (i = 0; i < napply; i++) {
+		for (i = 0; i < napply && !bad; i++) {
 			apth[i].slot = slot_init(nw + 7 + i);
 			apth[i].idx = i;
-			pthread_create(&apth[i].slot->tid, &tattr, apply_main, &apth[i]);
+			bad = spawn(apth[i].slot, &tattr, apply_main, &apth[i], "apply");
 		}
-		for (i = 0; i < npsrx; i++) {
+		for (i = 0; i < npsrx && !bad; i++) {
 			psrx[i].slot = slot_init(nw + 7 + napply + i);
 			psrx[i].idx = i;
-			pthread_create(&psrx[i].slot->tid, &tattr, psrx_main, &psrx[i]);
+			bad = spawn(psrx[i].slot, &tattr, psrx_main, &psrx[i], "relay");
 		}
+	}
+	if (bad) {
+		pthread_attr_destroy(&tattr);
+		spawn_unwind();
+		pthread_sigmask(SIG_SETMASK, &old, NULL);
+		return 1;
 	}
 	pthread_attr_destroy(&tattr);
 
-	pthread_sigmask(SIG_SETMASK, &old, NULL);
-	memset(&sa, 0, sizeof sa);
+	/* the handlers before the mask lifts: a TERM taken in thread creation is a clean stop */
 	sa.sa_handler = on_signal;
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
-	sa.sa_handler = on_hup;
-	sigaction(SIGHUP, &sa, NULL);
-	signal(SIGPIPE, SIG_IGN);
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
 
 	/* "ready" promises that the doors accept, and each worker opens its OWN listener: wait for
 	 * every worker, bounded - one that never gets there is said, not hidden */
@@ -1964,19 +2078,21 @@ int pc_daemon_run(struct pc_config *cfg)
 	pc_upstream_shutdown();                       /* no gate runs now */
 	pthread_join(mt->tid, NULL);
 	pc_mail_stop();                               /* after the alert source */
-	pthread_join(wt->tid, NULL);
 	if (rt)
 		pthread_join(rt->tid, NULL);
 	if (ct)
 		pthread_join(ct->tid, NULL);
 	if (hb)
 		pthread_join(hb->tid, NULL);
+	if (bt)                                       /* it stores: before the snapshot and the arena go */
+		pthread_join(bt->tid, NULL);
 	/* after the cluster thread (ct) - nothing pushes any more,
 	 * and a thread drains what it holds before it sees the flag */
 	for (i = 0; i < napply; i++)
 		pthread_join(apth[i].slot->tid, NULL);
 	for (i = 0; i < npsrx; i++)
 		pthread_join(psrx[i].slot->tid, NULL);
+	wal_stop_join(wt);                            /* last: every writer has stopped */
 	if (unix_fd >= 0) {
 		close(unix_fd);
 		for (i = 0; i < cfg->n_listen; i++)
@@ -1998,6 +2114,11 @@ int pc_daemon_run(struct pc_config *cfg)
 				"peers\n");
 	}
 	pcache_arena_destroy();
+	if (stop_for_worker) {
+		LM_CRIT("perfcached: stopped because a worker left its loop (exit 1: a "
+			"supervisor restarts it)\n");
+		return 1;
+	}
 	if (stop_for_files) {
 		LM_WARN("perfcached: stopped to start again from its own files (exit 75: a "
 			"supervisor restarts it)\n");

@@ -43,7 +43,7 @@ stages: [lint, fast, full, arch, nightly]
   # runner a missing engine FAILS it.  The shell runners (224, 225) carry
   # Debian's nodejs on the host since 2026-10-20.
   - apt-get update -qq && apt-get install -y -qq gcc make libsodium-dev
-    libevent-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev openssl nodejs >/dev/null
+    libevent-dev libcurl4-openssl-dev libmicrohttpd-dev libssl-dev openssl nodejs libeatmydata1 >/dev/null
     || echo "deps install failed - relying on preinstalled toolchain"
 
 # the PHP extension, against the runners' php8.3 from Sury, pinned so the
@@ -59,7 +59,7 @@ php:
   script:
     - make -j"$(nproc)" perfcached libperfd.so
     - make phpext phpvendor
-    - tools/netns-run.sh make check-php
+    - PC_NOSYNC=1 tools/netns-run.sh make check-php
 
 # php8.3-perfcached built and proven in throwaway Debian 13 containers
 phpdeb:
@@ -106,7 +106,7 @@ check-fast:
   before_script: *deps
   script:
     - make -j"$(nproc)"
-    - tools/netns-run.sh make check-fast
+    - PC_NOSYNC=1 tools/netns-run.sh make check-fast
 
 # The full ladder: tags only - as suite GROUPS (Makefile CHECK_GROUPS,
 # `make check-g-<group>`), each its own job, plain and under ASan+UBSan.
@@ -142,7 +142,7 @@ check:
   script:
     - *group-filter
     - make -j"$(nproc)"
-    - tools/netns-run.sh make check-g-$GROUP
+    - PC_NOSYNC=1 tools/netns-run.sh make check-g-$GROUP
 
 # The fault suites (Makefile check-fault), each group its own job, as on
 # GitHub.  A suite that cannot run says SKIPPED; PC_SKIP_FAILS=1 makes that
@@ -339,7 +339,7 @@ check-asan:
   before_script: *deps
   script:
     - *group-filter
-    - tools/netns-run.sh make check-asan-g-$GROUP
+    - PC_NOSYNC=1 tools/netns-run.sh make check-asan-g-$GROUP
 
 # memcheck, NIGHTLY and LOCAL - "slow, not CI material".
 # It runs here because this runner IS the build host, and only on a

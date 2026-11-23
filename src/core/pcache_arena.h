@@ -98,6 +98,11 @@ extern int pcache_reclaim_giveback;          /* 0 = retire/re-cut only */
  * DROPPED, before the madvise, with the bytes the punch is about to zero.
  * NULL (always, outside test/tailflighttest.c) */
 extern void (*pcache_arena_tail_hook)(char *lo, char *hi);
+/* a test's pause in a free: the first cell home on a chunk, after the count and before
+ * the chunk is announced.  NULL outside test/arenacaptest.c */
+extern void (*pcache_arena_home_hook)(void *chunk);
+/* a test's refusal of an index carve: nonzero refuses it.  NULL outside test/regiontest.c */
+extern int (*pcache_region_hook)(size_t size);
 int pcache_arena_backing(void);
 const char *pcache_arena_backing_str(void);
 void pcache_arena_backing_notice(void);

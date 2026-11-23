@@ -38,7 +38,8 @@ struct resp_sess_conf {
 	const char *password;          /* NULL: no AUTH */
 	int connect_timeout_ms;
 	int io_timeout_ms;             /* per send / receive wait */
-	size_t max_bulk;
+	int call_timeout_ms;           /* a whole call, its retry included; 0: 2 x (connect + 2 x io) */
+	size_t max_bulk;                /* a bulk up to 64 KiB past it is drained, a longer one closes */
 };
 
 struct resp_sess;
@@ -52,8 +53,8 @@ void resp_sess_free(struct resp_sess *s);
 int resp_sess_open(struct resp_sess *s, const char *collection,
 		char *err, size_t errcap);
 
-/* Run one command in @collection (empty: whatever is selected), opening a closed session.  0: a
- * reply in @out, maybe RESP_T_ERROR (free it with resp_reply_free); -1: none (@err says why). */
+/* Run one command in @collection (empty: whatever is selected), opening a closed session, within
+ * call_timeout_ms.  0: a reply in @out, maybe RESP_T_ERROR (free it with resp_reply_free); -1: none. */
 int resp_sess_call(struct resp_sess *s, const char *collection, int argc,
 		const char *const *argv, const size_t *lens,
 		struct resp_reply *out, char *err, size_t errcap);

@@ -67,7 +67,11 @@ start() { # start <binary>
 	done
 	echo "did not start: $(tail -2 "$D/n.log" | tr '\n' ' ')"; return 1
 }
-stop() { kill -9 "$(cat "$D/n.pid" 2>/dev/null)" 2>/dev/null; rm -f "$D/n.pid"; sleep 0.3; }
+# kill -9 and wait, bounded, until it is gone: one killed inside a stalled fsync holds its port until the fsync returns
+stop() { p=$(cat "$D/n.pid" 2>/dev/null); kill -9 "$p" 2>/dev/null; rm -f "$D/n.pid"; i=0
+	while [ -n "$p" ] && [ $i -lt 300 ] && s=$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null) && [ "$s" != Z ]; do
+		sleep 0.1; i=$((i+1)); done
+	sleep 0.3; }
 wal() { # wal <field>
 	printf '{"jsonrpc":"2.0","id":1,"method":"stats"}\n' | timeout 10 python3 -c '
 import json, socket, sys, pcnative

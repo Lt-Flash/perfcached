@@ -111,6 +111,12 @@ sleep 4
 [ "$(st $M "s['cluster']['epoch_refused']")" -gt "$R0" ] && ok "4. epoch_refused counts it on the master ($R0 -> $(st $M "s['cluster']['epoch_refused']"))" || bad "4. epoch_refused $R0 -> $(st $M "s['cluster']['epoch_refused']")"
 # the fleet SPEAKS 5: node 4 refuses the master's keepalive by both numbers before it could even adopt
 grep -q -E "REFUSING master keepalive .* speaks cluster wire epoch 5 and we speak 4..4|committed the fleet to wire epoch 5, which this build does not speak" "$D/n4.log" && ok "4. node 4 says why it cannot stay: the fleet speaks 5, it speaks 4..4" || bad "4. n4.log: $(grep -h -E 'epoch|REFUS' "$D/n4.log" | tail -2 | cut -c1-140 | tr '\n' '|')"
+# its keepalives keep coming once a second: refused before they are taken in, so said once, not
+# admitted and expelled again on every beat
+RF=$(grep -c "REFUSING node .*(127.0.86.4) - it speaks wire epochs" "$D/n$M.log")
+DR=$(grep -c "(127.0.86.4) was dropped (refused)" "$D/n$M.log")
+[ "$RF" -le 1 ] && [ "$DR" -le 2 ] && ok "4. the master refused node 4's keepalives before taking them in: $RF refusal line(s), dropped $DR time(s) in 4 s" \
+	|| bad "4. the master logged $RF refusals and dropped node 4 $DR time(s) in 4 s - each keepalive was published first, then expelled"
 kill -9 $P4ID 2>/dev/null; P4ID=
 # ---- 5. the master restarted: the committed epoch survives ------------------------------------------
 eval "mp=\$P${M}ID"; kill $mp 2>/dev/null; wait $mp 2>/dev/null; eval "P${M}ID="

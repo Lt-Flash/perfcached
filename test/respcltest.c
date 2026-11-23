@@ -17,7 +17,7 @@ static int fails;
 
 /* ---- the stubs: what respcl.c reaches outside itself -------------------- */
 unsigned int pc_resp_slots_hits, pc_resp_slots_builds;
-static struct pc_member fleet[2];
+static struct pc_member fleet[3];
 static int fleet_n, alternate, unk_calls;
 
 struct pc_member *members_scratch(void)
@@ -131,6 +131,8 @@ int main(void)
 	fleet[1].node = 2;
 	inet_pton(AF_INET, "127.0.0.2", &fleet[1].addr);
 	fleet[1].client_port = 6481;               /* no RESP door gossiped */
+	fleet[0].gone_s = fleet[1].gone_s = -1;    /* both present */
+	fleet[0].live = fleet[1].live = 1;
 	fleet_n = 2;
 	cluster("INFO", NULL);
 	CHK(has("cluster_enabled:1") && has("cluster_state:ok") &&
@@ -160,6 +162,30 @@ int main(void)
 	cluster("BOGUS", NULL);
 	CHK(unk_calls == 1 && is("-ERR unsupported CLUSTER subcommand\r\n"),
 		"D: an unknown subcommand counted (S165) and refused");
+
+	/* E: a member that left keeps its card while its id is reserved (ports 0, gone_s >= 0):
+	 * no command lists it - no client may dial <ip>:0 or count it as a node */
+	alternate = 0;
+	memset(&fleet[2], 0, sizeof fleet[2]);
+	fleet[2].node = 3;
+	inet_pton(AF_INET, "127.0.0.3", &fleet[2].addr);
+	fleet[2].gone_s = 5;
+	fleet_n = 3;
+	cluster("NODES", NULL);
+	CHK(!has("127.0.0.3") && !has(":0@0"), "E: NODES leaves out the member that left");
+	cluster("SHARDS", NULL);
+	CHK(!strncmp(out.buf, "*2\r\n", 4) && !has("127.0.0.3"), "E: SHARDS - two shards, not three");
+	cluster("SLOTS", NULL);
+	CHK(!has("127.0.0.3") && !has(":0\r\n$40"), "E: SLOTS - nor here");
+	cluster("INFO", NULL);
+	CHK(has("cluster_known_nodes:2") && has("cluster_size:2"), "E: INFO counts the two present");
+	fleet[2].gone_s = -1;                      /* present, but no door to dial */
+	fleet[2].live = 1;
+	cluster("NODES", NULL);
+	CHK(!has("127.0.0.3"), "E: a member with no port to dial is not listed either");
+	fleet[2].client_port = 6482;
+	cluster("NODES", NULL);
+	CHK(has("127.0.0.3:6482@6482 master"), "E: once it has one, it is");
 
 	printf("respcltest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

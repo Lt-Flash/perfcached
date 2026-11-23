@@ -191,6 +191,10 @@ int cfg_validate(struct pstate *ps, const char *path,
 				if (!cfg->listen[i].loopback)
 					n_resp_lan++;
 			}
+		if (cfg->http_token && !cfg->http_token[0]) {
+			PERR(ps, "empty http secret - an empty bearer would match it\n");
+			return -1;
+		}
 		if (!n_resp && (cfg->n_resp_allow || cfg->resp_password ||
 		        cfg->resp_collections)) {
 			PERR(ps, "resp_allow/resp_collections/[secrets] resp are "

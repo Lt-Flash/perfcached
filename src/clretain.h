@@ -10,7 +10,8 @@ struct clretain_stats {
 	unsigned long long entries;        /* held now */
 	unsigned long long bytes;          /* what they cost, headers in */
 	unsigned long long dropped_early;  /* evicted by the cap before retain_s */
-	unsigned long long noted;          /* tombstones ever planted here */
+	unsigned long long noted;          /* tombstones planted here; one already held at
+	                                    * that version or newer is not counted again */
 	unsigned long long local;          /* of entries, this node's own
 	                                    * drops - refused, never replayed */
 	/* of the entries, early drops and notes: the EXPIRIES (keys an eager collection reaped), or
@@ -34,7 +35,7 @@ int clretain_enabled(void);
 void clretain_note(const char *col, size_t cn, const char *key, size_t kn,
 		uint64_t ver, unsigned int now_s);
 /* the same for a drop this node made for ITSELF (an invalidation, a startup flush): it refuses
- * older copies but is never replayed; a real delete noted later makes it a replayed one */
+ * older copies but is never replayed; a real delete or an expiry of the key is held apart */
 void clretain_note_local(const char *col, size_t cn, const char *key,
 		size_t kn, uint64_t ver, unsigned int now_s);
 
@@ -56,12 +57,22 @@ unsigned long clretain_forget(uint64_t oid, uint32_t incarn, uint64_t upto,
  * must hold before this node vouches for a window that began before @at_s */
 int clretain_forgot_each(int (*cb)(uint64_t oid, uint32_t incarn,
 		uint64_t through, unsigned int at_s, void *ctx), void *ctx);
+/* the space's highest seq no longer held other than by a newer numbered delete of the same key
+ * (forgotten, time rule, cap, no room, an unnumbered drop): UINT64_MAX when that is not known */
+uint64_t clretain_space_gone(uint64_t oid, uint32_t incarn);
 /* at most @max entries of space (oid, incarn) numbered in [@from, @to], a gap request's; @cb
  * runs under a shard lock (it must not call back in).  Returns how many */
 unsigned int clretain_space_each(uint64_t oid, uint32_t incarn, uint64_t from,
 		uint64_t to, unsigned int max,
 		void (*cb)(const char *col, size_t cn, const char *key, size_t kn,
 			uint64_t ver, uint64_t seq, void *ctx), void *ctx);
+
+/* this node's own space (oid, incarn): its seqs a newer numbered delete takes over are remembered
+ * (the last CLRETAIN_SUP_MAX of them) - not held, and not lost either */
+#define CLRETAIN_SUP_MAX 131072u
+void clretain_own_space(uint64_t oid, uint32_t incarn);
+/* 1 when every seq in [@lo, @hi] of the own space was taken over so (at most 4096 of them) */
+int clretain_superseded(uint64_t oid, uint32_t incarn, uint64_t lo, uint64_t hi);
 
 /* per space, the highest seq no longer held (forgotten, or dropped by the time rule or the cap):
  * a member back with its marks below it lacks what nobody can replay */

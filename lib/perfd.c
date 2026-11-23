@@ -152,9 +152,12 @@ struct perfd {
 	int nids, idhead, idcap;
 
 	struct early *early;
+	unsigned long long stray_replies;      /* replies no request waited for, dropped */
 
 	perfd_notify_cb ncb;
 	void *nctx;
+	int in_call;                   /* a blocking call is running */
+	int hook_refuses;              /* the hook runs inside one: calls back are refused */
 	char *nj;                      /* the hook's JSON, rendered from the
 	                                * NOTIFY tree; reused */
 	size_t njcap;
@@ -176,6 +179,7 @@ struct perfd {
 		 * is skipped; 1 for a daemon too old to send the field, as the peer plane reads READY */
 		int ready;
 		int draining;          /* ready, but being emptied: no new traffic */
+		int returning;         /* was down, then answered as not serving: a recovery when it serves */
 		char why[64];          /* this handle's last failed dial to it, "" = none */
 		long long retry_ms;    /* next background re-dial */
 		int backoff_ms;        /* 1 s doubling to 30 s */
@@ -260,6 +264,10 @@ struct perfd {
 	char ahost[256];
 	int aport;
 	struct pd_udp *udp;            /* pushes over UDP, or NULL */
+	/* a call never replayed on a failover whatever its method (a conditional jset) */
+	int once;
+	/* the member list's fingerprint, and the count of its changes (perfd_fleet_changes) */
+	unsigned long long fleet_fp, fleet_changes;
 };
 
 /* usable = reachable AND willing: `down` is what THIS client saw, `ready` what the fleet says;
@@ -290,9 +298,11 @@ static void notify_hook(perfd_t *p, const unsigned char *tree, size_t n);
 static int failover(perfd_t *p);
 static void spread_arm(perfd_t *p, const struct pd_member *m);
 static int spare_for(perfd_t *p, int node);
-static int conn_where(perfd_t *p, int *mine, int *least, int *workers);
+static int conn_where(perfd_t *p, int *mine, int *least, int *workers, int *serving);
+static int state_usable(const char *s, int sl);
 static void spread_leave(perfd_t *p);
 static void udp_drop(perfd_t *p, int pruned);
+static void fleet_seen(perfd_t *p);
 /* async connect/handshake progression */
 #define PD_HS_TCP     0            /* connect() outstanding */
 #define PD_HS_SEND    1            /* msg1 built, still going out */
@@ -363,3 +373,8 @@ int perfd_error_kind(const perfd_t *p)
 #include "perfd-verbs.inc"
 #include "perfd-connect.inc"
 #include "perfd-async.inc"
+#include "perfd-url.inc"
+#include "perfd-fleetinfo.inc"
+#include "perfd-exec.inc"
+
+#include "perfd-apool.inc"

@@ -77,5 +77,43 @@ $star->get('k', fn() => 'mine'); $near->get('k', fn() => 'theirs');
 ok($star->clear() === true && !$star->hasItem('k') && $near->get('k', fn() => 'lost') === 'theirs',
     "clear() on namespace 'ns*' leaves 'nsx''s keys");
 $near->clear();
+// the lock store: Symfony Lock on a collection, as RedisStore does it
+$storeFile = dirname($adapterFile) . '/PerfcachedLockStore.php';
+if (!is_file($storeFile) || !interface_exists('Symfony\Component\Lock\PersistingStoreInterface')) {
+    ok(false, 'the lock store ' . basename($storeFile) . ' and symfony/lock are there');
+} else {
+    require $storeFile;
+    // the daemon counts whole seconds and expires a record at exp <= now: a ttl of N lasts N-1..N s,
+    // so the store must ask one second more than the lock's lifetime, never less
+    $toSec = new ReflectionMethod('Perfcached\Symfony\PerfcachedLockStore', 'seconds');
+    if (PHP_VERSION_ID < 80100) $toSec->setAccessible(true);
+    $asked = array_map(fn($t) => $toSec->invoke(null, $t), [30.0, 1.5, 0.01, 1.0]);
+    ok($asked === [31, 3, 2, 2], 'a lifetime of 30, 1.5, 0.01 and 1 s is asked of the daemon as ' . implode(', ', $asked)
+        . ' s (31, 3, 2, 2): the key outlives the lock');
+    $f = new \Symfony\Component\Lock\LockFactory(new \Perfcached\Symfony\PerfcachedLockStore($pc, 'c', 'lock-test:'));
+    $a = $f->createLock('job', 30);
+    $b = $f->createLock('job', 30);
+    ok($a->acquire() === true, 'a lock is acquired');
+    ok($b->acquire() === false && $a->isAcquired() === true && $b->isAcquired() === false, 'a second lock on the same resource is not, and isAcquired says which holds it');
+    $t = $pc->ttl('c', 'lock-test:job');
+    ok($t > 20 && $t <= 31, "the key carries the lock's ttl: $t");
+    $a->refresh(60);
+    $t = $pc->ttl('c', 'lock-test:job');
+    ok($t > 50 && $t <= 61, "refresh moved it: $t");
+    $a->release();
+    ok($a->isAcquired() === false && $b->acquire() === true, 'released, the second acquires it');
+    ok($a->acquire() === false, 'and the first cannot');
+    $b->release();
+    $e = $f->createLock('short', 1, false);
+    ok($e->acquire() === true, 'a lock with a ttl of 1 s');
+    sleep(3);
+    $g = $f->createLock('short', 30);
+    ok($g->acquire() === true, 'expired, another acquires it');
+    $threw = false;
+    try { $e->refresh(); } catch (\Symfony\Component\Lock\Exception\LockConflictedException $x) { $threw = true; }
+    ok($threw, 'and the expired one cannot refresh it');
+    $g->release();
+    ok(!$pc->exists('c', 'lock-test:short') && !$pc->exists('c', 'lock-test:job'), 'released locks leave no key behind');
+}
 echo "phpsymfonytest: " . ($n - $fails) . " passed, $fails failed\n";
 exit($fails ? 1 : 0);

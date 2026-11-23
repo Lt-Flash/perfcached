@@ -1774,7 +1774,14 @@ static void check_link(const struct hl_obs *o)
 	if (o->moved)
 		LM_NOTICE("link: now %s, %d Mb/s\n", HL.path, HL.speed_mbps);
 	if ((pct = hl_pct()) < 0) {
+		struct akey *k;
+
+		/* an unknown speed judges nothing: a raised alert clears */
+		cond("host.link", 0, 0, 0, S(60), "");
+		k = key_find("host.link", 0);
 		__atomic_store_n(&link_pct_pub, -1, __ATOMIC_RELAXED);
+		__atomic_store_n(&link_lvl_pub, k && k->active ? (k->level >=
+			PC_AL_CRITICAL ? 2 : 1) : 0, __ATOMIC_RELAXED);
 		return;
 	}
 	lv = hw_level("host.link", pct, A.al.link_warn, A.al.link_crit);
@@ -2451,6 +2458,7 @@ static void relay_in(const struct pc_alert_relay *r)
 	struct aring *e = ring_next();
 	int lvl = r->level >= PC_AL_CRITICAL ? PC_AL_CRITICAL : r->level >=
 		PC_AL_WARNING ? PC_AL_WARNING : PC_AL_INFO;
+	int i, mailed = -1;
 
 	if (snprintf(e->text, sizeof e->text, "node %d (%s): %s", r->node,
 	        r->host, r->text) < 0)
@@ -2462,9 +2470,15 @@ static void relay_in(const struct pc_alert_relay *r)
 	A.relayed_in++;
 	LM_NOTICE("alert %s on node %d (%s), relayed to this node: %s\n",
 		r->cleared ? "cleared" : "raised", r->node, r->host, r->text);
+	for (i = 0; i < RMEM; i++)
+		if (A.rm[i].used && A.rm[i].node == r->node && !strcmp(A.rm[i].key, r->key))
+			mailed = i;
 	if (!pc_mail_ready()) {
+		if (r->cleared && mailed >= 0)
+			A.rm[mailed].used = 0;     /* its problem is over, mailed or not */
 		snprintf(e->mail, sizeof e->mail, "no mailer");
-	} else if (lvl < A.mail_level) {
+	} else if (lvl < A.mail_level && !(r->cleared && mailed >= 0)) {
+		/* a clear carries its last level: one whose raise was mailed is mailed whatever it is */
 		snprintf(e->mail, sizeof e->mail, "below level");
 	} else {
 		digest_relay(r, lvl);

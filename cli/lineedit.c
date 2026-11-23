@@ -31,7 +31,7 @@ static int t_raw;
 static void tty_restore(void)
 {
 	if (t_raw) {
-		tcsetattr(0, TCSAFLUSH, &t_saved);
+		tcsetattr(0, TCSADRAIN, &t_saved);
 		t_raw = 0;
 	}
 }
@@ -47,7 +47,7 @@ static int tty_raw(void)
 	t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
 	t.c_cc[VMIN] = 1;
 	t.c_cc[VTIME] = 0;
-	if (tcsetattr(0, TCSAFLUSH, &t) != 0)
+	if (tcsetattr(0, TCSADRAIN, &t) != 0)
 		return -1;
 	t_raw = 1;
 	atexit(tty_restore);

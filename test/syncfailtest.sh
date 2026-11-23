@@ -56,7 +56,7 @@ EOF
 	: > "$D/$1.ctl"; : > "$D/$1.shim"
 }
 start() { # start <arm>
-	PC_SYNCFAIL_CTL="$D/$1.ctl" PC_SYNCFAIL_LOG="$D/$1.shim" LD_PRELOAD="$PRELOAD" \
+	PC_SYNCFAIL_CTL="$D/$1.ctl" PC_SYNCFAIL_LOG="$D/$1.shim" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
 		"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 &
 	P1=$!
 	i=0
@@ -116,6 +116,14 @@ if arm in ("always", "everysec", "append"):
     out("REASON1", st.get("state_reason"))
     r = put("after")
     out("WRITE1", "STORED" if (r.get("result") or {}).get("stored") else "refused:" + str((r.get("error") or {}).get("message"))[:60])
+    r = call("mset", col="c", items=[{"key": "m1", "value": "x"}])
+    out("MSET1", "STORED" if (r.get("result") or {}).get("stored") else "refused:" + str((r.get("error") or {}).get("message"))[:60])
+    r = call("jset", col="c", key="j1", val='{"a":1}')
+    out("JSET1", "STORED" if (r.get("result") or {}).get("set") else "refused:" + str((r.get("error") or {}).get("message"))[:60])
+    r = call("del", col="c", key="pre5")
+    out("DEL1", "deleted=%s" % (r.get("result") or {}).get("deleted") if "result" in r else "refused:" + str((r.get("error") or {}).get("message"))[:60])
+    r = call("expire", col="c", key="pre6", ttl=100)
+    out("EXPIRE1", "updated=%s" % (r.get("result") or {}).get("updated") if "result" in r else "refused:" + str((r.get("error") or {}).get("message"))[:60])
     r = call("get", col="c", key="pre3")
     out("READ1", (r.get("result") or {}).get("value"))
     # and it stays where it is: more time, another barrier, no movement
@@ -194,6 +202,14 @@ walarm() { # walarm <arm> <port> <fsync> <cluster> <what> <shim-class> <errno-te
 	esac
 	case "$(val $1 WRITE1)" in refused:*) ok "the next write is refused ($(val $1 WRITE1))";;
 		*) bad "the next write was '$(val $1 WRITE1)' on a node that cannot log it";; esac
+	case "$(val $1 MSET1)" in refused:node*) ok "an mset is refused too ($(val $1 MSET1))";;
+		*) bad "an mset was '$(val $1 MSET1)' on a node that cannot log it";; esac
+	case "$(val $1 JSET1)" in refused:node*) ok "a jset is refused too ($(val $1 JSET1))";;
+		*) bad "a jset was '$(val $1 JSET1)' on a node that cannot log it";; esac
+	case "$(val $1 DEL1)" in refused:node*) ok "a del is refused, not answered as a missing key ($(val $1 DEL1))";;
+		*) bad "a del was '$(val $1 DEL1)' on a node that refuses writes";; esac
+	case "$(val $1 EXPIRE1)" in refused:node*) ok "an expire is refused, not answered as a missing key ($(val $1 EXPIRE1))";;
+		*) bad "an expire was '$(val $1 EXPIRE1)' on a node that refuses writes";; esac
 	[ "$(val $1 READ1)" = v ] && ok "a read is still served" || bad "a read of a key written before the fault answers '$(val $1 READ1)'"
 	grep -q "CRIT.*wal: .*($7)" "$D/$1.log" \
 		&& ok "the log names the errno: $(grep -m1 "($7)" "$D/$1.log" | sed 's/.*wal: //' | cut -c1-90)..." \

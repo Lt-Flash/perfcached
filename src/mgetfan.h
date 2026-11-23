@@ -16,6 +16,8 @@ struct pc_mget;
 /* the most remote lookups one mget may wait on; more is refused - split
  * the mget */
 #define PC_MGET_MAX_REMOTE 1000
+/* the value bytes one mget may hold: a reply's payload ceiling (PC_MAX_REQ) */
+#define PC_MGET_MAX_BYTES (1u << 20)
 
 #define PC_MK_ABSENT      0
 #define PC_MK_HIT         1
@@ -37,6 +39,9 @@ void pc_mget_set_count(struct pc_mget *m);
 void pc_mget_hit(struct pc_mget *m, unsigned int i, char *val, int vlen,
 		unsigned int exp);
 void pc_mget_absent(struct pc_mget *m, unsigned int i);
+/* its hits passed PC_MGET_MAX_BYTES: their values are dropped, the reply renders
+ * overflowed and the verb refuses it */
+int pc_mget_over(const struct pc_mget *m);
 
 /* key @i waits on pull @req (key copied): 0, or _CAP (split it), _BUSY (the pending table is
  * at its reserve), _NOMEM, text in *@why - the caller then cancels @req and refuses the mget */

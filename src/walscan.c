@@ -120,7 +120,8 @@ long pc_wal_scan(const char *dir, pc_wal_scan_cb cb, void *ctx,
 				const char *key = col + collen;
 				const char *val = key + klen;
 
-				if (hdr + (uint32_t)(collen + klen) + vlen != len) {
+				if (len < hdr || (uint32_t)(collen + klen) > len - hdr ||
+				        vlen != len - hdr - (uint32_t)(collen + klen)) {
 					*why = "torn";
 					break;
 				}

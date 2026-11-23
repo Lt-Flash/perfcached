@@ -84,6 +84,12 @@ const char *pc_rdb_dir(void);      /* "" until pc_rdb_init */
 /* a whole snapshot file into @buf: @n, or less on a failure */
 ssize_t pc_rdb_read_all(int fd, void *buf, size_t n);
 
+/* 1 = the record (@off past its tag) fits before the CRC, its lengths within the store's limits;
+ * _col_fits: the collection name at @off does */
+int pc_rdb_rec_fits(const unsigned char *data, size_t n, size_t off,
+		uint32_t fmt, uint32_t *kl, uint32_t *vl);
+int pc_rdb_col_fits(const unsigned char *data, size_t n, size_t off);
+
 long pc_rdb_validate(const char *dir, unsigned long long *marker,
 		long *ncols, const char **why);
 

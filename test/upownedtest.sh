@@ -1,6 +1,7 @@
 #!/bin/sh
 # upownedtest.sh - fleet_owned counts a key only when it was unmarked at the walk before too, so a
-# record caught between its write-through push and its "t" never shows on a healthy fleet.
+# record caught between its write-through push and its "t" never shows on a healthy fleet; and an
+# invalidation dropping a peer's copy does not take the mark of a fresher copy pushed meanwhile.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -53,7 +54,7 @@ upstream_prefixes = w:*
 upstream_timeout_ms = 2000
 C
 	chmod 600 "$D/n$1.conf"
-	PERFCACHED_TEST_WT_OWNED_MS=300 "$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
+	env ${NODE_ENV:-} PERFCACHED_TEST_WT_OWNED_MS=300 "$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P${1}ID=\$!"
 	i=0; while [ $i -lt 150 ] && ! grep -q "perfcached ready" "$D/n$1.log"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/n$1.log" || { bad "node $1 did not start: $(tail -2 "$D/n$1.log")"; echo "upownedtest: $pass passed, $fail failed"; exit 1; }
@@ -112,6 +113,31 @@ sleep 1
 o1=$(st 1 "$WT['fleet_owned']"); o2=$(st 2 "$WT['fleet_owned']")
 [ "$o1 $o2" = "0 0" ] && ok "C. a second after the writes: fleet_owned 0 on both" ||
 	bad "C. after the writes: fleet_owned $o1 / $o2 (0 / 0)"
+
+# D: node 2 again, its invalidations held 500 ms between their two drops; each key is written
+# through node 1 three times - v1, v2 300 ms later, v2 again 150 ms after that (the master does
+# not change: no invalidation) - so a push lands inside an invalidation of a copy node 2 holds.
+# No copy may stay without its "t".
+kill $P2ID 2>/dev/null; wait $P2ID 2>/dev/null; P2ID=
+NODE_ENV=PERFCACHED_TEST_INV_GAP_US=500000 node 2
+i=0; while [ $i -lt 100 ] && [ "$(st 1 "s['cluster']['peers_up']") $(st 2 "s['cluster']['peers_up'], s['state'], $WT['bcast']")" != "1 (1, 'ready', 'on')" ]; do sleep 0.2; i=$((i+1)); done
+v0=$(st 2 "$WT['invalidated']")
+python3 - <<'G'
+import socket, time
+k = socket.create_connection(("127.0.0.1", 20841), 10); f = k.makefile("rb")
+for i in range(20):
+    key = b"w:gap:%d" % i
+    for v, d in ((b"v1", 0.3), (b"v2", 0.15), (b"v2", 0.7)):
+        k.sendall(b"*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$2\r\n%s\r\n" % (len(key), key, v))
+        f.readline()
+        time.sleep(d)
+G
+sleep 2
+o2=$(st 2 "$WT['fleet_owned']"); v1=$(st 2 "$WT['invalidated']")
+[ $(( ${v1:-0} - ${v0:-0} )) -ge 5 ] 2>/dev/null ||
+	bad "D. the premise: node 2 dropped $(( ${v1:-0} - ${v0:-0} )) copies on an invalidation (at least 5 of 20 keys)"
+[ "$o2" = 0 ] && ok "D. an invalidation held across a fresher push: fleet_owned 0 on node 2" ||
+	bad "D. an invalidation held across a fresher push: fleet_owned $o2 on node 2 (0) - the fresher copy lost its mark"
 for n in 1 2; do grep -h 'an fsync has been stuck' "$D/n$n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"; grep "CRIT" "$D/n$n.log" | grep -qv 'an fsync has been stuck' && bad "node $n logged CRIT: $(grep CRIT "$D/n$n.log" | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' ' ' | cut -c1-200)"; done
 echo "upownedtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

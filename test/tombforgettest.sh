@@ -63,6 +63,15 @@ t = c["tombstones_retained"]
 print(eval(sys.argv[2]))
 PY
 }
+wmax() { # wmax <i>: the longest WAL fsync node i has seen, in whole seconds (an ordinary one is 0)
+	python3 - "$1" <<'PY' 2>/dev/null
+import socket, sys, pcnative
+i = int(sys.argv[1])
+f = pcnative.wrap(socket.create_connection(("127.0.148.%d" % i, 19420 + i), 10))
+w = pcnative.call(f, "stats")["result"].get("wal") or {}
+print(int((w.get("observed") or {}).get("fsync_max_us", 0) / 1e6 + 0.5))
+PY
+}
 k=0; while [ $k -lt 75 ] && { [ "$(tr 1 'c.get("peers_up")')" != 2 ] || [ "$(tr 1 'c["acks"]["fleet"]["confirming"]')" != True ]; }; do sleep 0.2; k=$((k+1)); done
 python3 "$T/waitready.py" 127.0.148.1:19421 127.0.148.2:19422 127.0.148.3:19423 || bad "a node is not ready"
 [ "$(tr 1 'c["acks"]["fleet"]["confirming"]')" = True ] || { bad "the fleet does not confirm: $(tr 1 'c.get("acks")')"; exit 1; }
@@ -95,9 +104,16 @@ done
 wait $DP; DP=
 N1=$(cat "$D/d1")
 F1=$(tr 1 't["forgotten"]')
-[ "$MX" -lt 400 ] 2>/dev/null && [ "${F1:-0}" -ge $((N1 - 400)) ] 2>/dev/null &&
-	ok "1. $N1 deletes at 40 a second: no node held more than $MX at a time, node 1 forgot $F1 (the time rule keeps all $N1)" ||
-	bad "1. $N1 deletes: the most held was $MX (want under 400), node 1 forgot ${F1:-?}: $(tr 1 't')"
+# a member confirms only up to its WAL's durable point: each second of a stalled fsync holds 40
+# more (the worst since start, so a stall before case 1 also widens it)
+ST=0
+for i in 1 2 3; do
+	s=$(wmax $i); [ "${s:-0}" -gt "$ST" ] 2>/dev/null && ST=$s
+done
+B=$((400 + 40 * ST))
+[ "$MX" -lt "$B" ] 2>/dev/null && [ "${F1:-0}" -ge $((N1 - B)) ] 2>/dev/null &&
+	ok "1. $N1 deletes at 40 a second: no node held more than $MX at a time (under $B$( [ "$ST" -gt 0 ] && echo ": 400 + 40 for each of a ${ST} s fsync stall")), node 1 forgot $F1 (the time rule keeps all $N1)" ||
+	bad "1. $N1 deletes: the most held was $MX (want under $B, the longest fsync ${ST} s), node 1 forgot ${F1:-?}: $(tr 1 't')"
 
 # 2. the driver stops: the tables empty
 k=0; while [ $k -lt 50 ]; do

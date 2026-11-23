@@ -1,17 +1,19 @@
 #!/bin/sh
 # respreadtest.sh - an eager fleet of three, a fourth joins, one dies and returns, the fourth fails and returns, under live handles.
-# Usage: test/respreadtest.sh [./perfcached] [./respreadtest] [./syncfailshim.so]
+# Usage: test/respreadtest.sh [./perfcached] [./respreadtest] [./syncfailshim.so] [./threadfreeze]
 set -u
 BIN=${1:-./perfcached}
 RT=${2:-./respreadtest}
 SHIM=${3:-./syncfailshim.so}
+TF=${4:-./threadfreeze}
 [ -f "$SHIM" ] || { echo "respreadtest: $SHIM is missing (make syncfailshim.so)" >&2; exit 1; }
+[ -x "$TF" ] || { echo "respreadtest: $TF is missing (make threadfreeze)" >&2; exit 1; }
 case "$SHIM" in /*) ;; *) SHIM="$PWD/$SHIM";; esac
 # a dynamic sanitizer runtime must come first in the preload list
 SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
 D=$(mktemp -d /var/tmp/pcrsp.XXXXXX)
 P1= P2= P3= P4= RP=
-trap 'for p in $P1 $P2 $P3 $P4 $RP; do kill -9 $p 2>/dev/null; done; wait 2>/dev/null; rm -rf "$D"' EXIT
+trap 'for p in $P1 $P2 $P3 $P4 $RP; do kill -9 $p 2>/dev/null; done; for p in $(pgrep -x perfcached 2>/dev/null); do grep -qa -- "$D" /proc/$p/cmdline 2>/dev/null && kill -9 "$p"; done; wait 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM
 SEC=rsp-client-secret
 for p in 19651 19652 19653 19654 19661 19662 19663 19664 19670; do
@@ -56,7 +58,10 @@ C
 start() {
 	if [ "$1" = 4 ]; then
 		: > "$D/ctl"; : >> "$D/shim"
-		PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim" LD_PRELOAD="${SANRT:+$SANRT }$SHIM" "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
+		PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim" LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
+	elif [ -n "${HOLD:-}" ]; then        # under threadfreeze, which can stop its cluster thread
+		: > "$D/tf"
+		"$TF" "$D/tf" -- "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
 	else
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
 	fi
@@ -102,7 +107,13 @@ if cue KILL-NODE; then
 	kill -9 "$P2"; wait "$P2" 2>/dev/null; P2=
 fi
 if cue RESTART-NODE; then
-	start 2
+	# its cluster thread stopped 12 s from its first second, its doors open: neither joined nor
+	# founding, it answers as not serving (the client checks 10 s)
+	HOLD=1 start 2
+	k=0; while [ $k -lt 50 ] && ! grep -q frozen "$D/tf.ack" 2>/dev/null; do
+		k=$((k+1)); echo "$k pc-cluster 12000" > "$D/tf"; sleep 0.1
+	done
+	[ -f "$D/tf.ack" ] && echo "$(cut -d' ' -f1 "$D/tf.ack") pc-cluster 12000" > "$D/tf"   # nothing left to freeze it again
 fi
 if cue FAIL-NODE; then
 	echo wal > "$D/ctl"

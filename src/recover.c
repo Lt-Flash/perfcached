@@ -111,6 +111,106 @@ void pc_recover_note_last_write(const char *dir)
 		note_last_write(dir);
 }
 
+/* ---- the WAL's renames and drops --------------------------------------- */
+
+/* the collections file names each collection as of its last rename; the snapshot and the
+ * replay may carry an older name, mapped forward by these (sorted by seq) */
+struct ren {
+	unsigned long long seq;
+	unsigned char fl, tl;              /* tl 0: a drop */
+	char from[PC_COL_NAME_MAX], to[PC_COL_NAME_MAX];
+};
+static struct ren *rens;
+static int nren, cren;
+
+static int ren_cb(int type, const char *col, int collen, const char *key,
+		int klen, const char *val, int vlen, unsigned long long wall,
+		unsigned long long seq, unsigned long long ver,
+		unsigned char flags, void *p)
+{
+	struct ren *r;
+
+	(void)key; (void)klen; (void)wall; (void)ver; (void)flags; (void)p;
+	if (collen <= 0 || collen >= PC_COL_NAME_MAX ||
+	    !(type == PC_WAL_T_COL_DROP || (type == PC_WAL_T_COL_RENAME &&
+	      vlen > 0 && vlen < PC_COL_NAME_MAX)))
+		return 0;
+	if (nren == cren) {
+		int nc = cren ? 2 * cren : 16;
+		struct ren *n = realloc(rens, (size_t)nc * sizeof *n);
+
+		if (!n)
+			return 0;
+		rens = n;
+		cren = nc;
+	}
+	r = &rens[nren++];
+	r->seq = seq;
+	r->fl = (unsigned char)collen;
+	memcpy(r->from, col, (size_t)collen);
+	r->tl = type == PC_WAL_T_COL_RENAME ? (unsigned char)vlen : 0;
+	if (r->tl)
+		memcpy(r->to, val, (size_t)vlen);
+	return 0;
+}
+
+static int ren_cmp(const void *a, const void *b)
+{
+	const struct ren *x = a, *y = b;
+
+	return x->seq < y->seq ? -1 : x->seq > y->seq;
+}
+
+static void ren_free(void)
+{
+	free(rens);
+	rens = NULL;
+	nren = cren = 0;
+}
+
+static void ren_scan(const char *dir)
+{
+	const char *why;
+
+	pc_wal_scan(dir, ren_cb, NULL, &why);
+	if (nren > 1)
+		qsort(rens, (size_t)nren, sizeof *rens, ren_cmp);
+}
+
+/* the table holding now what @nm named at @seq: the last name on its path through the later
+ * renames that the store holds; NULL when a later drop ends that path */
+static pcache_htable_t *ren_find(const char *nm, size_t nl, unsigned long long seq)
+{
+	pcache_htable_t *ht = pc_store_find(nm, nl), *h;
+	int i;
+
+	for (i = 0; i < nren; i++) {
+		const struct ren *r = &rens[i];
+
+		if (r->seq <= seq || r->fl != nl || memcmp(r->from, nm, nl))
+			continue;
+		if (!r->tl)
+			return NULL;
+		nm = r->to;
+		nl = r->tl;
+		if ((h = pc_store_find(nm, nl)))
+			ht = h;
+	}
+	return ht;
+}
+
+/* is @nm renamed onto after @seq?  Then the store's @nm is that collection, not the one before */
+static int ren_onto_after(const char *nm, size_t nl, unsigned long long seq)
+{
+	int i;
+
+	for (i = 0; i < nren; i++)
+		if (rens[i].seq > seq && rens[i].tl == nl &&
+		    !memcmp(rens[i].to, nm, nl))
+			return 1;
+	return 0;
+}
+
 static int rdb_load(const char *dir, struct pc_recover_stats *st)
 {
 	char path[512];
@@ -162,9 +262,12 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 		if (tag == 0xFF)
 			break;
 		if (tag == 1) {
-			unsigned char cl = data[off];
+			unsigned char cl;
 
-			ht = pc_store_find((const char *)data + off + 1, cl);
+			if (!pc_rdb_col_fits(data, n, off))
+				goto torn;
+			cl = data[off];
+			ht = ren_find((const char *)data + off + 1, cl, st->marker);
 			if (!ht)
 				st->rdb_skipped_nocol++;
 			/* a cache collection starts empty - a snapshot taken
@@ -174,16 +277,20 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 				ht = NULL;
 			off += 1u + cl;
 		} else if (tag == 2) {
-			uint32_t kl = rd32(data + off), vl = rd32(data + off + 4);
-			unsigned long long wall = rd64(data + off + 8);
-			/* format 1 predates the field: those records come back
-			 * unnumbered rather than being refused */
-			unsigned long long ver = fmt >= 2 ? rd64(data + off + 16) : 0;
-			/* the record's type */
-			unsigned char fl = fmt >= 3 ? (data[off + 24] & PCACHE_F_CARRY) : 0;
+			uint32_t kl, vl;
+			unsigned long long wall, ver;
+			unsigned char fl;
 			str k, v;
 			unsigned int exp;
 
+			if (!pc_rdb_rec_fits(data, n, off, fmt, &kl, &vl))
+				goto torn;
+			wall = rd64(data + off + 8);
+			/* format 1 predates the field: those records come back
+			 * unnumbered rather than being refused */
+			ver = fmt >= 2 ? rd64(data + off + 16) : 0;
+			/* the record's type */
+			fl = fmt >= 3 ? (data[off + 24] & PCACHE_F_CARRY) : 0;
 			off += PC_RDB_RHDR(fmt);
 			k.s = (char *)data + off;
 			k.len = (int)kl;
@@ -209,12 +316,14 @@ static int rdb_load(const char *dir, struct pc_recover_stats *st)
 				st->rdb_records++;
 			}
 		} else {
-			free(data);
-			return -1;
+			goto torn;
 		}
 	}
 	free(data);
 	return 0;
+torn:
+	free(data);
+	return -1;
 }
 
 /* ---- WAL replay -------------------------------------------------------- */
@@ -373,15 +482,19 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 	/* the collection set replays in order with the records: a create precedes the
 	 * records written into it, a drop undoes an earlier create */
 	if (type == PC_WAL_T_COL_RENAME) {
-		/* the collections file names the collection as the window STARTS, so the
-		 * rename lands here, between the records written under each name */
-		if (vlen > 0 && pc_store_find(col, (size_t)collen))
+		/* only for a file written before renames were persisted: one that holds the new
+		 * name, or a later one on its path, is past this record */
+		if (vlen > 0 && pc_store_find(col, (size_t)collen) &&
+		    !ren_find(val, (size_t)vlen, seq))
 			(void)pc_store_rename(col, (size_t)collen, val,
 				(size_t)vlen, pc_lamport_now());
 		return 0;
 	}
 	if (type == PC_WAL_T_COL_CREATE || type == PC_WAL_T_COL_DROP) {
 		if (type == PC_WAL_T_COL_DROP) {
+			/* the store's name is the collection renamed onto it later */
+			if (ren_onto_after(col, (size_t)collen, seq))
+				return 0;
 			if (pc_store_find(col, (size_t)collen))
 				pc_store_drop(col, (size_t)collen);
 			else
@@ -400,11 +513,17 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 		}
 		return 0;
 	}
-	ht = pc_store_find(col, (size_t)collen);
+	/* a write racing its rename may be logged under the old name after it */
+	ht = ren_find(col, (size_t)collen, seq);
+	if (!ht)
+		ht = ren_find(col, (size_t)collen, 0);
 	if (!ht) {
 		c->st->wal_skipped++;
 		return 0;
 	}
+	/* tombstones by table, not by the name a record was logged under */
+	col = (const char *)&ht;
+	collen = (int)sizeof ht;
 	/* a cache collection starts empty - records logged before it was
 	 * made one are not replayed into it */
 	if (!pc_store_durable(ht)) {
@@ -550,8 +669,10 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 	int rc;
 
 	memset(st, 0, sizeof *st);
+	ren_scan(dir);                     /* before either name lookup */
 	rc = rdb_load(dir, st);
 	if (rc == -2) {
+		ren_free();
 		LM_CRIT("recover: the snapshot in %s is format %u - written by a "
 			"NEWER build (this one reads formats 1 to %u).  Refusing to "
 			"start: from the WAL alone this node would lose every replica "
@@ -585,6 +706,7 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 	ctx.unk_pending = 0;
 	pc_wal_scan(dir, replay_cb, &ctx, &why);
 	tomb_free();                       /* one replay's worth */
+	ren_free();
 	st->wal_unknown += ctx.unk_pending;   /* the log's last word */
 	if (st->wal_unknown_covered)
 		LM_NOTICE("recover: %ld WAL record(s) of a type this build does "
@@ -634,7 +756,21 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 
 /* the load verb: store only the snapshot records whose key is ABSENT (the live value
  * wins); rdb_load's format, none of its boot-time assumptions */
-int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
+/* a test holds the import between a key's probe and its store (PERFCACHED_TEST_IMPORT_GAP_MS) */
+static long import_gap_ms(void)
+{
+	static long m = -1;
+
+	if (m < 0) {
+		const char *e = getenv("PERFCACHED_TEST_IMPORT_GAP_MS");
+		long v = e ? atol(e) : 0;
+
+		m = v > 0 ? v : 0;
+	}
+	return m;
+}
+
+static int rdb_import(const char *dir, long *loaded, long *skipped_existing,
 		long *skipped_expired)
 {
 	char path[512];
@@ -676,19 +812,27 @@ int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 		if (tag == 0xFF)
 			break;
 		if (tag == 1) {
-			unsigned char cl = data[off];
+			unsigned char cl;
 
+			if (!pc_rdb_col_fits(data, n, off))
+				goto torn;
+			cl = data[off];
 			ht = pc_store_find((const char *)data + off + 1, cl);
 			off += 1u + cl;
 		} else if (tag == 2) {
-			uint32_t kl = rd32(data + off), vl = rd32(data + off + 4);
-			unsigned long long wall = rd64(data + off + 8);
-			unsigned long long ver = fmt >= 2 ? rd64(data + off + 16) : 0;
-			/* the record's type */
-			unsigned char fl = fmt >= 3 ? (data[off + 24] & PCACHE_F_CARRY) : 0;
+			uint32_t kl, vl;
+			unsigned long long wall, ver;
+			unsigned char fl;
 			str k, v;
 			unsigned int exp;
+			int rc;
 
+			if (!pc_rdb_rec_fits(data, n, off, fmt, &kl, &vl))
+				goto torn;
+			wall = rd64(data + off + 8);
+			ver = fmt >= 2 ? rd64(data + off + 16) : 0;
+			/* the record's type */
+			fl = fmt >= 3 ? (data[off + 24] & PCACHE_F_CARRY) : 0;
 			off += PC_RDB_RHDR(fmt);
 			k.s = (char *)data + off;
 			k.len = (int)kl;
@@ -702,15 +846,26 @@ int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 				(*skipped_expired)++;
 				continue;
 			}
+			/* the clock first: a client write from here on outranks this copy */
+			pc_lamport_restore(ver);
 			if (pcache_ht_probe(ht, &k, NULL, NULL, NULL) == 0) {
 				(*skipped_existing)++;
 				continue;
 			}
-			if (pcache_ht_store_ex(ht, &k, &v, exp, fl) == 0) {
-				pcache_ht_setver(ht, &k, ver);
+			if (import_gap_ms()) {
+				struct timespec gt = { import_gap_ms() / 1000,
+					(import_gap_ms() % 1000) * 1000000L };
+
+				nanosleep(&gt, NULL);
+			}
+			/* under the bucket lock with its version: a write since the probe wins */
+			rc = pcache_ht_store_ver(ht, &k, &v, exp, fl, ver);
+			if (rc == 0) {
 				if (ver > high)
 					high = ver;
 				(*loaded)++;
+			} else if (rc == PCACHE_E_OLDER) {
+				(*skipped_existing)++;
 			}
 		} else {
 			break;                     /* unknown tag: stop cleanly */
@@ -721,4 +876,23 @@ int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 	 * next local write is numbered below data this node just took in */
 	pc_lamport_restore(high);
 	return 0;
+torn:
+	free(data);
+	pc_lamport_restore(high);
+	return -1;
+}
+
+/* one import at a time: each holds a snapshot-sized buffer and its worker for the whole file */
+int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
+		long *skipped_expired)
+{
+	static int busy;
+	int rc;
+
+	*loaded = *skipped_existing = *skipped_expired = 0;
+	if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQ_REL))
+		return -2;
+	rc = rdb_import(dir, loaded, skipped_existing, skipped_expired);
+	__atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
+	return rc;
 }

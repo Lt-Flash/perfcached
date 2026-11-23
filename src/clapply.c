@@ -152,7 +152,9 @@ int clapply_push(struct clapply *a, const struct clapply_rec *rec,
 			__atomic_store_n(&r->tail, 0, __ATOMIC_SEQ_CST);
 			continue;
 		}
-		if (a->stop && *a->stop) {
+		volatile int *st = __atomic_load_n(&a->stop, __ATOMIC_ACQUIRE);
+
+		if (st && *st) {
 			if (g)
 				__atomic_fetch_sub(&g->remaining, 1, __ATOMIC_ACQ_REL);
 			return -1;             /* shutting down: the caller applies it */
@@ -194,6 +196,8 @@ int clapply_take(struct clapply *a, int idx, volatile int *stop,
 	struct hdr h;
 	unsigned int head;
 
+	if (!__atomic_load_n(&a->stop, __ATOMIC_ACQUIRE))   /* the push's escape at shutdown */
+		__atomic_store_n(&a->stop, stop, __ATOMIC_RELEASE);
 	for (;;) {
 		unsigned int tail;
 

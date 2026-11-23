@@ -1,8 +1,10 @@
 /* clworktest.c - the worker entry points over the real clwork, clpend, clsend, clpush and clmig,
  * only cluster.c's accessors stubbed: what is sent is captured, opened and parsed back. */
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sodium.h>
 
@@ -18,6 +20,7 @@
 #include "../src/clmig.h"
 #include "../src/clpush.h"
 #include "../src/pc_slot.h"
+#include "../src/clplace.h"
 
 static int pass, fail;
 static void chk(int cond, const char *what)
@@ -63,8 +66,15 @@ void cl_px_spread_ack(unsigned int parked, unsigned int kept)
 }
 int cl_enabled(void) { return enabled; }
 int cl_node_id(void) { return 42; }
-int cl_map_usable(void) { return 0; }
-const struct pc_clmap *cl_map(void) { return NULL; }
+/* the published map: off unless a case turns it on; cl_map_gen is the write generation cluster.c
+ * keeps around a rewrite of it, odd while the copy is under way */
+static int map_on;
+static struct pc_clmap MAP;
+static unsigned int map_gen;
+int cl_map_usable(void) { return map_on; }
+const struct pc_clmap *cl_map(void) { return map_on ? &MAP : NULL; }
+unsigned int cl_map_gen(void);
+unsigned int cl_map_gen(void) { return __atomic_load_n(&map_gen, __ATOMIC_ACQUIRE); }
 pc_addr cl_self_addr(void) { pc_addr a; memset(&a, 0, sizeof a); return a; }
 long long cl_now_ms(void) { return NOW; }
 unsigned int cl_self_free_mb(void) { return 100; }
@@ -175,6 +185,51 @@ static unsigned sent_to(void)
 	for (i = 0; i < nout && i < 8; i++)
 		m |= out[i].last == 5 ? 1u : out[i].last == 7 ? 2u : 4u;
 	return m;
+}
+
+/* ---- the map rewritten under the workers ------------------------------- */
+static struct pc_clmap MA, MB;
+static int stop_writer;
+
+static void map_fill(struct pc_clmap *m, uint32_t seq, uint16_t base)
+{
+	unsigned int i;
+
+	memset(m, 0, sizeof *m);
+	m->term = 1;
+	m->seq = seq;
+	m->nnodes = 8;
+	for (i = 0; i < m->nnodes; i++) {
+		m->node[i].node_id = (uint16_t)(base + i);
+		m->node[i].addr = 0x0a000000u | (uint32_t)(base + i);
+		m->node[i].cluster_port = 17000;
+		m->node[i].state = PC_CLMAP_ST_READY;
+		m->node[i].cap_weight = PC_CLMAP_W_NOMINAL;
+		m->node[i].admin_weight = PC_CLMAP_W_UNSET;
+	}
+}
+
+/* what cluster.c does on every map it installs: the whole struct copied over, generation odd */
+static void *map_writer(void *arg)
+{
+	unsigned long n = 0;
+
+	(void)arg;
+	while (!__atomic_load_n(&stop_writer, __ATOMIC_RELAXED)) {
+		__atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELAXED);
+		__atomic_thread_fence(__ATOMIC_RELEASE);
+		memcpy(&MAP, (n++ & 1) ? &MB : &MA, sizeof MAP);
+		__atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
+	}
+	return NULL;
+}
+
+static long long mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 int main(void)
@@ -441,6 +496,46 @@ int main(void)
 	PT.peers[2].last_seen_ms = NOW - PEER_UP_MS - 1;
 	nst = 0;
 	K = 0;
+
+	/* ---- the owner from a map being replaced: either map's answer, or the fallback's - never one
+	 * ranked over a half-copied node list --------------------------------------------------- */
+	{
+		enum { NS = 64 };
+		int a[NS], b[NS], h[NS], s, torn = 0;
+		unsigned long calls = 0;
+		pthread_t wt;
+		long long end;
+
+		map_fill(&MA, 1, 101);
+		map_fill(&MB, 2, 201);
+		for (s = 0; s < NS; s++) {
+			a[s] = pc_clplace_owner(&MA, (uint64_t)s);
+			b[s] = pc_clplace_owner(&MB, (uint64_t)s);
+			h[s] = pc_shard_owner_slot((unsigned)s);   /* the map off: the HRW fallback */
+		}
+		memcpy(&MAP, &MA, sizeof MAP);
+		map_on = 1;
+		if (pthread_create(&wt, NULL, map_writer, NULL) != 0) {
+			chk(0, "map race: the writer thread could not start");
+		} else {
+			end = mono_ms() + 2000;
+			while (calls < 3000000 && (calls & 1023 || mono_ms() < end)) {
+				int o;
+
+				s = (int)(calls++ % NS);
+				o = pc_shard_owner_slot((unsigned)s);
+				if (o != a[s] && o != b[s] && o != h[s])
+					torn++;
+			}
+			__atomic_store_n(&stop_writer, 1, __ATOMIC_RELAXED);
+			pthread_join(wt, NULL);
+			if (torn)
+				printf("  .. %d of %lu owners came from neither map nor the fallback\n",
+					torn, calls);
+			chk(torn == 0, "map race: every owner read while the map is replaced is one map's or the fallback's");
+		}
+		map_on = 0;
+	}
 
 	printf("clworktest: %d passed, %d failed\n", pass, fail);
 	return fail ? 1 : 0;

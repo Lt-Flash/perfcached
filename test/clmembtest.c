@@ -552,6 +552,45 @@ int main(void)
 		if (n >= 42) CHK(J.wal == a[41], w);
 	}
 
+	/* ---- cfg2: the config set's digest, last in the three frames, read only whole ---- */
+	{
+		struct clmemb_alive in = { 0 };
+		struct clmemb_malive mi = { 0 };
+		struct clmemb_joinreq ji = { 0 }, J;
+		size_t l0, l1;
+
+		in.node = 9; in.ident = ident; in.ext = 1;
+		l0 = clmemb_alive_write(b, sizeof b, 8, &in);
+		in.cfg2 = 1; in.cfg_digest2 = 0x0123456789abcdefULL;
+		l1 = clmemb_alive_write(b, sizeof b, 8, &in);
+		CHK(l1 == l0 + CLMEMB_CFG2_LEN && clmemb_alive_parse(b, l1, &A) &&
+			(A.have & CLMEMB_A_CFG2) && (A.have & CLMEMB_A_LINK) &&
+			A.cfg_digest2 == 0x0123456789abcdefULL,
+			"cfg2: ALIVE carries it behind the link");
+		CHK(clmemb_alive_parse(b, l1 - 1, &A) && !(A.have & CLMEMB_A_CFG2) &&
+			(A.have & CLMEMB_A_LINK),
+			"cfg2: an ALIVE without it (0.7.5) reads as none sent");
+		in.ext = 0;
+		CHK(clmemb_alive_write(b, sizeof b, 8, &in) < l0,
+			"cfg2: no ext group, no cfg2");
+		mi.node = 3; mi.cfg2 = 1; mi.cfg_digest2 = ~0ULL;
+		CHK(clmemb_malive_write(b, sizeof b, 9, &mi) == CLMEMB_MALIVE_BUF &&
+			clmemb_malive_parse(b, CLMEMB_MALIVE_BUF, &M) &&
+			(M.have & CLMEMB_M_CFG2) && M.cfg_digest2 == ~0ULL,
+			"cfg2: MASTER_ALIVE carries it last");
+		CHK(clmemb_malive_parse(b, CLMEMB_MALIVE_LEN, &M) &&
+			!(M.have & CLMEMB_M_CFG2) && (M.have & CLMEMB_M_COMMIT),
+			"cfg2: a MASTER_ALIVE without it reads as none sent");
+		ji.ident = ident; ji.cfg2 = 1; ji.cfg_digest2 = 0x8000000000000000ULL;
+		CHK(clmemb_joinreq_write(b, sizeof b, 4, &ji) == CLMEMB_JOINREQ_BUF &&
+			clmemb_joinreq_parse(b, CLMEMB_JOINREQ_BUF, &J) &&
+			(J.have & CLMEMB_J_CFG2) && J.cfg_digest2 == 0x8000000000000000ULL,
+			"cfg2: JOIN_REQ carries it last");
+		CHK(clmemb_joinreq_parse(b, CLMEMB_JOINREQ_LEN, &J) &&
+			!(J.have & CLMEMB_J_CFG2) && (J.have & CLMEMB_J_EPOCH),
+			"cfg2: a JOIN_REQ without it reads as none sent");
+	}
+
 	/* ---- ASSIGN: header, records, and the bound on a lying count --- */
 	{
 		unsigned char x[15 + 3 * 20], y[15 + 3 * 20];

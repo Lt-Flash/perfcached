@@ -88,6 +88,15 @@ R=$(call '{"method":"jset","params":{"col":"js","key":"d1","path":"$.a","val":9,
 echo "$R" | grep -q 'exists' && ok || bad "nx on existing: $R"
 R=$(call '{"method":"jset","params":{"col":"js","key":"d1","path":"$.nope","val":9,"xx":true}}')
 echo "$R" | grep -q 'no value at path' && ok || bad "xx on missing: $R"
+# NX and XX hold at the root too: no replacing an existing document, no creating a missing one
+R=$(call '{"method":"jset","params":{"col":"js","key":"d1","path":"$","val":{"z":1},"nx":true}}')
+echo "$R" | grep -q 'exists' && ok || bad "nx at the root of an existing document: $R"
+R=$(call '{"method":"jget","params":{"col":"js","key":"d1","path":"$.a"}}')
+echo "$R" | grep -q '"value": 42' && ok || bad "the document after a refused root nx: $R"
+R=$(call '{"method":"jset","params":{"col":"js","key":"rootxx","path":"$","val":{"z":1},"xx":true}}')
+echo "$R" | grep -q 'no value at path' && ok || bad "xx at the root of a missing key: $R"
+R=$(call '{"method":"jget","params":{"col":"js","key":"rootxx"}}')
+echo "$R" | grep -q '"found": false' && ok || bad "a refused root xx created the key: $R"
 R=$(call '{"method":"jset","params":{"col":"js","key":"d1","path":"$.esc","val":"a\"b"}}')
 echo "$R" | grep -q '"set": true' && ok || bad "escaped string set: $R"
 R=$(call '{"method":"jget","params":{"col":"js","key":"d1","path":"$.esc"}}')

@@ -51,7 +51,7 @@ CONF
 chmod 600 "$D/n.conf"
 : > "$D/n.log"; : > "$D/ctl"
 PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" PC_SYNCFAIL_SLOW_MS=50 \
-	LD_PRELOAD="$PRELOAD" "$BIN" -f "$D/n.conf" >> "$D/n.log" 2>&1 &
+	LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" "$BIN" -f "$D/n.conf" >> "$D/n.log" 2>&1 &
 PID=$!
 i=0
 while [ $i -lt 300 ]; do

@@ -192,6 +192,18 @@ unsigned long long pc_obs_hist_hi(int k)
 	 * above, so this never collapses to a zero-width bucket */
 }
 
+/* a row's name lower-cased, a byte outside printable ASCII as '?': INFO prints it raw */
+static void obs_fold(char *lc, const char *name, size_t nlen)
+{
+	size_t i;
+
+	for (i = 0; i < nlen; i++) {
+		unsigned char c = (unsigned char)name[i];
+
+		lc[i] = c < 0x21 || c > 0x7e ? '?' : (char)tolower(c);
+	}
+}
+
 void *pc_obs_cmd_slot(const char *name, size_t nlen)
 {
 	struct cmdrow *r;
@@ -202,8 +214,7 @@ void *pc_obs_cmd_slot(const char *name, size_t nlen)
 		return NULL;
 	if (nlen >= OBS_NAME)
 		nlen = OBS_NAME - 1;
-	for (i = 0; i < nlen; i++)
-		lc[i] = (char)tolower((unsigned char)name[i]);
+	obs_fold(lc, name, nlen);
 	h = 5381;
 	for (i = 0; i < nlen; i++)
 		h = h * 33 + (unsigned char)lc[i];
@@ -251,8 +262,7 @@ void pc_obs_cmd(const char *name, size_t nlen, unsigned long long usec)
 		return;
 	if (nlen >= OBS_NAME)
 		nlen = OBS_NAME - 1;
-	for (i = 0; i < nlen; i++)
-		lc[i] = (char)tolower((unsigned char)name[i]);
+	obs_fold(lc, name, nlen);
 	h = 5381;
 	for (i = 0; i < nlen; i++)
 		h = h * 33 + (unsigned char)lc[i];
@@ -318,7 +328,7 @@ int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
 			/* the window is the difference from the OLDEST snapshot the row holds; a row younger
 			 * than one roll has none, and its window is everything it has */
 			{
-				unsigned int w, old_slot = PC_OBS_WIN;
+				unsigned int w, fill, old_slot = PC_OBS_WIN;
 				unsigned int oldest = 0, nowt = (unsigned int)get_ticks();
 
 				for (w = 0; w < PC_OBS_WIN; w++) {
@@ -346,10 +356,11 @@ int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
 					for (k = 0; k < PC_OBS_HIST; k++)
 						out[j].w_hist[k] += r[i].hist[k];
 				}
-				/* the max spans the same slots as the calls: the oldest snapshot is taken at the
-				 * END of old_slot, so old_slot's calls and its max are outside the window */
+				/* old_slot's calls and max are outside the window (its snapshot is taken at its
+				 * END) - unless it is the slot being filled, emptied at the roll */
+				fill = __atomic_load_n(&obs_win_slot, __ATOMIC_RELAXED);
 				for (w = 0; w < PC_OBS_WIN; w++) {
-					if (w == old_slot)
+					if (w == old_slot && w != fill)
 						continue;
 					if (r[i].w_max[w] > out[j].w_max)
 						out[j].w_max = r[i].w_max[w];
@@ -554,6 +565,8 @@ int pc_obs_qlog_on(void)
 	return qlog_every != 0;
 }
 
+static unsigned int obs_secret_args(char *const *argv, const size_t *argl, int nargs);
+
 void pc_obs_qlog(const char *dialect, void *row, const char *verb,
 		size_t vlen, const char *col, size_t clen, const char *key,
 		size_t klen, const char *outcome, unsigned long long usec)
@@ -574,6 +587,13 @@ void pc_obs_qlog(const char *dialect, void *row, const char *verb,
 	        QLOG_MAX_PER_SEC) {
 		__atomic_add_fetch(&qlog_sec_dropped, 1, __ATOMIC_RELAXED);
 		return;
+	}
+	if (klen) {                        /* AUTH's argument is a password: the slow ring's rule */
+		char *const a[2] = { (char *)verb, (char *)key };
+		const size_t l[2] = { vlen, klen };
+
+		if (obs_secret_args(a, l, 2) & 2u)
+			klen = 0;
 	}
 	if (klen && qlog_keys == 2) {
 		snprintf(kb, sizeof kb, " key=%.*s%s", (int)(klen > 64 ? 64 : klen),
@@ -1004,20 +1024,30 @@ static int slow_cmp(const void *a, const void *b)
 	return ((*y)->id > (*x)->id) - ((*y)->id < (*x)->id);
 }
 
+/* every ring's entries sorted newest first, then cut to @max: a cut before the sort kept the first
+ * rows' entries and never a later worker's */
 static int slow_collect(const struct slowent **out, int max)
 {
 	unsigned int ep = __atomic_load_n(&obs_slow_epoch, __ATOMIC_RELAXED);
-	int row, i, n = 0;
+	const struct slowent **all = malloc((size_t)obs_rows * OBS_SLOWN * sizeof *all);
+	const struct slowent **to = all ? all : out;
+	int row, i, n = 0, cap = all ? obs_rows * OBS_SLOWN : max;
 
 	for (row = 0; row < obs_rows; row++) {
 		const struct slowent *r = obs_slow +
 			(size_t)row * OBS_SLOWN;
 
-		for (i = 0; i < OBS_SLOWN && n < max; i++)
+		for (i = 0; i < OBS_SLOWN && n < cap; i++)
 			if (r[i].id && r[i].epoch == ep)
-				out[n++] = &r[i];
+				to[n++] = &r[i];
 	}
-	qsort(out, (size_t)n, sizeof *out, slow_cmp);
+	qsort(to, (size_t)n, sizeof *to, slow_cmp);
+	if (all) {
+		if (n > max)
+			n = max;
+		memcpy(out, all, (size_t)n * sizeof *out);
+		free(all);
+	}
 	return n;
 }
 
@@ -1033,9 +1063,14 @@ void pc_obs_slowlog_get(struct pc_jw *w, int want)
 	ln = snprintf(num, sizeof num, "*%d\r\n", n);
 	pc_jw_raw(w, num, (size_t)ln);
 	for (i = 0; i < n; i++) {
-		const struct slowent *e = ents[i];
+		/* a copy: the slot's owner may rewrite it, and each $N must match its bytes */
+		struct slowent c = *ents[i];
+		const struct slowent *e = &c;
 		int argc = e->argc < OBS_ARGN ? e->argc : OBS_ARGN;
+		size_t al, nl;
 
+		c.addr[sizeof c.addr - 1] = 0;
+		c.name[sizeof c.name - 1] = 0;
 		pc_jw_lit(w, "*6\r\n");
 		ln = snprintf(num, sizeof num, ":%llu\r\n", e->id);
 		pc_jw_raw(w, num, (size_t)ln);
@@ -1046,19 +1081,22 @@ void pc_obs_slowlog_get(struct pc_jw *w, int want)
 		ln = snprintf(num, sizeof num, "*%d\r\n", argc);
 		pc_jw_raw(w, num, (size_t)ln);
 		for (j = 0; j < argc; j++) {
-			ln = snprintf(num, sizeof num, "$%u\r\n",
-				e->arglen[j]);
+			unsigned int a = e->arglen[j] < OBS_ARGLEN ? e->arglen[j] : OBS_ARGLEN;
+
+			ln = snprintf(num, sizeof num, "$%u\r\n", a);
 			pc_jw_raw(w, num, (size_t)ln);
-			pc_jw_raw(w, e->argv[j], e->arglen[j]);
+			pc_jw_raw(w, e->argv[j], a);
 			pc_jw_lit(w, "\r\n");
 		}
-		ln = snprintf(num, sizeof num, "$%zu\r\n", strlen(e->addr));
+		al = strlen(e->addr);
+		ln = snprintf(num, sizeof num, "$%zu\r\n", al);
 		pc_jw_raw(w, num, (size_t)ln);
-		pc_jw_lit(w, e->addr);
+		pc_jw_raw(w, e->addr, al);
 		pc_jw_lit(w, "\r\n");
-		ln = snprintf(num, sizeof num, "$%zu\r\n", strlen(e->name));
+		nl = strlen(e->name);
+		ln = snprintf(num, sizeof num, "$%zu\r\n", nl);
 		pc_jw_raw(w, num, (size_t)ln);
-		pc_jw_lit(w, e->name);
+		pc_jw_raw(w, e->name, nl);
 		pc_jw_lit(w, "\r\n");
 	}
 }

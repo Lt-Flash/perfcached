@@ -70,6 +70,8 @@ void clpend_release_locked(struct clpend *p, struct pending *slot)
 	if (!slot->req)
 		return;
 	slot->req = 0;
+	free(slot->key_long);
+	slot->key_long = NULL;
 	if (p->used > 0)
 		p->used--;
 	if (slot->kind >= 0 && slot->kind < 16 && p->used_kind[slot->kind] > 0)
@@ -278,7 +280,7 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 		out->from_node = from_node;
 		memcpy(out->col, s->col, s->collen);
 		out->collen = s->collen;
-		memcpy(out->key, s->key, s->klen);
+		memcpy(out->key, s->key_long ? s->key_long : s->key, s->klen);
 		out->klen = s->klen;
 
 		if (s->kind >= 0 && s->kind < 16 && p->used_kind[s->kind] > 0)
@@ -318,7 +320,7 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 				 * copy (liveness proves nothing); one yes is enough, repair restores K */
 				memcpy(out->col, s->col, s->collen);
 				out->collen = s->collen;
-				memcpy(out->key, s->key, s->klen);
+				memcpy(out->key, s->key_long ? s->key_long : s->key, s->klen);
 				out->klen = s->klen;
 				clpend_release_locked(p, s);
 				r = CLPEND_ANS_POSSESS;
@@ -326,7 +328,7 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 				/* the key, for the receiver's retained-tombstone check */
 				memcpy(out->col, s->col, s->collen);
 				out->collen = s->collen;
-				memcpy(out->key, s->key, s->klen);
+				memcpy(out->key, s->key_long ? s->key_long : s->key, s->klen);
 				out->klen = s->klen;
 				if (--s->expect <= 0)
 					clpend_release_locked(p, s);
@@ -354,7 +356,7 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 				? (older_first ? s->first_ver : ver) : 0;
 			memcpy(out->col, s->col, s->collen);
 			out->collen = s->collen;
-			memcpy(out->key, s->key, s->klen);
+			memcpy(out->key, s->key_long ? s->key_long : s->key, s->klen);
 			out->klen = s->klen;
 			if (--s->expect <= 0)
 				clpend_release_locked(p, s);
@@ -381,7 +383,7 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 			 * DELETED while this node was down and replay brought it back */
 			memcpy(out->col, s->col, s->collen);
 			out->collen = s->collen;
-			memcpy(out->key, s->key, s->klen);
+			memcpy(out->key, s->key_long ? s->key_long : s->key, s->klen);
 			out->klen = s->klen;
 			r = CLPEND_ANS_RECONCILE;
 		} else {

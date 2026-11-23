@@ -1205,9 +1205,10 @@ const char pc_status_page[] =
 	"  r.entries*10>r.max*9],\n"
 	"[\"kept for\",nf(r.retain_s)+\" s\"],\n"
 	"[\"dropped before that\",nf(d)+(x?\" \\u00b7 \"+nf(x)+\" expiries\":\"\"),d>0]]\n"
-	/* the deletes waiting for members to confirm them, which member each space waits for
-	 * (the lowest mark), and the one stuck.  An older daemon says neither. */
-	".concat(r.numbered===undefined?[]:[[\"deletes awaiting members\",nf(r.numbered)]],\n"
+	/* the deletes waiting for members to confirm them (by time while the fleet does not confirm),
+	 * which member each space waits for (the lowest mark), the one stuck.  An older daemon: neither */
+	".concat(r.numbered===undefined?[]:[[c.acks&&c.acks.fleet&&c.acks.fleet.confirming===false?\n"
+	"  \"numbered deletes (kept by time)\":\"deletes awaiting members\",nf(r.numbered)]],\n"
 	"(function(a){var hb=a&&a.held_by;if(!hb||!hb.length)return [];var sk=hb.filter(function(h){return !!h.stuck;});\n"
 	"return [[\"waiting for\",hb.map(function(h){return (h.self?\"this node\":h.node?\"node \"+h.node:\"a member\")+\" \\u00b7 \"+nf(h.waiting);}).join(\", \"),sk.length>0]]\n"
 	".concat(sk.slice(0,1).map(function(h){return [\"stuck\",\"node \"+h.stuck.node+\" still \"+h.stuck.still_s+\" s \\u00b7 \"+nf(h.stuck.behind)+\" behind\",true];}));})(c.acks));})(c.tombstones_retained):[]))+\n"

@@ -16,10 +16,12 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RESP_RBUF      16384
 #define RESP_LINE_MAX  4096
+#define RESP_DRAIN_MAX (64 * 1024)     /* past max_bulk: drained up to this, else the link closes */
 
 struct resp_sess {
 	const struct resp_sess_conf *cf;
@@ -30,6 +32,8 @@ struct resp_sess {
 	char selected[256];
 	unsigned long long reconnects;
 	char where[300];
+	long long deadline;            /* monotonic ms the call in progress ends by, 0: none */
+	int budget_ms;
 	size_t roff, rlen;
 	char rbuf[RESP_RBUF];
 };
@@ -45,18 +49,51 @@ static void sess_close(struct resp_sess *s)
 	s->where[0] = '\0';
 }
 
+static long long mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* a signal does not restart the whole wait */
 static int wait_fd(int fd, short events, int ms)
 {
 	struct pollfd pf;
+	long long end = mono_ms() + ms;
 	int rc;
 
 	pf.fd = fd;
 	pf.events = events;
 	pf.revents = 0;
-	do {
+	for (;;) {
 		rc = poll(&pf, 1, ms);
-	} while (rc < 0 && errno == EINTR);
-	return rc;
+		if (rc >= 0 || errno != EINTR)
+			return rc;
+		ms = (int)(end - mono_ms());
+		if (ms < 0)
+			ms = 0;
+	}
+}
+
+/* @ms cut to what is left of the call in progress */
+static int call_wait_ms(const struct resp_sess *s, int ms)
+{
+	long long left;
+
+	if (!s->deadline)
+		return ms;
+	left = s->deadline - mono_ms();
+	return left <= 0 ? 0 : left < ms ? (int)left : ms;
+}
+
+static int call_expired(const struct resp_sess *s, char *err, size_t cap)
+{
+	if (!s->deadline || mono_ms() < s->deadline)
+		return 0;
+	snprintf(err, cap, "call took longer than %d ms", s->budget_ms);
+	return 1;
 }
 
 static void describe(const struct resp_server *sv, char *buf, size_t cap)
@@ -191,9 +228,11 @@ static int send_all(struct resp_sess *s, const char *p, size_t n,
 		if (w < 0 && errno == EINTR)
 			continue;
 		if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			rc = wait_fd(s->fd, POLLOUT, s->cf->io_timeout_ms);
+			rc = wait_fd(s->fd, POLLOUT, call_wait_ms(s, s->cf->io_timeout_ms));
 			if (rc > 0)
 				continue;
+			if (rc == 0 && call_expired(s, err, cap))
+				return -1;
 			if (rc == 0)
 				snprintf(err, cap, "write timed out after %d ms",
 					s->cf->io_timeout_ms);
@@ -209,6 +248,8 @@ static int send_all(struct resp_sess *s, const char *p, size_t n,
 
 static int fill(struct resp_sess *s, char *err, size_t cap)
 {
+	if (call_expired(s, err, cap))
+		return -1;
 	if (s->roff == s->rlen)
 		s->roff = s->rlen = 0;
 	if (s->rlen == sizeof s->rbuf) {
@@ -236,9 +277,11 @@ static int fill(struct resp_sess *s, char *err, size_t cap)
 		if (errno == EINTR)
 			continue;
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			rc = wait_fd(s->fd, POLLIN, s->cf->io_timeout_ms);
+			rc = wait_fd(s->fd, POLLIN, call_wait_ms(s, s->cf->io_timeout_ms));
 			if (rc > 0)
 				continue;
+			if (rc == 0 && call_expired(s, err, cap))
+				return -1;
 			if (rc == 0)
 				snprintf(err, cap, "read timed out after %d ms",
 					s->cf->io_timeout_ms);
@@ -371,7 +414,10 @@ static int read_reply(struct resp_sess *s, struct resp_reply *out,
 		out->len = (size_t)n;
 		if ((unsigned long long)n > (unsigned long long)s->cf->max_bulk) {
 			out->oversize = 1;
-			return read_bytes(s, NULL, (size_t)n + 2, err, cap);
+			if ((unsigned long long)n - s->cf->max_bulk <= RESP_DRAIN_MAX)
+				return read_bytes(s, NULL, (size_t)n + 2, err, cap);
+			sess_close(s);         /* not read: the next call dials again */
+			return 0;
 		}
 		out->str = malloc((size_t)n + 1);
 		if (!out->str) {
@@ -525,7 +571,9 @@ int resp_sess_open(struct resp_sess *s, const char *collection,
 
 		sv = &s->cf->servers[i];
 		describe(sv, name, sizeof name);
-		s->fd = dial(sv, s->cf->connect_timeout_ms, e, sizeof e);
+		if (call_expired(s, err, errcap))
+			return -1;
+		s->fd = dial(sv, call_wait_ms(s, s->cf->connect_timeout_ms), e, sizeof e);
 		if (s->fd < 0) {
 			snprintf(err, errcap, "%s: %s", name, e);
 			continue;
@@ -555,7 +603,7 @@ int resp_sess_open(struct resp_sess *s, const char *collection,
 	return -1;
 }
 
-int resp_sess_call(struct resp_sess *s, const char *collection, int argc,
+static int sess_call(struct resp_sess *s, const char *collection, int argc,
 		const char *const *argv, const size_t *lens,
 		struct resp_reply *out, char *err, size_t errcap)
 {
@@ -600,6 +648,20 @@ int resp_sess_call(struct resp_sess *s, const char *collection, int argc,
 		return 0;
 	}
 	return -1;
+}
+
+int resp_sess_call(struct resp_sess *s, const char *collection, int argc,
+		const char *const *argv, const size_t *lens,
+		struct resp_reply *out, char *err, size_t errcap)
+{
+	int rc;
+
+	s->budget_ms = s->cf->call_timeout_ms > 0 ? s->cf->call_timeout_ms
+		: 2 * (s->cf->connect_timeout_ms + 2 * s->cf->io_timeout_ms);
+	s->deadline = mono_ms() + s->budget_ms;
+	rc = sess_call(s, collection, argc, argv, lens, out, err, errcap);
+	s->deadline = 0;
+	return rc;
 }
 
 int resp_sess_is_open(const struct resp_sess *s)

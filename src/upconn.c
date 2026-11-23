@@ -39,6 +39,7 @@ void uc_close(struct uconn *c)
 			flush_shadow(c->s);
 	}
 	c->tracked = 0;
+	c->untrackable = 0;
 	c->len = c->off = 0;
 }
 
@@ -164,7 +165,8 @@ int read_reply_span(struct uconn *c, struct rv *v, long long dl,
 		if (rc > 0) {
 			if (v->t == '>') {
 				c->off = pos;
-				on_push(c, v);
+				if (c->s)              /* a discovery connection tracks nothing */
+					on_push(c, v);
 				rv_free(v);
 				continue;
 			}
@@ -190,10 +192,12 @@ int read_reply_span(struct uconn *c, struct rv *v, long long dl,
 				c->off = 0;
 			}
 			if (c->len == c->cap) {
-				nc = c->cap ? c->cap * 2 : 65536;
-				if (nc > rv_max + 65536)
+				if (c->cap >= rv_max + 65536)
 					return -3;     /* the reply is larger than this
 					                * thread holds */
+				nc = c->cap ? c->cap * 2 : 65536;
+				if (nc > rv_max + 65536)
+					nc = rv_max + 65536;
 				nb = realloc(c->buf, nc);
 				if (!nb)
 					return -1;
@@ -842,6 +846,7 @@ int uc_connect(struct uconn *c, long long dl)
 	/* tracked, redirected to the invalidation connection; the generation is read
 	 * FIRST so if that one moves meanwhile, the next fetch sees it and re-arms */
 	c->tracked = 0;
+	c->untrackable = 0;
 	if (!c->inv && !c->notrack && !c->wr && uc->tracking && c->resp3) {
 		unsigned int gen = __atomic_load_n(&s->inv_gen, __ATOMIC_ACQUIRE);
 		long long id = __atomic_load_n(&s->inv_id, __ATOMIC_ACQUIRE);
@@ -855,6 +860,7 @@ int uc_connect(struct uconn *c, long long dl)
 			/* another server than the invalidation connection's: the id is
 			 * not ours there, so this one stays untracked */
 			ST_ADD(s->other_server, 1);
+			c->untrackable = 1;
 			if (!__atomic_exchange_n(&s->other_said, 1, __ATOMIC_RELAXED))
 				LM_WARN("collection '%s': a connection to the upstream "
 					"reached another server (run_id %.12s) than the "
@@ -878,6 +884,7 @@ int uc_connect(struct uconn *c, long long dl)
 			    read_reply(c, &v, dl) != 0)
 				goto fail;
 			c->tracked = is_ok(&v);
+			c->untrackable = !c->tracked;
 			rv_free(&v);
 		}
 	}

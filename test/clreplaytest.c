@@ -88,10 +88,23 @@ int main(void)
 		"D1 another host, or another port on this one, is another sender");
 	chk(adm(a, 3, 1, CLREPLAY_STREAMS, 1, 0) == CLREPLAY_FULL &&
 		adm(a, 3, 1, CLREPLAY_STREAMS, 1, 0) == CLREPLAY_FULL,
-		"D2 a stream past the table is let through, counted");
+		"D2 a stream past the table is refused, counted");
 	clreplay_counts(c);
 	chk(c[CLREPLAY_DUP] == 2 && c[CLREPLAY_OLD] == 1 && c[CLREPLAY_INCARN] == 2 &&
 		c[CLREPLAY_FULL] == 2, "D3 each refusal is counted by its reason");
+
+	/* ---- G. a clock stepped back: every stream of the sender is taken again, not the first only ---- */
+	chk(adm(a, 4, 200, 1, 1, 0) == CLREPLAY_OK && adm(a, 4, 200, 2, 1, 0) == CLREPLAY_OK &&
+		adm(a, 4, 200, 3, 1, 0) == CLREPLAY_OK, "G1 three streams of a sender at one incarnation");
+	chk(adm(a, 4, 50, 1, 1, CLREPLAY_STALE_MS) == CLREPLAY_OK,
+		"G2 quiet 60 s, its lower incarnation is taken on the first stream");
+	chk(adm(a, 4, 50, 2, 1, CLREPLAY_STALE_MS) == CLREPLAY_OK &&
+		adm(a, 4, 50, 3, 7, CLREPLAY_STALE_MS + 1) == CLREPLAY_OK,
+		"G3 and on every other stream whose window still holds the higher one");
+	chk(adm(a, 4, 50, 2, 1, CLREPLAY_STALE_MS + 1) == CLREPLAY_DUP,
+		"G4 the reset window still refuses a replay of the new process");
+	chk(adm(a, 4, 40, 2, 9, CLREPLAY_STALE_MS + 2) == CLREPLAY_INCARN,
+		"G5 an incarnation below the sender's current one is still refused");
 
 	/* ---- F. a header naming another host refused; window budget; a stream past 255 ---- */
 	chk(adm(b, 9, 10, 1, 1, 0) == CLREPLAY_OK, "F1 a sender's first frame is taken");
@@ -112,12 +125,35 @@ int main(void)
 				taken += r == CLREPLAY_OK;
 			}
 		chk(taken > 0 && taken < CLREPLAY_WINS && full == 8 * CLREPLAY_STREAMS - taken,
-			"F5 the windows stop at the budget: past it a frame is let through, counted");
-		printf("  ..   F5 %d windows taken, %d let through past the budget of %d\n",
+			"F5 the windows stop at the budget: past it a frame is refused, counted");
+		printf("  ..   F5 %d windows taken, %d refused past the budget of %d\n",
 			taken, full, CLREPLAY_WINS);
 	}
 	clreplay_counts(c);
 	chk(c[CLREPLAY_HOST] == 1, "F6 the host refusal is counted by its reason");
+
+	/* ---- H. a frame the table cannot track is refused; senders quiet 60 s make room ---- */
+	{
+		uint32_t cc = 0x0300007f, d = 0x0400007f;
+		unsigned long long full0 = c[CLREPLAY_FULL];
+		int took = 0, port;
+
+		chk(!clreplay_taken(adm(cc, 1, 1, 1, 1, 1000)) &&
+			!clreplay_taken(adm(cc, 1, 1, 1, 1, 1000)),
+			"H1 past the window budget a new sender's frame, and its replay, are refused");
+		for (port = 4000; port < 4000 + CLREPLAY_SENDERS; port++)
+			took += clreplay_taken(adm(cc, (uint16_t)port, 1, 1, 1, 1000));
+		chk(took == 0, "H2 and every frame once the sender table is full as well");
+		chk(adm(b, 9, 10, 1, 3, 150000) == CLREPLAY_OK, "H3 a tracked sender heard at 150 s");
+		chk(adm(d, 1, 1, 1, 1, 200000) == CLREPLAY_OK,
+			"H4 at 200 s the senders quiet past 60 s are let go: a new sender's frame is taken");
+		chk(adm(d, 1, 1, 1, 1, 200000) == CLREPLAY_DUP, "H5 and its replay is refused");
+		chk(adm(b, 9, 10, 1, 3, 200000) == CLREPLAY_DUP,
+			"H6 the sender heard 50 s before kept its window: its replay is still refused");
+		clreplay_counts(c);
+		chk(c[CLREPLAY_FULL] >= full0 + 2 + CLREPLAY_SENDERS,
+			"H7 each frame refused for want of room is counted");
+	}
 
 	/* ---- E. the header: sender and position; a thread's stream goes on in the next ---- */
 	if (sodium_init() < 0) {

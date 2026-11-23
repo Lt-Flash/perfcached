@@ -295,14 +295,22 @@ int main(int argc, char **argv)
 	}
 
 	/* the REQUEST must survive, the DATA need not: a plain store collection held "before" only
-	 * on the killed node, so a miss is the store model working (eagertest covers the data) */
+	 * on the killed node, which no one has purged yet - its pull goes unanswered, and that is
+	 * refused as retryable (never a miss); after the purge it is a miss (eagertest covers the data) */
 	t0 = now_ms();
 	{
 		int rc = perfd_get(p, "c", "before", (void **)&val, &vlen,
 			&ttl);
 
 		dt = now_ms() - t0;
-		if (rc >= 0) {
+		if (rc < 0 && perfd_error_kind(p) == PERFD_E_REFUSED) {
+			ok("the request SURVIVED the node dying: a live node refused it as "
+				"retryable, the only holder not answering yet");
+			if (dt < 1000)
+				ok("failover was fast (no handshake on the hot path)");
+			else
+				bad("failover took %lldms - was it really pre-warmed?", dt);
+		} else if (rc >= 0) {
 			ok("the request SURVIVED the node dying");
 			if (rc == 1) {
 				if (vlen == 4 && !memcmp(val, "kept", 4))
@@ -562,8 +570,8 @@ member:
 			bad("fleet not held (members=%d standby port=%d)", n, bp);
 		fo0 = perfd_failovers(p);
 
-		/* 1. a member bounced within the purge window: found dead by the idle ping or a
-		 * routed request, brought back by recovery, every request succeeding meanwhile */
+		/* 1. a member bounced within the purge window: found dead by the idle ping or a routed
+		 * request, a standby again once it serves (its re-dial or the push), every request succeeding */
 		/* each key's owner's client port, while all three are usable -
 		 * the bounce takes the bounced member out of the ring */
 		for (k = 0; k < 80; k++) {
@@ -621,11 +629,13 @@ member:
 				"retry)", refused);
 		else
 			bad("%d request(s) failed during the bounce (the first: %s)", fails, ferr);
-		if (saw_standby && perfd_recovered(p) >= 1)
-			okf("the bounced member came back as a standby on its own (recovered=%llu, after %d00 ms)",
-				perfd_recovered(p), k);
+		/* a restarted process answers before the fleet has it back, and a dial then is no return:
+		 * recovered counts a re-dial that found it serving, not one the push replaced */
+		if (saw_standby)
+			okf("the bounced member came back as a standby once it served (after %d00 ms; recovered=%llu)",
+				k, perfd_recovered(p));
 		else
-			bad("the bounced member never came back (recovered=%llu)", perfd_recovered(p));
+			bad("the bounced member never came back as a standby (recovered=%llu)", perfd_recovered(p));
 		if (perfd_failovers(p) == fo0)
 			ok("no failover was needed: the active was never touched");
 		else

@@ -57,7 +57,7 @@ C
 done
 start() { # start <i>: node 2 under the shim; the log is kept across its restart
 	if [ "$1" = 2 ]; then
-		LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut2" PC_NETCUT_LOG="$D/cutlog2" \
+		LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut2" PC_NETCUT_LOG="$D/cutlog2" \
 			"$BIN" -f "$D/n2.conf" >> "$D/n2.log" 2>&1 &
 	else
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &

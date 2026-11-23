@@ -19,10 +19,10 @@ case $V in
 	fi
 	;;
 *)
-	if printf '%s' "$FOLDED" | grep -qE "last tagged release is \*\*$V\*\*"; then
-		ok "README status: the last tagged release is $V (version.h says $V)"
+	if printf '%s' "$FOLDED" | grep -qE "\*\*Current release: $V\*\*"; then
+		ok "README status: the current release is $V (version.h says $V)"
 	else
-		bad "README status does not say the last tagged release is $V (version.h says $V)"
+		bad "README status does not say **Current release: $V** (version.h says $V)"
 	fi
 	;;
 esac
@@ -39,7 +39,7 @@ else
 	bad "contrib/alpine/APKBUILD pkgver is '$P', version.h says $V"
 fi
 # libperfd's version (the dashboard's -V reports it): a client-only fix may take it ahead of the
-# daemon's first three numbers, never behind; a fourth number is the daemon's alone
+# daemon's first three numbers, never behind; each carries its own fourth number
 L=$(sed -n 's/^#define PERFD_VERSION "\(.*\)"/\1/p' lib/perfd.h 2>/dev/null)
 B=$(printf '%s' "$LINE" | cut -d. -f1-3)
 if [ -n "$L" ] && [ "$(printf '%s\n%s\n' "$B" "$L" | sort -V | head -n 1)" = "$B" ]; then
@@ -56,6 +56,15 @@ if [ "$N" = "$LINE" ]; then
 	ok "version.h's numeric defines spell $N"
 else
 	bad "version.h's numeric defines spell $N, PC_VERSION says $V"
+fi
+# and libperfd's numeric defines spell PERFD_VERSION, the fourth number when it is not 0
+lv() { sed -n "s/^#define PERFD_VERSION_$1 \([0-9]*\).*/\1/p" lib/perfd.h; }
+NL="$(lv MAJOR).$(lv MINOR).$(lv PATCH)"
+[ "$(lv TWEAK)" = "" ] || [ "$(lv TWEAK)" = 0 ] || NL="$NL.$(lv TWEAK)"
+if [ "$NL" = "$L" ]; then
+	ok "lib/perfd.h's numeric defines spell $NL"
+else
+	bad "lib/perfd.h's numeric defines spell $NL, PERFD_VERSION says $L"
 fi
 echo "readmetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

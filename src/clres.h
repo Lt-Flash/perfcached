@@ -56,6 +56,8 @@ int clres_take(struct clres *r, const unsigned char *ident,
 
 /* How many reservations are live - the stats surface. */
 int clres_count(const struct clres *r, long long now);
+/* live reservations of members that left for @why (CLRES_GONE_*) */
+int clres_count_why(const struct clres *r, int why, long long now);
 
 /* The address a live reservation for @ident was last held at, without
  * consuming it.  Returns 1 and fills *home, or 0. */

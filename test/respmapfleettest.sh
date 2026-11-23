@@ -169,6 +169,8 @@ cp "$D/n1.conf.orig" "$D/n1.conf"
 r=$("$BIN" -C -f "$D/n1.conf" 2>&1)
 echo "$r" | grep -q "resp: 1 DB index(es) mapped at runtime ($D/state1/respmap) outrank resp_collections" && ok "3. -C says a runtime map outranks resp_collections" || bad "3. -C: $(echo "$r" | grep -i resp | head -2)"
 # ---- 4. the whole fleet restarted: the map holds ----------------------------------------------------
+# a member writes a fleet map from pc-maint, within its 1 s pass
+i=0; while [ $i -lt 50 ] && ! grep -q "^map 0 [0-9]* 1 prod-redis" "$D/state2/respmap" 2>/dev/null; do sleep 0.1; i=$((i+1)); done
 head -1 "$D/state2/respmap" | grep -q "^perfcached-respmap 1" && grep -q "^map 0 [0-9]* 1 prod-redis" "$D/state2/respmap" && ok "4. node 2's respmap file holds it" || bad "4. respmap: $(cat "$D/state2/respmap" 2>&1 | tr '\n' '|')"
 halt 1; halt 2; halt 3
 node 1; node 2; node 3

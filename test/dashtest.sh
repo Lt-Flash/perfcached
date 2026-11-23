@@ -331,13 +331,27 @@ AS="-H X-Perfcached-Dashboard:1 -H Content-Type:application/octet-stream -H X-Pe
 head -c 300000 /dev/urandom > "$D/build.tgz"
 req POST /stage -H X-Perfcached-Dashboard:1 -H Content-Type:application/octet-stream -H X-Perfcached-Version:9.9.9 --data-binary "@$D/build.tgz"
 [ "$ST" = 401 ] && ok "stage without a session 401" || bad "stage without session $ST"
+# the session (and the size) are judged before the body is read: a client that waits for
+# 100 Continue gets its answer instead, and sends none of the build (stage_max_mb unauthenticated)
+head -c 900000 /dev/urandom > "$D/near.tgz"
+head -c 1200000 /dev/urandom > "$D/big.tgz"
+early() { # early <file> [curl args...] -> "<status> <bytes uploaded>"
+	f=$1; shift
+	curl -s -o /dev/null -w '%{http_code} %{size_upload}' --expect100-timeout 10 -H 'Expect: 100-continue' \
+		-X POST "$@" --data-binary "@$f" "$U/stage"
+}
+R=$(early "$D/near.tgz" -H X-Perfcached-Dashboard:1 -H Content-Type:application/octet-stream -H X-Perfcached-Version:9.9.9)
+[ "${R% *}" = 401 ] && [ "${R#* }" -lt 900000 ] 2>/dev/null && ok "stage without a session: 401 before the body (${R#* } of 900000 bytes sent)" \
+	|| bad "stage without a session, the body offered first: $R (status, bytes sent of 900000)"
+R=$(early "$D/big.tgz" $AS -H X-Perfcached-Version:9.9.9)
+[ "${R% *}" = 413 ] && [ "${R#* }" -lt 1200000 ] 2>/dev/null && ok "a build over stage_max_mb: 413 before the body (${R#* } of 1200000 bytes sent)" \
+	|| bad "a build over stage_max_mb, offered first: $R (status, bytes sent of 1200000)"
 req POST /stage $A -H X-Perfcached-Version:9.9.9 --data-binary "@$D/build.tgz"
 [ "$ST" = 415 ] && ok "stage as application/json is 415" || bad "stage json $ST $(head -c 200 "$D/body")"
 req POST /stage $AS --data-binary "@$D/build.tgz"
 [ "$ST" = 400 ] && ok "stage without a version is 400" || bad "stage no version $ST $(head -c 200 "$D/body")"
 req POST /stage $AS -H X-Perfcached-Version:9.9.9 -H X-Perfcached-Sig:abc --data-binary "@$D/build.tgz"
 [ "$ST" = 400 ] && ok "a signature that is not 128 hex is 400" || bad "stage bad sig $ST $(head -c 200 "$D/body")"
-head -c 1200000 /dev/urandom > "$D/big.tgz"
 req POST /stage $AS -H X-Perfcached-Version:9.9.9 --data-binary "@$D/big.tgz"
 [ "$ST" = 413 ] && ok "a build over stage_max_mb (1) is 413" || bad "stage big $ST $(head -c 200 "$D/body")"
 SHA9=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$D/build.tgz")
@@ -355,7 +369,9 @@ req POST /ddl $A --data '{"op":"bogus","col":"dash-new"}'
 req POST /ddl $A --data '{"op":"rename","col":"dash-new"}'
 [ "$ST" = 400 ] && ok "rename without \"to\" is 400" || bad "rename without to $ST"
 req POST /ddl $A --data '{"op":"create","col":"dash-new","buckets_log2":8}'
-[ "$ST" = 200 ] && [ "$(jq1 "$D/body" "d['created']")" = True ] && [ "$(jq1 "$D/body" "d['buckets']")" = 256 ] && ok "create dash-new 8: created, 256 buckets" || bad "create: $ST $(cat "$D/body")"
+[ "$ST" = 200 ] && [ "$(jq1 "$D/body" "d['created']")" = True ] && [ "$(jq1 "$D/body" "d['buckets']")" = 256 ] && ok "create dash-new 8: created, 256 buckets" || {
+	bad "create: $ST $(cat "$D/body")"   # what the nodes and the tool said meanwhile (114805: no answer in 5 s)
+	for f in "$D"/n*.log "$D/dash.log"; do tail -n 4 "$f" | cut -c1-200 | sed "s|^|  ..   $(basename "$f"): |"; done; }
 sleep 0.5
 req GET /stats
 [ "$(jq1 "$D/body" "'dash-new' in [c['name'] for c in d['collections']]")" = True ] && ok "/stats lists the new collection" || bad "/stats lacks dash-new"

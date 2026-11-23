@@ -1,6 +1,7 @@
 #!/bin/sh
 # handovertest.sh - master_prefer moves mastership before a restart: the named member promotes at the
-# next term with no masterless sample, and a stale beacon at the old term cannot unseat it.
+# next term with no masterless sample, and neither a stale beacon at the old term nor one claiming
+# a large member count unseats it.
 set -u
 BIN=${1:-./perfcached}
 CLI=${2:-./perfcli}
@@ -85,10 +86,10 @@ if len(sys.argv) > 4:                  # the second fleet: the stale beacon
           and len(members(A)) == 3 and len(members(B)) == 3, 40)
     out("ROLES0", "%s/%s/%s" % (role(M), role(A), role(B)))
     cM, idA = cl(M), cl(A).get("node")
-    def beacon(term, n, gap):
+    def beacon(term, n, gap, frm="127.0.75.8:24758", node="77", count="3"):
         return subprocess.Popen([sys.argv[4], "-s", "ho-cluster-secret", "-c", cM.get("cluster_id"),
-                                 "-f", "127.0.75.8:24758", "-t", "127.0.75.1:24750", "-n", str(n), "-i", str(gap),
-                                 "malive", "77", "3", str(term)], stdout=subprocess.DEVNULL)
+                                 "-f", frm, "-t", "127.0.75.1:24750", "-n", str(n), "-i", str(gap),
+                                 "malive", node, count, str(term)], stdout=subprocess.DEVNULL)
     ref0 = cl(A).get("sender_refused", 0)
     p = beacon((cM.get("map") or {}).get("term"), 1500, 20)
     out("REACHED", until(lambda: cl(A).get("sender_refused", 0) > ref0, 20) >= 0)
@@ -101,6 +102,10 @@ if len(sys.argv) > 4:                  # the second fleet: the stale beacon
     time.sleep(2)
     p.kill(); p.wait()
     out("ROLES1", "%s/%s/%s" % (role(M), role(A), role(B)))
+    # at its own term, from an address below it, claiming 1000 members: a count is the claimant's word
+    beacon((cl(A).get("map") or {}).get("term", 0), 30, 100, "127.0.74.8:24758", "78", "1000").wait(timeout=30)
+    time.sleep(1)
+    out("INFLATED", role(A))
     beacon((cl(A).get("map") or {}).get("term", 0) + 1, 1, 0).wait(timeout=30)
     out("CONTROL", until(lambda: role(A) != "master", 5) >= 0)
     sys.exit(0)
@@ -210,6 +215,9 @@ H=$(num "$(val DONE_MS)")
 [ "$(val ASKED)" = True ] && [ "$H" -ge 0 ] && [ "$(val ROLES1)" = member/master/member ] \
 	&& ok "a beacon at the old term moves no promoted master: named member master in $H ms, and stays" \
 	|| bad "a beacon at the old term: asked $(val ASKED), done after $(val DONE_MS) ms, roles $(val ROLES1): $(grep -m1 'yielding mastership' "$D/n1.log" | sed 's/.*cluster: //' | cut -c1-90)"
+[ "$(val INFLATED)" = master ] && ! grep -q "yielding mastership to node 78" "$D/n1.log" \
+	&& ok "a beacon at its term claiming 1000 members moves no master" \
+	|| bad "a beacon at its term claiming 1000 members: node 1 is $(val INFLATED): $(grep -m1 'yielding mastership to node 78' "$D/n1.log" | sed 's/.*cluster: //' | cut -c1-90)"
 [ "$(val CONTROL)" = True ] && ok "the same beacon a term above it makes it step down (the control)" \
 	|| bad "a beacon a term above moved nothing: these beacons tested nothing ($(val CONTROL))"
 

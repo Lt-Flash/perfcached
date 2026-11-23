@@ -31,8 +31,6 @@ static int apply_counts(int rc, uint32_t req)
 	return rc == 1 || (rc == 2 && (req & CLPUSH_ACK_TAG));
 }
 
-static volatile int *apply_stop;
-
 /* daemon.c runs one of these per thread, idx 0..n-1, each with a thread
  * slot of its own (the WAL ring a migration lands in is the slot's) */
 void pc_cluster_apply_thread(volatile int *stop, int idx)
@@ -40,16 +38,16 @@ void pc_cluster_apply_thread(volatile int *stop, int idx)
 	struct clapply *ap = cl_ap();      /* once: the call is per record otherwise */
 	struct clapply_item it;
 
-	apply_stop = stop;
-	pc_qs_enter();                     /* tables in hand between waits */
 	while (clapply_take(ap, idx, stop, &it, cl_now_ms())) {
-		int rc = apply_rec(&it.r, NULL);
+		int rc;
 
+		pc_qs_enter();                 /* a turn per record: parked while the take waits */
+		rc = apply_rec(&it.r, NULL);
 		if (it.grp && apply_counts(rc, it.grp->req))
 			__atomic_fetch_add(&it.grp->stored, 1, __ATOMIC_RELAXED);
 		clapply_done(ap, idx, &it);
+		pc_qs_exit();
 	}
-	pc_qs_exit();
 }
 
 /* migration: the receiver becomes the holder */

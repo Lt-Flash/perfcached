@@ -107,6 +107,7 @@ struct pc_conn {
 	/* a consumed RESP command waits on the cluster (a park entry, or an MGET's lookups): what the
 	 * client pipelined behind it stays buffered until its reply is out - RESP replies are ordered */
 	int park_hold;
+	int in_held;                       /* input turned off for one of the holds above */
 	char peer[48];                     /* ip:port, filled on first use */
 	int resp_only;                     /* RESP-pinned listener */
 	int http_loop;                     /* an HTTP peer on loopback - no rate

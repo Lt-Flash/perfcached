@@ -2,6 +2,7 @@
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* respkv.c - the RESP door's key-value and connection commands, answered through verbs.c's
  * dialect-neutral data cores (verbsint.h) like the native doors, so the dialects cannot drift */
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -131,6 +132,16 @@ static void rh_client_setinfo(struct resp_ctx *c)
 int rh_client(struct resp_ctx *c)
 {
 	if (c->nargs == 3 && resp_is(c->argv[1], c->argl[1], "SETNAME")) {
+		size_t i;
+
+		/* SETINFO's rule, for the same space-separated CLIENT LIST line */
+		for (i = 0; i < c->argl[2]; i++)
+			if ((unsigned char)c->argv[2][i] < '!' ||
+			        (unsigned char)c->argv[2][i] > '~') {
+				resp_err(c->out, "Client names cannot contain spaces, "
+					"newlines or special characters.");
+				return 0;
+			}
 		pc_obs_conn_name(c->obs, c->argv[2], c->argl[2]);
 		/* a perfcached's read-through fetcher - no read-through
 		 * on its behalf, ever */
@@ -499,6 +510,26 @@ int rh_get(struct resp_ctx *c)
 	return 0;
 }
 
+/* milliseconds to whole seconds, a part rounded up; nothing to overflow */
+static long long ms_to_s(long long ms)
+{
+	return ms > 0 ? ms / 1000 + (ms % 1000 != 0) : ms / 1000;
+}
+
+/* a delete or expire that did not happen answers as SET does: 1 when said */
+static int op_failed(struct pc_jw *out, int rc)
+{
+	if (rc == PC_OP_ERR_BUSY)
+		resp_err_code(out, "TRYAGAIN", "cluster busy, retry");
+	else if (rc == PC_OP_ERR_FWD)
+		resp_err(out, "forward failed");
+	else if (rc == PC_OP_ERR_WRFAIL)
+		resp_err(out, wr_refused_msg());
+	else
+		return 0;
+	return 1;
+}
+
 /* DELEX key [IFEQ v | IFNE v] (Redis 8.4); without a condition it is DEL of one key.
  * IFDEQ/IFDNE compare a DIGEST, which perfcached does not have: refused by name */
 int rh_delex(struct resp_ctx *c)
@@ -520,6 +551,8 @@ int rh_delex(struct resp_ctx *c)
 	*c->klenp = c->argl[1];
 	if (c->nargs == 2) {
 		rc = op_del(c->ht, &k, c->park_req);
+		if (op_failed(c->out, rc))
+			return 0;
 		resp_int(c->out, rc == PC_OP_OK ? 1 : 0);   /* parked: DEL's fallback */
 		return 0;
 	}
@@ -580,6 +613,8 @@ int rh_del(struct resp_ctx *c)
 		*c->keyp = c->argv[1];
 		*c->klenp = c->argl[1];
 		rc = op_del(c->ht, &k, c->park_req);
+		if (op_failed(c->out, rc))
+			return 0;
 		if (rc == PC_OP_PARKED)
 			resp_int(c->out, 0);   /* park fallback only */
 		else
@@ -596,6 +631,8 @@ int rh_del(struct resp_ctx *c)
 		k.s = c->argv[i];
 		k.len = (int)c->argl[i];
 		rc = op_del(c->ht, &k, &throwaway);
+		if (op_failed(c->out, rc))
+			return 0;
 		if (rc == PC_OP_OK || rc == PC_OP_PARKED)
 			cnt++;
 	}
@@ -621,14 +658,18 @@ int rh_expire(struct resp_ctx *c)
 		struct timespec tw;
 
 		clock_gettime(CLOCK_REALTIME, &tw);
-		ttl -= (long long)tw.tv_sec * 1000 +
-			tw.tv_nsec / 1000000;
+		ttl = (ttl < 0 ? 0 : ttl) - ((long long)tw.tv_sec * 1000 +
+			tw.tv_nsec / 1000000);
 	} else if (resp_is(c->cmd, c->cl, "EXPIREAT")) {
-		ttl -= (long long)time(NULL);
+		ttl = (ttl < 0 ? 0 : ttl) - (long long)time(NULL);
 	}
 	if (resp_is(c->cmd, c->cl, "PEXPIRE") ||
 	        resp_is(c->cmd, c->cl, "PEXPIREAT"))
-		ttl = (ttl + 999) / 1000;
+		ttl = ms_to_s(ttl);
+	if (ttl > PC_TTL_MAX) {
+		resp_err(c->out, "invalid expire time in 'expire' command");
+		return 0;
+	}
 	if (ttl <= 0) {
 		/* Redis deletes on a non-positive relative expire */
 		k.s = c->argv[1];
@@ -636,6 +677,8 @@ int rh_expire(struct resp_ctx *c)
 		*c->keyp = c->argv[1];
 		*c->klenp = c->argl[1];
 		rc = op_del(c->ht, &k, c->park_req);
+		if (op_failed(c->out, rc))
+			return 0;
 		if (rc == PC_OP_PARKED)
 			resp_int(c->out, 0);
 		else
@@ -647,6 +690,8 @@ int rh_expire(struct resp_ctx *c)
 	*c->keyp = c->argv[1];
 	*c->klenp = c->argl[1];
 	rc = op_expire(c->ht, &k, ttl, c->park_req);
+	if (op_failed(c->out, rc))
+		return 0;
 	if (rc == PC_OP_PARKED)
 		resp_int(c->out, 0);           /* park fallback only */
 	else
@@ -671,12 +716,13 @@ int rh_set(struct resp_ctx *c)
 			resp_err(c->out, "wrong number of arguments");
 			return 0;
 		}
-		if (resp_ll(c->argv[2], c->argl[2], &ttl) < 0 || ttl <= 0) {
+		if (resp_ll(c->argv[2], c->argl[2], &ttl) < 0 || ttl <= 0 ||
+		        (is_psetex ? ms_to_s(ttl) : ttl) > PC_TTL_MAX) {
 			resp_err(c->out, "invalid expire time");
 			return 0;
 		}
 		if (is_psetex)
-			ttl = (ttl + 999) / 1000;
+			ttl = ms_to_s(ttl);
 	} else {
 		if (c->nargs < 3) {
 			resp_err(c->out, "wrong number of arguments for "
@@ -691,13 +737,14 @@ int rh_set(struct resp_ctx *c)
 				if (i + 1 >= c->nargs ||
 				        resp_ll(c->argv[i + 1],
 				            c->argl[i + 1], &ttl) < 0 ||
-				        ttl <= 0) {
+				        ttl <= 0 || (px ? ms_to_s(ttl) : ttl) >
+				        PC_TTL_MAX) {
 					resp_err(c->out, "invalid expire "
 						"time in 'set' command");
 					return 0;
 				}
 				if (px)
-					ttl = (ttl + 999) / 1000;
+					ttl = ms_to_s(ttl);
 				i++;
 			} else if (resp_is(c->argv[i], c->argl[i], "NX") ||
 			        resp_is(c->argv[i], c->argl[i], "XX")) {
@@ -855,6 +902,10 @@ int rh_incr(struct resp_ctx *c)
 		resp_err(c->out, "key too long");
 		return 0;
 	}
+	if (neg && by == LLONG_MIN) {
+		resp_err(c->out, "value is not an integer or out of range");
+		return 0;
+	}
 	if (neg)
 		by = -by;
 	k.s = c->argv[1];
@@ -873,6 +924,8 @@ int rh_incr(struct resp_ctx *c)
 		resp_err_line(c->out, pc_wrongtype_msg);
 	else if (rc == PC_OP_ERR_NOTINT)
 		resp_err(c->out, "value is not an integer or out of range");
+	else if (rc == PC_OP_ERR_OVF)
+		resp_err(c->out, PC_OVF_MSG);
 	else if (rc != PC_OP_OK)
 		resp_err(c->out, "cache full");
 	else

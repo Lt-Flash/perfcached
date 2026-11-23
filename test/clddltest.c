@@ -144,7 +144,11 @@ int pc_store_rename(const char *from, size_t flen, const char *to, size_t tlen,
 	return 0;
 }
 
-int pc_store_persist(void) { call("persist;"); return 0; }
+/* the receive side marks the files due: a write there would hold the cluster thread (T585) */
+static int sync_writes;
+void pc_store_persist_later(void) { call("persist;"); }
+int pc_store_persist(void) { sync_writes++; return 0; }
+void pc_wal_col_rename(const char *from, const char *to) { call("wal_rename %s %s;", from, to); }
 int pc_store_count(void) { return n_cols; }
 
 int pc_store_entry(int i, const char **name, int *bl, unsigned long long *gen, int *live)
@@ -186,7 +190,8 @@ int pc_respmap_apply(int index, const char *col, size_t cl, uint64_t gen, int se
 	return 1;
 }
 
-int pc_respmap_persist(void) { call("map_persist;"); return 0; }
+void pc_respmap_persist_later(void) { call("map_persist;"); }
+int pc_respmap_persist(void) { sync_writes++; return 0; }
 
 void pc_respmap_each(pc_respmap_cb cb, void *ctx)
 {
@@ -369,6 +374,9 @@ int main(void)
 	CHK(strstr(calls, "rename users people 706;") && !strstr(calls, "707") &&
 		pc_cluster_bad_col_names() == 2, "D. a rename made; one to a name that breaks the rule "
 		"refused and counted");
+	/* a member's restart maps its snapshot's older name by this record and its file */
+	CHK(strstr(calls, "rename users people 706;wal_rename users people;persist;") != NULL,
+		"D. a fleet rename is logged to the WAL, then persisted (%s)", calls);
 	reset();
 	feed(CLCOL_OP_MAP, 1, 708, "3", "users");
 	feed(CLCOL_OP_MAP, 1, 709, "64", "users");
@@ -378,8 +386,10 @@ int main(void)
 	feed(CLCOL_OP_AUTOSCALE, 1, 710, "users", NULL);
 	as_deaf = 1;
 	feed(CLCOL_OP_AUTOSCALE, 0, 711, "users", NULL);
-	CHK(strstr(calls, "mode users 1 710;") && !strstr(calls, "711"),
-		"D. a mode applied; ignored by a deaf member");
+	CHK(strstr(calls, "mode users 1 710;persist;") && !strstr(calls, "711"),
+		"D. a mode applied and persisted; ignored by a deaf member (%s)", calls);
+	CHK(sync_writes == 0, "D. the receive side wrote no file itself, %d times: pc-maint writes "
+		"what it marks due", sync_writes);
 
 	printf("%s\n", fails ? "FAIL" : "PASS");
 	return fails ? 1 : 0;

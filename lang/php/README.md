@@ -52,6 +52,9 @@ is refused (`PerfcachedServerException`, "value too large").  A write that a
 node must forward to the key's owner (a shard fleet, without `route_keys`)
 carries at most 58,000 bytes of value.
 
+A ttl is whole seconds, 0 (no expiry) to 2,147,483,647; any other is a
+`ValueError`, except that `add` takes a negative ttl as "keep the key's expiry".
+
 | Method | Answers |
 |---|---|
 | `set(col, key, value, ttl = 0)` | nothing |
@@ -61,13 +64,22 @@ carries at most 58,000 bytes of value.
 | `expire(col, key, ttl)` | bool: the key existed |
 | `add(col, key, by = 1, ttl = 0)`, `sub(col, key, by = 1)` | the new value |
 | `mget(col, keys)` | key => value or null |
-| `keys(col, match = null, limit = 0)` | a list of keys |
+| `keys(col, match = null, limit = 0, &complete = null)` | a list of keys; `complete` false when it is only the answering node's share (a sharded collection on a fleet) |
 | `hset`, `hsetnx(col, key, field, value)` | bool: the field is new, or was set |
 | `hget(col, key, field)` | the value, or null |
 | `hdel`, `hexists(col, key, field)` | bool |
 | `hlen(col, key)` | the field count |
 | `hincrby(col, key, field, by = 1)` | the new value |
 | `hgetall(col, key)` | field => value |
+| `jget(col, key, path = '$')` | the document or the fragment at `path` as JSON text, or null |
+| `jset(col, key, path, json, ttl = 0)` | nothing; `json` is JSON text, refused when it is not |
+| `jdel(col, key, path = null)` | bool: something was deleted (no path: the whole document) |
+| `jincr(col, key, path, by = 1)` | the new number at `path` |
+| `setNx(col, key, value, ttl = 0)` | bool: stored (the key was absent) |
+| `setIfEq(col, key, value, expected, ttl = 0)` | bool: stored (the key held `expected`, byte for byte) |
+| `delIfEq(col, key, expected)` | bool: deleted (the key held `expected`) |
+| `publish(channel, payload)` | the receivers on the node reached |
+| `subscribe(channels, callback, timeout = 0)`, `psubscribe(patterns, callback, timeout = 0)` | the messages handed to `callback`; see below |
 | `members()`, `ownerOf(col, key)`, `activeNode()`, `failovers()`, `routing()`, `serverVersion()` | the fleet as this handle sees it |
 | `maintain()`, `ping()`, `close()` | nothing |
 | `stats(col = null)` | the daemon's stats document, as an array |
@@ -129,6 +141,49 @@ $rates = $cache->get('rates.au', function (ItemInterface $item) { /* ... */ });
 A value past a record is not stored and an error is logged, to the pool's logger
 or else to PHP's error log: Symfony would only see a miss, and run the callback
 every time.
+
+`clear()` deletes the namespace's keys as the connected node lists them.  On a
+fleet whose collection is sharded (not eager) that node holds only its share:
+`clear()` deletes that share, logs a warning and returns false, never true while
+other nodes still hold keys, up or down.  Extension 0.2.0 and later says so through
+`keys()`'s `complete`; with an older extension `clear()` cannot tell and returns true.
+
+`PerfcachedLockStore` is a `symfony/lock` store (5.4, 6.4 and 7) on a collection,
+as `RedisStore` does it: a lock is a key holding a random token, taken with
+`setNx` and a ttl, refreshed with `setIfEq` and released with `delIfEq` only
+while the key still holds that token.  A ttl is whole seconds: a fraction is
+rounded up and one second added, since the daemon's clock ticks in whole
+seconds and a ttl of N lasts between N-1 and N of them - the key outlives the
+lock, never the other way round.
+
+```php
+$locks = new \Symfony\Component\Lock\LockFactory(
+    new \Perfcached\Symfony\PerfcachedLockStore($pc, 'collection', 'lock:'));
+$lock = $locks->createLock('billing-run', 300);
+if ($lock->acquire()) { /* ... */ $lock->release(); }
+```
+
+## Pub/sub
+
+`publish` reaches subscribers on either door: a RESP `SUBSCRIBE` (phpredis,
+predis, a Node Redis client) on any node gets it, and so does `subscribe` here.
+
+`subscribe` and `psubscribe` are for a long-running CLI worker, as in phpredis:
+they open a connection of their own (the handle's seeds and options, never the
+pool's), subscribe, and call `callback($handle, $channel, $message)` (with
+`$pattern` before `$channel` for `psubscribe`) for each message, until the
+callback returns `false`, throws, or `timeout` seconds pass (0: no limit).  They
+answer the number of messages handed over; the subscriptions end with the call.
+A message reaches PHP as text: a NUL byte or a byte that is not UTF-8 in a
+payload does not arrive as sent.
+
+```php
+$pc->subscribe(['dev_device_updates'], function ($pc, $channel, $message) {
+    $event = json_decode($message, true);
+    /* ... */
+    return true;                   // false ends the loop
+});
+```
 
 ## Errors
 

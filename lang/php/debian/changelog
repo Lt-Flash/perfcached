@@ -1,3 +1,13 @@
+php-perfcached (0.2.0-1) unstable; urgency=medium
+
+  * keys() takes a fourth, by-reference argument: complete, false when the
+    listing is only the answering node's share.  The Symfony adapter's
+    clear() returns false, with a warning, when a listing was not complete,
+    and sweeps in passes of 10000.  A failed async handshake is an
+    authentication error naming the secret tried.  Needs libperfd 0.7.6.
+
+ -- Yury Kirsanov <yury@kfi.net.au>  Wed, 18 Nov 2026 18:00:00 +1100
+
 php-perfcached (0.1.1-1) unstable; urgency=medium
 
   * The seeds' second pass shares one connect_timeout_ms; a secret holding

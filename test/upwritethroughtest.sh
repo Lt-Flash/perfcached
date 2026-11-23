@@ -214,6 +214,20 @@ echo "$r" | grep -q '"stored": false' && [ "$(mdata m n:1 value)" = nv ] &&
 r=$(native '{"method": "jset", "params": {"key": "n:2", "path": "$", "val": {"s": "Reachable"}, "ttl": 30}}')
 echo "$r" | grep -q '"set": true' && grep -q '^JSON.SET n:2 \$ {"s":"Reachable"}$' "$D/upm/writes" &&
 	ok "4. native jset (cachedb's JSON.SET): forwarded, {set: true}" || bad "4. jset: $r; M: $(grep 'n:2' "$D/upm/writes" | tr '\n' '|')"
+# a path the handler cannot read is its refusal, never the root: not a number, not one past
+# 512 bytes; and a 512-byte path the handler takes goes as that path, not as $
+r=$(native '{"method": "jset", "params": {"key": "n:2", "path": 5, "val": 1}}')
+echo "$r" | grep -q 'bad path' && ! grep -q '^JSON.SET n:2 \$ 1$' "$D/upm/writes" &&
+	ok "4. native jset with a path that is not bytes: bad path, nothing forwarded" || bad "4. jset path 5: $r; M: $(grep 'n:2' "$D/upm/writes" | tr '\n' '|')"
+LP=$(python3 -c 'print("$." + "a" * 600)')
+r=$(native '{"method": "jdel", "params": {"key": "n:2", "path": "'"$LP"'"}}')
+echo "$r" | grep -q 'bad path' && ! grep -q '^JSON.DEL n:2 \$$' "$D/upm/writes" &&
+	ok "4. native jdel with a 602-byte path: bad path, the document not deleted" || bad "4. jdel long path: $r; M: $(grep 'n:2' "$D/upm/writes" | cut -c1-40 | tr '\n' '|')"
+LP=$(python3 -c 'print("$." + "a" * 510)')
+native '{"method": "jdel", "params": {"key": "n:2", "path": "'"$LP"'"}}' > /dev/null
+! grep -q '^JSON.DEL n:2 \$$' "$D/upm/writes" && [ "$(mdata m n:2 value)" != None ] &&
+	ok "4. native jdel with a 512-byte path: sent as that path, the document still on the master" ||
+	bad "4. jdel 512-byte path: M: $(grep 'n:2' "$D/upm/writes" | cut -c1-40 | tr '\n' '|'), n:2 $(mdata m n:2 value)"
 r=$(native '{"method": "expire", "params": {"key": "n:1", "ttl": 0}}')
 echo "$r" | grep -q '"updated": true' && grep -q '^PERSIST n:1$' "$D/upm/writes" &&
 	ok "4. native expire with ttl 0 is PERSIST" || bad "4. expire: $r"
@@ -961,6 +975,9 @@ waitfor 30 '[ "$(cst 1 "s[\"state\"]")" = ready ] && [ "$(cst 2 "s[\"state\"]")"
 # (a) a key written through on member 1: its own invalidation comes back within ~50 ms and drops the
 # record and its mark - both retained, as local
 i1=$(cst 1 'w["invalidated"]'); l1=$(cst 1 'r.get("local")'); p1=$(cst 1 'r.get("replayed")'); p2=$(cst 2 'r.get("replayed")')
+# the replicas take the write 500 ms after the master, as a real replica lags: an echo pushed before
+# the reply finds the mark without its record and rightly keeps it, which is no drop to retain
+ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"], "replicate_delay_ms": 500}'
 r=$(cresp 1 SET w:1 mine)
 waitfor 5 '[ "$(cst 1 "w[\"invalidated\"]")" != "'"$i1"'" ]'
 # wait for both retentions, bounded: on a loaded ASan runner the mark's drop can come later
@@ -968,6 +985,7 @@ waitfor 5 '[ "$(cst 1 "r.get(\"local\")")" = "'"$((l1 + 2))"'" ]'
 [ "$r" = "+OK" ] && [ "$(cst 1 'w["invalidated"]')" != "$i1" ] && [ "$(cst 1 'r.get("local")')" = "$((l1 + 2))" ] &&
 	ok "18. (a) w:1 written through on member 1, dropped on its own invalidation: the record and its mark retained as local (local $l1 -> $((l1 + 2)))" ||
 	bad "18. (a) SET w:1 $r; invalidated $i1 -> $(cst 1 'w["invalidated"]'); local $l1 -> $(cst 1 'r.get("local")') (rc8: 0 - retained as deletes); $(tail -2 "$D/c1.log" | cut -c 1-160 | tr '\n' '|')"
+ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"]}'
 rawm SET w:1 theirs > /dev/null
 waitfor 5 '[ "$(cresp 1 GET w:1)" = "'"'"'theirs'"'"'" ] && [ "$(cresp 2 GET w:1)" = "'"'"'theirs'"'"'" ]'
 [ "$(cresp 1 GET w:1)" = "'theirs'" ] && [ "$(cresp 2 GET w:1)" = "'theirs'" ] && ok "18. (a) another client's change in Redis: both read 'theirs'" ||
@@ -1223,6 +1241,102 @@ ln=$(grep -h "the tracking of 127.0.0.1:$P1 changed" "$D/r.log" | head -1 | sed 
 	{ bad "20. (d) after R1's tracking was lost: $sh copies held, requeued $q0 -> $q1; log: ${ln:-none}"; rwdiag; }
 set -- $(allheld)
 [ "$1" = 40 ] && [ "$2" = 0 ] && ok "20. (d) all 40 read back from the held copies, no fetch" || bad "20. (d) read back: $1 of 40 right, $2 fetched"
+# (e) both replicas refuse CLIENT TRACKING ... REDIRECT (an ACL): a re-warmed copy can never be
+# tracked, so its name leaves the list after one fetch instead of going round for ever
+ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "redirect_refused": true, "kill_seq": 2}'
+ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "redirect_refused": true, "kill_seq": 1}'
+waitfor 10 'grep -q "TRACKING REFUSED" "$D/up1/counts" "$D/up2/counts" 2>/dev/null'
+sleep 4
+q0=$(rw requeued); f0=$(ust fetches); n0=$(grep -c "the re-warm is done" "$D/r.log")
+sleep 3
+q1=$(rw requeued); f1=$(ust fetches); n1=$(grep -c "the re-warm is done" "$D/r.log")
+[ "$q1" = "$q0" ] && [ "$f1" = "$f0" ] && [ "$n1" = "$n0" ] && [ "$(rw state)" = idle ] &&
+	ok "20. (e) tracking refused on both replicas: the re-warm settles (requeued $q0, fetches $f0, no new run in 3 s)" ||
+	{ bad "20. (e) tracking refused: the names go round for ever - requeued $q0 -> $q1, fetches $f0 -> $f1, 're-warm is done' $n0 -> $n1 in 3 s"; rwdiag; }
+stop
+unfake
+
+# ---- 21. a value no record holds --------------------------------------------------------------
+# refused before Redis applies it, as on any collection; one that grows past a record only at Redis
+# (APPEND) drops the copy here, so the older value never answers for it.  Tracking off: Redis's
+# invalidation would drop that copy on its own, and only the read-back is under test
+rbig() { # rbig <args...> - one RESP command, an argument @<n> being n x's; a long bulk prints len:<n>
+	python3 - $RESP "$@" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10)
+f = s.makefile("rb")
+a = [b"x" * int(x[1:]) if x[:1] == "@" else x.encode() for x in sys.argv[2:]]
+s.sendall(b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a))
+l = f.readline()
+t, body = l[:1], l[1:-2]
+if t == b"$":
+    n = int(body)
+    v = None if n < 0 else f.read(n + 2)[:-2].decode("latin-1")
+    print(v if v is None or len(v) <= 64 else "len:%d" % len(v))
+else:
+    print((body if t == b":" else t + body).decode("latin-1"))
+PY
+}
+nbig() { # nbig set <key> <bytes> | nbig mset <key> <value> <key> <bytes> - x's made here, not in argv
+	python3 - $TCP "$T" "$@" <<'PY' 2>&1
+import json, socket, sys
+sys.path.insert(0, sys.argv[2])
+import pcnative
+f = pcnative.wrap(socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10))
+a = sys.argv[3:]
+if a[0] == "set":
+    p = {"col": "0", "key": a[1], "value": "x" * int(a[2])}
+else:
+    p = {"col": "0", "items": [{"key": a[1], "value": a[2]}, {"key": a[3], "value": "x" * int(a[4])}]}
+r = {"jsonrpc": "2.0", "id": 1, "method": a[0], "params": p}
+f.write((json.dumps(r) + "\n").encode()); f.flush()
+m = json.loads(f.readline())
+print(json.dumps(m.get("result", m.get("error"))))
+PY
+}
+mlen() { # mlen <dir> <key> - the length of a fake's stored value (a hash: its fields), or None
+	python3 -c 'import json,sys
+e=json.load(open(sys.argv[1]+"/data.json")).get(sys.argv[2])
+print(None if e is None else len(e.get("value")))' "$D/up$1" "$2" 2>/dev/null
+}
+fakes
+conf a "upstream_tracking = off"
+start a || bad "21. start: $(grep -m2 -E 'ERROR|CRIT' "$D/a.log")"
+waitfor 5 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ]'
+rf0=$(wt 'w["refused"]')
+rbig SET b:1 v1 > /dev/null
+waitfor 5 '[ "$(rbig GET b:1)" = v1 ]'
+r=$(rbig SET b:1 @300000)
+[ "$r" = "-ERR value too large" ] && [ "$(mlen m b:1)" = 2 ] && [ "$(rbig GET b:1)" = v1 ] &&
+	ok "21. SET of 300,000 bytes: refused before the master (value too large) - the master and this node keep v1" ||
+	bad "21. SET of 300,000 bytes: $r; the master holds $(mlen m b:1) bytes, a read here answers $(rbig GET b:1) (want the refusal, 2 and v1)"
+r=$(nbig set b:6 300000)
+echo "$r" | grep -q "value too large" && [ "$(mlen m b:6)" = None ] &&
+	ok "21. a native set of 300,000 bytes: refused the same way, nothing on the master" ||
+	bad "21. a native set of 300,000 bytes: $r; the master holds $(mlen m b:6)"
+# an mset item over 262,080 bytes is dropped before the gate (section 4); 262,060 passes that and,
+# with its key and header, still no record holds it
+r=$(nbig mset b:2 small b:3 262060)
+echo "$r" | grep -q "value too large" && [ "$(mlen m b:2)/$(mlen m b:3)" = None/None ] &&
+	ok "21. a native mset with one item past a record (262,060 bytes and its key): refused whole, neither key on the master" ||
+	bad "21. a native mset with one item past a record: $r; the master holds b:2 $(mlen m b:2), b:3 $(mlen m b:3)"
+r=$(rbig HSET b:4 f @300000)
+[ "$r" = "-ERR value too large" ] && [ "$(mlen m b:4)" = None ] &&
+	ok "21. HSET of a 300,000-byte field: refused, no hash on the master" ||
+	bad "21. HSET of a 300,000-byte field: $r; the master holds $(mlen m b:4) field(s)"
+rf1=$(wt 'w["refused"]')
+[ $((rf1 - rf0)) = 4 ] 2>/dev/null && ok "21. the four counted as refused writes ($rf0 -> $rf1)" ||
+	bad "21. refused writes $rf0 -> $rf1 (want 4 more)"
+rbig SET b:5 @200000 > /dev/null
+waitfor 5 '[ "$(rbig GET b:5)" = len:200000 ]'
+rr0=$(wt 'w["read_back_released"]')
+r=$(rbig APPEND b:5 @100000)
+waitfor 5 '[ "$(rbig GET b:5)" != len:200000 ]'
+g=$(rbig GET b:5); rr1=$(wt 'w["read_back_released"]')
+case "$g" in *"larger than"*|len:300000) gok=1 ;; *) gok= ;; esac
+[ "$r" = 300000 ] && [ "$(mlen m b:5)" = 300000 ] && [ -n "$gok" ] && [ "${rr1:-0}" -gt "${rr0:-0}" ] 2>/dev/null &&
+	ok "21. APPEND past a record at the master (300,000 bytes): the copy here dropped (read-backs released $rr0 -> $rr1) - a read answers '$g', never the old 200,000 bytes" ||
+	bad "21. APPEND past a record: $r, the master holds $(mlen m b:5) bytes; a read here answers '$g' (want no len:200000), read-backs released $rr0 -> $rr1"
 stop
 unfake
 

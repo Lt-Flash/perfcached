@@ -8,7 +8,7 @@
 #define PC_VERSION_MAJOR 0
 #define PC_VERSION_MINOR 7
 #define PC_VERSION_PATCH 5
-#define PC_VERSION_TWEAK 0          /* the fourth number, the daemon's alone; 0: none */
-#define PC_VERSION "0.7.5"
+#define PC_VERSION_TWEAK 1          /* the fourth number, the daemon's alone; 0: none */
+#define PC_VERSION "0.7.5.1"
 
 #endif /* PC_VERSION_H */

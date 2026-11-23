@@ -2,6 +2,7 @@
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* jsonpath.c - the JSON path engine: span splicing over the tokenizer (prefix + fragment +
  * suffix); string token spans EXCLUDE their quotes, so their extent is start-1 .. end+1. */
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -242,6 +243,134 @@ static int jp_prim_ok(const char *s, int n)
 	return i == n;
 }
 
+static int jp_ws(char c)
+{
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* the index past the string opening at s[i], or 0: no control byte, one of the eight escapes,
+ * four hex digits after \u */
+static size_t jp_str_end(const char *s, size_t n, size_t i)
+{
+	size_t k;
+
+	for (i++; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+
+		if (c == '"')
+			return i + 1;
+		if (c < 0x20)
+			return 0;
+		if (c != '\\')
+			continue;
+		if (++i >= n)
+			return 0;
+		switch (s[i]) {
+		case '"': case '\\': case '/': case 'b': case 'f': case 'n': case 'r': case 't':
+			break;
+		case 'u':
+			for (k = 1; k <= 4; k++) {
+				char h = i + k < n ? s[i + k] : 0;
+
+				if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') ||
+				        (h >= 'A' && h <= 'F')))
+					return 0;
+			}
+			i += 4;
+			break;
+		default:
+			return 0;
+		}
+	}
+	return 0;
+}
+
+/* the structure the jsmn-style tokenizer does not check (RFC 8259): every separator in its place
+ * per container.  @list: values joined by commas, as an array's inside; returns how many */
+static int jp_strict(const char *s, size_t n, int list)
+{
+	static __thread char *stk;
+	static __thread size_t scap;
+	enum { S_VAL, S_VAL_OR_END, S_KEY, S_KEY_OR_END, S_COLON, S_AFTER } st = S_VAL;
+	size_t i = 0, d = 0, b;
+	int cnt = 1;
+
+	if (n + 2 > scap) {
+		char *ns = realloc(stk, n + 2);
+
+		if (!ns)
+			return 0;
+		stk = ns;
+		scap = n + 2;
+	}
+	if (list)
+		stk[d++] = '[';                /* never closed: the array they go into */
+	for (;;) {
+		while (i < n && jp_ws(s[i]))
+			i++;
+		if (i == n)
+			return st == S_AFTER && d == (list ? 1u : 0u) ? cnt : 0;
+		switch (st) {
+		case S_VAL_OR_END:
+			if (s[i] == ']') {
+				d--;
+				i++;
+				st = S_AFTER;
+				break;
+			}
+			/* fall through */
+		case S_VAL:
+			if (s[i] == '{' || s[i] == '[') {
+				stk[d++] = s[i];
+				st = s[i] == '{' ? S_KEY_OR_END : S_VAL_OR_END;
+				i++;
+			} else if (s[i] == '"') {
+				if (!(i = jp_str_end(s, n, i)))
+					return 0;
+				st = S_AFTER;
+			} else {
+				for (b = i; i < n && !jp_ws(s[i]) && s[i] != ',' &&
+				        s[i] != ']' && s[i] != '}' && s[i] != ':'; i++)
+					;
+				if (!jp_prim_ok(s + b, (int)(i - b)))
+					return 0;
+				st = S_AFTER;
+			}
+			break;
+		case S_KEY_OR_END:
+			if (s[i] == '}') {
+				d--;
+				i++;
+				st = S_AFTER;
+				break;
+			}
+			/* fall through */
+		case S_KEY:
+			if (s[i] != '"' || !(i = jp_str_end(s, n, i)))
+				return 0;
+			st = S_COLON;
+			break;
+		case S_COLON:
+			if (s[i++] != ':')
+				return 0;
+			st = S_VAL;
+			break;
+		case S_AFTER:
+			if (!d || (list && d == 1 && s[i] != ','))
+				return 0;              /* something after the one value */
+			if (s[i] == ',') {
+				st = stk[d - 1] == '{' ? S_KEY : S_VAL;
+				cnt += list && d == 1;
+			} else if (s[i] == (stk[d - 1] == '{' ? '}' : ']'))
+				d--;
+			else
+				return 0;
+			i++;
+			break;
+		}
+	}
+}
+
 /* is @val exactly one JSON value (no trailing garbage)? */
 static int jp_valid_value(const char *val, size_t vlen)
 {
@@ -249,6 +378,8 @@ static int jp_valid_value(const char *val, size_t vlen)
 	int ntok, e, k;
 	size_t i;
 
+	if (!jp_strict(val, vlen, 0))
+		return 0;
 	ntok = jp_tokenize(val, vlen, &t);
 	if (ntok < 0)
 		return 0;
@@ -332,7 +463,11 @@ int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 	if (!jp_valid_value(val, vlen))
 		return PC_JP_E_VAL;
 	if (ns == 0) {
-		/* root replace: the document becomes @val */
+		/* root replace: the document becomes @val; an absent key comes in empty */
+		if (nx && dlen)
+			return PC_JP_E_EXISTS;
+		if (xx && !dlen)
+			return PC_JP_E_NOLEAF;
 		if (vlen > cap || vlen > PC_JP_MAX)
 			return PC_JP_E_SIZE;
 		memcpy(out, val, vlen);
@@ -411,6 +546,8 @@ int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 				*o++ = '}';
 			memcpy(o, doc + at, dlen - (size_t)at);
 			o += dlen - (size_t)at;
+			if (o - out > PC_JP_MAX)
+				return PC_JP_E_SIZE;
 			return (int)(o - out);
 		}
 	}
@@ -428,7 +565,8 @@ int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 		if (n < 0 || (size_t)n >= sizeof ins)
 			return PC_JP_E_PATH;
 		/* two splices in one: prefix + name + val at the same spot */
-		if ((size_t)at + (size_t)n + vlen + (dlen - (size_t)at) > cap)
+		if ((size_t)at + (size_t)n + vlen + (dlen - (size_t)at) > cap ||
+		        (size_t)n + vlen + dlen > PC_JP_MAX)
 			return PC_JP_E_SIZE;
 		memcpy(out, doc, (size_t)at);
 		memcpy(out + at, ins, (size_t)n);
@@ -441,7 +579,7 @@ int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 }
 
 int pc_jp_append(const char *doc, size_t dlen, const char *path,
-		size_t plen, const char *val, size_t vlen, int *count_out,
+		size_t plen, const char *val, size_t vlen, int nvals, int *count_out,
 		char *out, size_t cap)
 {
 	struct jp_step st[JP_MAX_STEPS];
@@ -452,7 +590,7 @@ int pc_jp_append(const char *doc, size_t dlen, const char *path,
 	ns = jp_split(path, plen, st);
 	if (ns < 0)
 		return ns;
-	if (!jp_valid_value(val, vlen))
+	if (nvals <= 1 ? !jp_valid_value(val, vlen) : jp_strict(val, vlen, 1) != nvals)
 		return PC_JP_E_VAL;
 	ntok = jp_tokenize(doc, dlen, &t);
 	if (ntok < 0)
@@ -467,7 +605,7 @@ int pc_jp_append(const char *doc, size_t dlen, const char *path,
 	at = t[w.leaf].end - 1;            /* before the closing bracket */
 	nonempty = t[w.leaf].size > 0;
 	if (count_out)
-		*count_out = t[w.leaf].size + 1;
+		*count_out = t[w.leaf].size + (nvals > 1 ? nvals : 1);
 	{
 		size_t need = dlen + vlen + 1;
 
@@ -551,11 +689,13 @@ int pc_jp_incr(const char *doc, size_t dlen, const char *path, size_t plen,
 	}
 	memcpy(num, doc + a, (size_t)(b - a));
 	num[b - a] = 0;
+	errno = 0;
 	v = strtoll(num, &endp, 10);
-	if (*endp) {
+	if (*endp || errno == ERANGE) {
 		return PC_JP_E_NUM;        /* floats stay untouched in v1 */
 	}
-	v += by;
+	if (__builtin_add_overflow(v, by, &v))
+		return PC_JP_E_NUM;
 	*result = v;
 	n = snprintf(num, sizeof num, "%lld", v);
 	return jp_splice(doc, dlen, a, b, num, (size_t)n, out, cap);

@@ -886,6 +886,46 @@ int main(void)
 			stuck_gauge);
 	}
 
+	printf("--- K: a CONNECTING member an earlier master admitted, held past CONNECT_MS\n");
+	role = PC_ROLE_MASTER;
+	nst = PC_NST_READY;
+	wboot = maxdg = lane_off = 0;
+	now += 10000;
+	fleet(3);
+	p = add_peer(&j3, 30);
+	p->nstate = PC_NST_CONNECTING;
+	now += 100;
+	cladmit_master_begin(now);
+	nsent = joins = 0;
+	stuck_gauge = 0;
+	logbuf[0] = 0;
+	{
+		pc_addr m2 = addr(10), m3 = addr(11);
+		int x30[] = { 30 }, xk[] = { 1, 2, 3 };
+		unsigned ok1[] = { CS }, rn[] = { CS | RN }, okk[] = { CS, CS, CS };
+		long long t0;
+
+		report(&j3, 1, 3, xk, okk, 3);         /* its own report: checked again */
+		report(&m2, 0, 1, x30, ok1, 1);
+		report(&m3, 0, 1, x30, rn, 1);         /* node 3's relay port never answers it */
+		now += 500;
+		beat();
+		cladmit_hold(jf, sizeof jf, &j1, 1);
+		CHK(!joins && strstr(logbuf, "admission held") &&
+			strstr(logbuf, "1 CONNECTING member(s) checked again"),
+			"K. while node 30 is checked again: held, and the line says that is why");
+		for (t0 = now; now <= t0 + 10000; ) {
+			ticks(1);
+			cladmit_probe_answered(p, now);
+		}
+		CHK(stuck_gauge == 1 && strstr(logbuf, "admission stuck - node 30 (10.0.0.102)"),
+			"K. node 30 held at 10 s (%llu)", stuck_gauge);
+		beat();
+		cladmit_hold(jf, sizeof jf, &j1, 1);
+		CHK(joins == 1, "K. once it is held the queue moves on, as the log says: the next "
+			"joiner admitted (%d)", joins);
+	}
+
 	printf("cladmittest: %s\n", fails ? "FAILED" : "all passed");
 	return fails != 0;
 }

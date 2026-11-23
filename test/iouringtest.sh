@@ -1,6 +1,7 @@
 #!/bin/sh
 # iouringtest.sh - [daemon] io: the io_uring startup check and epoll fallback, workers on io_uring,
-# iowait, and a queued reply never reaching a connection that reused the closed fd's number.
+# iowait, a queued reply never reaching a connection that reused the closed fd's number, and a refused
+# submit's entries handed over by the next.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -237,6 +238,37 @@ if start dflt PERFCACHED_URING_DENY=1; then
 	stop
 else
 	bad "7. did not start under PERFCACHED_URING_DENY=1"
+fi
+
+# ---- 8. a submit the kernel answers -EAGAIN --------------------------------------------------
+# PERFCACHED_TEST_UR_EAGAIN=1: each worker's first submit (its doors' polls) comes back -EAGAIN with
+# nothing consumed; the next submit must still hand those entries over, or the worker never hears a door
+if [ "$USABLE" = 1 ]; then
+	conf eag
+	if start eag PERFCACHED_TEST_UR_EAGAIN=1; then
+		timeout 60 python3 - > "$D/eagain.out" 2>&1 <<'PY'
+import socket
+ok = 0
+for i in range(8):
+    try:
+        s = socket.create_connection(("127.0.0.1", 19731), 3)
+        s.settimeout(3)
+        s.sendall(b"*1\r\n$4\r\nPING\r\n")
+        ok += s.recv(64) == b"+PONG\r\n"
+        s.close()
+    except OSError:
+        pass
+print("pong", ok)
+PY
+		grep -q "^pong 8$" "$D/eagain.out" &&
+			ok "8. each worker's first submit refused -EAGAIN: 8 of 8 connections answered" ||
+			bad "8. after a refused first submit the doors go unheard: $(cat "$D/eagain.out")"
+		kill -9 $P 2>/dev/null; wait $P 2>/dev/null; P=
+	else
+		bad "8. did not start under PERFCACHED_TEST_UR_EAGAIN=1: $(tail -2 "$D/eag.log")"
+	fi
+else
+	echo "  skip 8. io_uring not usable here - a refused submit is not tested"
 fi
 
 # ---- 4. the value ------------------------------------------------------------------

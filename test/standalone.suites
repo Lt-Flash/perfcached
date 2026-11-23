@@ -58,10 +58,11 @@ sh test/grafanatest.sh ./perfcached
 sh test/storagetest.sh ./perfcached
 sh test/walprobetest.sh ./perfcached
 sh test/waltest.sh ./perfcached
+sh test/walmarktest.sh ./perfcached
 sh test/waldroptest.sh ./perfcached ./pcbench ./perfcli ./syncfailshim.so
 sh test/rdbtest.sh ./perfcached
 sh test/recoverytest.sh ./perfcached
-sh test/stagetest.sh ./perfcached ./perfcli
+sh test/stagetest.sh ./perfcached ./perfcli ./syncfailshim.so
 sh test/switchtest.sh ./perfcached
 sh test/walctrltest.sh ./perfcached
 sh test/healtest.sh ./perfcached ./syncfailshim.so

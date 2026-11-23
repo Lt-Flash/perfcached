@@ -90,7 +90,7 @@ static int wbuf_push(perfd_t *p)
 	if (p->wstlen && wbuf_seal(p) != 0)   /* one seal a push */
 		return -1;
 	while (p->woff < p->wlen) {
-		ssize_t r = write(p->fd, p->w + p->woff, p->wlen - p->woff);
+		ssize_t r = send(p->fd, p->w + p->woff, p->wlen - p->woff, MSG_NOSIGNAL);
 
 		if (r > 0) {
 			p->woff += (size_t)r;
@@ -393,6 +393,11 @@ int perfd_events(const perfd_t *p)
 	return ev;
 }
 
+int perfd_secret_index(const perfd_t *p)
+{
+	return p && p->nsec ? p->hs_sec : -1;
+}
+
 int perfd_inflight(const perfd_t *p)
 {
 	return p ? p->ncalls : 0;
@@ -421,7 +426,7 @@ perfd_t *perfd_connect_async(const char *host, int port,
 	hints.ai_socktype = SOCK_STREAM;
 	snprintf(ps, sizeof ps, "%d", port);
 	if (getaddrinfo(host, ps, &hints, &res) != 0) {
-		errk(p, PERFD_E_TRANSPORT, "cannot resolve %s", host ? host : "(null)");
+		errk(NULL, PERFD_E_TRANSPORT, "cannot resolve %s", host ? host : "(null)");
 		perfd_free(p);
 		return NULL;
 	}
@@ -441,7 +446,7 @@ perfd_t *perfd_connect_async(const char *host, int port,
 	}
 	freeaddrinfo(res);
 	if (p->fd < 0) {
-		errk(p, PERFD_E_TRANSPORT, "cannot connect: %s", strerror(errno));
+		errk(NULL, PERFD_E_TRANSPORT, "cannot connect: %s", strerror(errno));
 		perfd_free(p);
 		return NULL;
 	}
@@ -459,12 +464,14 @@ static int submit_framed(perfd_t *p, perfd_reply_cb cb, void *ctx,
 	}
 	if (wbuf_put(p, p->q, p->qlen) != 0) {
 		p->qlen = 0;
+		p->ncalls--;           /* the -1 reports this one */
 		return -1;
 	}
 	p->qlen = 0;
 	if (!p->eager_push)
 		return 0;              /* batched; goes out on write-readiness */
 	if (wbuf_push(p) < 0) {
+		p->ncalls--;
 		call_fail_all(p, p->err);
 		p->st = PERFD_ST_FAILED;
 		return -1;
@@ -530,6 +537,7 @@ int perfd_push(perfd_t *p)
 		return errk(p, PERFD_E_STATE, "not an async handle");
 	if (p->poisoned) {
 		p->st = PERFD_ST_FAILED;
+		call_fail_all(p, p->err);
 		return -1;
 	}
 	if (p->woff >= p->wlen && !p->wstlen)
@@ -548,6 +556,7 @@ int perfd_write_ready(perfd_t *p)
 		return errk(p, PERFD_E_STATE, "not an async handle");
 	if (p->poisoned) {
 		p->st = PERFD_ST_FAILED;
+		call_fail_all(p, p->err);
 		return -1;
 	}
 	if (p->hs_stage == PD_HS_TCP) {
@@ -592,9 +601,14 @@ int perfd_read_ready(perfd_t *p)
 		return errk(p, PERFD_E_STATE, "not an async handle");
 	if (p->poisoned) {
 		p->st = PERFD_ST_FAILED;
+		call_fail_all(p, p->err);
 		return -1;
 	}
 	if (cin_pull(p) < 0) {
+		/* a node drops a msg1 its secrets cannot open, as the blocking dial reads it too */
+		if (p->hs_stage == PD_HS_WAIT && p->err_kind == PERFD_E_TRANSPORT)
+			errk(p, PERFD_E_AUTH, "handshake refused with secrets[%d] (wrong or retired?) - "
+				"dial again from the next", p->hs_sec);
 		p->st = PERFD_ST_FAILED;
 		call_fail_all(p, p->err);
 		return -1;

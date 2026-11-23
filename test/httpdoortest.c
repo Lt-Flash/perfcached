@@ -48,11 +48,16 @@ void compat_log(int level, const char *tag, const char *fmt, ...)
 	notices++;
 }
 
-size_t pc_metrics_render(char *buf, size_t cap)
+char *pc_metrics_render(size_t *len)
 {
-	int n = snprintf(buf, cap, "pc_up 1\npc_build %d\n", ++metrics_builds);
+	char *b = malloc(64);
+	int n;
 
-	return (size_t)n;
+	if (!b)
+		return NULL;
+	n = snprintf(b, 64, "pc_up 1\npc_build %d\n", ++metrics_builds);
+	*len = (size_t)n;
+	return b;
 }
 
 void pc_stats_tree(struct pc_tw *out, const char *only_col)

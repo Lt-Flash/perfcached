@@ -24,6 +24,10 @@
 #define CLMEMB_MARK_LEN      20    /* oid 8, incarn 4, mark 8 */
 #define CLMEMB_ALIVE_MAX     (CLMEMB_ALIVE_CFGMAX + 4 + 1 + 2 + CLMEMB_MARK_LEN * CLMEMB_MARKS_MAX + 2)  /* 953; + 79 sealed <= 1,232 */
 #define CLMEMB_ALIVE_MIN      7    /* below this the frame is refused */
+/* the digest of the config's own collection set (cfg2), last in ALIVE (behind the watermarks
+ * group), MASTER_ALIVE and JOIN_REQ; buffers take the _BUF sizes */
+#define CLMEMB_CFG2_LEN       8
+#define CLMEMB_ALIVE_BUF     (CLMEMB_ALIVE_MAX + CLMEMB_CFG2_LEN)
 
 #define CLMEMB_A_MEM       0x0001u  /* total_mb, live_kb        n >= 15 */
 #define CLMEMB_A_CFG       0x0002u  /* mode, eager, cfg_digest  n >= 25 */
@@ -63,6 +67,7 @@
                                       * an origin forgets by marks only while all set it */
 #define CLMEMB_A_MARKS     0x100000u /* nmarks pairs            n >= ... + 7 + 8 * ncfg + 20 * nmarks */
 #define CLMEMB_A_LINK      0x200000u /* link_pct, link_level, after the marks */
+#define CLMEMB_A_CFG2      0x400000u /* cfg_digest2, after the link (ext and cfg2 set) */
 #define CLMEMB_SOLEWIT_MANY 0xFFFF
 #define CLMEMB_FEAT_TYPES2 0x01     /* rate-limit and hash records */
 #define CLMEMB_FEAT_HREAD  0x02     /* answers a forwarded hash READ with the record */
@@ -125,6 +130,9 @@ struct clmemb_alive {
 	/* the link's busier direction, % of its speed (-1 = not watched),
 	 * and host.link's level (0 none, 1 warning, 2 critical) - with ext only */
 	int link_pct, link_level;
+	/* the config's collection set alone, runtime creates left out - written with ext and cfg2 */
+	int cfg2;
+	uint64_t cfg_digest2;
 	/* the first ncols of ncols_total live collections */
 	int ncols, ncols_total;
 	struct clmemb_col cols[CLMEMB_COLS_MAX];
@@ -148,6 +156,7 @@ int clmemb_alive_parse(const unsigned char *p, size_t n,
 
 /* ---- MASTER_ALIVE ------------------------------------------------ */
 #define CLMEMB_MALIVE_LEN    41
+#define CLMEMB_MALIVE_BUF    (CLMEMB_MALIVE_LEN + CLMEMB_CFG2_LEN)  /* LEN is without cfg2 */
 #define CLMEMB_MALIVE_MIN    17
 
 #define CLMEMB_M_MEM       0x0001u  /* total_mb, live_kb        n >= 25 */
@@ -155,6 +164,7 @@ int clmemb_alive_parse(const unsigned char *p, size_t n,
 #define CLMEMB_M_TERM      0x0004u  /* term                     n >= 39 */
 #define CLMEMB_M_EPOCH     0x0008u  /* wire epoch               n >= 40 */
 #define CLMEMB_M_COMMIT    0x0010u  /* committed epoch          n >= 41 */
+#define CLMEMB_M_CFG2      0x0020u  /* cfg_digest2              n >= 49 */
 
 struct clmemb_malive {
 	unsigned have;
@@ -168,6 +178,8 @@ struct clmemb_malive {
 	uint32_t term;
 	int epoch;
 	int committed;                     /* the epoch the fleet speaks */
+	int cfg2;                          /* write cfg_digest2 */
+	uint64_t cfg_digest2;
 };
 
 size_t clmemb_malive_write(unsigned char *buf, size_t cap, unsigned char type,
@@ -178,6 +190,7 @@ int clmemb_malive_parse(const unsigned char *p, size_t n,
 /* ---- JOIN_REQ ---- its gates are NOT in offset order (`proposed` at 35 is
  * gated at 37, read before the config block at 9): keep them exactly */
 #define CLMEMB_JOINREQ_LEN   43
+#define CLMEMB_JOINREQ_BUF   (CLMEMB_JOINREQ_LEN + CLMEMB_CFG2_LEN)  /* LEN is without cfg2 */
 #define CLMEMB_JOINREQ_MIN    9
 
 #define CLMEMB_J_CFG      0x01u  /* mode, eager, cfg_digest   n >= 19 */
@@ -186,6 +199,7 @@ int clmemb_malive_parse(const unsigned char *p, size_t n,
 #define CLMEMB_J_INCARN   0x08u  /* incarn                    n >= 41 */
 #define CLMEMB_J_WAL      0x10u  /* wal posture               n >= 42 */
 #define CLMEMB_J_EPOCH    0x20u  /* wire epoch                n >= 43 */
+#define CLMEMB_J_CFG2     0x40u  /* cfg_digest2               n >= 51 */
 
 struct clmemb_joinreq {
 	unsigned have;
@@ -197,6 +211,8 @@ struct clmemb_joinreq {
 	uint32_t incarn;
 	int wal;                           /* 1 = none, 2 = logs; 0 = unknown */
 	int epoch;                         /* PC_CL_EPOCH; 0 = absent */
+	int cfg2;                          /* write cfg_digest2 */
+	uint64_t cfg_digest2;
 };
 
 size_t clmemb_joinreq_write(unsigned char *buf, size_t cap, unsigned char type,

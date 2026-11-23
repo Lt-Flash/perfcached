@@ -99,6 +99,7 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 			(sl == 8 && !memcmp(state, "draining", 8));
 		p->mem[n].draining = sl == 8 && !memcmp(state, "draining", 8);
 		p->mem[n].down = 0;
+		p->mem[n].returning = 0;
 		if (!p->mem[n].port)
 			continue;      /* a node that cannot be dialled */
 		n++;
@@ -146,6 +147,7 @@ static int parse_members(perfd_t *p, const unsigned char *tree, size_t tn)
 	}
 	pc_tv_free(&v);
 	p->nmem = n;
+	fleet_seen(p);
 	return n;
 }
 
@@ -257,6 +259,7 @@ static void route_retire(perfd_t *p, perfd_t *dead)
 	for (i = 0; i < p->nmem; i++)
 		if (p->mem[i].node == dead->active_node)
 			p->mem[i].down = 1;
+	fleet_seen(p);
 	for (i = 0; i < p->nspare; i++)
 		if (p->spare[i] == dead) {
 			perfd_free(dead);
@@ -339,8 +342,13 @@ static void hint_drop(perfd_t *p, unsigned long long h)
 static void hint_after(perfd_t *p, perfd_t *u, int verb, const char *col,
 		const char *key, long long ttl, const char *out, size_t outlen)
 {
-	unsigned long long h = hint_hash(col, key);
+	unsigned long long h;
 
+	if (!col || !key) {                    /* a ping: no key to learn */
+		u->hh_got = 0;
+		return;
+	}
+	h = hint_hash(col, key);
 	if (u->hh_got) {
 		long long t = u->hh_ttl == HINT_TTL_UNKNOWN ?
 			(verb == BV_SET || verb == BV_SETNX || verb == BV_SETXX ?
@@ -511,6 +519,7 @@ static int dial_start_try(perfd_t *p, struct pd_member *m, int arm, int tries, i
 	c = perfd_connect_async(m->addr, m->port, &o);
 	if (!c) {
 		dial_failed(m, perfd_error(NULL));
+		fleet_seen(p);
 		return -1;
 	}
 	d = &p->dial[p->ndial++];
@@ -534,7 +543,7 @@ static void dial_done(perfd_t *p, struct pd_dial d)
 {
 	struct pd_member *m = member_of(p, d.node);
 	perfd_t *c = d.c;
-	int fl = fcntl(c->fd, F_GETFL, 0), mine, least, workers, was_down;
+	int fl = fcntl(c->fd, F_GETFL, 0), mine, least, workers, was_down, look, serving = 1;
 	struct timeval tv = { 0, DIAL_LOOK_MS * 1000L };
 	int cap = p->want_spares < 0 || p->want_spares > PERFD_MAX_SPARES
 		? PERFD_MAX_SPARES : p->want_spares;
@@ -546,7 +555,8 @@ static void dial_done(perfd_t *p, struct pd_dial d)
 	c->async = 0;
 	setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-	if (c->worker_bal && conn_where(c, &mine, &least, &workers) == 0 && workers >= 2 &&
+	look = conn_where(c, &mine, &least, &workers, &serving) == 0;
+	if (c->worker_bal && look && workers >= 2 &&
 	    mine - 1 > least && d.tries < 8 * workers && d.tries < 64) {
 		perfd_free(c);
 		dial_start_try(p, m, d.arm, d.tries + 1, d.secn);
@@ -557,6 +567,16 @@ static void dial_done(perfd_t *p, struct pd_dial d)
 		perfd_free(c);
 		return;
 	}
+	/* by its own word it does not serve (a restarted process the fleet has not admitted again):
+	 * no standby and no draw; its push or the next member list brings it back */
+	if (look && !serving) {
+		m->returning = m->returning || m->down;
+		m->ready = 0;
+		m->down = 0;
+		m->why[0] = 0;
+		perfd_free(c);
+		return;
+	}
 	tv.tv_sec = c->io_ms / 1000;
 	tv.tv_usec = (c->io_ms % 1000) * 1000L;
 	setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -564,8 +584,9 @@ static void dial_done(perfd_t *p, struct pd_dial d)
 	c->is_child = 1;
 	c->active_node = d.node;
 	c->last_reply_ms = now_ms_lib();   /* the handshake answered */
-	was_down = m->down;
+	was_down = m->down || m->returning;
 	m->down = 0;
+	m->returning = 0;
 	m->why[0] = 0;
 	m->backoff_ms = 0;
 	if (was_down)
@@ -612,6 +633,7 @@ static void dials_run(perfd_t *p, int wait_ms)
 			if (perfd_state(c) == PERFD_ST_READY && c->woff == c->wlen && !c->wstlen) {
 				p->dial[i] = p->dial[--p->ndial];
 				dial_done(p, d);
+				fleet_seen(p);
 			} else if (perfd_state(c) == PERFD_ST_FAILED || now >= d.until_ms) {
 				struct pd_member *m = member_of(p, d.node);
 				int refused = perfd_state(c) == PERFD_ST_FAILED;
@@ -623,6 +645,7 @@ static void dials_run(perfd_t *p, int wait_ms)
 				else
 					dial_failed(m, refused ? perfd_error(c) : "no answer");
 				perfd_free(c);
+				fleet_seen(p);
 			}
 		}
 		if (now_ms_lib() >= until)
@@ -665,6 +688,7 @@ static void adopt_conn(perfd_t *dst, perfd_t *src)
 	free(dst->rbuf);
 	free(dst->q);
 	free(dst->ids);
+	early_free(dst);
 
 	dst->fd = src->fd;
 	dst->encrypted = src->encrypted;
@@ -675,12 +699,15 @@ static void adopt_conn(perfd_t *dst, perfd_t *src)
 	dst->q = src->q; dst->qlen = src->qlen; dst->qcap = src->qcap;
 	dst->ids = src->ids; dst->nids = src->nids;
 	dst->idhead = src->idhead; dst->idcap = src->idcap;
-	dst->next_id = src->next_id;
+	dst->early = src->early;
+	/* ids mean nothing to the server; going back would reuse ones the dead link's replies carry */
+	if (src->next_id > dst->next_id)
+		dst->next_id = src->next_id;
 	dst->active_node = src->active_node;
 	dst->poisoned = 0;
 
 	src->fd = -1;
-	src->rbuf = NULL; src->q = NULL; src->ids = NULL;
+	src->rbuf = NULL; src->q = NULL; src->ids = NULL; src->early = NULL;
 	src->rlen = src->rcap = src->qlen = src->qcap = 0;
 	src->roff = 0;
 	src->nids = src->idhead = src->idcap = 0;
@@ -757,12 +784,13 @@ static void member_down(perfd_t *p, int node, const char *prefix,
 				p->mem[j].backoff_ms = 1000;
 			p->mem[j].retry_ms = now_ms_lib() + p->mem[j].backoff_ms;
 		}
+	fleet_seen(p);
 }
 
 /* a FRESH dial to any learned member, the ones not down first and the dead one last, bounded by
  * REDIAL_CONNECT_MS, adopting the first handshake that completes: 0 = usable again */
 
-static int redial_any(perfd_t *p)
+static int redial_any(perfd_t *p, long long until)
 {
 	int pass, i, dead = p->active_node;
 
@@ -772,12 +800,20 @@ static int redial_any(perfd_t *p)
 		for (i = 0; i < p->nmem; i++) {
 			struct pd_member *m = &p->mem[i];
 			perfd_t *c;
+			int cms = p->o_connect_ms > 0 && p->o_connect_ms < REDIAL_CONNECT_MS
+				? p->o_connect_ms : REDIAL_CONNECT_MS;
 
 			if ((pass == 0) != (!m->down && m->node != dead))
 				continue;
-			c = open_child(p, m, p->o_connect_ms > 0 &&
-				p->o_connect_ms < REDIAL_CONNECT_MS
-				? p->o_connect_ms : REDIAL_CONNECT_MS);
+			if (until) {                   /* 0 = no total bound (perfd_redial) */
+				long long left = until - now_ms_lib();
+
+				if (left <= 0)
+					return -1;
+				if (left < cms)
+					cms = (int)left;
+			}
+			c = open_child(p, m, cms);
 			if (!c) {
 				member_down(p, m->node, "re-dial: ", perfd_error(NULL));
 				continue;
@@ -790,6 +826,7 @@ static int redial_any(perfd_t *p)
 			p->last_reply_ms = now_ms_lib();
 			p->failovers++;
 			p->next_refresh_ms = 0;    /* re-learn, re-warm on the next call */
+			fleet_seen(p);
 			return 0;
 		}
 	return -1;
@@ -819,6 +856,7 @@ static int redial_own(perfd_t *p)
 		m->why[0] = 0;
 		p->last_reply_ms = now_ms_lib();
 		p->next_refresh_ms = 0;
+		fleet_seen(p);
 		return 0;
 	}
 	return errk(p, PERFD_E_TRANSPORT, "re-dial: node %d, the one this pinned handle "
@@ -829,12 +867,13 @@ static int redial_own(perfd_t *p)
  * dial to any learned member, so only the call that found it dead can fail.  0 = usable again. */
 static int failover(perfd_t *p)
 {
+	long long until = now_ms_lib() + p->io_ms;     /* the whole move, not each step */
 	int k;
 
 	if (p->is_child || p->pin)             /* the error stays the dialled node's */
 		return -1;
 	member_down(p, p->active_node, "", "the link died");
-	while ((k = pick_spare(p)) >= 0) {
+	while (now_ms_lib() < until && (k = pick_spare(p)) >= 0) {
 		perfd_t *c = p->spare[k];
 
 		if (probe_child(p, c) == 0) {
@@ -855,7 +894,7 @@ static int failover(perfd_t *p)
 		member_down(p, c->active_node, "probe: ", perfd_error(c));
 		drop_spare(p, k);
 	}
-	return redial_any(p);
+	return redial_any(p, until);
 }
 
 int perfd_redial(perfd_t *p)
@@ -885,7 +924,7 @@ int perfd_redial(perfd_t *p)
 			perfd_error(p->spare[k]));
 		drop_spare(p, k);
 	}
-	if (redial_any(p) == 0)
+	if (redial_any(p, 0) == 0)
 		return 0;
 	return errk(p, PERFD_E_TRANSPORT, "re-dial: no learned member answered");
 }

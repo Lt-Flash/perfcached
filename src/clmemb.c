@@ -90,6 +90,8 @@ size_t clmemb_alive_write(unsigned char *buf, size_t cap, unsigned char type,
 		pc_w8(&c, in->link_pct < 0 || in->link_pct > 100 ? 255u
 			: (unsigned)in->link_pct);
 		pc_w8(&c, (unsigned)in->link_level);
+		if (in->cfg2)
+			pc_w64(&c, in->cfg_digest2);
 	}
 	return c.ok ? pc_wcur_len(&c, buf) : 0;
 }
@@ -280,6 +282,10 @@ int clmemb_alive_parse(const unsigned char *p, size_t n,
 			out->link_pct = v > 100 ? -1 : (int)v;
 			out->link_level = pc_ru8(&c);
 			out->have |= CLMEMB_A_LINK;
+			if (pc_rfits(&c, 8)) {
+				out->cfg_digest2 = pc_ru64(&c);
+				out->have |= CLMEMB_A_CFG2;
+			}
 		}
 	}
 	return 1;
@@ -305,6 +311,8 @@ size_t clmemb_malive_write(unsigned char *buf, size_t cap, unsigned char type,
 	pc_w32(&c, in->term);
 	pc_w8(&c, (unsigned)in->epoch);
 	pc_w8(&c, (unsigned)in->committed);
+	if (in->cfg2)
+		pc_w64(&c, in->cfg_digest2);
 	return c.ok ? pc_wcur_len(&c, buf) : 0;
 }
 
@@ -349,6 +357,11 @@ int clmemb_malive_parse(const unsigned char *p, size_t n,
 		return 1;
 	out->committed = pc_ru8(&c);
 	out->have |= CLMEMB_M_COMMIT;
+
+	if (!pc_rfits(&c, 8))
+		return 1;
+	out->cfg_digest2 = pc_ru64(&c);
+	out->have |= CLMEMB_M_CFG2;
 	return 1;
 }
 
@@ -369,6 +382,8 @@ size_t clmemb_joinreq_write(unsigned char *buf, size_t cap, unsigned char type,
 	pc_w32(&c, in->incarn);
 	pc_w8(&c, (unsigned)in->wal);
 	pc_w8(&c, (unsigned)in->epoch);
+	if (in->cfg2)
+		pc_w64(&c, in->cfg_digest2);
 	return c.ok ? pc_wcur_len(&c, buf) : 0;
 }
 
@@ -414,6 +429,11 @@ int clmemb_joinreq_parse(const unsigned char *p, size_t n,
 		return 1;
 	out->epoch = pc_ru8(&c);
 	out->have |= CLMEMB_J_EPOCH;
+
+	if (!pc_rfits(&c, 8))
+		return 1;
+	out->cfg_digest2 = pc_ru64(&c);
+	out->have |= CLMEMB_J_CFG2;
 	return 1;
 }
 

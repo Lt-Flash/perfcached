@@ -105,6 +105,17 @@ static void serve(const char *s, size_t n)
 }
 #define SERVE(lit) serve((lit), sizeof(lit) - 1)
 
+/* a reply larger than a socket buffer, written from a thread while the client reads */
+static const char *srv_big;
+static size_t srv_big_n;
+
+static void *serve_big(void *a)
+{
+	(void)a;
+	serve(srv_big, srv_big_n);
+	return NULL;
+}
+
 /* what the client sent so far, as a string; its length in sent_len */
 static size_t sent_len;
 
@@ -267,6 +278,54 @@ int main(void)
 		nap_ms(20);
 		CHK(now_ms() - t0 >= 20 && now_us() - u0 >= 20000, "E: nap_ms(20) - at least 20 ms by both clocks");
 	}
+
+	/* F: a discovery connection (a sentinel's, a cluster seed's) has no server: a push on it is
+	 * dropped, never handed to on_push, and the reply after it still read */
+	open_pair();
+	c.s = NULL;
+	pushes = 0;
+	SERVE(">2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n+OK\r\n");
+	rc = read_reply(&c, &v, dl());
+	CHK(rc == 0 && is_ok(&v) && pushes == 0,
+		"F: a push on a connection with no server - dropped (on_push %d times), +OK read", pushes);
+	if (rc == 0)
+		rv_free(&v);
+	close(c.fd);
+	c.fd = -1;
+	c.s = &srv;
+
+	/* G: rv_max 150,000 - the buffer grows to rv_max + 64 KB, not only to the powers of two
+	 * under it: a 140,000-byte bulk (over 131,072, under rv_max) is read whole */
+	open_pair();
+	free(c.buf);
+	c.buf = NULL;
+	c.cap = 0;
+	rv_max = 150000;
+	{
+		static char big[140100];
+		pthread_t th;
+		size_t i;
+
+		memcpy(big, "$140000\r\n", 9);
+		for (i = 0; i < 140000; i++)
+			big[9 + i] = (char)('a' + i % 26);
+		memcpy(big + 140009, "\r\n", 2);
+		srv_big = big;
+		srv_big_n = 140011;
+		if (pthread_create(&th, NULL, serve_big, NULL) != 0) {
+			perror("pthread_create");
+			exit(2);
+		}
+		rc = read_reply(&c, &v, dl());
+		pthread_join(th, NULL);
+		CHK(rc == 0 && v.len == 140000 && v.s[139999] == (char)('a' + 139999 % 26),
+			"G: rv_max 150,000 - a 140,000-byte bulk read whole (rc %d, buffer %zu)", rc, c.cap);
+		if (rc == 0)
+			rv_free(&v);
+	}
+	rv_max = UP_RBUF_MAX;
+	close(c.fd);
+	c.fd = -1;
 
 	if (peer >= 0)
 		close(peer);

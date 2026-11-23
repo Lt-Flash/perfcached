@@ -204,8 +204,8 @@ int pc_json_unescape(const char *buf, const struct pc_jtok *tok,
 	size_t n = 0;
 	int u;
 
-	/* the decoded length never exceeds the source span (\uXXXX: 6 source bytes -> at most 3),
-	 * so the bound is checked per write against the ACTUAL bytes about to land */
+	/* the decoded length never exceeds the source span (\uXXXX: 6 source bytes -> at most 3, a
+	 * surrogate pair 12 -> 4), so the bound is checked per write against the bytes about to land */
 #define PUT1(ch) do { if (n + 1 > outcap) return -1; out[n++] = (ch); } while (0)
 	while (s < e) {
 		if (*s != '\\') {
@@ -227,11 +227,23 @@ int pc_json_unescape(const char *buf, const struct pc_jtok *tok,
 			if (e - s < 5)
 				return -1;
 			u = hex4(s + 1);
-			if (u < 0)
+			if (u < 0 || (u >= 0xDC00 && u <= 0xDFFF))
 				return -1;
 			s += 4;
-			/* BMP only; a NUL here is legitimate (the whole point) */
-			if (u < 0x80) {
+			if (u >= 0xD800 && u <= 0xDBFF) {
+				/* a high surrogate names one character with the low one after it */
+				int lo = e - s >= 7 && s[1] == '\\' && s[2] == 'u' ? hex4(s + 3) : -1;
+
+				if (lo < 0xDC00 || lo > 0xDFFF || n + 4 > outcap)
+					return -1;
+				u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+				s += 6;
+				out[n++] = (char)(0xF0 | (u >> 18));
+				out[n++] = (char)(0x80 | ((u >> 12) & 0x3F));
+				out[n++] = (char)(0x80 | ((u >> 6) & 0x3F));
+				out[n++] = (char)(0x80 | (u & 0x3F));
+			} else if (u < 0x80) {
+				/* a NUL here is legitimate (the whole point) */
 				PUT1((char)u);
 			} else if (u < 0x800) {
 				if (n + 2 > outcap)
@@ -385,6 +397,37 @@ void pc_jw_i64(struct pc_jw *w, long long v)
 		pc_jw_raw_slow(w, p, n);
 }
 
+/* the length of the well-formed UTF-8 sequence at @s (RFC 3629: no overlong form, no surrogate,
+ * nothing past U+10FFFF), 0 when none starts there */
+static size_t utf8_seq(const unsigned char *s, size_t n)
+{
+	unsigned char c = s[0], lo = 0x80, hi = 0xBF;
+	size_t len, k;
+
+	if (c >= 0xC2 && c <= 0xDF)
+		len = 2;
+	else if (c >= 0xE0 && c <= 0xEF)
+		len = 3;
+	else if (c >= 0xF0 && c <= 0xF4)
+		len = 4;
+	else
+		return 0;
+	if (c == 0xE0)
+		lo = 0xA0;
+	else if (c == 0xED)
+		hi = 0x9F;
+	else if (c == 0xF0)
+		lo = 0x90;
+	else if (c == 0xF4)
+		hi = 0x8F;
+	if (n < len || s[1] < lo || s[1] > hi)
+		return 0;
+	for (k = 2; k < len; k++)
+		if ((s[k] & 0xC0) != 0x80)
+			return 0;
+	return len;
+}
+
 /* like pc_jw_str, but a byte that cannot be part of valid UTF-8 becomes U+FFFD: client bytes in a
  * diagnostic sample (slow log, client rows) need no fidelity and must not break strict readers */
 void pc_jw_str_utf8(struct pc_jw *w, const char *s, size_t n)
@@ -416,20 +459,7 @@ void pc_jw_str_utf8(struct pc_jw *w, const char *s, size_t n)
 			i++;
 			continue;
 		}
-		/* the same sequence rules pc_utf8_clean applies, one
-		 * character at a time */
-		if ((c & 0xE0) == 0xC0 && c >= 0xC2 && i + 1 < n &&
-		        ((unsigned char)s[i + 1] & 0xC0) == 0x80)
-			len = 2;
-		else if ((c & 0xF0) == 0xE0 && i + 2 < n &&
-		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
-		        ((unsigned char)s[i + 2] & 0xC0) == 0x80)
-			len = 3;
-		else if ((c & 0xF8) == 0xF0 && i + 3 < n &&
-		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
-		        ((unsigned char)s[i + 2] & 0xC0) == 0x80 &&
-		        ((unsigned char)s[i + 3] & 0xC0) == 0x80)
-			len = 4;
+		len = utf8_seq((const unsigned char *)s + i, n - i);
 		if (len) {
 			pc_jw_raw(w, (const char *)&s[i], len);
 			i += len;
@@ -452,20 +482,12 @@ int pc_utf8_clean(const char *s, size_t n)
 			return 0;
 		if (c < 0x80) {
 			i++;
-		} else if ((c & 0xE0) == 0xC0 && i + 1 < n &&
-		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 && c >= 0xC2) {
-			i += 2;
-		} else if ((c & 0xF0) == 0xE0 && i + 2 < n &&
-		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
-		        ((unsigned char)s[i + 2] & 0xC0) == 0x80) {
-			i += 3;
-		} else if ((c & 0xF8) == 0xF0 && i + 3 < n &&
-		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
-		        ((unsigned char)s[i + 2] & 0xC0) == 0x80 &&
-		        ((unsigned char)s[i + 3] & 0xC0) == 0x80) {
-			i += 4;
 		} else {
-			return 0;
+			size_t len = utf8_seq((const unsigned char *)s + i, n - i);
+
+			if (!len)
+				return 0;
+			i += len;
 		}
 	}
 	return 1;

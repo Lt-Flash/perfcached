@@ -118,6 +118,10 @@ int pc_upstream_pull_fetch(const char *col, size_t collen, const char *key,
 int pc_upstream_pull_answer_take(uint32_t *addr, uint16_t *port, uint32_t *req,
 		char *col, size_t ccap, size_t *collen, char *key, size_t kcap,
 		size_t *klen);
+/* a pull of @key timed out: the error to answer when its owner fetches it from the upstream
+ * (the owner leaves a failed fetch unanswered) and on_error = error, else NULL */
+const char *pc_upstream_pull_lost(const char *col, size_t collen,
+		const char *key, size_t klen);
 /* how much longer than pull_timeout_ms a pull of a read-through key
  * may wait (the owner fetches from Redis first); 0 for any other collection */
 int pc_upstream_pull_extra_ms(const char *col, size_t collen);
@@ -133,6 +137,9 @@ int pc_upstream_fwd_ack_take(uint32_t *addr, uint16_t *port, uint32_t *req,
  * Redis's by construction) - its "t" mark is written here, passively */
 void pc_upstream_note_copy(const char *col, size_t collen, const char *k,
 		size_t kl, unsigned int exp, unsigned long long ver);
+/* @col a ".nofall" companion and @k's record held in its collection: the mark stays */
+int pc_upstream_mark_held(const char *col, size_t collen, const char *k,
+		size_t kl);
 /* is @k one of @col's upstream keys (upstream_prefixes)? */
 int pc_upstream_allowed(const char *col, size_t collen, const char *k,
 		size_t kl);

@@ -47,6 +47,21 @@ static int resp_cl_port(const struct pc_member *m)
 	return m->resp_port ? m->resp_port : m->client_port;
 }
 
+/* drop the cards a client cannot dial - a member that left (kept while its id is reserved) or one
+ * with no port - in place; returns how many remain */
+static int resp_cl_present(struct pc_member *mem, int nm)
+{
+	int i, n = 0;
+
+	for (i = 0; i < nm; i++)
+		if (mem[i].is_self || (mem[i].gone_s < 0 && resp_cl_port(&mem[i]) > 0)) {
+			if (n != i)
+				mem[n] = mem[i];
+			n++;
+		}
+	return n;
+}
+
 /* one member as [ip, port, id], the triple CLUSTER SLOTS wants */
 static void resp_cl_node(struct pc_jw *w, const struct pc_member *m)
 {
@@ -164,7 +179,7 @@ static void resp_clmap_store(int shards, unsigned long long key,
 int rh_cluster(struct resp_ctx *c)
 {
 	struct pc_member *mem = members_scratch();
-	int nm = mem ? pc_cluster_members(mem, PC_CL_MAXMEMBERS) : 0;
+	int nm = mem ? resp_cl_present(mem, pc_cluster_members(mem, PC_CL_MAXMEMBERS)) : 0;
 	const char *sub = c->nargs >= 2 ? c->argv[1] : "";
 	size_t subl = c->nargs >= 2 ? c->argl[1] : 0;
 

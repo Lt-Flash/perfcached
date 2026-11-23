@@ -105,15 +105,34 @@ static int buf_reserve(char **b, size_t *cap, size_t have, size_t need,
 	return 0;
 }
 
+/* records io_uring held through a pause or hold (ur_hold) decrypt into c->in under the hold's
+ * limit, as a plaintext connection's held bytes do, not one request's */
+static __thread int in_hold_serve;
+
 int in_append(struct pc_conn *c, const char *p, size_t n)
 {
-	if (buf_reserve(&c->in, &c->in_cap, c->in_len, n,
+	if (buf_reserve(&c->in, &c->in_cap, c->in_len, n, in_hold_serve ?
+	        PC_MAX_REQ + 4 * PC_NOISE_MAXMSG + PC_UR_HOLD_MAX :
 	        PC_MAX_REQ + PC_BIN_HDR) < 0)
 		return -1;
 	bufs_mark(c);
 	memcpy(c->in + c->in_len, p, n);
 	c->in_len += n;
 	return 0;
+}
+
+/* the output cap; a test lowers it (PERFCACHED_TEST_OUTQ) to reach it with small replies */
+static size_t outq_max(void)
+{
+	static size_t m;
+
+	if (!m) {
+		const char *e = getenv("PERFCACHED_TEST_OUTQ");
+		long long v = e ? atoll(e) : 0;
+
+		m = v > 0 && v < PC_MAX_OUTQ ? (size_t)v : PC_MAX_OUTQ;
+	}
+	return m;
 }
 
 int out_append(struct pc_conn *c, const char *p, size_t n)
@@ -127,12 +146,12 @@ int out_append(struct pc_conn *c, const char *p, size_t n)
 	/* an io_uring send's unsent part is still backlog: the cap covers both, as on epoll, so
 	 * the send's completion merges them within PC_MAX_OUTQ */
 	if (c->ur_send &&
-	    c->out_len + n + (c->wire_len - c->wire_off) > PC_MAX_OUTQ) {
+	    c->out_len + n + (c->wire_len - c->wire_off) > outq_max()) {
 		if (!c->out_failed)
 			c->out_failed = 1;
 		return -1;
 	}
-	rc = buf_reserve(&c->out, &c->out_cap, c->out_len, n, PC_MAX_OUTQ);
+	rc = buf_reserve(&c->out, &c->out_cap, c->out_len, n, outq_max());
 
 	if (rc < 0) {                  /* -1 at the cap, -2 out of memory */
 		if (!c->out_failed)
@@ -460,9 +479,12 @@ static __thread int walp_here;
 static unsigned long long walp_now_all, walp_pauses_all;
 int pc_output_stall_s = 30;
 
+/* a hold (a KEYS walk, a read-through fetch, a parked RESP command) serves nothing behind it, so
+ * its input waits in the socket as a pause's does */
 static inline int conn_input_off(const struct pc_conn *c)
 {
-	return c->ps_paused || c->out_paused || c->wal_paused;
+	return c->ps_paused || c->out_paused || c->wal_paused ||
+		c->enum_active || c->up_hold || c->park_hold;
 }
 
 static inline size_t out_pending(const struct pc_conn *c)
@@ -510,6 +532,21 @@ static void ur_starve(struct pc_conn *c)
 	c->ur_starved = 1;
 	c->ur_starved_next = ur_starved_head;
 	ur_starved_head = c;
+}
+
+/* off that list: a destroyed connection may be freed before the next retry walks it */
+static void ur_unstarve(struct pc_conn *c)
+{
+	struct pc_conn **pp = &ur_starved_head;
+
+	if (!c->ur_starved)
+		return;
+	while (*pp && *pp != c)
+		pp = &(*pp)->ur_starved_next;
+	if (*pp)
+		*pp = c->ur_starved_next;
+	c->ur_starved = 0;
+	c->ur_starved_next = NULL;
 }
 
 /* the requests in flight, brought in line with what the connection wants */
@@ -676,8 +713,10 @@ void conn_destroy(struct pc_conn *c)
 		*c->list = c->next;
 	if (c->next)
 		c->next->prev = c->prev;
-	if (c->ep < 0)
+	if (c->ep < 0) {
+		ur_unstarve(c);
 		ur_drop(c);
+	}
 	if (c->ur_send) {                  /* the kernel still reads it: */
 		c->ur_wire_hold = c->wire; /* the send's completion frees it */
 		c->wire = NULL;
@@ -1240,6 +1279,9 @@ int conn_flush(struct pc_conn *c)
 	struct epoll_event ev;
 	ssize_t n;
 
+	/* a reply that did not fit was lost: the stream is out of step, the caller closes it */
+	if (c->out_failed)
+		return -1;
 	/* a send in flight owns c->wire: staged replies wait in c->out for its completion,
 	 * and CLIENT LIST sees them pending */
 	if (c->ur_send) {
@@ -1347,6 +1389,7 @@ static int bin_reply_ex(struct pc_conn *c, uint64_t id, int flags,
 		const char *payload, size_t n, const char *trail, size_t tn)
 {
 	char hdr[PC_BIN_HDR];
+	size_t at = c->out_len;
 
 	hdr[0] = (char)PC_BIN_MAGIC;
 	hdr[1] = PC_BIN_VER;
@@ -1354,11 +1397,13 @@ static int bin_reply_ex(struct pc_conn *c, uint64_t id, int flags,
 	hdr[3] = (char)flags;
 	put32(hdr + 4, (uint32_t)(n + tn));
 	put64(hdr + 8, id);
-	if (out_append(c, hdr, sizeof hdr) < 0)
+	/* all of the frame or none of it: a lone header would frame what follows */
+	if (out_append(c, hdr, sizeof hdr) < 0 || out_append(c, payload, n) < 0 ||
+	        (tn && out_append(c, trail, tn) < 0)) {
+		c->out_len = at;
 		return -1;
-	if (out_append(c, payload, n) < 0)
-		return -1;
-	return tn ? out_append(c, trail, tn) : 0;
+	}
+	return 0;
 }
 
 static int bin_reply(struct pc_conn *c, uint64_t id, int flags,
@@ -1768,7 +1813,29 @@ static int pf_gate(pcache_htable_t *ht)
 	return pf_gate_on;
 }
 
+static void pause_set_events(struct pc_conn *c);
+
+static int plaintext_drain(struct pc_conn *c);
+
+/* the drain, then input on or off as a hold began or ended in it; records io_uring held
+ * through the hold (ur_hold) are served once it is over */
 int process_plaintext(struct pc_conn *c)
+{
+	int rc = plaintext_drain(c), h;
+
+	if (rc < 0 || c->dead)
+		return rc;
+	h = c->enum_active || c->up_hold || c->park_hold;
+	if (h == c->in_held)
+		return rc;
+	c->in_held = h;
+	pause_set_events(c);
+	if (!h && c->ep < 0 && c->raw_len && (c->encrypted || c->tls))
+		return conn_take(c, NULL, 0);
+	return rc;
+}
+
+static int plaintext_drain(struct pc_conn *c)
 {
 	size_t off = 0;
 	int rc = 0;
@@ -2052,7 +2119,7 @@ static struct parked *park_find(unsigned int req)
 	return NULL;
 }
 
-static void pull_complete_body(const struct pc_pull_done *d);
+static void pull_complete_body(const struct pc_pull_done *d, int rd);
 /* a read-through fetch this worker's connection waited on is done: release the hold and
  * run the parked command, then what the client pipelined behind it, in order */
 void pc_proto_upstream_complete(unsigned int req, int status)
@@ -2121,6 +2188,10 @@ void pc_proto_upstream_complete(unsigned int req, int status)
 static void resp_park_done(struct pc_conn *c)
 {
 	c->park_hold = 0;
+	if (c->out_failed) {               /* its reply was lost: run nothing behind it */
+		conn_destroy(c);
+		return;
+	}
 	if (process_plaintext(c) < 0) {
 		c->why = "protocol error";
 		conn_destroy(c);
@@ -2149,7 +2220,8 @@ static void mget_answer(struct pc_mget *m)
 		if (!buf) {
 			pc_mget_free(m);
 			bin_reply(c, id, PC_BIN_F_ERR, "out of memory", 13);
-			conn_flush(c);
+			if (conn_flush(c) < 0)
+				conn_destroy(c);
 			return;
 		}
 		pc_tw_init(&w, (unsigned char *)buf, JW_REPLY_CAP);
@@ -2162,7 +2234,8 @@ static void mget_answer(struct pc_mget *m)
 		else
 			bin_reply(c, id, 0, (const char *)w.b, w.n);
 		pc_tw_free(&w);
-		conn_flush(c);
+		if (conn_flush(c) < 0)
+			conn_destroy(c);
 		return;
 	}
 	{
@@ -2227,7 +2300,7 @@ void pc_proto_pull_complete(const struct pc_pull_done *d)
 				dd.ok = st;
 				dd.val = st == 0 ? frag : NULL;
 				dd.vlen = st == 0 ? fl : 0;
-				pull_complete_body(&dd);
+				pull_complete_body(&dd, 1);
 				return;
 			}
 			/* a hash read pulled the record: 0 a hash, 1 absent, 3 wrong type */
@@ -2252,9 +2325,13 @@ void pc_proto_pull_complete(const struct pc_pull_done *d)
 			dd.ok = 2;             /* holder rejected / timed out */
 		}
 		d = &dd;
+		pull_complete_body(d, 1);
+		if (rendered)
+			pc_tw_free(&rt);
+		return;
 	}
 plain:
-	pull_complete_body(d);
+	pull_complete_body(d, d->kind == PC_DONE_JSON && d->jop == PC_JOP_GET);
 	if (rendered)
 		pc_tw_free(&rt);
 }
@@ -2295,12 +2372,14 @@ void pc_pull_found_keep(const char *col, size_t collen, const char *key,
 	}
 }
 
-static void pull_complete_body(const struct pc_pull_done *d)
+/* @rd: the request was a read (a pull, or a forwarded document or hash read) */
+static void pull_complete_body(const struct pc_pull_done *d, int rd)
 {
 	struct parked *pk = NULL;
 	struct pc_conn *c;
 	long long resume_nv;
-	int resume_rc, pull_wrongtype = 0;
+	int resume_rc, pull_wrongtype = 0, busy;
+	const char *pull_uperr = NULL;
 
 	pk = park_find(d->req);
 	if (!pk)
@@ -2315,8 +2394,18 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		pull_wrongtype = tht && pc_store_types_strict(tht);
 	}
 
+	if (d->kind == PC_DONE_PULL && !d->found && d->timedout && !pk->pres)
+		pull_uperr = pc_upstream_pull_lost(pk->col, pk->collen, pk->key,
+			pk->klen);
+	/* a read nobody answered in time is no miss: refused as retryable, nothing cached */
+	busy = d->timedout && !pull_uperr &&
+		(d->kind == PC_DONE_PULL ? !d->found : rd);
 	if (d->kind == PC_DONE_PULL && d->found) {
 		pc_pull_found_keep(pk->col, pk->collen, pk->key, pk->klen, d);
+	} else if (pull_uperr) {
+		/* the owner's upstream fetch failed: neither a miss nor a marker */
+	} else if (busy) {
+		/* answered below */
 	} else if (d->kind == PC_DONE_PULL) {
 		pcache_htable_t *ht = pc_store_find(pk->col, pk->collen);
 
@@ -2417,24 +2506,33 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		struct pc_jw w;
 
 		pc_jw_init(&w, nb, sizeof nb);
-		switch (d->kind) {
+		if (busy)
+			out_append(c, "-TRYAGAIN cluster busy, retry\r\n",
+				sizeof "-TRYAGAIN cluster busy, retry\r\n" - 1);
+		else switch (d->kind) {
 		case PC_DONE_PULL:
 			if (pk->pres) {
 				pc_pres_resp(&w, pk->pres, d->found,
 					(unsigned int)d->newval, d->ttl_left);
 				out_append(c, w.buf, w.len);
-			} else if (pull_wrongtype) {
-				out_append(c, "-", 1);
-				out_append(c, pc_wrongtype_msg,
-					strlen(pc_wrongtype_msg));
+			} else if (pull_wrongtype || pull_uperr) {
+				const char *em = pull_uperr ? pull_uperr
+					: pc_wrongtype_msg;
+
+				out_append(c, pull_uperr ? "-ERR " : "-",
+					pull_uperr ? 5 : 1);
+				out_append(c, em, strlen(em));
 				out_append(c, "\r\n", 2);
 			} else if (d->found) {
+				size_t at = c->out_len;
+
 				pc_jw_lit(&w, "$");
 				pc_jw_i64(&w, d->vlen);
 				pc_jw_lit(&w, "\r\n");
-				out_append(c, w.buf, w.len);
-				out_append(c, d->val, (size_t)d->vlen);
-				out_append(c, "\r\n", 2);
+				if (out_append(c, w.buf, w.len) < 0 ||
+				        out_append(c, d->val, (size_t)d->vlen) < 0 ||
+				        out_append(c, "\r\n", 2) < 0)
+					c->out_len = at;   /* resp_park_done closes it */
 			} else {
 				out_append(c, "$-1\r\n", 5);
 			}
@@ -2646,6 +2744,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		case PC_DONE_PULL:             /* the get reply shape */
 			if (pull_wrongtype)
 				emsg = pc_wrongtype_msg;
+			else if (pull_uperr)
+				emsg = pull_uperr;
 			break;
 		case PC_DONE_SET_RESUME:
 			if (!d->ok) {          /* probe timeout: refuse */
@@ -2677,6 +2777,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		default:
 			emsg = "protocol";     /* document ops park CMD frames only */
 		}
+		if (busy)
+			emsg = "cluster busy";  /* PERFD_E_REFUSED: retry */
 		tn = park_moved(pk, &flags, trail);
 		if (!emsg)
 			tn += park_hint(pk, d, &flags, trail + tn);
@@ -2707,7 +2809,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 		} else {
 			bin_reply_ex(c, id, flags, pay, pn, trail, tn);
 		}
-		conn_flush(c);
+		if (conn_flush(c) < 0)
+			conn_destroy(c);           /* drops this park too */
 		free(pk->key);
 		pk->key = NULL;
 		free(pk->hargs);
@@ -2728,6 +2831,16 @@ static void pull_complete_body(const struct pc_pull_done *d)
 
 		if (!tb)
 			goto done;
+		if (pull_uperr || busy) {
+			/* as the same read's local upstream failure answers; a read
+			 * nobody answered in time, as a busy cluster does */
+			const char *em = pull_uperr ? pull_uperr : "cluster busy";
+
+			bin_reply(c, id, PC_BIN_F_ERR, em, strlen(em));
+			if (conn_flush(c) < 0)
+				conn_destroy(c);
+			goto done;
+		}
 		pc_tw_init(&w, tb, JW_REPLY_CAP);
 		switch (d->kind) {
 		case PC_DONE_FWD_SET:
@@ -2876,7 +2989,8 @@ static void pull_complete_body(const struct pc_pull_done *d)
 			bin_reply_ex(c, id, flags, (const char *)w.b, w.n, trail, tn);
 		else
 			bin_reply(c, id, PC_BIN_F_ERR, "reply too large", 15);
-		conn_flush(c);
+		if (conn_flush(c) < 0)
+			conn_destroy(c);
 	}
 
 done:
@@ -3302,7 +3416,8 @@ static int push_flush(struct pc_conn *c)
 {
 	if (conn_flush(c) == 0)
 		return 0;
-	return c->out_len + (c->wire_len - c->wire_off) >= PC_MAX_OUTQ
+	return c->out_failed == 1 ||
+		c->out_len + (c->wire_len - c->wire_off) >= PC_MAX_OUTQ
 		? PC_PS_PUSH_SLOW : PC_PS_PUSH_BROKEN;
 }
 
@@ -3656,6 +3771,7 @@ void pc_conn_flush_pushes(void)
 int pc_conn_notify(struct pc_conn *c, const char *payload, size_t n)
 {
 	char hdr[PC_BIN_HDR];
+	size_t at;
 	int rc;
 
 	if (c->encrypted && !c->established)
@@ -3668,11 +3784,14 @@ int pc_conn_notify(struct pc_conn *c, const char *payload, size_t n)
 	hdr[3] = 0;
 	put32(hdr + 4, (uint32_t)n);
 	put64(hdr + 8, 0);
+	at = c->out_len;
 	rc = out_append(c, hdr, sizeof hdr);
 	if (rc == 0)
 		rc = out_append(c, payload, n);
-	if (rc < 0)
+	if (rc < 0) {
+		c->out_len = at;               /* never a header alone */
 		return rc;                     /* SLOW at the cap, NOMEM */
+	}
 	return push_stage(c);
 }
 
@@ -3839,14 +3958,25 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 			if (c->raw_len && in_append(c, c->raw, c->raw_len) < 0)
 				return -1;
 			c->raw_len = 0;
-		} else if (channel_records(c) < 0)
-			return -1;
+		} else {
+			int rc;
+
+			in_hold_serve = !n && c->ep < 0;
+			rc = channel_records(c);
+			in_hold_serve = 0;
+			if (rc < 0)
+				return -1;
+		}
 	} else if (c->tls) {               /* records in, plaintext to the parser */
 		if (c->raw_len) {          /* records held while paused or parked (ur_hold) */
 			size_t hl = c->raw_len;
+			int rc;
 
 			c->raw_len = 0;
-			if (pc_tls_input(c->tls, c->raw, hl, tls_plain, tls_wire, c, &c->why) < 0)
+			in_hold_serve = c->ep < 0;
+			rc = pc_tls_input(c->tls, c->raw, hl, tls_plain, tls_wire, c, &c->why);
+			in_hold_serve = 0;
+			if (rc < 0)
 				return -1;
 		}
 		if (pc_tls_input(c->tls, buf, n, tls_plain, tls_wire, c, &c->why) < 0)

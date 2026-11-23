@@ -192,6 +192,7 @@ static void notify_internal(perfd_t *p, const unsigned char *tree, size_t n)
 			sl == 8 && !memcmp(state, "draining", 8));
 	else if (!strcmp(event, "expelled"))
 		member_expel(p, (int)node);
+	fleet_seen(p);
 }
 
 /* whatever the daemon pushed while nothing was read: a bounded non-blocking look, so a push is

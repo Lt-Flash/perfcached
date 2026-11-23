@@ -45,6 +45,11 @@
 #include <perfd.h>                /* libperfd, linked */
 #include "perfd/resp.h"
 
+#if !defined(PERFD_HAS_URL) || !defined(PERFD_VERSION_TWEAK) || (PERFD_VERSION_MAJOR * 1000000 \
+	+ PERFD_VERSION_MINOR * 10000 + PERFD_VERSION_PATCH * 100 + PERFD_VERSION_TWEAK) < 70601
+#error "func_perfd needs libperfd 0.7.6.1 or later (perfd_url_connect)"
+#endif
+
 /*** DOCUMENTATION
 	<function name="PERFD_GET" language="en_US">
 		<synopsis>
@@ -217,6 +222,7 @@ struct pd_conf {
 	int pool;
 	int connect_timeout_ms;
 	int io_timeout_ms;
+	int call_timeout_ms;           /* resp: 0 = 2 x (connect + 2 x io) */
 	int wait_timeout_ms;
 	long long default_ttl;
 	size_t max_value;
@@ -224,6 +230,7 @@ struct pd_conf {
 	int spares;
 	int route_keys;
 	int keepalive_s;
+	int ntcp;                      /* binary: TCP servers, dialled as one perfd:// URL's seeds */
 	struct resp_sess_conf resp;    /* points into this struct */
 };
 
@@ -231,8 +238,8 @@ struct pd_conn {
 	int in_use;                    /* pool lock */
 	/* owned by the borrower while in_use */
 	perfd_t *h;
+	perfd_url *url;                /* binary, TCP seeds: its dial backoff is this connection's */
 	struct resp_sess *rs;
-	int next_server;
 	int opened_before;
 	unsigned long long failovers_done;
 	unsigned long long failovers_live;
@@ -270,9 +277,6 @@ struct pd_pool {
 };
 
 static AO2_GLOBAL_OBJ_STATIC(pd_pool_global);
-
-/* libperfd's connect error lives in one process-wide buffer: dials take turns */
-AST_MUTEX_DEFINE_STATIC(pd_dial_lock);
 
 AST_MUTEX_DEFINE_STATIC(pd_log_lock);
 static time_t pd_log_second;
@@ -425,6 +429,33 @@ static int set_string(char **dst, const char *v)
 	return *dst ? 0 : -1;
 }
 
+/* the TCP servers as a perfd:// URL, starting at the @first one (each pooled connection its
+ * own start), with the options the config gives: perfd_url_connect applies them */
+static int conf_url(const struct pd_conf *cf, int first, char *buf, size_t cap)
+{
+	static const char *const pols[] = { "failover", "rr", "least", "weighted" };
+	size_t off;
+	int k, n = 0, spares;
+
+	off = (size_t)snprintf(buf, cap, "perfd://");
+	for (k = 0; k < cf->nservers && off < cap; k++) {
+		const struct resp_server *sv = &cf->servers[(first + k) % cf->nservers];
+
+		if (sv->path) {
+			continue;
+		}
+		off += (size_t)snprintf(buf + off, cap - off, "%s%s%s%s:%d", n++ ? "," : "",
+			strchr(sv->host, ':') ? "[" : "", sv->host, strchr(sv->host, ':') ? "]" : "", sv->port);
+	}
+	spares = cf->spares == PERFD_SPARES_NONE ? 0 : cf->spares <= 0 ? -1
+		: cf->spares > PERFD_URL_MAX_SEEDS ? PERFD_URL_MAX_SEEDS : cf->spares;
+	if (off < cap) {
+		off += (size_t)snprintf(buf + off, cap - off, "/func_perfd?route=%d,encrypt=0,spares=%d,policy=%s",
+			cf->route_keys, spares, pols[cf->policy >= 0 && cf->policy < 4 ? cf->policy : 0]);
+	}
+	return off < cap ? 0 : -1;
+}
+
 /* @line 0: the refusal is about the file as a whole */
 #define CONF_FAIL(line, ...) do { \
 	ast_log(LOG_ERROR, PD_CONFIG ": " __VA_ARGS__); \
@@ -529,6 +560,11 @@ static struct pd_conf *conf_parse(struct ast_config *cfg)
 				CONF_FAIL(v->lineno, "io_timeout_ms '%s' is not 1..60000\n", v->value);
 			}
 			cf->io_timeout_ms = (int)x;
+		} else if (!strcasecmp(v->name, "call_timeout_ms")) {
+			if (parse_ll(v->value, 1, 600000, &x)) {
+				CONF_FAIL(v->lineno, "call_timeout_ms '%s' is not 1..600000\n", v->value);
+			}
+			cf->call_timeout_ms = (int)x;
 		} else if (!strcasecmp(v->name, "wait_timeout_ms")) {
 			if (parse_ll(v->value, 1, 60000, &x)) {
 				CONF_FAIL(v->lineno, "wait_timeout_ms '%s' is not 1..60000\n", v->value);
@@ -605,12 +641,37 @@ static struct pd_conf *conf_parse(struct ast_config *cfg)
 		}
 	}
 
+	if (cf->protocol == PD_BINARY) {
+		char url[4096], why[256] = "the server list is too long";
+		perfd_url *u;
+
+		for (i = 0; i < cf->nservers; i++) {
+			cf->ntcp += !cf->servers[i].path;
+		}
+		if (cf->ntcp > PERFD_URL_MAX_SEEDS) {
+			CONF_FAIL(0, "%d TCP servers: binary takes at most %d (they are seeds; the fleet's members are learned from any one)\n",
+				cf->ntcp, PERFD_URL_MAX_SEEDS);
+		}
+		if (cf->spares > PERFD_URL_MAX_SEEDS) {
+			ast_log(LOG_WARNING, PD_CONFIG ": spares = %d is taken as %d, libperfd's most\n",
+				cf->spares, PERFD_URL_MAX_SEEDS);
+		}
+		if (cf->ntcp) {
+			u = conf_url(cf, 0, url, sizeof(url)) ? NULL : perfd_url_parse(url, why, sizeof(why));
+			if (!u) {
+				CONF_FAIL(0, "the binary servers do not make a libperfd seed list: %s\n", why);
+			}
+			perfd_url_free(u);
+		}
+	}
+
 	cf->resp.servers = cf->servers;
 	cf->resp.nservers = cf->nservers;
 	cf->resp.username = cf->username;
 	cf->resp.password = cf->password;
 	cf->resp.connect_timeout_ms = cf->connect_timeout_ms;
 	cf->resp.io_timeout_ms = cf->io_timeout_ms;
+	cf->resp.call_timeout_ms = cf->call_timeout_ms;
 	cf->resp.max_bulk = cf->max_value;
 	return cf;
 }
@@ -625,6 +686,7 @@ static void pool_destroy(void *obj)
 			if (p->conns[i].h) {
 				perfd_free(p->conns[i].h);
 			}
+			perfd_url_free(p->conns[i].url);
 			resp_sess_free(p->conns[i].rs);
 		}
 	}
@@ -656,8 +718,35 @@ static struct pd_pool *pool_new(struct pd_conf *cf)
 				return NULL;
 			}
 		}
+	} else if (cf->ntcp) {
+		char url[4096];
+
+		for (i = 0; i < cf->pool; i++) {
+			p->conns[i].url = conf_url(cf, i, url, sizeof(url)) ? NULL
+				: perfd_url_parse(url, NULL, 0);
+			if (!p->conns[i].url) {
+				ao2_ref(p, -1);
+				return NULL;
+			}
+		}
 	}
 	return p;
+}
+
+/* the member a URL-dialled handle works through, as host:port */
+static void conn_where(const perfd_t *h, char *buf, size_t cap)
+{
+	char addr[64];                 /* an IPv6 text is 45 at most */
+	int i, port, node, active;
+
+	ast_copy_string(buf, "a seed", cap);
+	for (i = 0; i < perfd_member_count(h); i++) {
+		if (!perfd_member_info(h, i, addr, sizeof(addr), &port, &node, &active) && active) {
+			snprintf(buf, cap, "%s%s%s:%d", strchr(addr, ':') ? "[" : "", addr,
+				strchr(addr, ':') ? "]" : "", port);
+			return;
+		}
+	}
 }
 
 static int bin_open(const struct pd_conf *cf, struct pd_conn *c, char *err, size_t cap)
@@ -675,25 +764,34 @@ static int bin_open(const struct pd_conf *cf, struct pd_conn *c, char *err, size
 	o.route_keys = cf->route_keys;
 	o.keepalive_s = cf->keepalive_s;
 
-	ast_mutex_lock(&pd_dial_lock);
+	/* no lock across a dial: under concurrent failures perfd_error(NULL) may read another
+	 * connection's text, the process-wide buffer being libperfd's */
+	if (c->url) {
+		perfd_t *h = perfd_url_connect(c->url, &o);
+
+		if (h) {
+			c->h = h;
+			conn_where(h, c->seed, sizeof(c->seed));
+			return 0;
+		}
+		snprintf(err, cap, "%s", perfd_error(NULL));
+	}
 	for (k = 0; k < cf->nservers; k++) {
-		int i = (c->next_server + k) % cf->nservers;
-		const struct resp_server *sv = &cf->servers[i];
+		const struct resp_server *sv = &cf->servers[k];
 		perfd_t *h;
 
+		if (!sv->path) {
+			continue;
+		}
 		server_name(sv, name, sizeof(name));
-		h = sv->path ? perfd_connect_unix(sv->path, &o)
-			: perfd_connect(sv->host, sv->port, &o);
+		h = perfd_connect_unix(sv->path, &o);
 		if (h) {
-			ast_mutex_unlock(&pd_dial_lock);
 			c->h = h;
-			c->next_server = (i + 1) % cf->nservers;
 			ast_copy_string(c->seed, name, sizeof(c->seed));
 			return 0;
 		}
 		snprintf(err, cap, "%s: %s", name, perfd_error(NULL));
 	}
-	ast_mutex_unlock(&pd_dial_lock);
 	return -1;
 }
 
@@ -716,9 +814,7 @@ static void bin_after_error(struct pd_conn *c)
 	if (perfd_state(c->h) != PERFD_ST_FAILED) {
 		return;
 	}
-	ast_mutex_lock(&pd_dial_lock);
 	rc = perfd_redial(c->h);
-	ast_mutex_unlock(&pd_dial_lock);
 	if (rc == 0) {
 		c->pending_reconnects++;
 	} else {
@@ -1352,6 +1448,7 @@ static int load_module(void)
 	perfd_set_log(pd_libperfd_log, NULL);
 
 	if (load_config(0)) {
+		perfd_set_log(NULL, NULL);    /* a declined module is unmapped too */
 		return AST_MODULE_LOAD_DECLINE;
 	}
 	res |= ast_custom_function_register(&get_function);

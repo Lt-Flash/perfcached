@@ -747,6 +747,11 @@ got10 = dict((k, r10.get(k)) for k in want10)
     "AT-11: the card says what waits for members, for whom, and the stuck one (%s; got %s)" % (e10 or "clean", got10))
 (ok if not e8 and "waiting for" not in r8 and "deletes awaiting members" not in r8 else bad)(
     "AT-11: a daemon without the marks shows neither row (%s; got %s)" % (e8 or "clean", sorted(r8)))
+# a fleet that does not confirm (a member on tombstone_acks = no) keeps its numbered deletes by time:
+# nothing awaits members, so the row says so rather than reading as a stuck queue
+r11, e11 = neg_rows(dict(t8, numbered=4800), {"fleet": {"confirming": False, "waiting_for": [2, 3]}, "held_by": []})
+(ok if not e11 and r11.get("numbered deletes (kept by time)") == ("", "4800") and "deletes awaiting members" not in r11 else bad)(
+    "the time rule: numbered deletes kept by time, not awaiting members (%s; got %s)" % (e11 or "clean", sorted(r11.items())))
 # connects per second on the clients card, from both doors' accept counters between polls
 # (the average from the five-minute windows); the door cards say "connects (5 min)"
 ctx.execute("var __now=1000000; Date.now=function(){return __now;};")

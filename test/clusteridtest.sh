@@ -146,7 +146,7 @@ else
 	echo "cut 127.0.5.11 rst" > "$D/cut9"; echo "cut 127.0.5.9 rst" > "$D/cut11"; : > "$D/cut10"
 	# node 10 starts once both have founded: a blank node hearing its beat would join through it
 	rstart() {
-		LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut$1" PC_NETCUT_LOG="$D/cutlog$1" \
+		LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut$1" PC_NETCUT_LOG="$D/cutlog$1" \
 			"$BIN" -f "$D/r$1.conf" >> "$D/r$1.log" 2>&1 &
 		P=$!; PIDS="$PIDS $P"; eval "PR$1=$P"
 	}

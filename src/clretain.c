@@ -52,9 +52,16 @@ static struct shard {
 static struct { uint64_t oid; uint32_t incarn; uint64_t through; unsigned int at_s;
 	uint64_t lost; } FG[SPL_MAX];      /* lost = dropped by time or cap */
 static unsigned int nfg;
+static int fg_full;                    /* a loss or forget FG had no row for: all count lost */
 static pthread_mutex_t FG_mx = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long long R_forgot, R_forgot_exp;              /* atomic */
 static unsigned int R_num;              /* numbered entries (atomic) */
+
+/* the own space's superseded seqs, a ring: an overwritten one reads as not superseded */
+static struct { uint64_t oid; uint32_t incarn; } SUP_own;
+static uint64_t SUP[CLRETAIN_SUP_MAX];
+static unsigned long long SUP_n;
+static pthread_mutex_t SUP_mx = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned int R_retain_s, R_max;
 static int R_on;
@@ -98,7 +105,12 @@ void clretain_init(unsigned int retain_s, unsigned int max)
 	__atomic_store_n(&R_num, 0, __ATOMIC_RELAXED);
 	pthread_mutex_lock(&FG_mx);
 	nfg = 0;
+	/* PERFCACHED_TEST_FG_FULL: the loss table starts full, as a fleet past SPL_MAX spaces leaves it */
+	fg_full = getenv("PERFCACHED_TEST_FG_FULL") != NULL;
 	pthread_mutex_unlock(&FG_mx);
+	pthread_mutex_lock(&SUP_mx);
+	SUP_n = 0;
+	pthread_mutex_unlock(&SUP_mx);
 	R_on = retain_s > 0 && max > 0;
 	if (!R_on)
 		return;
@@ -253,6 +265,8 @@ static void slist_append(struct shard *s, struct ent *e, int spi,
 
 /* the entry now stands for the delete noted at (oid, incarn, seq) -
  * seq 0 for one without a number */
+static void lost_seq(uint64_t oid, uint32_t incarn, uint64_t seq);
+
 static void ent_number(struct shard *s, struct ent *e, uint64_t oid,
 		uint32_t incarn, uint64_t seq)
 {
@@ -262,14 +276,14 @@ static void ent_number(struct shard *s, struct ent *e, uint64_t oid,
 		slist_unlink(s, e);
 	if (seq && (spi = spl_slot(s, oid, incarn, 1)) >= 0)
 		slist_append(s, e, spi, seq);
+	else if (seq)
+		lost_seq(oid, incarn, seq);    /* no space slot: not held */
 }
 
-/* a numbered entry dropped unconfirmed (time rule or cap): the highest such seq per
- * space.  Under a shard lock; FG_mx nests inside it here and never the other way */
-static void lost_note(const struct shard *s, const struct ent *e)
+/* a numbered delete no longer held unconfirmed (time rule, cap, no room, or a newer unnumbered drop
+ * took it over): the highest such seq per space.  FG_mx nests inside a shard lock, never the other way */
+static void lost_seq(uint64_t oid, uint32_t incarn, uint64_t seq)
 {
-	uint64_t oid = s->sp[e->spi].oid;
-	uint32_t incarn = s->sp[e->spi].incarn;
 	unsigned int i;
 
 	pthread_mutex_lock(&FG_mx);
@@ -283,9 +297,63 @@ static void lost_note(const struct shard *s, const struct ent *e)
 		FG[nfg].at_s = 0;
 		FG[nfg++].lost = 0;
 	}
-	if (i < nfg && e->nseq > FG[i].lost)
-		FG[i].lost = e->nseq;
+	if (i == nfg)
+		fg_full = 1;
+	else if (seq > FG[i].lost)
+		FG[i].lost = seq;
 	pthread_mutex_unlock(&FG_mx);
+}
+
+static void lost_note(const struct shard *s, const struct ent *e)
+{
+	lost_seq(s->sp[e->spi].oid, s->sp[e->spi].incarn, e->nseq);
+}
+
+void clretain_own_space(uint64_t oid, uint32_t incarn)
+{
+	pthread_mutex_lock(&SUP_mx);
+	if (SUP_own.oid != oid || SUP_own.incarn != incarn) {
+		SUP_own.oid = oid;
+		SUP_own.incarn = incarn;
+		SUP_n = 0;
+	}
+	pthread_mutex_unlock(&SUP_mx);
+}
+
+/* under a shard lock (SUP_mx nests inside it): @e's number goes to a newer numbered delete */
+static void sup_note(const struct shard *s, const struct ent *e)
+{
+	pthread_mutex_lock(&SUP_mx);
+	if (SUP_own.oid && SUP_own.oid == s->sp[e->spi].oid &&
+	        SUP_own.incarn == s->sp[e->spi].incarn)
+		SUP[SUP_n++ % CLRETAIN_SUP_MAX] = e->nseq;
+	pthread_mutex_unlock(&SUP_mx);
+}
+
+int clretain_superseded(uint64_t oid, uint32_t incarn, uint64_t lo, uint64_t hi)
+{
+	unsigned char seen[4096 / 8];
+	unsigned long long i, n;
+	uint64_t want, got = 0;
+
+	if (!lo || hi < lo || hi - lo >= 4096)
+		return 0;
+	want = hi - lo + 1;
+	memset(seen, 0, sizeof seen);
+	pthread_mutex_lock(&SUP_mx);
+	if (oid == SUP_own.oid && incarn == SUP_own.incarn) {
+		n = SUP_n < CLRETAIN_SUP_MAX ? SUP_n : CLRETAIN_SUP_MAX;
+		for (i = 0; i < n && got < want; i++) {
+			uint64_t d = SUP[i] - lo;
+
+			if (SUP[i] >= lo && SUP[i] <= hi && !(seen[d / 8] & (1u << (d % 8)))) {
+				seen[d / 8] |= (unsigned char)(1u << (d % 8));
+				got++;
+			}
+		}
+	}
+	pthread_mutex_unlock(&SUP_mx);
+	return got == want;
 }
 
 /* under the shard lock: take @e out of the table and free it */
@@ -336,6 +404,13 @@ static void lost_at(unsigned int t_s)
 		;
 }
 
+static void note_count(int expiry)
+{
+	__atomic_fetch_add(&R_noted, 1, __ATOMIC_RELAXED);
+	if (expiry)
+		__atomic_fetch_add(&R_noted_exp, 1, __ATOMIC_RELAXED);
+}
+
 static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		uint64_t ver, unsigned int now_s, int local, int expiry,
 		uint64_t oid, uint32_t incarn, uint64_t seq)
@@ -348,25 +423,39 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		return;                        /* an unversioned entry orders nothing */
 	h = hash_of(col, cn, key, kn);
 	s = &sh[h % NSHARD];
-	__atomic_fetch_add(&R_noted, 1, __ATOMIC_RELAXED);
-	if (expiry)
-		__atomic_fetch_add(&R_noted_exp, 1, __ATOMIC_RELAXED);
 	pthread_mutex_lock(&s->mx);
+	/* the clock was read before the lock: planting order must stay time order */
+	if (s->tail && s->tail->t_s > now_s)
+		now_s = s->tail->t_s;
+	/* a local drop and a replayed entry of one key are held apart: merged, the replay would carry
+	 * the local drop's version and take a newer copy from a peer */
 	for (e = s->tab[(h / NSHARD) & (s->nb - 1)]; e; e = e->hnext)
-		if (ent_is(e, col, cn, key, kn))
+		if (ent_is(e, col, cn, key, kn) && e->local == (local != 0))
 			break;
 	if (e) {
+		/* held at this version or newer, kind and number unchanged: not planted again at now,
+		 * where a running catch-up would hand a peer's own replay back to it, nor counted */
+		int same = ver <= e->ver && !(ver == e->ver && seq && !e->nseq) &&
+			!(!expiry && e->expiry) && !(e->expiry == 1 && expiry == 2);
+
 		/* a newer delete takes the entry over, numbered or not;
 		 * the same one again adds a number it lacked */
+		if (ver > e->ver && !seq && e->nseq)
+			lost_note(s, e);       /* an unnumbered drop replays nothing for it */
+		if (ver > e->ver && e->nseq && seq && !local && !expiry)
+			sup_note(s, e);        /* a numbered newer delete travels: it stands for it */
 		if (ver > e->ver || (ver == e->ver && seq && !e->nseq))
 			ent_number(s, e, oid, incarn, seq);
+		else if (seq && !e->nseq)
+			lost_seq(oid, incarn, seq);    /* outranked by a drop that replays nothing */
+		if (same) {
+			pthread_mutex_unlock(&s->mx);
+			return;
+		}
+		note_count(expiry);
 		if (ver > e->ver)
 			e->ver = ver;
 		e->t_s = now_s;
-		if (!local && e->local) {
-			e->local = 0;          /* a real delete: replayed from now */
-			__atomic_fetch_sub(&R_local, 1, __ATOMIC_RELAXED);
-		}
 		if (!expiry && e->expiry) {
 			if (e->expiry == 1)
 				xlist_unlink(s, e);
@@ -384,6 +473,7 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 		pthread_mutex_unlock(&s->mx);
 		return;
 	}
+	note_count(expiry);
 	if (__atomic_load_n(&R_n, __ATOMIC_RELAXED) >= R_max && s->head) {
 		/* the cap counts the WHOLE table; the victim: this shard's oldest EXPIRY, else its
 		 * oldest (near-global, no global lock) - but an expiry never pushes out a delete */
@@ -417,12 +507,14 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 			__atomic_fetch_add(&R_dropped_early_exp, 1,
 				__ATOMIC_RELAXED);
 		lost_at(now_s);
+		if (seq)
+			lost_seq(oid, incarn, seq);
 		pthread_mutex_unlock(&s->mx);
 		return;
 	}
 	e->ver = ver;
 	e->t_s = now_s;
-	e->local = (unsigned char)local;
+	e->local = local != 0;
 	e->expiry = (unsigned char)expiry;
 	e->xprev = e->xnext = NULL;
 	e->nseq = 0;                       /* numbered below */
@@ -510,6 +602,8 @@ unsigned long clretain_forget(uint64_t oid, uint32_t incarn, uint64_t upto,
 			FG[nfg].lost = 0;
 			FG[nfg++].through = 0;
 		}
+		if (i == nfg)
+			fg_full = 1;
 		if (i < nfg) {
 			if (upto > FG[i].through)
 				FG[i].through = upto;
@@ -547,6 +641,23 @@ int clretain_gone_each(int (*cb)(uint64_t oid, uint32_t incarn,
 			FG[i].through : FG[i].lost, ctx);
 	pthread_mutex_unlock(&FG_mx);
 	return rc;
+}
+
+uint64_t clretain_space_gone(uint64_t oid, uint32_t incarn)
+{
+	uint64_t g = 0;
+	unsigned int i;
+
+	if (!R_on)
+		return UINT64_MAX;
+	pthread_mutex_lock(&FG_mx);
+	if (fg_full)
+		g = UINT64_MAX;
+	for (i = 0; i < nfg && !g; i++)
+		if (FG[i].oid == oid && FG[i].incarn == incarn)
+			g = FG[i].through > FG[i].lost ? FG[i].through : FG[i].lost;
+	pthread_mutex_unlock(&FG_mx);
+	return g;
 }
 
 unsigned int clretain_space_each(uint64_t oid, uint32_t incarn, uint64_t from,
@@ -611,11 +722,9 @@ uint64_t clretain_get(const char *col, size_t cn, const char *key, size_t kn,
 		return 0;
 	}
 	for (e = s->tab[(h / NSHARD) & (s->nb - 1)]; e; e = e->hnext)
-		if (ent_is(e, col, cn, key, kn)) {
-			if (now_s - e->t_s < R_retain_s)
-				v = e->ver;
-			break;
-		}
+		if (ent_is(e, col, cn, key, kn) && now_s - e->t_s < R_retain_s &&
+		    e->ver > v)
+			v = e->ver;            /* a local drop's and a delete's: the higher */
 	pthread_mutex_unlock(&s->mx);
 	return v;
 }

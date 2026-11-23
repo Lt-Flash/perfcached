@@ -42,7 +42,7 @@ PID=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n.log"; do sleep 0.1; i=$((i+1)); done
 grep -q "perfcached ready" "$D/n.log" || { echo "liballoctest: the node did not start: $(tail -3 "$D/n.log")"; exit 1; }
 : > "$D/count"
-PC_ALLOC_COUNT="$D/count" LD_PRELOAD="$SHIM" "$DRV" "$PORT" "$D/count" > "$D/run.out" 2>&1
+PC_ALLOC_COUNT="$D/count" LD_PRELOAD="$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" "$DRV" "$PORT" "$D/count" > "$D/run.out" 2>&1
 RC=$?
 CTL=$(sed -n 's/^control //p' "$D/run.out")
 if [ "${CTL:-0}" = 0 ]; then

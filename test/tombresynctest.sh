@@ -63,7 +63,7 @@ C
 }
 start() { # start <i> [shim]
 	if [ -n "${2:-}" ]; then
-		LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/$A/cut3" PC_NETCUT_LOG="$D/$A/cutlog3" \
+		LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/$A/cut3" PC_NETCUT_LOG="$D/$A/cutlog3" \
 			"$BIN" -f "$D/$A/n$1.conf" >> "$D/$A/n$1.log" 2>&1 &
 	else
 		"$BIN" -f "$D/$A/n$1.conf" >> "$D/$A/n$1.log" 2>&1 &

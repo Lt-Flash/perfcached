@@ -26,6 +26,9 @@
 #define PEND_SLOT_BITS  16
 #define PEND_SLOT_MASK  ((1u << PEND_SLOT_BITS) - 1)
 #define PEND_GEN_SHIFT  PEND_SLOT_BITS
+
+/* a probe's answer carries any key a door takes */
+#define CLPEND_KEY_MAX  4096            /* KEY_MAX */
 #define PEND_GEN_MASK   (PEND_TAG - 1 - PEND_SLOT_MASK)
 
 struct pending {
@@ -47,6 +50,7 @@ struct pending {
 	unsigned char collen;
 	char key[256];
 	unsigned short klen;           /* 0 = too big for demote tracking */
+	char *key_long;                /* a key of 256 bytes or more (a probe's), heap: freed on release */
 	unsigned char jop;             /* PC_DONE_JSON: the PC_JOP_* code */
 	/* probe-before-place (proxy set/add, holder unknown): the deferred
 	 * write, forwarded or replayed when the probe answers */
@@ -160,7 +164,7 @@ struct clpend_ans_out {
 	unsigned long long loser_ver;  /* RACE: the loser's copy, 0 = unknown */
 	char col[40];
 	unsigned int collen;
-	char key[256];
+	char key[CLPEND_KEY_MAX];
 	unsigned int klen;
 	unsigned char probe_op;        /* PROBE_FWD, RESUME: raw, as stored */
 	char *stash;                   /* ownership PASSES to the caller */

@@ -9,6 +9,7 @@
 
 #include "cluster.h"
 #include "clterm.h"
+#include "clcid.h"
 #include "clunk.h"
 #include "clfleet.h"
 #include "clpeers.h"
@@ -224,6 +225,11 @@ int pc_cluster_peers(struct pc_cl_peer_info *out, int max)
 {
 	(void)out;
 	(void)max;
+	return 0;
+}
+
+int pc_cluster_peers_known(void)
+{
 	return 0;
 }
 
@@ -766,6 +772,17 @@ int pc_spread_pick_peer_except(unsigned slot, int k, int except)
 }
 
 uint32_t pc_term_current(void)
+{
+	return 0;
+}
+
+/* no cluster: no term or cluster id to write */
+int pc_term_persist_tick(void)
+{
+	return 0;
+}
+
+int pc_cid_persist_tick(void)
 {
 	return 0;
 }

@@ -14,6 +14,7 @@
 #include "php_perfcached.h"
 #include <perfd.h>
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -430,6 +431,22 @@ static zend_string *pc_pool_key(const pc_conn *c)
 	if (!p) \
 		RETURN_THROWS()
 
+/* the daemon holds a ttl of 0 .. 2^31-1 s, and reads a negative one as "no expiry"; add() alone
+ * takes a negative ttl, as "keep the key's expiry" */
+#define PC_TTL_LIMIT 0x7FFFFFFFLL
+static int pc_ttl_ok(zend_long ttl, int keep_ok)
+{
+	if ((ttl < 0 && !keep_ok) || (long long)ttl > PC_TTL_LIMIT) {
+		zend_value_error("ttl must be 0 (no expiry) to %lld seconds%s", PC_TTL_LIMIT,
+			keep_ok ? ", or negative to keep the key's expiry" : "");
+		return 0;
+	}
+	return 1;
+}
+#define PC_TTL_CHECK(ttl, keep_ok) \
+	if (!pc_ttl_ok(ttl, keep_ok)) \
+		RETURN_THROWS()
+
 PHP_METHOD(Perfcached, __construct)
 {
 	zend_string *host = NULL;
@@ -534,6 +551,7 @@ PHP_METHOD(Perfcached, set)
 		Z_PARAM_OPTIONAL
 		Z_PARAM_LONG(ttl)
 	ZEND_PARSE_PARAMETERS_END();
+	PC_TTL_CHECK(ttl, 0);
 	PC_SELF(p);
 	if (perfd_set(p, col, key, ZSTR_VAL(val), ZSTR_LEN(val), ttl) != 0)
 		pc_throw(p);
@@ -633,6 +651,7 @@ PHP_METHOD(Perfcached, expire)
 		PC_PARSE_COL_KEY()
 		Z_PARAM_LONG(ttl)
 	ZEND_PARSE_PARAMETERS_END();
+	PC_TTL_CHECK(ttl, 0);
 	PC_SELF(p);
 	rc = perfd_expire(p, col, key, ttl);
 	if (rc < 0) {
@@ -654,6 +673,7 @@ PHP_METHOD(Perfcached, add)
 		Z_PARAM_LONG(by)
 		Z_PARAM_LONG(ttl)
 	ZEND_PARSE_PARAMETERS_END();
+	PC_TTL_CHECK(ttl, 1);
 	PC_SELF(p);
 	if (perfd_add(p, col, key, by, ttl, &v) != 0) {
 		pc_throw(p);
@@ -748,21 +768,25 @@ PHP_METHOD(Perfcached, keys)
 	char *col, *match = NULL;
 	size_t col_len, match_len = 0;
 	zend_long limit = 0;
+	zval *complete = NULL;
 	char **out = NULL;
-	int n, i;
+	int n, i, flags = 0;
 
-	ZEND_PARSE_PARAMETERS_START(1, 3)
+	ZEND_PARSE_PARAMETERS_START(1, 4)
 		Z_PARAM_PATH(col, col_len)
 		Z_PARAM_OPTIONAL
 		Z_PARAM_PATH_OR_NULL(match, match_len)
 		Z_PARAM_LONG(limit)
+		Z_PARAM_ZVAL(complete)
 	ZEND_PARSE_PARAMETERS_END();
 	PC_SELF(p);
-	n = perfd_keys(p, col, match, (int)limit, &out);
+	n = perfd_keys_ex(p, col, match, (int)limit, &out, &flags);
 	if (n < 0) {
 		pc_throw(p);
 		RETURN_THROWS();
 	}
+	if (complete)
+		ZEND_TRY_ASSIGN_REF_BOOL(complete, !(flags & PERFD_KEYS_PARTIAL));
 	array_init_size(return_value, (uint32_t)n);
 	for (i = 0; i < n; i++)
 		add_next_index_string(return_value, out[i]);
@@ -931,6 +955,487 @@ PHP_METHOD(Perfcached, hgetall)
 		pc_throw(p);
 }
 
+/* JSON path verbs: documents and fragments travel as JSON text; a null path is "$" */
+PHP_METHOD(Perfcached, jget)
+{
+	PC_KEY_ARGS();
+	char *path = NULL, *frag = NULL;
+	size_t path_len = 0, n = 0;
+	int rc;
+
+	ZEND_PARSE_PARAMETERS_START(2, 3)
+		PC_PARSE_COL_KEY()
+		Z_PARAM_OPTIONAL
+		Z_PARAM_PATH_OR_NULL(path, path_len)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_SELF(p);
+	rc = perfd_jget_buf(p, col, key, path, pc_buf, sizeof pc_buf, &n);
+	if (rc == 1)
+		RETURN_STRINGL(pc_buf, n);
+	if (rc == 0)
+		RETURN_NULL();
+	if (rc == -2) {
+		rc = perfd_jget(p, col, key, path, &frag);
+		if (rc == 1) {
+			RETVAL_STRING(frag);
+			perfd_free_value(frag);
+			return;
+		}
+		if (rc == 0)
+			RETURN_NULL();
+	}
+	pc_throw(p);
+}
+
+PHP_METHOD(Perfcached, jset)
+{
+	PC_KEY_ARGS();
+	char *path, *json;
+	size_t path_len, json_len;
+	zend_long ttl = 0;
+
+	ZEND_PARSE_PARAMETERS_START(4, 5)
+		PC_PARSE_COL_KEY()
+		Z_PARAM_PATH(path, path_len)
+		Z_PARAM_PATH(json, json_len)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG(ttl)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_TTL_CHECK(ttl, 0);
+	PC_SELF(p);
+	if (perfd_jset(p, col, key, path, json, ttl) != 0)
+		pc_throw(p);
+}
+
+PHP_METHOD(Perfcached, jdel)
+{
+	PC_KEY_ARGS();
+	char *path = NULL;
+	size_t path_len = 0;
+	int rc;
+
+	ZEND_PARSE_PARAMETERS_START(2, 3)
+		PC_PARSE_COL_KEY()
+		Z_PARAM_OPTIONAL
+		Z_PARAM_PATH_OR_NULL(path, path_len)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_SELF(p);
+	rc = perfd_jdel(p, col, key, path);
+	if (rc < 0) {
+		pc_throw(p);
+		RETURN_THROWS();
+	}
+	RETURN_BOOL(rc == 1);
+}
+
+PHP_METHOD(Perfcached, jincr)
+{
+	PC_KEY_ARGS();
+	char *path;
+	size_t path_len;
+	zend_long by = 1;
+	long long v = 0;
+
+	ZEND_PARSE_PARAMETERS_START(3, 4)
+		PC_PARSE_COL_KEY()
+		Z_PARAM_PATH(path, path_len)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG(by)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_SELF(p);
+	if (perfd_jincr(p, col, key, path, by, &v) != 0) {
+		pc_throw(p);
+		RETURN_THROWS();
+	}
+	RETURN_LONG((zend_long)v);
+}
+
+/* the lock idiom: true stored, false the key was there; one node decides each key */
+PHP_METHOD(Perfcached, setNx)
+{
+	PC_KEY_ARGS();
+	zend_string *val;
+	zend_long ttl = 0;
+	int rc;
+
+	ZEND_PARSE_PARAMETERS_START(3, 4)
+		PC_PARSE_COL_KEY()
+		Z_PARAM_STR(val)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG(ttl)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_TTL_CHECK(ttl, 0);
+	PC_SELF(p);
+	rc = perfd_set_cond(p, col, key, ZSTR_VAL(val), ZSTR_LEN(val), ttl, PERFD_NX);
+	if (rc < 0) {
+		pc_throw(p);
+		RETURN_THROWS();
+	}
+	RETURN_BOOL(rc == 1);
+}
+
+/* SET ... IFEQ: stored only while the key holds @expected, byte for byte - a refresh is
+ * setIfEq(col, key, token, token, ttl) */
+PHP_METHOD(Perfcached, setIfEq)
+{
+	PC_KEY_ARGS();
+	zend_string *val, *expected;
+	zend_long ttl = 0;
+	int rc;
+
+	ZEND_PARSE_PARAMETERS_START(4, 5)
+		PC_PARSE_COL_KEY()
+		Z_PARAM_STR(val)
+		Z_PARAM_STR(expected)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG(ttl)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_TTL_CHECK(ttl, 0);
+	PC_SELF(p);
+	rc = perfd_set_if(p, col, key, ZSTR_VAL(val), ZSTR_LEN(val), ttl,
+		ZSTR_VAL(expected), ZSTR_LEN(expected), 0);
+	if (rc < 0) {
+		pc_throw(p);
+		RETURN_THROWS();
+	}
+	RETURN_BOOL(rc == 1);
+}
+
+/* DELEX ... IFEQ: deleted only while the key holds @expected */
+PHP_METHOD(Perfcached, delIfEq)
+{
+	PC_KEY_ARGS();
+	zend_string *expected;
+	int rc;
+
+	ZEND_PARSE_PARAMETERS_START(3, 3)
+		PC_PARSE_COL_KEY()
+		Z_PARAM_STR(expected)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_SELF(p);
+	rc = perfd_del_if(p, col, key, ZSTR_VAL(expected), ZSTR_LEN(expected), 0);
+	if (rc < 0) {
+		pc_throw(p);
+		RETURN_THROWS();
+	}
+	RETURN_BOOL(rc == 1);
+}
+
+/* the receivers on the node reached; RESP subscribers anywhere in the fleet get it too */
+PHP_METHOD(Perfcached, publish)
+{
+	char *chan;
+	size_t chan_len;
+	zend_string *payload;
+	int rc;
+
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_PATH(chan, chan_len)
+		Z_PARAM_STR(payload)
+	ZEND_PARSE_PARAMETERS_END();
+	PC_SELF(p);
+	rc = perfd_publish(p, chan, ZSTR_VAL(payload), ZSTR_LEN(payload));
+	if (rc < 0) {
+		pc_throw(p);
+		RETURN_THROWS();
+	}
+	RETURN_LONG(rc);
+}
+
+/* ---- subscribe: phpredis' model on a connection of its own, driven by libperfd's event-loop
+ * surface; the hook only queues, PHP is called between reads, never from inside libperfd ---- */
+#define PC_SUB_SLICE_MS 1000
+
+typedef struct {
+	zend_string **m;
+	int n, cap;
+} pc_subq;
+
+typedef struct {
+	int pending, failed;
+	char err[200];
+} pc_subw;
+
+static void pc_sub_hook(const char *json, size_t len, void *ctx)
+{
+	pc_subq *q = ctx;
+
+	if (q->n == q->cap) {
+		q->cap = q->cap ? q->cap * 2 : 16;
+		q->m = erealloc(q->m, sizeof(*q->m) * (size_t)q->cap);
+	}
+	q->m[q->n++] = zend_string_init(json, len, 0);
+}
+
+static void pc_sub_reply(char *result, size_t len, const char *errmsg, void *ctx)
+{
+	pc_subw *w = ctx;
+
+	(void)len;
+	w->pending--;
+	if (!result) {
+		w->failed = 1;
+		snprintf(w->err, sizeof w->err, "%s", errmsg && *errmsg ? errmsg : "refused");
+	}
+	perfd_free_value(result);
+}
+
+/* a signal PHP has a handler for is waiting: the loop returns so it runs */
+static int pc_interrupted(void)
+{
+#if PHP_VERSION_ID >= 80200
+	return zend_atomic_bool_load_ex(&EG(vm_interrupt));
+#else
+	return EG(vm_interrupt);
+#endif
+}
+
+/* one step of the connection's I/O within @ms (-1 none): 1 progressed, 0 nothing came, -1 failed,
+ * -2 a signal for PHP to handle */
+static int pc_sub_step(perfd_t *sp, int ms)
+{
+	struct pollfd f;
+	int ev = perfd_events(sp), r;
+
+	f.fd = perfd_fd(sp);
+	f.events = (short)((ev & PERFD_EV_READ ? POLLIN : 0) | (ev & PERFD_EV_WRITE ? POLLOUT : 0));
+	f.revents = 0;
+	r = poll(&f, 1, ms);
+	if (r < 0)
+		return errno == EINTR ? (pc_interrupted() ? -2 : 0) : -1;
+	if (!r)
+		return 0;
+	if ((f.revents & (POLLIN | POLLERR | POLLHUP)) && perfd_read_ready(sp) != 0)
+		return -1;
+	if ((f.revents & POLLOUT) && perfd_write_ready(sp) != 0)
+		return -1;
+	return 1;
+}
+
+static zend_long pc_sub_left(zend_long deadline)
+{
+	zend_long left;
+
+	if (!deadline)
+		return PC_SUB_SLICE_MS;
+	left = deadline - pc_now_ms();
+	return left <= 0 ? 0 : left < PC_SUB_SLICE_MS ? left : PC_SUB_SLICE_MS;
+}
+
+/* the handle's seeds in its own order, async; READY or NULL with the last reason in @err */
+static perfd_t *pc_sub_dial(pc_conn *c, char *err, size_t errcap)
+{
+	int i, s, ct = c->o.connect_timeout_ms > 0 ? c->o.connect_timeout_ms : PC_CONNECT_DEFAULT_MS;
+
+	snprintf(err, errcap, "no seed answered");
+	for (i = 0; i < c->nseeds; i++)
+		/* an async handle tries only its first secret: each in turn, as the blocking dial does */
+		for (s = 0; s == 0 || c->secrets[s]; s++) {
+			perfd_opts o = c->o;
+			perfd_t *sp;
+			zend_long until;
+			int failed;
+
+			if (c->secrets[0])
+				o.secrets = (const char *const *)&c->secrets[s];
+			sp = perfd_connect_async(c->seeds[i], c->port, &o);
+			until = pc_now_ms() + ct;
+			if (!sp)
+				break;
+			while (perfd_state(sp) == PERFD_ST_CONNECTING && pc_now_ms() < until)
+				if (pc_sub_step(sp, (int)pc_sub_left(until)) < 0)
+					break;
+			if (perfd_state(sp) == PERFD_ST_READY)
+				return sp;
+			failed = perfd_state(sp) == PERFD_ST_FAILED;
+			snprintf(err, errcap, "%s:%d: %s", c->seeds[i], c->port,
+				failed ? perfd_error(sp) : "connect timed out");
+			perfd_free(sp);
+			if (!failed)
+				break;
+		}
+	return NULL;
+}
+
+/* a delivery's parts, by the NOTIFY's own names; 0 when it is not a message (membership, ...) */
+static int pc_sub_parse(zend_string *json, int pattern, zval *out)
+{
+	zval doc, *method, *params, *v;
+	const char *names[] = { "pattern", "channel", "payload" };
+	int i, n = 0;
+
+	if (php_json_decode_ex(&doc, ZSTR_VAL(json), ZSTR_LEN(json), PHP_JSON_OBJECT_AS_ARRAY,
+	        PHP_JSON_PARSER_DEFAULT_DEPTH) != SUCCESS || Z_TYPE(doc) != IS_ARRAY)
+		return 0;
+	method = zend_hash_str_find(Z_ARRVAL(doc), "method", sizeof("method") - 1);
+	params = zend_hash_str_find(Z_ARRVAL(doc), "params", sizeof("params") - 1);
+	if (method && params && Z_TYPE_P(method) == IS_STRING && Z_TYPE_P(params) == IS_ARRAY &&
+	    (pattern ? zend_string_equals_literal(Z_STR_P(method), "pmessage")
+	             : zend_string_equals_literal(Z_STR_P(method), "message"))) {
+		for (i = pattern ? 0 : 1; i < 3; i++) {
+			v = zend_hash_str_find(Z_ARRVAL_P(params), names[i], strlen(names[i]));
+			if (!v || Z_TYPE_P(v) != IS_STRING)
+				break;
+			ZVAL_COPY(&out[n++], v);
+		}
+		if (i < 3) {
+			while (n)
+				zval_ptr_dtor(&out[--n]);
+		}
+	}
+	zval_ptr_dtor(&doc);
+	return n;
+}
+
+static void pc_subscribe(INTERNAL_FUNCTION_PARAMETERS, int pattern)
+{
+	HashTable *names;
+	zend_fcall_info fci;
+	zend_fcall_info_cache fcc;
+	double timeout = 0;
+	pc_obj *self = pc_from(Z_OBJ_P(ZEND_THIS));
+	pc_subq q = { NULL, 0, 0 };
+	pc_subw w = { 0, 0, "" };
+	perfd_t *sp;
+	zval *z;
+	zend_long deadline, delivered = 0;
+	char err[256];
+	int stop = 0, i, rc;
+
+	ZEND_PARSE_PARAMETERS_START(2, 3)
+		Z_PARAM_ARRAY_HT(names)
+		Z_PARAM_FUNC(fci, fcc)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_DOUBLE(timeout)
+	ZEND_PARSE_PARAMETERS_END();
+	if (!zend_hash_num_elements(names)) {
+		zend_argument_value_error(1, "must name at least one %s", pattern ? "pattern" : "channel");
+		RETURN_THROWS();
+	}
+	ZEND_HASH_FOREACH_VAL(names, z) {
+		if (Z_TYPE_P(z) != IS_STRING || !Z_STRLEN_P(z) ||
+		    memchr(Z_STRVAL_P(z), 0, Z_STRLEN_P(z))) {
+			zend_argument_value_error(1, "must hold non-empty strings without NUL bytes");
+			RETURN_THROWS();
+		}
+	} ZEND_HASH_FOREACH_END();
+	if (!self->c) {
+		zend_throw_exception(pc_ex, "perfcached: the handle is closed", 9);
+		RETURN_THROWS();
+	}
+	if (self->c->unix_path) {
+		zend_throw_exception(pc_ex_arg, "perfcached: subscribe needs a TCP door", PERFD_E_ARG);
+		RETURN_THROWS();
+	}
+	deadline = timeout > 0 ? pc_now_ms() + (zend_long)(timeout * 1000) : 0;
+	sp = pc_sub_dial(self->c, err, sizeof err);
+	if (!sp) {
+		zend_throw_exception(pc_ex_transport, err, PERFD_E_TRANSPORT);
+		RETURN_THROWS();
+	}
+	perfd_set_notify(sp, pc_sub_hook, &q);
+	ZEND_HASH_FOREACH_VAL(names, z) {
+		smart_str js = {0};
+
+		smart_str_appends(&js, pattern ? "{\"pattern\":" : "{\"channel\":");
+		if (php_json_encode(&js, z, 0) != SUCCESS) {   /* not UTF-8 */
+			smart_str_free(&js);
+			perfd_free(sp);
+			zend_argument_value_error(1, "must hold valid UTF-8 names");
+			RETURN_THROWS();
+		}
+		smart_str_appendc(&js, '}');
+		smart_str_0(&js);
+		rc = perfd_submit(sp, pattern ? "psubscribe" : "subscribe", ZSTR_VAL(js.s), pc_sub_reply, &w);
+		smart_str_free(&js);
+		if (rc != 0) {
+			w.failed = 1;
+			snprintf(w.err, sizeof w.err, "%s", perfd_error(sp));
+			break;
+		}
+		w.pending++;
+	} ZEND_HASH_FOREACH_END();
+	/* every subscription confirmed before the first message is handed over */
+	while (!w.failed && w.pending > 0) {
+		rc = pc_sub_step(sp, (int)pc_sub_left(deadline));
+		if (rc < 0 || (deadline && pc_now_ms() >= deadline)) {
+			snprintf(w.err, sizeof w.err, "%s", rc == -1 ? perfd_error(sp)
+				: rc == -2 ? "interrupted" : "not confirmed before the timeout");
+			w.failed = 1;
+		}
+	}
+	if (w.failed) {
+		perfd_free(sp);
+		for (i = 0; i < q.n; i++)
+			zend_string_release(q.m[i]);
+		if (q.m)
+			efree(q.m);
+		zend_throw_exception(pc_ex_refused, w.err, PERFD_E_REFUSED);
+		RETURN_THROWS();
+	}
+	while (!stop) {
+		for (i = 0; i < q.n; i++) {
+			zval args[4], ret;
+			int n;
+
+			if (stop) {
+				zend_string_release(q.m[i]);
+				continue;
+			}
+			ZVAL_OBJ_COPY(&args[0], Z_OBJ_P(ZEND_THIS));
+			n = pc_sub_parse(q.m[i], pattern, &args[1]);
+			zend_string_release(q.m[i]);
+			if (!n) {
+				zval_ptr_dtor(&args[0]);
+				continue;
+			}
+			ZVAL_UNDEF(&ret);
+			fci.retval = &ret;
+			fci.params = args;
+			fci.param_count = (uint32_t)(n + 1);
+			rc = zend_call_function(&fci, &fcc);
+			while (n >= 0)
+				zval_ptr_dtor(&args[n--]);
+			delivered++;
+			if (rc != SUCCESS || EG(exception) || Z_TYPE(ret) == IS_FALSE)
+				stop = 1;
+			zval_ptr_dtor(&ret);
+		}
+		q.n = 0;
+		if (stop || (deadline && pc_now_ms() >= deadline))
+			break;
+		rc = pc_sub_step(sp, (int)pc_sub_left(deadline));
+		if (rc == -2)
+			break;                     /* a signal: PHP's to handle */
+		if (rc == -1) {
+			snprintf(err, sizeof err, "%s", perfd_error(sp));
+			perfd_free(sp);
+			if (q.m)
+				efree(q.m);
+			zend_throw_exception(pc_ex_transport, err, PERFD_E_TRANSPORT);
+			RETURN_THROWS();
+		}
+	}
+	perfd_free(sp);                    /* its subscriptions go with the connection */
+	for (i = 0; i < q.n; i++)
+		zend_string_release(q.m[i]);
+	if (q.m)
+		efree(q.m);
+	if (EG(exception))
+		RETURN_THROWS();
+	RETURN_LONG(delivered);
+}
+
+PHP_METHOD(Perfcached, subscribe)
+{
+	pc_subscribe(INTERNAL_FUNCTION_PARAM_PASSTHRU, 0);
+}
+
+PHP_METHOD(Perfcached, psubscribe)
+{
+	pc_subscribe(INTERNAL_FUNCTION_PARAM_PASSTHRU, 1);
+}
+
 /* one row a member, as this handle's own dials found it */
 PHP_METHOD(Perfcached, members)
 {
@@ -1089,6 +1594,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_keys, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, match, IS_STRING, 1, "null")
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, limit, IS_LONG, 0, "0")
+	ZEND_ARG_INFO_WITH_DEFAULT_VALUE(1, complete, "null")
 ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_hset, 0, 4, _IS_BOOL, 0)
 	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
@@ -1115,6 +1621,56 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_hgetall, 0, 2, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_jget, 0, 2, IS_STRING, 1)
+	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, path, IS_STRING, 1, "'$'")
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_jset, 0, 4, IS_VOID, 0)
+	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, json, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, ttl, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_jdel, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, path, IS_STRING, 1, "null")
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_jincr, 0, 3, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, by, IS_LONG, 0, "1")
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_setnx, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, value, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, ttl, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_setifeq, 0, 4, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, value, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, expected, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, ttl, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_delifeq, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, key, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, expected, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_publish, 0, 2, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, channel, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, payload, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_subscribe, 0, 2, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, names, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, timeout, IS_DOUBLE, 0, "0")
 ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(ai_owner, 0, 2, IS_LONG, 1)
 	ZEND_ARG_TYPE_INFO(0, col, IS_STRING, 0)
@@ -1143,6 +1699,16 @@ static const zend_function_entry pc_methods[] = {
 	PHP_ME(Perfcached, hlen, ai_key_int, ZEND_ACC_PUBLIC)
 	PHP_ME(Perfcached, hincrby, ai_hincrby, ZEND_ACC_PUBLIC)
 	PHP_ME(Perfcached, hgetall, ai_hgetall, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, jget, ai_jget, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, jset, ai_jset, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, jdel, ai_jdel, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, jincr, ai_jincr, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, setNx, ai_setnx, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, setIfEq, ai_setifeq, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, delIfEq, ai_delifeq, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, publish, ai_publish, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, subscribe, ai_subscribe, ZEND_ACC_PUBLIC)
+	PHP_ME(Perfcached, psubscribe, ai_subscribe, ZEND_ACC_PUBLIC)
 	PHP_ME(Perfcached, members, ai_arr0, ZEND_ACC_PUBLIC)
 	PHP_ME(Perfcached, ownerOf, ai_owner, ZEND_ACC_PUBLIC)
 	PHP_ME(Perfcached, activeNode, ai_int0, ZEND_ACC_PUBLIC)

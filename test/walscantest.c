@@ -99,7 +99,7 @@ static int cb(int type, const char *col, int collen, const char *key, int klen,
 		g->type[i] = type;
 		snprintf(g->col[i], sizeof g->col[i], "%.*s", collen, col);
 		snprintf(g->key[i], sizeof g->key[i], "%.*s", klen, key);
-		snprintf(g->val[i], sizeof g->val[i], "%.*s", vlen < 15 ? vlen : 15, val);
+		snprintf(g->val[i], sizeof g->val[i], "%.*s", vlen < 0 ? 0 : vlen < 15 ? vlen : 15, val);
 		g->vlen[i] = vlen;
 		g->exp[i] = exp;
 		g->seq[i] = seq;
@@ -227,6 +227,29 @@ int main(void)
 		seg(0, 1, b, m + 1);
 		n = scan(&g, &why);
 		CHK(n == 0 && !strcmp(why, "torn"), "C: a sound frame whose lengths do not add up - torn");
+	}
+
+	/* F: lengths whose 32-bit sum wraps to the frame's - a 100-byte upsert claiming a 200-byte
+	 * key and a value of 2^32 - 136: torn, never handed on with a negative value length */
+	{
+		unsigned char *p = b + PC_WAL_RECHDR;
+		uint32_t len = 100;
+
+		memset(b, 0, sizeof b);
+		p[0] = PC_WAL_T_UPSERT_V;
+		p[1] = 3;
+		w16(p + 2, 200);
+		w32(p + 4, len - PC_WAL_HDRLEN(PC_WAL_T_UPSERT_V) - 3 - 200);
+		w64(p + 16, 1);
+		memcpy(p + PC_WAL_HDRLEN(PC_WAL_T_UPSERT_V), "colkey", 6);
+		w32(b, len);
+		w32(b + 8, 1);
+		w32(b + 4, pc_crc32c(0, b + 8, 4 + len));
+		seg(0, 1, b, PC_WAL_RECHDR + len);
+		n = scan(&g, &why);
+		CHK(n == 0 && g.n == 0 && !strcmp(why, "torn"),
+			"F: key and value lengths that wrap 32 bits to the frame's - torn (%ld handed on, vlen %d)",
+			n, g.n ? g.vlen[0] : 0);
 	}
 
 	/* D: a newer build's record type - handed on unparsed, the records after it still read */

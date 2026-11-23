@@ -1,5 +1,6 @@
 /* clretaintest.c - the retained-tombstone table (clretain.c): get, replay by range, the cap,
- * expiry, numbered deletes, what a returning member has lost, memory at the default cap. */
+ * expiry, numbered deletes, local drops never replayed, what a returning member has lost,
+ * memory at the default cap. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -390,6 +391,125 @@ int main(void)
 		clretain_gone_each(gn_cb, &g);
 		CHK(g.n == 1 && g.hi == 1 && clretain_lost_since(9200) && !clretain_lost_since(9201),
 			"G: the cap evicted seq 1 (noted at 9200) unconfirmed: gone through 1, lost since 9200, nothing since 9201");
+	}
+
+	/* ---- H: two threads either side of a second boundary append in the other order
+	 * (each reads its clock before the shard lock); back-to-back windows still hand out
+	 * every entry once */
+	{
+		struct acc w1, w2;
+
+		clretain_init(100, 64000);
+		for (i = 0; i < 1024; i++) {
+			snprintf(k, sizeof k, "h1-%d", i);
+			clretain_note("c", 1, k, strlen(k), (uint64_t)i + 1, 5001);
+		}
+		for (i = 0; i < 1024; i++) {
+			snprintf(k, sizeof k, "h0-%d", i);
+			clretain_note("c", 1, k, strlen(k), (uint64_t)i + 1, 5000);
+		}
+		memset(&w1, 0, sizeof w1);
+		memset(&w2, 0, sizeof w2);
+		clretain_each(4999, 5000, count_cb, &w1);
+		clretain_each(5000, 5001, count_cb, &w2);
+		CHK(w1.n + w2.n == 2048,
+			"H: (4999, 5000] then (5000, 5001] hand out all 2048, each once (%u + %u) - "
+			"a 5000 entry behind a 5001 one fell between the windows", w1.n, w2.n);
+	}
+
+	/* ---- I: the own space's seqs a newer numbered delete took over - superseded, not lost */
+	{
+		clretain_init(100, 640);
+		clretain_own_space(0xabc, 7);
+		clretain_note_n("c", 1, "s1", 2, 10, 8000, 0xabc, 7, 100);
+		clretain_note_n("c", 1, "s1", 2, 11, 8000, 0xabc, 7, 140);   /* a newer one, own */
+		clretain_note_n("c", 1, "s2", 2, 10, 8000, 0xabc, 7, 101);
+		clretain_note_n("c", 1, "s2", 2, 11, 8000, 0x999, 2, 5);     /* newer, another origin's */
+		clretain_note_n("c", 1, "s3", 2, 10, 8000, 0xabc, 7, 102);
+		clretain_note_local("c", 1, "s3", 2, 11, 8000);              /* newer, never replayed */
+		clretain_note_n("c", 1, "s4", 2, 10, 8000, 0xabc, 7, 103);
+		clretain_note_expiry("c", 1, "s4", 2, 11, 8000, 0);          /* newer, an expiry */
+		clretain_note_n("c", 1, "s5", 2, 10, 8000, 0x999, 2, 6);
+		clretain_note_n("c", 1, "s5", 2, 11, 8000, 0x999, 2, 7);     /* not the own space */
+		CHK(clretain_superseded(0xabc, 7, 100, 101),
+			"I: 100 and 101, taken over by newer numbered deletes (own, another origin's): superseded");
+		CHK(!clretain_superseded(0xabc, 7, 100, 102) && !clretain_superseded(0xabc, 7, 103, 103),
+			"I: 102 taken over by a local drop, 103 by an expiry: not superseded (those do not travel)");
+		CHK(!clretain_superseded(0xabc, 7, 140, 140) && !clretain_superseded(0xabc, 7, 99, 100),
+			"I: 140 (held) and 99 (never seen) are not superseded");
+		CHK(!clretain_superseded(0x999, 2, 6, 6) && !clretain_superseded(0xabc, 8, 100, 100),
+			"I: only the own space, this incarnation, is remembered");
+		clretain_own_space(0xabc, 8);
+		CHK(!clretain_superseded(0xabc, 7, 100, 100), "I: a new own space starts empty");
+		/* the ring: past CLRETAIN_SUP_MAX the oldest reads as not superseded (the safe answer) */
+		clretain_init(100, 300000);
+		clretain_own_space(0xabc, 7);
+		for (i = 0; i < (int)CLRETAIN_SUP_MAX + 1; i++) {
+			snprintf(k, sizeof k, "o%d", i);
+			clretain_note_n("c", 1, k, strlen(k), 1, 8000, 0xabc, 7, (uint64_t)i + 1);
+			clretain_note_n("c", 1, k, strlen(k), 2, 8000, 0x999, 2, (uint64_t)i + 1);
+		}
+		CHK(!clretain_superseded(0xabc, 7, 1, 1) && clretain_superseded(0xabc, 7, 2, 4097),
+			"I: past the ring's %u the oldest falls out (not superseded), the newest 4096 stay",
+			CLRETAIN_SUP_MAX);
+	}
+
+	/* ---- L: this node's own drops are never replayed - not even once a real delete or an
+	 * expiry of the same key is noted next to them (a peer would lose a newer copy) */
+	clretain_init(100, 640);
+	clretain_note_local("c", 1, "l1", 2, 9, 7000);       /* an invalidation's drop at 9 */
+	clretain_note_expiry("c", 1, "l1", 2, 4, 7001, 0);   /* an older copy reaped here */
+	memset(&a, 0, sizeof a);
+	clretain_each(6999, 7100, count_cb, &a);
+	CHK(a.n == 1 && a.x == 1 && a.vsum == 4,
+		"L: a local drop at 9, then an expiry at 4: the replay hands out the expiry at 4 alone "
+		"(%u handed out, %u expiries, versions summing %llu)", a.n, a.x, a.vsum);
+	CHK(clretain_get("c", 1, "l1", 2, 7050) == 9, "L: and it still refuses up to 9 here");
+	clretain_note("c", 1, "l2", 2, 5, 7000);             /* a peer's delete at 5 */
+	clretain_note_local("c", 1, "l2", 2, 12, 7001);      /* then a local drop at 12 */
+	clretain_note_local("c", 1, "l3", 2, 20, 7000);
+	clretain_note("c", 1, "l3", 2, 7, 7001);             /* a real delete after a local drop */
+	memset(&a, 0, sizeof a);
+	clretain_each(6999, 7100, count_cb, &a);
+	CHK(a.n == 3 && a.vsum == 4 + 5 + 7 && a.x == 1,
+		"L: the deletes at 5 and 7 replay at 5 and 7, not at the local drops' 12 and 20 "
+		"(%u handed out, versions summing %llu of 16)", a.n, a.vsum);
+	CHK(clretain_get("c", 1, "l2", 2, 7050) == 12 && clretain_get("c", 1, "l3", 2, 7050) == 20,
+		"L: each key still refuses up to its highest, the local drop's");
+
+	/* ---- M: an entry already held at that version or newer, noted again (a peer's replay of
+	 * an expiry reaped here), is neither re-planted nor counted: re-planted at now, a running
+	 * catch-up would hand it back to the peer that sent it */
+	{
+		struct clretain_stats s0, s1;
+
+		clretain_init(100, 640);
+		clretain_note_expiry("c", 1, "m1", 2, 5, 7000, 0);   /* reaped here */
+		clretain_note("c", 1, "m2", 2, 6, 7000);             /* a delete */
+		clretain_get_stats(&s0, 7000);
+		clretain_note_expiry("c", 1, "m1", 2, 5, 7050, 0);   /* the same expiry, replayed */
+		clretain_note_expiry("c", 1, "m1", 2, 4, 7050, 0);   /* an older one */
+		clretain_note("c", 1, "m2", 2, 6, 7050);             /* the same delete again */
+		clretain_note_expiry("c", 1, "m2", 2, 6, 7050, 0);   /* an expiry under the delete */
+		clretain_get_stats(&s1, 7050);
+		memset(&a, 0, sizeof a);
+		clretain_each(7040, 7100, count_cb, &a);
+		CHK(a.n == 0, "M: noted again at 7050 at the same or an older version: a catch-up "
+			"window from 7040 hands out nothing (%u)", a.n);
+		CHK(s1.noted == s0.noted && s1.noted_expiries == s0.noted_expiries,
+			"M: and none of the four is counted (noted +%llu, noted_expiries +%llu)",
+			s1.noted - s0.noted, s1.noted_expiries - s0.noted_expiries);
+		CHK(clretain_get("c", 1, "m1", 2, 7100) == 0 && clretain_get("c", 1, "m2", 2, 7100) == 0,
+			"M: each still ages out from its first planting (7000 + 100 s)");
+		clretain_note_expiry("c", 1, "m1", 2, 7, 7060, 0);   /* a newer expiry */
+		clretain_note("c", 1, "m1", 2, 7, 7060);             /* a delete over an expiry */
+		clretain_get_stats(&s1, 7060);
+		memset(&a, 0, sizeof a);
+		clretain_each(7055, 7100, count_cb, &a);
+		CHK(a.n == 1 && a.x == 0 && a.vsum == 7 && s1.noted - s0.noted == 2 &&
+		    s1.noted_expiries - s0.noted_expiries == 1,
+			"M: a newer version, or a delete over an expiry, is re-planted and counted "
+			"(%u handed out, %u expiries; noted +%llu)", a.n, a.x, s1.noted - s0.noted);
 	}
 
 	/* ---- E: memory at the default cap ------------------------------- */

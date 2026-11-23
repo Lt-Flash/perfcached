@@ -1,6 +1,18 @@
 #!/bin/sh
 # netns-run.sh - run a command in a private network namespace (lo up, a multicast route) so concurrent CI
 # jobs on one host cannot collide on fixed ports or the group; without unshare it runs plainly.
+# PC_NOSYNC=1: fsync and fdatasync return at once (libeatmydata), so the runners' shared-storage
+# stalls stop timing the suites; a suite that measures real fsyncs clears LD_PRELOAD for its daemon,
+# and one that preloads its own shims appends $PC_NOSYNC_LIB after them.
+if [ "${PC_NOSYNC:-}" = 1 ]; then
+	L=$(ls /usr/lib/*/libeatmydata.so* /usr/lib/libeatmydata.so* 2>/dev/null | head -1)
+	if [ -n "$L" ]; then
+		LD_PRELOAD="$L${LD_PRELOAD:+ $LD_PRELOAD}"; PC_NOSYNC_LIB=$L; export LD_PRELOAD PC_NOSYNC_LIB
+		echo "netns-run: PC_NOSYNC - fsync is a no-op ($L)"
+	else
+		echo "netns-run: PC_NOSYNC set but libeatmydata is not installed - fsync is REAL"
+	fi
+fi
 if unshare -n true 2>/dev/null; then
 	exec unshare -n sh -c \
 		'ip link set lo up

@@ -326,6 +326,8 @@ plaintext = never
 # SELECT n maps onto the collection NAMED n, so declare [collection 0],
 # [collection 1] ... to serve Redis clients that expect db indices.
 #resp = 192.0.2.31:6379
+# Each entry is a full address with an optional prefix length; one with
+# host bits set (10.1.2.3/8) is taken as its network, with a WARNING.
 #resp_allow = 192.0.2.0/24, 198.51.100.5/32
 #resp_collections = 0, 1
 # What a RESP door does with a key this node does not own, under shard
@@ -426,7 +428,8 @@ dir = /var/lib/perfcached
 # does not have to hold the workload, only what arrives during ONE
 # drain+fsync cycle, which is why fsync latency is what governs its
 # depth.  Left unset with a probe available, fsync = always derives it
-# from the measured p99; set it here to pin it yourself.
+# from the measured p99; set it here to pin it yourself.  Either way a
+# ring is rounded up to a power of two (3000 runs as 4096).
 #ring_kb = 1024
 # what a full log does.  wait (the default): a connection that writes is
 # held, unread, while the WAL catches up - its worker serves the others -

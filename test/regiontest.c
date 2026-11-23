@@ -1,5 +1,6 @@
 /* regiontest.c - a retired table's index regions join the arena's free set and are taken before the
- * frontier moves; past the cool-off quiet groups are punched, as the process RSS shows. */
+ * frontier moves; past the cool-off quiet groups are punched, as the process RSS shows; a table or a
+ * segment whose later carve fails gives back what it had carved. */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -15,6 +16,14 @@ void pcache_mem_probe(void);
 static int fails;
 #define CHK(c, ...) do { if (c) printf("  ok   " __VA_ARGS__); \
 	else { printf("  FAIL " __VA_ARGS__); fails++; } printf("\n"); } while (0)
+
+static int refuse_at, carves;
+
+static int refuse_hook(size_t size)
+{
+	(void)size;
+	return ++carves == refuse_at;
+}
 
 static unsigned long rss_bytes(void)
 {
@@ -188,6 +197,52 @@ int main(void)
 	CHK(rss0 >= rss1 + RA / G * G * slot - 2 * slot &&
 	        rss0 <= rss1 + (RA + G - 1) / G * G * slot + (1UL << 20),
 		"S445: the ticks punched them as tail - RSS %lu -> %lu KB", rss0 >> 10, rss1 >> 10);
+
+	/* 10. a later carve refused: the table's carves before it go back (header, segment 0, the
+	 * hint slab, then segment 1 refused) */
+	rg1 = pcache_arena_regions_bytes();
+	carves = 0;
+	refuse_at = 4;
+	pcache_region_hook = refuse_hook;
+	a = pcache_htable_new(14);
+	pcache_region_hook = NULL;
+	CHK(!a && carves == 4, "10a a 2^14 table whose fourth carve is refused is not made (%u carves)",
+		carves);
+	CHK(pcache_arena_regions_bytes() == rg1,
+		"10b and the three regions carved before it are given back (regions %lu -> %lu KB)",
+		rg1 >> 10, pcache_arena_regions_bytes() >> 10);
+
+	/* 11. a split into segment 16 needs a second hint slab: refused, the segment goes back */
+	a = pcache_htable_new(16);
+	if (!a) {
+		printf("create failed\n");
+		return 2;
+	}
+	for (k = 0; k <= (1U << 16); k++) {
+		char kb[16];
+
+		key.len = snprintf(kb, sizeof kb, "s%u", k);
+		key.s = kb;
+		if (pcache_ht_store(a, &key, &val, 0) != 0) {
+			printf("store %u failed\n", k);
+			return 2;
+		}
+	}
+	rg1 = pcache_arena_regions_bytes();
+	carves = 0;
+	refuse_at = 2;
+	pcache_region_hook = refuse_hook;
+	t = pcache_ht_grow(a, 1, 1);
+	pcache_region_hook = NULL;
+	CHK(t == 0 && carves == 2 && pcache_ht_nbuckets(a) == (1U << 16),
+		"11a the split whose hint slab is refused does not happen (%u splits, %u carves)",
+		t, carves);
+	CHK(pcache_arena_regions_bytes() == rg1,
+		"11b and the segment carved for it is given back (regions %lu -> %lu KB)",
+		rg1 >> 10, pcache_arena_regions_bytes() >> 10);
+	t = pcache_ht_grow(a, 1, 1);
+	CHK(t == 1 && pcache_ht_nbuckets(a) == (1U << 16) + 1,
+		"11c with the carves allowed the split goes ahead (%u)", t);
 
 	printf("regiontest: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
 	return fails ? 1 : 0;

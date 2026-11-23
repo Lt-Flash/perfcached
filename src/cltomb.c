@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -149,6 +150,19 @@ int pc_cluster_tomb_alert(struct pc_tomb_alert *out)
 }
 
 static int catchup_by_marks;           /* set each tick */
+
+/* tests only: PERFCACHED_TEST_TOMB_BURST=<n> - the catch-up's per-tick bound (4,000) */
+static unsigned int catchup_burst(void)
+{
+	static unsigned int b;
+
+	if (!b) {
+		const char *e = getenv("PERFCACHED_TEST_TOMB_BURST");
+
+		b = e && atoi(e) >= 4 ? (unsigned int)atoi(e) : 4000;
+	}
+	return b;
+}
 
 static void tomb_catchup_cb(const char *col, size_t cn, const char *key,
 		size_t kn, uint64_t ver, int expiry, uint64_t oid, uint32_t incarn,
@@ -455,10 +469,12 @@ static void gap_send(const pc_addr *to, const struct pc_ack_hole *h)
 
 void acks_gap_tick(long long now)
 {
-	int nh, i, j, k, sent;
+	int nh, i, j, k, sent, timed;
 
+	clretain_own_space(fnv1a64(cl_self_ident(), 16), pc_cluster_incarnation());
 	if (!cl_enabled() || cl_self_no_acks() || !pc_ack_enabled())
 		return;
+	timed = !pc_cluster_acks_gate(NULL, 0, NULL);
 	nh = pc_ack_holes(holev, 64);
 	/* the tails: a space whose origin announces more than is held here, or one never heard of, is
 	 * asked for from just past what is held; the origin's mark is its own, so it holds them */
@@ -504,6 +520,14 @@ void acks_gap_tick(long long now)
 			g->asked_ms = 0;
 			g->over_ms = 0;
 			g->tries = 0;
+			continue;
+		}
+		/* a member not on yes: the fleet keeps the time rule, where nobody asks for a lost
+		 * delete or rebuilds for it, so the mark goes past the hole */
+		if (timed) {
+			if (now - g->seen_ms >= GAP_WAIT_MS &&
+			    pc_ack_floor(h->oid, h->incarn, h->to) == CLACK_NEW)
+				cl_st_acks_floors();
 			continue;
 		}
 		{
@@ -599,8 +623,9 @@ static uint64_t gap_floor_at(uint64_t oid, uint32_t incarn, uint64_t lo,
 	return first ? first - 1 : hi;
 }
 
+/* @lost: a seq floored was lost, not taken over by a newer numbered delete still held - rebuild */
 static void gap_floor_send(const pc_addr *to, uint64_t oid, uint32_t incarn,
-		uint64_t floor, int node)
+		uint64_t floor, int node, int lost)
 {
 	unsigned char m[M_GAP_FLOOR_LEN];
 	struct pc_wcur c;
@@ -615,9 +640,12 @@ static void gap_floor_send(const pc_addr *to, uint64_t oid, uint32_t incarn,
 	cl_st_gap_floored();
 	if (pc_logrl_ok(LRL_GAP_FLOOR, to))
 		LM_NOTICE("cluster: node %d asked for deletes this node no longer "
-			"holds (up to %llu) - told to floor there, and asked to "
-			"rebuild\n", node, (unsigned long long)floor);
-	rebuild_send(to, M_REBUILD_ASK, M_REBUILD_FLOOR);
+			"holds (up to %llu) - told to floor there%s\n", node,
+			(unsigned long long)floor, lost ? ", and asked to rebuild" :
+			"; newer deletes of the same keys took them over, so no "
+			"rebuild");
+	if (lost)
+		rebuild_send(to, M_REBUILD_ASK, M_REBUILD_FLOOR);
 }
 
 void handle_gap_req(const unsigned char *pt, size_t n,
@@ -645,7 +673,10 @@ void handle_gap_req(const unsigned char *pt, size_t n,
 		uint64_t floor = gap_floor_at(g.oid, g.incarn, lo, hi);
 
 		if (floor >= lo) {             /* it starts below what is held */
-			gap_floor_send(from, g.oid, g.incarn, floor, p->node);
+			/* a loss the table cannot rule out asks, unless every seq floored was superseded */
+			gap_floor_send(from, g.oid, g.incarn, floor, p->node,
+				lo <= clretain_space_gone(g.oid, g.incarn) &&
+				!clretain_superseded(g.oid, g.incarn, lo, floor));
 			if (floor >= hi)
 				return;
 			lo = floor + 1;
@@ -682,8 +713,8 @@ void handle_gap_floor(const unsigned char *pt, size_t n,
 	if (pc_ack_floor(oid, incarn, floor) == CLACK_NEW) {
 		cl_st_acks_floors();
 		LM_NOTICE("cluster: node %d no longer holds its deletes up to %llu "
-			"- this node's mark floored there; the rebuild it asks "
-			"for re-checks what that skipped\n", p->node,
+			"- this node's mark floored there (a rebuild follows if "
+			"any was lost rather than taken over)\n", p->node,
 			(unsigned long long)floor);
 	}
 }
@@ -780,8 +811,9 @@ void acks_rebuild_tick(long long now)
 
 void tomb_catchup_tick(void)
 {
+	static unsigned int catchup_last_s;
 	long long now = cl_now_ms();
-	unsigned int now_s = (unsigned int)(now / 1000);
+	unsigned int now_s = (unsigned int)(now / 1000), wmin;
 	struct clretain_stats rs;
 	int i;
 
@@ -792,6 +824,11 @@ void tomb_catchup_tick(void)
 		return;                        /* no copies by this road either */
 	catchup_by_marks = pc_cluster_acks_gate(NULL, 0, NULL);
 	clretain_get_stats(&rs, now_s);
+	/* a window never under twice the time between ticks: the cursor gains on the clock, or one
+	 * behind a faster planting rate trails at the horizon, replaying each entry as it ages out */
+	wmin = catchup_last_s && now_s > catchup_last_s ?
+		2 * (now_s - catchup_last_s) : 20;
+	catchup_last_s = now_s;
 	for (i = 0; i < cl_peers()->n_peers; i++) {
 		struct peer *p = &cl_peers()->peers[i];
 		unsigned int horizon, upto, sent, win;
@@ -800,7 +837,7 @@ void tomb_catchup_tick(void)
 		    !clpeers_live(p, now))
 			continue;              /* silent: the gap is noted on return */
 		horizon = now_s > rs.retain_s ? now_s - rs.retain_s : 0;
-		if (!p->tomb_owed) {
+		if (!p->tomb_owed || p->tomb_gap_from) {
 			if (p->tomb_gap_from) {
 				/* it went quiet at gap_from: what was deleted
 				 * since may never have reached it */
@@ -841,7 +878,10 @@ void tomb_catchup_tick(void)
 					"silence - replaying the deletes it may have "
 					"missed (%llu retained)\n", p->node, away,
 					rs.entries);
-				p->tomb_mark = p->tomb_gap_from;
+				/* a silence while a replay is owed joins it: that replay covers
+				 * what is past its cursor, so the cursor only ever moves back */
+				if (!p->tomb_owed || p->tomb_gap_from < p->tomb_mark)
+					p->tomb_mark = p->tomb_gap_from;
 				p->tomb_gap_from = 0;
 			} else if (!p->tomb_mark) {
 				/* never caught up before: everything retained */
@@ -852,9 +892,11 @@ void tomb_catchup_tick(void)
 				p->tomb_drop_mark = clretain_dropped_early();
 				continue;
 			}
+			if (!p->tomb_owed) {
+				p->tomb_sent = 0;
+				p->tomb_win = 60;
+			}
 			p->tomb_owed = 1;
-			p->tomb_sent = 0;
-			p->tomb_win = 60;
 		}
 		if (p->tomb_mark < horizon)
 			p->tomb_mark = horizon;    /* nothing older is held */
@@ -864,10 +906,12 @@ void tomb_catchup_tick(void)
 		p->tomb_mark = upto;
 		/* a few thousand a tick: halve the window past 4,000, double it
 		 * under 1,000 */
-		if (sent > 4000 && win > 1)
+		if (sent > catchup_burst() && win / 2 >= wmin)
 			p->tomb_win = win / 2;
-		else if (sent < 1000 && win < 3600)
+		else if (sent < catchup_burst() / 4 && win < 3600)
 			p->tomb_win = win * 2;
+		if (p->tomb_win < wmin)
+			p->tomb_win = wmin;
 		if (upto >= now_s) {
 			p->tomb_owed = 0;
 			p->tomb_drop_mark = clretain_dropped_early();

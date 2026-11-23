@@ -40,6 +40,8 @@ struct ring {
 	uint32_t size;
 	volatile uint32_t head, tail;     /* monotonically increasing */
 	unsigned long long dropped;
+	/* at most the seq its producer holds and has not yet put in it (0 = none) */
+	unsigned long long busy;
 };
 
 static struct {
@@ -61,6 +63,8 @@ static struct {
 	unsigned long long seq;           /* the global stamp */
 	unsigned long long appended, bytes, late, recycles, synced_seq,
 		pending_hi;
+	/* every seq at or below it was written, then synced, or dropped: what a sync waits for */
+	unsigned long long synced_low;
 	/* the lowest and highest seq a full ring dropped - never cleared, read
 	 * against the last snapshot's marker */
 	unsigned long long drop_lo, drop_hi;
@@ -233,19 +237,53 @@ static int wal_fdatasync_timed(long long now)
 	return rc;
 }
 
+/* the lowest seq not yet written - held by a producer or still in a ring; every number below it
+ * is written or dropped */
+static unsigned long long seq_low(void)
+{
+	unsigned long long lo = __atomic_load_n(&W.seq, __ATOMIC_SEQ_CST) + 1;
+	int i;
+
+	for (i = 0; i < W.nrings; i++) {
+		struct ring *r = &W.rings[i];
+		unsigned long long b = __atomic_load_n(&r->busy, __ATOMIC_SEQ_CST);
+		uint32_t head = r->head;
+
+		if (b && b < lo)
+			lo = b;
+		if (head != __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE)) {
+			unsigned char sq[8];
+			unsigned long long s;
+
+			walring_copy(r->buf, r->size, (walring_pos(head, r->size) +
+				PC_WAL_RECHDR + 1 + 1 + 2 + 4 + 8) % r->size, sq, 8);
+			s = r64(sq);
+			if (s < lo)
+				lo = s;
+		}
+	}
+	return lo;
+}
+
 /* the only place the durable watermark moves, on the device's yes (not
  * for @claim 0, the rotation's); a refusal fails the node, never retried */
 static int wal_sync_commit(long long now, int claim)
 {
+	unsigned long long low;
+
 	if (W.failed)
 		return -1;
+	/* before the sync: what it covers is what was written by now */
+	low = claim ? seq_low() - 1 : 0;
 	if (wal_fdatasync_timed(now) != 0) {
 		wal_storage_failed("fdatasync", errno);
 		return -1;
 	}
 	if (claim) {
 		W.last_fsync_us = now;
-		W.synced_seq = W.pending_hi;
+		/* the highest written, but not past a lower number still unwritten */
+		W.synced_seq = low < W.pending_hi ? low : W.pending_hi;
+		__atomic_store_n(&W.synced_low, low, __ATOMIC_RELEASE);
 	}
 	return 0;
 }
@@ -815,7 +853,7 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 		}
 		W.free_segs = W.nseg;
 	}
-	W.pending_hi = W.synced_seq = W.seq;
+	W.pending_hi = W.synced_seq = W.synced_low = W.seq;
 	/* a span left OPEN (last 0) was active at a stop without a shutdown and
 	 * nothing else closes it; the resumed seq bounds its records */
 	{
@@ -841,8 +879,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	for (i = 0; i < nthreads; i++) {
 		/* a ring per thread, sized by what the thread writes - the
 		 * caller knows which slot is which; NULL = all ring_kb */
-		W.rings[i].size = (uint32_t)(ring_kb_of && ring_kb_of[i] > 0
-			? ring_kb_of[i] : ring_kb) << 10;
+		W.rings[i].size = walring_size(ring_kb_of && ring_kb_of[i] > 0
+			? ring_kb_of[i] : ring_kb);
 		W.rings[i].buf = malloc(W.rings[i].size);
 		if (!W.rings[i].buf)
 			return -1;
@@ -851,7 +889,7 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 		pc_touch_pages(W.rings[i].buf, W.rings[i].size);
 	}
 	W.stage_cap = 4u << 20;
-	W.stage = malloc(2 * W.stage_cap);        /* and the write buffer after it */
+	W.stage = malloc(2 * W.stage_cap + 4);    /* and the write buffer after it, + its end mark */
 	if (!W.stage)
 		return -1;
 	pc_touch_pages(W.stage, 2 * W.stage_cap);
@@ -1107,6 +1145,33 @@ static void note_drop(unsigned long long seq)
 		;
 }
 
+/* a test holds a "stall*" key's writer between its number and its ring (PERFCACHED_TEST_WAL_STALL_MS) */
+static long wal_stall_ms(void)
+{
+	static long m = -1;
+
+	if (m < 0) {
+		const char *e = getenv("PERFCACHED_TEST_WAL_STALL_MS");
+		long v = e ? atol(e) : 0;
+
+		m = v > 0 ? v : 0;
+	}
+	return m;
+}
+
+/* a test drops a "drop*" key's record as a full ring drops one (PERFCACHED_TEST_WAL_DROP) */
+static int wal_drop_test(void)
+{
+	static int m = -1;
+
+	if (m < 0) {
+		const char *e = getenv("PERFCACHED_TEST_WAL_DROP");
+
+		m = e && atoi(e) > 0;
+	}
+	return m;
+}
+
 /* the record's seq once in a ring (or dropped by a full one); 0 when
  * nothing is logged by design, PC_WAL_SEQ_NEVER when it could not be */
 static unsigned long long produce(int type, const char *col, const char *key,
@@ -1164,7 +1229,11 @@ static unsigned long long produce(int type, const char *col, const char *key,
 	{
 		unsigned char *p = scratch;
 
-		seq = __atomic_fetch_add(&W.seq, 1, __ATOMIC_RELAXED) + 1;
+		/* a bound below the number about to be taken, published first: the pump's
+		 * watermark stops under it until the record is in the ring */
+		__atomic_store_n(&r->busy, __atomic_load_n(&W.seq, __ATOMIC_SEQ_CST) + 1,
+			__ATOMIC_SEQ_CST);
+		seq = __atomic_fetch_add(&W.seq, 1, __ATOMIC_SEQ_CST) + 1;
 
 		w32(p, pl);                        /* len */
 		w32(p + 4, 0);                     /* crc: the WAL thread stamps */
@@ -1193,6 +1262,12 @@ static unsigned long long produce(int type, const char *col, const char *key,
 		if (vlen > 0)
 			memcpy(p, val, (size_t)vlen);
 	}
+	if (wal_stall_ms() && klen >= 5 && !memcmp(key, "stall", 5)) {
+		struct timespec st = { wal_stall_ms() / 1000,
+			(wal_stall_ms() % 1000) * 1000000L };
+
+		nanosleep(&st, NULL);
+	}
 
 	/* SPSC publish: fits? copy (with wrap), then release the tail */
 	{
@@ -1204,9 +1279,12 @@ static unsigned long long produce(int type, const char *col, const char *key,
 			head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
 			free_ = r->size - (tail - head);
 		}
+		if (wal_drop_test() && klen >= 4 && !memcmp(key, "drop", 4))
+			free_ = 0;
 		if (free_ < need) {
 			r->dropped++;              /* on_full = heal, or a wait gave up */
 			note_drop(seq);
+			__atomic_store_n(&r->busy, 0, __ATOMIC_RELEASE);
 			/* wake the pump here too: with every ring full
 			 * nothing else wakes it, one batch per nap */
 			if (__atomic_load_n(&W.sleeping, __ATOMIC_ACQUIRE) &&
@@ -1214,7 +1292,7 @@ static unsigned long long produce(int type, const char *col, const char *key,
 				if (write(W.wake_efd, &one, sizeof one) < 0) { /* best effort */ }
 			return seq;
 		}
-		pos = tail % r->size;
+		pos = walring_pos(tail, r->size);
 		if (pos + need <= r->size) {
 			memcpy(r->buf + pos, scratch, need);
 		} else {
@@ -1224,6 +1302,7 @@ static unsigned long long produce(int type, const char *col, const char *key,
 			memcpy(r->buf, scratch + first, need - first);
 		}
 		__atomic_store_n(&r->tail, tail + need, __ATOMIC_RELEASE);
+		__atomic_store_n(&r->busy, 0, __ATOMIC_RELEASE);
 	}
 	if (pc_wal_wrote)
 		*pc_wal_wrote = 1;                 /* its connection writes */
@@ -1333,11 +1412,15 @@ int pc_wal_enabled(void)
 	return W.enabled;
 }
 
-/* records before this are logged under @from and after it under @to, so
- * the replay must meet this record between them */
+/* records before this are logged under @from and after it under @to; synced before the
+ * caller persists @to, as a load maps a snapshot's @from by this record */
 void pc_wal_col_rename(const char *from, const char *to)
 {
 	produce(PC_WAL_T_COL_RENAME, from, ".", 1, to, (int)strlen(to), 0, 0, 0);
+	if (W.enabled && pc_wal_sync(0) < 0)
+		LM_WARN("wal: the rename of '%s' to '%s' is not synced - a crash before "
+			"it is may lose what the last snapshot holds under '%s'\n", from, to,
+			from);
 }
 
 void pc_wal_touch(const char *col, const char *key, int klen,
@@ -1566,22 +1649,33 @@ static size_t wal_pend;
 
 static int append_flush(void)
 {
-	const unsigned char *b = W.stage + W.stage_cap;
-	size_t n = wal_pend;
+	unsigned char *b = W.stage + W.stage_cap;
+	size_t n = wal_pend, mark = 0;
+	long long at = W.off;
 
 	wal_pend = 0;
+	if (!n)
+		return 0;
+	/* 4 zero bytes after the batch, overwritten by the next: the frontier reads len 0, not
+	 * whatever a recycled segment held there */
+	if (W.off + (long long)n + 4 <= W.seg_bytes) {
+		memset(b + n, 0, 4);
+		mark = 4;
+	}
+	n += mark;
 	while (n > 0) {
-		ssize_t w = pwrite(W.fd, b, n, W.off);
+		ssize_t w = pwrite(W.fd, b, n, at);
 
 		if (w <= 0) {
 			if (w == 0)
 				errno = 0;             /* a short write, no errno */
 			return -1;
 		}
-		W.off += w;
+		at += w;
 		b += w;
 		n -= (size_t)w;
 	}
+	W.off = at - (long long)mark;
 	return 0;
 }
 
@@ -1592,7 +1686,8 @@ static unsigned char *take_rec(const struct batch_rec *br)
 	struct ring *r = &W.rings[br->ring];
 	unsigned char *d = W.stage + W.stage_cap + wal_pend;
 
-	walring_copy(r->buf, r->size, br->pos % r->size, d, br->len);
+	walring_copy(r->buf, r->size, walring_pos(br->pos, r->size), d,
+		br->len);
 	__atomic_store_n(&r->head, br->pos + br->len, __ATOMIC_RELEASE);
 	wal_pend += br->len;
 	return d;
@@ -1708,7 +1803,7 @@ int pc_wal_pump(void)
 
 		while (head != tail && nrec < BATCH_MAX) {
 			unsigned char hdr[PC_WAL_RECHDR], sq[8];
-			uint32_t pos = head % r->size, len, total;
+			uint32_t pos = walring_pos(head, r->size), len, total;
 
 			walring_copy(r->buf, r->size, pos, hdr,
 				PC_WAL_RECHDR);
@@ -1947,8 +2042,9 @@ int pc_wal_sync(int timeout_ms)
 	target = __atomic_load_n(&W.seq, __ATOMIC_ACQUIRE);
 	if (timeout_ms <= 0)
 		timeout_ms = 5000;
+	/* a dropped number is never written: the wait is for a sync that left none below it */
 	while (waited < timeout_ms) {
-		if (W.synced_seq >= target)
+		if (__atomic_load_n(&W.synced_low, __ATOMIC_ACQUIRE) >= target)
 			return 0;
 		/* the watermark will never reach it - say so now, not after the
 		 * caller's timeout */
@@ -1961,7 +2057,7 @@ int pc_wal_sync(int timeout_ms)
 		usleep(2000);
 		waited += 2;
 	}
-	return W.synced_seq >= target ? 0 : -1;
+	return __atomic_load_n(&W.synced_low, __ATOMIC_ACQUIRE) >= target ? 0 : -1;
 }
 
 void pc_wal_get_stats(struct pc_wal_stats *out)

@@ -161,6 +161,36 @@ else
 	bad "3. did not start: $(tail -3 "$D/low.log")"
 fi
 
+# ---- 4. the link: raised, then its speed unreadable -------------------------------------
+# a fake /sys (PERFCACHED_HOSTLINK_ROOT): fk0 at 10 Mb/s, fed 1.25 MB/s; the speed then reads -1,
+# as a lost carrier or a bond with no active slave does - the alert must clear, not stay raised
+H=$D/hl
+mkdir -p "$H/sys/class/net/fk0/statistics"
+for f in rx_bytes tx_bytes rx_dropped tx_dropped rx_missed_errors; do
+	echo 0 > "$H/sys/class/net/fk0/statistics/$f"
+done
+echo 10 > "$H/sys/class/net/fk0/speed"
+conf link "link_warn_pct = 1" "link_crit_pct = 2"
+sed -i 's/^\[daemon\]$/[daemon]\nlink_monitor = fk0/' "$D/link.conf"
+export PERFCACHED_HOSTLINK_ROOT="$H"
+if start link; then
+	( b=0; while :; do b=$((b + 250000)); echo $b > "$H/sys/class/net/fk0/statistics/rx_bytes"
+		sleep 0.2; done ) & L=$!
+	v=$(until_active host.link 15)
+	[ "$v" = critical ] && ok "4. host.link: critical at 100% of a 10 Mb/s link" ||
+		bad "4. host.link: '$v' $(st 's["alerts"]["active"]')"
+	echo -1 > "$H/sys/class/net/fk0/speed"
+	n=0; while [ $n -lt 100 ] && [ "$(active host.link)" != none ]; do sleep 0.25; n=$((n+1)); done
+	kill $L 2>/dev/null; wait $L 2>/dev/null; L=
+	[ "$v" = critical ] && [ "$(active host.link)" = none ] &&
+		ok "4. the speed unreadable (re-read every 10 s): host.link cleared" ||
+		bad "4. 25 s after the speed turned unreadable host.link is still '$(active host.link)'"
+	stop
+else
+	bad "4. did not start: $(tail -3 "$D/link.log")"
+fi
+unset PERFCACHED_HOSTLINK_ROOT
+
 # a raised critical alert is logged CRIT by design (alerts.c) - anything else is not
 grep -h 'an fsync has been stuck' "$D"/*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
 e=$(cat "$D"/*.log | grep -E ' (ERROR|CRIT)' | grep -v ' alert: ' | grep -cv 'an fsync has been stuck')

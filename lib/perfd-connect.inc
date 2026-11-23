@@ -312,7 +312,7 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 		if (p->fd < 0) {
 			errk(NULL, PERFD_E_TRANSPORT, "cannot connect: %s",
 				strerror(errno));
-			free(p);
+			perfd_free(p);
 			return NULL;
 		}
 		setsockopt(p->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -333,25 +333,25 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 		p->poisoned = 0;
 		if (p->io_silent) {            /* no answer says nothing of the secret */
 			errk(NULL, PERFD_E_TRANSPORT, "handshake: no answer in %d ms", hs_ms);
-			free(p);
+			perfd_free(p);
 			return NULL;
 		}
 	}
 	errk(NULL, PERFD_E_AUTH,
 		"handshake failed with every secret (%d tried)", nsec);
-	free(p);
+	perfd_free(p);
 	return NULL;
 }
 
 /* where this connection landed - its worker's live native connections,
  * the least any worker holds, and how many workers; -1 from a daemon without conninfo */
-static int conn_where(perfd_t *p, int *mine, int *least, int *workers)
+static int conn_where(perfd_t *p, int *mine, int *least, int *workers, int *serving)
 {
 	struct pc_tv v;
 	long long m, l, w;
-	char *res = NULL;
+	char *res = NULL, st[16] = "";
 	size_t n = 0;
-	int own = p->own_reply, rc;
+	int own = p->own_reply, rc, sl = -1;
 
 	p->own_reply = 1;
 	rc = roundtrip_once(p, "conninfo", NULL, 0, &res, &n);
@@ -362,12 +362,16 @@ static int conn_where(perfd_t *p, int *mine, int *least, int *workers)
 	rc = pc_tv_parse(&v, (const unsigned char *)res, n) == 0 && v.n[0].type == 'm' &&
 		pc_tv_get_int(&v, 0, "mine", &m) == 0 && pc_tv_get_int(&v, 0, "least", &l) == 0 &&
 		pc_tv_get_int(&v, 0, "workers", &w) == 0 ? 0 : -1;
+	if (rc == 0)                       /* a daemon older than the field serves */
+		sl = pc_tv_get_str(&v, 0, "state", st, sizeof st - 1);
 	pc_tv_free(&v);
 	free(res);
 	if (rc == 0) {
 		*mine = (int)m;
 		*least = (int)l;
 		*workers = (int)w;
+		if (serving)
+			*serving = state_usable(st, sl);
 	}
 	return rc;
 }
@@ -379,7 +383,7 @@ static perfd_t *balance_worker(perfd_t *p, const char *host, int port,
 {
 	int mine, least, workers, tries;
 
-	if (!p->worker_bal || unixp || conn_where(p, &mine, &least, &workers) != 0 ||
+	if (!p->worker_bal || unixp || conn_where(p, &mine, &least, &workers, NULL) != 0 ||
 	    workers < 2 || mine - 1 <= least)
 		return p;
 	for (tries = 0; tries < 8 * workers && tries < 64; tries++) {
@@ -387,7 +391,7 @@ static perfd_t *balance_worker(perfd_t *p, const char *host, int port,
 
 		if (!q)
 			break;
-		if (conn_where(q, &mine, &least, &workers) == 0 && mine - 1 <= least) {
+		if (conn_where(q, &mine, &least, &workers, NULL) == 0 && mine - 1 <= least) {
 			perfd_free(p);
 			return q;
 		}
@@ -470,7 +474,6 @@ void perfd_free(perfd_t *p)
 		free(p->enable_sec);
 		free(p->conn_name);
 	}
-	struct early *e;
 	int i;
 
 	if (!p)
@@ -495,11 +498,7 @@ void perfd_free(perfd_t *p)
 	}
 	if (p->fd >= 0)
 		close(p->fd);
-	while ((e = p->early)) {
-		p->early = e->next;
-		free(e->result);
-		free(e);
-	}
+	early_free(p);
 	free(p->rbuf);
 	free(p->xbuf);
 	free(p->rsc);

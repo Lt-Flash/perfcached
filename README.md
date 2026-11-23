@@ -37,8 +37,8 @@ $ redis-cli -p 6380 -a resp-password-example --no-auth-warning GET user:42
 alice
 ```
 
-**Current release: 0.7.5** (2026-11-22), with libperfd 0.7.6 and
-php-perfcached 0.1.1.  [GUIDE.md](GUIDE.md) shows how to install it,
+**Current release: 0.7.5.1** (2026-11-26), with libperfd 0.7.6.1 and
+php-perfcached 0.2.0.  [GUIDE.md](GUIDE.md) shows how to install it,
 build a cluster, take over from Redis, upgrade, back up and watch it,
 with real output.
 
@@ -118,41 +118,28 @@ with real output.
   `tls` (a build with OpenSSL).  Under `upstream_writes = through` the
   RESP door can write to Redis: keep it on a trusted segment, behind
   `resp_allow` and `[secrets] resp`, or on TLS.
-- **Upgrading to 0.7.5 from 0.7.4.x is a whole-fleet stop**: 0.7.5
-  speaks cluster wire epoch 4 alone and refuses an older node.  Stop
-  every node (`perfcli -E <enable> fleetstop`), install 0.7.5, start
+- **Upgrading from 0.7.4.x is a whole-fleet stop**: 0.7.5 and later
+  speak cluster wire epoch 4 alone and refuse an older node.  Stop
+  every node (`perfcli -E <enable> fleetstop`), install 0.7.5.1, start
   them all; the state is kept ([GUIDE.md](GUIDE.md#upgrade)).  Use
   libperfd 0.7.6 or later with it: an older libperfd does not route by
-  key against 0.7.5 (every request takes a forward hop) and is refused a
-  value over 58,000 bytes.
-- **`[cluster] tombstone_acks`**: a fleet running `no` cannot be
-  switched to `yes` by a rolling restart - a node on `yes` among members
-  on `no` loops.  Until 0.7.5.1, leave a fleet that runs `no` on `no`
-  (a switch to `yes` needs every node changed and the fleet restarted
-  whole).
+  key against 0.7.5 and later (every request takes a forward hop) and
+  is refused a value over 58,000 bytes.
 
-**Known issues in 0.7.5**, fixed in **0.7.5.1**, the fix release
-coming next:
-
-- Write-through (`upstream_writes = through`): a value too large for
-  one record (about 256 KB with its key) is still sent to Redis, which
-  takes it, and the client gets OK, but the fleet cannot hold it.  An
-  older copy of that key may keep answering until tracking invalidates
-  it (for good with `upstream_tracking = off`); after that, reads fail
-  as too large.  Keep write-through values under 256 KB until 0.7.5.1.
-- A node rejoining while a reconcile pass is open can report ready
-  before its copy of the fleet's state has finished, and for that
-  moment answer a read with a key deleted while it was away, or an
-  older value.
-- A collection change that comes from the fleet (a resize, an autoscale
-  or mode change) writes the collections file on the cluster thread.
-  On slow storage that stalls the forwards and pulls the thread
-  carries for as long as the fsync takes, and a read routed through
-  such a node can answer as a miss.
-
-0.7.5.1 also carries the fixes from a full code review of 0.7.5:
-memory-safety fixes, refusals for malformed input, and corrections in
-the cluster, the upstream bridge, the client libraries and the tools.
+**0.7.5.1 fixes 0.7.5's known issues**: a write-through value too large
+for one record is refused before Redis takes it, a node rejoining
+during a reconcile pass no longer reports ready before its copy has
+finished, a collection change from the fleet no longer stalls the
+cluster thread on slow storage, and `tombstone_acks = yes` works in a
+mixed fleet - once every node runs 0.7.5.1, a fleet on `no` switches
+to `yes` one node at a time.  It also carries the fixes from a full
+code review of 0.7.5.  **From 0.7.5 it rolls node by node** (the same
+wire epoch); create, drop or rename no collection while the fleet is
+mixed.  From 0.7.4.x it is still the whole-fleet stop above.  Read the
+top of the [ChangeLog](ChangeLog) before upgrading:
+`perfcli load` now needs `-E`, a read whose owner does not answer in
+time is refused as retryable instead of answered absent, and an IPv4
+allow-list entry must be a full dotted quad (`10/8` is refused).
 
 Report anything odd as an
 [issue](https://github.com/Lt-Flash/perfcached/issues), with `perfcached
@@ -168,17 +155,18 @@ security problem goes privately, as [SECURITY.md](SECURITY.md) says.
 node only) - they install the same files and replace each other - and
 `perfcached-dashboard` (Debian 13 and 12, Ubuntu 24.04).  On Alpine all
 three come as signed `.apk` files; a release tarball installs under
-`/opt/perfcached-0.7.5`.
+`/opt/perfcached-0.7.5.1`.
 
 ```
-sudo apt install ./perfcached_0.7.5-1+deb13_amd64.deb
+sudo apt install ./perfcached_0.7.5.1-1+deb13_amd64.deb
 ```
 
-**libperfd** 0.7.6: `libperfd0` (the shared library) and `libperfd-dev`
-(header, static archive, pkg-config file) as `.deb`, `libperfd` /
-`libperfd-dev` as `.apk`.  A program built against `libperfd-dev`
-links the shared library, so a libperfd update with the same SONAME is
-an install and a restart, no rebuild ([lib/README.md](lib/README.md)).
+**libperfd** 0.7.6.1: `libperfd0` (the shared library) and
+`libperfd-dev` (header, static archive, pkg-config file) as `.deb`,
+`libperfd` / `libperfd-dev` as `.apk`.  A program built against
+`libperfd-dev` links the shared library, so a libperfd update with the
+same SONAME is an install and a restart, no rebuild
+([lib/README.md](lib/README.md)).
 
 **From source:** a C compiler, make and libsodium (OpenSSL for TLS):
 `make && sudo make install && sudo systemd-sysusers`.  The editions, the
@@ -307,7 +295,9 @@ Every table, its method and how to reproduce it:
 
 ## Upgrading
 
-- **0.7.4.x to 0.7.5**: a whole-fleet stop (above).
+- **0.7.4.x to 0.7.5.1**: a whole-fleet stop (above).
+- **0.7.5 to 0.7.5.1**: a rolling restart, as below; no collection
+  create, drop or rename while the fleet is mixed.
 - **Within the support window** - from 0.7.5 to a later 0.7.5.x patch or
   to the next minor's releases - a rolling restart: members first, the master last,
   one node at a time, each only once its `stats.cluster.restart.safe`

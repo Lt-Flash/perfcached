@@ -167,6 +167,7 @@ unsigned long long pc_wal_durable_seq(unsigned long long covered);
 /* a collection created, dropped or renamed while the daemon serves */
 void pc_wal_col_create(const char *col, int buckets_log2);
 void pc_wal_col_drop(const char *col);
+/* waits (bounded) for its record to be synced: the caller persists the new name next */
 void pc_wal_col_rename(const char *from, const char *to);
 int pc_wal_enabled(void);   /* is a WAL running at all? */
 void pc_wal_touch(const char *col, const char *key, int klen,

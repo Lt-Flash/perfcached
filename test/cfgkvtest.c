@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "config.h"
 #include "configint.h"
 
@@ -24,8 +25,43 @@ static int kv(int (*f)(struct pstate *, char *, char *), const char *key, const 
 	return f(&ps, k, v);
 }
 
+/* @key = @val on [listen], its answer; what it logged in @out */
+static int kv_logged(const char *key, const char *val, char *out, size_t cap)
+{
+	char tmp[] = "/var/tmp/cfgkvtest.XXXXXX";
+	int fd = mkstemp(tmp), save = dup(2), rc;
+	ssize_t n = 0;
+
+	fflush(stderr);
+	if (fd >= 0)
+		dup2(fd, 2);
+	rc = kv(cfg_kv_listen, key, val);
+	fflush(stderr);
+	dup2(save, 2);
+	close(save);
+	if (fd >= 0) {
+		n = pread(fd, out, cap - 1, 0);
+		close(fd);
+		unlink(tmp);
+	}
+	out[n > 0 ? n : 0] = 0;
+	return rc;
+}
+
+static int count_of(const char *s, const char *w)
+{
+	int n = 0;
+
+	while ((s = strstr(s, w)) != NULL) {
+		n++;
+		s += strlen(w);
+	}
+	return n;
+}
+
 int main(void)
 {
+	char lg[2048];
 	int i, n;
 
 	ps.path = "cfgkvtest.conf";
@@ -107,6 +143,44 @@ int main(void)
 	}
 	CHK(kv(cfg_kv_daemon, "workers", "4x") == -1 && kv(cfg_kv_daemon, "workers", "") == -1 &&
 		cfg.workers == 512, "E: junk after the number, or no number - refused");
+
+	/* F: [listen] resp_allow / http_allow take a full dotted quad only - inet_aton's short and
+	 * octal forms name another network than the one written */
+	n = cfg.n_resp_allow;
+	CHK(kv(cfg_kv_listen, "resp_allow", "192.168.0.0/16") == 0 && cfg.n_resp_allow == n + 1 &&
+		cfg.resp_allow[n].net[0] == 192 && cfg.resp_allow[n].net[1] == 168 &&
+		cfg.resp_allow[n].bits == 16, "F: resp_allow 192.168.0.0/16 - taken");
+	n = cfg.n_resp_allow;
+	CHK(kv(cfg_kv_listen, "resp_allow", "192.168/16") == -1 && cfg.n_resp_allow == n,
+		"F: resp_allow 192.168/16 (inet_aton: 192.0.0.168) - refused");
+	CHK(kv(cfg_kv_listen, "resp_allow", "10/8") == -1 && cfg.n_resp_allow == n,
+		"F: resp_allow 10/8 (inet_aton: 0.0.0.10) - refused");
+	CHK(kv(cfg_kv_listen, "resp_allow", "010.0.0.0/8") == -1 && cfg.n_resp_allow == n,
+		"F: resp_allow 010.0.0.0/8 (inet_aton: octal, 8.0.0.0) - refused");
+	CHK(kv(cfg_kv_listen, "resp_allow", "10.0.0.1 10.0.0.2") == -1 && cfg.n_resp_allow == n,
+		"F: resp_allow \"10.0.0.1 10.0.0.2\" (inet_aton: the first alone) - refused");
+	n = cfg.n_http_allow;
+	CHK(kv(cfg_kv_listen, "http_allow", "172.16/12") == -1 && cfg.n_http_allow == n,
+		"F: http_allow 172.16/12 (inet_aton: 172.0.0.16) - refused");
+	CHK(kv(cfg_kv_listen, "http_allow", "[::1]/128") == 0 && cfg.n_http_allow == n + 1,
+		"F: http_allow [::1]/128 - IPv6 still taken");
+
+	/* G: host bits past the prefix - taken as the network, with one WARNING naming the entry */
+	n = cfg.n_resp_allow;
+	CHK(kv_logged("resp_allow", "10.1.2.3/8", lg, sizeof lg) == 0 && cfg.n_resp_allow == n + 1 &&
+		cfg.resp_allow[n].net[0] == 10 && cfg.resp_allow[n].net[1] == 0 &&
+		cfg.resp_allow[n].net[3] == 0 && cfg.resp_allow[n].bits == 8,
+		"G: resp_allow 10.1.2.3/8 - taken as 10.0.0.0/8");
+	CHK(count_of(lg, "WARNING") == 1 && strstr(lg, "10.1.2.3/8") && strstr(lg, "10.0.0.0/8"),
+		"G: and one WARNING names the entry and the network (log: %.200s)", lg);
+	n = cfg.n_http_allow;
+	CHK(kv_logged("http_allow", "[2001:db8::1]/32", lg, sizeof lg) == 0 && cfg.n_http_allow == n + 1 &&
+		cfg.http_allow[n].net[4] == 0 && cfg.http_allow[n].net[15] == 0 &&
+		count_of(lg, "WARNING") == 1 && strstr(lg, "2001:db8::1"),
+		"G: http_allow [2001:db8::1]/32 - taken masked, one WARNING (log: %.200s)", lg);
+	CHK(kv_logged("resp_allow", "10.0.0.0/8", lg, sizeof lg) == 0 && !strstr(lg, "WARNING") &&
+		kv_logged("resp_allow", "10.1.2.3", lg, sizeof lg) == 0 && !strstr(lg, "WARNING"),
+		"G: 10.0.0.0/8 and a bare 10.1.2.3 - no warning (log: %.200s)", lg);
 
 	printf("cfgkvtest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

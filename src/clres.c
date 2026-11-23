@@ -86,6 +86,16 @@ int clres_count(const struct clres *r, long long now)
 	return n;
 }
 
+int clres_count_why(const struct clres *r, int why, long long now)
+{
+	int i, n = 0;
+
+	for (i = 0; i < CLRES_MAX; i++)
+		if (r->e[i].id && r->e[i].until_ms > now && r->e[i].why == why)
+			n++;
+	return n;
+}
+
 int clres_home(const struct clres *r, const unsigned char *ident,
 		long long now, struct in_addr *home)
 {

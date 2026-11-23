@@ -213,7 +213,7 @@ static void sample(unsigned long long *limit, unsigned long long *avail,
 {
 	char b[8192], f[PATH_MAX + 32];
 	long long mt = -1, ma = -1;
-	int i;
+	int i, have_av = 0;
 
 	*limit = *avail = *cg_use = *cg_inact = 0;
 	snprintf(src, srclen, "none");
@@ -241,6 +241,7 @@ static void sample(unsigned long long *limit, unsigned long long *avail,
 			if (G.pool && G.pool < *limit)
 				*limit -= G.pool;          /* never the heap's */
 			*avail = (unsigned long long)(ma > 0 ? ma : 0) << 10;
+			have_av = 1;
 			snprintf(src, srclen, G.pool ? "meminfo, less the hugetlb pool"
 				: "meminfo");
 		}
@@ -278,8 +279,10 @@ static void sample(unsigned long long *limit, unsigned long long *avail,
 			*cg_inact = inact > 0 ? (unsigned long long)inact : 0;
 			snprintf(src, srclen, "cgroup v%d %s", G.cgv, *rel ? rel : "/");
 		}
-		if (head < *avail || !*avail)
+		if (head < *avail || !have_av) {
 			*avail = head;
+			have_av = 1;
+		}
 	}
 }
 

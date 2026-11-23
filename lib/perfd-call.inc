@@ -152,9 +152,11 @@ static perfd_t *pick_live(perfd_t *p, const char *col, const char *key)
 	return t;
 }
 
+static void relink(perfd_t *p);
+
 /* the data verbs' failover: a dead connection retries once on a standby, a non-idempotent verb
  * does not, and a "not READY" refusal (nothing applied) moves to another member */
-static int bin_roundtrip(perfd_t *p, int verb, const char *col,
+static int bin_roundtrip_body(perfd_t *p, int verb, const char *col,
 		const char *key, const void *val, size_t vlen,
 		long long by, long long ttl, char **out, size_t *outlen)
 {
@@ -169,6 +171,8 @@ static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 	}
 	if (p->spread_due && !p->is_child)
 		spread_apply(p);
+	if (!p->is_child)
+		relink(p);                     /* before a standby is picked: its failover may adopt one */
 	t = pick_live(p, col, key);
 	if (t == p && keep_live(p) != 0)
 		return -1;
@@ -223,6 +227,7 @@ static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 		first_keep(p, &f);
 		if (failover(p) != 0)
 			return first_report(p, &f, 0);
+		relink(p);
 		rc = bin_roundtrip_once(p, verb, col, key, val, vlen, by, ttl,
 			out, outlen);
 		if (rc == 0)
@@ -240,12 +245,34 @@ static int bin_roundtrip(perfd_t *p, int verb, const char *col,
 	first_keep(p, &f);
 	if (failover(p) != 0)
 		return first_report(p, &f, 0);
+	relink(p);
 	rc = bin_roundtrip_once(p, verb, col, key, val, vlen, by, ttl,
 		out, outlen);
 	if (rc == 0)
 		after_success(p);
 	else
 		first_report(p, &f, 1);
+	return rc;
+}
+
+/* a notify hook inside a call would take that call's replies or overwrite its answer */
+static int hook_refused(perfd_t *p)
+{
+	return errk(p, PERFD_E_STATE, "a notify hook may not call its handle while a call on it "
+		"runs - deliveries between calls (perfd_maintain) may");
+}
+
+static int bin_roundtrip(perfd_t *p, int verb, const char *col,
+		const char *key, const void *val, size_t vlen,
+		long long by, long long ttl, char **out, size_t *outlen)
+{
+	int rc;
+
+	if (p->hook_refuses)
+		return hook_refused(p);
+	p->in_call++;
+	rc = bin_roundtrip_body(p, verb, col, key, val, vlen, by, ttl, out, outlen);
+	p->in_call--;
 	return rc;
 }
 
@@ -325,6 +352,11 @@ static int roundtrip_once(perfd_t *p, const char *method,
 	*outlen = 0;
 	if (p->nids - p->idhead || p->qlen)
 		return errk(p, PERFD_E_STATE, "pipeline in progress");
+	/* every sender of enable passes here: the replay on an adopted link and perfd_command too */
+	if (!p->encrypted && p->nsec && !strcmp(method, "enable"))
+		return errk(p, PERFD_E_STATE, "enable needs an encrypted connection - this one is "
+			"authenticated but plaintext (libperfd: perfd_opts.encrypt = 1; perfcli: "
+			"--encrypt, which -E and -e imply)");
 	if (enqueue_cmd(p, method, tree, tlen) != 0 || perfd_flush(p) != 0) {
 		pipeline_drop(p);
 		return -1;
@@ -367,7 +399,7 @@ static int roundtrip_key(perfd_t *p, const char *method,
 		return roundtrip(p, method, tree, tlen, out, outlen);
 	}
 	route_retire(p, t);            /* dead standby: we carry it */
-	if (!method_idempotent(method))
+	if (!method_idempotent(method) || p->once)
 		/* the standby may have applied it before it died and the primary would apply it
 		 * again - the rule of the primary's own failover in roundtrip() */
 		return errk(p, PERFD_E_TRANSPORT, "connection lost during '%s' on the key's node - "
@@ -388,7 +420,7 @@ static void relink(perfd_t *p)
 
 /* one retry on a pre-warmed standby when the CONNECTION died; a verb-level error is never retried,
  * nor a non-idempotent verb, which could apply twice - the caller sees the error and decides */
-static int roundtrip(perfd_t *p, const char *method,
+static int roundtrip_body(perfd_t *p, const char *method,
 		const unsigned char *tree, size_t tlen, char **out,
 		size_t *outlen)
 {
@@ -402,6 +434,8 @@ static int roundtrip(perfd_t *p, const char *method,
 	}
 	if (p->spread_due && !p->is_child)
 		spread_apply(p);
+	if (!p->is_child)
+		relink(p);
 	if (keep_live(p) != 0)
 		return -1;
 	rc = roundtrip_once(p, method, tree, tlen, out, outlen);
@@ -425,7 +459,7 @@ static int roundtrip(perfd_t *p, const char *method,
 	}
 	if (!p->poisoned || p->is_child || !p->nmem)
 		return rc;
-	if (!method_idempotent(method))
+	if (!method_idempotent(method) || p->once)
 		return errk(p, PERFD_E_TRANSPORT, "connection lost during '%s' - NOT replayed (the "
 			"verb is not idempotent); retry if the operation is safe "
 			"to repeat", method);
@@ -438,6 +472,20 @@ static int roundtrip(perfd_t *p, const char *method,
 		after_success(p);
 	else
 		first_report(p, &f, 1);
+	return rc;
+}
+
+static int roundtrip(perfd_t *p, const char *method,
+		const unsigned char *tree, size_t tlen, char **out,
+		size_t *outlen)
+{
+	int rc;
+
+	if (p->hook_refuses)
+		return hook_refused(p);
+	p->in_call++;
+	rc = roundtrip_body(p, method, tree, tlen, out, outlen);
+	p->in_call--;
 	return rc;
 }
 

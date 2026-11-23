@@ -10,8 +10,11 @@
 struct win {
 	int lock;
 	uint64_t incarn, hi;
+	struct win *next;                  /* on the free list */
 	uint64_t bits[CLREPLAY_WIN / 64];
 };
+
+#define TOMB 1ULL                          /* a slot let go: lookups go on past it */
 
 struct sender {
 	uint64_t key;                      /* 1 << 48 | ip << 16 | port; 0 = free */
@@ -20,7 +23,10 @@ struct sender {
 	struct win *w[CLREPLAY_STREAMS];
 };
 
+/* slots and windows are never freed, only let go and reused under tab_lock, so a
+ * thread holding a stale pointer locks valid memory and finds it no longer its own */
 static struct sender tab[CLREPLAY_SENDERS];
+static struct win *freew;
 static int tab_lock, nwins;
 static unsigned long long cnt[CLREPLAY_NCOUNT];
 
@@ -36,35 +42,123 @@ static void unspin(int *l)
 	__atomic_store_n(l, 0, __ATOMIC_RELEASE);
 }
 
-static struct sender *sender_of(uint32_t ip, uint16_t port)
+/* under tab_lock: senders not heard for CLREPLAY_STALE_MS give up their slot and windows;
+ * each window is taken off under its lock, so an admit inside it finishes first */
+static int evict_stale(long long now)
 {
-	uint64_t key = 1ULL << 48 | (uint64_t)ip << 16 | port;
-	unsigned int h = (unsigned int)((key * 0x9E3779B97F4A7C15ULL) >> 40);
-	unsigned int i, k;
+	int i, j, n = 0;
 
 	for (i = 0; i < CLREPLAY_SENDERS; i++) {
-		struct sender *s = &tab[(h + i) % CLREPLAY_SENDERS];
-		uint64_t sk = __atomic_load_n(&s->key, __ATOMIC_ACQUIRE);
+		struct sender *s = &tab[i];
 
+		if (__atomic_load_n(&s->key, __ATOMIC_RELAXED) <= TOMB ||
+		    now - __atomic_load_n(&s->seen_ms, __ATOMIC_RELAXED) <= CLREPLAY_STALE_MS)
+			continue;
+		__atomic_store_n(&s->key, TOMB, __ATOMIC_RELEASE);
+		for (j = 0; j < CLREPLAY_STREAMS; j++) {
+			struct win *w = s->w[j];
+
+			if (!w)
+				continue;
+			spin(&w->lock);
+			__atomic_store_n(&s->w[j], NULL, __ATOMIC_RELEASE);
+			unspin(&w->lock);
+			w->next = freew;
+			freew = w;
+		}
+		n++;
+	}
+	return n;
+}
+
+/* under tab_lock: the sender's slot, or the first free or let-go one on its chain */
+static struct sender *claim(uint64_t key, unsigned int h, long long now)
+{
+	struct sender *s, *spare = NULL;
+	unsigned int i;
+
+	for (i = 0; i < CLREPLAY_SENDERS; i++) {
+		uint64_t sk;
+
+		s = &tab[(h + i) % CLREPLAY_SENDERS];
+		sk = __atomic_load_n(&s->key, __ATOMIC_ACQUIRE);
 		if (sk == key)
 			return s;
-		if (sk)
+		if (sk > TOMB)
 			continue;
-		spin(&tab_lock);               /* a free slot: claim it, or find it taken */
-		for (k = i; k < CLREPLAY_SENDERS; k++) {
-			s = &tab[(h + k) % CLREPLAY_SENDERS];
-			sk = __atomic_load_n(&s->key, __ATOMIC_ACQUIRE);
-			if (sk == key || !sk) {
-				if (!sk)
-					__atomic_store_n(&s->key, key, __ATOMIC_RELEASE);
-				unspin(&tab_lock);
-				return s;
-			}
-		}
-		unspin(&tab_lock);
-		return NULL;
+		if (!spare)
+			spare = s;
+		if (!sk)
+			break;
 	}
-	return NULL;
+	if (spare) {
+		__atomic_store_n(&spare->incarn, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&spare->seen_ms, now, __ATOMIC_RELAXED);
+		__atomic_store_n(&spare->key, key, __ATOMIC_RELEASE);
+	}
+	return spare;
+}
+
+static struct sender *sender_of(uint64_t key, long long now)
+{
+	unsigned int h = (unsigned int)((key * 0x9E3779B97F4A7C15ULL) >> 40);
+	struct sender *s;
+	unsigned int i;
+
+	for (i = 0; i < CLREPLAY_SENDERS; i++) {
+		uint64_t sk;
+
+		s = &tab[(h + i) % CLREPLAY_SENDERS];
+		sk = __atomic_load_n(&s->key, __ATOMIC_ACQUIRE);
+		if (sk == key)
+			return s;
+		if (!sk)
+			break;
+	}
+	spin(&tab_lock);
+	if (!(s = claim(key, h, now)) && evict_stale(now))
+		s = claim(key, h, now);
+	unspin(&tab_lock);
+	return s;
+}
+
+static struct win *win_new(void)
+{
+	struct win *w = freew;
+
+	if (w)
+		freew = w->next;
+	else if (nwins < CLREPLAY_WINS && (w = calloc(1, sizeof *w)))
+		nwins++;
+	return w;
+}
+
+/* @s's window for @st, made if it has none; NULL with *full set when there is no
+ * room, NULL alone when @s was let go under us */
+static struct win *win_of(struct sender *s, uint64_t key, const struct clwire_id *id,
+		long long now, int *full)
+{
+	struct win *w;
+
+	*full = 0;
+	spin(&tab_lock);
+	if (__atomic_load_n(&s->key, __ATOMIC_RELAXED) != key)
+		w = NULL;
+	else if (!(w = s->w[id->stream])) {
+		if (!(w = win_new()) && evict_stale(now) &&
+		    __atomic_load_n(&s->key, __ATOMIC_RELAXED) == key)
+			w = win_new();
+		if (!w)
+			*full = __atomic_load_n(&s->key, __ATOMIC_RELAXED) == key;
+		else {
+			w->incarn = id->incarn;
+			w->hi = 0;
+			memset(w->bits, 0, sizeof w->bits);
+			__atomic_store_n(&s->w[id->stream], w, __ATOMIC_RELEASE);
+		}
+	}
+	unspin(&tab_lock);
+	return w;
 }
 
 static void bit_clear_range(struct win *w, uint64_t from, uint64_t to)
@@ -111,49 +205,46 @@ static int counted(int rc)
 
 int clreplay_admit(const struct clwire_id *id, uint32_t from_ip, long long now)
 {
+	uint64_t key = 1ULL << 48 | (uint64_t)id->ip << 16 | id->port, cur;
 	struct sender *s;
-	struct win *w, *fresh;
-	uint64_t cur;
-	int rc, lower = 0;
+	struct win *w;
+	int rc, full, tries;
 
 	if (id->ip != from_ip)             /* it speaks for its own host only */
 		return counted(CLREPLAY_HOST);
-	s = sender_of(id->ip, id->port);
-	if (!s || id->stream >= CLREPLAY_STREAMS)
+	if (id->stream >= CLREPLAY_STREAMS)
 		return counted(CLREPLAY_FULL);
+	for (tries = 0; ; tries++) {
+		if (tries == 3 || !(s = sender_of(key, now)))
+			return counted(CLREPLAY_FULL);
+		if (!(w = __atomic_load_n(&s->w[id->stream], __ATOMIC_ACQUIRE)) &&
+		    !(w = win_of(s, key, id, now, &full))) {
+			if (full)
+				return counted(CLREPLAY_FULL);
+			continue;
+		}
+		spin(&w->lock);
+		if (__atomic_load_n(&s->w[id->stream], __ATOMIC_ACQUIRE) == w &&
+		    __atomic_load_n(&s->key, __ATOMIC_ACQUIRE) == key)
+			break;
+		unspin(&w->lock);              /* let go under us: look again */
+	}
 	cur = __atomic_load_n(&s->incarn, __ATOMIC_ACQUIRE);
 	if (id->incarn < cur) {
 		/* the newer one gone quiet: this sender's clock stepped back */
-		if (now - __atomic_load_n(&s->seen_ms, __ATOMIC_RELAXED) < CLREPLAY_STALE_MS)
+		if (now - __atomic_load_n(&s->seen_ms, __ATOMIC_RELAXED) < CLREPLAY_STALE_MS) {
+			unspin(&w->lock);
 			return counted(CLREPLAY_INCARN);
-		lower = 1;
+		}
 		__atomic_store_n(&s->incarn, id->incarn, __ATOMIC_RELEASE);
 	} else
 		while (id->incarn > cur && !__atomic_compare_exchange_n(&s->incarn,
 		        &cur, id->incarn, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			;
-	if (!(w = __atomic_load_n(&s->w[id->stream], __ATOMIC_ACQUIRE))) {
-		if (__atomic_add_fetch(&nwins, 1, __ATOMIC_RELAXED) > CLREPLAY_WINS) {
-			__atomic_sub_fetch(&nwins, 1, __ATOMIC_RELAXED);
-			return counted(CLREPLAY_FULL);     /* the window budget */
-		}
-		if (!(fresh = calloc(1, sizeof *fresh))) {
-			__atomic_sub_fetch(&nwins, 1, __ATOMIC_RELAXED);
-			return counted(CLREPLAY_FULL);
-		}
-		fresh->incarn = id->incarn;
-		w = NULL;
-		if (__atomic_compare_exchange_n(&s->w[id->stream], &w, fresh, 0,
-		        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-			w = fresh;
-		else {
-			free(fresh);           /* another thread's went in */
-			__atomic_sub_fetch(&nwins, 1, __ATOMIC_RELAXED);
-		}
-	}
-	spin(&w->lock);
 	if (id->incarn != w->incarn) {
-		if (id->incarn < w->incarn && !lower) {
+		/* below the sender's incarnation only: after a step back a window
+		 * may still hold the higher one */
+		if (id->incarn < __atomic_load_n(&s->incarn, __ATOMIC_ACQUIRE)) {
 			unspin(&w->lock);
 			return counted(CLREPLAY_INCARN);
 		}
@@ -162,10 +253,10 @@ int clreplay_admit(const struct clwire_id *id, uint32_t from_ip, long long now)
 		memset(w->bits, 0, sizeof w->bits);
 	}
 	rc = win_admit(w, id->seq);
-	unspin(&w->lock);
 	if (rc == CLREPLAY_OK &&           /* once a second: the line is shared */
 	    now - __atomic_load_n(&s->seen_ms, __ATOMIC_RELAXED) >= 1000)
 		__atomic_store_n(&s->seen_ms, now, __ATOMIC_RELAXED);
+	unspin(&w->lock);
 	return rc == CLREPLAY_OK ? rc : counted(rc);
 }
 

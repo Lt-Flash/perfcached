@@ -67,6 +67,9 @@ cat > "$D/hook.sh" <<EOF2
 op=\$1 addr=\$2 port=\$3 node=\$4
 n=\${addr#127.0.0.7}
 echo "\$op \$n" >> "$D/hook.log"
+if [ "\$op" = switch ] && [ "\${UPROLL_NOOP:-}" = "\$n" ]; then
+	echo "leaving node \$n as it is (UPROLL_NOOP)" >> "$D/hook.log"; exit 0
+fi
 p=\$(cat "$D/pid\$n")
 kill \$p 2>/dev/null
 i=0; while [ \$i -lt 100 ] && kill -0 \$p 2>/dev/null; do sleep 0.1; i=\$((i+1)); done
@@ -75,6 +78,10 @@ if [ "\$op" = switch ] && [ "\${UPROLL_FAIL:-}" = "\$n" ]; then
 fi
 "$BIN" -f "$D/n\$n.conf" >> "$D/n\$n.log" 2>&1 &
 echo \$! > "$D/pid\$n"
+if [ "\$op" = switch ] && [ -n "\${UPROLL_KILLPEER:-}" ] && [ "\$UPROLL_KILLPEER" != "\$n" ]; then
+	kill -9 \$(cat "$D/pid\$UPROLL_KILLPEER") 2>/dev/null
+	echo "killed node \$UPROLL_KILLPEER (UPROLL_KILLPEER)" >> "$D/hook.log"
+fi
 exit 0
 EOF2
 chmod 755 "$D/hook.sh"
@@ -149,6 +156,19 @@ i=0; while [ $i -lt 150 ] && [ "$(stats $first 's["state"]')" != ready ]; do sle
 r=$($CLI -q ${cont:-continue-not-printed} 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$(grep -c 'event=gated' "$D/j3")" = 3 ] && ok "C. resume by the printed continue command: the roll finished" || bad "C. resume ($cont) rc=$rc: $(tail -3 "$D/j3" | tr '\n' '|')"
 
+# ---- C2. a switch that did not take: the node still runs the build it ran, so nothing is reverted ----
+# (a revert would take it to the build BEFORE that one: the helper's last successful switch's from)
+$P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j3b" ready_s=3 gate_s=20 > /dev/null 2>&1
+first=$(for n in 1 2 3; do [ "$(stats $n 's["cluster"]["role"]')" = master ] || echo "$(stats $n 's["cluster"]["node"]') $n"; done | sort -n | head -1 | cut -d' ' -f2)
+rv0=$(grep -c '^revert ' "$D/hook.log"); p0=$(cat "$D/pid$first")
+r=$(UPROLL_NOOP=$first $P upgrade start journal="$D/j3b" 2>&1); rc=$?
+rv1=$(grep -c '^revert ' "$D/hook.log")
+[ $rc -eq 1 ] && grep -q 'reason=not-up-in-time' "$D/j3b" && [ $((rv1 - rv0)) -eq 0 ] && [ "$(cat "$D/pid$first")" = "$p0" ] &&
+	! grep -q 'event=reverted' "$D/j3b" && grep -q 'stop reason=node-[0-9]*-not-switched' "$D/j3b" &&
+	ok "C2. the switch left node $first as it was: not reverted, the roll stopped saying so" ||
+	bad "C2. rc=$rc, reverts $((rv1 - rv0)), pid $p0 -> $(cat "$D/pid$first"): $(tail -4 "$D/j3b" | tr '\n' '|')"
+[ "$(stats $first 's["state"]')" = ready ] && ok "C2. node $first still serves" || bad "C2. node $first: $(stats $first 's["state"]')"
+
 # ---- D. the driver killed after the first gate; resume -------------------------------------------
 $P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j4" ready_s=20 gate_s=40 > /dev/null 2>&1
 h0=$(grep -c '^switch ' "$D/hook.log")
@@ -172,6 +192,57 @@ lastrolled=$(grep 'event=gated' "$D/j4" | tail -1 | sed 's/.*node=\([0-9]*\).*/\
 [ "$firstback" = "$lastrolled" ] && ok "E. the last rolled node (the master) went back first" || bad "E. first reverted $firstback, last rolled $lastrolled"
 r=$($P upgrade status journal="$D/j4" 2>&1)
 echo "$r" | grep -q "0 node(s) gated" && ok "E. status after the rollback: nothing gated" || bad "E. status: $(echo "$r" | head -2 | tr '\n' '|')"
+
+# kill_mid_switch <journal>: start a roll and kill the driver once the hook is switching the first
+# node, before its gate; the hook carries on alone. Sets L0 (hook.log's length before) and hn.
+kill_mid_switch() {
+	L0=$(wc -l < "$D/hook.log")
+	$P upgrade start journal="$1" > "$1.out" 2>&1 &
+	DP=$!
+	i=0; while [ $i -lt 600 ] && ! tail -n +$((L0 + 1)) "$D/hook.log" | grep -q '^switch '; do sleep 0.1; i=$((i+1)); done
+	hn=$(tail -n +$((L0 + 1)) "$D/hook.log" | sed -n 's/^switch \([0-9]\)$/\1/p' | head -1)
+	po=$(cat "$D/pid${hn:-0}" 2>/dev/null)
+	kill -9 $DP 2>/dev/null; wait $DP 2>/dev/null
+	# the hook's restart done (a new pid written), then the fleet formed around it
+	i=0; while [ $i -lt 300 ] && [ "$(cat "$D/pid${hn:-0}" 2>/dev/null)" = "$po" ]; do sleep 0.1; i=$((i+1)); done
+	i=0; while [ $i -lt 300 ] && ! formed; do sleep 0.2; i=$((i+1)); done
+}
+
+# ---- H. the driver killed between a node's switch and its gate; resume does not switch it again ----
+$P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j6" ready_s=20 gate_s=40 > /dev/null 2>&1
+kill_mid_switch "$D/j6"
+[ -n "$hn" ] && [ "$(cat "$D/pid$hn")" != "$po" ] && [ "$(grep -c 'event=gated' "$D/j6")" = 0 ] && formed && ok "H. the driver was killed while node $hn was switched, before its gate" ||
+	bad "H. kill: node '$hn', gated $(grep -c 'event=gated' "$D/j6"): $(tr '\n' '|' < "$D/j6")"
+r=$($P upgrade resume journal="$D/j6" 2>&1); rc=$?
+sw=$(tail -n +$((L0 + 1)) "$D/hook.log" | grep -c "^switch $hn\$")
+[ $rc -eq 0 ] && [ "$(grep -c 'event=gated' "$D/j6")" = 3 ] && [ "$sw" = 1 ] &&
+	ok "H. resume took node $hn, already switched, through its gates without switching it again" ||
+	bad "H. resume rc=$rc, node $hn switched $sw times: $(tail -5 "$D/j6" | tr '\n' '|')"
+
+# ---- I. the driver killed between a node's switch and its gate; rollback takes that node back too ----
+$P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j7" ready_s=20 gate_s=40 > /dev/null 2>&1
+kill_mid_switch "$D/j7"
+[ -n "$hn" ] && [ "$(cat "$D/pid$hn")" != "$po" ] && [ "$(grep -c 'event=gated' "$D/j7")" = 0 ] && formed && ok "I. the driver was killed while node $hn was switched, before its gate" ||
+	bad "I. kill: node '$hn', gated $(grep -c 'event=gated' "$D/j7"): $(tr '\n' '|' < "$D/j7")"
+r=$($P upgrade rollback journal="$D/j7" 2>&1); rc=$?
+rv=$(tail -n +$((L0 + 1)) "$D/hook.log" | grep -c "^revert $hn\$")
+[ $rc -eq 0 ] && [ "$rv" = 1 ] && grep -q "addr=127\.0\.0\.7$hn:1770$hn event=reverted" "$D/j7" && grep -q 'rollback done' "$D/j7" &&
+	ok "I. rollback reverted node $hn, switched but never gated, then said done" ||
+	bad "I. rollback rc=$rc, node $hn reverted $rv times: $(tail -4 "$D/j7" | tr '\n' '|')"
+
+# ---- J. a peer lost while the switched node comes up: nothing reverted, the stop names the peer ----
+$P upgrade plan "$D/a.tgz" version=$VER switch_cmd="$D/hook.sh" journal="$D/j8" ready_s=20 gate_s=5 > /dev/null 2>&1
+backups=$(for n in 1 2 3; do [ "$(stats $n 's["cluster"]["role"]')" = master ] || echo "$(stats $n 's["cluster"]["node"]') $n"; done | sort -n | cut -d' ' -f2)
+first=$(echo "$backups" | sed -n 1p); other=$(echo "$backups" | sed -n 2p)
+L0=$(wc -l < "$D/hook.log")
+r=$(UPROLL_KILLPEER=$other $P upgrade start journal="$D/j8" 2>&1); rc=$?
+rv=$(tail -n +$((L0 + 1)) "$D/hook.log" | grep -c '^revert ')
+[ $rc -eq 1 ] && [ "$rv" = 0 ] && ! grep -q 'event=reverted' "$D/j8" && grep -q 'stop reason=peer-unreachable' "$D/j8" &&
+	ok "J. node $other lost while node $first came up: node $first not reverted, the stop names the peer" ||
+	bad "J. rc=$rc, reverts $rv: $(tail -4 "$D/j8" | tr '\n' '|')"
+start $other
+i=0; while [ $i -lt 300 ] && ! formed; do sleep 0.2; i=$((i+1)); done
+formed && ok "J. node $other back, the fleet formed again" || bad "J. the fleet did not form after node $other came back"
 
 # ---- F. a member that refuses the artifact: nothing switched --------------------------------------
 kill $(cat "$D/pid3") 2>/dev/null; sleep 1

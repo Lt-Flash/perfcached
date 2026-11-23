@@ -142,7 +142,7 @@ struct peer {
 struct clpeers {
 	struct peer peers[PC_CL_MAXPEER];
 	int n_peers;
-	struct { struct in_addr addr; long long first_ms; }
+	struct { struct in_addr addr; long long first_ms, last_ms; }
 		dup_seen[PC_CL_MAXPEER];   /* joiners with a duplicate id */
 };
 

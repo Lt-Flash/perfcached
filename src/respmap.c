@@ -311,14 +311,43 @@ int pc_respmap_overrides(void)
 
 /* ---- persistence -------------------------------------------------------- */
 
+/* callers on several threads share one temp file: one write and rename at a time */
+static pthread_mutex_t persist_mx = PTHREAD_MUTEX_INITIALIZER;
+static int persist_due;
+
+static int respmap_persist_locked(void);
+
 int pc_respmap_persist(void)
+{
+	int rc;
+
+	if (!state_dir[0])
+		return 0;                      /* ephemeral by configuration */
+	pthread_mutex_lock(&persist_mx);
+	rc = respmap_persist_locked();
+	pthread_mutex_unlock(&persist_mx);
+	return rc;
+}
+
+/* the fleet's applies only mark it due, as the collections file (pc_store_persist_later) */
+void pc_respmap_persist_later(void)
+{
+	__atomic_store_n(&persist_due, 1, __ATOMIC_RELEASE);
+}
+
+void pc_respmap_persist_tick(void)
+{
+	if (__atomic_exchange_n(&persist_due, 0, __ATOMIC_ACQ_REL) &&
+	        pc_respmap_persist() != 0)
+		__atomic_store_n(&persist_due, 1, __ATOMIC_RELEASE);   /* the next tick retries */
+}
+
+static int respmap_persist_locked(void)
 {
 	char path[600], tmp[620];
 	FILE *f;
 	int i, rc = 0;
 
-	if (!state_dir[0])
-		return 0;                      /* ephemeral by configuration */
 	snprintf(path, sizeof path, "%s/respmap", state_dir);
 	snprintf(tmp, sizeof tmp, "%s/respmap.tmp", state_dir);
 	f = fopen(tmp, "w");

@@ -106,12 +106,51 @@ _Static_assert((PC_HR_MAX - PC_HR_HDR) / 7 * sizeof(unsigned int) <=
 _Static_assert(PC_MAX_FWD_VAL <= PC_HR_MAX + 64,
 	"a forwarded hash command must fit the edit scratch");
 
-/* relative seconds -> absolute ticks (0 stays 0 = never) */
+/* a test's pause between a probe's run and the read of its result */
+static long long probe_gap_ms(void)
+{
+	static long long ms = -1;
+
+	if (ms < 0) {
+		const char *e = getenv("PERFCACHED_TEST_PROBE_GAP_MS");
+
+		ms = e ? atoll(e) : 0;
+		if (ms < 0)
+			ms = 0;
+	}
+	return ms;
+}
+
+/* a delete or expire that did not happen: set's words for it, NULL otherwise */
+static const char *op_fail_text(int rc)
+{
+	if (rc == PC_OP_ERR_BUSY)
+		return "parked-request table full - retry";
+	if (rc == PC_OP_ERR_FWD)
+		return "forward failed";
+	if (rc == PC_OP_ERR_WRFAIL)
+		return wr_refused_msg();
+	return NULL;
+}
+
+/* the most elements one mget or mset takes; the refusal texts name it */
+#define MULTI_MAX 65536u
+
+/* relative seconds -> absolute ticks (0 stays 0 = never); the doors refuse past PC_TTL_MAX */
 static unsigned int ttl_to_abs(long long ttl)
 {
 	if (ttl <= 0)
 		return 0;
+	if (ttl > PC_TTL_MAX)
+		ttl = PC_TTL_MAX;
 	return get_ticks() + (unsigned int)ttl;
+}
+
+/* a relative ttl as a forward carries it (0 = none): never past PC_TTL_MAX, so never
+ * PCACHE_EXP_PRESERVE - the doors refuse longer ones, this holds behind them */
+static unsigned int fwd_ttl(long long ttl)
+{
+	return ttl <= 0 ? 0 : ttl > PC_TTL_MAX ? (unsigned int)PC_TTL_MAX : (unsigned int)ttl;
 }
 
 /* a bytes parameter read IN PLACE (its span in the request tree, no copy).  -1 = absent, not a
@@ -174,6 +213,13 @@ static int fwd_fail_code(void)
 {
 	return pc_cluster_last_fail() == PC_CLFAIL_BUSY
 		? PC_OP_ERR_BUSY : PC_OP_ERR_FWD;
+}
+
+/* a fleet probe not begun because the parked-request table is full: refused for a retry, not
+ * read as "no live peer", which places the key here or answers absent */
+static int probe_busy(void)
+{
+	return pc_cluster_last_fail() == PC_CLFAIL_BUSY;
 }
 
 /* defined beside serving_denied(), where the two gates are explained */
@@ -353,6 +399,12 @@ int op_mget_fan(pcache_htable_t *ht, const char *const *keys,
 				pc_mget_absent(m, i);
 			} else {
 				pc_mget_hit(m, i, v.s, v.len, exp);
+				if (pc_mget_over(m)) {
+					pc_mget_free(m);
+					pc_mget_count_refused();
+					*why = "reply too large - split the mget";
+					return -1;
+				}
 			}
 			continue;
 		}
@@ -446,13 +498,11 @@ int pc_op_expire_apply(const char *col, size_t collen, const char *key,
  * across would come back at the swap */
 static int store_remove(pcache_htable_t *ht, const str *k)
 {
-	pcache_htable_t *sh = pc_store_resize_shadow(ht);
+	pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
+	int rc, rs;
 
-	int rc;
-
-	if (sh)
-		(void)pcache_ht_remove(sh, k);
-	rc = pcache_ht_remove(ht, k);
+	rs = pcache_ht_remove(f, k);                    /* the copier's source first */
+	rc = (o ? pcache_ht_remove(o, k) : 0) == 1 || rs == 1;
 	if (rc == 1)
 		pc_ev_remove(ht, k);
 	return rc;
@@ -463,12 +513,15 @@ static int store_remove(pcache_htable_t *ht, const str *k)
 static int store_remove_ver(pcache_htable_t *ht, const str *k,
 		unsigned long long *ver)
 {
-	pcache_htable_t *sh = pc_store_resize_shadow(ht);
-	int rc;
+	pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
+	int rc, rs = 0;
 
-	if (sh)
-		(void)pcache_ht_remove(sh, k);
-	rc = pcache_ht_remove_ver(ht, k, ver);
+	if (f != ht)                                    /* the copier's source first */
+		rs = pcache_ht_remove(f, k);
+	rc = pcache_ht_remove_ver(ht, k, ver) == 1;
+	if (f == ht && o)
+		rs = pcache_ht_remove(o, k);
+	rc = rc || rs == 1;
 	if (rc == 1)
 		pc_ev_remove(ht, k);
 	return rc;
@@ -478,7 +531,7 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 {
 	const char *cn;
 	unsigned long long dver = 0;
-	int rc;
+	int rc, dead;
 	HOT(ht, k->s, k->len);
 
 	if (op_refused(ht))
@@ -497,14 +550,15 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 				*park = req;
 				return PC_OP_PARKED;
 			}
-			return PC_OP_ABSENT;   /* plane down: honest no-op */
+			return fwd_fail_code();   /* the owner may hold it: not "absent" */
 		}
 		/* self-owned: the local remove is the whole story - one
 		 * owner means no tombstone plane */
 		rc = store_remove(ht, k);
+		dead = rc == 1 && pcache_last_del_dead;
 		if (rc == 1)
 			pc_wal_del(cn, k->s, k->len);
-		return rc == 1 ? PC_OP_OK : PC_OP_ABSENT;
+		return rc == 1 && !dead ? PC_OP_OK : PC_OP_ABSENT;
 	}
 	if (pc_store_proxy_enabled(ht) && pc_cluster_enabled() &&
 	        pcache_ht_probe(ht, k, NULL, NULL, NULL) != 0) {
@@ -533,6 +587,8 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 				*park = req;
 				return PC_OP_PARKED;
 			}
+			if (probe_busy())
+				return PC_OP_ERR_BUSY;
 		}
 		return PC_OP_ABSENT;
 	}
@@ -563,7 +619,7 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 				h = pc_spread_pick_peer_except(kslot,
 					pc_cluster_replicas(), h);
 			}
-			return PC_OP_ABSENT;
+			return tries ? fwd_fail_code() : PC_OP_ABSENT;
 		}
 		if (pc_store_pull_enabled(ht) &&
 		        !(pc_neg_ver(cn, strlen(cn), k->s, (size_t)k->len, &tv)
@@ -575,17 +631,20 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 				*park = req;
 				return PC_OP_PARKED;
 			}
+			if (probe_busy())
+				return PC_OP_ERR_BUSY;
 		}
 		return PC_OP_ABSENT;
 	}
 	rc = store_remove_ver(ht, k, &dver);
+	dead = rc == 1 && pcache_last_del_dead;   /* past its deadline: removed, answered absent */
 	if (rc == 1) {
 		cn = col_name_of(ht);
 		/* logged, and with a cluster numbered and sent */
 		pc_delete_originate(cn, strlen(cn), k->s, (size_t)k->len,
 			dver, 1);
 	}
-	return rc == 1 ? PC_OP_OK : PC_OP_ABSENT;
+	return rc == 1 && !dead ? PC_OP_OK : PC_OP_ABSENT;
 }
 
 /* a re-arm takes the write's road: shard -> owner, proxy -> holder (locator, else probe; never
@@ -593,7 +652,7 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 int op_expire(pcache_htable_t *ht, str *k, long long ttl,
 		unsigned int *park)
 {
-	unsigned int ttl_rel = ttl > 0 ? (unsigned int)ttl : 0;
+	unsigned int ttl_rel = fwd_ttl(ttl);
 	const char *cn;
 	HOT(ht, k->s, k->len);
 
@@ -639,6 +698,8 @@ int op_expire(pcache_htable_t *ht, str *k, long long ttl,
 				*park = req;
 				return PC_OP_PARKED;
 			}
+			if (probe_busy())
+				return PC_OP_ERR_BUSY;
 		}
 		return PC_OP_ABSENT;
 	} else if (pc_cluster_replicas() && pc_cluster_enabled() &&
@@ -680,7 +741,7 @@ int op_addsub(pcache_htable_t *ht, str *k, long long by, long long ttl,
 			unsigned int req = pc_fwd_begin(owner, 2, cn,
 				strlen(cn), k->s, (size_t)k->len, NULL, 0,
 				ttl < 0 ? PCACHE_EXP_PRESERVE :
-				ttl > 0 ? (unsigned int)ttl : 0, by);
+				fwd_ttl(ttl), by);
 
 			if (req) {
 				*park = req;
@@ -702,12 +763,14 @@ int op_addsub(pcache_htable_t *ht, str *k, long long by, long long ttl,
 			unsigned int req = pc_probe_fwd_begin(2, cn,
 				strlen(cn), k->s, (size_t)k->len, NULL, 0,
 				ttl < 0 ? PCACHE_EXP_PRESERVE :
-				ttl > 0 ? (unsigned int)ttl : 0, by);
+				fwd_ttl(ttl), by);
 
 			if (req) {
 				*park = req;
 				return PC_OP_PARKED;
 			}
+			if (probe_busy())
+				return PC_OP_ERR_BUSY;
 		}
 		if (!target)
 			target = pc_place();
@@ -715,7 +778,7 @@ int op_addsub(pcache_htable_t *ht, str *k, long long by, long long ttl,
 			unsigned int req = pc_fwd_begin(target, 2, cn,
 				strlen(cn), k->s, (size_t)k->len, NULL, 0,
 				ttl < 0 ? PCACHE_EXP_PRESERVE :
-				ttl > 0 ? (unsigned int)ttl : 0, by);
+				fwd_ttl(ttl), by);
 
 			if (req) {
 				*park = req;
@@ -727,15 +790,18 @@ int op_addsub(pcache_htable_t *ht, str *k, long long by, long long ttl,
 	{
 		unsigned int eff = 0;
 		unsigned char fl = 0;
+		int r;
 
 		/* INCR on a document is WRONGTYPE, not "not an integer" */
 		if (pc_store_types_strict(ht) &&
 		        pcache_ht_getflags(ht, k, &fl) == 0 &&
 		        (fl & PCACHE_F_TYPES))
 			return PC_OP_ERR_TYPE;
-		if (pcache_ht_add_ex(ht, k, by,
-		        ttl < 0 ? PCACHE_EXP_PRESERVE : ttl_to_abs(ttl),
-		        nv, &eff) < 0)
+		r = pcache_ht_add_ex(ht, k, by,
+			ttl < 0 ? PCACHE_EXP_PRESERVE : ttl_to_abs(ttl), nv, &eff);
+		if (r == -3)
+			return PC_OP_ERR_OVF;
+		if (r < 0)
 			return PC_OP_ERR_NOTINT;
 		/* replay is idempotent: the WAL row is the resulting value and, under preserve
 		 * (ttl < 0, Redis's INCR), the record's EFFECTIVE expiry */
@@ -776,7 +842,7 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 				                        * local store would break ownership */
 			req = pc_fwd_begin(owner, 0, cn, strlen(cn), k->s,
 				(size_t)k->len, v->s, (size_t)v->len,
-				ttl > 0 ? (unsigned int)ttl : 0, 0);
+				fwd_ttl(ttl), 0);
 			if (req) {
 				*park = req;
 				return PC_OP_PARKED;
@@ -807,12 +873,14 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 				unsigned int req = pc_probe_fwd_begin(0, cn,
 					strlen(cn), k->s, (size_t)k->len, v->s,
 					(size_t)v->len,
-					ttl > 0 ? (unsigned int)ttl : 0, 0);
+					fwd_ttl(ttl), 0);
 
 				if (req) {
 					*park = req;
 					return PC_OP_PARKED;
 				}
+				if (probe_busy())
+					return PC_OP_ERR_BUSY;
 				/* no peers: place it */
 			}
 			if (!target)
@@ -821,7 +889,7 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 				unsigned int req = pc_fwd_begin(target, 0, cn,
 					strlen(cn), k->s, (size_t)k->len, v->s,
 					(size_t)v->len,
-					ttl > 0 ? (unsigned int)ttl : 0, 0);
+					fwd_ttl(ttl), 0);
 
 				if (req) {
 					*park = req;
@@ -926,7 +994,7 @@ int op_setcond(pcache_htable_t *ht, str *k, str *v, long long ttl,
 				return PC_OP_ERR_2BIG;
 			req = pc_fwd_begin(owner, cond == PC_SETCOND_NX ? 4 : 5,
 				cn, strlen(cn), k->s, (size_t)k->len, v->s,
-				(size_t)v->len, ttl > 0 ? (unsigned int)ttl : 0, 0);
+				(size_t)v->len, fwd_ttl(ttl), 0);
 			if (req) {
 				*park = req;
 				return PC_OP_PARKED;
@@ -1057,7 +1125,7 @@ int op_cmp(pcache_htable_t *ht, str *k, const char *cmp,
 				memcpy(enc + 4 + cmplen, v->s, (size_t)v->len);
 			req = pc_fwd_begin(owner, PC_CMP_FWD_OP(kind), cn,
 				strlen(cn), k->s, (size_t)k->len, (const char *)enc,
-				need, ttl > 0 ? (unsigned int)ttl : 0, 0);
+				need, fwd_ttl(ttl), 0);
 			if (req) {
 				*park = req;
 				return PC_OP_PARKED;
@@ -1832,6 +1900,23 @@ void pc_verb_forget_local(pcache_htable_t *ht, const str *k)
 	}
 }
 
+/* pc_verb_forget_local of the record at @ver or older only: one stored since then stays */
+void pc_verb_forget_upto(pcache_htable_t *ht, const str *k,
+		unsigned long long ver)
+{
+	const char *cn = col_name_of(ht);
+	pcache_htable_t *sh = pc_store_resize_shadow(ht);
+	int rs = sh ? pcache_ht_remove_upto(sh, k, ver) : 0;
+
+	if (pcache_ht_remove_upto(ht, k, ver) == 1 || rs == 1) {
+		pc_ev_remove(ht, k);
+		pc_wal_del(cn, k->s, k->len);
+		if (pc_cluster_enabled())
+			pc_neg_set_ver_local(cn, strlen(cn), k->s, (size_t)k->len,
+				2000, ver);
+	}
+}
+
 /* a record written here as a client write would be (table, WAL, eager push), for read-through's
  * promoted copies and no-fall entries; @fl its TYPE bits */
 int pc_verb_store_local(pcache_htable_t *ht, const str *k, const char *v,
@@ -2020,34 +2105,41 @@ static void hcmd_render(int ci, int argc, const char *const *argv,
 			pc_tw_end(t);
 			break;
 		}
-		/* positive count: distinct fields, a partial shuffle in the edit
-		 * scratch (idle in a read); negative: repeats, each pick alone */
+		/* every field's offset once, in the edit scratch (idle in a read): a pick indexes it;
+		 * positive count: distinct fields, a partial shuffle of it; negative: repeats */
 		m = want > 0 ? (want > cnt ? cnt : (unsigned int)want) :
 			(unsigned int)(want < -1000000 ? 1000000 : -want);
-		if (want > 0) {
-			idx = (unsigned int *)hr_buf();
-			if (!idx) {
-				pc_tw_err(t, "ERR out of memory");
+		idx = (unsigned int *)hr_buf();
+		if (!idx) {
+			pc_tw_err(t, "ERR out of memory");
+			break;
+		}
+		off = 0;
+		for (j = 0; j < cnt; j++) {
+			idx[j] = (unsigned int)(off ? off : PC_HR_HDR);
+			if (!pc_hr_next(r, n, &off, &f, &flen, &fv, &vl))
 				break;
-			}
-			for (j = 0; j < cnt; j++)
-				idx[j] = j;
-			for (j = 0; j < m; j++) {
-				unsigned int s = j + (unsigned int)(hc_rand() %
-					(cnt - j)), tmp2 = idx[j];
+		}
+		cnt = j;
+		if (!cnt) {
+			pc_tw_arr(t);
+			pc_tw_end(t);
+			break;
+		}
+		if (m > cnt && want > 0)
+			m = cnt;
+		for (j = 0; want > 0 && j < m; j++) {
+			unsigned int s = j + (unsigned int)(hc_rand() %
+				(cnt - j)), tmp2 = idx[j];
 
-				idx[j] = idx[s];
-				idx[s] = tmp2;
-			}
+			idx[j] = idx[s];
+			idx[s] = tmp2;
 		}
 		pc_tw_arr(t);
-		for (j = 0; j < m; j++) {
-			unsigned int q;
-
-			pick = idx ? idx[j] : (unsigned int)(hc_rand() % cnt);
-			off = 0;
-			for (q = 0; q <= pick; q++)
-				pc_hr_next(r, n, &off, &f, &flen, &fv, &vl);
+		for (j = 0; j < m && !t->over; j++) {
+			pick = want > 0 ? j : (unsigned int)(hc_rand() % cnt);
+			off = idx[pick];
+			pc_hr_next(r, n, &off, &f, &flen, &fv, &vl);
 			pc_tw_bulk(t, f, flen);
 			if (withv)
 				pc_tw_bulk(t, fv, vl);
@@ -2750,6 +2842,12 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 			*newval = res;
 		return r;
 	}
+	/* a write asks as the op_ cores do, here so a forwarded apply and RESP ask too */
+	if ((op == PC_JOP_RLHIT || op == PC_JOP_SET || op == PC_JOP_DEL ||
+	        op == PC_JOP_INCR || op == PC_JOP_APPEND) && op_refused(ht)) {
+		*errmsg = wr_refused_msg();
+		return -1;
+	}
 	if (op == PC_JOP_RLHIT) {
 		long long cnt = 0;
 		int al = 0, r;
@@ -2850,8 +2948,10 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 				(size_t)plen, by, newval, nd, VAL_MAX);
 			break;
 		default:                       /* APPEND */
+			/* @by: how many values @val joins (RESP's several); 0 or 1 = one */
 			rc2 = pc_jp_append(doc, (size_t)v.len, path,
-				(size_t)plen, val, (size_t)vlen, count_out,
+				(size_t)plen, val, (size_t)vlen,
+				by > 1 && by <= vlen ? (int)by : 1, count_out,
 				nd, VAL_MAX);
 		}
 		if (op == PC_JOP_DEL && rc2 == PC_JP_E_NOLEAF) {
@@ -2886,6 +2986,17 @@ int pc_json_rmw(pcache_htable_t *ht, const char *key, int klen, int op,
 		*errmsg = fmsg;
 		return -1;
 	}
+	return 0;
+}
+
+/* a collection change written to the collections file: 0 when it could not be - logged, and the
+ * verb's reply says persisted false */
+static int col_persist(const char *nm, const char *what)
+{
+	if (pc_store_persist() == 0)
+		return 1;
+	LM_ERR("collection '%s' %s, but the collections file could not be written to the state "
+		"dir - a restart may not keep the change\n", nm, what);
 	return 0;
 }
 
@@ -3213,6 +3324,9 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_i64(out, me >= 1 && me <= n ? c[me - 1] : 0);
 		pc_tw_key(out, "least");
 		pc_tw_i64(out, least < 0 ? 0 : least);
+		/* a client's standby dial asks whether this node serves before it counts it as come up */
+		pc_tw_key(out, "state");
+		pc_tw_str(out, pc_node_state_name(pc_node_state()));
 		pc_tw_key(out, "conns");
 		pc_tw_arr(out);
 		for (i = 0; i < n; i++)
@@ -3538,13 +3652,20 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	}
 
 	/* ---- load : import the current snapshot ADDITIVELY (existing
-	 * keys win; expired records dropped) ----------------------------- */
+	 * keys win; expired records dropped); privileged ------------------ */
 	if (m_is(method, mlen, "load")) {
 		long ld = 0, se = 0, sx = 0;
+		int rc2;
 
 		if (!pc_rdb_dir()[0])
 			ERR("persistence is not configured");
-		if (pc_rdb_import(pc_rdb_dir(), &ld, &se, &sx) != 0)
+		if (!privileged || !*privileged)
+			ERR(pc_enable_configured() ? PC_NOPRIV_MSG
+				: PC_NOENABLE_MSG);
+		rc2 = pc_rdb_import(pc_rdb_dir(), &ld, &se, &sx);
+		if (rc2 == -2)
+			ERR("a load is already running");
+		if (rc2 != 0)
 			ERR("no readable snapshot");
 		pc_tw_map(out);
 		pc_tw_key(out, "loaded");
@@ -3562,7 +3683,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	if (m_is(method, mlen, "create")) {
 		char nm[PC_COL_NAME_MAX];
 		long long bl = PC_COL_DEFAULT_LOG2;
-		int nl, rc2;
+		int nl, rc2, saved;
 
 		if (!allow_create)
 			ERR(PC_NOCREATE_MSG);
@@ -3595,7 +3716,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		/* the WAL first, then the file: both are read at startup and
 		 * the WAL's ordering settles a disagreement between them */
 		pc_wal_col_create(nm, (int)bl);
-		pc_store_persist();
+		saved = col_persist(nm, "created");
 		pc_cluster_col_announce(nm, (size_t)nl, (int)bl, CLCOL_OP_SET);
 		LM_NOTICE("collection '%s' created by a client: 2^%d buckets, "
 			"%s mode\n", nm, (int)bl, pc_cluster_mode_name());
@@ -3606,6 +3727,10 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_bulk(out, nm, (size_t)nl);
 		pc_tw_key(out, "buckets");
 		pc_tw_i64(out, 1LL << bl);
+		if (!saved) {
+			pc_tw_key(out, "persisted");
+			pc_tw_bool(out, 0);
+		}
 		pc_tw_end(out);
 		return 0;
 	}
@@ -3613,7 +3738,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		char nm[PC_COL_NAME_MAX];
 		pcache_ht_totals_t tot;
 		long long n = 0;
-		int nl, force;
+		int nl, force, saved;
 
 		if (!allow_create)
 			ERR(PC_NOCREATE_MSG);
@@ -3646,7 +3771,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if (n < 0)
 			ERR("no such collection");
 		pc_wal_col_drop(nm);
-		pc_store_persist();
+		saved = col_persist(nm, "dropped");
 		pc_cluster_col_announce(nm, (size_t)nl, 0, CLCOL_OP_DROP);
 		LM_NOTICE("collection '%s' dropped by a client: %lld record(s) "
 			"freed\n", nm, n);
@@ -3657,15 +3782,19 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_bulk(out, nm, (size_t)nl);
 		pc_tw_key(out, "records");
 		pc_tw_i64(out, n);
+		if (!saved) {
+			pc_tw_key(out, "persisted");
+			pc_tw_bool(out, 0);
+		}
 		pc_tw_end(out);
 		return 0;
 	}
 
-	/* ---- rename {col, to}: one pointer swap.  The collections file waits for a checkpoint:
-	 * WAL records before this carry the old name, and a replay must meet it first */
+	/* ---- rename {col, to}: one pointer swap, persisted at once.  A load maps the snapshot's and
+	 * the WAL's older name through the WAL's rename records (recover.c) */
 	if (m_is(method, mlen, "rename")) {
 		char nm[PC_COL_NAME_MAX], to[PC_COL_NAME_MAX];
-		int nl, tl, rc2;
+		int nl, tl, rc2, saved;
 
 		if (!allow_create)
 			ERR(PC_NOCREATE_MSG);
@@ -3699,8 +3828,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if (rc2 != 0)
 			ERR("the rename failed");
 		pc_wal_col_rename(nm, to);
-		if (!pc_wal_enabled())
-			pc_store_persist();
+		saved = col_persist(to, "renamed");
 		pc_cluster_col_announce2(nm, (size_t)nl, to, (size_t)tl);
 		LM_NOTICE("collection '%s' renamed to '%s' by a client\n", nm, to);
 		pc_tw_map(out);
@@ -3710,6 +3838,10 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_bulk(out, nm, (size_t)nl);
 		pc_tw_key(out, "to");
 		pc_tw_bulk(out, to, (size_t)tl);
+		if (!saved) {
+			pc_tw_key(out, "persisted");
+			pc_tw_bool(out, 0);
+		}
 		pc_tw_end(out);
 		return 0;
 	}
@@ -4149,6 +4281,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if (rc == 0)
 			ERR("a newer autoscale change to this collection is already "
 				"held - read stats and retry");
+		(void)pc_store_persist();
 		pc_cluster_autoscale_announce(nm, (size_t)nl, mode, gen);
 		LM_NOTICE("collection '%s': autoscale = %s, set by a client "
 			"(was %s)\n", nm, md, pc_autoscale_name(was));
@@ -4318,18 +4451,31 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	/* ---- probe {secs?}: re-measure the WAL storage, blocking this worker for the probe;
 	 * its I/O shares the device with the live pump, so fsync latency is perturbed */
 	if (m_is(method, mlen, "probe")) {
+		static pthread_mutex_t probe_mu = PTHREAD_MUTEX_INITIALIZER;
 		struct pc_wal_policy pol;
-		const struct pc_wal_probe *pr;
+		struct pc_wal_probe got;
+		const struct pc_wal_probe *pr = &got;
 		long long secs = 0;
+		int prc;
 
 		pc_tv_get_int(v, params, "secs", &secs);
 		if (secs < 0)
 			secs = 0;
 		if (secs > 30)
 			ERR("secs is capped at 30");
-		if (pc_wal_reprobe((int)secs, &pol) != 0)
+		/* one probe at a time; its result is copied before another can start */
+		if (pthread_mutex_trylock(&probe_mu) != 0)
+			ERR("a probe is already running - retry when it ends");
+		prc = pc_wal_reprobe((int)secs, &pol);
+		if (prc == 0 && probe_gap_ms())
+			usleep((useconds_t)probe_gap_ms() * 1000);
+		if (prc == 0 && pc_wal_probe_result())
+			got = *pc_wal_probe_result();
+		else
+			prc = -1;
+		pthread_mutex_unlock(&probe_mu);
+		if (prc != 0)
 			ERR("wal is not configured or the probe failed");
-		pr = pc_wal_probe_result();
 		pc_tw_map(out);
 		pc_tw_key(out, "cached");
 		pc_tw_bool(out, 0);
@@ -4377,7 +4523,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			pc_tw_end(out);
 		}
 		pc_tw_key(out, "probe_sync_kb");
-		pc_tw_i64(out, pr ? pr->sync_bytes >> 10 : 0);
+		pc_tw_i64(out, pr->sync_bytes >> 10);
 		pc_tw_key(out, "segment_mb");
 		pc_tw_i64(out, pol.segment_mb);
 		{
@@ -4525,7 +4671,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		unsigned int cursor;
 		size_t off;
 		struct pc_tw_mark mark;
-		int n = 0;
+		int n = 0, big = 0;
 		unsigned long long tpub = 0;
 		long long want = -1;
 		int tcol = pc_tv_get(v, params, "col");
@@ -4605,7 +4751,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_map(out);
 		pc_tw_key(out, "records");
 		pc_tw_arr(out);
-		for (off = 0; off < dk.len && !out->over; ) {
+		for (off = 0; off < dk.len && !out->over && !big; ) {
 			str rk, rv;
 			unsigned int rexp = 0;
 			unsigned long long ver = 0;
@@ -4647,9 +4793,11 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			}
 			pc_tw_end(out);
 			free(rv.s);
+			/* the door queues at most PC_MAX_OUTQ, header and trailer included */
+			big = out->n > PC_MAX_OUTQ - 65536;
 		}
 		free(dk.buf);
-		if (out->over) {
+		if (out->over || big) {
 			/* roll the partial reply back to its last whole part -
 			 * counts included - before the error frame goes */
 			pc_tw_rollback(out, mark);
@@ -4681,6 +4829,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				: PC_NOENABLE_MSG);
 		int trec, tpol, policy = 0;      /* 0 newer, 1 skip, 2 overwrite */
 		unsigned int i, nrec;
+		int r;
 		long long stored = 0, older = 0, existing = 0, expired = 0, refused = 0, bad = 0;
 		unsigned long long now_ms;
 		unsigned int now_t = get_ticks();
@@ -4716,8 +4865,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_map(out);
 		pc_tw_key(out, "misrouted");
 		pc_tw_arr(out);
-		for (i = 0; i < nrec; i++) {
-			int r = pc_tv_at(v, trec, i), tt, rc2;
+		for (i = 0, r = trec + 1; i < nrec; i++, r = v->n[r].next) {
+			int tt, rc2;
 			const char *kp, *vp;
 			size_t kl, vl;
 			unsigned char rtype;
@@ -4753,6 +4902,12 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			}
 			if (expms > 0 && (unsigned long long)expms <= now_ms) {
 				expired++;
+				continue;
+			}
+			/* past what the tick expiry holds: refused, as a ttl past PC_TTL_MAX is */
+			if (expms > 0 && ((unsigned long long)expms - now_ms + 999ULL) / 1000ULL >
+			        (unsigned long long)PC_TTL_MAX) {
+				bad++;
 				continue;
 			}
 			exp = expms > 0 ? now_t + (unsigned int)(((unsigned long long)expms - now_ms + 999ULL) / 1000ULL) : 0;
@@ -4906,6 +5061,9 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	ht = get_col(v, params, errmsg);
 	if (!ht)
 		return -1;
+	ttl = 0;
+	if (pc_tv_get_int(v, params, "ttl", &ttl) == 0 && ttl > PC_TTL_MAX)
+		ERR(PC_TTL_MSG);
 	/* an upstream-backed collection: the gate may park the frame, refuse it, or answer
 	 * with Redis's reply */
 	if (ht->shadow && conn) {
@@ -5006,6 +5164,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	if (m_is(method, mlen, "del")) {
 		NEEDKEY();
 		rc = op_del(ht, &k, park_req);
+		if (op_fail_text(rc))
+			ERR(op_fail_text(rc));
 		pc_tw_map(out);
 		pc_tw_key(out, "deleted");
 		pc_tw_bool(out, rc == PC_OP_OK);   /* parked falls back to false */
@@ -5019,6 +5179,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		if (pc_tv_get_int(v, params, "ttl", &ttl) != 0)
 			ERR("missing ttl");
 		rc = op_expire(ht, &k, ttl, park_req);
+		if (op_fail_text(rc))
+			ERR(op_fail_text(rc));
 		pc_tw_map(out);
 		pc_tw_key(out, "updated");
 		pc_tw_bool(out, rc == PC_OP_OK);   /* parked falls back to false */
@@ -5054,6 +5216,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			ERR(pc_wrongtype_msg);
 		if (rc == PC_OP_ERR_NOTINT)
 			ERR("value is not an integer");
+		if (rc == PC_OP_ERR_OVF)
+			ERR(PC_OVF_MSG);
 		if (rc == PC_OP_ERR_WRFAIL)    /* refused: nv was never written */
 			ERR(wr_refused_msg());
 		pc_tw_map(out);
@@ -5326,6 +5490,8 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			        !(fl & PCACHE_F_JSON))
 				ERR(pc_json_wrongtype_msg);
 			rc = op_del(ht, &k, park_req);
+			if (op_fail_text(rc))
+				ERR(op_fail_text(rc));
 			pc_tw_map(out);
 			pc_tw_key(out, "deleted");
 			pc_tw_bool(out, rc == PC_OP_OK);
@@ -5503,15 +5669,15 @@ jlocal:
 			/* name the collection, so a key pastes back into get, and flag ONE node's
 			 * share of a placement-spread collection */
 			{
-				struct pc_cl_stats cs;
 				const char *cn = col_name_of(ht);
 
-				pc_cluster_get_stats(&cs);
 				pc_tw_map(out);
 				pc_tw_key(out, "collection");
 				pc_tw_bulk(out, cn, strlen(cn));
 				pc_tw_key(out, "complete");
-				pc_tw_bool(out, !(pc_cluster_enabled() && cs.peers_up > 0 &&
+				/* a member that is down still holds its share */
+				pc_tw_bool(out, !(pc_cluster_enabled() &&
+					pc_cluster_peers_known() > 0 &&
 					!pc_store_eager_enabled(ht)));
 				pc_tw_key(out, "scope");
 				pc_tw_str(out, "node");
@@ -5555,11 +5721,13 @@ jlocal:
 	}
 
 	if (m_is(method, mlen, "mget")) {
-		int tk = pc_tv_get(v, params, "keys");
+		int tk = pc_tv_get(v, params, "keys"), kn;
 		unsigned int i;
 
 		if (tk < 0 || v->n[tk].type != 'a')
 			ERR("missing keys array");
+		if (v->n[tk].len > MULTI_MAX)
+			ERR("too many keys - mget takes at most 65536, split it");
 		if (mget_fans(ht)) {
 			/* a key on another node is looked up, never a silent miss; the keys as
 			 * the loop below takes them: non-bytes skipped, a long one absent */
@@ -5573,10 +5741,9 @@ jlocal:
 			ks = malloc((v->n[tk].len + 1) * sizeof *ks);
 			kl = malloc((v->n[tk].len + 1) * sizeof *kl);
 			if (ks && kl) {
-				for (i = 0; i < v->n[tk].len; i++) {
-					int kn = pc_tv_at(v, tk, i);
-
-					if (kn < 0 || v->n[kn].type != 'b')
+				for (i = 0, kn = tk + 1; i < v->n[tk].len;
+				        i++, kn = v->n[kn].next) {
+					if (v->n[kn].type != 'b')
 						continue;
 					ks[nk] = (const char *)v->n[kn].p;
 					kl[nk++] = v->n[kn].len;
@@ -5598,11 +5765,10 @@ jlocal:
 		pc_tw_map(out);
 		pc_tw_key(out, "values");
 		pc_tw_arr(out);
-		for (i = 0; i < v->n[tk].len; i++) {
-			int kn = pc_tv_at(v, tk, i);
-
+		for (i = 0, kn = tk + 1; i < v->n[tk].len && !out->over;
+		        i++, kn = v->n[kn].next) {
 			/* an element that is not bytes is skipped, not counted */
-			if (kn < 0 || v->n[kn].type != 'b')
+			if (v->n[kn].type != 'b')
 				continue;
 			if (v->n[kn].len > KEY_MAX) {
 				pc_tw_map(out);
@@ -5642,20 +5808,24 @@ jlocal:
 
 	if (m_is(method, mlen, "mset")) {
 		int ti = pc_tv_get(v, params, "items");
-		int stored = 0, dropped = 0;
+		int stored = 0, dropped = 0, it;
 		unsigned int i;
 
 		if (ti < 0 || v->n[ti].type != 'a')
 			ERR("missing items array");
+		if (v->n[ti].len > MULTI_MAX)
+			ERR("too many items - mset takes at most 65536, split it");
 		if (pc_store_shard_enabled(ht))
 			ERR("mset on a shard collection is not "
 				"supported yet - use pipelined set");
-		for (i = 0; i < v->n[ti].len; i++) {
-			int it = pc_tv_at(v, ti, i);
+		if (op_refused(ht))
+			ERR(wr_refused_msg());
+		for (i = 0, it = ti + 1; i < v->n[ti].len;
+		        i++, it = v->n[it].next) {
 			const char *kp, *vp;
 			size_t kl, vl;
 
-			if (it < 0 || v->n[it].type != 'm')
+			if (v->n[it].type != 'm')
 				continue;
 			if (get_bytes(v, it, "key", &kp, &kl, KEY_MAX) != 0 ||
 			        get_bytes(v, it, "value", &vp, &vl, VAL_MAX) != 0) {
@@ -5663,7 +5833,11 @@ jlocal:
 				continue;
 			}
 			ttl = 0;
-			pc_tv_get_int(v, it, "ttl", &ttl);
+			if (pc_tv_get_int(v, it, "ttl", &ttl) == 0 &&
+			        ttl > PC_TTL_MAX) {
+				dropped++;
+				continue;
+			}
 			k.s = (char *)kp; k.len = (int)kl;
 			v_.s = (char *)vp; v_.len = (int)vl;
 			/* the same local write a set makes - WAL, event, eager push */
@@ -6021,7 +6195,7 @@ static int up_mset_fw(pcache_htable_t *ht, const struct pc_tv *v, int ta,
 	const char *cn = col_name_of(ht), **av = NULL, **a2 = NULL;
 	size_t cl = strlen(cn), *al = NULL, *l2 = NULL;
 	char *tb = NULL;
-	int *kx = NULL, ac = 0, nv = 0, nx = 0, outside = 0, rc;
+	int *kx = NULL, ac = 0, nv = 0, nx = 0, outside = 0, rc, e;
 	unsigned int it;
 	struct pc_upfw fw;
 	static const char mixed[] = "upstream_writes = through: this mset "
@@ -6040,16 +6214,16 @@ static int up_mset_fw(pcache_htable_t *ht, const struct pc_tv *v, int ta,
 	}
 	av[ac] = "MSET";
 	al[ac++] = 4;
-	for (it = 0; it < v->n[ta].len; it++) {
-		int e = pc_tv_at(v, ta, it);
+	for (it = 0, e = ta + 1; it < v->n[ta].len; it++, e = v->n[e].next) {
 		const char *kp, *vp;
 		size_t kn, vn;
 		long long ttl = 0;
 
-		if (e < 0 || v->n[e].type != 'm')
+		if (v->n[e].type != 'm')
 			continue;
 		if (get_bytes(v, e, "key", &kp, &kn, KEY_MAX) != 0 ||
-		        get_bytes(v, e, "value", &vp, &vn, VAL_MAX) != 0) {
+		        get_bytes(v, e, "value", &vp, &vn, VAL_MAX) != 0 ||
+		        (pc_tv_get_int(v, e, "ttl", &ttl) == 0 && ttl > PC_TTL_MAX)) {
 			ans->dropped++;            /* as the handler drops it */
 			continue;
 		}
@@ -6105,6 +6279,19 @@ out:
 	return rc;
 }
 
+/* a j* verb's path as its handler reads it: absent is the root; -1 for one present but not
+ * readable, or empty - the gate then proceeds and the handler refuses it */
+static int gate_jpath(const struct pc_tv *v, int params, char *path)
+{
+	int pl = pc_tv_get_str(v, params, "path", path, JP_NAME_PARAM);
+
+	if (pl < 0 && pc_tv_get(v, params, "path") < 0) {
+		path[0] = '$';
+		return 1;
+	}
+	return pl > 0 ? pl : -1;
+}
+
 static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		const struct pc_tv *v, int params, const char **errmsg,
 		struct up_ans *ans)
@@ -6121,11 +6308,13 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 	else if (m_is(method, mlen, "set"))
 		cls = PC_UPC_PLAIN;
 	else if (m_is(method, mlen, "jset")) {
-		char path[64];
-		int pl = pc_tv_get_str(v, params, "path", path, sizeof path - 1);
+		char path[JP_NAME_PARAM];
+		int pl = gate_jpath(v, params, path);
 		int tn = pc_tv_get(v, params, "nx"), tx = pc_tv_get(v, params, "xx");
 
-		cls = (pl <= 0 || (pl == 1 && (path[0] == '$' || path[0] == '.'))) &&
+		if (pl < 0)
+			return PC_UPG_PROCEED;
+		cls = pl == 1 && (path[0] == '$' || path[0] == '.') &&
 			tn < 0 && tx < 0 ? PC_UPC_PLAIN : PC_UPC_MUTATE;
 	} else if (m_is(method, mlen, "del") || m_is(method, mlen, "delifeq") ||
 	    m_is(method, mlen, "delifne") || m_is(method, mlen, "expire") ||
@@ -6161,9 +6350,11 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		const char **ks;
 		size_t *kl;
 		unsigned int i;
-		int n = 0;
+		int n = 0, e;
 
-		if (ta < 0 || v->n[ta].type != 'a' || !v->n[ta].len)
+		/* past the handler's element cap: the handler refuses it */
+		if (ta < 0 || v->n[ta].type != 'a' || !v->n[ta].len ||
+		        v->n[ta].len > MULTI_MAX)
 			return PC_UPG_PROCEED;
 		ks = malloc(v->n[ta].len * sizeof *ks);
 		kl = malloc(v->n[ta].len * sizeof *kl);
@@ -6172,11 +6363,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 			free(kl);
 			return PC_UPG_PROCEED;
 		}
-		for (i = 0; i < v->n[ta].len; i++) {
-			int e = pc_tv_at(v, ta, i);
-
-			if (e < 0)
-				continue;
+		for (i = 0, e = ta + 1; i < v->n[ta].len; i++, e = v->n[e].next) {
 			if (ism) {
 				if (get_bytes(v, e, "key", &kp, &kn, KEY_MAX) != 0)
 					continue;
@@ -6259,11 +6446,9 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 			const char *vp = NULL;
 			size_t vl = 0;
 
-			pl = pc_tv_get_str(v, params, "path", path, sizeof path - 1);
-			if (pl <= 0) {
-				path[0] = '$';
-				pl = 1;
-			}
+			pl = gate_jpath(v, params, path);
+			if (pl < 0)
+				return PC_UPG_PROCEED;     /* refused below */
 			fw.json = 1;
 			guess = PC_UPFW_JSON;
 			if (m_is(method, mlen, "jset")) {
@@ -6406,6 +6591,11 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 		ERRB("short request");
 	if (!klen || klen > KEY_MAX)
 		ERRB("missing or bad key");
+	if (((verb == PC_VERB_EXPIRE || verb == PC_VERB_SET || verb == PC_VERB_SETNX ||
+	        verb == PC_VERB_SETXX) && br_i64(pl + 4) > PC_TTL_MAX) ||
+	        ((verb == PC_VERB_ADD || verb == PC_VERB_SUB) &&
+	        br_i64(pl + 12) > PC_TTL_MAX))
+		ERRB(PC_TTL_MSG);
 	ht = pc_store_find(pl + off, cn);
 	if (!ht)
 		ERRB("no such collection");
@@ -6481,12 +6671,16 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 
 	case PC_VERB_DEL:
 		rc = op_del(ht, &k, park_req);
+		if (op_fail_text(rc))
+			ERRB(op_fail_text(rc));
 		bw_u8(out, rc == PC_OP_OK);       /* parked falls back to 0 */
 		return 0;
 
 	case PC_VERB_EXPIRE:
 		ttl = br_i64(pl + 4);
 		rc = op_expire(ht, &k, ttl, park_req);
+		if (op_fail_text(rc))
+			ERRB(op_fail_text(rc));
 		bw_u8(out, rc == PC_OP_OK);       /* parked falls back to 0 */
 		return 0;
 
@@ -6510,6 +6704,8 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 			ERRB(pc_wrongtype_msg);
 		if (rc == PC_OP_ERR_NOTINT)
 			ERRB("value is not an integer");
+		if (rc == PC_OP_ERR_OVF)
+			ERRB(PC_OVF_MSG);
 		if (rc == PC_OP_ERR_WRFAIL)    /* refused: nv was never written */
 			ERRB(wr_refused_msg());
 		bw_i64(out, nv);
@@ -7058,6 +7254,11 @@ static const struct resp_cmd *resp_cmd_find(const char *cmd, size_t cl)
 	return NULL;
 }
 
+int pc_verb_resp_known(const char *cmd, size_t cl)
+{
+	return resp_cmd_find(cmd, cl) != NULL;
+}
+
 int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 		struct pc_jw *out, char *scratch, size_t scratch_cap,
 		unsigned int *park_req, const char **colp, size_t *collenp,
@@ -7170,8 +7371,9 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 	ht = resp_col(out, cur_col, *cur_collen);
 	if (!ht)
 		return 0;
-	*colp = cur_col;
-	*collenp = *cur_collen;
+	/* the table's own name: cur_col may be a SELECT index the door would park with */
+	*colp = col_name_of(ht);
+	*collenp = strlen(*colp);
 
 	{
 		/* resp_redirect = moved: cluster clients refresh their slot map only on -MOVED,
@@ -7182,7 +7384,7 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 			int target = 0;
 
 			if (pc_store_shard_enabled(ht))
-				target = pc_shard_owner(cur_col, *cur_collen,
+				target = pc_shard_owner(*colp, *collenp,
 					argv[1], argl[1]);
 			else if (pc_cluster_replicas() &&
 			         !pc_spread_in_set(slot, 0, pc_cluster_replicas()))

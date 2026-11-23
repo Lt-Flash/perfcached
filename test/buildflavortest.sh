@@ -69,7 +69,7 @@ build_of() { # build_of <binary> -> process.build from a short start
 	printf '[daemon]\nworkers = 1\n[memory]\narena_mb = 32\n[secrets]\nclient = flav-secret\n[listen]\ntcp = 127.0.0.1:%d\nhttp = 127.0.0.1:%d\nplaintext = loopback\n[collection 0]\nbuckets_log2 = 8\n' \
 		$P1 $P2 > "$D/n$2.conf"
 	chmod 600 "$D/n$2.conf"
-	ASAN_OPTIONS=detect_leaks=0 "$1" -f "$D/n$2.conf" > "$D/n$2.log" 2>&1 &
+	ASAN_OPTIONS=detect_leaks=0${LD_PRELOAD:+:verify_asan_link_order=0} "$1" -f "$D/n$2.conf" > "$D/n$2.log" 2>&1 &
 	PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n$2.log"; do sleep 0.1; i=$((i+1)); done
 	python3 -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:$P2/stats',timeout=3))['process'].get('build'))" 2>/dev/null
@@ -94,7 +94,7 @@ else
 	S=$(pb PC_BUILD=asan | cut -d'|' -f3)
 	printf '#include <stdlib.h>\n#include <stdio.h>\nint main(void){volatile char *p=malloc(16);p[0]=1;free((void*)p);printf("%%d\\n",p[0]);return 0;}\n' > "$D/uaf.c"
 	if "$CC" -O0 -g $S -o "$D/uaf" "$D/uaf.c" > "$D/uaf.build" 2>&1; then
-		ASAN_OPTIONS=detect_leaks=0 "$D/uaf" > "$D/uaf.out" 2>&1
+		ASAN_OPTIONS=detect_leaks=0${LD_PRELOAD:+:verify_asan_link_order=0} "$D/uaf" > "$D/uaf.out" 2>&1
 		grep -q "AddressSanitizer: heap-use-after-free" "$D/uaf.out" &&
 			ok "4. a use after free built with the asan flavor's flags aborts with an AddressSanitizer report" ||
 			bad "4. no AddressSanitizer report: $(head -3 "$D/uaf.out" | tr '\n' ' ')"

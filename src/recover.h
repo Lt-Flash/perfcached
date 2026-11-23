@@ -61,7 +61,7 @@ long long pc_recovered_last_write_ms(void);
 void pc_recover_note_last_write(const char *dir);
 
 /* the load verb: import the CURRENT snapshot additively (the live value wins, expired
- * ones dropped).  0 (counts filled) or -1 (no/corrupt file). */
+ * ones dropped).  0 (counts filled), -1 (no/corrupt file) or -2 (another import is running). */
 PC_MUST_CHECK int pc_rdb_import(const char *dir, long *loaded, long *skipped_existing,
 		long *skipped_expired);
 

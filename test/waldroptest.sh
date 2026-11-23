@@ -162,7 +162,7 @@ fi
 #    nothing may drop, all must reach the WAL, and the waits must be counted
 rm -rf "$D/wal"; mkdir -p "$D/wal"; : > "$D/ctl"; : > "$D/shim.log"
 mkcfg no "ring_kb = 1024"
-PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD" \
+PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
 	"$BIN" -f "$D/n1.conf" > "$D/n5.log" 2>&1 &
 P5=$!
 k=0
@@ -194,7 +194,7 @@ grep -q walslow "$D/shim.log" && ok || bad "5. the shim never slowed a WAL write
 #    waits, its connection held (writer_pauses) or its write in the ring (ring_waits)
 rm -rf "$D/wal"; mkdir -p "$D/wal"; : > "$D/ctl"; : > "$D/shim.log"
 FSYNC=everysec mkcfg no "ring_kb = 64"
-PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD" \
+PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
 	"$BIN" -f "$D/n1.conf" > "$D/n6.log" 2>&1 &
 P6=$!
 k=0

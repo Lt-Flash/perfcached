@@ -884,5 +884,7 @@ int pc_cluster_fleet_stop(long long timeout_ms, int *gone, int *ngone,
 /* hand mastership to live member @node (0 cancels); NULL or why not */
 const char *pc_cluster_master_prefer(int node);
 int  pc_cluster_peers(struct pc_cl_peer_info *out, int max);
+/* peers holding a node id, up or not, plus silent ones purged with their id still reserved */
+int  pc_cluster_peers_known(void);
 
 #endif /* PC_CLUSTER_H */

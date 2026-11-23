@@ -1,6 +1,6 @@
 #!/bin/sh
 # stagetest.sh - who vouches for a build: perfcached -K verifies an artifact's signature offline,
-# upgrade_stage publishes only signed, trusted builds.  Usage: test/stagetest.sh [./perfcached] [./perfcli]
+# upgrade_stage publishes only signed, trusted builds.  Usage: test/stagetest.sh [./perfcached] [./perfcli] [./syncfailshim.so]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -276,8 +276,36 @@ rm -f "$D/st/upgrade/request"                                    # the helper to
 printf 'id=%s\nstatus=ok\nreason=ready again\nfrom=/opt/perfcached-0.7.0\nto=/opt/perfcached-0.6.6\nat=1700000300\n' "$RID" > "$D/res/result-$RID"
 [ "$(status 's["switching"], s["previous"]["from"], s["previous"]["to"]')" = "(None, '/opt/perfcached-0.7.0', '/opt/perfcached-0.6.6')" ] &&
 	ok "S9. the helper's result ends switching and is the new previous (a revert of the revert goes forward again)" || bad "S9. after the result: $(status 's["switching"], s["previous"]')"
+# a switch's upgrade/requested: the id, the 64-hex sha, the time taken - since is that time
+printf 'dd44dd44dd44dd44\n%s\n1700000400\n' "$SHA" > "$D/st/upgrade/requested"
+[ "$(status 's["switching"]["id"], s["switching"]["since"]')" = "('dd44dd44dd44dd44', 1700000400)" ] &&
+	ok "S9. a switch taken, not answered: since is line 3's time, not read from the sha line" || bad "S9. switch since: $(status 's["switching"]')"
+rm -f "$D/st/upgrade/requested"
 r=$("$CLI" -q -h 127.0.0.1 -p 16598 -E stage-enable upgrade-revert 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$r" | grep -q "this node runs no prefix" && ok "S9. perfcli upgrade-revert: the daemon's refusal, exit 1" || bad "S9. perfcli upgrade-revert rc=$rc: $r"
+
+# ---- S10. an upload whose staging file cannot be made durable: dropped, its descriptor closed
+SHIM=${3:-}
+if [ -n "$SHIM" ] && [ -f "$SHIM" ]; then
+	SHIM=$(readlink -f "$SHIM")
+	# a dynamic sanitizer runtime (check-asan) must come first in the preload list
+	SANRT=$(ldd "$BIN" 2>/dev/null | awk '/libasan|libclang_rt\.asan/ { print $3; exit }')
+	kill $PID 2>/dev/null; wait $PID 2>/dev/null; PID=
+	head -c 300000 /dev/urandom > "$D/e.tar.gz"
+	openssl pkeyutl -sign -inkey "$D/k.pem" -rawin -in "$D/e.tar.gz" -out "$D/e.sig" 2> /dev/null
+	echo part > "$D/sf.ctl"
+	LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_SYNCFAIL_CTL="$D/sf.ctl" PC_SYNCFAIL_LOG="$D/sf.log" "$BIN" -f "$D/c.conf" > "$D/n10.log" 2>&1 &
+	PID=$!
+	i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/n10.log"; do sleep 0.1; i=$((i+1)); done
+	r=$(up stage-enable "$D/e.tar.gz" "$D/e.sig" 0.6.9)
+	echo "$r" | grep -q "could not be made durable" && grep -q "^part .*\.part$" "$D/sf.log" 2>/dev/null &&
+		ok "S10. the staging file's fsync refused: the upload is dropped, said" || bad "S10. fsync refused: $r ($(cat "$D/sf.log" 2>/dev/null | tr '\n' '|'))"
+	n=$(ls -l /proc/$PID/fd 2>/dev/null | grep -c '\.part')
+	[ "$n" = 0 ] && ok "S10. and no descriptor stays open on the dropped staging file" ||
+		bad "S10. $n descriptor(s) still open on the dropped staging file: $(ls -l /proc/$PID/fd 2>/dev/null | grep '\.part' | sed 's/.*-> //' | tr '\n' '|')"
+else
+	bad "S10. no syncfailshim.so given (the third argument)"
+fi
 
 echo "stagetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

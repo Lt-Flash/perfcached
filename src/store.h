@@ -21,8 +21,8 @@ int pc_store_durable_name(const char *name, size_t nlen);
 int pc_store_types_strict(pcache_htable_t *ht);
 int pc_store_autoscale(int i);
 void pc_store_set_autoscale_idx(int i, int m);
-/* set by name at fleet generation @gen and persisted: an older @gen is refused, an equal one takes
- * the higher mode.  1 applied, 0 refused as older, -1 no such collection, -2 not a mode */
+/* set by name at fleet generation @gen, persisted by the caller: an older @gen is refused, an equal
+ * one takes the higher mode.  1 applied, 0 refused as older, -1 no such collection, -2 not a mode */
 int pc_store_autoscale_apply(const char *name, size_t nlen, int m,
 		unsigned long long gen, int *was);
 /* the generation of the mode set at runtime, 0 when the config's holds */
@@ -57,7 +57,8 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 		unsigned long long gen);
 
 /* tombstoned first, then the records freed by ordinary removes, so no pointer loses its target;
- * the table stays carved for the next create of that size.  Records freed, or -1 if none */
+ * the table stays carved for the next create of that size.  Records freed, -1 if none, -2 if
+ * @gen is older than the live collection's (a stale drop) */
 long pc_store_drop(const char *name, size_t nlen);
 long pc_store_drop_gen(const char *name, size_t nlen, unsigned long long gen);
 void pc_store_note_drop(const char *name, size_t nlen, unsigned long long gen);
@@ -96,6 +97,9 @@ int pc_store_slot_pub(pcache_htable_t *ht, unsigned long long *pub);
 /* the table a resize is filling, so a DELETE reaches both and no key returns at the swap;
  * NULL when no resize is running for @ht */
 pcache_htable_t *pc_store_resize_shadow(pcache_htable_t *ht);
+/* a delete during a resize empties the table the copier reads FIRST (the copy is made under that
+ * table's bucket lock), then the other: returns the first, *@second the other or NULL */
+pcache_htable_t *pc_store_del_order(pcache_htable_t *ht, pcache_htable_t **second);
 /* pcache_ht_scan_ex for a CLIENT cursor that survives a resize: a swap restarts the walk (SCAN may
  * repeat, never skip) and a draining resize walks the old table first.  0 = start / complete */
 int pc_store_scan(pcache_htable_t *ht, unsigned int *cursor,
@@ -115,10 +119,15 @@ int pc_store_buckets_log2(int i);
 int pc_store_floor_log2(int i);
 void pc_store_set_floor(const char *name, size_t nlen, int log2);
 int pc_store_runtime(int i);
+/* the name the config registered entry @i under (renames and drops keep it), NULL if none */
+const char *pc_store_cfg_name(int i);
 
 /* the created set, persisted under the state directory; load runs BEFORE the WAL replay and the
  * snapshot import, which drop records for a name they cannot resolve */
 int pc_store_persist(void);
+/* the same off the caller's thread: pc-maint writes it on its next tick */
+void pc_store_persist_later(void);
+void pc_store_persist_tick(void);
 int pc_store_load(const char *state_dir);
 
 /* find a collection by NUL-terminated-in-buffer name span; NULL if none */

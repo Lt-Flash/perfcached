@@ -26,11 +26,27 @@
 #define LIN_IDLE_MS   120000
 #define LIN_PER_ADDR  4
 #define LIN_HELLO_LEN 10
+#define LIN_PASS_FRAMES 64             /* a connection's frames per pass of the lane thread */
+
+/* what one inbound connection holds of the receive queue: at most what a sender may queue
+ * for one peer (CLANE_MAX_QUEUE).  Freed by the last of the connection and its frames */
+struct rxacct {
+	size_t bytes;
+	int refs;
+};
+
+/* under L.mx */
+static void acct_put(struct rxacct *a)
+{
+	if (a && !--a->refs)
+		free(a);
+}
 
 struct frame {
 	struct frame *next;
 	long long at_ms;
 	size_t len;
+	struct rxacct *acct;               /* a received frame's connection; NULL outbound */
 	unsigned char data[];
 };
 
@@ -49,6 +65,7 @@ struct lpeer {
 	int forced;                        /* everything by TCP */
 	int probe;                         /* connect even with nothing queued */
 	long long conn_start_ms;           /* the connect in flight began */
+	int idle;                          /* the lane thread leaves it alone: reusable */
 };
 
 struct lin {
@@ -59,6 +76,7 @@ struct lin {
 	unsigned char *buf;     /* the hello's bytes, then FRAME_MAX + 4 */
 	size_t have;
 	long long since_ms;     /* the accept, the hello, the last frame */
+	struct rxacct *acct;
 };
 
 static int forced_any;                 /* fast path for clane_forced */
@@ -110,8 +128,20 @@ static struct lpeer *peer_get(const pc_addr *to)
 	for (i = 0; i < L.npeer; i++)
 		if (same(&L.peer[i].to, to))
 			return &L.peer[i];
-	if (L.npeer >= MAX_PEERS)
+	if (L.npeer >= MAX_PEERS) {
+		/* full: a slot the lane thread marked idle, still with nothing to do */
+		for (i = 0; i < L.npeer; i++) {
+			struct lpeer *p = &L.peer[i];
+
+			if (p->idle && !p->head && !p->probe && !p->forced && p->fd < 0) {
+				memset(p, 0, sizeof *p);
+				p->to = *to;
+				p->fd = -1;
+				return p;
+			}
+		}
 		return NULL;
+	}
 	memset(&L.peer[L.npeer], 0, sizeof L.peer[0]);
 	L.peer[L.npeer].to = *to;
 	L.peer[L.npeer].fd = -1;
@@ -203,6 +233,7 @@ int clane_send(const pc_addr *to, const unsigned char *sealed,
 	f->next = NULL;
 	f->at_ms = mono_ms();
 	f->len = n;
+	f->acct = NULL;
 	memcpy(f->data, sealed, n);
 	pthread_mutex_lock(&L.mx);
 	p = peer_get(to);
@@ -242,6 +273,10 @@ size_t clane_rx_take(unsigned char *buf, size_t cap, pc_addr *from)
 		if (!L.rx_head)
 			L.rx_tail = NULL;
 		L.rx_bytes -= f->len;
+		if (f->acct) {
+			f->acct->bytes -= f->len;
+			acct_put(f->acct);
+		}
 	} else {
 		uint64_t v;
 
@@ -272,7 +307,7 @@ void clane_figures(struct clane_figs *out)
 }
 
 /* a whole frame arrived on an inbound lane: to the cluster thread */
-static void rx_queue(const pc_addr *from, const unsigned char *d,
+static void rx_queue(struct rxacct *acct, const pc_addr *from, const unsigned char *d,
 		size_t n)
 {
 	struct frame *f = malloc(sizeof *f + sizeof(struct rxhdr) + n);
@@ -282,10 +317,12 @@ static void rx_queue(const pc_addr *from, const unsigned char *d,
 		return;
 	f->next = NULL;
 	f->len = sizeof(struct rxhdr) + n;
+	f->acct = acct;
 	memcpy(f->data, from, sizeof(struct rxhdr));
 	memcpy(f->data + sizeof(struct rxhdr), d, n);
 	pthread_mutex_lock(&L.mx);
-	if (L.rx_bytes + f->len > CLANE_MAX_RXQ) {
+	if (L.rx_bytes + f->len > CLANE_MAX_RXQ ||
+	        acct->bytes + f->len > CLANE_MAX_QUEUE) {
 		L.f.dropped_rx++;
 		pthread_mutex_unlock(&L.mx);
 		free(f);
@@ -298,6 +335,8 @@ static void rx_queue(const pc_addr *from, const unsigned char *d,
 		L.rx_head = f;
 	L.rx_tail = f;
 	L.rx_bytes += f->len;
+	acct->bytes += f->len;
+	acct->refs++;
 	L.f.recv_frames++;
 	L.f.recv_bytes += n;
 	pthread_mutex_unlock(&L.mx);
@@ -325,6 +364,19 @@ static void peer_close(struct lpeer *p, long long now)
 		(long long)(random() % (p->backoff_ms / 2 + 1));
 }
 
+/* a host lost without an RST must read as gone in seconds, not at the retransmission limit */
+static void lane_keepalive(int fd)
+{
+	int one = 1, idle = 3, intvl = 1, cnt = 3;
+	unsigned int ut = 6000;
+
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+	setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ut, sizeof ut);
+}
+
 static void peer_connect(struct lpeer *p, long long now)
 {
 	pc_addr a = p->to;
@@ -337,6 +389,7 @@ static void peer_connect(struct lpeer *p, long long now)
 		return;
 	}
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+	lane_keepalive(fd);
 	/* from the advertise address: the receiver checks the hello against the source,
 	 * and an unbound socket leaves by whatever address the route picks */
 	{
@@ -491,7 +544,9 @@ static int lin_fill(struct lin *c, size_t want)
  * the 4-byte length and the body; 0 ok, -1 close it */
 static int lin_read(struct lin *c)
 {
-	for (;;) {
+	int frames;
+
+	for (frames = 0; frames < LIN_PASS_FRAMES; ) {
 		size_t len;
 		int rc;
 
@@ -515,6 +570,9 @@ static int lin_read(struct lin *c)
 				return -1;
 			}
 			pc_addr_from_v4(&c->from, a4, ntohs(p2));
+			if (!(c->acct = calloc(1, sizeof *c->acct)))
+				return -1;
+			c->acct->refs = 1;
 			{
 				unsigned char *fb = realloc(c->buf, FRAME_MAX + 4);
 
@@ -535,10 +593,21 @@ static int lin_read(struct lin *c)
 			return -1;
 		if ((rc = lin_fill(c, 4 + len)) <= 0)
 			return rc;
-		rx_queue(&c->from, c->buf + 4, len);
+		rx_queue(c->acct, &c->from, c->buf + 4, len);
 		c->have = 0;
 		c->since_ms = mono_ms();
+		frames++;
 	}
+	return 0;                              /* the rest on the next pass: poll still says so */
+}
+
+static void lin_drop(struct lin *c)
+{
+	close(c->fd);
+	free(c->buf);
+	pthread_mutex_lock(&L.mx);
+	acct_put(c->acct);
+	pthread_mutex_unlock(&L.mx);
 }
 
 /* inbound connections now held from @a's address */
@@ -571,6 +640,19 @@ static void *lane_main(void *arg)
 		for (i = 0; i < L.npeer; i++) {
 			struct lpeer *p = &L.peer[i];
 
+			/* no lane to it: what waited too long goes here, or the queue and the
+			 * reconnects would last as long as the process */
+			while (p->head && !p->connected && now - p->head->at_ms > CLANE_MAX_AGE_MS) {
+				struct frame *f = p->head;
+
+				p->head = f->next;
+				if (!p->head)
+					p->tail = NULL;
+				p->qbytes -= f->len;
+				L.f.dropped_stale++;
+				free(f);
+			}
+			p->idle = !p->head && p->fd < 0 && !p->probe && !p->forced;
 			if (!p->head && p->fd < 0 && !p->probe)
 				continue;
 			if (p->fd < 0) {
@@ -617,6 +699,7 @@ static void *lane_main(void *arg)
 			while ((fd = accept(L.lfd, &pa.sa, &pl)) >= 0) {
 				fcntl(fd, F_SETFL, O_NONBLOCK);
 				fcntl(fd, F_SETFD, FD_CLOEXEC);
+				lane_keepalive(fd);
 				if (nin >= CLANE_MAX_INBOUND ||
 				        lin_from(in, nin, &pa) >= LIN_PER_ADDR) {
 					L.f.refused++;     /* counted before the peer sees it */
@@ -651,7 +734,9 @@ static void *lane_main(void *arg)
 				gone = r == 0 || (r < 0 && errno != EAGAIN &&
 					errno != EWOULDBLOCK);
 			}
-			if (gone || peer_write(p, now) != 0)
+			/* a connect in flight is done only when POLLOUT says so */
+			if (gone || ((p->connected || (re & POLLOUT)) &&
+			        peer_write(p, now) != 0))
 				peer_close(p, now);
 		}
 		/* backwards: an entry removed takes the LAST one's place, which
@@ -663,8 +748,7 @@ static void *lane_main(void *arg)
 				continue;
 			if (((re & (POLLERR | POLLHUP)) && !(re & POLLIN)) ||
 			        lin_read(&in[i]) != 0) {
-				close(in[i].fd);
-				free(in[i].buf);
+				lin_drop(&in[i]);
 				in[i] = in[--nin];
 			}
 		}
@@ -674,8 +758,7 @@ static void *lane_main(void *arg)
 			if (now - in[i].since_ms >
 			        (in[i].hello_ok ? LIN_IDLE_MS : LIN_HELLO_MS)) {
 				L.f.inbound_timeouts++;
-				close(in[i].fd);
-				free(in[i].buf);
+				lin_drop(&in[i]);
 				in[i] = in[--nin];
 			}
 	}

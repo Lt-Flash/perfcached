@@ -1,7 +1,8 @@
 <?php
 // phpexttest.php - PE-1: every verb of the extension; see phpexttest.sh.
-// Usage: php -d extension=... phpexttest.php <plaintext-port> <noise-port> <secret>
+// Usage: php -d extension=... phpexttest.php <plaintext-port> <noise-port> <secret> <extension .so>
 [$_, $pp, $np, $sec] = $argv;
+$ext = $argv[4] ?? '';
 $pp = (int)$pp; $np = (int)$np;
 $fails = 0;
 function ok(bool $c, string $n): void {
@@ -45,6 +46,20 @@ foreach ([['plaintext door', $pp, []], ['Noise door', $np, ['secrets' => [$sec]]
     ok($pc->add('c', 'ctr', 5) === 5, 'add 5');
     ok($pc->sub('c', 'ctr', 2) === 3, 'sub 2');
     ok($pc->add('c', 'ctr') === 4, 'add, by 1 by default');
+    // the daemon holds 0 .. 2^31-1 s; a negative ttl read as "no expiry" and a larger one wrapped
+    $pc->del('c', 'tt');
+    $pc->del('c', 'tt2');
+    foreach ([-1, -300, 0x80000000, PHP_INT_MAX] as $bad) {
+        throws(fn() => $pc->set('c', 'tt', 'v', $bad), 'ValueError', "set with ttl $bad");
+        throws(fn() => $pc->setNx('c', 'tt2', 'v', $bad), 'ValueError', "setNx with ttl $bad");
+        throws(fn() => $pc->setIfEq('c', 'ctr', '4', '4', $bad), 'ValueError', "setIfEq with ttl $bad");
+        throws(fn() => $pc->expire('c', 'ctr', $bad), 'ValueError', "expire with ttl $bad");
+    }
+    throws(fn() => $pc->add('c', 'ctr', 1, 0x80000000), 'ValueError', 'add with ttl 2^31');
+    ok($pc->get('c', 'tt') === null && $pc->get('c', 'tt2') === null && $pc->ttl('c', 'ctr') === -1,
+        'and none of them stored or changed anything');
+    ok($pc->add('c', 'ctr', 1, -1) === 5, 'add with a negative ttl still keeps the expiry the key has');
+    ok($pc->sub('c', 'ctr') === 4, 'sub');
     $pc->set('c', 'm1', 'v1');
     $pc->set('c', 'm2', "v\x002");
     $pc->del('c', 'gone');
@@ -77,6 +92,93 @@ foreach ([['plaintext door', $pp, []], ['Noise door', $np, ['secrets' => [$sec]]
     ok($pc->hincrby('c', 'h', 'n', 7) === 7 && $pc->hincrby('c', 'h', 'n') === 8, 'hincrby');
     ok($pc->hgetall('c', 'h') === ['f1' => 'b', 'f2' => "x\x00", 'n' => '8'], 'hgetall');
     ok($pc->hdel('c', 'h', 'f1') === true && $pc->hdel('c', 'h', 'f1') === false, 'hdel');
+    if (!method_exists($pc, 'jget')) {
+        ok(false, 'the JSON path methods jget/jset/jdel/jincr exist');
+    } else {
+        $pc->del('c', 'doc');
+        $pc->jset('c', 'doc', '$', '{"n":1,"s":"x"}');
+        ok($pc->jget('c', 'doc') === '{"n":1,"s":"x"}', 'jset and jget: the whole document, "$" by default');
+        ok($pc->jincr('c', 'doc', '$.n', 4) === 5 && $pc->jincr('c', 'doc', '$.n') === 6, 'jincr: by 4, then by the default 1');
+        ok($pc->jget('c', 'doc', '$.s') === '"x"', 'jget: a fragment comes back as JSON text');
+        ok($pc->jdel('c', 'doc', '$.s') === true && $pc->jdel('c', 'doc', '$.s') === false, 'jdel: a path, then absent');
+        $pc->jset('c', 'doc', '$.a', '[1,2]');
+        ok($pc->jget('c', 'doc', '$.a') === '[1,2]' && json_decode($pc->jget('c', 'doc'), true) === ['n' => 6, 'a' => [1, 2]], 'jset under a path');
+        ok($pc->jget('c', 'nodoc') === null, 'jget: a miss is null');
+        ok($pc->jdel('c', 'doc') === true && $pc->jget('c', 'doc') === null, 'jdel with no path removes the document');
+        $pc->jset('c', 'tdoc', '$', '{"a":1}', 500);
+        $t = $pc->ttl('c', 'tdoc');
+        ok($t > 400 && $t <= 500, "jset with a ttl: $t");
+        throws(fn() => $pc->jset('c', 'doc2', '$', '{not json'), 'PerfcachedException', 'jset: text that is not JSON');
+        throws(fn() => $pc->jget('c', "a\x00b"), 'ValueError', 'a NUL in a jget key');
+        throws(fn() => $pc->jset('c', 'doc', '$', "{\"a\":\"\x00\"}"), 'ValueError', 'a NUL in jset text');
+    }
+    if (!method_exists($pc, 'setNx')) {
+        ok(false, 'the lock and publish methods setNx/setIfEq/delIfEq/publish exist');
+    } else {
+        $pc->del('c', 'lk');
+        ok($pc->setNx('c', 'lk', 'tok1', 500) === true, 'setNx: absent, so set');
+        ok($pc->setNx('c', 'lk', 'tok2', 500) === false && $pc->get('c', 'lk') === 'tok1', 'setNx: present, so declined and the value kept');
+        $t = $pc->ttl('c', 'lk');
+        ok($t > 400 && $t <= 500, "setNx with a ttl: $t");
+        ok($pc->setIfEq('c', 'lk', 'tok1', 'tok1', 900) === true && $pc->ttl('c', 'lk') > 800, 'setIfEq with its own token: refreshed, the ttl moved');
+        ok($pc->setIfEq('c', 'lk', 'tok2', 'other', 900) === false && $pc->get('c', 'lk') === 'tok1', 'setIfEq: no match, nothing changed');
+        ok($pc->delIfEq('c', 'lk', 'other') === false && $pc->exists('c', 'lk') === true, 'delIfEq: no match, kept');
+        ok($pc->delIfEq('c', 'lk', 'tok1') === true && $pc->exists('c', 'lk') === false, 'delIfEq: the token matches, deleted');
+        ok($pc->setIfEq('c', 'lk', 'x', 'tok1') === false && $pc->exists('c', 'lk') === false, 'setIfEq on an absent key: false, nothing set');
+        ok($pc->delIfEq('c', 'lk', 'tok1') === false, 'delIfEq on an absent key: false');
+        ok($pc->setNx('c', 'lk', "b\x00in") === true && $pc->delIfEq('c', 'lk', "b\x00i") === false && $pc->delIfEq('c', 'lk', "b\x00in") === true,
+            'a token with a NUL byte compares byte-exact');
+        ok($pc->publish('php.chan', "p\x00y") === 0, 'publish with nobody subscribed: 0 receivers');
+        throws(fn() => $pc->publish("a\x00b", 'x'), 'ValueError', 'a NUL in a channel name');
+    }
+    if (!method_exists($pc, 'subscribe')) {
+        ok(false, 'subscribe and psubscribe exist');
+    } else {
+        // a publisher of its own: it repeats its first message until a subscriber counts it
+        $pub = function (string $first, string $rest) use ($port, $opts, $ext) {
+            $src = '$p = new Perfcached("127.0.0.1", ' . $port . ', ' . var_export($opts, true) . ');'
+                . ' for ($i = 0; $i < 200 && $p->publish("' . $first . '", "hello") < 1; $i++) usleep(50000); ' . $rest;
+            return proc_open([PHP_BINARY, '-n', '-d', "extension=$ext", '-r', $src],
+                [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
+        };
+        $c1 = $pub('php.sub', 'foreach (["m1", "m2", "stop"] as $m) $p->publish("php.sub", $m);');
+        $got = [];
+        $n = $pc->subscribe(['php.sub', 'php.other'], function ($h, $ch, $msg) use (&$got, $pc) {
+            $got[] = ($h === $pc ? '' : 'NOT-THE-HANDLE ') . "$ch:$msg";
+            return $msg !== 'stop';
+        }, 15);
+        proc_close($c1);
+        ok($got === ['php.sub:hello', 'php.sub:m1', 'php.sub:m2', 'php.sub:stop'] && $n === 4,
+            "subscribe: each message in order, the handle first, the callback's false ends it: " . implode(' ', $got));
+        $c2 = $pub('php.pat.a', '$p->publish("php.pat.b", "stop");');
+        $pg = [];
+        $n = $pc->psubscribe(['php.pat.*'], function ($h, $pat, $ch, $msg) use (&$pg) {
+            $pg[] = "$pat $ch $msg";
+            return $msg !== 'stop';
+        }, 15);
+        proc_close($c2);
+        ok($pg === ['php.pat.* php.pat.a hello', 'php.pat.* php.pat.b stop'] && $n === 2,
+            'psubscribe: pattern, channel and message: ' . implode(' | ', $pg));
+        $t0 = microtime(true);
+        $n = $pc->subscribe(['php.none'], fn() => true, 0.5);
+        $dt = microtime(true) - $t0;
+        ok($n === 0 && $dt >= 0.45 && $dt < 5, sprintf('subscribe with a timeout and no message: 0 after %.2f s', $dt));
+        ok($pc->get('c', 'bin') === $bin, 'the handle works after a subscription');
+        // the node drops a subscription when it sees its connection close: asked again, briefly
+        for ($i = 0; $i < 40 && ($r = $pc->publish('php.none', 'x')) !== 0; $i++) usleep(50000);
+        ok($r === 0, "the subscription went with its connection: publish answers $r after " . ($i * 50) . ' ms');
+        $c3 = $pub('php.ex', '');
+        $threw = false;
+        try {
+            $pc->subscribe(['php.ex'], function () { throw new RuntimeException('from the callback'); }, 15);
+        } catch (RuntimeException $e) {
+            $threw = $e->getMessage() === 'from the callback';
+        }
+        proc_close($c3);
+        ok($threw, 'an exception in the callback ends the loop and reaches the caller');
+        throws(fn() => $pc->subscribe(["a\x00b"], fn() => true, 0.1), 'ValueError', 'a NUL in a channel name');
+        throws(fn() => $pc->subscribe([], fn() => true, 0.1), 'ValueError', 'no channel');
+    }
     throws(fn() => $pc->get('nosuchcol', 'k'), 'PerfcachedException', 'no such collection throws');
     throws(fn() => $pc->ttl('nosuchcol', 'k'), 'PerfcachedException', 'and from ttl, whose -1 is also an answer');
     ok($pc->ttl('c', 'bin') === -1, 'a -1 after that error is still "no expiry", no exception');
@@ -106,6 +208,14 @@ $rot = new Perfcached('127.0.0.1', $np, ['secrets' => ['wrong-first', $sec]]);
 $rot->ping();
 ok(true, 'rotation: the second secret wins');
 ok($rot->get('c', 'bin') === $bin, 'and carries binary');
+// subscribe dials a connection of its own: it walks the secrets as the handle's dial does
+try {
+    $n = $rot->subscribe(['php.rot'], fn() => true, 0.3);
+    ok($n === 0, "rotation: subscribe connects with the second secret too ($n delivered)");
+} catch (\Throwable $e) {
+    ok(false, 'rotation: subscribe connects with the second secret too (' . get_class($e) . ': '
+        . substr($e->getMessage(), 0, 60) . ')');
+}
 throws(fn() => new Perfcached('127.0.0.1', $np, ['secrets' => ['wrong']]), 'PerfcachedAuthException', 'a wrong secret');
 throws(fn() => (new Perfcached('127.0.0.1', $np))->ping(), 'PerfcachedException', 'no secret on a Noise-only door: refused at the first request');
 throws(fn() => new Perfcached('127.0.0.1', 1), 'PerfcachedTransportException', 'nothing listening');

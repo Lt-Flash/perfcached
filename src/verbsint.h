@@ -17,6 +17,10 @@ struct pc_tw;
 
 #define VAL_MAX     PCACHE_CELL_MAX          /* largest storable value */
 #define KEY_MAX     4096
+/* the longest relative TTL (s): with it, the 32-bit tick expiry stays unwrapped for 68 years
+ * of uptime; a longer one is refused as Redis refuses an invalid expire */
+#define PC_TTL_MAX  0x7FFFFFFFLL
+#define PC_TTL_MSG  "invalid expire time - a ttl is at most 2147483647 seconds"
 #define JP_NAME_PARAM 512                    /* longest path string */
 /* every door's read and write of a key notes it for the hot-key sampler
  * (store.c); the cores carry it, so one hook each covers them all */

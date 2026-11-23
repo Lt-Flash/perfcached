@@ -66,6 +66,7 @@ upstream_writes = through
 upstream_prefixes = *
 upstream_timeout_ms = 1000
 upstream_negative_ms = 5000
+upstream_on_error = ${ONERR:-error}
 C
 	chmod 600 "$D/n$1.conf"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
@@ -262,7 +263,51 @@ sum() { python3 -c 'import sys; print(sum(int(x) for x in sys.argv[1].split()))'
 allv() { python3 -c 'import sys; print(all(int(x) == int(sys.argv[2]) for x in sys.argv[1].split()))' "$1" "$2"; }
 [ "$(sum "$RD")" -eq "$NR" ] && ok "10. the drain sweeps read each of the master's $NR keys at its owner alone (read:$RD)" || bad "10. drain read:$RD ($NR keys on the master, 1 x expected)"
 [ $(( $(sum "$TK") + $(sum "$HD") )) -eq $((NR * 1)) ] && [ "$(sum "$EL")" -eq $((NR * 2)) ] && ok "10. each key taken (or already held) by its owner alone - taken_over:$TK fleet_had:$HD, the other nodes skipped it (elsewhere:$EL)" || bad "10. taken_over:$TK fleet_had:$HD elsewhere:$EL (want 1 x $NR taken+had, 2 x $NR elsewhere)"
-grep -h 'an fsync has been stuck' "$D"/n?.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
-grep -h -E 'ERROR|CRIT' "$D"/n?.log | grep -qv 'an fsync has been stuck' && bad "the nodes logged: $(grep -h -E 'ERROR|CRIT' "$D"/n?.log | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' '|')" || ok "no ERROR or CRIT in the nodes' logs"
+
+# ---- 11. the owner's fetch fails: a read through another node is an upstream error ----------
+# every upstream answers TYPE -LOADING; on_error = error, so a pull the owner cannot fill must not read as absent
+ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"], "error_cmds": {"TYPE": "LOADING Redis is loading the dataset in memory"}}'
+ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "error_cmds": {"TYPE": "LOADING Redis is loading the dataset in memory"}}'
+ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "error_cmds": {"TYPE": "LOADING Redis is loading the dataset in memory"}}'
+sleep 0.3
+pfs() { echo $(( $(st 2 "s['cluster']['pull_fetching']") + $(st 3 "s['cluster']['pull_fetching']") )); }
+EK=; ER=
+for cand in $(seq 1 20); do
+	p0=$(pfs); r=$(nget 1 "lx:$cand"); p1=$(pfs)
+	[ "$p1" -gt "$p0" ] && { EK="lx:$cand"; ER=$r; break; }
+done
+case "$ER" in "ERR "*upstream*) ok "11. $EK read through node 1 while its owner's fetch fails: an upstream error ($ER)";;
+	*) bad "11. $EK through node 1, its owner's fetch failing: '$ER' (want an upstream error, not absent)";; esac
+[ -n "$EK" ] && r=$(rsp 1 GET "$EK") || r=
+case "$r" in "'-ERR upstream"*) ok "11. GET $EK over RESP through node 1: $r";;
+	*) bad "11. GET $EK over RESP through node 1, its owner's fetch failing: $r (want -ERR upstream...)";; esac
+ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"]}'
+ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM'}'
+ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM'}'
+
+# ---- 12. on_error = miss: the owner's failed fetch answers absent at once, with no pull timeout --
+for n in 1 2 3; do eval "kill -9 \$P${n}ID"; eval "wait \$P${n}ID" 2>/dev/null; mv "$D/n$n.log" "$D/n$n-error.log"; done
+ONERR=miss; node 1; node 2; node 3
+i=0; while [ $i -lt 100 ] && [ "$(st 1 "s['cluster']['peers_up']")" != 2 ]; do sleep 0.2; i=$((i+1)); done
+for n in 1 2 3; do i=0; while [ $i -lt 100 ] && [ "$(st $n "s['state']")" != ready ]; do sleep 0.2; i=$((i+1)); done; done
+# a membership change opens the 30 s reshard grace, in which an owner's miss is retried as a broadcast
+sleep 31
+ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"], "error_cmds": {"TYPE": "LOADING Redis is loading the dataset in memory"}}'
+ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "error_cmds": {"TYPE": "LOADING Redis is loading the dataset in memory"}}'
+ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "error_cmds": {"TYPE": "LOADING Redis is loading the dataset in memory"}}'
+sleep 0.3
+MK=; MR=; T0=$(st 1 "s['cluster']['pull_timeouts']")
+for cand in $(seq 1 20); do
+	p0=$(pfs); r=$(nget 1 "lm:$cand"); p1=$(pfs)
+	[ "$p1" -gt "$p0" ] && { MK="lm:$cand"; MR=$r; break; }
+done
+T1=$(st 1 "s['cluster']['pull_timeouts']")
+[ -n "$MK" ] && [ "$MR" = None ] && ok "12. $MK through node 1 under on_error = miss, its owner's fetch failing: a miss" || bad "12. '$MK' through node 1 under on_error = miss: '$MR' (want None)"
+[ -n "$MK" ] && [ "$T1" = "$T0" ] && ok "12. the owner answered absent at once: node 1 counted no pull timeout ($T0 -> $T1)" || bad "12. node 1's pulls timed out under on_error = miss ($T0 -> $T1): the owner stayed silent"
+ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"]}'
+ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM'}'
+ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM'}'
+grep -h 'an fsync has been stuck' "$D"/n*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
+grep -h -E 'ERROR|CRIT' "$D"/n*.log | grep -qv 'an fsync has been stuck' && bad "the nodes logged: $(grep -h -E 'ERROR|CRIT' "$D"/n*.log | grep -v 'an fsync has been stuck' | head -n 2 | tr '\n' '|')" || ok "no ERROR or CRIT in the nodes' logs"
 echo "upthroughshardtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

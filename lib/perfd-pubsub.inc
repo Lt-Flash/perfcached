@@ -432,7 +432,7 @@ static int udp_probe_in(perfd_t *p, const unsigned char *dg, size_t n)
 	return 0;
 }
 
-/* 1 new, 0 duplicate; counts what left the window unseen */
+/* 1 new, 0 duplicate or older than the window; counts what left the window unseen */
 static int udp_window(struct pd_udp *u, uint64_t seq)
 {
 	if (seq > u->high) {
@@ -451,7 +451,7 @@ static int udp_window(struct pd_udp *u, uint64_t seq)
 		return 1;
 	}
 	if (u->high - seq >= 64)
-		return 1;                      /* already counted as a gap: late */
+		return 0;                      /* counted as a gap; past the window it may be a replay */
 	if (u->bits & (1ULL << (u->high - seq)))
 		return 0;
 	u->bits |= 1ULL << (u->high - seq);

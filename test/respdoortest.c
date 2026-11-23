@@ -123,6 +123,19 @@ void pc_obs_qlog(const char *dialect, void *row, const char *verb, size_t vlen,
 	snprintf(last_outcome, sizeof last_outcome, "%s", outcome);
 }
 
+/* the commands the door implements, as verbs.c's table would answer */
+int pc_verb_resp_known(const char *cmd, size_t cl)
+{
+	static const char *const k[] = { "PING", "GET", "MISS", "ERRX", "QUIT", "BIG", "PARK",
+		"WALK", "HOLD", "MGET", "ECHO", "SET", "FAIL", "AUTH" };
+	size_t i;
+
+	for (i = 0; i < sizeof k / sizeof k[0]; i++)
+		if (cl == strlen(k[i]) && !memcmp(cmd, k[i], cl))
+			return 1;
+	return 0;
+}
+
 /* the verb layer: answers by the command's name */
 int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 		struct pc_jw *out, char *scratch, size_t scratch_cap,
@@ -213,6 +226,7 @@ int main(void)
 	long long v;
 	int rc;
 
+	c.resp_authed = 1;                 /* F turns it off */
 	/* A: multibulk - lengths, bare LF, *0, pipelining, incomplete is 0, malformed is -1 */
 	rc = FRAME("*1\r\n$4\r\nPING\r\n");
 	CHK(rc == 14 && verb_calls == 1 && verb_nargs == 1 && !strcmp(verb_argv[0], "PING") &&
@@ -345,6 +359,36 @@ int main(void)
 		resp_ll_span("123456789012345678", 18, &v) == -1, "E: 17 characters read, 18 refused");
 	CHK(resp_ll_span("-1234567890123456", 17, &v) == 0 && resp_ll_span("-12345678901234567", 18, &v) == -1,
 		"E: the sign counts toward the 17");
+
+	/* F: a stats row is named only for a command the door implements, run authenticated -
+	 * anything else is counted under the one fixed row "unknown" */
+	{
+		int i, named = 0;
+		char req[64];
+
+		c.resp_authed = 0;
+		cmds = 0;
+		FRAME("*1\r\n$3\r\na\nb\r\n");
+		CHK(cmds == 1 && !strcmp(last_cmd, "unknown"),
+			"F: before AUTH, a name holding a line feed - counted as unknown (%s)", last_cmd);
+		FRAME("*1\r\n$4\r\nPING\r\n");
+		CHK(!strcmp(last_cmd, "unknown"), "F: before AUTH, a known command - unknown (%s)",
+			last_cmd);
+		c.resp_authed = 1;
+		FRAME("*1\r\n$7\r\nNOSUCH1\r\n");
+		CHK(!strcmp(last_cmd, "unknown"), "F: authenticated, a command the door does not "
+			"implement - unknown (%s)", last_cmd);
+		FRAME("*1\r\n$4\r\nPING\r\n");
+		CHK(!strcmp(last_cmd, "PING"), "F: authenticated, PING - its own row (%s)", last_cmd);
+		for (i = 0; i < 70; i++) {
+			int n = snprintf(req, sizeof req, "*1\r\n$5\r\nj%04d\r\n", i);
+
+			frame_at(req, (size_t)n, 0);
+		}
+		for (i = 0; i < stub_rows; i++)
+			named += stub_row[i][0] == 'j';
+		CHK(named == 0, "F: 70 distinct junk names - none of them names a row (%d did)", named);
+	}
 
 	printf("respdoortest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

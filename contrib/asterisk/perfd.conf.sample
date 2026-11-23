@@ -54,6 +54,9 @@ connect_timeout_ms = 1000
 ; Per send and per receive.  A stalled server holds a call this long, and
 ; libperfd's own default would be 5000.
 io_timeout_ms = 300
+; resp only: the most one call may take, its dial and one retry included;
+; default 2 x (connect_timeout_ms + 2 x io_timeout_ms).
+;call_timeout_ms = 2600
 ; How long a call waits for a free connection before it is an ERROR.
 wait_timeout_ms = 300
 ; Seconds; 0 = no expiry.  PERFD_SET's third argument overrides it.

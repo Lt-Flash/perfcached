@@ -102,13 +102,14 @@ static const char *jobj(const char *res, const char *key)   /* "key":{ ... */
  * summed - not every "entries" in the text, which mixes in the fleet's and the negative cache's */
 static long long jentries_sum(const char *res)
 {
-	const char *p = res ? strstr(res, "\"collections\":[") : NULL;
+	static const char pat[] = "\"collections\":[";
+	const char *p = res ? strstr(res, pat) : NULL;
 	long long sum = 0;
 	int depth = 0;
 
 	if (!p)
 		return 0;
-	for (p += 14; *p; p++) {
+	for (p += sizeof pat - 1; *p; p++) {
 		if (*p == '"') {
 			for (p++; *p && *p != '"'; p++)
 				if (*p == '\\' && p[1])
@@ -465,7 +466,7 @@ static void ufile_release(const char *tarball, struct urel *rl)
 	static char list[1 << 20];
 	char member[512] = "", body[4096], *line, *save = NULL;
 	char *lav[] = { "tar", "-tzf", (char *)tarball, NULL };
-	char *xav[] = { "tar", "-xzOf", (char *)tarball, member, NULL };
+	char *xav[] = { "tar", "-xzOf", (char *)tarball, "--", member, NULL };
 
 	memset(rl, 0, sizeof *rl);
 	if (utar(lav, list, sizeof list) < 0)
@@ -475,6 +476,8 @@ static void ufile_release(const char *tarball, struct urel *rl)
 
 		if (l >= t && !strcmp(line + l - t, "share/perfcached/RELEASE") &&
 		    (l == t || line[l - t - 1] == '/') && l < sizeof member) {
+			if (line[0] == '-')            /* no build is named so: a crafted tarball */
+				return;
 			snprintf(member, sizeof member, "%s", line);
 			break;
 		}
@@ -496,17 +499,95 @@ static void ufile_release(const char *tarball, struct urel *rl)
 	rl->found = rl->version[0] && rl->emin > 0 && rl->emax >= rl->emin;
 }
 
+/* a node's last "switching" line since the plan: the pid and build it had then, and whether a
+ * gated or reverted line followed (closed) or not (open: on the new build, or the switch failed) */
+struct uswitch {
+	int node, open;
+	long long pid;
+	char from[32];
+};
+
+/* every node switched since the last plan line, in the order of their last switch */
+static int ujournal_switched(const struct uplan *pl, struct uswitch *sw, int max)
+{
+	FILE *f = fopen(pl->journal, "r");
+	char line[1200];
+	int n = 0;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f)) {
+		char *p = strchr(line, ' '), *e;
+		int node, i;
+
+		if (!p)
+			continue;
+		p++;
+		if (!strncmp(p, "plan ", 5)) {
+			n = 0;
+			continue;
+		}
+		if (sscanf(p, "node=%d", &node) != 1)
+			continue;
+		for (i = 0; i < n && sw[i].node != node; i++)
+			;
+		if (strstr(p, "event=switching")) {
+			if (i < n) {
+				memmove(&sw[i], &sw[i + 1], (size_t)(n - i - 1) * sizeof sw[0]);
+				n--;
+			}
+			if (n >= max)
+				continue;
+			memset(&sw[n], 0, sizeof sw[n]);
+			sw[n].node = node;
+			sw[n].open = 1;
+			e = strstr(p, " from=");
+			if (e)
+				sscanf(e + 6, "%31s", sw[n].from);
+			e = strstr(p, " pid=");
+			sw[n].pid = e ? strtoll(e + 5, NULL, 10) : -1;
+			n++;
+		} else if (i < n && (strstr(p, "event=gated") || strstr(p, "event=reverted"))) {
+			sw[i].open = 0;
+		}
+	}
+	fclose(f);
+	return n;
+}
+
+static const struct uswitch *uswitch_find(const struct uswitch *sw, int n, int node)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (sw[i].node == node)
+			return &sw[i];
+	return NULL;
+}
+
 /* ---- the steps ------------------------------------------------------------ */
 
+/* run directly, no shell: the address is what a member advertised, the artifact any path */
 static int uhook(const struct uplan *pl, const char *op, const struct unode *u)
 {
-	char cmd[1400];
-	int rc;
+	char port[16], node[16];
+	char *av[] = { (char *)pl->switch_cmd, (char *)op, (char *)u->addr, port, node,
+		(char *)pl->artifact, (char *)pl->sha, NULL };
+	pid_t pid;
+	int st;
 
-	snprintf(cmd, sizeof cmd, "%s %s %s %d %d '%s' %s", pl->switch_cmd, op,
-		u->addr, u->port, u->node, pl->artifact, pl->sha);
-	rc = system(cmd);
-	return rc == -1 ? -1 : WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+	snprintf(port, sizeof port, "%d", u->port);
+	snprintf(node, sizeof node, "%d", u->node);
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		execvp(av[0], av);
+		_exit(127);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
 /* the artifact on every member: staged on the seed, relayed by the daemon,
@@ -571,7 +652,8 @@ static int ustage(const struct uplan *pl, struct unode *ns, int n)
 	return -1;
 }
 
-static int uwait_safe(const struct uplan *pl, struct unode *ns, int n, int before)
+/* every node reachable and restart-safe; node @down_ok may be down (-1: none) */
+static int uwait_safe(const struct uplan *pl, struct unode *ns, int n, int before, int down_ok)
 {
 	int t, i;
 
@@ -580,7 +662,7 @@ static int uwait_safe(const struct uplan *pl, struct unode *ns, int n, int befor
 
 		n = ufleet_read(ns, n > 0 ? n : UP_MAX_NODES);
 		for (i = 0; i < n; i++)
-			if (!ns[i].reach || !ns[i].safe)
+			if (ns[i].reach ? !ns[i].safe : ns[i].node != down_ok)
 				all = 0;
 		if (all)
 			return n;
@@ -589,6 +671,23 @@ static int uwait_safe(const struct uplan *pl, struct unode *ns, int n, int befor
 	ujournal_line(pl, "stop reason=not-restart-safe before=%d (a reconcile pass is open "
 		"on a node that needs a peer to finish it)", before);
 	return -1;
+}
+
+/* before a revert in a roll: a peer out stops it with nothing reverted (that would be a second
+ * node down); else the wait every planned restart gets, the node itself allowed to be down */
+static int urevert_ready(const struct uplan *pl, const struct unode *u)
+{
+	struct unode ns[UP_MAX_NODES];
+	int n = ufleet_read(ns, UP_MAX_NODES), i;
+
+	for (i = 0; i < n; i++)
+		if (ns[i].node != u->node && !ns[i].reach) {
+			ujournal_line(pl, "stop reason=peer-unreachable node=%d peer=%d addr=%s:%d - "
+				"nothing reverted while a peer is out; resume or roll back once it is back",
+				u->node, ns[i].node, ns[i].addr, ns[i].port);
+			return -1;
+		}
+	return uwait_safe(pl, ns, n, u->node, u->node) < 0 ? -1 : 0;
 }
 
 /* the node is up on the new build (a new pid, the version asked), then
@@ -710,15 +809,18 @@ static int uroll(struct uplan *pl, int resume)
 	peers = n - 1;
 	for (;;) {
 		struct unode *u = NULL, cur;
+		char from[sizeof cur.ver];
 		long long old_pid;
-		int rc, is_gated;
+		int rc, is_gated, nsw;
+		struct uswitch sw[UP_MAX_NODES];
+		const struct uswitch *was;
 
 		if (uabort_wanted(pl)) {
 			ujournal_line(pl, "stop reason=abort (asked; the roll stopped between nodes)");
 			uabort_clear(pl);
 			return 1;
 		}
-		n = uwait_safe(pl, ns, n, 0);
+		n = uwait_safe(pl, ns, n, 0, -1);
 		if (n < 0)
 			return 1;
 		qsort(ns, (size_t)n, sizeof ns[0], unode_cmp);   /* the master last, live */
@@ -730,6 +832,14 @@ static int uroll(struct uplan *pl, int resume)
 			if (!is_gated)
 				u = &ns[i];
 		}
+		/* every node gated: done only if every node runs the version (one taken back by hand) */
+		for (i = 0; i < n && !u; i++)
+			if (strcmp(ns[i].ver, pl->version)) {
+				ujournal_line(pl, "stop reason=node-%d-not-on-%s - it runs %s although "
+					"journaled gated (reverted by hand?)", ns[i].node, pl->version,
+					ns[i].ver);
+				return 1;
+			}
 		if (!u) {
 			ujournal_line(pl, "done version=%s nodes=%d", pl->version, n);
 			printf("every node runs %s - the roll is done\n", pl->version);
@@ -741,6 +851,18 @@ static int uroll(struct uplan *pl, int resume)
 		cur = *u;
 		u = &cur;
 		old_pid = u->pid;
+		memcpy(from, u->ver, sizeof from);
+		nsw = ujournal_switched(pl, sw, UP_MAX_NODES);
+		was = uswitch_find(sw, nsw, u->node);
+		if (was && was->open && was->pid != u->pid && !strcmp(u->ver, pl->version)) {
+			/* switched by an earlier run that stopped before its gate: on to the gates */
+			ujournal_line(pl, "node=%d addr=%s:%d event=switched-before version=%s pid=%lld "
+				"(pid %lld at the journal's switch) - not switched again", u->node, u->addr,
+				u->port, u->ver, u->pid, was->pid);
+			snprintf(from, sizeof from, "%s", was->from);
+			old_pid = -1;
+			goto gates;
+		}
 		ujournal_line(pl, "node=%d addr=%s:%d event=switching from=%s role=%s pid=%lld",
 			u->node, u->addr, u->port, u->ver, u->role, old_pid);
 		if (pl->switch_cmd[0]) {
@@ -767,17 +889,25 @@ static int uroll(struct uplan *pl, int resume)
 			perfd_free_value(r);
 			perfd_free(h);
 		}
+gates:
 		rc = uwait_up(pl, u, old_pid, peers);
 		if (rc != 0) {
 			ujournal_line(pl, "node=%d addr=%s:%d event=failed reason=%s", u->node,
 				u->addr, u->port, rc == -1 ? "not-up-in-time" : "not-ready-in-time");
+			/* still on the build it ran: the switch did not take (refused, or undone by the
+			 * helper), and a revert would go to the build before that one */
+			if (rc == -1 && u->reach && !strcmp(u->ver, from))
+				ujournal_line(pl, "stop reason=node-%d-not-switched - it runs %s (pid %lld), "
+					"nothing reverted; see its upgrade_status", u->node, u->ver, u->pid);
 			/* revert THAT node, verify the old build, stop */
-			if (urevert_node(pl, u, peers) == 0)
-				ujournal_line(pl, "stop reason=node-%d-reverted - the nodes already "
-					"rolled stay on %s", u->node, pl->version);
-			else
-				ujournal_line(pl, "stop reason=node-%d-not-reverted - look at it now",
-					u->node);
+			else if (urevert_ready(pl, u) == 0) {
+				if (urevert_node(pl, u, peers) == 0)
+					ujournal_line(pl, "stop reason=node-%d-reverted - the nodes already "
+						"rolled stay on %s", u->node, pl->version);
+				else
+					ujournal_line(pl, "stop reason=node-%d-not-reverted - look at it now",
+						u->node);
+			}
 			uprint_rollback(pl, u);
 			return 1;
 		}
@@ -806,16 +936,19 @@ static int uroll(struct uplan *pl, int resume)
 			if (lost) {
 				ujournal_line(pl, "node=%d addr=%s:%d event=failed reason=peers-lost-records",
 					u->node, u->addr, u->port);
-				if (urevert_node(pl, u, peers) == 0)
-					ujournal_line(pl, "stop reason=node-%d-reverted after the gate", u->node);
-				else
-					ujournal_line(pl, "stop reason=node-%d-not-reverted - look at it now",
-						u->node);
+				if (urevert_ready(pl, u) == 0) {
+					if (urevert_node(pl, u, peers) == 0)
+						ujournal_line(pl, "stop reason=node-%d-reverted after the gate",
+							u->node);
+					else
+						ujournal_line(pl, "stop reason=node-%d-not-reverted - look at "
+							"it now", u->node);
+				}
 				uprint_rollback(pl, u);
 				return 1;
 			}
 		}
-		n = uwait_safe(pl, ns, n, u->node);
+		n = uwait_safe(pl, ns, n, u->node, -1);
 		if (n < 0)
 			return 1;
 		ujournal_line(pl, "node=%d addr=%s:%d event=gated version=%s", u->node,
@@ -829,10 +962,22 @@ static int uroll(struct uplan *pl, int resume)
 static int urollback(struct uplan *pl)
 {
 	struct unode ns[UP_MAX_NODES];
-	int gated[UP_MAX_NODES], ng, done, n, i, peers;
+	struct uswitch sw[UP_MAX_NODES];
+	const struct uswitch *s;
+	int gated[UP_MAX_NODES], todo[2 * UP_MAX_NODES], ng, nsw, nt = 0, done, n, i, k, peers;
 
 	uabort_clear(pl);
 	ng = ujournal_gated(pl, gated, UP_MAX_NODES, &done);
+	nsw = ujournal_switched(pl, sw, UP_MAX_NODES);
+	/* the last rolled first: a switch no gate followed (a run that stopped), then the gated */
+	for (i = nsw - 1; i >= 0; i--) {
+		for (k = 0; k < ng && gated[k] != sw[i].node; k++)
+			;
+		if (sw[i].open && k == ng)
+			todo[nt++] = sw[i].node;
+	}
+	for (i = ng - 1; i >= 0; i--)
+		todo[nt++] = gated[i];
 	n = ufleet_read(ns, UP_MAX_NODES);
 	if (n <= 0) {
 		ujournal_line(pl, "stop reason=no-fleet");
@@ -851,22 +996,42 @@ static int urollback(struct uplan *pl)
 			return 1;
 		}
 	peers = n - 1;
-	ujournal_line(pl, "rollback nodes=%d (the last rolled first)", ng);
-	for (i = ng - 1; i >= 0; i--) {
-		struct unode *u = ufind(ns, n, gated[i]);
+	ujournal_line(pl, "rollback nodes=%d (the last rolled first)", nt);
+	for (i = 0; i < nt; i++) {
+		struct unode *u = ufind(ns, n, todo[i]);
 
 		if (!u || !u->reach) {
 			ujournal_line(pl, "stop reason=unreachable node=%d - resume the rollback when it is back",
-				gated[i]);
+				todo[i]);
 			return 1;
 		}
-		if (uwait_safe(pl, ns, n, u->node) < 0)
+		s = uswitch_find(sw, nsw, todo[i]);
+		if (s && s->open && u->pid == s->pid && !strcmp(u->ver, s->from)) {
+			ujournal_line(pl, "node=%d addr=%s:%d event=not-switched version=%s pid=%lld - "
+				"nothing to revert", u->node, u->addr, u->port, u->ver, u->pid);
+			continue;
+		}
+		if (uwait_safe(pl, ns, n, u->node, -1) < 0)
 			return 1;
-		u = ufind(ns, n, gated[i]);
+		u = ufind(ns, n, todo[i]);
+		if (!u)
+			return 1;
 		ujournal_line(pl, "node=%d addr=%s:%d event=reverting from=%s", u->node, u->addr,
 			u->port, u->ver);
 		if (urevert_node(pl, u, peers) != 0) {
 			ujournal_line(pl, "stop reason=node-%d-not-reverted - look at it now", u->node);
+			return 1;
+		}
+	}
+	/* done when every rolled node runs the build its switch left, not when the journal says so */
+	n = ufleet_read(ns, UP_MAX_NODES);
+	for (i = 0; i < nt; i++) {
+		struct unode *u = ufind(ns, n, todo[i]);
+
+		s = uswitch_find(sw, nsw, todo[i]);
+		if (s && s->from[0] && (!u || !u->reach || strcmp(u->ver, s->from))) {
+			ujournal_line(pl, "stop reason=node-%d-not-on-%s - it runs %s; look at it now",
+				todo[i], s->from, u && u->reach ? u->ver : "?");
 			return 1;
 		}
 	}

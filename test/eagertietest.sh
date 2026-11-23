@@ -120,7 +120,7 @@ EOF
 
 for n in 9 1 2; do
 	if [ $n = 9 ]; then "$BIN" -f "$D/n9.conf" > "$D/n9.log" 2>&1 &
-	elif [ $n = 1 ]; then LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut1" PC_NETCUT_LOG="$D/cutlog1" \
+	elif [ $n = 1 ]; then LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut1" PC_NETCUT_LOG="$D/cutlog1" \
 		"$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 	else "$BIN" -f "$D/n$n.conf" > "$D/n$n.log" 2>&1 &
 	fi

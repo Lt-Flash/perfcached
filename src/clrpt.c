@@ -17,6 +17,7 @@
 #include "clrpt.h"
 
 #define FRAME_MAX (HDR_LEN + MAX_DGRAM + 64)
+#define TX_PEEK_MS 1000                /* quiet this long: is the receiver still there? */
 
 static unsigned long long sent_frames, sent_bytes, fallbacks, connects,
 	connect_fail, lost_frames, rx_frames, rx_bytes, rx_accepts, rx_refused;
@@ -129,6 +130,22 @@ fail:
 	return -1;
 }
 
+/* the receiver sends nothing back: its close (idle, a restart) reads as EOF.  A new connection
+ * at once, not after CLRPT_RETRY_MS - nothing failed */
+static void tx_peek(struct tx *t)
+{
+	unsigned char c;
+	ssize_t r;
+
+	if (!t->up || t->qoff < t->qlen || mono_ms() - t->sent_ms < TX_PEEK_MS)
+		return;
+	r = recv(t->fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+	if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+		tx_close(t);
+		t->retry_ms = 0;
+	}
+}
+
 /* a connect in flight: finished yet? */
 static void tx_check(struct tx *t)
 {
@@ -178,11 +195,12 @@ int clrpt_send(const pc_addr *relay, const unsigned char *f, size_t n)
 
 	if (!t || n == 0 || n > FRAME_MAX)
 		goto fallback;
+	tx_peek(t);
 	if (t->fd < 0 && (mono_ms() < t->retry_ms || tx_connect(t) != 0))
 		goto fallback;
 	tx_check(t);
-	if (t->fd < 0)
-		goto fallback;
+	if (!t->up)
+		goto fallback;             /* not yet, or failed: nothing waits on a connect */
 	need = t->qlen - t->qoff + 4 + n;
 	if (need > qmax)
 		goto fallback;
@@ -215,6 +233,8 @@ int clrpt_send(const pc_addr *relay, const unsigned char *f, size_t n)
 	BUMP(sent_bytes, n);
 	t->sent_ms = mono_ms();
 	tx_write(t);
+	if (t->fd < 0)
+		goto fallback;             /* the connection broke: this frame went with it */
 	return 0;
 fallback:
 	BUMP(fallbacks, 1);

@@ -272,6 +272,60 @@ int main(void)
 		CHK(!strcmp(get(nw, "h-stale"), "v2"), "H4 and the new table holds it");
 	}
 
+	/* I: i-only lives in the drained table alone - written after the copier's
+	 * last pass over its bucket; i-both is in both */
+	old = pcache_htable_new(4);
+	nw = pcache_htable_new(6);
+	put(old, "i-only", "v", 0);
+	put(old, "i-both", "v", 0);
+	k = S("i-both");
+	pcache_ht_getver(old, &k, &vo);
+	{
+		str v = S("v");
+		unsigned long long dv = 0;
+
+		pcache_ht_store_copy(nw, &k, &v, 0, 0, vo, 0);
+		pcache_ht_set_drain(nw, old);
+		k = S("i-only");
+		pcache_ht_getver(old, &k, &vo);
+		CHK(pcache_ht_remove_ver(nw, &k, &dv) == 1,
+			"I1 a delete of a key only the drained table holds answers 1 - the WAL delete and the tombstone hang on it");
+		CHK(dv > vo, "I2 and its version outranks the drained copy's (%llu over %llu)", dv, vo);
+		CHK(!strcmp(get(nw, "i-only"), "") && !strcmp(get(old, "i-only"), ""),
+			"I3 the key reads absent, and the drained table no longer holds it");
+		k = S("i-both");
+		CHK(pcache_ht_remove(nw, &k) == 1 && !strcmp(get(old, "i-both"), "") &&
+			!strcmp(get(nw, "i-both"), ""), "I4 a key in both tables leaves both");
+		CHK(pcache_ht_remove(nw, &k) == 0, "I5 and a second delete answers 0");
+		pcache_ht_set_drain(nw, NULL);
+	}
+
+	/* J: j-over was copied before the swap, then overwritten with a short TTL
+	 * in the table the swap retires - that newer copy expires first */
+	old = pcache_htable_new(4);
+	nw = pcache_htable_new(6);
+	now = get_ticks();
+	put(old, "j-over", "a", 0);
+	k = S("j-over");
+	pcache_ht_getver(old, &k, &vo);
+	{
+		str v = S("a");
+
+		pcache_ht_store_copy(nw, &k, &v, 0, 0, vo, 0);
+	}
+	put(old, "j-over", "b", now + 1);
+	pcache_ht_set_drain(nw, old);
+	CHK(!strcmp(get(nw, "j-over"), "b"), "J1 before the expiry the newer copy answers");
+	for (i = 0; i < 40 && get_ticks() <= now + 1; i++)
+		usleep(100000);
+	CHK(!strcmp(get(nw, "j-over"), ""),
+		"J2 after it the key reads absent - not the older copy the overwrite replaced (read \"%s\")",
+		get(nw, "j-over"));
+	CHK(pcache_ht_getver(nw, &k, &vn) == -2, "J3 nor does its version");
+	CHK(pcache_ht_add(nw, &k, 1, 0, &nv) == 0 && nv == 1,
+		"J4 and an add starts from nothing (%lld; the older \"a\" would refuse it)", nv);
+	pcache_ht_set_drain(nw, NULL);
+
 	printf("draincarrytest: %s\n", fails ? "FAILED" : "all ok");
 	return fails ? 1 : 0;
 }

@@ -26,6 +26,7 @@ const char *jp_strerror(int rc)
 	case PC_JP_E_DOC:     return "stored value is not JSON";
 	case PC_JP_E_NOLEAF:  return "no value at path";
 	case PC_JP_E_EXISTS:  return "value exists (nx)";
+	case PC_JP_E_VAL:     return "new value is not valid JSON";
 	default:              return "json path error";
 	}
 }
@@ -86,6 +87,7 @@ int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 	return del_rc;
 }
 
+const char *wr_refused_msg(void) { return "refused"; }
 int pc_cluster_enabled(void) { return cl_on; }
 /* the pull for a read-through or spread JSON.GET - never taken here */
 int pc_jget_park(pcache_htable_t *ht, const char *key, size_t klen,
@@ -265,16 +267,27 @@ int main(void)
 	RUN(rh_json, "JSON.NUMINCRBY", "k", "$.n");
 	CHK(is("-ERR wrong number of arguments for this JSON command\r\n"), "D: the arity");
 
-	/* E: JSON.ARRAPPEND - a core call per value, the last count answered; an error stops it */
+	/* E: JSON.ARRAPPEND - every value validated first, then one core call with them joined, so
+	 * the append is all or nothing; the count answered */
 	answer(0, NULL, NULL);
+	ans.cnt = 3;
 	RUN(rh_json, "JSON.ARRAPPEND", "k", "$.a", "1", "2", "3");
-	CHK(is("*1\r\n:3\r\n") && got.calls == 3 && got.op == PC_JOP_APPEND &&
-		!strcmp(got.val, "3"), "E: three values, three calls, the last count - in an array on $");
-	RUN(rh_json, "JSON.ARRAPPEND", "k", ".a", "1", "2");
-	CHK(is(":2\r\n"), "E: legacy - the count bare");
-	ans.fail_at = 2;
+	CHK(is("*1\r\n:3\r\n") && got.calls == 1 && got.op == PC_JOP_APPEND &&
+		!strcmp(got.val, "1,2,3") && got.by == 3,
+		"E: three values, one call with the three joined, the count - in an array on $");
+	ans.cnt = 2;
+	RUN(rh_json, "JSON.ARRAPPEND", "k", ".a", "1", "{\"b\":[2]}");
+	CHK(is(":2\r\n") && got.calls == 1 && !strcmp(got.val, "1,{\"b\":[2]}"),
+		"E: legacy - the count bare");
+	RUN(rh_json, "JSON.ARRAPPEND", "k", "$.a", "1", "2", "oops");
+	CHK(is("-ERR new value is not valid JSON\r\n") && got.calls == 0,
+		"E: a value that is not JSON - refused before anything is appended");
+	RUN(rh_json, "JSON.ARRAPPEND", "k", "$.a", "1,2");
+	CHK(is("-ERR new value is not valid JSON\r\n") && got.calls == 0,
+		"E: one argument holding two values is not one value");
+	ans.fail_at = 1;
 	RUN(rh_json, "JSON.ARRAPPEND", "k", "$.a", "1", "2", "3");
-	CHK(is("-ERR array append failed\r\n") && got.calls == 2, "E: an error stops it");
+	CHK(is("-ERR array append failed\r\n") && got.calls == 1, "E: the core's error answered");
 
 	/* F: JSON.DEL - a document's root via the delete core, a plain string WRONGTYPE, a path */
 	answer(0, NULL, NULL);
@@ -299,6 +312,23 @@ int main(void)
 	answer(1, NULL, NULL);
 	RUN(rh_json, "JSON.DEL", "k", "$.a");
 	CHK(is(":0\r\n"), "F: an absent path - 0");
+
+	/* E: a JSON.SET TTL the 32-bit expiry cannot hold is refused */
+	answer(0, NULL, NULL);
+	got.calls = 0;
+	RUN(rh_json, "JSON.SET", "k", "$", "1", "EX", "4294967296");
+	CHK(is("-ERR invalid expire time in 'json.set' command\r\n") && got.calls == 0,
+		"E: JSON.SET EX 2^32 - invalid expire time, the core not called");
+
+	/* F: a refused delete of the root answers the refusal, not :0 (no such key) */
+	flags = PCACHE_F_JSON;
+	del_rc = PC_OP_ERR_WRFAIL;
+	RUN(rh_json, "JSON.DEL", "k");
+	CHK(is("-ERR refused\r\n"), "F: the root on a node refusing writes - the refusal");
+	del_rc = PC_OP_ERR_BUSY;
+	RUN(rh_json, "JSON.DEL", "k");
+	CHK(is("-TRYAGAIN cluster busy, retry\r\n"), "F: on a busy fleet - TRYAGAIN");
+	del_rc = PC_OP_OK;
 
 	/* G: a key another node holds is refused by name, the core never called */
 	answer(0, "1", NULL);
@@ -337,6 +367,114 @@ int main(void)
 	CHK(is("-WRONGTYPE the value at this key is not a JSON document\r\n"), "H: a value that is not JSON");
 	RUN(rh_json_debug, "JSON.DEBUG", "BOGUS");
 	CHK(is("-ERR JSON.DEBUG: use HELP or MEMORY <key> [path]\r\n"), "H: anything else refused");
+
+	/* I: the path layer it links - NX and XX hold at the root (an absent key's document
+	 * comes in empty): no replacing a document under NX, no creating one under XX */
+	{
+		char jo[64];
+
+		CHK(pc_jp_set("{\"a\":1}", 7, "$", 1, "{}", 2, 1, 0, 0, jo, sizeof jo) ==
+			PC_JP_E_EXISTS, "I: SET $ NX over a document - exists");
+		CHK(pc_jp_set("", 0, "$", 1, "{}", 2, 0, 1, 0, jo, sizeof jo) == PC_JP_E_NOLEAF,
+			"I: SET $ XX with no document - no leaf");
+		CHK(pc_jp_set("", 0, "$", 1, "{}", 2, 1, 0, 0, jo, sizeof jo) == 2,
+			"I: SET $ NX with no document - created");
+		CHK(pc_jp_set("{\"a\":1}", 7, "$", 1, "{}", 2, 0, 1, 0, jo, sizeof jo) == 2,
+			"I: SET $ XX over a document - replaced");
+	}
+
+	/* J: the validator holds the door - exactly one JSON value, structure included: separators
+	 * in their places, the eight escapes, four hex digits after \u */
+	{
+		static const char *const nope[] = { "[1 2]", "[,1,]", "[1,]", "{\"a\" 1}",
+			"{\"a\":}", "{\"a\":1,}", "[\"k\":\"v\"]", "\"\\q\"", "\"\\uZZZZ\"",
+			"\"\\u12\"", "{,}", "[}", "{\"a\":1]", "{1:2}", "{\"a\",\"b\"}", "[1]]",
+			"\"a\tb\"", "[1,,2]", "{\"a\":1 \"b\":2}" };
+		static const char *const yes[] = { "{\"a\":[1,2,{\"b\":null}],\"c\":\"x\\\"\\\\\\u00e9\\/\"}",
+			"[]", "{}", " 1 ", "\"s\"", "-0.5e+3", "[[[]]]", "{\"a\":{}}", "true",
+			"[ 1 , { \"k\" : [ ] } ]\n" };
+		char jo[64];
+		size_t i;
+		int all = 1;
+
+		for (i = 0; i < sizeof nope / sizeof nope[0]; i++)
+			if (pc_jp_valid_value(nope[i], strlen(nope[i]))) {
+				all = 0;
+				printf("    taken: %s\n", nope[i]);
+			}
+		CHK(all, "J: text that is not one JSON value is refused (%zu shapes)",
+			sizeof nope / sizeof nope[0]);
+		all = 1;
+		for (i = 0; i < sizeof yes / sizeof yes[0]; i++)
+			if (!pc_jp_valid_value(yes[i], strlen(yes[i]))) {
+				all = 0;
+				printf("    refused: %s\n", yes[i]);
+			}
+		CHK(all, "J: well-formed values are taken (%zu shapes)", sizeof yes / sizeof yes[0]);
+		CHK(pc_jp_set("{}", 2, "$", 1, "{\"a\" 1,}", 8, 0, 0, 0, jo, sizeof jo) ==
+			PC_JP_E_VAL, "J: SET $ of {\"a\" 1,} - not valid JSON");
+		CHK(pc_jp_append("[1]", 3, "$", 1, "[1 2]", 5, 1, NULL, jo, sizeof jo) ==
+			PC_JP_E_VAL, "J: ARRAPPEND of [1 2] - not valid JSON");
+	}
+
+	/* K: every edit is bounded by PC_JP_MAX - a new member and a created path too, or a
+	 * document grows past what a replace, an increment or a delete will then write */
+	{
+		size_t cap = 300000, vl = 70000;
+		char *big = malloc(vl), *jo = malloc(cap);
+
+		if (!big || !jo) {
+			CHK(0, "K: out of memory in the test");
+		} else {
+			memset(big, 'a', vl);
+			big[0] = big[vl - 1] = '"';
+			CHK(pc_jp_set("{}", 2, "$.blob", 6, big, vl, 0, 0, 0, jo, cap) == PC_JP_E_SIZE,
+				"K: a new member past PC_JP_MAX - too large");
+			CHK(pc_jp_set("{}", 2, "$.a.b", 5, big, vl, 0, 0, 1, jo, cap) == PC_JP_E_SIZE,
+				"K: a created path past PC_JP_MAX - too large");
+			big[60000 - 1] = '"';
+			CHK(pc_jp_set("{}", 2, "$.blob", 6, big, 60000, 0, 0, 0, jo, cap) == 60009,
+				"K: a new member under it is added");
+			CHK(pc_jp_set("{}", 2, "$.a.b", 5, big, 60000, 0, 0, 1, jo, cap) == 60012,
+				"K: a created path under it is made");
+		}
+		free(big);
+		free(jo);
+	}
+
+	/* L: NUMINCRBY - a stored number past int64, or a sum past it, is refused, not clamped
+	 * or wrapped into the document */
+	{
+		char jo[128];
+		long long r = 0;
+
+		CHK(pc_jp_incr("{\"n\":18446744073709551615}", 26, "$.n", 3, 1, &r, jo, sizeof jo) ==
+			PC_JP_E_NUM, "L: a stored number past int64 - not a number it can add to");
+		CHK(pc_jp_incr("{\"n\":9223372036854775807}", 25, "$.n", 3, 1, &r, jo, sizeof jo) ==
+			PC_JP_E_NUM, "L: LLONG_MAX + 1 - refused");
+		CHK(pc_jp_incr("{\"n\":-9223372036854775808}", 26, "$.n", 3, -1, &r, jo,
+			sizeof jo) == PC_JP_E_NUM, "L: LLONG_MIN - 1 - refused");
+		CHK(pc_jp_incr("{\"n\":5}", 7, "$.n", 3, 2, &r, jo, sizeof jo) == 7 && r == 7 &&
+			!memcmp(jo, "{\"n\":7}", 7), "L: 5 + 2 - 7, written back");
+	}
+
+	/* M: the path layer appends several values at once - joined by commas, each one value */
+	{
+		char jo[64];
+		int cnt = 0;
+
+		CHK(pc_jp_append("{\"a\":[0]}", 9, "$.a", 3, "1,\"x\",[2]", 9, 3, &cnt, jo, sizeof jo) ==
+			19 && cnt == 4 && !memcmp(jo, "{\"a\":[0,1,\"x\",[2]]}", 19),
+			"M: three values joined - appended in one splice, four elements");
+		CHK(pc_jp_append("[]", 2, "$", 1, "1,2", 3, 2, &cnt, jo, sizeof jo) == 5 && cnt == 2 &&
+			!memcmp(jo, "[1,2]", 5), "M: two values into an empty array");
+		CHK(pc_jp_append("[]", 2, "$", 1, "1,2", 3, 1, &cnt, jo, sizeof jo) == PC_JP_E_VAL,
+			"M: two values where one is said - not valid");
+		CHK(pc_jp_append("[]", 2, "$", 1, "1,,2", 4, 2, &cnt, jo, sizeof jo) == PC_JP_E_VAL &&
+			pc_jp_append("[]", 2, "$", 1, "1],[2", 5, 2, &cnt, jo, sizeof jo) == PC_JP_E_VAL &&
+			pc_jp_append("[]", 2, "$", 1, "1,2,3", 5, 2, &cnt, jo, sizeof jo) == PC_JP_E_VAL,
+			"M: an empty element, a bracket out of place, a count that disagrees - not valid");
+	}
 
 	printf("respjsontest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

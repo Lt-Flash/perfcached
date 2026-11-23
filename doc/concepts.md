@@ -122,6 +122,11 @@ and `copies` how many copies the mode keeps: `1`, the copy factor K,
 | `shard` | its slice is out of reach until it returns | the keys it owns wait for it |
 | `proxy` | its keys are out of reach until it returns | the keys it holds wait for it |
 
+A read another node must answer and does not within `pull_timeout_ms` (it is slow, frozen,
+or gone and not yet dropped from the fleet) is refused as retryable, never answered absent:
+RESP `-TRYAGAIN`, the native door's "cluster busy", `PERFD_E_REFUSED` in libperfd (0.7.5.1).
+Once a dead node is dropped, the reads it alone could answer are misses.
+
 **A split.**  Both sides keep serving and taking writes: the fleet
 favours availability, and no side waits for a majority.  On the heal
 one master remains, the newer version of each key wins, and the deletes

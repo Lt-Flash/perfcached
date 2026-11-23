@@ -33,10 +33,11 @@ int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 		const char *val, size_t vlen, int nx, int xx, int mkpath,
 		char *out, size_t cap);
 
-/* append @val to the ARRAY at @path (jarrappend).  Returns the new
- * document length, *count_out = elements after the append. */
+/* append @val to the ARRAY at @path (jarrappend); with @nvals > 1, @val is that many values
+ * joined by commas, appended at once.  Returns the new document length, *count_out = elements
+ * after the append. */
 int pc_jp_append(const char *doc, size_t dlen, const char *path,
-		size_t plen, const char *val, size_t vlen, int *count_out,
+		size_t plen, const char *val, size_t vlen, int nvals, int *count_out,
 		char *out, size_t cap);
 
 /* delete the leaf at @path (root is not deletable here - use del) */

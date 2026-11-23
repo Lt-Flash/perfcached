@@ -31,6 +31,9 @@ int cl_master_id(void);
 const char *cl_state_dir(void);       /* "" = none */
 int cl_map_usable(void);
 const struct pc_clmap *cl_map(void);
+/* cl_map()'s write generation, odd while the peer thread rewrites the map: a reader takes it before
+ * it reads the map and retries when it differs after */
+unsigned int cl_map_gen(void);
 pc_addr cl_self_addr(void);
 long long cl_now_ms(void);
 unsigned int cl_self_free_mb(void);
