@@ -51,7 +51,8 @@ CLI="$D/cli.py"
 cat > "$CLI" <<'EOF'
 import json, pcnative, socket, sys
 port = int(sys.argv[1])
-s = socket.create_connection(("127.0.0.1", port), timeout=8)
+# a probe makes at least 200 fsyncs: on a shared-storage stall that is seconds each
+s = socket.create_connection(("127.0.0.1", port), timeout=60)
 f = pcnative.wrap(s); rid = 0
 for line in sys.stdin:
     line = line.strip()
