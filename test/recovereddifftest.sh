@@ -3,7 +3,8 @@
 # or holds older, which no live peer authors, reach it without a read and without a cold restart.
 # Usage: test/recovereddifftest.sh [./perfcached]
 set -u
-PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
+T=$(cd "$(dirname "$0")" && pwd)
+PYTHONPATH=$T${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
@@ -71,7 +72,7 @@ waitfor() { w=0; while [ $w -lt $(($1 * 4)) ]; do eval "$2" && return 0; sleep 0
 ops() { python3 - "1698$1" "$2" "$3" "$4" "${5:-v}" <<'PY'
 import json, pcnative, socket, sys
 port, meth, pre, n, val = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
-s = socket.create_connection(("127.0.0.1", port), timeout=120); f = pcnative.wrap(s); got = 0
+s = socket.create_connection(("127.0.0.1", port), timeout=120); f = pcnative.wrap(s); got = 0; err = None
 for x in range(0, n, 200):
     rq = []
     for i in range(x, min(n, x + 200)):
@@ -81,8 +82,13 @@ for x in range(0, n, 200):
         rq.append(json.dumps({"jsonrpc": "2.0", "id": i, "method": meth, "params": p}))
     f.write(("\n".join(rq) + "\n").encode()); f.flush()
     for _ in rq:
-        r = next(_m for _m in iter(lambda: json.loads(f.readline()), None) if "id" in _m).get("result") or {}
+        m = next(_m for _m in iter(lambda: json.loads(f.readline()), None) if "id" in _m)
+        r = m.get("result") or {}
         got += 1 if (r.get("stored") or r.get("value") == val) else 0
+        if "error" in m and not err:
+            err = m["error"].get("message")
+if err:
+    sys.stderr.write("  ..   node on %d: first refusal: %s\n" % (port, err))
 print(got)
 PY
 }
@@ -94,6 +100,8 @@ for n in 1 2 3; do conf $n; done
 start 1 && start 2 && start 3 || exit 1
 waitfor 30 '[ "$(st 1 "r[\"cluster\"][\"peers_up\"]")$(st 2 "r[\"cluster\"][\"peers_up\"]")$(st 3 "r[\"cluster\"][\"peers_up\"]")" = 222 ]' \
 	|| { bad "the fleet did not form"; exit 1; }
+# formed is not ready: a node still RECOVERING refuses data verbs (waitready.py)
+python3 "$T/waitready.py" 127.0.0.1:16981 127.0.0.1:16982 127.0.0.1:16983 -t 30 || { bad "a node is not ready"; exit 1; }
 [ "$(ops 1 set k 200)" = 200 ] && [ "$(ops 1 set o 50 old)" = 50 ] && ok "250 keys written on node 1" || bad "the first writes were not all stored"
 waitfor 30 '[ "$(ent 3)" = 250 ]' && ok "node 3 holds all 250" || bad "node 3 holds $(ent 3) of 250"
 sleep 2                                   # node 3's WAL synced (fsync = everysec)
@@ -107,6 +115,8 @@ waitfor 30 '[ "$(ent 1)" = 550 ]' && ok "node 1 holds 550" || bad "node 1 holds 
 stop 2 TERM
 
 start 3 || exit 1
+python3 "$T/waitready.py" 127.0.0.1:16981 127.0.0.1:16983 -t 30 || bad "node 1 or 3 not ready after the restart"
+waitfor 15 'grep -q "node .* restarted holding .* recovered" "$D/n1.log"'
 grep -q "node .* restarted holding .* recovered" "$D/n1.log" && ok "node 1 saw node 3 restart RECOVERED (from its WAL)" \
 	|| bad "node 1 never saw a recovered restart: $(grep 'node .* restarted\|started cold' "$D/n1.log" | tail -1)"
 # counted before any read: a read of a key it lacks would pull it

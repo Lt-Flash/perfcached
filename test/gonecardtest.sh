@@ -29,7 +29,6 @@ enable = g-enable-secret
 [listen]
 tcp = 127.0.0.1:$2
 http = 127.0.0.1:$3
-plaintext = loopback
 [cluster]
 multicast = 239.255.77.52:17152
 advertise = 127.0.1.3$1
@@ -149,10 +148,10 @@ for nid, how in ((peer, "goodbye"), (lost, "silent")):
     t = al.get("fleet.node%d" % nid, {}).get("text", "none")
     (ok if "forget %d" % nid in t else bad)("T593: the %s member's warning names forget %d (%s)" % (how, nid, t))
 r = call({"method": "forget", "params": {"node": peer}})
-(ok if "_err" in r and "forgotten" not in r else bad)("T593: forget without the enable secret is refused (%s)" % str(r)[:80])
+(ok if "privilege" in r.get("_err", "") else bad)("T593: forget without the enable secret is refused for privilege (%s)" % str(r)[:100])
 me = json.loads(urllib.request.urlopen("http://127.0.0.1:17721/stats", timeout=8).read())["cluster"]["node"]
 r = call({"method": "forget", "params": {"node": me}}, True)
-(ok if "_err" in r else bad)("T593: forget of this node itself is refused (%s)" % str(r)[:80])
+(ok if "this node" in r.get("_err", "") else bad)("T593: forget of this node itself is refused (%s)" % str(r)[:100])
 r = call({"method": "forget", "params": {"node": peer}}, True)
 (ok if r.get("forgotten") == peer else bad)("T593: forget %d answers forgotten (%s)" % (peer, str(r)[:80]))
 gone = until(lambda: peer not in members() and "fleet.node%d" % peer not in alerts(), 10)
@@ -164,7 +163,7 @@ time.sleep(3)
 (ok if "fleet.missing" not in alerts() else bad)(
     "T593: the fleet is one smaller, not one missing (%s)" % alerts().get("fleet.missing", {}).get("text", "none"))
 r = call({"method": "forget", "params": {"node": peer}}, True)
-(ok if "_err" in r else bad)("T593: a second forget is refused - nothing holds the id (%s)" % str(r)[:80])
+(ok if "no departed member" in r.get("_err", "") else bad)("T593: a second forget is refused - nothing holds the id (%s)" % str(r)[:100])
 
 # and every state a node CAN be in carries its reason, not just FAILED
 st = json.loads(urllib.request.urlopen(

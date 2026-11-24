@@ -39,6 +39,23 @@
           there; the card and the warning go and the fleet's size drops
           by one, so fleet.missing does not take over.  A member still
           listed is refused.  The warning's text names the command.
+        * [durability] [wal] fsync = sync: the pump syncs as under
+          always, and a write's reply leaves only once the device has
+          synced its record, so an OK means on disk.  Under the other
+          policies a write is still acknowledged at the log's ring, and
+          a kill -9 loses what the ring held.  Replies pipelined behind
+          a write wait with it; other connections are not held.  Each
+          write's reply waits for one fdatasync; many clients share
+          each sync.  Only the node that logs a write holds its reply.
+          /stats wal.sync_held, sync_holds and sync_hold_ms.
+        * [durability] A new WAL segment, a retired one and the
+          collections file are now followed by a sync of their
+          directory, so a power loss cannot leave the old directory
+          entry behind a file whose data was synced.  A start that
+          restored nothing from its snapshot (every record expired)
+          after its log was lost numbered new writes below the
+          snapshot's marker, and a second unclean stop skipped them as
+          older than the snapshot; the sequence now resumes above it.
         * [alerts] A read-through upstream that refused connections was
           reported as "not a replica (ROLE) - not used (upstream_role =
           replica)", or as lagging, even with upstream_role = any; it now

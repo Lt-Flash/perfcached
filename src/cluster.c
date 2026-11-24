@@ -5747,8 +5747,9 @@ static void clmap_recheck_usable(void)
 		if (!id || id == C.node_id || !clpeers_live(p, now))
 			continue;
 		nd = pc_clmap_find(&C.map, (uint16_t)id);
-		/* a member that is not READY owns nothing: a map that leaves it out agrees */
-		if (p->nstate != PC_NST_READY && !pc_clmap_placeable(nd))
+		/* a FAILED or STALLED member owns nothing: a map that leaves it out agrees */
+		if ((p->nstate == PC_NST_FAILED || p->nstate == PC_NST_STALLED) &&
+		    !pc_clmap_placeable(nd))
 			continue;
 		live++;
 		if (pc_clmap_placeable(nd))

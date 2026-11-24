@@ -1326,7 +1326,13 @@ check-g-durability: check-edition-guard $(CHECK_BINS)
 	sh test/walprobetest.sh ./perfcached
 	sh test/waltest.sh ./perfcached
 	sh test/walmarktest.sh ./perfcached
+	# a start that restored nothing resumes the WAL sequence above the snapshot's marker
+	sh test/walmarkertest.sh ./perfcached
+	# a durable file's directory is synced: the WAL's new segments, the collections file
+	sh test/dirsynctest.sh ./perfcached ./syncfailshim.so ./perfcli
 	sh test/waldroptest.sh ./perfcached ./pcbench ./perfcli ./syncfailshim.so
+	# fsync = sync: a reply waits for its write's sync, on both doors, in order; always does not
+	sh test/walsynctest.sh ./perfcached ./syncfailshim.so
 	# a full log waits - no overwrite, no heal - and /stats answers while writers are held
 	sh test/walfulltest.sh ./perfcached ./pcbench ./perfcli ./syncfailshim.so
 	# the segments follow the load - grow under a fill, kept across a restart, given back when quiet

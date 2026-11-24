@@ -69,20 +69,28 @@ import socket, sys, pcnative
 i = int(sys.argv[1])
 f = pcnative.wrap(socket.create_connection(("127.0.149.%d" % i, 19440 + i), 10))
 n = 0
+err = None
 for k in range(10):
     key = "%s-%d" % (sys.argv[2], k)
     pcnative.call(f, "set", col="c", key=key, value="v")
-    n += 1 if (pcnative.call(f, "del", col="c", key=key).get("result") or {}).get("deleted") else 0
-print(n)
+    r = pcnative.call(f, "del", col="c", key=key)
+    n += 1 if (r.get("result") or {}).get("deleted") else 0
+    if "error" in r and not err:
+        err = r["error"].get("message")
+print(n if not err else "%d (first refusal: %s)" % (n, err))
 PY
 }
 both() { [ "$(cs 1 'c.get("peers_up")')" = 1 ] && [ "$(cs 2 'c.get("peers_up")')" = 1 ] &&
 	[ "$(cs 1 'c["acks"]["fleet"]["confirming"]')" = True ]; }
+# formed is not ready: a node still RECOVERING refuses data verbs
+ready() { python3 "$T/waitready.py" 127.0.149.1:19441 127.0.149.2:19442 -t 30; }
 waitfor() { w=0; while [ $w -lt $(($1 * 4)) ]; do eval "$2" && return 0; sleep 0.25; w=$((w+1)); done; return 1; }
 
 start 1 && start 2 || { echo "tombspacetest: $pass passed, $fail failed"; exit 1; }
 waitfor 20 both || { bad "the pair did not form and confirm: $(cs 1 'c.get("acks")')"; exit 1; }
-[ "$(dels 1 a)" = 10 ] && [ "$(dels 2 b0)" = 10 ] && ok "deletes numbered on both nodes" || bad "the deletes were not all applied"
+ready || { bad "a node is not ready"; exit 1; }
+d1=$(dels 1 a) d2=$(dels 2 b0)
+[ "$d1" = 10 ] && [ "$d2" = 10 ] && ok "deletes numbered on both nodes" || bad "the deletes were not all applied: node 1 $d1, node 2 $d2"
 
 # five restarts of node 2, each run numbering its own deletes: a new space on both nodes each time
 peak=0
@@ -90,7 +98,8 @@ for r in 1 2 3 4 5; do
 	kill -TERM $P2; wait $P2 2>/dev/null; P2=
 	start 2 || break
 	waitfor 20 both || bad "restart $r: the pair did not confirm again"
-	dels 2 "b$r" > /dev/null
+	ready || bad "restart $r: a node is not ready"
+	d=$(dels 2 "b$r"); [ "$d" = 10 ] || bad "restart $r: node 2's deletes: $d of 10"
 	waitfor 5 '[ "$(cs 1 "c[\"acks\"][\"applied\"]")" -ge $((20 + r * 10)) ]'
 	s=$(cs 1 'c["acks"]["spaces"]'); [ "${s:-0}" -gt $peak ] && peak=$s
 done
@@ -107,8 +116,8 @@ grep -q "numbering space(s) of runs that are over forgotten" "$D/n1.log" && ok "
 
 # and they stay gone over one more restart: node 2's WAL replay brings back nothing for good
 kill -TERM $P2; wait $P2 2>/dev/null; P2=
-start 2 && waitfor 20 both
-dels 2 b9 > /dev/null
+start 2 && waitfor 20 both && ready
+d=$(dels 2 b9); [ "$d" = 10 ] || bad "after one restart more: node 2's deletes: $d of 10"
 waitfor $((RETAIN + 30)) '[ "$(cs 1 "c[\"acks\"][\"spaces\"]")" -le 2 ] && [ "$(cs 2 "c[\"acks\"][\"spaces\"]")" -le 2 ]'
 s1=$(cs 1 'c["acks"]["spaces"]') s2=$(cs 2 'c["acks"]["spaces"]')
 [ "${s1:-9}" -le 2 ] && [ "${s2:-9}" -le 2 ] && ok "one restart more: still bounded (node 1 $s1, node 2 $s2)" \
