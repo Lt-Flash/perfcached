@@ -127,12 +127,13 @@ grep -q "node .* restarted holding .* recovered" "$D/n1.log" && ok "node 1 saw n
 waitfor 60 '[ "$(ent 3)" = 570 ]'
 [ "$(ent 3)" = 570 ] && ok "node 3 holds all 570 without a read - the 300 it lacked came by the diff" \
 	|| bad "node 3 holds $(ent 3) of node 1's $(ent 1) after 60 s: the copies it lacked never came"
-r=$(ops 3 get o 50 new)
-[ "$r" = 50 ] && ok "node 3 reads the 50 new values (a hit answers locally)" || bad "node 3 reads $r of the 50 new values - the rest its older copies"
 # a round a sweep turn (10 s): ask, walk, ask again and find every slot equal
 waitfor 60 'grep -q "diff sync with node [0-9]* done" "$D/n1.log"'
 grep -q "diff sync with node [0-9]* done" "$D/n1.log" && ok "node 1 logs the diff's end: $(grep -o 'diff sync with node [0-9]* done[^)]*)' "$D/n1.log" | head -1)" \
 	|| bad "no 'diff sync ... done' on node 1: $(grep 'diff sync' "$D/n1.log" | tail -1)"
+# the values once the diff is done: the missing keys can land before the newer copies
+r=$(ops 3 get o 50 new)
+[ "$r" = 50 ] && ok "node 3 reads the 50 new values (a hit answers locally)" || bad "node 3 reads $r of the 50 new values - the rest its older copies"
 e=$(cat "$D"/n*.log | grep -E ' (ERROR|CRIT)' | grep -cv 'an fsync has been stuck')
 [ "$e" = 0 ] && ok "no ERROR/CRIT" || { bad "$e ERROR/CRIT lines"; cat "$D"/n*.log | grep -E ' (ERROR|CRIT)' | sort | uniq -c | head -5; }
 for n in 1 3; do stop $n TERM; done

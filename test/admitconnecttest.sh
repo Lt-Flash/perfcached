@@ -128,7 +128,8 @@ wait_for 40 '[ "$(master_of $OTHERS)" != 0 ]' && NM=$(master_of $OTHERS) || NM=0
 	|| bad "4. new master $NM, node 5 role $(role 5): $(grep -E 'elected master|founded' "$D/n5.log" | head -1)"
 wait_for 30 '[ "$(stuck $NM)" = 1 ]' && [ "$(state 5)" = connecting ] \
 	&& ok "4. node $NM checked node 5 again and holds it" \
-	|| bad "4. node $NM admission_stuck $(stuck $NM), node 5 $(state 5)"
+	|| { bad "4. node $NM admission_stuck $(stuck $NM), node 5 $(state 5)"
+	echo "  ..   node $NM: $(grep -E 'admission|ONLINE|CONNECTING|link check|master' "$D/n$NM.log" | tail -8 | tr '\n' '|' | cut -c1-900)"; }
 
 echo "--- 5: the cut healed"
 : > "$D/cut$X"; : > "$D/cut5"
