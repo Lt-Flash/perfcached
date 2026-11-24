@@ -103,7 +103,9 @@ waitfor 30 '[ "$(st 1 "r[\"cluster\"][\"peers_up\"]")$(st 2 "r[\"cluster\"][\"pe
 # formed is not ready: a node still RECOVERING refuses data verbs (waitready.py)
 python3 "$T/waitready.py" 127.0.0.1:16981 127.0.0.1:16982 127.0.0.1:16983 -t 30 || { bad "a node is not ready"; exit 1; }
 [ "$(ops 1 set k 200)" = 200 ] && [ "$(ops 1 set o 50 old)" = 50 ] && ok "250 keys written on node 1" || bad "the first writes were not all stored"
-waitfor 30 '[ "$(ent 3)" = 250 ]' && ok "node 3 holds all 250" || bad "node 3 holds $(ent 3) of 250"
+# a copy lands off its holder's WAL (its author persists it): node 3 restarts RECOVERED only from writes it took
+[ "$(ops 3 set m 20)" = 20 ] && ok "20 keys written on node 3 - its own, in its WAL" || bad "node 3's own writes were not all stored"
+waitfor 30 '[ "$(ent 3)" = 270 ]' && ok "node 3 holds all 270" || bad "node 3 holds $(ent 3) of 270"
 sleep 2                                   # node 3's WAL synced (fsync = everysec)
 
 # node 3 down; node 2 writes 300 new keys and overwrites 50; node 2 then leaves for good, so on node 1
@@ -111,7 +113,7 @@ sleep 2                                   # node 3's WAL synced (fsync = everyse
 stop 3 9
 [ "$(ops 2 set n 300)" = 300 ] && [ "$(ops 2 set o 50 new)" = 50 ] && ok "while node 3 was down: 300 new keys and 50 overwrites through node 2" \
 	|| bad "node 2's writes were not all stored"
-waitfor 30 '[ "$(ent 1)" = 550 ]' && ok "node 1 holds 550" || bad "node 1 holds $(ent 1) of 550"
+waitfor 30 '[ "$(ent 1)" = 570 ]' && ok "node 1 holds 570" || bad "node 1 holds $(ent 1) of 570"
 stop 2 TERM
 
 start 3 || exit 1
@@ -122,8 +124,8 @@ grep -q "node .* restarted holding .* recovered" "$D/n1.log" && ok "node 1 saw n
 	echo "  ..   node 3: $(grep -E 'recover:|wal:' "$D/n3.log" | tr '\n' ' ' | cut -c1-600)"
 	echo "  ..   node 3's WAL: $(ls -l "$D/s3/wal" | tr '\n' ' ' | cut -c1-400)"; }
 # counted before any read: a read of a key it lacks would pull it
-waitfor 60 '[ "$(ent 3)" = 550 ]'
-[ "$(ent 3)" = 550 ] && ok "node 3 holds all 550 without a read - the 300 it lacked came by the diff" \
+waitfor 60 '[ "$(ent 3)" = 570 ]'
+[ "$(ent 3)" = 570 ] && ok "node 3 holds all 570 without a read - the 300 it lacked came by the diff" \
 	|| bad "node 3 holds $(ent 3) of node 1's $(ent 1) after 60 s: the copies it lacked never came"
 r=$(ops 3 get o 50 new)
 [ "$r" = 50 ] && ok "node 3 reads the 50 new values (a hit answers locally)" || bad "node 3 reads $r of the 50 new values - the rest its older copies"

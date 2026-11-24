@@ -25,6 +25,7 @@ cat > "$D/n.conf" <<EOF
 workers = 2
 log_level = info
 state_dir = $D/state
+allow_create = yes
 [memory]
 arena_mb = 64
 [secrets]
