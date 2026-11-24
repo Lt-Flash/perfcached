@@ -149,7 +149,8 @@ static int raise_privilege(void)
 static int unsafe_twice(const char *m)
 {
 	static const char *const once[] = { "fleetstop", "create", "drop",
-		"rename", "resize", "restore", "mailtest", "map", "unmap", NULL };
+		"rename", "resize", "restore", "mailtest", "map", "unmap", "forget",
+		NULL };
 	int i;
 
 	for (i = 0; once[i]; i++)
@@ -558,6 +559,11 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		pc_jw_lit(&w, "{\"timeout_ms\":");
 		pc_jw_i64(&w, atoll(argv[1]));
 		pc_jw_lit(&w, "}");
+	} else if (!strcmp(m, "forget")) {
+		NEED(1);
+		pc_jw_lit(&w, "{\"node\":");
+		pc_jw_i64(&w, atoll(argv[1]));
+		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "master_prefer")) {
 		NEED(1);
 		pc_jw_lit(&w, "{\"node\":");
@@ -800,6 +806,8 @@ static int build(char *out, size_t cap, int argc, char **argv)
 	  "      last, after waiting up to timeout_ms (30000) for its\n"
 	  "      peers: stopped (said goodbye), still_up, or lost (left\n"
 	  "      without a goodbye)\n"
+	  "  forget <node> - a member removed for good: its reserved id\n"
+	  "      released on this node (run it on each); needs -E\n"
 	  "  master_prefer <node> - on the master: hand mastership to that\n"
 	  "      member once it is the synced standby; needs -E.\n"
 	  "      master_auto cancels one not yet taken\n"

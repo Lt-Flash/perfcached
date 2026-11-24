@@ -11,6 +11,7 @@
 #define APOOL_MAX_CONNS   1024
 #define APOOL_BACKOFF_MIN 1000
 #define APOOL_BACKOFF_MAX 30000
+#define APOOL_DIAL_WAIT_MS 500     /* dial_wait_ms 0: a get waits this long for a dial */
 
 struct pd_aslot {
 	perfd_t *pd;                   /* READY once warmed; NULL = a hole */
@@ -22,6 +23,8 @@ struct pd_aslot {
 	int dead;                      /* cancelled: rebuilt at the next get, never reused */
 	unsigned int seq, fired_seq;   /* which request's callback ran last */
 	long long used_ms;             /* the eviction picks the least recently used */
+	long long dial_ms;             /* still connecting since, 0 = settled */
+	int seed;                      /* the seed a "" dial went to, -1 = none */
 };
 
 struct perfd_apool {
@@ -33,6 +36,11 @@ struct perfd_apool {
 	char seed_host[APOOL_MAX_SEEDS][256];
 	int seed_port[APOOL_MAX_SEEDS];
 	unsigned char seed_said[APOOL_MAX_SEEDS];   /* its failure logged this outage */
+	unsigned char seed_pend[APOOL_MAX_SEEDS];   /* a dial to it still connecting */
+	long long seed_hold[APOOL_MAX_SEEDS];       /* skipped until then: it failed */
+	int seed_back[APOOL_MAX_SEEDS];
+	long long router_dial_ms;      /* the router still connecting since */
+	int router_seed;
 	int nseeds;
 	int route;                     /* opts.route_keys */
 	perfd_t *router;               /* learns the fleet for the owner lookup */
@@ -46,6 +54,16 @@ struct perfd_apool {
 static int apool_connect_ms(const perfd_apool *pool)
 {
 	return pool->o.connect_timeout_ms > 0 ? pool->o.connect_timeout_ms : DEF_TIMEOUT_MS;
+}
+
+/* how long a get waits on a dial: dial_wait_ms, never past connect_timeout */
+static int apool_wait_ms(const perfd_apool *pool)
+{
+	int c = apool_connect_ms(pool), w = pool->o.dial_wait_ms;
+
+	if (w < 0 || (w > 0 && w > c))
+		return c;
+	return w ? w : (APOOL_DIAL_WAIT_MS < c ? APOOL_DIAL_WAIT_MS : c);
 }
 
 /* turn @pd's socket until @done or @deadline; 0 done, -1 failed or late */
@@ -108,55 +126,148 @@ static void apool_dial_result(perfd_apool *pool, int ok)
 	pool->next_dial_ms = now_ms_lib() + pool->backoff_ms;
 }
 
-/* an async handle READY within connect_timeout, or NULL with the reason in perfd_error(NULL) */
-static perfd_t *apool_dial_one(perfd_apool *pool, const char *host, int port,
-		const perfd_opts *o)
+static void apool_seed_ok(perfd_apool *pool, int i)
 {
-	perfd_t *pd = perfd_connect_async(host, port, o);
-	int ms = apool_connect_ms(pool);
-
-	pool->st.dials++;
-	if (!pd)
-		return NULL;
-	if (apool_drive(pd, now_ms_lib() + ms, apool_not_connecting, NULL) < 0 ||
-	    perfd_state(pd) != PERFD_ST_READY) {
-		if (perfd_error_kind(pd) != PERFD_E_NONE)
-			errk(NULL, perfd_error_kind(pd), "%s:%d: %s", host, port, perfd_error(pd));
-		else
-			errk(NULL, PERFD_E_TRANSPORT, "%s:%d: not ready within %d ms", host, port, ms);
-		perfd_free(pd);
-		return NULL;
-	}
-	return pd;
+	if (i < 0)
+		return;
+	pool->seed_pend[i] = 0;
+	pool->seed_back[i] = 0;
+	pool->seed_hold[i] = 0;
+	pool->seed_said[i] = 0;
 }
 
-/* the seeds from a start rotated by the pid, so a pre-forked server's processes spread */
-static perfd_t *apool_dial_seeds(perfd_apool *pool, const perfd_opts *o)
+static void apool_seed_fail(perfd_apool *pool, int i)
 {
-	int start = (int)(getpid() % pool->nseeds), k;
+	if (i < 0)
+		return;
+	pool->seed_pend[i] = 0;
+	pool->seed_back[i] = pool->seed_back[i] ? pool->seed_back[i] * 2 : APOOL_BACKOFF_MIN;
+	if (pool->seed_back[i] > APOOL_BACKOFF_MAX)
+		pool->seed_back[i] = APOOL_BACKOFF_MAX;
+	pool->seed_hold[i] = now_ms_lib() + pool->seed_back[i];
+	if (!pool->seed_said[i]) {
+		pool->seed_said[i] = 1;
+		LM_WARN("async pool: seed %s:%d did not answer (%s)\n", pool->seed_host[i],
+			pool->seed_port[i], perfd_error(NULL));
+	}
+}
 
-	for (k = 0; k < pool->nseeds; k++) {
-		int i = (start + k) % pool->nseeds;
-		perfd_t *pd = apool_dial_one(pool, pool->seed_host[i], pool->seed_port[i], o);
+/* dial, waiting at most apool_wait_ms: 1 READY, 0 still connecting (*out), -1 failed */
+static int apool_start(perfd_apool *pool, const char *host, int port, const perfd_opts *o,
+		perfd_t **out)
+{
+	int ms = apool_connect_ms(pool), w = apool_wait_ms(pool);
+	perfd_t *pd;
 
-		if (pd)
-			return pd;
-		if (!pool->seed_said[i]) {
-			pool->seed_said[i] = 1;
-			LM_WARN("async pool: seed %s:%d did not answer (%s)\n", pool->seed_host[i],
-				pool->seed_port[i], perfd_error(NULL));
+	*out = NULL;
+	if (o->secrets)
+		(void)perfd_psk_prepare(o->secrets);   /* derived once, outside the wait */
+	pool->st.dials++;
+	if (!(pd = perfd_connect_async(host, port, o)))
+		return -1;
+	apool_drive(pd, now_ms_lib() + w, apool_not_connecting, NULL);
+	if (perfd_state(pd) == PERFD_ST_READY) {
+		*out = pd;
+		return 1;
+	}
+	if (perfd_state(pd) == PERFD_ST_CONNECTING && pd->fd >= 0 && w < ms) {
+		*out = pd;
+		errk(NULL, PERFD_E_TRANSPORT, "%s:%d: still connecting", host, port);
+		return 0;
+	}
+	if (perfd_error_kind(pd) != PERFD_E_NONE)
+		errk(NULL, perfd_error_kind(pd), "%s:%d: %s", host, port, perfd_error(pd));
+	else
+		errk(NULL, PERFD_E_TRANSPORT, "%s:%d: not ready within %d ms", host, port, ms);
+	perfd_free(pd);
+	return -1;
+}
+
+/* a parked dial turned without blocking: 1 READY, 0 still connecting, -1 failed (freed) */
+static int apool_settle(perfd_apool *pool, perfd_t *pd, long long since, int seed,
+		const char *host, int port)
+{
+	struct pollfd pf;
+	int ms = apool_connect_ms(pool);
+
+	if (perfd_state(pd) == PERFD_ST_CONNECTING && pd->fd >= 0) {
+		pf.fd = pd->fd;
+		pf.events = (short)((perfd_events(pd) & PERFD_EV_WRITE ? POLLOUT : 0) | POLLIN);
+		pf.revents = 0;
+		if (poll(&pf, 1, 0) > 0) {
+			if (pf.revents & POLLOUT)
+				(void)perfd_write_ready(pd);
+			if ((pf.revents & ~POLLOUT) && perfd_state(pd) == PERFD_ST_CONNECTING)
+				(void)perfd_read_ready(pd);
 		}
+	}
+	if (perfd_state(pd) == PERFD_ST_READY) {
+		apool_seed_ok(pool, seed);
+		apool_dial_result(pool, 1);
+		return 1;
+	}
+	if (perfd_state(pd) == PERFD_ST_CONNECTING && pd->fd >= 0 &&
+	    now_ms_lib() - since < ms)
+		return 0;
+	if (perfd_error_kind(pd) != PERFD_E_NONE)
+		errk(NULL, perfd_error_kind(pd), "%s:%d: %s", host, port, perfd_error(pd));
+	else
+		errk(NULL, PERFD_E_TRANSPORT, "%s:%d: not ready within %d ms", host, port, ms);
+	perfd_free(pd);
+	if (seed >= 0)
+		apool_seed_fail(pool, seed);
+	else
+		LM_WARN("async pool: %s\n", perfd_error(NULL));
+	apool_dial_result(pool, 0);
+	return -1;
+}
+
+/* the seeds from a start rotated by the pid, so a pre-forked server's processes spread; one
+ * failed, held or already being dialled is passed over.  READY, connecting (*seed) or NULL */
+static perfd_t *apool_dial_seeds(perfd_apool *pool, const perfd_opts *o, int *seed)
+{
+	int start = (int)(getpid() % pool->nseeds), k, tried = 0;
+	long long now = now_ms_lib();
+
+	*seed = -1;
+	for (k = 0; k < pool->nseeds; k++) {
+		int i = (start + k) % pool->nseeds, r;
+		perfd_t *pd;
+
+		if (pool->seed_pend[i] || pool->seed_hold[i] > now)
+			continue;
+		tried++;
+		r = apool_start(pool, pool->seed_host[i], pool->seed_port[i], o, &pd);
+		if (r < 0) {
+			apool_seed_fail(pool, i);
+			continue;
+		}
+		*seed = i;
+		if (r == 0)
+			pool->seed_pend[i] = 1;
+		else
+			apool_seed_ok(pool, i);
+		return pd;
+	}
+	if (!tried) {
+		*seed = -2;                    /* nothing dialled: no failure to count */
+		errk(NULL, PERFD_E_TRANSPORT, "backing off: every seed failed or is still connecting");
 	}
 	return NULL;
 }
 
-/* a handle for one target - pinned, no fleet, no standbys; dials share the pool's backoff */
-static perfd_t *apool_dial(perfd_apool *pool, const char *host, int port)
+/* a handle for one target - pinned, no fleet, no standbys; dials share the pool's backoff.
+ * *pending: it is still connecting, parked by the caller */
+static perfd_t *apool_dial(perfd_apool *pool, const char *host, int port, int *pending,
+		int *seed)
 {
 	perfd_opts o = pool->o;
-	perfd_t *pd;
+	perfd_t *pd = NULL;
 	long long now = now_ms_lib();
+	int r;
 
+	*pending = 0;
+	*seed = -1;
 	if (now < pool->next_dial_ms) {
 		errk(NULL, PERFD_E_TRANSPORT, "backing off: no dial for %lld ms",
 			pool->next_dial_ms - now);
@@ -167,12 +278,22 @@ static perfd_t *apool_dial(perfd_apool *pool, const char *host, int port)
 	o.route_hints = 0;
 	o.pin = 1;
 	if (host[0]) {
-		pd = apool_dial_one(pool, host, port, &o);
-		if (!pd)
+		r = apool_start(pool, host, port, &o, &pd);
+		if (r < 0)
 			LM_WARN("async pool: %s\n", perfd_error(NULL));
-	} else
-		pd = apool_dial_seeds(pool, &o);
-	apool_dial_result(pool, pd != NULL);
+	} else {
+		pd = apool_dial_seeds(pool, &o, seed);
+		if (!pd && *seed == -2) {
+			*seed = -1;
+			return NULL;
+		}
+		r = !pd ? -1 : perfd_state(pd) == PERFD_ST_READY ? 1 : 0;
+	}
+	if (r == 0) {
+		*pending = 1;
+		return pd;
+	}
+	apool_dial_result(pool, r > 0);
 	return pd;
 }
 
@@ -183,12 +304,23 @@ static perfd_t *apool_router(perfd_apool *pool)
 	perfd_t *r = pool->router;
 	struct pollfd pf;
 
+	if (r && pool->router_dial_ms) {
+		int st = apool_settle(pool, r, pool->router_dial_ms, pool->router_seed,
+			pool->seed_host[pool->router_seed], pool->seed_port[pool->router_seed]);
+
+		if (st < 0)
+			r = pool->router = NULL;
+		if (st <= 0)
+			return NULL;
+		pool->router_dial_ms = 0;
+	}
 	if (r && perfd_state(r) == PERFD_ST_FAILED) {
 		perfd_free(r);
 		r = pool->router = NULL;
 	}
 	if (!r) {
 		perfd_opts o = pool->o;
+		int seed;
 
 		if (now_ms_lib() < pool->next_dial_ms)
 			return NULL;
@@ -196,12 +328,20 @@ static perfd_t *apool_router(perfd_apool *pool)
 		o.route_keys = 1;
 		o.route_hints = 0;
 		o.pin = 0;
-		r = apool_dial_seeds(pool, &o);
+		r = apool_dial_seeds(pool, &o, &seed);
+		if (!r && seed == -2)
+			return NULL;
+		if (r && perfd_state(r) != PERFD_ST_READY) {
+			pool->router = r;      /* parked: settled at a later get */
+			pool->router_dial_ms = now_ms_lib();
+			pool->router_seed = seed;
+			return NULL;
+		}
 		apool_dial_result(pool, r != NULL);
 		if (!r)
 			return NULL;
 		pool->router = r;
-		apool_drive(r, now_ms_lib() + apool_connect_ms(pool), apool_learned, NULL);
+		apool_drive(r, now_ms_lib() + apool_wait_ms(pool), apool_learned, NULL);
 		if (perfd_state(r) == PERFD_ST_FAILED)
 			return NULL;
 		return r;
@@ -269,6 +409,10 @@ static void apool_forked(perfd_apool *pool)
 	pool->n = 0;
 	perfd_free(pool->router);
 	pool->router = NULL;
+	pool->router_dial_ms = 0;
+	memset(pool->seed_pend, 0, sizeof pool->seed_pend);
+	memset(pool->seed_hold, 0, sizeof pool->seed_hold);
+	memset(pool->seed_back, 0, sizeof pool->seed_back);
 	pool->pid = getpid();
 	pool->backoff_ms = 0;
 	pool->next_dial_ms = 0;
@@ -279,12 +423,30 @@ static void apool_forked(perfd_apool *pool)
 static struct pd_aslot *apool_slot(perfd_apool *pool, const char *host, int port)
 {
 	struct pd_aslot *s;
-	int i, hole = -1, idle = -1;
+	int i, hole = -1, idle = -1, pending;
 
 	for (i = 0; i < pool->n; i++) {
 		s = &pool->slot[i];
 		if (s->busy)
 			continue;
+		if (s->pd && s->dial_ms) {
+			int st = apool_settle(pool, s->pd, s->dial_ms, s->seed,
+				s->seed >= 0 ? pool->seed_host[s->seed] : s->host,
+				s->seed >= 0 ? pool->seed_port[s->seed] : s->port);
+
+			if (st < 0) {
+				s->pd = NULL;          /* freed by the settle */
+				apool_clear(s);
+			} else if (st == 0) {
+				if (s->seed < 0 && s->port == port && !strcmp(s->host, host)) {
+					errk(NULL, PERFD_E_TRANSPORT, "%s:%d: still connecting",
+						host, port);
+					return NULL;
+				}
+				continue;              /* neither a hole nor idle; a seed's: try another */
+			} else
+				s->dial_ms = 0;
+		}
 		if (s->pd && (s->dead || perfd_state(s->pd) != PERFD_ST_READY)) {
 			apool_clear(s);
 			pool->st.rebuilt++;
@@ -319,11 +481,15 @@ static struct pd_aslot *apool_slot(perfd_apool *pool, const char *host, int port
 		return NULL;
 	}
 	s = &pool->slot[hole];
-	s->pd = apool_dial(pool, host, port);
+	s->pd = apool_dial(pool, host, port, &pending, &s->seed);
 	if (!s->pd)
 		return NULL;
 	snprintf(s->host, sizeof s->host, "%s", host);
 	s->port = port;
+	if (pending) {                     /* this get fails; a later one finds it settled */
+		s->dial_ms = now_ms_lib();
+		return NULL;
+	}
 	return s;
 }
 

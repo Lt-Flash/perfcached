@@ -131,6 +131,11 @@ struct peer {
 	unsigned char backfill[PC_MAX_COLLECTIONS];
 	/* it asked for this collection whole (M_ASKFILL): a backfill walk from every peer */
 	unsigned char askfill[PC_MAX_COLLECTIONS];
+	/* it restarted from its WAL: diff rounds toward it (rounds run + 1, 0 none), the slots
+	 * the last round found differing and how many rounds did not shrink them */
+	unsigned char dsync[PC_MAX_COLLECTIONS];
+	unsigned char dsync_stall[PC_MAX_COLLECTIONS];
+	unsigned int dsync_prev[PC_MAX_COLLECTIONS];
 	/* when this peer last arrived empty - the sender holdoff is
 	 * measured from here, not from the flag, which can go stale */
 	long long fresh_ms;

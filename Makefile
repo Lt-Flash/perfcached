@@ -1266,6 +1266,7 @@ check-g-core2: check-edition-guard $(CHECK_BINS)
 	sh test/tombsupertest.sh ./perfcached ./netcutshim.so
 	# a delete forgotten once every member holds it; a frozen member keeps what it missed
 	sh test/tombforgettest.sh ./perfcached
+	sh test/tombspacetest.sh ./perfcached
 	# a lost delete is a hole the member asks for
 	sh test/tombholetest.sh ./perfcached ./netcutshim.so
 	# a joiner floors its spaces at what its bootstrap's sources confirmed
@@ -1459,7 +1460,7 @@ check-g-cluster2: check-edition-guard $(CHECK_BINS) perfcached.release
 	sh test/standbypassovertest.sh ./perfcached ./netcutshim.so
 	sh test/colsfleettest.sh ./perfcached
 	sh test/fleetcolstest.sh ./perfcached
-	sh test/gonecardtest.sh ./perfcached
+	sh test/gonecardtest.sh ./perfcached ./perfcli
 	sh test/clustercfgtest.sh ./perfcached
 	sh test/mcastttltest.sh ./perfcached
 	sh test/unicasttest.sh ./perfcached
@@ -1582,6 +1583,7 @@ check-g-repl3: check-edition-guard $(CHECK_BINS)
 	sh test/eagerrestarttest.sh ./perfcached
 	# T600: a peer ahead for good - the pulls' empty answers settle the returning node
 	sh test/eagercatchuptest.sh ./perfcached
+	sh test/recovereddifftest.sh ./perfcached
 	sh test/stalebackfilltest.sh ./perfcached
 	sh test/fwdtest.sh ./perfcached
 	sh test/routedpairtest.sh ./perfcached ./routedpairtest

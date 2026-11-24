@@ -110,7 +110,9 @@ int pc_shard_owner_slot(unsigned slot)
 			self.in4.sin_port)
 		: 0;
 	for (i = 0; i < pt->n_peers; i++) {
-		if (!clpeers_usable(&pt->peers[i], now))   /* not a CONNECTING one */
+		/* a FAILED, STALLED or joining peer owns nothing, as this node when not READY */
+		if (!clpeers_usable(&pt->peers[i], now) ||
+		    pt->peers[i].nstate != PC_NST_READY)
 			continue;
 		h = pc_hrw_mix(kh, pt->peers[i].addr.in4.sin_addr.s_addr,
 			pt->peers[i].addr.in4.sin_port);

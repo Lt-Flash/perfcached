@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* apooltest.c - the async pool against a stand-in server in this process (plaintext, a thread):
- * ready, wait, cancel and the late reply, a failed or closed handle rebuilt, a full pool, fork. */
+ * ready, wait, cancel and the late reply, a failed or closed handle rebuilt, a full pool, fork,
+ * a dial bounded for the caller, and by dial_wait_ms. */
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
@@ -503,6 +504,81 @@ int main(void)
 		perfd_apool_free(qp);
 		if (qfd >= 0)
 			close(qfd);
+	}
+
+	printf("--- I. a dial does not hold the get for connect_timeout\n");
+	{
+		int qport, qfd = listen_on(&qport);
+		const char *sec[2] = { "apool-secret", NULL };
+		const char *qh[1] = { "127.0.0.1" };
+		perfd_opts q = PERFD_OPTS_INIT;
+		perfd_apool *qp;
+		unsigned long long d0;
+		long long t0, el;
+
+		q.secrets = sec;
+		q.connect_timeout_ms = 3000;
+		perfd_psk_prepare(sec);            /* the derivation is not the dial */
+		qp = perfd_apool_new_seeds(qh, &qport, 1, "c", &q, 2);
+		memset(&g, 0, sizeof g);
+		t0 = ms();
+		fd = qfd >= 0 && qp ? perfd_apool_get(qp, "k1", cb, &g) : 0;
+		el = ms() - t0;
+		CHK(fd == -1 && g.calls == 0 && el >= 400 && el < 1500,
+			"I1 a node that takes the TCP and never answers: -1 after %lld ms, not "
+			"connect_timeout's 3000 ('%s')", el, perfd_error(NULL));
+		d0 = qp ? stats(qp).dials : 0;
+		t0 = ms();
+		fd = qp ? perfd_apool_get(qp, "k2", cb, &g) : 0;
+		el = ms() - t0;
+		CHK(fd == -1 && el < 100 && strstr(perfd_error(NULL), "still connecting") &&
+			qp && stats(qp).dials == d0, "I2 while that dial is still connecting a get "
+			"fails at once and dials nothing new (%lld ms, '%s')", el, perfd_error(NULL));
+		usleep(3200000);
+		t0 = ms();
+		fd = qp ? perfd_apool_get(qp, "k3", cb, &g) : 0;
+		el = ms() - t0;
+		CHK(fd == -1 && el < 100 && qp && stats(qp).dial_failures == 1 &&
+			strstr(perfd_error(NULL), "backing off"), "I3 past connect_timeout the dial "
+			"counts as failed and the pool backs off (%lld ms, %llu failures, '%s')", el,
+			qp ? stats(qp).dial_failures : 0, perfd_error(NULL));
+		CHK(g.calls == 0, "I4 no callback ran for a get that answered -1");
+		perfd_apool_free(qp);
+		if (qfd >= 0)
+			close(qfd);
+	}
+
+	printf("--- J. dial_wait_ms sets that wait\n");
+	{
+		static const int waits[2] = { 150, -1 };
+		const char *sec[2] = { "apool-secret", NULL };
+		const char *qh[1] = { "127.0.0.1" };
+		int w;
+
+		for (w = 0; w < 2; w++) {
+			int qport, qfd = listen_on(&qport);
+			perfd_opts q = PERFD_OPTS_INIT;
+			perfd_apool *qp;
+			long long t0, el;
+
+			q.secrets = sec;
+			q.connect_timeout_ms = 1200;
+			q.dial_wait_ms = waits[w];
+			qp = perfd_apool_new_seeds(qh, &qport, 1, "c", &q, 2);
+			memset(&g, 0, sizeof g);
+			t0 = ms();
+			fd = qfd >= 0 && qp ? perfd_apool_get(qp, "k1", cb, &g) : 0;
+			el = ms() - t0;
+			if (w == 0)
+				CHK(fd == -1 && el >= 100 && el < 400, "J1 dial_wait_ms = 150: "
+					"-1 after %lld ms, not the default 500", el);
+			else
+				CHK(fd == -1 && el >= 1100 && el < 2500, "J2 dial_wait_ms = -1: "
+					"the get waits all of connect_timeout's 1200 (%lld ms)", el);
+			perfd_apool_free(qp);
+			if (qfd >= 0)
+				close(qfd);
+		}
 	}
 
 	__atomic_store_n(&want_stop, 1, __ATOMIC_RELEASE);

@@ -316,6 +316,51 @@ static void acks_hold_note(const struct fsp *sp, uint64_t lo, int nm, int nl,
 	}
 }
 
+/* the run that numbered space (oid, incarn) is over: neither this process nor a listed member */
+static int space_run_over(uint64_t oid, uint32_t incarn)
+{
+	int k;
+
+	if (oid == fnv1a64(cl_self_ident(), 16))
+		return incarn != pc_cluster_incarnation();
+	for (k = 0; k < cl_peers()->n_peers; k++) {
+		struct peer *p = &cl_peers()->peers[k];
+
+		if (__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) && p->has_ident &&
+		    fnv1a64(p->ident, sizeof p->ident) == oid)
+			return p->incarn != incarn;
+	}
+	return 1;
+}
+
+/* a space of a run that is over goes once this node holds all of it, its mark has stood
+ * retain_s, no member that reports it is below it and no retained entry of it is left */
+static int space_drop_ok(const struct fsp *sp, int nm, long long now,
+		long long keep_ms)
+{
+	unsigned int i;
+	int d;
+
+	if (sp->hi > sp->mark || !space_run_over(sp->oid, sp->incarn))
+		return 0;
+	for (i = 0; i < progn; i++)
+		if (progv[i].oid == sp->oid && progv[i].incarn == sp->incarn)
+			break;
+	if (i == progn || now - progv[i].ms < keep_ms)
+		return 0;
+	for (d = 0; d < nm; d++) {
+		uint64_t m;
+
+		if (pc_ack_fleet_mark(fmembers[d], sp->oid, sp->incarn, &m) &&
+		    m < sp->mark)
+			return 0;
+	}
+	if (!clretain_space_drop(sp->oid, sp->incarn))
+		return 0;
+	progv[i] = progv[--progn];
+	return 1;
+}
+
 int pc_cluster_acks_holds(struct pc_ack_hold *out, int max)
 {
 	int n;
@@ -382,6 +427,19 @@ void acks_forget_tick(unsigned int now_s)
 			cl_st_tomb_forgotten(clretain_forget(fspv[i].oid,
 				fspv[i].incarn, lo, now_s));
 		acks_hold_note(&fspv[i], lo, nm, nl, now, hv, &hn);
+	}
+	if (now_s % 10 == 0) {
+		unsigned int nd = 0;
+
+		for (i = 0; i < fspn; i++)
+			if (space_drop_ok(&fspv[i], nm, now, keep_ms)) {
+				pc_ack_drop(fspv[i].oid, fspv[i].incarn);
+				nd++;
+			}
+		if (nd)
+			LM_NOTICE("cluster: %u numbering space(s) of runs that are over "
+				"forgotten - held whole, confirmed by every member that "
+				"reports them, no delete of them retained\n", nd);
 	}
 	clretain_expire_expiries(now_s, PC_TOMB_EXPIRY_HOLD_S);
 	pthread_mutex_lock(&hold_mx);

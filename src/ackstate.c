@@ -566,3 +566,12 @@ void pc_ack_get_stats(struct clack_stats *st)
 	clack_get_stats(A, st);
 	pthread_mutex_unlock(&A_mx);
 }
+
+void pc_ack_drop(uint64_t oid, uint32_t incarn)
+{
+	if (!A)
+		return;
+	pthread_mutex_lock(&A_mx);
+	clack_drop(A, oid, incarn);
+	pthread_mutex_unlock(&A_mx);
+}

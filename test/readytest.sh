@@ -35,6 +35,7 @@ chmod 600 "$D/r.conf"
 run=0
 while [ $run -lt 3 ]; do
 	run=$((run+1))
+	: > "$D/log"
 	LD_PRELOAD="$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_SLOWLISTEN_MS=300 "$BIN" -f "$D/r.conf" > "$D/log" 2>&1 &
 	P=$!
 	R=$(python3 - "$D/log" <<'PY'

@@ -23,6 +23,7 @@ struct perfd_url {
 		int port;
 	} seed[PERFD_URL_MAX_SEEDS];
 	int route, encrypt, spares, policy;
+	int dial_wait_ms, dial_wait_set;   /* dial_wait_ms=, given */
 	/* the connect's state, this process's (pid): seeds logged down, the hold after a dial none
 	 * answered */
 	pid_t pid;
@@ -166,7 +167,8 @@ static const char *url_seed(perfd_url *u, int i, const char *s, const char *e)
 /* one "name=value" between @s and @e; @seen keeps a name from coming twice */
 static const char *url_opt(perfd_url *u, const char *s, const char *e, unsigned int *seen)
 {
-	static const char *const names[] = { "route", "encrypt", "spares", "policy", NULL };
+	static const char *const names[] = { "route", "encrypt", "spares", "policy",
+		"dial_wait_ms", NULL };
 	static const char *const pols[] = { "failover", "rr", "least", "weighted", NULL };
 	const char *eq = memchr(s, '=', (size_t)(e - s)), *v;
 	size_t nl, vl;
@@ -184,7 +186,7 @@ static const char *url_opt(perfd_url *u, const char *s, const char *e, unsigned 
 		if (strlen(names[k]) == nl && !memcmp(s, names[k], nl))
 			break;
 	if (!names[k])
-		return "an unknown option (route, encrypt, spares, policy)";
+		return "an unknown option (route, encrypt, spares, policy, dial_wait_ms)";
 	if (*seen & (1u << k))
 		return "an option given twice";
 	*seen |= 1u << k;
@@ -201,6 +203,14 @@ static const char *url_opt(perfd_url *u, const char *s, const char *e, unsigned 
 		else if (url_num(v, e, 0, PERFD_MAX_SPARES, &n) != 0)
 			return "spares is -1 (one per member), 0 (none) or up to 8";
 		u->spares = (int)n;
+		return NULL;
+	case 4:
+		if (vl == 2 && v[0] == '-' && v[1] == '1')
+			n = -1;
+		else if (url_num(v, e, 1, 60000, &n) != 0)
+			return "dial_wait_ms is -1 (all of connect_timeout) or 1 to 60000";
+		u->dial_wait_ms = (int)n;
+		u->dial_wait_set = 1;
 		return NULL;
 	default:
 		for (n = 0; pols[n]; n++)
@@ -391,6 +401,8 @@ void perfd_url_apply(const perfd_url *u, perfd_opts *o)
 		o->encrypt = u->encrypt;
 	if (u->secret && URL_HAS(o, secrets))
 		o->secrets = u->secv;
+	if (u->dial_wait_set && URL_HAS(o, dial_wait_ms))
+		o->dial_wait_ms = u->dial_wait_ms;
 }
 
 static const char *url_seed_name(const perfd_url *u, int i, char *buf, size_t cap)

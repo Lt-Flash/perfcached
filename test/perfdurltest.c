@@ -142,6 +142,35 @@ int main(void)
 		CHK(o.spares == -1 && o.policy == PERFD_POLICY_ROUND_ROBIN, "A15 spares=-1, rr");
 		perfd_url_free(u);
 	}
+	u = perfd_url_parse("perfd://h:1/c?dial_wait_ms=250", err, sizeof err);
+	if (u) {
+		perfd_opts o = PERFD_OPTS_INIT;
+
+		o.dial_wait_ms = 900;
+		perfd_url_apply(u, &o);
+		CHK(o.dial_wait_ms == 250, "A15b dial_wait_ms=250 applied (%d)", o.dial_wait_ms);
+		perfd_url_free(u);
+	} else
+		CHK(0, "A15b dial_wait_ms=250 parses ('%s')", err);
+	u = perfd_url_parse("perfd://h:1/c?dial_wait_ms=-1", err, sizeof err);
+	if (u) {
+		perfd_opts o = PERFD_OPTS_INIT;
+
+		perfd_url_apply(u, &o);
+		CHK(o.dial_wait_ms == -1, "A15c dial_wait_ms=-1 applied (%d)", o.dial_wait_ms);
+		perfd_url_free(u);
+	} else
+		CHK(0, "A15c dial_wait_ms=-1 parses ('%s')", err);
+	u = perfd_url_parse("perfd://h:1/c", err, sizeof err);
+	if (u) {
+		perfd_opts o = PERFD_OPTS_INIT;
+
+		o.dial_wait_ms = 900;
+		perfd_url_apply(u, &o);
+		CHK(o.dial_wait_ms == 900, "A15d a URL without it leaves the caller's dial_wait_ms (%d)",
+			o.dial_wait_ms);
+		perfd_url_free(u);
+	}
 	u = perfd_url_parse("perfd://a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8/c", err, sizeof err);
 	CHK(u && perfd_url_seed_count(u) == 8, "A16 eight seeds");
 	perfd_url_free(u);
@@ -186,6 +215,9 @@ int main(void)
 	refused("perfd://h:1/c?spares=9", "spares");
 	refused("perfd://h:1/c?spares=-2", "spares");
 	refused("perfd://h:1/c?policy=random", "policy");
+	refused("perfd://h:1/c?dial_wait_ms=0", "dial_wait_ms");
+	refused("perfd://h:1/c?dial_wait_ms=60001", "dial_wait_ms");
+	refused("perfd://h:1/c?dial_wait_ms=-2", "dial_wait_ms");
 	refused("perfd://h:1/c?bogus=1", "unknown option");
 	refused("perfd://h:1/c?Route=1", "unknown option");
 	refused("perfd://h:1/c?route=1&route=0", "twice");

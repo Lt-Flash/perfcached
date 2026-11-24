@@ -2069,6 +2069,7 @@ int pc_daemon_run(struct pc_config *cfg)
 				nw, w);
 	}
 	pc_metrics_mark_start();       /* uptime counts from HERE: a slow recovery is not uptime */
+	pcache_arena_flush_private();  /* the replay's and imports' cells: this thread allocates no more */
 	LM_NOTICE("perfcached ready: %d workers, %d collections, %d "
 		"listeners, arena %s\n", nw, n_cols, cfg->n_listen,
 		cfg->backing_heap ? "heap" : "reserved");

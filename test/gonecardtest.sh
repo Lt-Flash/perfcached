@@ -1,9 +1,13 @@
 #!/bin/sh
 # gonecardtest.sh - a member that leaves keeps its card in the fleet view for about two minutes, and
-# one that said goodbye does not read the same as one that just stopped.
+# one that said goodbye does not read the same as one that just stopped; its fleet.node warning names
+# forget, and a forget (privileged) takes the card and the warning away.  Usage: [./perfcached] [./perfcli]
 set -u
 
 BIN=${1:-./perfcached}
+CLI=${2:-./perfcli}
+[ -x "$CLI" ] || { echo "gonecardtest: $CLI is missing (make perfcli)"; exit 1; }
+export PERFCACHED_ALERT_FAST=60
 D=$(mktemp -d /var/tmp/pcgone.XXXXXX)
 P1= P2= P3=
 trap '[ -n "$P1" ] && kill -9 $P1 2>/dev/null; \
@@ -21,6 +25,7 @@ arena_mb = 64
 [secrets]
 client = g-client-secret
 cluster = g-cluster-secret
+enable = g-enable-secret
 [listen]
 tcp = 127.0.0.1:$2
 http = 127.0.0.1:$3
@@ -53,8 +58,8 @@ grep -q "perfcached ready" "$D/n1.log" || { echo "node 1 did not start"; cat "$D
 
 # node 2 leaves as a deploy makes it, SIGTERM and a goodbye; node 3 simply stops (kill -9), and the
 # two must not read the same
-python3 - "$P2" "$P3" <<'PY_EOF'
-import json, os, signal, sys, time, urllib.request
+python3 - "$P2" "$P3" "$CLI" <<'PY_EOF'
+import json, os, signal, subprocess, sys, time, urllib.request
 
 pass_n = fail_n = 0
 def ok(m):
@@ -119,6 +124,47 @@ if m3:
         "S293: and as SILENT, not as a goodbye it never sent (%r)" % m3.get("gone_reason"))
     (ok if m3.get("gone_silent_s", 0) >= 5 else bad)(
         "S293: with how long it was silent before the purge (%s s)" % m3.get("gone_silent_s"))
+
+# T593: a member removed for good - its warning says how to clear it, and forget does
+def alerts():
+    d = json.loads(urllib.request.urlopen("http://127.0.0.1:17721/stats", timeout=8).read())
+    return {a["key"]: a for a in d["alerts"]["active"]}
+def call(req, priv=False):
+    o = subprocess.run([sys.argv[3], "-h", "127.0.0.1", "-p", "17720", "-a", "g-client-secret", "-q"]
+                       + (["-E", "g-enable-secret"] if priv else []),
+                       input=(json.dumps(req) + "\n").encode(), stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, timeout=15)
+    out = o.stdout.decode().strip()
+    return json.loads(out.splitlines()[0]) if out else {"_err": o.stderr.decode().strip() or "no reply"}
+def until(pred, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.25)
+    return pred()
+until(lambda: "fleet.node%d" % peer in alerts() and "fleet.node%d" % lost in alerts(), 10)
+al = alerts()
+for nid, how in ((peer, "goodbye"), (lost, "silent")):
+    t = al.get("fleet.node%d" % nid, {}).get("text", "none")
+    (ok if "forget %d" % nid in t else bad)("T593: the %s member's warning names forget %d (%s)" % (how, nid, t))
+r = call({"method": "forget", "params": {"node": peer}})
+(ok if "_err" in r and "forgotten" not in r else bad)("T593: forget without the enable secret is refused (%s)" % str(r)[:80])
+me = json.loads(urllib.request.urlopen("http://127.0.0.1:17721/stats", timeout=8).read())["cluster"]["node"]
+r = call({"method": "forget", "params": {"node": me}}, True)
+(ok if "_err" in r else bad)("T593: forget of this node itself is refused (%s)" % str(r)[:80])
+r = call({"method": "forget", "params": {"node": peer}}, True)
+(ok if r.get("forgotten") == peer else bad)("T593: forget %d answers forgotten (%s)" % (peer, str(r)[:80]))
+gone = until(lambda: peer not in members() and "fleet.node%d" % peer not in alerts(), 10)
+(ok if gone else bad)("T593: its card and its fleet.node%d warning are gone (listed %s, alerts %s)"
+                      % (peer, sorted(members()), sorted(alerts())))
+(ok if lost in members() and "fleet.node%d" % lost in alerts() else bad)(
+    "T593: the member not forgotten keeps its card and warning")
+time.sleep(3)
+(ok if "fleet.missing" not in alerts() else bad)(
+    "T593: the fleet is one smaller, not one missing (%s)" % alerts().get("fleet.missing", {}).get("text", "none"))
+r = call({"method": "forget", "params": {"node": peer}}, True)
+(ok if "_err" in r else bad)("T593: a second forget is refused - nothing holds the id (%s)" % str(r)[:80])
 
 # and every state a node CAN be in carries its reason, not just FAILED
 st = json.loads(urllib.request.urlopen(

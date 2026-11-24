@@ -164,7 +164,8 @@ int out_append(struct pc_conn *c, const char *p, size_t n)
 	return 0;
 }
 
-int wire_append(struct pc_conn *c, const char *p, size_t n)
+/* room for @n more bytes at c->wire + c->wire_len, nothing written: 0, or -1 */
+static int wire_reserve(struct pc_conn *c, size_t n)
 {
 	const size_t limit = PC_MAX_OUTQ + (PC_MAX_OUTQ >> 4);
 
@@ -183,6 +184,13 @@ int wire_append(struct pc_conn *c, const char *p, size_t n)
 	if (buf_reserve(&c->wire, &c->wire_cap, c->wire_len, n, limit) < 0)
 		return -1;
 	bufs_mark(c);
+	return 0;
+}
+
+int wire_append(struct pc_conn *c, const char *p, size_t n)
+{
+	if (wire_reserve(c, n) < 0)
+		return -1;
 	memcpy(c->wire + c->wire_len, p, n);
 	c->wire_len += n;
 	return 0;
@@ -1236,22 +1244,29 @@ static int tls_wire(void *ctx, const char *p, size_t n);
 
 static int encrypt_pending(struct pc_conn *c)
 {
-	uint8_t rec[2 + PC_NOISE_MAXPT + PC_NOISE_TAGLEN];
-	size_t off = 0;
+	size_t nrec = (c->out_len + PC_NOISE_MAXPT - 1) / PC_NOISE_MAXPT, off = 0;
 
+	/* room for every record first: one sealed and not queued would put the nonces out of
+	 * step, and the plaintext left in c->out would be sealed again */
+	if (wire_reserve(c, c->out_len + nrec * (2 + PC_NOISE_TAGLEN)) < 0)
+		return -1;
 	while (off < c->out_len) {
 		size_t chunk = c->out_len - off;
+		uint8_t *rec = (uint8_t *)c->wire + c->wire_len;
 		int cl;
 
 		if (chunk > PC_NOISE_MAXPT)
 			chunk = PC_NOISE_MAXPT;
 		cl = pc_transport_encrypt(&c->send_cs,
 			(const uint8_t *)c->out + off, chunk, rec + 2);
-		if (cl < 0)
+		if (cl < 0) {
+			/* what was sealed is queued: a re-run seals only the rest */
+			memmove(c->out, c->out + off, c->out_len - off);
+			c->out_len -= off;
 			return -1;
+		}
 		put16(rec, (uint16_t)cl);
-		if (wire_append(c, (char *)rec, 2 + (size_t)cl) < 0)
-			return -1;
+		c->wire_len += 2 + (size_t)cl;
 		off += chunk;
 	}
 	c->out_len = 0;

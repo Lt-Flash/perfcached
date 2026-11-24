@@ -24,6 +24,12 @@
 #define MAXTOK   (1 << 17)
 #define RECMAX   PCACHE_CELL_MAX    /* the store's largest record: key + value never exceed it */
 
+/* a record this file format, and perfload and --inspect reading it, can carry */
+static int pcd_rec_fits(size_t kl, size_t vl)
+{
+	return kl <= RECMAX && vl <= RECMAX - kl;
+}
+
 /* perfdump-format 2: the chunk magic, and the type byte as an index here - the daemon's
  * dump `t` (absent = a string); perfload reads it with the same table */
 #define PCD_FORMAT 2
@@ -462,17 +468,26 @@ static void *walker(void *arg)
 			long long ttl, ver;
 			unsigned long long exp_ms;
 
-			if (rec < 0 || v.n[rec].type != 'm')
-				continue;
-			tk = pc_tv_get(&v, rec, "k");
-			tvv = pc_tv_get(&v, rec, "v");
+			tk = rec < 0 || v.n[rec].type != 'm' ? -1 : pc_tv_get(&v, rec, "k");
+			tvv = tk < 0 ? -1 : pc_tv_get(&v, rec, "v");
 			if (tk < 0 || v.n[tk].type != 'b' || tvv < 0 ||
 			    v.n[tvv].type != 'b' ||
 			    pc_tv_get_int(&v, rec, "ttl", &ttl) != 0 ||
-			    pc_tv_get_int(&v, rec, "ver", &ver) != 0)
-				continue;
-			if (v.n[tk].len > RECMAX || v.n[tvv].len > RECMAX)
-				continue;
+			    pc_tv_get_int(&v, rec, "ver", &ver) != 0) {
+				fprintf(stderr, "perfdump: connection %d: record %d of the chunk at "
+					"cursor %u is malformed - the dump would miss it\n",
+					j->idx, i, cursor);
+				j->failed = 1;
+				break;
+			}
+			if (!pcd_rec_fits(v.n[tk].len, v.n[tvv].len)) {
+				fprintf(stderr, "perfdump: connection %d: a record of %zu + %zu bytes, "
+					"past the %u a dump file carries - the dump would miss it\n",
+					j->idx, (size_t)v.n[tk].len, (size_t)v.n[tvv].len,
+					(unsigned int)RECMAX);
+				j->failed = 1;
+				break;
+			}
 			tt = pc_tv_get(&v, rec, "t");
 			type = pcd_type_of(&v, tt);
 			if (type < 0) {

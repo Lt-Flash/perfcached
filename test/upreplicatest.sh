@@ -107,6 +107,11 @@ alert() { # alert <key> - its level, or none
 s=json.loads(urllib.request.urlopen("http://127.0.0.1:'$HTTP'/stats", timeout=5).read())
 print(next((a["level"] for a in s["alerts"]["active"] if a["key"]==sys.argv[1]), "none"))' "$1" 2>/dev/null
 }
+atext() { # atext <key> - its text, or none
+	python3 -c 'import json,sys,urllib.request
+s=json.loads(urllib.request.urlopen("http://127.0.0.1:'$HTTP'/stats", timeout=5).read())
+print(next((a["text"] for a in s["alerts"]["active"] if a["key"]==sys.argv[1]), "none"))' "$1" 2>/dev/null
+}
 waitfor() { # waitfor <seconds> <shell condition>
 	w=0; while [ $w -lt $(($1 * 10)) ]; do eval "$2" && return 0; sleep 0.1; w=$((w+1)); done; return 1
 }
@@ -145,6 +150,8 @@ r=$(read_keys 41 60)
 	ok "3. R2 serves every read ($(($(gets 2) - g2)) fetches), the master none" || bad "3. reads $r, R2 +$(($(gets 2) - g2)), M $(gets 3)"
 waitfor 6 '[ "$(alert upstream.0.1)" = warning ]'
 [ "$(alert upstream.0.1)" = warning ] && ok "3. R1's warning: upstream.0.1" || bad "3. upstream.0.1: $(alert upstream.0.1)"
+case "$(atext upstream.0.1)" in *" is unreachable - "*) ok "3. it says R1 is unreachable";;
+	*) bad "3. R1 refuses connections, the text says: $(atext upstream.0.1)";; esac
 # the master, skipped by design since 1. (listed to follow a failover), raises none
 [ "$(alert upstream.0.3)" = none ] && ok "3. the master, skipped by design, raises no alert: upstream.0.3 none" ||
 	bad "3. upstream.0.3: $(alert upstream.0.3)"
@@ -215,6 +222,24 @@ chmod 600 "$D/e.conf"
 "$BIN" -C -f "$D/e.conf" > "$D/e.out" 2>&1
 [ $? -ne 0 ] && grep -q "upstream_role / upstream_max_lag_ms without an upstream" "$D/e.out" &&
 	ok "8. upstream_role without an upstream is refused" || bad "8. role alone: $(tail -1 "$D/e.out")"
+
+# ---- 9. upstream_role = any, its one upstream stopped: unreachable, not a role -----------------
+sed -e "s|^upstream = .*|upstream = redis://127.0.0.1:$P1|" -e "s|^upstream_role = .*|upstream_role = any|" "$D/a.conf" > "$D/g.conf"
+chmod 600 "$D/g.conf"
+ctl 1 '{"role": "replica"}'
+if start g; then
+	waitfor 8 '[ "$(state 1)" = serving ]'
+	ctl 1 '{"role": "replica", "down": true, "kill_seq": 3}'
+	waitfor 8 '[ "$(alert upstream.0)" = warning ]'
+	t=$(atext upstream.0)
+	case "$t" in *" is unreachable - misses answer per on_error"*)
+		ok "9. role any, the replica stopped: the warning says unreachable";;
+		*) bad "9. role any, the replica stopped: $t";; esac
+	ctl 1 '{"role": "replica"}'
+	stop
+else
+	bad "9. did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/g.log")"
+fi
 
 # ---- never a write ----------------------------------------------------------------------------
 w=$(cat "$D"/up*/writes 2>/dev/null | wc -l)

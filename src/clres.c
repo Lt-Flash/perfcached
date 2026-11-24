@@ -134,3 +134,15 @@ const char *clres_why_name(int why)
 	default:                   return "unknown";
 	}
 }
+
+int clres_drop(struct clres *r, int id)
+{
+	int i, n = 0;
+
+	for (i = 0; i < CLRES_MAX; i++)
+		if (id && r->e[i].id == id) {
+			r->e[i].id = 0;
+			n++;
+		}
+	return n;
+}
