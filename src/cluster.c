@@ -6461,6 +6461,8 @@ static void handover_tick(long long now)
 
 /* ---- T600: a collection asked for whole (M_ASKFILL) ---- */
 static long long askfill_at[PC_MAX_COLLECTIONS];  /* when to ask, 0 = not; workers set it */
+/* sends left: one ask can land before the peer counts this restarted node live, and it drops it unseen */
+static int askfill_left[PC_MAX_COLLECTIONS];
 
 static int store_index(const char *col, size_t collen)
 {
@@ -6482,6 +6484,7 @@ void pc_cluster_ask_fill(const char *col, size_t collen)
 	if (!C.enabled || (c = store_index(col, collen)) < 0 ||
 	    !pc_store_eager_enabled(pc_store_ht(c)))
 		return;
+	__atomic_store_n(&askfill_left[c], 3, __ATOMIC_RELAXED);
 	__atomic_store_n(&askfill_at[c], now_ms() + 3000, __ATOMIC_RELEASE);
 }
 
@@ -6489,7 +6492,7 @@ static void askfill_tick(long long now)
 {
 	unsigned char m[2 + 255];
 	struct pc_wcur w;
-	int c, up;
+	int c, up, left;
 
 	for (c = 0; c < pc_store_count(); c++) {
 		long long t = __atomic_load_n(&askfill_at[c], __ATOMIC_ACQUIRE);
@@ -6508,10 +6511,13 @@ static void askfill_tick(long long now)
 		if (!w.ok)
 			continue;
 		(void)clsend_live(&C.pt, m, 2 + cl, now);
-		__atomic_store_n(&askfill_at[c], 0, __ATOMIC_RELEASE);
-		LM_NOTICE("cluster: asked %d peer(s) for collection '%s' whole - its "
-			"records written through went with the upstream tracking gap\n",
-			up, cn);
+		left = __atomic_sub_fetch(&askfill_left[c], 1, __ATOMIC_RELAXED);
+		/* a peer that took an earlier ask ignores the repeat while it sends */
+		__atomic_store_n(&askfill_at[c], left > 0 ? now + 3000 : 0, __ATOMIC_RELEASE);
+		if (left == 2)
+			LM_NOTICE("cluster: asked %d peer(s) for collection '%s' whole - its "
+				"records written through went with the upstream tracking gap\n",
+				up, cn);
 	}
 }
 

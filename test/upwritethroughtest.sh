@@ -1398,7 +1398,7 @@ waitfor 40 '[ "$(crec 2)" = 40 ] && [ "$(cmark 2 a:7)" = t ]'
 grep -q "asked 1 peer(s) for collection '0' whole" "$D/c2.log" && grep -q "asks for collection '0' whole" "$D/c1.log" &&
 	grep -q "sent collection '0' whole to node" "$D/c1.log" &&
 	ok "22. the logs: member 2 asked for '0' whole, member 1 sent it" ||
-	bad "22. logs: $(grep -h -E 'whole' "$D/c1.log" "$D/c2.log" | cut -c 17-150 | tr '\n' '|')"
+	bad "22. logs: $(grep -h -E "collection '[^']*' whole" "$D/c1.log" "$D/c2.log" | cut -c 17-150 | tr '\n' '|')"
 # the replicas never took the writes, so a read answers 'v9' only from the record the peer sent
 [ "$(cresp 2 GET a:9)" = "'v9'" ] && ok "22. a read of a:9 on member 2 answers 'v9' - the record (Redis' replicas never had it)" ||
 	bad "22. GET a:9 on member 2: $(cresp 2 GET a:9)"
