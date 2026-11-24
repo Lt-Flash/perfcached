@@ -230,7 +230,8 @@ ctl 1 '{"role": "replica"}'
 if start g; then
 	waitfor 8 '[ "$(state 1)" = serving ]'
 	ctl 1 '{"role": "replica", "down": true, "kill_seq": 3}'
-	waitfor 8 '[ "$(alert upstream.0)" = warning ]'
+	read_keys 1 10 > /dev/null    # a fetch connection learns of "down" only by its next command
+	waitfor 15 '[ "$(alert upstream.0)" = warning ]'
 	t=$(atext upstream.0)
 	case "$t" in *" is unreachable - misses answer per on_error"*)
 		ok "9. role any, the replica stopped: the warning says unreachable";;

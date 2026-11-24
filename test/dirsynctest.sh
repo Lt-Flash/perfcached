@@ -32,7 +32,6 @@ client = dsy-client-secret
 enable = dsy-enable-secret
 [listen]
 tcp = 127.0.0.1:16497
-plaintext = loopback
 [collection c]
 buckets_log2 = 10
 [wal]

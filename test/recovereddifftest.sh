@@ -118,7 +118,9 @@ start 3 || exit 1
 python3 "$T/waitready.py" 127.0.0.1:16981 127.0.0.1:16983 -t 30 || bad "node 1 or 3 not ready after the restart"
 waitfor 15 'grep -q "node .* restarted holding .* recovered" "$D/n1.log"'
 grep -q "node .* restarted holding .* recovered" "$D/n1.log" && ok "node 1 saw node 3 restart RECOVERED (from its WAL)" \
-	|| bad "node 1 never saw a recovered restart: $(grep 'node .* restarted\|started cold' "$D/n1.log" | tail -1)"
+	|| { bad "node 1 never saw a recovered restart: $(grep 'node .* restarted\|started cold' "$D/n1.log" | tail -1)"
+	echo "  ..   node 3: $(grep -E 'recover:|wal:' "$D/n3.log" | tr '\n' ' ' | cut -c1-600)"
+	echo "  ..   node 3's WAL: $(ls -l "$D/s3/wal" | tr '\n' ' ' | cut -c1-400)"; }
 # counted before any read: a read of a key it lacks would pull it
 waitfor 60 '[ "$(ent 3)" = 550 ]'
 [ "$(ent 3)" = 550 ] && ok "node 3 holds all 550 without a read - the 300 it lacked came by the diff" \
