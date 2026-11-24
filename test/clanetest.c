@@ -125,7 +125,8 @@ static int state_after(int pt, int ms)
 }
 
 /* the fd in this process whose local port is @lp and peer port @rp; -1 if none */
-static int fd_by_ports(int lp, int rp)
+/* addresses too: the test's own lane from 127.0.0.2 can draw the lane port as its source */
+static int fd_by_ends(int lh, int lp, int rh, int rp)
 {
 	struct sockaddr_in l, r;
 	socklen_t ll, rl;
@@ -136,7 +137,8 @@ static int fd_by_ports(int lp, int rp)
 		rl = sizeof r;
 		if (getsockname(fd, (struct sockaddr *)&l, &ll) == 0 && l.sin_family == AF_INET &&
 		    getpeername(fd, (struct sockaddr *)&r, &rl) == 0 &&
-		    ntohs(l.sin_port) == lp && ntohs(r.sin_port) == rp)
+		    l.sin_addr.s_addr == htonl(0x7f000000u | (unsigned)lh) && ntohs(l.sin_port) == lp &&
+		    r.sin_addr.s_addr == htonl(0x7f000000u | (unsigned)rh) && ntohs(r.sin_port) == rp)
 			return fd;
 	}
 	return -1;
@@ -290,11 +292,11 @@ int main(void)
 			acc = state_after(lpt, 3000) == CLANE_TCP_UP ?
 				accept(live, (struct sockaddr *)&pa, &pl) : -1;
 		}
-		CHK(acc >= 0 && dead_peer_bounded(fd_by_ports(ntohs(pa.sin_port), lpt)),
+		CHK(acc >= 0 && dead_peer_bounded(fd_by_ends(1, ntohs(pa.sin_port), 1, lpt)),
 			"F: the outbound lane socket - keepalive and a user timeout of seconds");
 		pl = sizeof pa;
 		CHK(lane >= 0 && getsockname(lane, (struct sockaddr *)&pa, &pl) == 0 &&
-			dead_peer_bounded(fd_by_ports(port, ntohs(pa.sin_port))),
+			dead_peer_bounded(fd_by_ends(1, port, 2, ntohs(pa.sin_port))),
 			"F: the inbound lane socket - keepalive and a user timeout of seconds");
 	}
 
