@@ -13,6 +13,10 @@ on:
     # whose run already judged that tree, so it starts none)
     tags: ['v*-rc*']
   pull_request:
+  # the FULL LADDER (since 2026-11-25): a push or an rc tag runs the rc gate - the check groups on
+  # io_uring, check-fault, check-standalone, check-root, php, clang-tidy; a manual run on the soaked
+  # rc's tag (gh workflow run ci.yml --ref vX.Y.Z-rcN) adds ASan, the fleet, alpine and the epoll fallback
+  workflow_dispatch:
 
 jobs:
   # The ratchet: "pushed = check-green" without human discipline.
@@ -20,17 +24,17 @@ jobs:
   # check outgrew its 90 minutes).  fail-fast off: every group reports.
   # A Debian 13 host (kernel 6.12) runs every suite on the io_uring
   # backend - check and check-asan both.
-  # Here the startup check is told to refuse it, so the same suites run
+  # In the full ladder the startup check is told to refuse it, so the same suites run
   # on the epoll fallback: each release is green on BOTH backends.
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      PERFCACHED_URING_DENY: "1"
+      PERFCACHED_URING_DENY: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
     strategy:
       fail-fast: false
       matrix:
-        group: [core1, core2, durability, cluster1, cluster2, repl1, repl2, repl3]
+        group: [core1, core2, durability, cluster1, cluster2, cluster3, repl1, repl2, repl3]
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -53,7 +57,7 @@ jobs:
       fail-fast: false
       matrix:
         group: [fault3, fault4]
-        build: [check, check-asan]
+        build: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["check", "check-asan"]') || fromJSON('["check"]') }}
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -68,6 +72,7 @@ jobs:
   # the partitions (iptables inside each container's namespace).  A VM per
   # job, so the fleet's fixed names cannot collide.
   check-fleet:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -155,6 +160,7 @@ jobs:
         run: tools/php-deb-check.sh
 
   alpine:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -165,12 +171,13 @@ jobs:
   # Highest-value job: the whole suite under ASan+UBSan,
   # per group as check above (`make check-asan` still runs them all).
   check-asan:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        group: [core1, core2, durability, cluster1, cluster2, repl1, repl2, repl3]
+        group: [core1, core2, durability, cluster1, cluster2, cluster3, repl1, repl2, repl3]
     steps:
       - uses: actions/checkout@v4
       - name: deps

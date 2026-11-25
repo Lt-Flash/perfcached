@@ -19,14 +19,16 @@
 #                  it is what release promises are made from.
 # The heavy jobs therefore key on $CI_COMMIT_TAG, not on a branch.
 #
-# Releases are soaked candidates, so only an rc tag is judged in full:
-#   - an rc tag (vX.Y.Z-rcN) runs the whole ladder, every job at once
-#     (needs: []) - no stage waits on lint and the fast gate first, and the
-#     arch matrix no longer waits for the x86_64 suites; a red lint or fast
-#     job still fails the pipeline.  Measured before: 70 min, 100 with the
-#     matrix, 18 of them before any full job started
+# Since 2026-11-25 a release is judged in two tiers (the full ladder had grown to ~2 h a pipeline):
+#   - an rc tag (vX.Y.Z-rcN) runs the RC GATE: clang-tidy, check-fast, check-standalone, php,
+#     phpdeb (~22 min; GitHub runs the check groups beside it).  Green on both = it goes to
+#     245-247 and the soak starts
+#   - the FULL LADDER - check, check-asan, check-epoll, check-fault, check-fleet, roll, form64,
+#     alpine, admin-image, matrix - runs on the same rc tag when a pipeline is created with
+#     FULL_LADDER=1 (API or the web form), started right after the deploy so it runs beside the
+#     soak; promotion needs it green, and any red in it is a new rc and a new soak
 #   - a FINAL tag (vX.Y.Z) runs nothing: it is put on the commit of the rc
-#     that soaked, whose pipeline already judged that exact tree
+#     that soaked, whose pipelines already judged that exact tree
 #   - a branch push runs lint and the fast gate side by side
 #   - core is split in two (core1, core2): it was the longest job
 
@@ -37,6 +39,11 @@ workflow:
     - when: always
 
 stages: [lint, fast, full, arch, nightly]
+
+# a rebuild leaves the image it replaced untagged, and a multi-stage build its stages: the jobs that
+# build drop those older than an hour, so a parallel job's build in flight keeps its own
+.image-prune: &image-prune
+  podman image prune -f --filter until=1h > /dev/null 2>&1 || true
 
 .deps: &deps
   # nodejs: pagejstest runs the page's script on node's vm - on a CI
@@ -124,7 +131,7 @@ check-fast:
 .groups: &groups
   parallel:
     matrix:
-      - GROUP: [core1, core2, durability, cluster1, cluster2, repl1, repl2, repl3]
+      - GROUP: [core1, core2, durability, cluster1, cluster2, cluster3, repl1, repl2, repl3]
 
 .group-filter: &group-filter
   - case ",$CHECK_GROUPS," in ",,"|*",$GROUP,"*) ;; *) echo "group $GROUP not in CHECK_GROUPS=$CHECK_GROUPS - skipped"; exit 0;; esac
@@ -135,7 +142,7 @@ check:
   image: debian:13
   timeout: 60m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
     - if: $CHECK_GROUPS
   <<: *groups
   before_script: *deps
@@ -156,7 +163,7 @@ check-fault:
   image: debian:13
   timeout: 60m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
     - if: $CHECK_GROUPS
   parallel:
     matrix:
@@ -179,7 +186,7 @@ check-fleet:
   needs: []
   timeout: 45m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
     - if: $CHECK_GROUPS
   resource_group: perfcached-container-fleet
   parallel:
@@ -203,6 +210,7 @@ check-fleet:
     - for c in pcnode1 pcnode2 pcnode3 pcredis; do podman rm -f $c >/dev/null 2>&1; done
     - podman network rm pcnet >/dev/null 2>&1 || true
     - rm -rf /var/tmp/pccluster /tmp/pcfleet.noignore.$CI_JOB_ID
+    - *image-prune
 
 # 64 blank nodes started at once on the runner tagged large, plain build only: an rc tag
 # runs it, or a pipeline whose CHECK_GROUPS names form64
@@ -213,7 +221,7 @@ form64:
   timeout: 30m
   tags: [large]
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
     - if: $CHECK_GROUPS =~ /(^|,)form64(,|$)/
   before_script: *deps
   script:
@@ -230,7 +238,7 @@ roll:
   image: debian:13
   timeout: 30m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
   before_script: *deps
   script:
     - make -j"$(nproc)"
@@ -248,10 +256,10 @@ check-epoll:
   image: debian:13
   timeout: 60m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
   parallel:
     matrix:
-      - GROUP: [cluster2, repl1, repl2, repl3, roll]
+      - GROUP: [cluster2, cluster3, repl1, repl2, repl3, roll]
   before_script: *deps
   script:
     - make -j"$(nproc)"
@@ -282,11 +290,13 @@ alpine:
   needs: []
   timeout: 60m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
   script:
     - tools/alpine-check.sh
     # PD-11: the packages - abuild, apk add, the services through OpenRC
     - tools/alpine-pkg-check.sh
+  after_script:
+    - *image-prune
 
 # the admin image - perfcached-dashboard, perfcli
 # and nginx - built with podman on the shell runner, proven to answer, and
@@ -299,10 +309,12 @@ admin-image:
   needs: []
   timeout: 40m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
   script:
     - tools/image-admin.sh /var/tmp/pcrel-image
     - mkdir -p image && cp /var/tmp/pcrel-image/perfcached-admin-*.tar image/ 2>/dev/null || true
+  after_script:
+    - *image-prune
   artifacts:
     paths: [image/]
     expire_in: 14 days
@@ -321,7 +333,7 @@ matrix:
   needs: []
   timeout: 60m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
   script:
     - tools/matrix.sh
 
@@ -333,7 +345,7 @@ check-asan:
   image: debian:13
   timeout: 60m
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG && $FULL_LADDER
     - if: $CHECK_GROUPS
   <<: *groups
   before_script: *deps

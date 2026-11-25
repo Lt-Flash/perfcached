@@ -1004,7 +1004,7 @@ CHECK_BINS = $(DASH_BIN) $(DASH_TEST) pagedump rollload selftest selftest_broken
 
 # The full ladder in GROUPS, one CI job each: `make check` runs every group, check-g-<group> one,
 # check-asan-g-<group> one under ASan+UBSan; check-wired keeps every test/*.sh in some group.
-CHECK_GROUPS = core1 core2 durability cluster1 cluster2 repl1 repl2 repl3 fault3 fault4
+CHECK_GROUPS = core1 core2 durability cluster1 cluster2 cluster3 repl1 repl2 repl3 fault3 fault4
 
 check-edition-guard:
 	@if [ "$(PC_EDITION)" = standalone ]; then \
@@ -1466,6 +1466,9 @@ check-g-cluster2: check-edition-guard $(CHECK_BINS) perfcached.release
 	sh test/colsfleettest.sh ./perfcached
 	sh test/fleetcolstest.sh ./perfcached
 	sh test/gonecardtest.sh ./perfcached ./perfcli
+
+# cluster2's second half, its own group since 2026-11-25: one job was the longest of every pipeline
+check-g-cluster3: check-edition-guard $(CHECK_BINS) perfcached.release
 	sh test/clustercfgtest.sh ./perfcached
 	sh test/mcastttltest.sh ./perfcached
 	sh test/unicasttest.sh ./perfcached
@@ -1935,5 +1938,5 @@ endif
 	@echo "      see PRODUCTION.md before the first real deployment"
 
 .PHONY: all menuconfig print-libperfd print-build check-standalone shim core check perfcached.release check-wired check-fast check-fault check-asan check-asan-findings hashbench clean install check-roll \
-	check-edition-guard check-g-core1 check-g-core2 check-g-durability check-g-cluster1 check-g-cluster2 \
+	check-edition-guard check-g-core1 check-g-core2 check-g-durability check-g-cluster1 check-g-cluster2 check-g-cluster3 \
 	check-g-repl1 check-g-repl2 check-g-repl3 check-g-fault1 check-g-fault2 check-g-fault3 check-g-fault4

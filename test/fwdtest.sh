@@ -174,13 +174,17 @@ set -- $B0; B0=$1; WDROP=$2; RBSTATE=$3; RBMOVED=$4
 KP=$P2; kill -9 $P2 2>/dev/null; P2=; i=0
 while [ $i -lt 300 ] && ks=$(awk '{print $3}' "/proc/$KP/stat" 2>/dev/null) && [ "$ks" != Z ]; do
 	sleep 0.1; i=$((i+1)); done
+L2=$(wc -l < "$D/n2.log")
 "$BIN" -f "$D/n2.conf" >> "$D/n2.log" 2>&1 &
 P2=$!
+# up to 60 s: under ASan the restart replays its ~55k records from the WAL before it listens
 i=0
-while [ $i -lt 200 ]; do
+while [ $i -lt 600 ]; do
 	python3 -c "import socket; socket.create_connection((\"127.0.0.1\", 17042), timeout=0.3).close()" 2>/dev/null && break
 	sleep 0.1; i=$((i+1))
 done
+[ $i -lt 600 ] || { echo "    the restarted holder did not listen in 60 s (pid $P2 $(kill -0 $P2 2>/dev/null && echo alive || echo gone)); its log since the restart:"
+	tail -n +$((L2 + 1)) "$D/n2.log" | grep -E "NOTICE|WARN|ERROR|CRIT|recover|ready" | tail -8 | cut -c1-200 | sed 's/^/      /'; }
 B1=$(python3 - <<'EOF'
 import json, pcnative, socket
 def ent(port):
