@@ -614,10 +614,8 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 			cfg->wal_fsync = 1;
 		else if (!strcasecmp(val, "no"))
 			cfg->wal_fsync = 2;
-		else if (!strcasecmp(val, "sync"))
-			cfg->wal_fsync = 3;
 		else {
-			PERR(ps, "fsync: always|everysec|no|sync\n");
+			PERR(ps, "fsync: always|everysec|no\n");
 			return -1;
 		}
 		return 0;

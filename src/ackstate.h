@@ -30,8 +30,6 @@ int pc_ack_save(const char *dir, uint64_t marker);
 int pc_ack_load(const char *dir, uint64_t marker);
 
 int pc_ack_each(clack_each_cb cb, void *ctx);
-/* forget space (oid, incarn): its run is over and nothing of it is held or owed */
-void pc_ack_drop(uint64_t oid, uint32_t incarn);
 void pc_ack_get_stats(struct clack_stats *st);
 
 /* the spaces with a hole - [from, to] below the highest seq

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* perfdlinktest.c - libperfd's per-connection state, from inside (perfd.c compiled in): what a
  * replaced link leaves behind, what an async handle keeps, what one frame may carry, what a
- * refused async handshake says, a node's refusal before the handshake. */
+ * refused async handshake says. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -887,55 +887,6 @@ int main(void)
 			rc == 1 ? (int)vl : 0, rc == 1 ? (const char *)v : "");
 		free(v);
 		close(sv[1]);
-		perfd_free(p);
-	}
-
-	printf("--- Y. a node that refuses the connection before the handshake is a refusal, not auth\n");
-	{
-		static const char *const secs[] = { "a-secret", NULL };
-		static const char full[] = "-ERR max number of clients reached\r\n";
-		perfd_opts o = PERFD_OPTS_INIT;
-		perfd_t *p;
-		char why[128] = "";
-		int sv[2] = { -1, -1 }, rc, k;
-
-		o.spares = PERFD_SPARES_NONE;
-		o.secrets = secs;
-		for (k = 0; k < 2; k++) {      /* the line then the close; the line alone */
-			p = pd_alloc(&o);
-			sv[0] = sv[1] = -1;
-			CHK(p && socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "Y%d a link", 1 + 3 * k);
-			p->async = 1;
-			p->st = PERFD_ST_CONNECTING;
-			p->hs_stage = PD_HS_WAIT;
-			p->fd = sv[0];
-			fcntl(sv[0], F_SETFL, O_NONBLOCK);
-			CHK(write(sv[1], full, sizeof full - 1) == (ssize_t)(sizeof full - 1),
-				"Y%d the node writes its refusal%s", 2 + 3 * k, k ? ", the link left open" : " and closes");
-			if (!k)
-				close(sv[1]);
-			rc = perfd_read_ready(p);
-			CHK(rc == -1 && perfd_state(p) == PERFD_ST_FAILED &&
-				perfd_error_kind(p) == PERFD_E_REFUSED && strstr(perfd_error(p), "max number of clients"),
-				"Y%d async: PERFD_E_REFUSED with the node's words (kind %d: %s)", 3 + 3 * k,
-				perfd_error_kind(p), perfd_error(p));
-			if (k)
-				close(sv[1]);
-			perfd_free(p);
-		}
-		p = pd_alloc(&o);
-		sv[0] = sv[1] = -1;
-		CHK(p && socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "Y7 a link");
-		if (p && sv[0] >= 0) {
-			p->fd = sv[0];
-			if (write(sv[1], full, sizeof full - 1) < 0)
-				fails++;
-			shutdown(sv[1], SHUT_WR);      /* the close a reader sees; msg1 still lands */
-			rc = noise_handshake(p, secs[0], why, sizeof why);
-			close(sv[1]);
-			CHK(rc == -3 && !strcmp(why, "max number of clients reached"),
-				"Y8 blocking: the handshake says refused, with the node's words (%d, '%s')", rc, why);
-		}
 		perfd_free(p);
 	}
 

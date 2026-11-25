@@ -2098,54 +2098,6 @@ const char *pc_cluster_master_prefer(int node)
 	return NULL;
 }
 
-/* the operator's forget: ids queued by the verb, dropped from the reservations on the beat */
-static unsigned long long forget_q[(PC_CL_NODE_MAX + 64) / 64];
-static unsigned int forget_gen;
-
-const char *pc_cluster_forget(int node)
-{
-	if (!C.enabled)
-		return "this node is not clustered";
-	if (node < 1 || node > PC_CL_NODE_MAX)
-		return "forget wants {\"node\": <a departed member's node id>}";
-	if (node == C.node_id)
-		return "that is this node";
-	if (peer_by_node(node))
-		return "a member here now - stop it, and forget it once it has left";
-	if (!clres_holds(&reserved, node, now_ms()))
-		return "no departed member holds that id here";
-	__atomic_fetch_or(&forget_q[node / 64], 1ULL << (node % 64),
-		__ATOMIC_RELEASE);
-	return NULL;
-}
-
-unsigned int pc_cluster_forget_gen(void)
-{
-	return __atomic_load_n(&forget_gen, __ATOMIC_ACQUIRE);
-}
-
-static void forget_tick(void)
-{
-	unsigned int w;
-	int b, id;
-
-	for (w = 0; w < sizeof forget_q / sizeof forget_q[0]; w++) {
-		unsigned long long q = __atomic_exchange_n(&forget_q[w], 0,
-			__ATOMIC_ACQ_REL);
-
-		for (b = 0; q && b < 64; b++) {
-			if (!(q & (1ULL << b)))
-				continue;
-			id = (int)(w * 64 + (unsigned int)b);
-			if (peer_by_node(id) || !clres_drop(&reserved, id))
-				continue;              /* back since the ask */
-			LM_NOTICE("cluster: node %d forgotten by the operator - its id is "
-				"free and it is no longer listed\n", id);
-			__atomic_add_fetch(&forget_gen, 1, __ATOMIC_RELEASE);
-		}
-	}
-}
-
 /* ---- completion queues (clpend) ---------------------------------------- */
 
 void pc_cluster_worker_register(int worker, int efd)
@@ -3833,9 +3785,6 @@ void peer_publish(struct peer *p, int node, unsigned int free_mb,
 		memset(p->repl_dirty, 0, sizeof p->repl_dirty);
 		memset(p->repl_bfcycle, 0, sizeof p->repl_bfcycle);
 		memset(p->askfill, 0, sizeof p->askfill);
-		memset(p->dsync, 0, sizeof p->dsync);
-		memset(p->dsync_stall, 0, sizeof p->dsync_stall);
-		memset(p->dsync_prev, 0, sizeof p->dsync_prev);
 		/* the sweep sends only AUTHORED records (copies would echo), so an empty node needs
 		 * a ONE-SHOT pass that includes copies, bounded to one clean cycle */
 		/* armed by the start kind it reports (PC_START_*), never its count; COLD arms only
@@ -3867,15 +3816,10 @@ void peer_publish(struct peer *p, int node, unsigned int free_mb,
 				"records - re-placing its share from every holder "
 				"(its copies came from a snapshot and may be older)\n",
 				node, entries);
-		} else if (incarn && start == PC_START_RECOVERED) {
-			/* its sweeps from mark 0 carry only what live peers authored: the copies
-			 * it lacks or holds older come by the diff, slot by slot */
-			memset(p->dsync, 1, sizeof p->dsync);
-			C.px.dsync_armed++;
+		} else if (incarn && start == PC_START_RECOVERED)
 			LM_NOTICE("cluster: node %d restarted holding %u records "
-				"recovered from its WAL - diffing it (the slots that "
-				"differ, copies included)\n", node, entries);
-		}
+				"recovered from its WAL - NOT backfilling (a recovered "
+				"node needs a diff, not a blind push)\n", node, entries);
 		else if (incarn && start == PC_START_UNKNOWN)
 			LM_NOTICE("cluster: node %d (older build) restarted holding "
 				"%u records - NOT backfilling (judged by its count: a "
@@ -5746,12 +5690,9 @@ static void clmap_recheck_usable(void)
 
 		if (!id || id == C.node_id || !clpeers_live(p, now))
 			continue;
-		nd = pc_clmap_find(&C.map, (uint16_t)id);
-		/* a FAILED member owns nothing: a map that leaves it out agrees (STALLED passes) */
-		if (p->nstate == PC_NST_FAILED && !pc_clmap_placeable(nd))
-			continue;
 		live++;
-		if (pc_clmap_placeable(nd))
+		nd = pc_clmap_find(&C.map, (uint16_t)id);
+		if (nd && pc_clmap_placeable(nd))
 			ok++;
 	}
 	/* every live node placeable, and nothing placeable we cannot see */
@@ -8766,7 +8707,6 @@ void pc_cluster_thread(volatile int *stop)
 				}
 			}
 			membership_tick();
-			forget_tick();
 			self_state_tick();
 			upg_msg_tick();                /* asks and answers */
 			pull_answer_tick();            /* the owner's fetched pulls */
@@ -8815,7 +8755,6 @@ void pc_cluster_thread(volatile int *stop)
 			to = clpush_open(&C.wp) ? REPL_FLUSH_MS : 100;
 			if (waiting && to > PEND_SWEEP_MS)
 				to = PEND_SWEEP_MS;
-			pcache_arena_flush_if_asked();
 			pc_qs_exit();          /* parked across the wait */
 			prc = poll(pf, 3, to);
 			pc_qs_enter();
@@ -8966,10 +8905,7 @@ void pc_proxy_get_stats(struct pc_proxy_stats *out)
  * (NULL when the cycle is not gated) */
 #define SG_BIT(b, i)   ((b)[(i) >> 3] & (1u << ((i) & 7)))
 #define SG_SET(b, i)   ((b)[(i) >> 3] |= (unsigned char)(1u << ((i) & 7)))
-#define SG_UNSET(b, i) ((b)[(i) >> 3] &= (unsigned char)~(1u << ((i) & 7)))
 static const unsigned char *sg_walk_filter;
-/* a diff walk sends copies but, unlike a backfill, still holds this node's own recovered ones */
-static int mig_diff_walk;
 
 struct mig_ctx {
 	const char *col;
@@ -9046,7 +8982,7 @@ static int mig_cb(const str *key, const str *val,
 		 * a restored copy could resurrect a key that expired everywhere else */
 		/* not for backfill/set-repair (incl_passive): reconcile waits for a cold peer,
 		 * so holding the walk that warms it would hold both forever */
-		if ((!m->incl_passive || mig_diff_walk) && rec_held(mt->wtick)) {
+		if (!m->incl_passive && rec_held(mt->wtick)) {
 			m->held++;
 			return 0;
 		}
@@ -9602,7 +9538,6 @@ struct sg_col {
 	long long deadline_ms;
 	unsigned int start;            /* the tick the digests were taken */
 	unsigned int rot;              /* the anti-entropy window's turn */
-	unsigned char full;            /* a diff round: every slot held asked */
 	unsigned char diff[PC_SLOTS / 8];
 };
 /* each cycle also compares 1/SG_ROT of all slots: a write whose push AND repeat were lost
@@ -9787,9 +9722,9 @@ static struct sg_col *sg_col_of(struct peer *pr, int i, int c)
 	return sp->c[c];
 }
 
-/* the sender's decision for one cycle of (peer, collection), taken with the cursor at 0;
- * @full, a diff round, asks every slot held here and ignores the mark */
-static int sg_gate(struct peer *pr, int i, int c, long long now, int full)
+/* the sender's decision for one ordinary cycle of (peer, collection),
+ * taken with the cursor at 0 */
+static int sg_gate(struct peer *pr, int i, int c, long long now)
 {
 	pcache_htable_t *ht = pc_store_ht(c);
 	struct sg_peer *sp;
@@ -9807,8 +9742,6 @@ static int sg_gate(struct peer *pr, int i, int c, long long now, int full)
 	sp = sg_tab[i];
 	if (sp->off_until_ms && now < sp->off_until_ms)
 		return SG_OFF;
-	if (g->st && g->full != full)
-		g->st = 0;                     /* the other kind's round: asked again */
 	if (g->st == 1) {
 		if (g->got >= g->parts) {
 			sp->fails = 0;         /* every part answered */
@@ -9855,9 +9788,8 @@ static int sg_gate(struct peer *pr, int i, int c, long long now, int full)
 	w.peer = pr->node;
 	w.kk = pc_cluster_replicas();
 	w.now = get_ticks();
-	w.mark = full ? 0 : pr->repl_mark[c];
+	w.mark = pr->repl_mark[c];
 	g->start = w.now;
-	g->full = (unsigned char)full;
 	if (cl_walk(ht, NULL, sg_walk_cb, &w) < 0) {
 		/* digests of nothing would match nothing and move the mark: the old sweep instead */
 		free(dig); free(cand); free(ungated);
@@ -9869,13 +9801,7 @@ static int sg_gate(struct peer *pr, int i, int c, long long now, int full)
 	for (s = 0; s < PC_SLOTS; s++) {
 		if (SG_BIT(ungated, s))
 			SG_SET(g->diff, s);     /* never gated: always walked */
-		else if (full) {
-			if (dig[s]) {           /* held here (a zero digest: near enough never) */
-				SG_SET(cand, s);
-				want++;
-			} else
-				SG_UNSET(cand, s);
-		} else if (SG_BIT(cand, s) ||
+		else if (SG_BIT(cand, s) ||
 		         (s % SG_ROT == g->rot &&
 		          (!w.kk || (pc_spread_in_set(s, pr->node, w.kk) &&
 		                     pc_spread_in_set(s, 0, w.kk))))) {
@@ -10188,56 +10114,6 @@ static void handle_sweep_dig_r(const unsigned char *pt, size_t n)
 	}
 }
 
-#define DSYNC_ROUNDS 8
-/* a diff round's outcome toward a member back from its WAL: all equal ends it, a round that
- * does not shrink the differing slots twice running or the last round stops it */
-static void dsync_round(struct peer *pr, int i, int c, int gate)
-{
-	struct sg_col *g;
-	unsigned int s, n = 0;
-
-	if (gate == SG_WAIT)
-		return;
-	if (gate == SG_OFF) {
-		pr->dsync[c] = 0;
-		C.px.dsync_off++;
-		LM_NOTICE("cluster: no diff for node %d (%s) - it does not answer "
-			"digests; it keeps what it recovered\n", pr->node,
-			pc_store_name(c));
-		return;
-	}
-	if (gate == SG_SKIP) {
-		LM_NOTICE("cluster: diff sync with node %d done (%s) after %u "
-			"round(s) - every slot matches\n", pr->node, pc_store_name(c),
-			(unsigned int)pr->dsync[c] - 1);
-		pr->dsync[c] = 0;
-		C.px.dsync_done++;
-		return;
-	}
-	if (!(g = sg_col_of(pr, i, c)))
-		return;
-	for (s = 0; s < PC_SLOTS; s++)
-		if (SG_BIT(g->diff, s))
-			n++;
-	C.px.dsync_rounds++;
-	C.px.dsync_slots += n;
-	if (pr->dsync[c] > 1 && n >= pr->dsync_prev[c])
-		pr->dsync_stall[c]++;
-	else
-		pr->dsync_stall[c] = 0;
-	pr->dsync_prev[c] = n;
-	if (pr->dsync_stall[c] >= 2 || pr->dsync[c] >= DSYNC_ROUNDS) {
-		LM_NOTICE("cluster: diff sync with node %d stopped (%s) after %u "
-			"round(s) - %u slot(s) still differ, newer there or deletes "
-			"its reconcile rules on\n", pr->node, pc_store_name(c),
-			(unsigned int)pr->dsync[c], n);
-		pr->dsync[c] = 0;
-		C.px.dsync_stopped++;
-		return;                        /* this last walk still runs */
-	}
-	pr->dsync[c]++;
-}
-
 static void eager_repl_tick(void)
 {
 	spread_note_set_change();
@@ -10253,7 +10129,7 @@ static void eager_repl_tick(void)
 		for (i = 0; i < C.pt.n_peers; i++) {
 			struct peer *pr = &C.pt.peers[i];
 			unsigned int start, since;
-			int clean = 0, bf, gate, ds, dswalk;
+			int clean = 0, bf, gate;
 			struct sg_col *gc;
 
 			if (!clpeers_live(pr, now))
@@ -10293,33 +10169,20 @@ static void eager_repl_tick(void)
 				pr->repl_cursor[c] = 0;
 			if (!bf)
 				pr->repl_bfcycle[c] = 0;
-			if (pr->dsync[c] && (!pc_sweep_digests || pc_cluster_replicas())) {
-				pr->dsync[c] = 0;
-				C.px.dsync_off++;
-				if (!pc_cluster_replicas())
-					LM_NOTICE("cluster: no diff for node %d (%s) - "
-						"sweep_digests = no; it keeps what it recovered\n",
-						pr->node, pc_store_name(c));
-			}
-			ds = pr->dsync[c] && !bf;
 			/* an ordinary cycle asks first (SKIP matched, WAIT, WALK the diffs, OFF
 			 * the full sweep); a backfill or set repair is never gated */
 			gate = SG_OFF;
 			gc = NULL;
 			if (!bf && pc_sweep_digests) {
 				if (pr->repl_cursor[c] == 0)
-					gate = sg_gate(pr, i, c, now, ds);
+					gate = sg_gate(pr, i, c, now);
 				else if ((gc = sg_col_of(pr, i, c)) && gc->st == 2)
 					gate = SG_WALK;
 			}
-			if (ds && pr->repl_cursor[c] == 0)
-				dsync_round(pr, i, c, gate);
 			if (gate == SG_SKIP || gate == SG_WAIT)
 				continue;
 			if (gate == SG_WALK && !gc)
 				gc = sg_col_of(pr, i, c);
-			/* a diff round's walk sends copies too, in the differing slots only */
-			dswalk = gate == SG_WALK && gc && gc->full;
 			/* one slice of a resumable cycle: the start tick is taken at cursor 0
 			 * only, or records written mid-cycle would fall below the next mark */
 			if (pr->repl_cursor[c] == 0) {
@@ -10347,11 +10210,9 @@ static void eager_repl_tick(void)
 				pc_addr to0 = pr->addr;
 
 				sg_walk_filter = gate == SG_WALK && gc ? gc->diff : NULL;
-				mig_diff_walk = dswalk && !bf;
 				run_migration(pr, 4 << 20, 2, since,
 					pc_store_name(c), &clean,
-					&pr->repl_cursor[c], bf || dswalk);
-				mig_diff_walk = 0;
+					&pr->repl_cursor[c], bf);
 				sg_walk_filter = NULL;
 				/* its pump handed the slot to another node: that one's
 				 * zeroed cursor and marks are no cycle of this run */
@@ -11932,7 +11793,6 @@ void pc_bulk_thread(volatile int *stop)
 			bulk_pull();
 		if (have_tx)
 			bulk_tx(stop);
-		pcache_arena_flush_if_asked();
 		pc_qs_exit();
 		prc = poll(&pf, 1, 200);
 		pc_qs_enter();
@@ -12130,7 +11990,6 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	memset(&C.st, 0, sizeof C.st);
 	/* patterns the peers hold; fixed buckets, read without a lock */
 	clps_init();
-	clps_idle_fn = pcache_arena_flush_if_asked;
 	/* the parked-request table: sized ONCE, clamped not refused (the slot index rides in
 	 * the request id), never resized - clpend_find() hands out raw pointers into it */
 	clpush_init(&C.wp, PC_CL_MAXPEER, MIG_GHDR, MIG_GATHER_CAP,
@@ -12548,7 +12407,6 @@ group_done:
 			ack_group, NULL);
 
 		C.ap.clock = cl_now_ms;    /* busy_since_ms stamps at the take */
-		C.ap.idle = pcache_arena_flush_if_asked;
 
 		if (n < 0)
 			LM_ERR("cluster: no memory for %d apply rings - "

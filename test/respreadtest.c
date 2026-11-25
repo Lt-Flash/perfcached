@@ -237,8 +237,6 @@ int main(int ac, char **av)
 	b = count_on(NEACH, NEACH * 2, p4);
 	OK(a >= 4 && a <= 28, "told by the push: %d of %d moved to the new node (1 in 4 is 15)", a, NEACH);
 	OK(b >= 4 && b <= 28, "told by the list: %d of %d moved to the new node (1 in 4 is 15)", b, NEACH);
-	if (a < 4 || b < 4)
-		views(p4);
 	for (i = j = 0; i < NFO; i++)
 		j += on_port(h[NEACH * 2 + i]) != was[i];
 	OK(j == 0, "the default policy stayed where it was: %d of %d moved", j, NFO);

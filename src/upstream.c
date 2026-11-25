@@ -166,7 +166,6 @@ int pc_upstream_health(int i, struct pc_up_health *h)
 		sh->host = sh->hbuf;
 		sh->conns_up = __atomic_load_n(&s->conns_up, __ATOMIC_RELAXED);
 		sh->tracking_on = __atomic_load_n(&s->inv_id, __ATOMIC_ACQUIRE) > 0;
-		sh->failing = __atomic_load_n(&s->failing, __ATOMIC_RELAXED);
 		sh->state = srv_state(s);
 		sh->role = __atomic_load_n(&s->role, __ATOMIC_RELAXED);
 		sh->link_down = __atomic_load_n(&s->link_down, __ATOMIC_RELAXED);

@@ -60,7 +60,6 @@ struct cfg {
 	int body_max;
 	int stage_max_mb;                 /* a build posted to /stage */
 	int timeout_s;
-	int ddl_timeout_s;                /* a DDL's answer: it may wait on the WAL's fsync */
 	int lockout_after;
 	int lockout_s;
 	int session_s;
@@ -77,7 +76,7 @@ struct cfg {
 static struct cfg CF = {
 	.listen_host = "127.0.0.1", .listen_port = 8090,
 	.cache_ms = 1000, .refresh_ms = 3000, .body_max = 4096, .timeout_s = 10,
-	.stage_max_mb = 64, .ddl_timeout_s = 60,
+	.stage_max_mb = 64,
 	.lockout_after = 5, .lockout_s = 60, .session_s = 1800,
 	.conn_limit = 64, .per_ip_limit = 16,
 };
@@ -156,8 +155,6 @@ static int cfg_set(const char *sect, const char *key, const char *val,
 		CF.stage_max_mb = atoi(val);
 	} else if (!strcmp(key, "timeout_s")) {
 		CF.timeout_s = atoi(val);
-	} else if (!strcmp(key, "ddl_timeout_s")) {
-		CF.ddl_timeout_s = atoi(val);
 	} else if (!strcmp(key, "lockout_after")) {
 		CF.lockout_after = atoi(val);
 	} else if (!strcmp(key, "lockout_s")) {
@@ -291,15 +288,14 @@ static const char *SECRETS[2];
 static char CONN_NAME[128];            /* dashboard@<host> */
 static int TLS_ON;                     /* the page is served over TLS */
 
-static perfd_t *dial_io(const char *host, int port, char *err, size_t ecap,
-		int io_ms)
+static perfd_t *dial(const char *host, int port, char *err, size_t ecap)
 {
 	perfd_opts po;
 	perfd_t *p;
 
 	memset(&po, 0, sizeof po);
 	po.connect_timeout_ms = 2000;
-	po.io_timeout_ms = io_ms;
+	po.io_timeout_ms = 5000;
 	po.spares = PERFD_SPARES_NONE;   /* this node's trees, nobody else's */
 	po.policy = PERFD_POLICY_FAILOVER;
 	if (CF.secret[0])
@@ -310,11 +306,6 @@ static perfd_t *dial_io(const char *host, int port, char *err, size_t ecap,
 	if (!p)
 		snprintf(err, ecap, "%s", perfd_error(NULL));
 	return p;
-}
-
-static perfd_t *dial(const char *host, int port, char *err, size_t ecap)
-{
-	return dial_io(host, port, err, ecap, 5000);
 }
 
 static struct member *member_add(const char *addr, int port, int node,
@@ -1516,11 +1507,10 @@ static MHD_RESULT route_ddl(struct MHD_Connection *c, const char *body,
 		const char *from)
 {
 	char op[16], col[64] = "", to[64] = "", nb[16], nodes[16], fb[8], ib[8];
-	char what[160], addr[sizeof FL.m[0].addr], en[sizeof FL.enable], err[400];
+	char what[160];
 	struct member *m;
-	perfd_t *p;
 	char *r;
-	int node = 0, log2 = 0, force = 0, index = -1, port, mnode;
+	int node = 0, log2 = 0, force = 0, index = -1;
 	MHD_RESULT rc;
 
 	if (jget(body, "op", op, sizeof op) != 1)
@@ -1564,52 +1554,42 @@ static MHD_RESULT route_ddl(struct MHD_Connection *c, const char *body,
 		pthread_mutex_unlock(&FL.mu);
 		return no_member(c, node);
 	}
-	/* its own handle, outside the fleet lock: a create waits on the WAL's fsync, which a
-	 * stalled disk holds past the page handles' 5 s */
-	snprintf(addr, sizeof addr, "%s", m->addr);
-	port = m->port;
-	mnode = m->node;
-	snprintf(en, sizeof en, "%s", FL.enable);
-	pthread_mutex_unlock(&FL.mu);
+	member_connect(m);
+	if (!m->p) {
+		char err[400];
+
+		snprintf(err, sizeof err, "node %s:%d: %s", m->addr, m->port,
+			m->err[0] ? m->err : "not connected");
+		pthread_mutex_unlock(&FL.mu);
+		return send_err(c, 502, err);
+	}
 	if (index >= 0)                    /* what the log lines name */
 		snprintf(what, sizeof what, "db %d%s%s", index, col[0] ? " -> " : "",
 			col);
 	else
 		snprintf(what, sizeof what, "%s%s%s", col, to[0] ? " -> " : "", to);
-	p = dial_io(addr, port, err, sizeof err, (CF.ddl_timeout_s > 0 ?
-		CF.ddl_timeout_s : 60) * 1000);
-	if (!p) {
-		char e2[512];
-
-		sodium_memzero(en, sizeof en);
-		snprintf(e2, sizeof e2, "node %s:%d: %s", addr, port, err);
-		return send_err(c, 502, e2);
-	}
-	r = en[0] && perfd_enable(p, en) != 0 ? NULL
-		: !strcmp(op, "create") ? perfd_create(p, col, log2)
-		: !strcmp(op, "drop") ? perfd_drop(p, col, force)
-		: !strcmp(op, "resize") ? perfd_resize(p, col, log2)
-		: !strcmp(op, "map") ? perfd_map(p, index, col)
-		: !strcmp(op, "unmap") ? perfd_unmap(p, index)
-		: perfd_rename(p, col, to);
-	sodium_memzero(en, sizeof en);
+	r = !strcmp(op, "create") ? perfd_create(m->p, col, log2)
+		: !strcmp(op, "drop") ? perfd_drop(m->p, col, force)
+		: !strcmp(op, "resize") ? perfd_resize(m->p, col, log2)
+		: !strcmp(op, "map") ? perfd_map(m->p, index, col)
+		: !strcmp(op, "unmap") ? perfd_unmap(m->p, index)
+		: perfd_rename(m->p, col, to);
 	if (!r) {
-		int kind = perfd_error_kind(p);
+		char err[300];
 
-		snprintf(err, sizeof err, "%s", perfd_error(p));
-		perfd_free(p);
+		snprintf(err, sizeof err, "%s", perfd_error(m->p));
 		logmsg("%s: %s %s on node %d (%s:%d) refused: %s", from, op, what,
-			mnode, addr, port, err);
-		return send_err(c, kind == PERFD_E_SERVER ? 409 : 502, err);
+			m->node, m->addr, m->port, err);
+		pthread_mutex_unlock(&FL.mu);
+		return send_err(c, perfd_error_kind(m->p) == PERFD_E_SERVER ? 409
+			: 502, err);
 	}
 	logmsg("%s: %s %s on node %d (%s:%d): %s", from, op, what,
-		mnode, addr, port, r);
-	pthread_mutex_lock(&FL.mu);
+		m->node, m->addr, m->port, r);
 	m->stats_at = 0;
 	pthread_mutex_unlock(&FL.mu);
 	rc = send_bytes(c, 200, "application/json", r, strlen(r), 0);
 	perfd_free_value(r);
-	perfd_free(p);
 	return rc;
 }
 

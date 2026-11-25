@@ -24,7 +24,6 @@ enum {
 
 struct clack_stats {
 	unsigned long long applied, dups, far, full;
-	unsigned long long dropped;    /* spaces forgotten by clack_drop */
 	unsigned int spaces;
 	int durable_on_apply;
 };

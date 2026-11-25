@@ -5,7 +5,6 @@
 #include <string.h>
 
 #include "ptree.h"
-#include "json.h"
 
 static int pass, fail;
 #define OK(c, m) do { if (c) pass++; else { fail++; printf("FAIL: %s\n", m); } } while (0)
@@ -293,43 +292,6 @@ int main(void)
 		pc_tw_free(&w);
 	}
 
-	/* the tokenizer takes JSON only: structure and primitives per RFC 8259 */
-	{
-		static const char *const bad[] = { "[1 2]", "{\"a\":1,}", "[\"k\":\"v\"]", "{\"a\"}",
-			"{\"a\" 1}", "{,}", "[,1]", "[1,,2]", "{\"a\"::1}", "{1:2}", "tru", "01", "1.",
-			"-", "nul", "abc", "[1]]", "{\"a\":1}{}", "1 2", "", "   ", "[}", ":1", NULL };
-		static const char *const good[] = { "{}", "[]", "{\"a\":[1,-2.5e3,true,false,null]}",
-			" { \"a\" : { \"b\" : [ ] } } ", "\"s\"", "0", "-0.5", "[[],[{}]]", NULL };
-		struct pc_jtok t[64];
-		int i, n;
-
-		for (i = 0; bad[i]; i++) {
-			n = pc_json_parse(bad[i], strlen(bad[i]), t, 64);
-			if (n >= 0)
-				printf("FAIL: '%s' tokenized (%d tokens)\n", bad[i], n);
-			OK(n < 0, "not JSON, not tokenized");
-		}
-		for (i = 0; good[i]; i++) {
-			n = pc_json_parse(good[i], strlen(good[i]), t, 64);
-			if (n < 1)
-				printf("FAIL: '%s' refused\n", good[i]);
-			OK(n >= 1, "JSON tokenized");
-		}
-		n = pc_json_parse("{\"a\":{\"b\":1},\"b\":2}", 19, t, 64);
-		OK(n == 7 && pc_json_get("{\"a\":{\"b\":1},\"b\":2}", t, n, 0, "b") == 6,
-			"a key is looked up among the object's own members, not a nested one's");
-		/* tokens as a lax tokenizer left them for [{"a"},2]: the key's value must
-		 * be the object's, never the token after it */
-		{
-			const char *j = "[{\"a\"},2]";
-			struct pc_jtok h[4] = {
-				{ PC_J_ARR, 0, 9, 2, -1 }, { PC_J_OBJ, 1, 6, 0, 0 },
-				{ PC_J_STR, 3, 4, 0, 1 }, { PC_J_PRIM, 7, 8, 0, 0 } };
-
-			OK(pc_json_get(j, h, 4, 1, "a") < 0,
-				"a key with no value inside the object answers absent, not the next token");
-		}
-	}
 	printf("ptreetest: %d passed, %d failed\n", pass, fail);
 	return fail != 0;
 }

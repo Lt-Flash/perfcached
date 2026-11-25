@@ -25,8 +25,6 @@
 #include "clreplay.h"
 #include "clstate.h"
 #include "clpeers.h"
-
-void (*clps_idle_fn)(void);
 #include "clsend.h"
 #include "clwire.h"
 #include "clmsg.h"
@@ -528,8 +526,6 @@ void pc_cluster_pubsub_rx_thread(volatile int *stop, int idx)
 		int seen = 0, prc, nt = tr ? clrpt_rx_pollset(tr, pf + 1,
 			1 + CLRPT_RX_CONNS) : 0;
 
-		if (clps_idle_fn)
-			clps_idle_fn();
 		pc_qs_exit();
 		prc = poll(pf, (nfds_t)(1 + nt), 100);
 		pc_qs_enter();

@@ -58,8 +58,6 @@ int clres_take(struct clres *r, const unsigned char *ident,
 int clres_count(const struct clres *r, long long now);
 /* live reservations of members that left for @why (CLRES_GONE_*) */
 int clres_count_why(const struct clres *r, int why, long long now);
-/* drop every reservation of @id at once (the operator's forget): how many */
-int clres_drop(struct clres *r, int id);
 
 /* The address a live reservation for @ident was last held at, without
  * consuming it.  Returns 1 and fills *home, or 0. */

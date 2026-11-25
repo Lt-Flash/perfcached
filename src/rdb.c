@@ -429,7 +429,6 @@ void pc_rdb_thread(volatile int *stop)
 		int fire = 0, i;
 
 		usleep(250 * 1000);
-		pcache_arena_flush_if_asked();
 		if (!R.enabled || R.hold)
 			continue;
 		if (R.save_req)

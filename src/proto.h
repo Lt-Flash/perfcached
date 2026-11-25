@@ -134,11 +134,6 @@ int pc_conn_out_paused_open(void);
 int pc_conn_wal_paused_open(void);
 void pc_conn_resume_wal(void);
 void pc_conn_wal_pause_stats(unsigned long long *now, unsigned long long *pauses);
-/* fsync = sync: replies held until their writes are synced, released once a turn */
-int pc_conn_sync_held_open(void);
-void pc_conn_resume_sync(void);
-void pc_conn_sync_stats(unsigned long long *now, unsigned long long *holds,
-		unsigned long long *hold_ms);
 struct pc_out_pause_stats { unsigned long long paused_now, pauses, stall_kills; };
 void pc_conn_out_pause_stats(struct pc_out_pause_stats *s);
 extern int pc_output_stall_s;               /* [daemon] output_stall_s: stalled that long, closed */

@@ -10,8 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* SYNC fsyncs as ALWAYS does, and a client's reply waits until its write is synced */
-enum pc_wal_fsync { PC_WFSYNC_EVERYSEC = 0, PC_WFSYNC_ALWAYS, PC_WFSYNC_NO, PC_WFSYNC_SYNC };
+enum pc_wal_fsync { PC_WFSYNC_EVERYSEC = 0, PC_WFSYNC_ALWAYS, PC_WFSYNC_NO };
 
 /* PC_WAL_HEAL_ROUTINE heals within PC_WAL_HEAL_WIN_S seconds is routine healing: the log is
  * undersized for the write rate, not unlucky */
@@ -200,16 +199,6 @@ int pc_wal_tight(int resume);
 /* set while a connection is served - the WAL marks it a writer when
  * one of its records is logged (proto.c pauses writers only) */
 extern __thread int *pc_wal_wrote;
-
-/* fsync = sync: the last seq this thread logged with no connection set (a completion's write), the
- * connection's slot while one is served, the watermark, and a worker asking for a kick when it moves */
-extern __thread unsigned long long pc_wal_tl_seq;
-extern __thread unsigned long long *pc_wal_conn_seq;
-int pc_wal_sync_mode(void);
-unsigned long long pc_wal_synced_low(void);
-int pc_wal_failed(void);
-void pc_wal_worker_register(int worker, int efd);
-void pc_wal_kick_wanted(void);
 
 /* clean shutdown: final pump + fdatasync */
 void pc_wal_shutdown(void);

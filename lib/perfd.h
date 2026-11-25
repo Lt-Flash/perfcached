@@ -25,8 +25,8 @@
 #define PERFD_VERSION_MAJOR 0
 #define PERFD_VERSION_MINOR 7
 #define PERFD_VERSION_PATCH 6
-#define PERFD_VERSION_TWEAK 2          /* the fourth number; 0: none */
-#define PERFD_VERSION "0.7.6.2"
+#define PERFD_VERSION_TWEAK 1          /* the fourth number; 0: none */
+#define PERFD_VERSION "0.7.6.1"
 /* the oldest daemon this binary wire works with: an older one answers the first request
  * with "unknown verb", which perfd_error() names */
 #define PERFD_NEEDS_PERFCACHED "0.4.5"
@@ -93,9 +93,6 @@ typedef struct perfd_opts {
 	/* 1 = every call goes to the node dialled - the fleet is still learned, but no
 	 * policy, routing, refusal, dead link or expulsion moves the handle; its answer is the caller's */
 	int pin;
-	/* the most perfd_apool_get waits on a new handle's dial, ms: 0 = 500, -1 = all of
-	 * connect_timeout; a dial still going then fails the get and is finished unblocked */
-	int dial_wait_ms;
 } perfd_opts;
 /* designated, so -Wextra's missing-field-initializers stays quiet; C++ and
  * FFI callers use perfd_opts_init_sz() with their own struct's size */
@@ -595,8 +592,6 @@ void perfd_apool_free(perfd_apool *pool);     /* in-flight callbacks never run *
 /* submit GET @key: @cb gets the get reply ([u8 found][u32 ttl][value]) or NULL + errmsg.  The fd to
  * watch for reading, PERFD_APOOL_DONE (@cb already ran), or -1 (@cb not called; perfd_error(NULL)) */
 #define PERFD_APOOL_DONE (-2)
-/* a new handle's dial blocks the get dial_wait_ms at most (500; connect_timeout if lower): one still
- * connecting fails the get at once (-1) and is finished, without blocking, by the gets after it */
 int perfd_apool_get(perfd_apool *pool, const char *key, perfd_reply_cb cb,
 		void *ctx);
 /* on readiness of @fd: 1 = @cb ran (reply or error), 0 = still pending, -1 = no request on @fd */

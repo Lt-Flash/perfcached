@@ -37,7 +37,7 @@ $ redis-cli -p 6380 -a resp-password-example --no-auth-warning GET user:42
 alice
 ```
 
-**Current release: 0.7.5.2** (2026-11-30), with libperfd 0.7.6.2 and
+**Current release: 0.7.5.1** (2026-11-26), with libperfd 0.7.6.1 and
 php-perfcached 0.2.0.  [GUIDE.md](GUIDE.md) shows how to install it,
 build a cluster, take over from Redis, upgrade, back up and watch it,
 with real output.
@@ -120,7 +120,7 @@ with real output.
   `resp_allow` and `[secrets] resp`, or on TLS.
 - **Upgrading from 0.7.4.x is a whole-fleet stop**: 0.7.5 and later
   speak cluster wire epoch 4 alone and refuse an older node.  Stop
-  every node (`perfcli -E <enable> fleetstop`), install 0.7.5.2, start
+  every node (`perfcli -E <enable> fleetstop`), install 0.7.5.1, start
   them all; the state is kept ([GUIDE.md](GUIDE.md#upgrade)).  Use
   libperfd 0.7.6 or later with it: an older libperfd does not route by
   key against 0.7.5 and later (every request takes a forward hop) and
@@ -141,15 +141,6 @@ top of the [ChangeLog](ChangeLog) before upgrading:
 time is refused as retryable instead of answered absent, and an IPv4
 allow-list entry must be a full dotted quad (`10/8` is refused).
 
-**0.7.5.2** goes on: a node restarted from its write-ahead log now gets
-the records it missed from its peers instead of waiting for them to be
-read, a shard member that fails while it stays up hands its keys to all
-the survivors, `perfcli -E <enable> forget <id>` clears a member removed
-for good, and an async-pool get waits at most `dial_wait_ms` (500 ms)
-for a new connection.  It rolls node by node from 0.7.5 and 0.7.5.1.
-JSON documents are read strictly: one stored before 0.7.5.1 that is not
-valid JSON now fails to read instead of being guessed at.
-
 Report anything odd as an
 [issue](https://github.com/Lt-Flash/perfcached/issues), with `perfcached
 -V`, the config (secrets removed) and the log around the event.  A
@@ -164,13 +155,13 @@ security problem goes privately, as [SECURITY.md](SECURITY.md) says.
 node only) - they install the same files and replace each other - and
 `perfcached-dashboard` (Debian 13 and 12, Ubuntu 24.04).  On Alpine all
 three come as signed `.apk` files; a release tarball installs under
-`/opt/perfcached-0.7.5.2`.
+`/opt/perfcached-0.7.5.1`.
 
 ```
-sudo apt install ./perfcached_0.7.5.2-1+deb13_amd64.deb
+sudo apt install ./perfcached_0.7.5.1-1+deb13_amd64.deb
 ```
 
-**libperfd** 0.7.6.2: `libperfd0` (the shared library) and
+**libperfd** 0.7.6.1: `libperfd0` (the shared library) and
 `libperfd-dev` (header, static archive, pkg-config file) as `.deb`,
 `libperfd` / `libperfd-dev` as `.apk`.  A program built against
 `libperfd-dev` links the shared library, so a libperfd update with the
@@ -304,9 +295,9 @@ Every table, its method and how to reproduce it:
 
 ## Upgrading
 
-- **0.7.4.x to 0.7.5.2**: a whole-fleet stop (above).
-- **0.7.5 or 0.7.5.1 to 0.7.5.2**: a rolling restart, as below; no
-  collection create, drop or rename while the fleet is mixed.
+- **0.7.4.x to 0.7.5.1**: a whole-fleet stop (above).
+- **0.7.5 to 0.7.5.1**: a rolling restart, as below; no collection
+  create, drop or rename while the fleet is mixed.
 - **Within the support window** - from 0.7.5 to a later 0.7.5.x patch or
   to the next minor's releases - a rolling restart: members first, the master last,
   one node at a time, each only once its `stats.cluster.restart.safe`

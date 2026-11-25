@@ -3583,26 +3583,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tw_end(out);
 		return 0;
 	}
-	/* forget {node}: a member removed for good - its reserved id released here, its card and
-	 * fleet.node warning gone; each node holds its own reservations */
-	if (m_is(method, mlen, "forget")) {
-		long long node = 0;
-		const char *why;
-
-		if (!privileged || !*privileged)
-			ERR(pc_enable_configured() ? PC_NOPRIV_MSG
-				: PC_NOENABLE_MSG);
-		if (pc_tv_get_int(v, params, "node", &node) != 0)
-			ERR("forget wants {\"node\": <a departed member's node id>}");
-		if ((why = pc_cluster_forget(node < 1 || node > PC_CL_NODE_MAX ?
-		        -1 : (int)node)))
-			ERR(why);
-		pc_tw_map(out);
-		pc_tw_key(out, "forgotten");
-		pc_tw_i64(out, node);
-		pc_tw_end(out);
-		return 0;
-	}
 	/* master_prefer {node} on the master hands mastership to that
 	 * member once it is the synced standby; master_auto (node 0) cancels */
 	if (m_is(method, mlen, "master_prefer") || m_is(method, mlen, "master_auto")) {

@@ -660,31 +660,6 @@ uint64_t clretain_space_gone(uint64_t oid, uint32_t incarn)
 	return g;
 }
 
-int clretain_space_drop(uint64_t oid, uint32_t incarn)
-{
-	unsigned int i;
-	int k;
-
-	if (!R_on)
-		return 1;
-	for (i = 0; i < NSHARD; i++) {
-		pthread_mutex_lock(&sh[i].mx);
-		k = spl_slot(&sh[i], oid, incarn, 0);
-		k = k >= 0 && sh[i].sp[k].head != NULL;
-		pthread_mutex_unlock(&sh[i].mx);
-		if (k)
-			return 0;
-	}
-	pthread_mutex_lock(&FG_mx);
-	for (i = 0; i < nfg; i++)
-		if (FG[i].oid == oid && FG[i].incarn == incarn) {
-			FG[i] = FG[--nfg];
-			break;
-		}
-	pthread_mutex_unlock(&FG_mx);
-	return 1;
-}
-
 unsigned int clretain_space_each(uint64_t oid, uint32_t incarn, uint64_t from,
 		uint64_t to, unsigned int max,
 		void (*cb)(const char *col, size_t cn, const char *key, size_t kn,

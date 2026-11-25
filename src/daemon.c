@@ -491,7 +491,6 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 		pc_conn_resume_paused();
 		pc_conn_resume_out();
 		pc_conn_resume_wal();
-		pc_conn_resume_sync();
 		pc_pubsub_flush_wakes();
 		pc_conn_flush_pushes();
 		pc_qs_exit();
@@ -513,7 +512,6 @@ static void worker_loop_uring(struct worker_arg *wa, struct pc_ur *ur,
 		}
 		tmo = pc_enum_pending() || pc_conn_hs_parked() || any_more ? 0
 			: pc_conn_wal_paused_open() ? 1
-			: pc_conn_sync_held_open() ? 10
 			: pc_conn_paused_open() || pc_conn_deny_open() ? 50
 			: (pc_conn_http_open() || pc_conn_udp_open() ||
 			   pc_conn_bufs_held() || pc_conn_out_paused_open() ? 1000 : -1);
@@ -614,7 +612,6 @@ static void *worker_main(void *p)
 	pc_cluster_worker_register(wa->slot->idx, wa->slot->efd);
 	pc_pubsub_worker_register(wa->slot->idx, wa->slot->efd);
 	pc_upstream_worker_register(wa->slot->idx, wa->slot->efd);
-	pc_wal_worker_register(wa->slot->idx, wa->slot->efd);
 	pcache_ht_shadow_reads(1);          /* client reads only */
 	pc_conn_push_batching();
 	pc_pubsub_defer_wakes();
@@ -725,7 +722,6 @@ static void *worker_main(void *p)
 		pc_conn_resume_paused();
 		pc_conn_resume_out();
 		pc_conn_resume_wal();
-		pc_conn_resume_sync();
 		pc_pubsub_flush_wakes();
 		pc_conn_flush_pushes();
 		pc_qs_exit();                  /* parked across the wait */
@@ -737,7 +733,6 @@ static void *worker_main(void *p)
 		n = epoll_wait(ep, evs, 32,
 			pc_enum_pending() || pc_conn_hs_parked() ? 0
 			: pc_conn_wal_paused_open() ? 1
-			: pc_conn_sync_held_open() ? 10
 			: pc_conn_paused_open() || pc_conn_deny_open() ? 50
 			: (pc_conn_http_open() || pc_conn_udp_open() ||
 			   pc_conn_bufs_held() || pc_conn_out_paused_open() ? 1000 : -1));
@@ -1590,11 +1585,10 @@ int pc_daemon_run(struct pc_config *cfg)
 
 		/* bring the WAL up - explicit knobs win, the probe's
 		 * policy fills what the config left at 0 */
-		if ((cfg->wal_fsync == 1 || cfg->wal_fsync == 3) &&
+		if (cfg->wal_fsync == 1 &&
 		        strcmp(pol.fsync_recommend, "always"))
-			LM_WARN("wal: fsync=%s configured but the probe "
-				"recommends %s on this device\n", cfg->wal_fsync == 3 ?
-				"sync" : "always", pol.fsync_recommend);
+			LM_WARN("wal: fsync=always configured but the probe "
+				"recommends %s on this device\n", pol.fsync_recommend);
 		{
 			static const struct pc_rdb_rule defrules[] = {
 				{ 900, 1 }, { 300, 10 }, { 60, 10000 } };
@@ -1630,9 +1624,6 @@ int pc_daemon_run(struct pc_config *cfg)
 			/* before the checkpoint below, whose marker is
 			 * stamped with this sequence */
 			pc_wal_seq_atleast(rst.last_seq);
-			/* and above the snapshot's marker: a log lost to a power loss can end below it */
-			if (rst.rdb_ok)
-				pc_wal_seq_atleast(rst.marker);
 			/* the loaded snapshot covers what it covers,
 			 * checkpoint or not - pc_wal_init asks below */
 			if (rst.rdb_ok)
@@ -1649,7 +1640,7 @@ int pc_daemon_run(struct pc_config *cfg)
 		/* fsync = always fsyncs once per drained batch, so the ring must absorb the fdatasync window:
 		 * on ms-class storage 1 MB overflows and DROPS acknowledged writes - take the probe's depth */
 		ring_kb = cfg->wal_ring_kb;
-		if ((cfg->wal_fsync == 1 || cfg->wal_fsync == 3) && !cfg->wal_ring_kb_set &&
+		if (cfg->wal_fsync == 1 && !cfg->wal_ring_kb_set &&
 		        pol.ring_kb_always > ring_kb) {
 			LM_NOTICE("wal: fsync = always on %lldus-p99 storage - "
 				"ring %d -> %d KB per writer so the pump's "
@@ -1659,7 +1650,7 @@ int pc_daemon_run(struct pc_config *cfg)
 				pc_wal_probe_result()->fsync_p99_us : 0,
 				ring_kb, pol.ring_kb_always);
 			ring_kb = pol.ring_kb_always;
-		} else if ((cfg->wal_fsync == 1 || cfg->wal_fsync == 3) && !pol.ring_kb_always) {
+		} else if (cfg->wal_fsync == 1 && !pol.ring_kb_always) {
 			LM_WARN("wal: fsync = always with no probe - the ring "
 				"depth CANNOT be sized for this device.  If "
 				"fdatasync here takes milliseconds the ring "
@@ -1668,7 +1659,7 @@ int pc_daemon_run(struct pc_config *cfg)
 				"after a restart.  Set [wal] probe = auto, or "
 				"raise ring_kb.\n");
 		}
-		if ((cfg->wal_fsync == 1 || cfg->wal_fsync == 3) && pol.fsync_recommend &&
+		if (cfg->wal_fsync == 1 && pol.fsync_recommend &&
 		        strcmp(pol.fsync_recommend, "always") != 0 &&
 		        pc_wal_probe_result()) {
 			LM_WARN("wal: fsync = always but this device measures "
@@ -1715,8 +1706,7 @@ int pc_daemon_run(struct pc_config *cfg)
 		pc_wal_set_segments_max(cfg->wal_segments_max);
 		if (pc_wal_init(cfg->wal_dir,
 		        cfg->wal_fsync == 1 ? PC_WFSYNC_ALWAYS :
-		        cfg->wal_fsync == 2 ? PC_WFSYNC_NO :
-		        cfg->wal_fsync == 3 ? PC_WFSYNC_SYNC : PC_WFSYNC_EVERYSEC,
+		        cfg->wal_fsync == 2 ? PC_WFSYNC_NO : PC_WFSYNC_EVERYSEC,
 		        cfg->wal_segment_mb ? cfg->wal_segment_mb : pol.segment_mb,
 		        cfg->wal_segments, ring_kb, wnr, wkb) != 0) {
 			free(wkb);
@@ -2079,7 +2069,6 @@ int pc_daemon_run(struct pc_config *cfg)
 				nw, w);
 	}
 	pc_metrics_mark_start();       /* uptime counts from HERE: a slow recovery is not uptime */
-	pcache_arena_flush_private();  /* the replay's and imports' cells: this thread allocates no more */
 	LM_NOTICE("perfcached ready: %d workers, %d collections, %d "
 		"listeners, arena %s\n", nw, n_cols, cfg->n_listen,
 		cfg->backing_heap ? "heap" : "reserved");
