@@ -38,13 +38,13 @@ static int cfgsig_add(struct pc_cfgsig *e, int n, const char *name,
 
 void cfgsig_build(const struct pc_config *cfg)
 {
-	static const char *const fs[] = { "everysec", "always", "no" };
+	static const char *const fs[] = { "everysec", "always", "no", "sync" };
 	struct pc_cfgsig e[PC_CFGSIG_MAX];
 	char nm[48], wt[64], v[256];
 	int n = 0, i;
 
 	n = cfgsig_add(e, n, "wal.fsync", "[wal] fsync", !cfg->wal_dir ? "off"
-		: cfg->wal_fsync >= 0 && cfg->wal_fsync <= 2 ? fs[cfg->wal_fsync]
+		: cfg->wal_fsync >= 0 && cfg->wal_fsync <= 3 ? fs[cfg->wal_fsync]
 		: "?");
 	n = cfgsig_add(e, n, "http.token", "the HTTP token ([secrets] http)",
 		cfg->http_token ? "set" : "none");

@@ -1799,6 +1799,21 @@ void pcache_arena_flush_private(void)
 	palloc_flush(pl);
 }
 
+static __thread unsigned long my_flush_seen;
+
+void pcache_arena_flush_if_asked(void)
+{
+	unsigned long g;
+
+	if (!arena || backing != PCACHE_BACKING_OWN || !my_palloc)
+		return;
+	g = __atomic_load_n(&arena->flush_broadcasts, __ATOMIC_RELAXED);
+	if (g != my_flush_seen) {
+		my_flush_seen = g;
+		palloc_flush(my_palloc);
+	}
+}
+
 void *pcache_cell_alloc(unsigned int size)
 {
 	struct pcache_palloc *pl;
@@ -1877,7 +1892,7 @@ void *pcache_cell_alloc(unsigned int size)
 
 		if (ask) {
 			arena->full_flush_at = arena->tick + 1;
-			arena->flush_broadcasts++;
+			__atomic_add_fetch(&arena->flush_broadcasts, 1, __ATOMIC_RELAXED);
 		}
 		lock_release(&arena->lock);
 		if (ask)
@@ -2626,7 +2641,7 @@ void pcache_arena_reclaim_tick(void)
 	if (lingering &&
 	    arena->tick - arena->flush_tick >= (unsigned int)pcache_reclaim_quiet_s) {
 		arena->flush_tick = arena->tick;
-		arena->flush_broadcasts++;
+		__atomic_add_fetch(&arena->flush_broadcasts, 1, __ATOMIC_RELAXED);
 		lock_release(&arena->lock);
 		ipc_send_rpc_all(pcache_flush_rpc, NULL);
 		return;
@@ -3265,6 +3280,22 @@ int pcache_arena_selftest(void)
 			pcache_cell_free(big[i]);
 	}
 	pcache_arena_stats(&n3, &by1);
+
+	/* a thread outside the broadcast's reach lets go at its next look once a flush was asked,
+	 * and keeps its hoard while none was */
+	a = pcache_cell_alloc(64);
+	CHK(a != NULL, "alloc before the asked flush failed\n");
+	pcache_cell_free(a);
+	pcache_arena_flush_if_asked();
+	a = pcache_cell_alloc(64);
+	pcache_cell_free(a);
+	c = size2class[(64 + 31) / 32];
+	CHK(my_palloc->cls[c].nfree > 0, "the free stack emptied with no flush asked\n");
+	__atomic_add_fetch(&arena->flush_broadcasts, 1, __ATOMIC_RELAXED);
+	pcache_arena_flush_if_asked();
+	CHK(my_palloc->cls[c].nfree == 0 && !my_palloc->cls[c].free_head &&
+	    !my_palloc->cls[c].bump, "an asked flush kept %u cells on the free stack\n",
+		my_palloc->cls[c].nfree);
 
 	/* fork-reset path: drop the private state, then allocate fresh */
 	pcache_arena_child_init();

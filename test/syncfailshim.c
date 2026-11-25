@@ -1,5 +1,5 @@
 /* syncfailshim.c - LD_PRELOAD shim: the classes the file PC_SYNCFAIL_CTL names, read at each sync,
- * make those syncs, WAL appends or term stores fail or stall; each refusal goes to PC_SYNCFAIL_LOG. */
+ * make those syncs, WAL appends or term stores fail, stall or wait; each goes to PC_SYNCFAIL_LOG. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -155,8 +155,54 @@ static void slow_state(int fd)
 	usleep((useconds_t)(d > 0 ? d : 2000) * 1000);
 }
 
+/* "walhold": a WAL segment's sync waits while the class stays armed (60 s at most) */
+static void hold_wal(int fd)
+{
+	char want[32], lnk[64], path[512];
+	const char *base;
+	ssize_t n;
+	int i, said = 0;
+
+	armed(want, sizeof want);
+	if (!has(want, "walhold"))
+		return;
+	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
+	n = readlink(lnk, path, sizeof path - 1);
+	if (n <= 0)
+		return;
+	path[n] = 0;
+	base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	if (strncmp(base, "wal-", 4) != 0 || !strstr(base, ".seg"))
+		return;
+	for (i = 0; i < 6000 && has(want, "walhold"); i++) {
+		if (!said++)
+			note("walhold", path);
+		usleep(10000);
+		armed(want, sizeof want);
+	}
+}
+
+/* "dirlog": every directory sync is noted, not changed */
+static void log_dir(int fd)
+{
+	char want[32], lnk[64], path[512];
+	struct stat st;
+	ssize_t n;
+
+	armed(want, sizeof want);
+	if (!has(want, "dirlog") || fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode))
+		return;
+	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
+	n = readlink(lnk, path, sizeof path - 1);
+	path[n > 0 ? n : 0] = 0;
+	note("dirlog", path);
+}
+
 int fdatasync(int fd)
 {
+	log_dir(fd);
+	hold_wal(fd);
 	if (refuse(fd))
 		return -1;
 	slow_dir(fd);
@@ -166,6 +212,8 @@ int fdatasync(int fd)
 
 int fsync(int fd)
 {
+	log_dir(fd);
+	hold_wal(fd);
 	if (refuse(fd))
 		return -1;
 	slow_dir(fd);

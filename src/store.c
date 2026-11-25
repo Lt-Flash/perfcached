@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include "core/pcache_arena.h"
 #include "fnv1a.h"
+#include "statefile.h"                  /* pc_state_sync_dir */
 
 /* writers (create, drop) serialize here; readers take nothing: an entry is filled before reg_n
  * is published and reg_n never shrinks, so a reader sees a new entry complete or not at all */
@@ -1668,6 +1669,11 @@ static int store_persist_locked(void)
 		unlink(tmp);
 		free(body);
 		return rc;
+	}
+	/* the new name survives a power loss only once the directory is synced */
+	if (pc_state_sync_dir(colfile_dir) != 0) {
+		free(body);
+		return -1;
 	}
 	free(colfile_last);
 	colfile_last = body;

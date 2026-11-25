@@ -814,6 +814,10 @@ struct pc_proxy_stats {
 		sweep_gate_asked, sweep_gate_answered, sweep_gate_unanswered,
 		sweep_gate_clean, sweep_gate_idle, sweep_gate_slots_asked,
 		sweep_gate_slots_diff, sweep_gate_digested, sweep_gate_walks,
+		/* the diff toward a member back from its WAL: armed, rounds, differing slots
+		 * walked, ended all equal, ended still differing, not possible */
+		dsync_armed, dsync_rounds, dsync_slots, dsync_done, dsync_stopped,
+		dsync_off,
 		spread_gap_repaired,  /* re-placements armed toward a peer back from silence */
 		/* copies refused because ours was the same age or newer; only climbing means a
 		 * sender loops on records nobody will take */
@@ -887,6 +891,10 @@ int pc_cluster_fleet_stop(long long timeout_ms, int *gone, int *ngone,
 		int *still, int *nstill, int *lost, int *nlost, int cap);
 /* hand mastership to live member @node (0 cancels); NULL or why not */
 const char *pc_cluster_master_prefer(int node);
+/* release departed member @node's reserved id here, on the next beat; NULL or why not */
+const char *pc_cluster_forget(int node);
+/* bumped by every forget applied - the alerts' fleet size shrinks with it */
+unsigned int pc_cluster_forget_gen(void);
 int  pc_cluster_peers(struct pc_cl_peer_info *out, int max);
 /* peers holding a node id, up or not, plus silent ones purged with their id still reserved */
 int  pc_cluster_peers_known(void);

@@ -115,6 +115,8 @@ void pcache_arena_destroy(void);
  * share a bump pointer. */
 void pcache_arena_child_init(void);
 void pcache_arena_flush_private(void);       /* a done process sends cells home */
+/* a thread outside the broadcast's reach: its cells home once a flush was asked since its last look */
+void pcache_arena_flush_if_asked(void);
 void pcache_arena_reclaim_tick(void);        /* the reclaim process, 1/s */
 /*
  * S188: top up the commit-ahead window, and nothing else.

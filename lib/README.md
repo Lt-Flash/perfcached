@@ -189,12 +189,15 @@ port (1-65535); up to 8 seeds.  The secret is the password field, or the
 user field when there is no password; `%XX` escapes a `:`, `@` or `/` in
 either.  The options, split by `,` or `&`, are `route=0|1` (default 1),
 `encrypt=0|1` (default 1), `spares=-1..8` (0 none, -1 one per member, the
-default) and `policy=failover|rr|least|weighted` (default failover).  The
+default), `policy=failover|rr|least|weighted` (default failover) and
+`dial_wait_ms=-1|1..60000`: how long an async pool's get waits on a new
+connection before it fails while the dial goes on in the background (default
+500, never past connect_timeout; -1 waits all of it).  The
 parse is strict: an unknown option, a repeated one or a bad value is an
 error, and the reason comes back in the caller's buffer.
 `perfd_url_collection`, `perfd_url_secret`, `perfd_url_group` and
 `perfd_url_seed` read the parts back; `perfd_url_apply` writes the four
-options (the URL's or their defaults) and the secret into a `perfd_opts`,
+options (the URL's or their defaults), `dial_wait_ms` when the URL gives it, and the secret into a `perfd_opts`,
 touching only the fields the caller's struct holds - timeouts, name and the
 rest stay the caller's.
 

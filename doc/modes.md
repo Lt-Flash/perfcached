@@ -274,6 +274,16 @@ the old master steps down on its first beacon, with no silent interval.
 A handover not taken within 20 s is given up (the log says so), as is one
 whose member leaves; `master_auto` cancels one still pending.
 
+**Removing a member for good.**  A member that leaves keeps its id
+reserved for a week, so it gets the same id back if it returns; until
+then it stays on the fleet view and raises its `fleet.node<id>` warning.
+When it will not come back, run `perfcli -E <enable secret> forget <id>`
+on each remaining node: the id is released there, the card and the
+warning go, and the fleet counts one member fewer.  Each node holds its
+own reservations, so each needs the command.  A member still listed as
+live is refused; stop it first.  If it does come back later, it joins
+as a new member.
+
 ## An eager fleet under write pressure
 
 Applying eager's copies takes a few threads per node - the relay

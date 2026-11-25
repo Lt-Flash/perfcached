@@ -932,6 +932,17 @@ const char *pc_cluster_master_prefer(int node)
 	return "this node is not clustered";
 }
 
+const char *pc_cluster_forget(int node)
+{
+	(void)node;
+	return "this node is not clustered";
+}
+
+unsigned int pc_cluster_forget_gen(void)
+{
+	return 0;
+}
+
 int pc_cluster_eager_miss_final(void)
 {
 	return 0;

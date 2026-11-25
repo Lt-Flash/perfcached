@@ -250,6 +250,8 @@ int clapply_take(struct clapply *a, int idx, volatile int *stop,
 		}
 		__atomic_store_n(&r->sleeping, 0, __ATOMIC_RELEASE);
 		pthread_mutex_unlock(&r->mx);
+		if (a->idle)
+			a->idle();                 /* nothing pending: the owner's idle work */
 	}
 	out->r.col = r->buf + head + HDR;
 	out->r.key = out->r.col + h.collen;

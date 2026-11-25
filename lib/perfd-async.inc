@@ -305,11 +305,11 @@ static int hs_build_msg1(perfd_t *p)
 	size_t mlen = 0;
 
 	if (psk_for(p->sec[p->hs_sec], psk) != 0)
-		return errk(p, PERFD_E_AUTH, "key derivation failed");
+		return errk(p, PERFD_E_NOMEM, "key derivation failed");
 	pc_hs_init_initiator(&p->hs, prologue, 1);
 	if (pc_hs_write_msg1(&p->hs, psk, ver, p->want_enc ? 1 : 2, msg + 3, &mlen) != 0) {
 		sodium_memzero(psk, sizeof psk);
-		return errk(p, PERFD_E_AUTH, "handshake build failed");
+		return errk(p, PERFD_E_NOMEM, "handshake build failed");
 	}
 	sodium_memzero(psk, sizeof psk);
 	msg[0] = (uint8_t)(1 + mlen);
@@ -334,6 +334,16 @@ static int hs_take_msg2(perfd_t *p)
 
 	if (p->cinlen < 2)
 		return 0;
+	if (p->cin[0] == '-' && p->cin[1] == 'E') {
+		char why[128];
+
+		if (!memchr(p->cin, '\n', p->cinlen) && p->cinlen < sizeof why)
+			return 0;              /* the rest of the line, or the close */
+		if (hs_refusal((const uint8_t *)p->cin, p->cinlen, why, sizeof why)) {
+			p->poisoned = 1;
+			return errk(p, PERFD_E_REFUSED, "refused by the node: %s", why);
+		}
+	}
 	cl = (size_t)(unsigned char)p->cin[0] |
 		((size_t)(unsigned char)p->cin[1] << 8);
 	if (cl == 0 || cl > sizeof m2) {
@@ -606,7 +616,12 @@ int perfd_read_ready(perfd_t *p)
 	}
 	if (cin_pull(p) < 0) {
 		/* a node drops a msg1 its secrets cannot open, as the blocking dial reads it too */
-		if (p->hs_stage == PD_HS_WAIT && p->err_kind == PERFD_E_TRANSPORT)
+		char why[128];
+
+		if (p->hs_stage == PD_HS_WAIT && p->err_kind == PERFD_E_TRANSPORT &&
+		    hs_refusal((const uint8_t *)p->cin, p->cinlen, why, sizeof why))
+			errk(p, PERFD_E_REFUSED, "refused by the node: %s", why);
+		else if (p->hs_stage == PD_HS_WAIT && p->err_kind == PERFD_E_TRANSPORT)
 			errk(p, PERFD_E_AUTH, "handshake refused with secrets[%d] (wrong or retired?) - "
 				"dial again from the next", p->hs_sec);
 		p->st = PERFD_ST_FAILED;

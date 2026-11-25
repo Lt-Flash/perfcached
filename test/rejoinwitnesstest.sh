@@ -65,7 +65,10 @@ start() { # start <n> <how many "ready" lines the log holds then> [VAR=value ...
 	done
 	P=$(cat "$D/n$n.pid"); kill -0 "$P" 2>/dev/null && w="alive" || { wait "$P" 2>/dev/null; w="exited $?"; }
 	echo "node $n did not start ($w, $(grep -c "perfcached ready" "$D/n$n.log") ready line(s), want $want):"
-	tail -n 8 "$D/n$n.log" | cut -c1-200 | sed "s/^/       n$n: /"; diag; return 1
+	tail -n 8 "$D/n$n.log" | cut -c1-200 | sed "s/^/       n$n: /"
+	# alive without its ready line: where each thread waits (an fsync stall reads as a sync call)
+	[ "$w" = alive ] && for t in /proc/$P/task/*; do echo "       n$n thread $(cat "$t/comm" 2>/dev/null): $(cat "$t/wchan" 2>/dev/null) $(cut -d' ' -f3 "$t/stat" 2>/dev/null)"; done | sort | uniq -c | head -12
+	diag; return 1
 }
 stop1() { kill "$(cat "$D/n$1.pid")" 2>/dev/null; i=0; while kill -0 "$(cat "$D/n$1.pid")" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; }
 st() { curl -s -m 3 "http://127.0.0.1:2759$1/stats" | python3 -c '

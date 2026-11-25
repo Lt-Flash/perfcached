@@ -66,6 +66,7 @@ struct clapply {
 	void *ctx;
 	long long (*clock)(void);      /* ms clock for busy_since_ms; NULL =
 	                                * the take's now_ms argument (tests) */
+	void (*idle)(void);            /* a take that waited for nothing calls it; NULL none */
 	volatile int *stop;            /* the owner's, else the first take's; a push
 	                                * waits on a full ring until this says otherwise */
 	unsigned long long dispatched, grp_acked;
