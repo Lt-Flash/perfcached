@@ -1,7 +1,8 @@
 #!/bin/sh
 # resizedeltest.sh - a delete that lands while the resize's copier has a record in hand is not undone:
 # the copy is made under the source bucket's lock, and a delete empties the copier's source first.
-# The copier is paused on one key before the swap and one after (PERFCACHED_TEST_RS_COPY_PAUSE).
+# The copier is paused on one key before the swap and one after (PERFCACHED_TEST_RS_COPY_PAUSE),
+# and a delete that resolved the old table before the swap is held until after it.
 # Usage: test/resizedeltest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -45,7 +46,7 @@ if ! grep -q "perfcached ready" "$D/n.log"; then
 	echo "resizedeltest: $pass passed, $fail failed"; exit 1
 fi
 
-D="$D" timeout 120 python3 - > "$D/py.out" 2>&1 <<'PY'
+D="$D" timeout 240 python3 - > "$D/py.out" 2>&1 <<'PY'
 import json, os, pcnative, socket, threading, time, urllib.request
 D = os.environ["D"]
 def conn():
@@ -94,10 +95,49 @@ for k, ph in (("pz:pre", "before the swap"), ("pz:post", "after the swap")):
     print(("ok  " if v is None else "FAIL") + " %s, deleted while the copier held it %s, reads absent once the resize is done (read %r)" % (k, ph, v))
 v = (call(f, "get", col="0", key="other").get("result") or {}).get("value")
 print(("ok  " if v == "v-other" else "FAIL") + " a key nobody deleted came through the resize (read %r)" % v)
+# a delete that resolved the old table before the swap and lands after it: the copy the
+# copier made into the new table goes too
+for k in ("pz:pre", "pz:stale"):
+    call(f, "set", col="0", key=k, value="v-" + k)
+for ph in ("pre", "del"):
+    open(D + "/pause." + ph, "w").close()
+r = call(f, "resize", col="0", buckets_log2=13)
+print("RESIZE2", json.dumps(r.get("result") or r.get("error")))
+got = {}
+def stale():
+    g = conn()
+    got["r"] = call(g, "del", col="0", key="pz:stale")
+def logged(t, secs=30):
+    end = time.time() + secs
+    while time.time() < end:
+        if t in open(D + "/n.log").read():
+            return True
+        time.sleep(0.05)
+    return False
+held = paused("pz:pre")
+t = threading.Thread(target=stale); t.start()
+dp = logged("delete paused on 'pz:stale'")
+os.unlink(D + "/pause.pre")
+sw = logged("resized to 2^13 buckets")
+os.unlink(D + "/pause.del")
+t.join(40)
+print("DEL2 %s held %s paused %s swapped %s" % (json.dumps(got.get("r")), held, dp, sw))
+if not (held and dp and sw):
+    print("FAIL the stale delete was not staged across the swap (copier paused %s, delete paused %s, swap logged %s)" % (held, dp, sw))
+end = time.time() + 30
+while time.time() < end and (col().get("buckets") != 8192 or col().get("resizing_to")):
+    time.sleep(0.1)
+c = col()
+print("SETTLED2 %s %s" % (c.get("buckets"), c.get("resizing_to")))
+v = (call(f, "get", col="0", key="pz:stale").get("result") or {}).get("value")
+print(("ok  " if v is None else "FAIL") + " pz:stale, deleted through the table resolved before the swap, reads absent after it (read %r)" % v)
+r2 = (got.get("r") or {}).get("result") or {}
+print(("ok  " if (r2.get("deleted") or r2.get("removed")) else "FAIL") + " that delete was acknowledged (%s)" % json.dumps(got.get("r")))
 PY
 grep -E "^RESIZE|^DEL|^SETTLED" "$D/py.out" | sed 's/^/  # /'
 grep -q "^RESIZE.*resizing" "$D/py.out" && ok "a shrink to 2^12 accepted" || bad "the resize: $(grep -m1 '^RESIZE' "$D/py.out") $(tail -2 "$D/py.out")"
-grep -q "^SETTLED 4096 None" "$D/py.out" && ok "the resize finished" || bad "the resize did not finish: $(grep '^SETTLED' "$D/py.out")"
+grep -q "^SETTLED 4096 None" "$D/py.out" && ok "the resize finished" || bad "the resize did not finish: $(grep '^SETTLED ' "$D/py.out")"
+grep -q "^SETTLED2 8192 None" "$D/py.out" && ok "the second resize finished" || bad "the second resize did not finish: $(grep '^SETTLED2' "$D/py.out")"
 while IFS= read -r l; do
 	case "$l" in
 		"ok  "*) ok "${l#ok  }" ;;

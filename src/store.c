@@ -1270,23 +1270,62 @@ void pc_store_walk_end(void)
 pcache_htable_t *pc_store_del_order(pcache_htable_t *ht, pcache_htable_t **second)
 {
 	int i, n = pc_store_count();
+	unsigned int q;
 
 	*second = NULL;
-	for (i = 0; i < n; i++)
+	for (i = 0; i < n; i++) {
 		if (reg[i].ht == ht) {
 			pcache_htable_t *sh = __atomic_load_n(&reg[i].rs_to, __ATOMIC_ACQUIRE);
 
 			if (!sh)
-				break;
+				return ht;
 			/* before the swap the copier reads the live table, after it the old one */
 			if (__atomic_load_n(&reg[i].rs_swapped, __ATOMIC_RELAXED)) {
 				*second = ht;
 				return sh;
 			}
 			*second = sh;
+			return ht;
+		}
+		/* resolved before the swap, applied after it: the new table holds the copy too */
+		if (__atomic_load_n(&reg[i].rs_to, __ATOMIC_ACQUIRE) == ht) {
+			*second = __atomic_load_n(&reg[i].ht, __ATOMIC_ACQUIRE);
+			return ht;
+		}
+	}
+	/* after the closing drain the old table waits to be retired, its records in the live one */
+	pthread_mutex_lock(&reg_mx);
+	for (q = 0; q < retq_n; q++)
+		if (retq[q].ht == ht && retq[q].idx >= 0 && retq[q].idx < reg_n &&
+		        reg[retq[q].idx].ht != ht) {
+			*second = reg[retq[q].idx].ht;
 			break;
 		}
+	pthread_mutex_unlock(&reg_mx);
 	return ht;
+}
+
+/* tests only: PERFCACHED_TEST_RS_COPY_PAUSE=<path> - a delete of "pz:stale", its table already
+ * resolved, waits (30 s at most) while <path>.del exists */
+void pc_store_test_del_pause(const str *key)
+{
+	static int init;
+	static const char *path;
+	char f[PATH_MAX];
+	int i;
+
+	if (!init) {
+		path = getenv("PERFCACHED_TEST_RS_COPY_PAUSE");
+		init = 1;
+	}
+	if (!path || key->len != 8 || memcmp(key->s, "pz:stale", 8))
+		return;
+	snprintf(f, sizeof f, "%s.del", path);
+	if (access(f, F_OK) != 0)
+		return;
+	LM_NOTICE("TEST HOOK - delete paused on '%.*s'\n", key->len, key->s);
+	for (i = 0; i < 3000 && access(f, F_OK) == 0; i++)
+		usleep(10000);
 }
 
 pcache_htable_t *pc_store_resize_shadow(pcache_htable_t *ht)

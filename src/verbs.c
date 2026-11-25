@@ -498,8 +498,11 @@ int pc_op_expire_apply(const char *col, size_t collen, const char *key,
  * across would come back at the swap */
 static int store_remove(pcache_htable_t *ht, const str *k)
 {
-	pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
+	pcache_htable_t *o, *f;
 	int rc, rs;
+
+	pc_store_test_del_pause(k);
+	f = pc_store_del_order(ht, &o);
 
 	rs = pcache_ht_remove(f, k);                    /* the copier's source first */
 	rc = (o ? pcache_ht_remove(o, k) : 0) == 1 || rs == 1;
@@ -513,8 +516,11 @@ static int store_remove(pcache_htable_t *ht, const str *k)
 static int store_remove_ver(pcache_htable_t *ht, const str *k,
 		unsigned long long *ver)
 {
-	pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
+	pcache_htable_t *o, *f;
 	int rc, rs = 0;
+
+	pc_store_test_del_pause(k);
+	f = pc_store_del_order(ht, &o);
 
 	if (f != ht)                                    /* the copier's source first */
 		rs = pcache_ht_remove(f, k);
