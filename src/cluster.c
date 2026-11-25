@@ -7820,8 +7820,10 @@ static void rx_sample(void)
 /* before a peer silent on UDP is purged or a master declared dead, ask whether TCP still reaches
  * it; alive on TCP means UDP is blocked on this path: force the lane both ways (unicast only) */
 #define LANE_PROBE_MS 3000
-/* TCP alone may be a new process on the old address: a UDP probe answered inside this says so */
-#define LANE_ASK_MS 1500
+/* TCP alone may be a new process on the old address: a UDP probe answered inside this says so.
+ * Asked again every LANE_RESEND_MS: a process still starting may drop the first ask unseen */
+#define LANE_ASK_MS 3000
+#define LANE_RESEND_MS 250
 static struct clprobe_tab lane_probes;
 
 /* 1 = TCP says it lives (or may - the probe is still out): keep it */
@@ -7847,12 +7849,18 @@ static int lane_keeps(const pc_addr *a, long long silent_ms,
 				return 0;
 			if (pm->ask_ms < now - silent_ms) {
 				m = M_LANE_PROBE;
-				pm->ask_ms = now;
+				pm->ask_ms = pm->sent_ms = now;
 				(void)clsend_seal_udp(a, &m, 1);
 				return 1;
 			}
-			if (now - pm->ask_ms < LANE_ASK_MS)
+			if (now - pm->ask_ms < LANE_ASK_MS) {
+				if (now - pm->sent_ms >= LANE_RESEND_MS) {
+					m = M_LANE_PROBE;
+					pm->sent_ms = now;
+					(void)clsend_seal_udp(a, &m, 1);
+				}
 				return 1;
+			}
 			clane_force(a, 1);
 			seal_send(a, &m, 1);       /* forced: it goes by the lane */
 			lane_probes.saves++;

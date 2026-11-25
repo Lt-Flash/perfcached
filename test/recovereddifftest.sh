@@ -106,7 +106,11 @@ python3 "$T/waitready.py" 127.0.0.1:16981 127.0.0.1:16982 127.0.0.1:16983 -t 30 
 # a copy lands off its holder's WAL (its author persists it): node 3 restarts RECOVERED only from writes it took
 [ "$(ops 3 set m 20)" = 20 ] && ok "20 keys written on node 3 - its own, in its WAL" || bad "node 3's own writes were not all stored"
 waitfor 30 '[ "$(ent 3)" = 270 ]' && ok "node 3 holds all 270" || bad "node 3 holds $(ent 3) of 270"
-sleep 2                                   # node 3's WAL synced (fsync = everysec)
+# node 3's WAL synced: fsync = everysec, but a stalled fsync on the runner's storage holds the pump past a fixed
+# sleep, and a kill -9 then takes the unsynced records with it (GitLab 115519 repl3: restarted cold, 0 records)
+waitfor 30 '[ "$(st 3 "r[\"wal\"][\"staged\"] + r[\"wal\"][\"unsynced\"]")" = 0 ] && [ "$(st 3 "r[\"wal\"][\"synced_seq\"]")" -gt 0 ] 2>/dev/null' \
+	&& ok "node 3's WAL synced its writes (synced_seq $(st 3 'r["wal"]["synced_seq"]'))" \
+	|| bad "node 3's WAL never synced in 30 s: $(st 3 '{k: r["wal"][k] for k in ("last_seq", "appended_seq", "synced_seq", "staged", "unsynced")}')"
 
 # node 3 down; node 2 writes 300 new keys and overwrites 50; node 2 then leaves for good, so on node 1
 # all of these are copies whose author is gone - no live peer's sweep sends a copy
@@ -119,13 +123,15 @@ waitfor 30 '[ "$(ops 1 get o 50 new)" = 50 ]' && ok "node 1 reads the 50 new val
 	|| bad "node 1 reads $(ops 1 get o 50 new) of the 50 new values before node 2 leaves"
 stop 2 TERM
 
+cp "$D/n3.log" "$D/n3.first.log"          # the restart truncates it
 start 3 || exit 1
 python3 "$T/waitready.py" 127.0.0.1:16981 127.0.0.1:16983 -t 30 || bad "node 1 or 3 not ready after the restart"
 waitfor 15 'grep -q "node .* restarted holding .* recovered" "$D/n1.log"'
 grep -q "node .* restarted holding .* recovered" "$D/n1.log" && ok "node 1 saw node 3 restart RECOVERED (from its WAL)" \
 	|| { bad "node 1 never saw a recovered restart: $(grep 'node .* restarted\|started cold' "$D/n1.log" | tail -1)"
 	echo "  ..   node 3: $(grep -E 'recover:|wal:' "$D/n3.log" | tr '\n' ' ' | cut -c1-600)"
-	echo "  ..   node 3's WAL: $(ls -l "$D/s3/wal" | tr '\n' ' ' | cut -c1-400)"; }
+	echo "  ..   node 3's WAL: $(ls -l "$D/s3/wal" | tr '\n' ' ' | cut -c1-400)"
+	echo "  ..   node 3 before the kill: $(grep -E 'wal:|WARN|ERROR|CRIT' "$D/n3.first.log" | tail -4 | tr '\n' ' ' | cut -c1-600)"; }
 # counted before any read: a read of a key it lacks would pull it
 waitfor 60 '[ "$(ent 3)" = 570 ]'
 [ "$(ent 3)" = 570 ] && ok "node 3 holds all 570 without a read - the 300 it lacked came by the diff" \
