@@ -30,7 +30,9 @@ The collections table carries the live DDL too (0.7.0): **+ new
 collection**, and **rename**, **resize** (a background migration the
 row shows) and **drop** (the confirmation names the entry count) on
 each row - the daemon's own verbs on the selected node, announced to
-the fleet.  A collection's *settings* (its read-through or
+the fleet.  The tool waits up to `ddl_timeout_s` (60) for the
+answer: a create waits on the node's WAL fsync, which a slow disk can
+hold for seconds.  A collection's *settings* (its read-through or
 write-through, prefixes, timeouts) are configuration, not DDL: they
 change in `perfcached.conf` and apply with a rolling restart.
 

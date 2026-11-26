@@ -60,6 +60,8 @@ int clretain_forgot_each(int (*cb)(uint64_t oid, uint32_t incarn,
 /* the space's highest seq no longer held other than by a newer numbered delete of the same key
  * (forgotten, time rule, cap, no room, an unnumbered drop): UINT64_MAX when that is not known */
 uint64_t clretain_space_gone(uint64_t oid, uint32_t incarn);
+/* 1 when no entry of space (oid, incarn) is held; then its forget/loss row goes too */
+int clretain_space_drop(uint64_t oid, uint32_t incarn);
 /* at most @max entries of space (oid, incarn) numbered in [@from, @to], a gap request's; @cb
  * runs under a shard lock (it must not call back in).  Returns how many */
 unsigned int clretain_space_each(uint64_t oid, uint32_t incarn, uint64_t from,

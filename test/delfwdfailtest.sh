@@ -45,6 +45,7 @@ buckets_log2 = 10
 mode = shard
 C
 	chmod 600 "$D/n$i.conf"
+	: > "$D/n$i.log"
 	if [ $i = 1 ]; then
 		LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut1" PC_NETCUT_LOG="$D/cutlog1" \
 			"$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 &

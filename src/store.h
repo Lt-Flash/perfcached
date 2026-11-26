@@ -101,6 +101,7 @@ pcache_htable_t *pc_store_resize_shadow(pcache_htable_t *ht);
  * table's bucket lock), then the other: returns the first, *@second the other or NULL */
 pcache_htable_t *pc_store_del_order(pcache_htable_t *ht, pcache_htable_t **second);
 void pc_store_test_del_pause(const str *key);
+void pc_store_test_set_pause(const str *key);
 /* pcache_ht_scan_ex for a CLIENT cursor that survives a resize: a swap restarts the walk (SCAN may
  * repeat, never skip) and a draining resize walks the old table first.  0 = start / complete */
 int pc_store_scan(pcache_htable_t *ht, unsigned int *cursor,

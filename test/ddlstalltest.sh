@@ -105,16 +105,21 @@ def batch(rq):
     out = {}
     for _ in rq:
         m = next(_m for _m in iter(lambda: json.loads(f.readline()), None) if "id" in _m)
-        out[m["id"]] = m.get("result") or {}
+        out[m["id"]] = m.get("result") or {"_err": m.get("error")}
     return out
-rounds = reads = wrong = writes = acked = 0; t0 = time.time()
+rounds = reads = wrong = writes = acked = 0; t0 = time.time(); first = None
 while time.time() - t0 < secs:
     g = batch([{"jsonrpc": "2.0", "id": i, "method": "get", "params": {"col": "c", "key": "a%03d" % i}} for i in range(300)])
-    reads += 300; wrong += sum(1 for i in range(300) if g[i].get("value") != "v1-a%03d" % i)
+    bad = [i for i in range(300) if g[i].get("value") != "v1-a%03d" % i]
+    reads += 300; wrong += len(bad)
+    if bad and first is None:
+        first = "a%03d at %.1f s: %s" % (bad[0], time.time() - t0, json.dumps(g[bad[0]])[:200])
     s = batch([{"jsonrpc": "2.0", "id": i, "method": "set", "params": {"col": "c", "key": "w%d-%d" % (rounds, i), "value": "x"}} for i in range(20)])
     writes += 20; acked += sum(1 for r in s.values() if r.get("stored"))
     rounds += 1
 print(rounds, reads, wrong, writes, acked)
+if first:
+    sys.stderr.write("  ..   first wrong read: %s\n" % first)
 PY
 }
 

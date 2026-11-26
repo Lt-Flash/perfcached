@@ -312,7 +312,7 @@ struct pc_config {
 	int query_log_keys;
 	enum pc_wal_probe_mode wal_probe;
 	int   wal_probe_secs;          /* sustained phase for probe=always */
-	int   wal_fsync;               /* 0 everysec, 1 always, 2 no */
+	int   wal_fsync;               /* 0 everysec, 1 always, 2 no, 3 sync */
 	int   wal_segment_mb;          /* 0 = follow the probe's policy */
 	int   wal_segments;            /* the floor (segments_min) */
 	int   wal_segments_max;        /* the cap; 0 = the floor */

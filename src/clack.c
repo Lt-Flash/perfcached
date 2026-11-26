@@ -28,7 +28,7 @@ struct clack {
 	int durable_on_apply;
 	unsigned int n;
 	uint64_t synced;
-	unsigned long long applied, dups, far, full;
+	unsigned long long applied, dups, far, full, dropped;
 	struct space *s[CLACK_SPACES];
 };
 
@@ -297,6 +297,7 @@ void clack_drop(struct clack *a, uint64_t oid, uint32_t incarn)
 		return;
 	free(a->s[i]);
 	a->s[i] = a->s[--a->n];
+	a->dropped++;
 }
 
 int clack_each(const struct clack *a, clack_each_cb cb, void *ctx)
@@ -320,6 +321,7 @@ void clack_get_stats(const struct clack *a, struct clack_stats *st)
 	st->dups = a->dups;
 	st->far = a->far;
 	st->full = a->full;
+	st->dropped = a->dropped;
 	st->spaces = a->n;
 	st->durable_on_apply = a->durable_on_apply;
 }

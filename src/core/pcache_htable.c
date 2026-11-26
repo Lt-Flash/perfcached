@@ -733,6 +733,22 @@ void pcache_ht_set_drain(pcache_htable_t *ht, pcache_htable_t *from)
 	__atomic_store_n(&ht->drain_from, from, __ATOMIC_RELEASE);
 }
 
+void pcache_ht_set_write_to(pcache_htable_t *ht, pcache_htable_t *to)
+{
+	__atomic_store_n(&ht->write_to, to, __ATOMIC_RELEASE);
+}
+
+/* a write resolved to a resize's old table before the swap goes to the live one: the closing
+ * drain empties the old table, and what landed there after its walk would be lost */
+pcache_htable_t *pcache_ht_write_target(pcache_htable_t *ht)
+{
+	pcache_htable_t *to;
+
+	while (ht && (to = __atomic_load_n(&ht->write_to, __ATOMIC_ACQUIRE)) != NULL)
+		ht = to;
+	return ht;
+}
+
 int pcache_ht_probe_present(pcache_htable_t *ht, const str *key,
 		unsigned int *expires, unsigned char *tflags)
 {
@@ -1281,7 +1297,10 @@ static int store_impl(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned long long inver, int use_ver, int keep_wt,
 		unsigned int inwtick)
 {
-	int rc = store_body(ht, key, val, expires, rflags, inver, use_ver,
+	int rc;
+
+	ht = pcache_ht_write_target(ht);
+	rc = store_body(ht, key, val, expires, rflags, inver, use_ver,
 		keep_wt, inwtick);
 
 	drain_forget(ht, key);                /* OM2-9 */
@@ -1743,7 +1762,10 @@ int pcache_ht_add_ex(pcache_htable_t *ht, const str *key, long long delta,
 		unsigned int expires, long long *new_val,
 		unsigned int *eff_expires)
 {
-	int rc = add_ex_body(ht, key, delta, expires, new_val, eff_expires);
+	int rc;
+
+	ht = pcache_ht_write_target(ht);
+	rc = add_ex_body(ht, key, delta, expires, new_val, eff_expires);
 
 	drain_forget(ht, key);                /* OM2-9 */
 	return rc;
@@ -2136,7 +2158,10 @@ static int setver_body(pcache_htable_t *ht, const str *key,
 int pcache_ht_setver(pcache_htable_t *ht, const str *key,
 		unsigned long long ver)
 {
-	int rc = setver_body(ht, key, ver);
+	int rc;
+
+	ht = pcache_ht_write_target(ht);
+	rc = setver_body(ht, key, ver);
 
 	drain_forget(ht, key);                /* OM2-9 */
 	return rc;
@@ -2188,7 +2213,10 @@ static int touch_body(pcache_htable_t *ht, const str *key,
 static int touch_inner(pcache_htable_t *ht, const str *key,
 		unsigned int expires, int adopt, int *was_passive)
 {
-	int rc = touch_body(ht, key, expires, adopt, was_passive);
+	int rc;
+
+	ht = pcache_ht_write_target(ht);
+	rc = touch_body(ht, key, expires, adopt, was_passive);
 
 	drain_forget(ht, key);                /* OM2-9 */
 	return rc;

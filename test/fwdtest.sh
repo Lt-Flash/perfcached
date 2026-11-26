@@ -170,24 +170,33 @@ set -- $B0; B0=$1; WDROP=$2; RBSTATE=$3; RBMOVED=$4
 # crash-durability covers every sequenced write; a ring drop is one the barrier can never cover,
 # so it fails loudly on its own
 [ "$WDROP" = "0" ] && ok || bad "wal ring dropped $WDROP records pre-barrier (ring too small for this host)"
-kill -9 $P2 2>/dev/null; P2=
-sleep 0.5
+# wait, bounded, until it is gone: one killed inside a stalled fsync holds its port, and a connect there is reset
+KP=$P2; kill -9 $P2 2>/dev/null; P2=; i=0
+while [ $i -lt 300 ] && ks=$(awk '{print $3}' "/proc/$KP/stat" 2>/dev/null) && [ "$ks" != Z ]; do
+	sleep 0.1; i=$((i+1)); done
+L2=$(wc -l < "$D/n2.log")
 "$BIN" -f "$D/n2.conf" >> "$D/n2.log" 2>&1 &
 P2=$!
-i=0
-while [ $i -lt 200 ]; do
-	python3 -c "import socket; socket.create_connection((\"127.0.0.1\", 17042), timeout=0.3).close()" 2>/dev/null && break
-	sleep 0.1; i=$((i+1))
-done
+# up to 60 s: under ASan the restart replays its ~55k records from the WAL before it listens; a connect
+# alone can still reach the killed holder's closing socket, so the wait is on both nodes' stats replies
 B1=$(python3 - <<'EOF'
-import json, pcnative, socket
+import json, pcnative, socket, sys, time
 def ent(port):
     g = pcnative.wrap(socket.create_connection(("127.0.0.1", port), timeout=5))
     g.write(b'{"jsonrpc":"2.0","id":1,"method":"stats","params":{"col":"px"}}\n'); g.flush()
     return json.loads(g.readline())["result"]["collections"][0]["entries"]
-print(ent(17042), ent(17041))
+end, last = time.time() + 60, None
+while time.time() < end:
+    try:
+        print(ent(17042), ent(17041)); sys.exit(0)
+    except Exception as e:
+        last = e; time.sleep(0.2)
+sys.stderr.write("    no stats from both nodes in 60 s: %r\n" % (last,))
 EOF
 )
+[ -n "$B1" ] || { echo "    the restarted holder: pid $P2 $(kill -0 $P2 2>/dev/null && echo alive || echo gone), the killed one $KP $(kill -0 $KP 2>/dev/null && echo 'still there' || echo gone); its log since the restart:"
+	tail -n +$((L2 + 1)) "$D/n2.log" | tail -8 | cut -c1-200 | sed 's/^/      /'; }
+[ -n "$B1" ] || { bad "no entry counts from the restarted holder and its peer (the stats call failed, above)"; B1="0 0"; }
 set -- $B1; B1=$1; A1=$2
 echo "holder kill -9 recovery: $B0 forwarded entries before, $B1 after; fleet A+B = $((A1 + B1)) of 100000"
 if [ $((A1 + B1)) -lt 100000 ]; then

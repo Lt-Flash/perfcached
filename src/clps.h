@@ -20,6 +20,8 @@ struct peer;
 
 /* once, at cluster init: the fleet pattern index */
 void clps_init(void);
+/* the receive threads call it before each wait; NULL none */
+extern void (*clps_idle_fn)(void);
 /* once per incarnation: the relay sequence's epoch */
 void clps_new_epoch(void);
 /* the bound relay port, 0 = none - advertised on the heartbeat */

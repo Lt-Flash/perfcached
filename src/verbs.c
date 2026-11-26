@@ -177,6 +177,8 @@ const char *col_name_of(pcache_htable_t *ht)
 {
 	int i;
 
+	/* a resize's old table names the collection its writes now land in */
+	ht = pcache_ht_write_target(ht);
 	for (i = 0; i < pc_store_count(); i++)
 		if (pc_store_live(i) && pc_store_ht(i) == ht)
 			return pc_store_name(i);
@@ -914,7 +916,10 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 static int set_local(pcache_htable_t *ht, const str *k, const str *v,
 		long long ttl)
 {
-	int rc = pcache_ht_store(ht, k, v, ttl_to_abs(ttl));
+	int rc;
+
+	pc_store_test_set_pause(k);
+	rc = pcache_ht_store(ht, k, v, ttl_to_abs(ttl));
 
 	if (rc == 0) {
 		const char *cn = col_name_of(ht);
@@ -3586,6 +3591,26 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		for (j = 0; j < nl; j++)
 			pc_tw_i64(out, lost[j]);
 		pc_tw_end(out);
+		pc_tw_end(out);
+		return 0;
+	}
+	/* forget {node}: a member removed for good - its reserved id released here, its card and
+	 * fleet.node warning gone; each node holds its own reservations */
+	if (m_is(method, mlen, "forget")) {
+		long long node = 0;
+		const char *why;
+
+		if (!privileged || !*privileged)
+			ERR(pc_enable_configured() ? PC_NOPRIV_MSG
+				: PC_NOENABLE_MSG);
+		if (pc_tv_get_int(v, params, "node", &node) != 0)
+			ERR("forget wants {\"node\": <a departed member's node id>}");
+		if ((why = pc_cluster_forget(node < 1 || node > PC_CL_NODE_MAX ?
+		        -1 : (int)node)))
+			ERR(why);
+		pc_tw_map(out);
+		pc_tw_key(out, "forgotten");
+		pc_tw_i64(out, node);
 		pc_tw_end(out);
 		return 0;
 	}

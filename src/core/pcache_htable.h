@@ -369,6 +369,9 @@ typedef struct pcache_htable {
 	/* S459: while a resize drains, the table it left behind - a miss here
 	 * reads there and a write carries the key over first; NULL otherwise */
 	struct pcache_htable   *drain_from;
+	/* a resize's old table after the swap: the live table its writes go to (never cleared,
+	 * the old table is retired); NULL otherwise */
+	struct pcache_htable   *write_to;
 } pcache_htable_t;
 
 /*
@@ -495,6 +498,11 @@ pcache_htable_t *pcache_htable_new(unsigned int size_log2);
 void pcache_ht_set_shadow(pcache_htable_t *ht, pcache_htable_t *shadow);
 /* S459: point @ht at the table its resize is draining (NULL once done) */
 void pcache_ht_set_drain(pcache_htable_t *ht, pcache_htable_t *from);
+/* writes to @ht (store, add, touch, setver) land in @to from now on; deletes keep their own
+ * order (the store's pc_store_del_order) */
+void pcache_ht_set_write_to(pcache_htable_t *ht, pcache_htable_t *to);
+/* the table a write to @ht lands in (@ht itself unless a resize swapped it out) */
+pcache_htable_t *pcache_ht_write_target(pcache_htable_t *ht);
 void pcache_ht_set_shadow_gate(pcache_htable_t *ht,
 		int (*ok)(void *ctx, const str *key), void *ctx);
 /* S331: does THIS thread read through to a shadow?  Off by default: only

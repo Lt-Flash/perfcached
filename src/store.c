@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include "core/pcache_arena.h"
 #include "fnv1a.h"
+#include "statefile.h"                  /* pc_state_sync_dir */
 
 /* writers (create, drop) serialize here; readers take nothing: an entry is filled before reg_n
  * is published and reg_n never shrinks, so a reader sees a new entry complete or not at all */
@@ -1327,6 +1328,28 @@ void pc_store_test_del_pause(const str *key)
 		usleep(10000);
 }
 
+/* tests only: as pc_store_test_del_pause, for a SET of "pz:late" while <path>.set exists */
+void pc_store_test_set_pause(const str *key)
+{
+	static int init;
+	static const char *path;
+	char f[PATH_MAX];
+	int i;
+
+	if (!init) {
+		path = getenv("PERFCACHED_TEST_RS_COPY_PAUSE");
+		init = 1;
+	}
+	if (!path || key->len != 7 || memcmp(key->s, "pz:late", 7))
+		return;
+	snprintf(f, sizeof f, "%s.set", path);
+	if (access(f, F_OK) != 0)
+		return;
+	LM_NOTICE("TEST HOOK - set paused on '%.*s'\n", key->len, key->s);
+	for (i = 0; i < 3000 && access(f, F_OK) == 0; i++)
+		usleep(10000);
+}
+
 pcache_htable_t *pc_store_resize_shadow(pcache_htable_t *ht)
 {
 	int i, n = pc_store_count();
@@ -1499,6 +1522,9 @@ void pc_store_resize_tick(void)
 				/* before the publish: a reader of the new table falls
 				 * back to the old one, and a writer carries the key over first */
 				pcache_ht_set_drain(reg[i].rs_to, old);
+				/* and a write that resolved `old` before the swap lands in the new
+				 * table: one landing after the closing drain's walk would be lost */
+				pcache_ht_set_write_to(old, reg[i].rs_to);
 				reg[i].pub++;      /* a publish */
 				__atomic_store_n(&reg[i].ht, reg[i].rs_to,
 					__ATOMIC_RELEASE);
@@ -1707,6 +1733,11 @@ static int store_persist_locked(void)
 		unlink(tmp);
 		free(body);
 		return rc;
+	}
+	/* the new name survives a power loss only once the directory is synced */
+	if (pc_state_sync_dir(colfile_dir) != 0) {
+		free(body);
+		return -1;
 	}
 	free(colfile_last);
 	colfile_last = body;

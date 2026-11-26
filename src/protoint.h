@@ -157,6 +157,13 @@ struct pc_conn {
 	 * down to its last quarter - its further requests wait, unread, until the pump frees room */
 	int wal_paused, wal_writer;
 	struct pc_conn *walp_next;
+	/* fsync = sync: its last logged seq (the WAL writes it), the seq its held replies wait for,
+	 * where they start in c->out, and the worker's list of held connections */
+	unsigned long long sync_want, sync_seq;
+	size_t sync_from;
+	int sync_held;
+	long long sync_t0_us;
+	struct pc_conn *sync_next;
 	int out_failed;                     /* a reply did not fit: 1 = past PC_MAX_OUTQ
 	                                     * (a slow consumer), 2 = out of memory */
 	int push_staged;                    /* on this worker's push_dirty list */

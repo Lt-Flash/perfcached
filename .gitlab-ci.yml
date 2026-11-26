@@ -40,6 +40,11 @@ workflow:
 
 stages: [lint, fast, full, arch, nightly]
 
+# a rebuild leaves the image it replaced untagged, and a multi-stage build its stages: the jobs that
+# build drop those older than an hour, so a parallel job's build in flight keeps its own
+.image-prune: &image-prune
+  podman image prune -f --filter until=1h > /dev/null 2>&1 || true
+
 .deps: &deps
   # nodejs: pagejstest runs the page's script on node's vm - on a CI
   # runner a missing engine FAILS it.  The shell runners (224, 225) carry
@@ -205,6 +210,7 @@ check-fleet:
     - for c in pcnode1 pcnode2 pcnode3 pcredis; do podman rm -f $c >/dev/null 2>&1; done
     - podman network rm pcnet >/dev/null 2>&1 || true
     - rm -rf /var/tmp/pccluster /tmp/pcfleet.noignore.$CI_JOB_ID
+    - *image-prune
 
 # 64 blank nodes started at once on the runner tagged large, plain build only: an rc tag
 # runs it, or a pipeline whose CHECK_GROUPS names form64
@@ -289,6 +295,8 @@ alpine:
     - tools/alpine-check.sh
     # PD-11: the packages - abuild, apk add, the services through OpenRC
     - tools/alpine-pkg-check.sh
+  after_script:
+    - *image-prune
 
 # the admin image - perfcached-dashboard, perfcli
 # and nginx - built with podman on the shell runner, proven to answer, and
@@ -305,6 +313,8 @@ admin-image:
   script:
     - tools/image-admin.sh /var/tmp/pcrel-image
     - mkdir -p image && cp /var/tmp/pcrel-image/perfcached-admin-*.tar image/ 2>/dev/null || true
+  after_script:
+    - *image-prune
   artifacts:
     paths: [image/]
     expire_in: 14 days

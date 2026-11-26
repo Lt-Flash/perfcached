@@ -11,7 +11,7 @@
 
 #define CLPROBE_MAX 64
 
-struct lprobe { pc_addr a; long long ms, ask_ms, heard_ms, used_ms; };
+struct lprobe { pc_addr a; long long ms, ask_ms, sent_ms, heard_ms, used_ms; };
 
 struct clprobe_tab {
 	struct lprobe e[CLPROBE_MAX];

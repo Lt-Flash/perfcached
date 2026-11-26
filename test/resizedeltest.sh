@@ -2,7 +2,8 @@
 # resizedeltest.sh - a delete that lands while the resize's copier has a record in hand is not undone:
 # the copy is made under the source bucket's lock, and a delete empties the copier's source first.
 # The copier is paused on one key before the swap and one after (PERFCACHED_TEST_RS_COPY_PAUSE),
-# and a delete that resolved the old table before the swap is held until after it.
+# and a delete that resolved the old table before the swap is held until after it; a set held
+# past the closing drain lands in the live table.
 # Usage: test/resizedeltest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
@@ -133,8 +134,32 @@ v = (call(f, "get", col="0", key="pz:stale").get("result") or {}).get("value")
 print(("ok  " if v is None else "FAIL") + " pz:stale, deleted through the table resolved before the swap, reads absent after it (read %r)" % v)
 r2 = (got.get("r") or {}).get("result") or {}
 print(("ok  " if (r2.get("deleted") or r2.get("removed")) else "FAIL") + " that delete was acknowledged (%s)" % json.dumps(got.get("r")))
+# a SET that resolved the old table before the swap and lands after the closing drain: it reaches
+# the live table, not the emptied old one about to be retired
+call(f, "set", col="0", key="pz:pre", value="v-pz:pre")
+call(f, "set", col="0", key="pz:late", value="v-old")
+for ph in ("pre", "set"):
+    open(D + "/pause." + ph, "w").close()
+r = call(f, "resize", col="0", buckets_log2=14)
+print("RESIZE3", json.dumps(r.get("result") or r.get("error")))
+got3 = {}
+def late():
+    g = conn()
+    got3["r"] = call(g, "set", col="0", key="pz:late", value="v-new")
+held = paused("pz:pre")
+t = threading.Thread(target=late); t.start()
+sp = logged("set paused on 'pz:late'")
+os.unlink(D + "/pause.pre")
+done3 = logged("resize complete at 2^14")
+os.unlink(D + "/pause.set")
+t.join(40)
+print("SET3 %s held %s paused %s closed %s" % (json.dumps(got3.get("r")), held, sp, done3))
+if not (held and sp and done3):
+    print("FAIL the late set was not staged across the closing drain (copier paused %s, set paused %s, resize closed %s)" % (held, sp, done3))
+v = (call(f, "get", col="0", key="pz:late").get("result") or {}).get("value")
+print(("ok  " if v == "v-new" else "FAIL") + " pz:late, set through the table resolved before the swap and applied after the closing drain, reads the new value (read %r)" % v)
 PY
-grep -E "^RESIZE|^DEL|^SETTLED" "$D/py.out" | sed 's/^/  # /'
+grep -E "^RESIZE|^DEL|^SETTLED|^SET3" "$D/py.out" | sed 's/^/  # /'
 grep -q "^RESIZE.*resizing" "$D/py.out" && ok "a shrink to 2^12 accepted" || bad "the resize: $(grep -m1 '^RESIZE' "$D/py.out") $(tail -2 "$D/py.out")"
 grep -q "^SETTLED 4096 None" "$D/py.out" && ok "the resize finished" || bad "the resize did not finish: $(grep '^SETTLED ' "$D/py.out")"
 grep -q "^SETTLED2 8192 None" "$D/py.out" && ok "the second resize finished" || bad "the second resize did not finish: $(grep '^SETTLED2' "$D/py.out")"
