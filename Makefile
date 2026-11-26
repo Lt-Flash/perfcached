@@ -54,7 +54,8 @@ CLUSTER_OBJS = src/cluster.o src/clmap.o src/clterm.o src/clsync.o src/clhist.o 
 	src/clmemb.o src/clpull.o src/clhold.o src/clrecon.o src/clepoch.o src/clcol.o src/clplat.o src/clsend.o \
 	src/clfleet.o src/clps.o src/clspread.o src/clcid.o \
 	src/clmesh.o src/clane.o src/clorder.o src/clrp.o src/clrpt.o src/clreplay.o \
-	src/clrecv.o src/cltomb.o src/cladmit.o src/clfound.o src/clddl.o src/clconn.o
+	src/clrecv.o src/cltomb.o src/cladmit.o src/clfound.o src/clddl.o src/clconn.o \
+	src/statefile.o
 ifeq ($(PC_EDITION),standalone)
 EDITION_OBJS = src/cluster_stub.o
 CFLAGS += -DPC_EDITION_STANDALONE
@@ -160,7 +161,7 @@ check-standalone: selftest verstamptest perfcached perfcli perfdump perfload pag
 
 perfcached: src/main.o src/tls.o src/config.o src/cfgcore.o src/cfgcluster.o src/cfgops.o src/cfgcheck.o src/daemon.o src/doorlive.o src/listenfd.o src/cfgsig.o src/autosize.o src/addrwait.o src/dirlock.o src/proto.o src/httpdoor.o src/respdoor.o src/enumwalk.o src/noisechan.o src/json.o \
 		src/pc_noise.o src/verbs.o src/jsonpath.o src/hashrec.o src/sha1.o src/ptree.o src/store.o src/storage.o \
-		src/walprobe.o src/wal.o src/walscan.o src/statefile.o src/crc32c.o src/rdb.o src/recover.o $(EDITION_OBJS) \
+		src/walprobe.o src/wal.o src/walscan.o src/crc32c.o src/rdb.o src/recover.o $(EDITION_OBJS) \
 		src/node.o src/clretain.o src/clack.o src/clackf.o src/ackstate.o src/clunk.o src/pcaddr.o \
 		src/obs.o src/metrics.o src/events.o src/quiesce.o src/psindex.o src/pubsub.o src/upstream.o src/upjson.o src/upstats.o src/upconn.o src/upsentinel.o src/upcluster.o src/uptls.o src/uprespc.o src/respout.o src/respcl.o src/resppubsub.o src/respkv.o src/respjson.o src/respscript.o src/respsrv.o src/respscan.o src/pcglob.o src/statstree.o src/statscluster.o src/statsreset.o src/winctr.o src/memguard.o src/mail.o src/alerts.o src/hostmon.o src/hostlink.o src/iostat.o src/uring.o src/busypoll.o src/upgrade.o src/upgverify.o src/logrl.o src/relkey.o src/reload.o src/respmap.o src/mgetfan.o src/presence.o src/keeps.o $(CORE_OBJS) src/compat/compat.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS) $(TLS_LIBS)
@@ -1265,7 +1266,6 @@ check-g-core2: check-edition-guard $(CHECK_BINS)
 	sh test/tombsupertest.sh ./perfcached ./netcutshim.so
 	# a delete forgotten once every member holds it; a frozen member keeps what it missed
 	sh test/tombforgettest.sh ./perfcached
-	sh test/tombspacetest.sh ./perfcached
 	# a lost delete is a hole the member asks for
 	sh test/tombholetest.sh ./perfcached ./netcutshim.so
 	# a joiner floors its spaces at what its bootstrap's sources confirmed
@@ -1325,13 +1325,7 @@ check-g-durability: check-edition-guard $(CHECK_BINS)
 	sh test/walprobetest.sh ./perfcached
 	sh test/waltest.sh ./perfcached
 	sh test/walmarktest.sh ./perfcached
-	# a start that restored nothing resumes the WAL sequence above the snapshot's marker
-	sh test/walmarkertest.sh ./perfcached
-	# a durable file's directory is synced: the WAL's new segments, the collections file
-	sh test/dirsynctest.sh ./perfcached ./syncfailshim.so ./perfcli
 	sh test/waldroptest.sh ./perfcached ./pcbench ./perfcli ./syncfailshim.so
-	# fsync = sync: a reply waits for its write's sync, on both doors, in order; always does not
-	sh test/walsynctest.sh ./perfcached ./syncfailshim.so
 	# a full log waits - no overwrite, no heal - and /stats answers while writers are held
 	sh test/walfulltest.sh ./perfcached ./pcbench ./perfcli ./syncfailshim.so
 	# the segments follow the load - grow under a fill, kept across a restart, given back when quiet
@@ -1465,7 +1459,7 @@ check-g-cluster2: check-edition-guard $(CHECK_BINS) perfcached.release
 	sh test/standbypassovertest.sh ./perfcached ./netcutshim.so
 	sh test/colsfleettest.sh ./perfcached
 	sh test/fleetcolstest.sh ./perfcached
-	sh test/gonecardtest.sh ./perfcached ./perfcli
+	sh test/gonecardtest.sh ./perfcached
 
 # cluster2's second half, its own group since 2026-11-25: one job was the longest of every pipeline
 check-g-cluster3: check-edition-guard $(CHECK_BINS) perfcached.release
@@ -1591,7 +1585,6 @@ check-g-repl3: check-edition-guard $(CHECK_BINS)
 	sh test/eagerrestarttest.sh ./perfcached
 	# T600: a peer ahead for good - the pulls' empty answers settle the returning node
 	sh test/eagercatchuptest.sh ./perfcached
-	sh test/recovereddifftest.sh ./perfcached
 	sh test/stalebackfilltest.sh ./perfcached
 	sh test/fwdtest.sh ./perfcached
 	sh test/routedpairtest.sh ./perfcached ./routedpairtest

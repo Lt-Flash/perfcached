@@ -174,7 +174,6 @@ except Exception: print(0)' 2>/dev/null)
 		[ "${up:-0}" -ge 46 ] 2>/dev/null && break
 		sleep 1; i=$((i + 1))
 	done
-	ra_up2=$up
 	kill -9 "$(pidof_node 1)" 2>/dev/null
 	sleep 2
 	# delete every key from a SURVIVOR while node1 is down
@@ -192,15 +191,6 @@ except Exception: print(0)' 2>/dev/null)
 	sleep "$ra_wait"
 	start 1 "$ra_label-b" || return 1
 	sleep 20                       # reconcile budget is 64 probes/tick
-	# an eager arm's pass may open late (GitLab 115514: none in 20 s, the deletes kept by the
-	# survivors' replay): wait up to 40 s more for it to show
-	i=0
-	while [ "$ra_eager" = 1 ] && [ $i -lt 40 ]; do
-		[ "$(stat_of 1 reconcile_walked)" -gt 0 ] 2>/dev/null && break
-		[ "$(stat_of 1 reconcile_fast)" = True ] && break
-		[ "$(stat_of 1 reconcile_skipped)" = True ] && break
-		sleep 1; i=$((i + 1))
-	done
 
 	A_BACK=$(alive_on 1)
 	A_PEER=$(alive_on 2)
@@ -228,8 +218,6 @@ if [ "${A_PROBED:-0}" -gt 0 ] || [ "$A_FAST" = True ] || [ "${A_WALKED:-0}" -gt 
 else
 	bad "A: probed $A_PROBED, fast $A_FAST, walked $A_WALKED - no reconcile ran, so the
 	     keys were never in the WAL and this arm proves nothing"
-	note "node2 up ${ra_up2:-?} s at the kill; node1 skipped $(stat_of 1 reconcile_skipped), witness $(stat_of 1 reconcile_witness), witnesses live $(stat_of 1 reconcile_witnesses_live), open $(stat_of 1 reconcile_open), rejoins $(stat_of 1 rejoins)"
-	grep -hE 'reconcile|rejoin|resync|witness|CONNECTING|READY|ERROR|CRIT' "$D/n1.A-b.log" | head -12 | cut -c1-200 | sed 's/^/          /'
 fi
 
 # ---- arm B: no eager, well past the window --------------------------

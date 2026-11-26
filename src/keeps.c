@@ -36,7 +36,7 @@ const char *pc_keeps_copies(int col, char *buf, size_t n)
 
 void pc_keeps_log(const struct pc_config *cfg)
 {
-	static const char *const fs[] = { "everysec", "always", "no", "sync" };
+	static const char *const fs[] = { "everysec", "always", "no" };
 	char kb[48];
 	int i;
 
@@ -65,7 +65,7 @@ void pc_keeps_log(const struct pc_config *cfg)
 			: "recoverable";
 		LM_NOTICE("collection '%s' keeps: %s - a restart replays its WAL "
 			"(fsync %s); copies: %s\n", c->name, why,
-			fs[cfg->wal_fsync >= 0 && cfg->wal_fsync <= 3 ?
+			fs[cfg->wal_fsync >= 0 && cfg->wal_fsync <= 2 ?
 			   cfg->wal_fsync : 0], copies);
 	}
 }

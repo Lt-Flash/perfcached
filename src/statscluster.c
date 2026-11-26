@@ -655,9 +655,6 @@ void stats_tree_cluster(struct pc_tw *out)
 			pc_tw_i64(out, (long long)ak.far);
 			pc_tw_key(out, "full");
 			pc_tw_i64(out, (long long)ak.full);
-			/* spaces of runs that are over, forgotten whole */
-			pc_tw_key(out, "dropped");
-			pc_tw_i64(out, (long long)ak.dropped);
 			/* the holes asked for, and the asks answered here */
 			pc_tw_key(out, "gap_asked");
 			pc_tw_i64(out, (long long)cs.gap_asked);
@@ -885,22 +882,6 @@ void stats_tree_cluster(struct pc_tw *out)
 		pc_tw_i64(out, (long long)px.sweep_gate_digested);
 		pc_tw_key(out, "walks");
 		pc_tw_i64(out, (long long)px.sweep_gate_walks);
-		pc_tw_end(out);
-		/* the diff toward members back from their WAL */
-		pc_tw_key(out, "diff_sync");
-		pc_tw_map(out);
-		pc_tw_key(out, "armed");
-		pc_tw_i64(out, (long long)px.dsync_armed);
-		pc_tw_key(out, "rounds");
-		pc_tw_i64(out, (long long)px.dsync_rounds);
-		pc_tw_key(out, "slots");
-		pc_tw_i64(out, (long long)px.dsync_slots);
-		pc_tw_key(out, "done");
-		pc_tw_i64(out, (long long)px.dsync_done);
-		pc_tw_key(out, "stopped");
-		pc_tw_i64(out, (long long)px.dsync_stopped);
-		pc_tw_key(out, "off");
-		pc_tw_i64(out, (long long)px.dsync_off);
 		pc_tw_end(out);
 		pc_tw_key(out, "spread_gap_repaired");
 		pc_tw_i64(out, (long long)px.spread_gap_repaired);

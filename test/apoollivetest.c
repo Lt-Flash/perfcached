@@ -376,44 +376,6 @@ int main(int argc, char **argv)
 	}
 	perfd_apool_free(P);
 
-	printf("--- a frozen owner: the dial does not hold the get\n");
-	{
-		perfd_apool *F = perfd_apool_new_seeds(hosts, ports, 3, "c", &o, 4);
-		char kf[32], ko[32];
-		long long t0, el;
-		int nf, fo;
-
-		key_on(1, 0, kf, sizeof kf);
-		key_on(1, 1, ko, sizeof ko);
-		nf = owner(kf, a, sizeof a);
-		ok = F && get_ok(F, ko, &g, &n);       /* router warm, the frozen node never dialled */
-		res(ok, "a fresh pool answers %s from node %d", ko, n);
-		ctl("stop", nf);
-		memset(&g2, 0, sizeof g2);
-		t0 = ms();
-		fo = F ? perfd_apool_get(F, kf, cb, &g2) : 0;
-		el = ms() - t0;
-		res(fo == -1 && el < 1200 && g2.calls == 0, "%s on stopped node %d: -1 after %lld ms, "
-			"not connect_timeout's 2000 (%s)", kf, nf, el, perfd_error(NULL));
-		t0 = ms();
-		ok = F && get_ok(F, ko, &g, &n);
-		el = ms() - t0;
-		res(ok && el < 500, "...a get for another node is answered meanwhile in %lld ms", el);
-		ctl("cont", nf);
-		{
-			long long until = ms() + 8000;
-
-			ok = 0;
-			while (!ok && ms() < until) {
-				ok = F && get_ok(F, kf, &g, &n);
-				if (!ok)
-					usleep(200000);
-			}
-		}
-		res(ok && n == nf, "...once node %d runs again %s is answered by it (%s)", nf, kf, g.val);
-		perfd_apool_free(F);
-	}
-
 	printf("--- no routing\n");
 	{
 		perfd_opts q = o;

@@ -200,12 +200,6 @@ int main(void)
 	snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
 	if (system(cmd) != 0)
 		printf("  ..   could not remove %s\n", dir);
-	/* the write bound is the read bound: perfload and --inspect stop at key + value past RECMAX */
-	CHK(pcd_rec_fits(10, RECMAX - 10) && pcd_rec_fits(0, RECMAX),
-		"a record of key + value = RECMAX is written");
-	CHK(!pcd_rec_fits(RECMAX / 2 + 1, RECMAX / 2 + 1),
-		"one whose key and value fit alone but not together is not - the readers would stop there");
-	CHK(!pcd_rec_fits(RECMAX + 1, 0), "nor one whose key alone is past it");
 	printf("dumpchunktest: %s\n", fails ? "FAILED" : "all passed");
 	return fails ? 1 : 0;
 }

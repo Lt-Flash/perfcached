@@ -77,7 +77,6 @@ python3 -c 'import json,sys,urllib.request; json.loads(urllib.request.urlopen("h
 	|| bad "the lock file says '$(cat "$D/state/perfcached.lock" 2>/dev/null)', not $P1"
 
 echo "--- 2: its own state_dir, the same [wal] dir"
-: > "$D/c.log"
 "$BIN" -f "$D/c.conf" > "$D/c.log" 2>&1 & P2=$!
 if exited $P2 10; then
 	wait $P2; rc=$?; P2=

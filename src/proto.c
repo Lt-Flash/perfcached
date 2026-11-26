@@ -135,8 +135,6 @@ static size_t outq_max(void)
 	return m;
 }
 
-static void sync_note(struct pc_conn *c);
-
 int out_append(struct pc_conn *c, const char *p, size_t n)
 {
 	int rc;
@@ -161,14 +159,12 @@ int out_append(struct pc_conn *c, const char *p, size_t n)
 		return rc;
 	}
 	bufs_mark(c);
-	sync_note(c);
 	memcpy(c->out + c->out_len, p, n);
 	c->out_len += n;
 	return 0;
 }
 
-/* room for @n more bytes at c->wire + c->wire_len, nothing written: 0, or -1 */
-static int wire_reserve(struct pc_conn *c, size_t n)
+int wire_append(struct pc_conn *c, const char *p, size_t n)
 {
 	const size_t limit = PC_MAX_OUTQ + (PC_MAX_OUTQ >> 4);
 
@@ -187,13 +183,6 @@ static int wire_reserve(struct pc_conn *c, size_t n)
 	if (buf_reserve(&c->wire, &c->wire_cap, c->wire_len, n, limit) < 0)
 		return -1;
 	bufs_mark(c);
-	return 0;
-}
-
-int wire_append(struct pc_conn *c, const char *p, size_t n)
-{
-	if (wire_reserve(c, n) < 0)
-		return -1;
 	memcpy(c->wire + c->wire_len, p, n);
 	c->wire_len += n;
 	return 0;
@@ -466,7 +455,6 @@ static void out_pause(struct pc_conn *c);      /* with the resume pass */
 static void out_unlink(struct pc_conn *c);
 static int conn_pause(struct pc_conn *c);
 static void wal_pause(struct pc_conn *c);      /* with the resume pass */
-static void sync_unlink(struct pc_conn *c);
 static void wal_unlink(struct pc_conn *c);
 /* this worker's HTTP connections, counted at make and destroy: the wait reads this, not
  * the sweep's last answer, which predates the turn's accepts */
@@ -488,9 +476,6 @@ static unsigned long long outp_now_all, outp_pauses_all, outp_stalls_all;
 /* writers held while this worker's WAL ring is nearly full */
 static __thread struct pc_conn *walp_head;
 static __thread int walp_here;
-static __thread struct pc_conn *synch_head;
-static __thread int synch_here;
-static unsigned long long synch_now_all, synch_holds_all, synch_ms_all;
 static unsigned long long walp_now_all, walp_pauses_all;
 int pc_output_stall_s = 30;
 
@@ -682,7 +667,6 @@ void conn_destroy(struct pc_conn *c)
 	pause_unlink(c);
 	out_unlink(c);
 	wal_unlink(c);
-	sync_unlink(c);
 	hs_unlink(c);
 	if (c->udp)
 		udp_free(c);
@@ -1252,29 +1236,22 @@ static int tls_wire(void *ctx, const char *p, size_t n);
 
 static int encrypt_pending(struct pc_conn *c)
 {
-	size_t nrec = (c->out_len + PC_NOISE_MAXPT - 1) / PC_NOISE_MAXPT, off = 0;
+	uint8_t rec[2 + PC_NOISE_MAXPT + PC_NOISE_TAGLEN];
+	size_t off = 0;
 
-	/* room for every record first: one sealed and not queued would put the nonces out of
-	 * step, and the plaintext left in c->out would be sealed again */
-	if (wire_reserve(c, c->out_len + nrec * (2 + PC_NOISE_TAGLEN)) < 0)
-		return -1;
 	while (off < c->out_len) {
 		size_t chunk = c->out_len - off;
-		uint8_t *rec = (uint8_t *)c->wire + c->wire_len;
 		int cl;
 
 		if (chunk > PC_NOISE_MAXPT)
 			chunk = PC_NOISE_MAXPT;
 		cl = pc_transport_encrypt(&c->send_cs,
 			(const uint8_t *)c->out + off, chunk, rec + 2);
-		if (cl < 0) {
-			/* what was sealed is queued: a re-run seals only the rest */
-			memmove(c->out, c->out + off, c->out_len - off);
-			c->out_len -= off;
+		if (cl < 0)
 			return -1;
-		}
 		put16(rec, (uint16_t)cl);
-		c->wire_len += 2 + (size_t)cl;
+		if (wire_append(c, (char *)rec, 2 + (size_t)cl) < 0)
+			return -1;
 		off += chunk;
 	}
 	c->out_len = 0;
@@ -1300,7 +1277,6 @@ static int ur_send_wire(struct pc_conn *c)
 int conn_flush(struct pc_conn *c)
 {
 	struct epoll_event ev;
-	size_t keep = 0, front;
 	ssize_t n;
 
 	/* a reply that did not fit was lost: the stream is out of step, the caller closes it */
@@ -1320,14 +1296,6 @@ int conn_flush(struct pc_conn *c)
 	/* records OpenSSL wrote while a send was in flight (a KeyUpdate's answer) */
 	if (c->tls && !c->out_len && pc_tls_flush(c->tls, tls_wire, c) < 0)
 		return -1;
-	/* fsync = sync: what was staged from the first held reply on stays until its write is synced */
-	if (c->sync_held) {
-		if (pc_wal_synced_low() >= c->sync_seq)
-			sync_unlink(c);
-		else
-			keep = c->out_len - (c->sync_from < c->out_len ? c->sync_from : c->out_len);
-	}
-	front = c->out_len -= keep;
 	/* move staged plaintext into the socket buffer */
 	if (c->out_len) {
 		if (c->encrypted) {
@@ -1347,13 +1315,6 @@ int conn_flush(struct pc_conn *c)
 				return -1;
 			c->out_len = 0;
 		}
-	}
-	if (keep) {                        /* the held tail, to the front once the rest left */
-		if (!c->out_len) {
-			memmove(c->out, c->out + front, keep);
-			c->sync_from = 0;
-		}
-		c->out_len += keep;
 	}
 
 	if (c->ep < 0 && c->wire_off < c->wire_len && ur_send_wire(c) == 0)
@@ -1898,7 +1859,6 @@ static int plaintext_drain(struct pc_conn *c)
 		pc_pubsub_pressure_take(NULL); /* not ours: nothing waits on it */
 
 	pc_wal_wrote = &c->wal_writer;     /* cleared on every way out */
-	pc_wal_conn_seq = pc_wal_sync_mode() ? &c->sync_want : NULL;
 	while (off < c->in_len) {
 		/* a cooperative walk's reply must precede any later request's (RESP replies are
 		 * ordered): the rest stays buffered until the walk completes */
@@ -1991,7 +1951,6 @@ static int plaintext_drain(struct pc_conn *c)
 			        !(f >= 'a' && f <= 'z') &&
 			        f != '\r' && f != '\n') {
 				pc_wal_wrote = NULL;
-				pc_wal_conn_seq = NULL;
 				return -1;
 			}
 			rc = resp_one(c, off);
@@ -2046,7 +2005,6 @@ static int plaintext_drain(struct pc_conn *c)
 			break;                 /* a queue it feeds is full: the rest waits */
 	}
 	pc_wal_wrote = NULL;
-	pc_wal_conn_seq = NULL;
 	if (rc < 0)
 		return -1;
 	if (off) {
@@ -3734,98 +3692,6 @@ void pc_conn_resume_wal(void)
 			conn_destroy(c);
 		}
 	}
-}
-
-/* fsync = sync: a reply staged after a write this connection logged, or one this worker logged
- * outside any connection's turn, waits with all after it until the device has synced it */
-static void sync_note(struct pc_conn *c)
-{
-	unsigned long long w = c->sync_want;
-
-	if (pc_wal_tl_seq > w)             /* a completion's write: whose reply is not known */
-		w = pc_wal_tl_seq;
-	if (w <= c->sync_seq || !pc_wal_sync_mode() || w <= pc_wal_synced_low())
-		return;
-	if (!c->sync_held) {
-		c->sync_held = 1;
-		c->sync_from = c->out_len;
-		c->sync_t0_us = deny_now();
-		c->sync_next = synch_head;
-		synch_head = c;
-		synch_here++;
-		__atomic_add_fetch(&synch_now_all, 1, __ATOMIC_RELAXED);
-		__atomic_add_fetch(&synch_holds_all, 1, __ATOMIC_RELAXED);
-	}
-	c->sync_seq = w;
-	pc_wal_kick_wanted();
-}
-
-static void sync_unlink(struct pc_conn *c)
-{
-	struct pc_conn **pp;
-
-	if (!c->sync_held)
-		return;
-	for (pp = &synch_head; *pp; pp = &(*pp)->sync_next)
-		if (*pp == c) {
-			*pp = c->sync_next;
-			break;
-		}
-	c->sync_next = NULL;
-	c->sync_held = 0;
-	synch_here--;
-	__atomic_sub_fetch(&synch_now_all, 1, __ATOMIC_RELAXED);
-	__atomic_add_fetch(&synch_ms_all, (unsigned long long)(deny_now() -
-		c->sync_t0_us), __ATOMIC_RELAXED);
-}
-
-int pc_conn_sync_held_open(void)
-{
-	return synch_here;
-}
-
-void pc_conn_sync_stats(unsigned long long *now, unsigned long long *holds,
-		unsigned long long *hold_ms)
-{
-	*now = __atomic_load_n(&synch_now_all, __ATOMIC_RELAXED);
-	*holds = __atomic_load_n(&synch_holds_all, __ATOMIC_RELAXED);
-	*hold_ms = __atomic_load_n(&synch_ms_all, __ATOMIC_RELAXED);
-}
-
-/* once a turn: a connection whose held writes are synced sends its replies; if the device
- * refused, no held reply is ever sent - the connection closes, its writes uncertain */
-void pc_conn_resume_sync(void)
-{
-	struct pc_conn *c, *next;
-	unsigned long long lo;
-
-	if (!synch_head)
-		return;
-	lo = pc_wal_synced_low();
-	for (c = synch_head; c; c = next) {
-		next = c->sync_next;
-		if (c->dead)
-			continue;
-		if (pc_wal_failed() && lo < c->sync_seq) {
-			c->why = "the WAL's storage failed before its writes were synced";
-			conn_destroy(c);
-			continue;
-		}
-		if (lo < c->sync_seq)
-			continue;
-		if (conn_flush(c) < 0) {
-			c->why = "write error";
-			conn_destroy(c);
-			continue;
-		}
-		if (c->close_after && !c->out_len && c->wire_off >= c->wire_len) {
-			if (!c->why)
-				c->why = "quit";
-			conn_destroy(c);
-		}
-	}
-	if (synch_head)
-		pc_wal_kick_wanted();          /* a sync short of them: the next one kicks again */
 }
 
 void pc_conn_out_pause_stats(struct pc_out_pause_stats *st)

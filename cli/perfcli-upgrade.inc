@@ -861,7 +861,7 @@ static int uroll(struct uplan *pl, int resume)
 		struct unode *u = NULL, cur;
 		char from[sizeof cur.ver];
 		long long old_pid;
-		int rc, is_gated, nsw, owned;
+		int rc, is_gated, nsw;
 		struct uswitch sw[UP_MAX_NODES];
 		const struct uswitch *was;
 
@@ -904,19 +904,12 @@ static int uroll(struct uplan *pl, int resume)
 		memcpy(from, u->ver, sizeof from);
 		nsw = ujournal_switched(pl, sw, UP_MAX_NODES);
 		was = uswitch_find(sw, nsw, u->node);
-		owned = was && was->open && was->pid != u->pid;
-		if (!strcmp(u->ver, pl->version) && (owned || !pl->switch_cmd[0])) {
-			/* already on the target: the helper would answer "already running" and the
-			 * restart waited for would never come; on to the gates (a hook decides itself) */
-			if (owned)
-				ujournal_line(pl, "node=%d addr=%s:%d event=switched-before version=%s "
-					"pid=%lld (pid %lld at the journal's switch) - not switched again",
-					u->node, u->addr, u->port, u->ver, u->pid, was->pid);
-			else
-				ujournal_line(pl, "node=%d addr=%s:%d event=on-target version=%s pid=%lld "
-					"- not switched by this roll, not switched again", u->node, u->addr,
-					u->port, u->ver, u->pid);
-			snprintf(from, sizeof from, "%s", owned ? was->from : "");
+		if (was && was->open && was->pid != u->pid && !strcmp(u->ver, pl->version)) {
+			/* switched by an earlier run that stopped before its gate: on to the gates */
+			ujournal_line(pl, "node=%d addr=%s:%d event=switched-before version=%s pid=%lld "
+				"(pid %lld at the journal's switch) - not switched again", u->node, u->addr,
+				u->port, u->ver, u->pid, was->pid);
+			snprintf(from, sizeof from, "%s", was->from);
 			old_pid = -1;
 			goto gates;
 		}
@@ -951,12 +944,9 @@ gates:
 		if (rc != 0) {
 			ujournal_line(pl, "node=%d addr=%s:%d event=failed reason=%s", u->node,
 				u->addr, u->port, rc == -1 ? "not-up-in-time" : "not-ready-in-time");
-			if (!from[0])
-				ujournal_line(pl, "stop reason=node-%d-on-target-not-switched-here - "
-					"nothing reverted; see it", u->node);
 			/* still on the build it ran: the switch did not take (refused, or undone by the
 			 * helper), and a revert would go to the build before that one */
-			else if (rc == -1 && u->reach && !strcmp(u->ver, from))
+			if (rc == -1 && u->reach && !strcmp(u->ver, from))
 				ujournal_line(pl, "stop reason=node-%d-not-switched - it runs %s (pid %lld), "
 					"nothing reverted; see its upgrade_status", u->node, u->ver, u->pid);
 			/* revert THAT node, verify the old build, stop */
@@ -983,10 +973,7 @@ gates:
 			if (lost) {
 				ujournal_line(pl, "node=%d addr=%s:%d event=failed reason=peers-lost-records",
 					u->node, u->addr, u->port);
-				if (!from[0])
-					ujournal_line(pl, "stop reason=node-%d-on-target-not-switched-here - "
-						"nothing reverted; see it", u->node);
-				else if (urevert_ready(pl, u) == 0) {
+				if (urevert_ready(pl, u) == 0) {
 					if (urevert_node(pl, u, peers) == 0)
 						ujournal_line(pl, "stop reason=node-%d-reverted after the gate",
 							u->node);

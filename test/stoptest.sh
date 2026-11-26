@@ -367,8 +367,7 @@ split_fleet() { # split_fleet <binary>: nodes 1+2, then 3 with term 50
 	echo "   node 3 not admitted in 45 s: map term $(mapterm 17343), role $(cl 17343 role), node 1 peers up $(cl 17341 peers_up)" >&2
 	return 1
 }
-s233() { # s233 <binary> <label>: prints "<split ok> <stop ok> <lost>", "nofleet" with no fleet; <lost>:
-	# 1 reported lost, 0 reported stopped (the reverted reply), x neither - no answer to judge
+s233() { # s233 <binary> <label>: prints "<split ok> <stop ok> <lost ok>", "nofleet" with no fleet
 	split_fleet "$1" >&2 || { echo "nofleet nofleet nofleet"; return; }   # its reason to the log, never into the result
 	T3=$(cl 17343 term); M3=$(mapterm 17343)
 	sp=0; [ "$T3" != "?" ] && [ "$M3" != "?" ] && [ "$T3" -ge 50 ] && [ "$M3" -ge 1 ] && [ "$M3" -lt 50 ] && sp=1
@@ -380,18 +379,12 @@ s233() { # s233 <binary> <label>: prints "<split ok> <stop ok> <lost>", "nofleet
 	echo "   $2: $up process(es) still running after the stop" >&2
 	for n in 1 2 3; do stop_kill $n; done
 	# lost: a fleet that loads, node 3 killed -9 just before the stop
-	lo=x
-	if load_fleet "$1" >/dev/null 2>&1; then
-		stop_kill 3
-		R=$(priv_stop); echo "   $2: node 3 killed -9, then fleetstop -> $(reply "$R")" >&2
-		lo=$(echo "$R" | python3 -c 'import json,sys
+	load_fleet "$1" >/dev/null 2>&1
+	stop_kill 3
+	R=$(priv_stop); echo "   $2: node 3 killed -9, then fleetstop -> $(reply "$R")" >&2
+	lo=0; echo "$R" | python3 -c 'import json,sys
 r=json.load(sys.stdin).get("result") or {}
-st, lo = len(r.get("stopped",[])), len(r.get("lost",[]))
-print(1 if r.get("asked")==2 and st==1 and lo==1 else 0 if r.get("asked")==2 and st==2 and lo==0 else "x")' 2>/dev/null)
-		[ -n "$lo" ] || lo=x
-	else
-		echo "   $2: the fleet for the lost arm did not load" >&2
-	fi
+sys.exit(0 if r.get("asked")==2 and len(r.get("stopped",[]))==1 and len(r.get("lost",[]))==1 else 1)' && lo=1
 	all_down
 	for n in 1 2 3; do stop_kill $n; done
 	echo "$sp $st $lo"
@@ -409,7 +402,7 @@ set -- $(s233 "$D/perfcached.s233old" "fixes reverted")
 [ "$1" = 1 ] && [ "$2" = 0 ] && ok "fail-first: with the gate on the claim again, node 3 ignored the stop and kept running" \
 	|| bad "fail-first: the reverted gate did not leave node 3 running (split $1, stop $2)$(nofleet "$1")"
 [ "$3" = 0 ] && ok "fail-first: with 'stopped' = 'left the live set', the killed peer was reported stopped" \
-	|| bad "fail-first: want the killed peer reported stopped (2 stopped, 0 lost), got '$3' - 1 lost, x no such answer$(nofleet "$3")"
+	|| bad "fail-first: the reverted reply still reported the killed peer lost$(nofleet "$3")"
 
 # ---- 7. perfcli: a stop that outwaits the read timeout ----------------------
 stuck_fleet() { # nodes 1+2 on this build, node 3 on the reverted one

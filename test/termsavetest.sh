@@ -157,11 +157,8 @@ N=$(grep -c '^dir ' "$D/shim4" 2>/dev/null)
 	|| bad "identity_durable $(st 4 'r["cluster"]["identity_durable"]') - a rename never made durable was taken as stored"
 grep -q "mastership term 0 (NOT persisted" "$D/n4.log" \
 	&& ok "the term is not called persisted" || bad "the term: $(grep -m1 "mastership term" "$D/n4.log" | cut -d' ' -f4- | cut -c1-100)"
-# the cluster id is stored by a maintenance tick after the founding, not by it: wait for its verdict
-wait_for 30 'grep -q "could not persist the new cluster id" "$D/n4.log"'
 grep -q "could not persist the new cluster id" "$D/n4.log" \
-	&& ok "and the cluster id it founded is reported unpersisted" \
-	|| bad "the founded cluster id was taken as stored: $(grep -m2 "cluster id" "$D/n4.log" | cut -d' ' -f4- | cut -c1-120 | tr '\n' ';')"
+	&& ok "and the cluster id it founded is reported unpersisted" || bad "the founded cluster id was taken as stored"
 kill9 4
 
 # ---- 4. the promotion's own claim refused (the followed term is on disk): master, but no map under the

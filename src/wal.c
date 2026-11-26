@@ -27,7 +27,6 @@
 #include "core/pcache_arena.h"          /* PCACHE_CELL_MAX: the record ceiling */
 #include "core/pcache_htable.h"         /* pcache_last_del_ver */
 #include "resident.h"
-#include "statefile.h"                  /* pc_state_sync_dir */
 #include <sys/mman.h>                   /* mlock */
 #include "walfmt.h"                     /* the record ceiling, LE fields */
 
@@ -163,13 +162,6 @@ static int seg_write_header(int fd, uint32_t gen)
 	return 0;
 }
 
-/* a segment made, retired or moved is found after a power loss only once
- * its directory is synced too (not under fsync = no) */
-static int wal_sync_dir(void)
-{
-	return W.mode == PC_WFSYNC_NO ? 0 : pc_state_sync_dir(W.dir);
-}
-
 /* provision one segment with real zero writes: fallocate does not
  * provision thin/sparse/COW backends, a write does */
 static int seg_provision(int idx)
@@ -209,7 +201,7 @@ static int seg_provision(int idx)
 		return -1;
 	}
 	close(fd);
-	return wal_sync_dir();
+	return 0;
 }
 static void ctrl_write(void);
 
@@ -273,16 +265,6 @@ static unsigned long long seq_low(void)
 	return lo;
 }
 
-#define MODE_ALWAYS(m) ((m) == PC_WFSYNC_ALWAYS || (m) == PC_WFSYNC_SYNC)
-
-static const char *wal_mode_name(enum pc_wal_fsync m)
-{
-	return m == PC_WFSYNC_SYNC ? "sync" : m == PC_WFSYNC_ALWAYS ? "always" :
-		m == PC_WFSYNC_NO ? "no" : "everysec";
-}
-
-static void sync_kick(void);
-
 /* the only place the durable watermark moves, on the device's yes (not
  * for @claim 0, the rotation's); a refusal fails the node, never retried */
 static int wal_sync_commit(long long now, int claim)
@@ -302,8 +284,6 @@ static int wal_sync_commit(long long now, int claim)
 		/* the highest written, but not past a lower number still unwritten */
 		W.synced_seq = low < W.pending_hi ? low : W.pending_hi;
 		__atomic_store_n(&W.synced_low, low, __ATOMIC_RELEASE);
-		if (W.mode == PC_WFSYNC_SYNC)
-			sync_kick();
 	}
 	return 0;
 }
@@ -628,18 +608,24 @@ static void shrink_check(long long now)
 	if (k < 0)
 		return;
 	seg_path(path, sizeof path, k);
-	if (k == top && unlink(path) != 0 && errno != ENOENT) {
+	if (unlink(path) != 0 && errno != ENOENT) {
 		LM_WARN("wal: cannot retire %s (%s)\n", path, strerror(errno));
 		W.low_since_us = now;
 		return;
 	}
 	if (k != top) {
-		/* the rename replaces k in one step: a failure leaves both files */
 		seg_path(tpath, sizeof tpath, top);
 		if (rename(tpath, path) != 0) {
-			LM_WARN("wal: cannot move %s onto %s (%s) - the log "
-				"keeps its %d segments\n", tpath, path,
-				strerror(errno), W.nseg);
+			/* k is gone, the top stays: provision k again (it was
+			 * cold), or a rotation onto it would find no file */
+			LM_WARN("wal: cannot move %s onto %s (%s) - provisioning "
+				"%s again\n", tpath, path, strerror(errno), path);
+			if (seg_provision(k) != 0)
+				LM_CRIT("wal: cannot provision %s again (%s) - a "
+					"rotation onto it will fail\n", path,
+					strerror(errno));
+			W.seg_first[k] = W.seg_last[k] = 0;
+			W.seg_gen[k] = 0;
 			W.low_since_us = now;
 			return;
 		}
@@ -654,9 +640,6 @@ static void shrink_check(long long now)
 	W.nseg--;
 	W.free_segs = W.nseg - hot;
 	W.retired++;
-	if (wal_sync_dir() != 0)
-		LM_WARN("wal: cannot sync %s after retiring a segment (%s)\n",
-			W.dir, strerror(errno));
 	W.low_since_us = now - W.shrink_us +
 		(W.shrink_us < 10000000LL ? W.shrink_us : 10000000LL);
 	ctrl_write();
@@ -1056,7 +1039,8 @@ int pc_wal_init(const char *dir, enum pc_wal_fsync mode, int segment_mb,
 	LM_NOTICE("wal: active in %s - %d x %d MB segments, generation %u, "
 		"fsync %s; the ring follows the load from %d to %d segment(s)\n",
 		dir, W.nseg, segment_mb, W.gen,
-		wal_mode_name(mode), W.nseg_min, W.nseg_max);
+		mode == PC_WFSYNC_ALWAYS ? "always" :
+		mode == PC_WFSYNC_NO ? "no" : "everysec", W.nseg_min, W.nseg_max);
 	return 0;
 }
 
@@ -1088,57 +1072,6 @@ void pc_wal_set_workers(int lo, int hi)
 }
 
 __thread int *pc_wal_wrote;
-__thread unsigned long long pc_wal_tl_seq;
-__thread unsigned long long *pc_wal_conn_seq;
-/* the workers' eventfds and whether each holds a reply for the watermark */
-static int sync_efd[MAX_THREADS];
-static int sync_want[MAX_THREADS];
-
-int pc_wal_sync_mode(void)
-{
-	return W.enabled && W.mode == PC_WFSYNC_SYNC;
-}
-
-unsigned long long pc_wal_synced_low(void)
-{
-	return __atomic_load_n(&W.synced_low, __ATOMIC_ACQUIRE);
-}
-
-int pc_wal_failed(void)
-{
-	return __atomic_load_n(&W.failed, __ATOMIC_ACQUIRE) != 0;
-}
-
-void pc_wal_worker_register(int worker, int efd)
-{
-	if (worker >= 0 && worker < MAX_THREADS)
-		sync_efd[worker] = efd;
-}
-
-/* a worker now holds replies: kicked at the next sync, and the pump woken for it */
-void pc_wal_kick_wanted(void)
-{
-	int w = pc_worker_id();
-	uint64_t one = 1;
-
-	if (w < 0 || w >= MAX_THREADS)
-		return;
-	__atomic_store_n(&sync_want[w], 1, __ATOMIC_RELEASE);
-	if (__atomic_load_n(&W.sleeping, __ATOMIC_ACQUIRE) && W.wake_efd > 0)
-		if (write(W.wake_efd, &one, sizeof one) < 0) { /* best effort */ }
-}
-
-/* the pump, after the watermark moved: every worker holding replies looks again */
-static void sync_kick(void)
-{
-	uint64_t one = 1;
-	int i;
-
-	for (i = 0; i < MAX_THREADS; i++)
-		if (sync_efd[i] > 0 && __atomic_exchange_n(&sync_want[i], 0,
-		        __ATOMIC_ACQ_REL))
-			if (write(sync_efd[i], &one, sizeof one) < 0) { /* best effort */ }
-}
 
 int pc_wal_tight(int resume)
 {
@@ -1171,7 +1104,7 @@ static int ring_wait(struct ring *r, uint32_t need)
 	long long t0, bound = 0;
 	int w;
 
-	if ((W.on_full_heal && !MODE_ALWAYS(W.mode)) || W.wake_efd <= 0 ||
+	if ((W.on_full_heal && W.mode != PC_WFSYNC_ALWAYS) || W.wake_efd <= 0 ||
 	    need > r->size || r == &W.rings[W.pump_w])
 		return 0;
 	w = pc_worker_id();
@@ -1373,12 +1306,6 @@ static unsigned long long produce(int type, const char *col, const char *key,
 	}
 	if (pc_wal_wrote)
 		*pc_wal_wrote = 1;                 /* its connection writes */
-	if (W.mode == PC_WFSYNC_SYNC) {        /* its reply waits for it */
-		if (pc_wal_conn_seq)
-			*pc_wal_conn_seq = seq;
-		else
-			pc_wal_tl_seq = seq;
-	}
 	if (__atomic_load_n(&W.sleeping, __ATOMIC_ACQUIRE) && W.wake_efd > 0)
 		if (write(W.wake_efd, &one, sizeof one) < 0) { /* best effort */ }
 	return seq;
@@ -1619,7 +1546,8 @@ static void heal_routine_note(void)
 		"log a faster disk, or spread the writes over more nodes\n",
 		n, PC_WAL_HEAL_WIN_S / 60,
 		big / 1024,
-		wal_mode_name(W.mode));
+		W.mode == PC_WFSYNC_ALWAYS ? "always" :
+		W.mode == PC_WFSYNC_NO ? "no" : "everysec");
 }
 
 /* the heal's steps, one per pump pass (WAL thread) */
@@ -1702,8 +1630,6 @@ static void wal_storage_failed(const char *what, int err)
 		W.synced_seq, W.pending_hi > W.synced_seq
 			? W.pending_hi - W.synced_seq : 0ULL);
 	wal_shed_once(PC_WAL_SHED_IO);
-	if (W.mode == PC_WFSYNC_SYNC)
-		sync_kick();                   /* the replies held for it are never sent */
 }
 
 void pc_wal_on_shed(void (*fn)(int why))
@@ -2031,7 +1957,7 @@ int pc_wal_pump(void)
 		/* where it can heal, only wal_heal_step() starts heals: drops
 		 * learnt here after a heal completed were covered by it */
 	}
-	if (MODE_ALWAYS(W.mode) && nrec) { /* NOLINT(bugprone-branch-clone) */
+	if (W.mode == PC_WFSYNC_ALWAYS && nrec) { /* NOLINT(bugprone-branch-clone) */
 		wal_sync_commit(now, 1);
 	/* the arms differ by MODE, kept apart so each mode's comment
 	 * sits on its own branch */
@@ -2055,7 +1981,7 @@ int pc_wal_pump(void)
 		return 2;                      /* a snapshot frees room soon */
 	if (nrec && !rings_empty())
 		return 0;
-	if (MODE_ALWAYS(W.mode))
+	if (W.mode == PC_WFSYNC_ALWAYS)
 		return nrec ? 0 : 20;          /* drain again promptly */
 	return nrec || W.healing ? 20 : 200;
 }
@@ -2141,7 +2067,8 @@ void pc_wal_get_stats(struct pc_wal_stats *out)
 
 	memset(out, 0, sizeof *out);
 	out->enabled = W.enabled;
-	out->fsync_mode = wal_mode_name(W.mode);
+	out->fsync_mode = W.mode == PC_WFSYNC_ALWAYS ? "always" :
+		W.mode == PC_WFSYNC_NO ? "no" : "everysec";
 	out->appended = W.appended;
 	out->bytes = W.bytes;
 	for (i = 0; i < W.nrings; i++)

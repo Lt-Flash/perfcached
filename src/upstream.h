@@ -196,7 +196,6 @@ struct pc_up_srv_health {
 	int port;
 	int conns_up;
 	int tracking_on;
-	int failing;                       /* the last connect failed */
 	int state;                         /* PC_UPS_* */
 	int role;                          /* 0 not asked, 1 master, 2 replica,
 	                                    * 3 other */
