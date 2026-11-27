@@ -496,14 +496,17 @@ unfake
 
 # a BCAST answered past upstream_timeout_ms is asked again on a new connection, not taken as refused
 fakes
-ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"], "bcast_delay_ms": 1500, "bcast_delay_n": 1}'
+# the tracking connection goes to a replica (R1 above): there the first BCAST is answered late
+ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "bcast_delay_ms": 1500, "bcast_delay_n": 1}'
+ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "bcast_delay_ms": 1500, "bcast_delay_n": 1}'
 conf o "upstream_prefixes = o:*"
 sed -i 's/^upstream_prefixes = \*$//' "$D/o.conf"
 start o || bad "11. start (slow BCAST): $(grep -m2 -E 'ERROR|CRIT' "$D/o.log")"
 waitfor 10 '[ "$(wt "w[\"bcast\"]")" = on ]'
-[ "$(wt 'w["bcast"]')" = on ] && [ "$(grep -c 'TRACKING ON BCAST' "$D/upm/counts")" -ge 2 ] &&
-	ok "11. the master's first BCAST answered after the timeout: asked again on a new connection, on" ||
-	bad "11. slow BCAST: bcast $(wt 'w["bcast"]'), M heard $(grep -c 'TRACKING ON BCAST' "$D/upm/counts") BCAST(s)"
+nb=$(cat "$D"/up1/counts "$D"/up2/counts 2>/dev/null | grep -c 'TRACKING ON BCAST')
+[ "$(wt 'w["bcast"]')" = on ] && [ "$nb" -ge 2 ] && grep -q "did not answer CLIENT TRACKING ON BCAST in time" "$D/o.log" &&
+	ok "11. the first BCAST answered after the timeout: asked again on a new connection, on" ||
+	bad "11. slow BCAST: bcast $(wt 'w["bcast"]'), the replicas heard $nb BCAST(s), log: $(grep -m2 'CLIENT TRACKING' "$D/o.log" | tr '\n' '|')"
 stop
 unfake
 
