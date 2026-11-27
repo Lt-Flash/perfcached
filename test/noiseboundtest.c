@@ -1,5 +1,5 @@
 /* noiseboundtest.c - the transport refuses at its own bounds: past MAXPT or MAXMSG without moving
- * the nonce, and for good at nonce 2^64-1 (Noise 5.1, reserved); the no-key copy-through too. */
+ * the nonce, and for good at nonce 2^64-1 (Noise 5.1, reserved); a state with no key refuses outright. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,14 +89,20 @@ int main(void)
 	CHK(cl < 0, "and it stays refused - the connection is over, a "
 		"reconnect re-keys");
 
-	/* ---- the no-key copy-through ---- */
+	/* ---- no key: the transport refuses, it never copies through ---- */
 	memset(&s, 0, sizeof s);
 	cl = pc_transport_encrypt(&s, pt, (size_t)PC_NOISE_MAXPT + 1, ct);
-	CHK(cl < 0, "the no-key copy-through obeys the same ceiling "
+	CHK(cl < 0, "a transport with no key refuses an oversize record "
 		"(returned %d)", cl);
+	memset(ct, 0, 100);
 	cl = pc_transport_encrypt(&s, pt, 100, ct);
-	CHK(cl == 100 && !memcmp(pt, ct, 100),
-		"and still copies a record that fits (%d)", cl);
+	CHK(cl < 0 && memcmp(pt, ct, 100),
+		"and a record that fits: nothing goes out in the clear (%d)", cl);
+	memset(&r, 0, sizeof r);
+	memset(back, 0, 100);
+	pl = pc_transport_decrypt(&r, pt, 100, back);
+	CHK(pl < 0 && memcmp(pt, back, 100),
+		"a transport with no key refuses to decrypt (%d)", pl);
 
 	printf("noiseboundtest: %s\n", fails ? "FAILED" : "passed");
 	free(pt); free(ct); free(back);

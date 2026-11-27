@@ -234,8 +234,8 @@ static int jeq(const char *ab, const struct pc_jtok *a, int na, int ia,
 			return 1;
 		if (jint(ab, x) && jint(bb, y))        /* "-0" and "0" aside */
 			return lx + ly == 3 && (ab[x->start] == '-' ?
-				!memcmp(ab + x->start, "-0", 2) && bb[y->start] == '0' :
-				!memcmp(bb + y->start, "-0", 2) && ab[x->start] == '0');
+				lx == 2 && !memcmp(ab + x->start, "-0", 2) && bb[y->start] == '0' :
+				ly == 2 && !memcmp(bb + y->start, "-0", 2) && ab[x->start] == '0');
 		return jnum(ab, x, &dx) && jnum(bb, y, &dy) && dx == dy;
 	}
 	if (x->type == PC_J_STR)

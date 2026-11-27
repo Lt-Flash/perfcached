@@ -17,6 +17,9 @@ size_t clpull_req_write(unsigned char *buf, size_t cap, unsigned char type,
 {
 	struct pc_wcur c;
 
+	/* the header's widths: a longer name would be cut and the frame misread */
+	if (q->collen > 255 || q->klen > 0xFFFF)
+		return 0;
 	pc_wcur_init(&c, buf, cap);
 	pc_w8(&c, type);
 	pc_w32(&c, q->req);
@@ -39,7 +42,8 @@ int clpull_req_parse(const unsigned char *p, size_t n, struct clpull_req *q)
 	q->node = pc_ru16(&c);
 	q->collen = pc_ru8(&c);
 	q->klen = pc_ru16(&c);
-	if (CLPULL_QHDR + q->collen + q->klen > n)
+	if (!q->klen || q->klen > CL_KEY_MAX ||
+	        CLPULL_QHDR + q->collen + q->klen > n)
 		return 0;
 	q->col = (const char *)p + CLPULL_QHDR;
 	q->key = q->col + q->collen;
@@ -89,15 +93,16 @@ int clpull_rsp_whole(const struct clpull_rsp *r, size_t n)
 	return n >= CLPULL_RHDR && r->vlen <= n - CLPULL_RHDR;
 }
 
-size_t clpull_req_frame(unsigned char *msg, uint32_t req, int node,
+size_t clpull_req_frame(unsigned char *msg, size_t cap, uint32_t req, int node,
 		const char *col, size_t collen, const char *key, size_t klen)
 {
 	struct clpull_req q;
 
+	if (collen > 255 || klen > 0xFFFF)
+		return 0;
 	q.req = req;
 	q.node = node;
 	q.col = col; q.collen = (unsigned int)collen;
 	q.key = key; q.klen = (unsigned int)klen;
-	return clpull_req_write(msg, clpull_req_size(q.collen, q.klen),
-		M_PULL_REQ, &q);
+	return clpull_req_write(msg, cap, M_PULL_REQ, &q);
 }

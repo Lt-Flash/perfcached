@@ -205,6 +205,15 @@ int main(void)
 	memset(longkey, 'k', KEY_MAX + 1);
 	RUN(rh_json, "JSON.GET", longkey);
 	CHK(is("-ERR key too long\r\n"), "A: a key over KEY_MAX refused");
+	RUN(rh_json, "JSON.GET", "k", "$.a", "$.b");
+	CHK(is("-ERR unsupported JSON.GET option\r\n") && got.calls == 0,
+		"A: two paths refused, not answered for the first alone");
+	RUN(rh_json, "JSON.GET", "k", "INDENT", "\t", "$");
+	CHK(is("-ERR unsupported JSON.GET option\r\n") && got.calls == 0,
+		"A: a formatting option refused, not read as a path");
+	RUN(rh_json, "JSON.DEL", "k", "$.a", "$.b");
+	CHK(is("-ERR unsupported JSON.DEL option\r\n") && got.calls == 0,
+		"A: JSON.DEL with two paths refused");
 
 	/* B: JSON.SET - NX, XX, EX to the core; EX 0, unknown option, arity; the error words */
 	answer(0, NULL, NULL);
@@ -381,6 +390,33 @@ int main(void)
 			"I: SET $ NX with no document - created");
 		CHK(pc_jp_set("{\"a\":1}", 7, "$", 1, "{}", 2, 0, 1, 0, jo, sizeof jo) == 2,
 			"I: SET $ XX over a document - replaced");
+	}
+
+	/* I2: a created path is budgeted by its real names - "n":{ and } a level, ":" the last;
+	 * a cap of the exact size is taken, one byte less refused with nothing written past it */
+	{
+		static char lp[1 + 8 * 257], lo[2200];
+		size_t pl = 0, real = 2 + 1 + 8 * 259 + 2 * 7;
+		int i, guard = 1;
+
+		lp[pl++] = '$';
+		for (i = 0; i < 8; i++) {
+			lp[pl++] = '.';
+			memset(lp + pl, 'a' + i, 256);
+			pl += 256;
+		}
+		memset(lo, '#', sizeof lo);
+		CHK(pc_jp_set("{}", 2, lp, pl, "1", 1, 0, 0, 1, lo, real - 1) == PC_JP_E_SIZE,
+			"I2: 8 created levels of 256-byte names, cap one short - refused");
+		for (i = (int)real - 1; i < (int)sizeof lo; i++)
+			guard &= lo[i] == '#';
+		CHK(guard, "I2: ...and nothing written at or past the cap");
+		CHK(pc_jp_set("{}", 2, lp, pl, "1", 1, 0, 0, 1, lo, real) == (int)real &&
+			lo[0] == '{' && lo[real - 1] == '}', "I2: the exact size - created, %zu bytes", real);
+		CHK(pc_jp_set("{}", 2, "$.a.b", 5, "1", 1, 0, 0, 1, lo, 13) == 13 &&
+			!memcmp(lo, "{\"a\":{\"b\":1}}", 13), "I2: $.a.b into {} with a cap of 13 - created");
+		CHK(pc_jp_set("{\"x\":0}", 7, "$.a.b", 5, "1", 1, 0, 0, 1, lo, 19) == 19 &&
+			!memcmp(lo, "{\"x\":0,\"a\":{\"b\":1}}", 19), "I2: into a non-empty object, the comma counted");
 	}
 
 	/* J: the validator holds the door - exactly one JSON value, structure included: separators

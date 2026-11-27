@@ -54,6 +54,8 @@ int clbulk_offer(struct clbulk *b, unsigned char *buf, size_t len,
 
 /* Any thread. */
 int clbulk_pending(struct clbulk *b);
+/* 1 = a slot is free now, so a large batch is worth building; any thread */
+int clbulk_room(struct clbulk *b);
 
 /* 0 when there is none; the caller frees the buffer, then calls
  * clbulk_done().  Bulk thread. */

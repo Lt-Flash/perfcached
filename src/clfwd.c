@@ -50,7 +50,8 @@ int clfwd_op_parse(const unsigned char *pt, size_t n, struct clfwd_op *f)
 	f->delta = (long long)pc_ru64(&c);
 	f->collen = pc_ru8(&c);
 	f->klen = pc_ru16(&c);
-	if (CLFWD_OP_HDR + f->collen + f->klen > n)
+	if (!f->klen || f->klen > CL_KEY_MAX ||
+	        CLFWD_OP_HDR + f->collen + f->klen > n)
 		return 0;
 	f->col = (const char *)pt + CLFWD_OP_HDR;
 	f->key = f->col + f->collen;
@@ -111,7 +112,7 @@ static int key_tail_parse(struct pc_rcur *c, const unsigned char *pt,
 		return 0;
 	k->collen = pc_ru8(c);
 	k->klen = pc_ru16(c);
-	if (hdr + k->collen + k->klen > n)
+	if (!k->klen || k->klen > CL_KEY_MAX || hdr + k->collen + k->klen > n)
 		return 0;
 	k->col = (const char *)pt + hdr;
 	k->key = k->col + k->collen;

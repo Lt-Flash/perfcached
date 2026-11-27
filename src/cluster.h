@@ -66,6 +66,8 @@ int pc_node_stalled(void);
 void pc_node_set_stalled(int on);
 const char *pc_node_state_name(int st);
 void pc_node_state_set(int st);
+/* @to only while the node is in @from, checked and set under one lock: 1 moved */
+int pc_node_state_move(int from, int to);
 /* the WAL's shed callback (pc_wal_on_shed): FAILED with the reason.  A daemon WITHOUT a
  * cluster installs it itself, or no WAL failure refuses a write */
 void pc_node_wal_shed(int why);
@@ -181,6 +183,8 @@ struct pc_cl_stats {
 	/* the [cluster] max_pending parked slots are the cluster plane's backpressure: a forward or
 	 * pull without one is refused, not queued; pend_peak sizes the knob */
 	unsigned long long pend_exhausted;
+	/* completions a worker never got: no queue for it, or its queue full */
+	unsigned long long pend_cq_dropped;
 	int pend_peak, pend_max;
 	int pend_peak_win;                 /* the peak of the last 5 min */
 	/* live occupancy: a missed release climbs and never returns; quiet fleet = 0 */
@@ -476,6 +480,8 @@ struct pc_cfgsig {
 	uint32_t name_h, val_h;
 };
 void pc_cluster_set_cfgsig(const struct pc_cfgsig *e, int n);
+/* the entry named as @e is, its value from @e: after a reload (none of that name: nothing) */
+void pc_cluster_set_cfgsig_one(const struct pc_cfgsig *e);
 /* a member's fact (PC_FACT_*): 1 and *val, or 0 when it did not say */
 struct pc_member;
 int pc_member_fact(const struct pc_member *m, uint32_t key, uint32_t *val);
@@ -483,13 +489,14 @@ int pc_member_fact(const struct pc_member *m, uint32_t key, uint32_t *val);
 int pc_cluster_cfgsig(const struct pc_cfgsig **e);
 
 /* the retained tombstones for the alerts, and members heard back after a silence longer than
- * the table covers (@gap_text: the last one); 0 when the table is off */
+ * the table covers (gap n's line at gap_text[(n - 1) % PC_TOMB_GAP_KEEP]); 0 when the table is off */
+#define PC_TOMB_GAP_KEEP 4
 struct pc_tomb_alert {
 	unsigned int retain_s, max;
 	unsigned long long entries, dropped_early, noted, gaps;
 	/* of the drops and the notes, the expiries */
 	unsigned long long dropped_early_expiries, noted_expiries;
-	char gap_text[256];
+	char gap_text[PC_TOMB_GAP_KEEP][256];
 };
 int pc_cluster_tomb_alert(struct pc_tomb_alert *out);
 /* replicate one AUTHORED eager record to every live peer now (worker thread, fire-and-forget);
@@ -564,10 +571,15 @@ void pc_cluster_autoscale_announce(const char *name, size_t nlen, int mode,
 /* the placement map's stamp a client must hold to route as this node does: 1 and the stamp
  * when valid, else 0; read relaxed - it rides a hint, never a decision */
 int pc_cluster_map_stamp(unsigned int *term, unsigned int *seq);
+/* 1 while placement reads the map, 0 while it falls back to the peers' liveness */
+int pc_cluster_map_usable(void);
 /* announce a collection SET/DROP/RESIZE (@op, CLCOL_OP_*) to every live peer, re-sent in full to
  * a newly seen one; returns the generation sent (0 = not); a RESIZE is re-sent 1, 3 and 7 s on */
 unsigned long long pc_cluster_col_announce(const char *name, size_t nlen,
 		int buckets_log2, int op);
+/* the same under @gen, the generation the store stamped (0 = chosen as above) */
+unsigned long long pc_cluster_col_announce_gen(const char *name, size_t nlen,
+		int buckets_log2, int op, unsigned long long gen);
 
 /* the same, for a rename - the message carries both names */
 void pc_cluster_col_announce2(const char *from, size_t flen, const char *to,

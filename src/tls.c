@@ -221,8 +221,12 @@ int pc_tls_input(struct pc_tls *t, const char *p, size_t n, pc_tls_out_fn plain,
 		e = SSL_get_error(t->ssl, r);
 		if (e == SSL_ERROR_WANT_READ)
 			break;
-		*why = e == SSL_ERROR_ZERO_RETURN ? "TLS: closed by the client" :
-			tls_reason("TLS read failed");
+		if (e == SSL_ERROR_ZERO_RETURN) {
+			/* what came before the close_notify is still served */
+			*why = "TLS: closed by the client";
+			return drain(t, wire, ctx) < 0 ? -1 : 1;
+		}
+		*why = tls_reason("TLS read failed");
 		return -1;
 	}
 	return drain(t, wire, ctx);        /* tickets after the handshake, alerts */

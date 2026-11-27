@@ -11,6 +11,7 @@ static unsigned char freed[PC_QS_LINES];   /* 1: given back by pc_qs_detach, to 
 static unsigned int nlines;
 static unsigned long long seq = 1; /* never 0: 0 is "outside" */
 static __thread int me = -1;
+static __thread int depth;         /* nested enters: only the outermost pair counts */
 
 void pc_qs_attach(void)
 {
@@ -46,13 +47,14 @@ void pc_qs_detach(void)
 	__atomic_store_n(&lines[me].epoch, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&freed[me], 1, __ATOMIC_RELEASE);
 	me = -1;
+	depth = 0;
 }
 
 /* the store and the fence make a Dekker pair with the retirer's stamp: either a later retirer sees
  * our epoch, or we see its unpublish and take the new pointer */
 void pc_qs_enter(void)
 {
-	if (me < 0)
+	if (me < 0 || depth++ > 0)
 		return;
 	__atomic_store_n(&lines[me].epoch,
 		__atomic_load_n(&seq, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
@@ -63,6 +65,11 @@ void pc_qs_exit(void)
 {
 	if (me < 0)
 		return;
+	if (depth > 1) {
+		depth--;
+		return;
+	}
+	depth = 0;
 	__atomic_store_n(&lines[me].epoch, 0, __ATOMIC_RELEASE);
 }
 

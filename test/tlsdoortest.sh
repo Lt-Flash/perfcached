@@ -127,6 +127,23 @@ with ctx.wrap_socket(socket.create_connection(("127.0.0.1", rt), 10), server_hos
     except Exception as e:
         out.append("N=lost-after-%d" % got)
     th.join(5)
+# O: commands and the client's close_notify in one write - the commands still run, as on a plain door
+sk = socket.create_connection(("127.0.0.1", rt), 5); bi, bo = ssl.MemoryBIO(), ssl.MemoryBIO()
+ob = ctx.wrap_bio(bi, bo, server_hostname="127.0.0.1")
+while True:
+    try:
+        ob.do_handshake(); break
+    except ssl.SSLWantReadError:
+        sk.sendall(bo.read()); bi.write(sk.recv(65536))
+ob.write(b"*2\r\n$4\r\nAUTH\r\n$13\r\npctls-resp-pw\r\n*3\r\n$3\r\nSET\r\n$6\r\ntlseof\r\n$2\r\nok\r\n")
+try:
+    ob.unwrap()
+except ssl.SSLWantReadError:
+    pass
+sk.sendall(bo.read()); time.sleep(0.5); sk.close()
+with ctx.wrap_socket(socket.create_connection(("127.0.0.1", rt), 5), server_hostname="127.0.0.1") as s:
+    resp(s, b"AUTH", b"pctls-resp-pw"); g = resp(s, b"GET", b"tlseof")
+    out.append("O=%s" % ("ok" if g == b"ok" else "lost-%r" % g))
 print(" ".join(out))
 PY
 )
@@ -145,6 +162,7 @@ PY
 		E=ok) ok "$io E. the plaintext RESP door beside it still plaintext";;
 		N=ok) ok "$io N. 8 MB of replies past the output pause while the client kept sending: every reply right";;
 		F=200) ok "$io F. GET /health over TLS with the token";;
+		O=ok) ok "$io O. a SET and the client's close_notify in one write: the SET ran";;
 		G=ok) grep -h 'an fsync has been stuck' "$D/$io.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
 			n=$(grep -E "ERROR|CRIT" "$D/$io.log" | grep -cv 'an fsync has been stuck')
 			[ "$n" = 0 ] && ok "$io G. a client gone mid-handshake: the node goes on, nothing in ERROR" ||

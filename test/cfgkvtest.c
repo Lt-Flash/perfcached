@@ -25,8 +25,9 @@ static int kv(int (*f)(struct pstate *, char *, char *), const char *key, const 
 	return f(&ps, k, v);
 }
 
-/* @key = @val on [listen], its answer; what it logged in @out */
-static int kv_logged(const char *key, const char *val, char *out, size_t cap)
+/* @f on @key = @val, its answer; what it logged in @out */
+static int kv_logged_f(int (*f)(struct pstate *, char *, char *), const char *key,
+		const char *val, char *out, size_t cap)
 {
 	char tmp[] = "/var/tmp/cfgkvtest.XXXXXX";
 	int fd = mkstemp(tmp), save = dup(2), rc;
@@ -35,7 +36,7 @@ static int kv_logged(const char *key, const char *val, char *out, size_t cap)
 	fflush(stderr);
 	if (fd >= 0)
 		dup2(fd, 2);
-	rc = kv(cfg_kv_listen, key, val);
+	rc = kv(f, key, val);
 	fflush(stderr);
 	dup2(save, 2);
 	close(save);
@@ -46,6 +47,12 @@ static int kv_logged(const char *key, const char *val, char *out, size_t cap)
 	}
 	out[n > 0 ? n : 0] = 0;
 	return rc;
+}
+
+/* @key = @val on [listen] */
+static int kv_logged(const char *key, const char *val, char *out, size_t cap)
+{
+	return kv_logged_f(cfg_kv_listen, key, val, out, cap);
 }
 
 static int count_of(const char *s, const char *w)
@@ -181,6 +188,67 @@ int main(void)
 	CHK(kv_logged("resp_allow", "10.0.0.0/8", lg, sizeof lg) == 0 && !strstr(lg, "WARNING") &&
 		kv_logged("resp_allow", "10.1.2.3", lg, sizeof lg) == 0 && !strstr(lg, "WARNING"),
 		"G: 10.0.0.0/8 and a bare 10.1.2.3 - no warning (log: %.200s)", lg);
+
+	/* H: a key told apart from its twin by its whole name, in any case */
+	CHK(kv(cfg_kv_listen, "TLS_CERT", "a.pem") == 0 && cfg.tls_cert &&
+		!strcmp(cfg.tls_cert, "a.pem") && !cfg.tls_key,
+		"H: TLS_CERT = a.pem - stored as the certificate, not the key");
+	CHK(kv(cfg_kv_collection, "Upstream_Sentinel_Master", "mymaster") == 0 && col.up_smaster &&
+		!strcmp(col.up_smaster, "mymaster") && !col.up_spassword,
+		"H: Upstream_Sentinel_Master = mymaster - the master's name, not the sentinel password");
+
+	/* I: keepalive_s within what TCP_KEEPIDLE takes */
+	CHK(kv(cfg_kv_listen, "keepalive_s", "32767") == 0 && cfg.keepalive_s == 32767 &&
+		kv(cfg_kv_listen, "keepalive_s", "32768") == -1 && cfg.keepalive_s == 32767,
+		"I: keepalive_s in 0..32767 - 32768 refused, the socket option would not take it");
+
+	/* J: save - every pair of a token or a refusal, one save line; sampled:N a whole number */
+	cfg.n_rdb_rules = -1;
+	CHK(kv(cfg_kv_wal, "save", "3600 1 300 100 60 10000") == -1,
+		"J: save = 3600 1 300 100 60 10000 (Redis's one-line form) - refused, not cut to 3600 1");
+	cfg.n_rdb_rules = -1;
+	CHK(kv(cfg_kv_wal, "save", "900 1, 300 10 ") == 0 && cfg.n_rdb_rules == 2 &&
+		cfg.rdb_rules[1].secs == 300 && cfg.rdb_rules[1].changes == 10,
+		"J: save = 900 1, 300 10 - two rules");
+	CHK(kv(cfg_kv_wal, "save", "60 10000") == -1 && cfg.n_rdb_rules == 2,
+		"J: a second save line - refused, the first kept");
+	cfg.query_log = 0;
+	CHK(kv(cfg_kv_daemon, "query_log", "sampled:100x") == -1 && cfg.query_log == 0 &&
+		kv(cfg_kv_daemon, "query_log", "sampled:100") == 0 && cfg.query_log == 100,
+		"J: query_log = sampled:100x - refused; sampled:100 taken");
+
+	/* K: [cluster] collections - every name under the collection-name rule */
+	CHK(kv(cfg_kv_cluster, "collections", "sessions; carts") == -1 && cfg.n_cl_col == 0,
+		"K: collections = sessions; carts - refused, no collection of that name");
+	free(cfg.cl_collections);
+	cfg.cl_collections = NULL;
+	CHK(kv(cfg_kv_cluster, "collections", "a234567890123456789012345678901234") == -1 &&
+		cfg.n_cl_col == 0, "K: a 34-character name - refused");
+	free(cfg.cl_collections);
+	cfg.cl_collections = NULL;
+	CHK(kv(cfg_kv_cluster, "collections", "sessions, carts_2") == 0 && cfg.n_cl_col == 2 &&
+		!strcmp(cfg.cl_colname[1], "carts_2"), "K: collections = sessions, carts_2 - taken");
+
+	/* L: a [secrets] line typed under [listen] or a URL with credentials - refused, not echoed */
+	n = cfg.n_listen;
+	CHK(kv_logged("http", "tok:en-part2", lg, sizeof lg) == -1 && cfg.n_listen == n &&
+		!strstr(lg, "en-part2") && strstr(lg, "ERROR"),
+		"L: [listen] http = tok:en-part2 - refused, the value not in the log (log: %.200s)", lg);
+	CHK(kv_logged("resp", "s3cret pass-word", lg, sizeof lg) == -1 && cfg.n_listen == n &&
+		!strstr(lg, "pass-word") && strstr(lg, "ERROR"),
+		"L: [listen] resp = s3cret pass-word - refused, the value not in the log (log: %.200s)", lg);
+	CHK(kv_logged_f(cfg_kv_mail, "smtp", "smpt://alerts:mail-pw@10.0.0.5:25", lg, sizeof lg) == -1 &&
+		!strstr(lg, "mail-pw") && strstr(lg, "no credentials"),
+		"L: smtp = smpt://alerts:mail-pw@... - refused for its credentials, not printed (log: %.200s)", lg);
+
+	/* M: loopback is a numeric loopback address (or localhost), never a name that starts 127. */
+	n = cfg.n_listen;
+	CHK(kv(cfg_kv_listen, "resp", "127.cache.example.net:6379") == 0 && cfg.n_listen == n + 1 &&
+		!cfg.listen[n].loopback, "M: resp = 127.cache.example.net:6379 - a name, not loopback");
+	CHK(kv(cfg_kv_listen, "resp", "127.0.0.2:6379") == 0 && cfg.n_listen == n + 2 &&
+		cfg.listen[n + 1].loopback, "M: resp = 127.0.0.2:6379 - loopback");
+	CHK(kv(cfg_kv_listen, "resp", "10.0.0.1:6379") == 0 && cfg.n_listen == n + 3 &&
+		!cfg.listen[n + 2].loopback, "M: resp = 10.0.0.1:6379 - not loopback");
 
 	printf("cfgkvtest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

@@ -141,6 +141,8 @@ int main(void)
 	CHK(rc == 1 && c.established && c.raw_len == 0,
 		"A: the second client secret - established, the frame consumed");
 	CHK(msg2(&st) == 0 && st == 0, "A: message 2 on the wire, read by the client - status 0");
+	CHK(sodium_is_zero((const unsigned char *)&c.hs, sizeof c.hs),
+		"A: the handshake state (ephemeral and chaining keys) is wiped once message 2 is staged");
 	{
 		uint8_t ct[64], pt[64];
 		int k = pc_transport_encrypt(&c.send_cs, (const uint8_t *)"pong", 4, ct);
@@ -258,6 +260,9 @@ int main(void)
 		rc = channel_handshake(&c);
 		CHK(rc == 1 && c.established && !c.encrypted && c.plain_auth && c.raw_len == 2,
 			"D: the switch record - established in the clear, the request behind it kept");
+		CHK(sodium_is_zero((const unsigned char *)&c.send_cs, sizeof c.send_cs) &&
+		    sodium_is_zero((const unsigned char *)&c.recv_cs, sizeof c.recv_cs),
+			"D: the session keys are wiped once the channel is plaintext");
 
 		fresh();
 		feed(f, 3 + m1len);

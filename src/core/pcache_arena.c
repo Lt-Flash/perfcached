@@ -67,8 +67,8 @@
  * of the reservation, or a whole shm page, are given back to the host after
  * a quiet window and a cool-off since the last carve: MADV_DONTNEED on the
  * reservation (PORTED S3: private anon now - REMOVE is shmem-only; same
- * semantics: the mapping stays, a later carve re-faults), shm_free of the
- * page.  Nothing is ever unmapped, so a lock-free reader still holding a
+ * semantics: the mapping stays, a later carve re-faults), and the same
+ * MADV_DONTNEED for a page, kept for reuse.  Nothing is ever unmapped, so a lock-free reader still holding a
  * pointer into a retired, re-cut or punched-out slot reads mapped memory:
  * the copy-out chain (extents, class bound, hash, key, version re-check)
  * rejects what it finds there, exactly as for any stale pointer.
@@ -342,6 +342,7 @@ typedef struct pcache_arena {
 	unsigned int nfree_warm, nfree_cold;    /* reservation + pages / reservation */
 	pcache_page_t *pages;
 	unsigned int npages;
+	pcache_page_t *pages_back;              /* given back: no RSS, still mapped */
 	unsigned int slots_total;               /* reservation slots cut + page slots */
 	unsigned int chunks_used;               /* slots holding a chunk */
 	unsigned int rchunks;                   /* of them, reservation slots */
@@ -707,26 +708,31 @@ static int page_add(void)
 	unsigned long size = (PCACHE_PAGE_SLOTS + 1) * PCACHE_SLOT;
 	unsigned int i;
 
-	pg = shm_malloc(sizeof *pg);
-	if (!pg) {
-		LM_ERR("no more shm memory for a page descriptor\n");
-		return -1;
+	/* a page given back is taken first: its mapping never went */
+	if ((pg = arena->pages_back) != NULL) {
+		arena->pages_back = pg->next;
+	} else {
+		pg = shm_malloc(sizeof *pg);
+		if (!pg) {
+			LM_ERR("no more shm memory for a page descriptor\n");
+			return -1;
+		}
+		pg->raw = shm_malloc(size);
+		if (!pg->raw) {
+			LM_ERR("no more shm memory for a %lu byte page\n", size);
+			shm_free(pg);
+			return -1;
+		}
+		pg->base = (char *)(((unsigned long)pg->raw + PCACHE_SLOT - 1)
+		                    & PCACHE_SLOT_MASK);
+		extents_add((unsigned long)pg->raw, (unsigned long)pg->raw + size);
 	}
-	pg->raw = shm_malloc(size);
-	if (!pg->raw) {
-		LM_ERR("no more shm memory for a %lu byte page\n", size);
-		shm_free(pg);
-		return -1;
-	}
-	pg->base = (char *)(((unsigned long)pg->raw + PCACHE_SLOT - 1)
-	                    & PCACHE_SLOT_MASK);
 	pg->nslots = PCACHE_PAGE_SLOTS;
 	pg->nfree = PCACHE_PAGE_SLOTS;
 	pg->next = arena->pages;
 	arena->pages = pg;
 	arena->npages++;
 	arena->bytes += size;
-	extents_add((unsigned long)pg->raw, (unsigned long)pg->raw + size);
 
 	pg->free = NULL;
 	for (i = 0; i < pg->nslots; i++) {
@@ -949,6 +955,23 @@ static inline int tail_inflight(unsigned long lo, unsigned long hi)
 		lo < arena->tail_fl_hi && hi > arena->tail_fl_lo;
 }
 
+/* the thread running a punch's phase 2 (only a test hook carves there) */
+static __thread int tail_punching;
+
+/* a carve into the tail in flight waits for it to land instead of leaving the reservation;
+ * 1 = it waited, the arena lock was dropped meanwhile.  Arena lock held */
+static int tail_wait(unsigned long lo, unsigned long hi)
+{
+	if (tail_punching || !tail_inflight(lo, hi))
+		return 0;
+	while (tail_inflight(lo, hi)) {
+		lock_release(&arena->lock);
+		usleep(200);
+		lock_get(&arena->lock);
+	}
+	return 1;
+}
+
 void (*pcache_arena_tail_hook)(char *lo, char *hi);
 
 static int groups_commit(unsigned long lo, unsigned long hi)
@@ -1007,6 +1030,7 @@ static pcache_chunk_t *slot_take(void)
 	pcache_page_t *pg, *best = NULL;
 	int i;
 
+again:
 	/* the (i = first()) >= 0 claim-and-test idiom, parenthesized */
 	/* NOLINTNEXTLINE(bugprone-assignment-in-if-condition) */
 	if (arena->hbase && (i = bit_first(arena->rwarm, arena->rslots)) >= 0) {
@@ -1025,6 +1049,9 @@ static pcache_chunk_t *slot_take(void)
 		arena->nfree_warm--;
 		ch = rslot_at(i);
 	}
+	if (!ch && arena->hbase && arena->hoff + PCACHE_SLOT <= arena->rtop &&
+	    tail_wait(arena->hoff, arena->hoff + PCACHE_SLOT))
+		goto again;                /* the maps may have moved meanwhile */
 	if (!ch && arena->hbase && arena->hoff + PCACHE_SLOT <= arena->rtop &&
 	    !tail_inflight(arena->hoff, arena->hoff + PCACHE_SLOT) &&    /* S447 */
 	    carve_commit((unsigned int)(arena->hoff / PCACHE_HPS)) == 0) {   /* S97 */
@@ -1617,6 +1644,7 @@ void *pcache_region_alloc(size_t size)
 
 	lock_get(&arena->lock);
 	slots = (size + PCACHE_SLOT - 1) >> PCACHE_SLOT_SHIFT;
+again:
 	/* S150 C: a retired slot before the frontier - resident first, then
 	 * a punched one (its whole group re-committed, as slot_take does).
 	 * Every index region is one slot (S155); a larger one still carves. */
@@ -1637,6 +1665,9 @@ void *pcache_region_alloc(size_t size)
 			return arena->hbase + (unsigned long)i * PCACHE_SLOT;
 		}
 	}
+	if (arena->hbase && arena->hoff + slots * PCACHE_SLOT <= arena->rtop &&
+	    tail_wait(arena->rtop - slots * PCACHE_SLOT, arena->rtop))
+		goto again;
 	if (arena->hbase && arena->hoff + slots * PCACHE_SLOT <= arena->rtop &&
 	    !tail_inflight(arena->rtop - slots * PCACHE_SLOT, arena->rtop) &&   /* S447 */
 	    groups_commit(arena->rtop - slots * PCACHE_SLOT, arena->rtop) == 0) {   /* S97 */
@@ -1725,6 +1756,11 @@ void pcache_arena_destroy(void)
 		shm_free(rg);
 	}
 	for (pg = arena->pages; pg; pg = pnext) {
+		pnext = pg->next;
+		shm_free(pg->raw);
+		shm_free(pg);
+	}
+	for (pg = arena->pages_back; pg; pg = pnext) {
 		pnext = pg->next;
 		shm_free(pg->raw);
 		shm_free(pg);
@@ -2397,9 +2433,9 @@ static void giveback_tick(void)
 	}
 
 	/* shm pages: a page whose every slot is free and quiet goes back to
-	 * shm_free (keep reclaim_keep of them resident for the next growth).
-	 * Unlinked and accounted here - a free() cannot fail - and released
-	 * outside the lock along with the groups. */
+	 * the host (keep reclaim_keep of them resident for the next growth).
+	 * Unlinked and accounted here, released outside the lock along with
+	 * the groups, and kept mapped for the next page_add. */
 	for (ppg = &arena->pages; (pg = *ppg) != NULL; ) {
 		if (pg->nfree < pg->nslots ||
 		    !range_quiet(pg->base, pg->base + (unsigned long)pg->nslots * PCACHE_SLOT)) {
@@ -2448,6 +2484,7 @@ static void giveback_tick(void)
 
 	/* ---- phase 2: the syscalls, lock DROPPED ------------------------ */
 	lock_release(&arena->lock);
+	tail_punching = 1;
 	if (pcache_arena_tail_hook && arena->tail_fl_hi > arena->tail_fl_lo)
 		pcache_arena_tail_hook(arena->hbase + arena->tail_fl_lo,
 			arena->hbase + arena->tail_fl_hi);
@@ -2465,13 +2502,17 @@ static void giveback_tick(void)
 			break;
 		}
 	}
+	/* a page's memory goes back, its mapping stays: a stale reader still reads mapped bytes */
+	for (pg = freed; pg; pg = pg->next)
+		(void)madvise(pg->base, (size_t)pg->nslots * PCACHE_SLOT, MADV_DONTNEED);
+	tail_punching = 0;
+	lock_get(&arena->lock);
 	while (freed) {
 		pg = freed;
 		freed = pg->next;
-		shm_free(pg->raw);
-		shm_free(pg);
+		pg->next = arena->pages_back;
+		arena->pages_back = pg;
 	}
-	lock_get(&arena->lock);
 
 	/* ---- phase 3: bookkeeping for what happened, lock held ----------- */
 	arena->tail_fl_lo = arena->tail_fl_hi = 0;     /* S447: landed */
@@ -2716,16 +2757,12 @@ void pcache_arena_pressure(struct pcache_arena_pressure *out)
 	out->tier = arena ? pcache_mem_tier_str(arena->htier) : "none";
 	out->refused = __atomic_load_n(&arena_refused, __ATOMIC_RELAXED);
 	out->pool_empty = __atomic_load_n(&arena_pool_empty, __ATOMIC_RELAXED);
-	out->commits_ahead = arena->commits_ahead;          /* S166 */
-	out->commits_inline = arena->commits_inline;
-	out->commits_index = arena->commits_index;          /* S168 */
-	out->sparse_chunks = arena->sparse_chunks;          /* S190 */
-	out->evacuated = __atomic_load_n(&arena->evacuated, __ATOMIC_RELAXED);
-	out->locked_bytes = arena->pinned                   /* S167 */
-		? (unsigned long)arena->hlocked_mb << 20 : 0;
-	out->pin_lost = arena->pin_failed;
 	out->at_ceiling_since = __atomic_load_n(&arena_ceiling_since, __ATOMIC_RELAXED);
 	if (!arena) {
+		out->commits_ahead = out->commits_inline = out->commits_index = 0;
+		out->sparse_chunks = out->evacuated = 0;
+		out->locked_bytes = 0;
+		out->pin_lost = 0;
 		out->retired = out->pages_freed = out->released_bytes = 0;
 		out->cold_bytes = out->flushes = 0;
 		out->punch_calls = out->punch_groups = 0;
@@ -2740,6 +2777,14 @@ void pcache_arena_pressure(struct pcache_arena_pressure *out)
 		out->regions_raised = 0;
 		return;
 	}
+	out->commits_ahead = arena->commits_ahead;          /* S166 */
+	out->commits_inline = arena->commits_inline;
+	out->commits_index = arena->commits_index;          /* S168 */
+	out->sparse_chunks = arena->sparse_chunks;          /* S190 */
+	out->evacuated = __atomic_load_n(&arena->evacuated, __ATOMIC_RELAXED);
+	out->locked_bytes = arena->pinned                   /* S167 */
+		? (unsigned long)arena->hlocked_mb << 20 : 0;
+	out->pin_lost = arena->pin_failed;
 	out->regions_bytes = arena->regions_bytes;             /* S114 */
 	/* S150 C: a retired slot kept resident is free and warm - the card's
 	 * rows still add up to held - and shown on its own beside that */
@@ -2769,7 +2814,8 @@ void pcache_arena_pressure(struct pcache_arena_pressure *out)
 /* the reclaim view for perf_stats "arena" - arena lock taken here */
 int pcache_arena_mi(mi_item_t *aobj)
 {
-	char buf[PCACHE_NCLASSES * 24], *p = buf;
+	/* the widest line: a space, three unsigned ints, an unsigned long and three separators */
+	char buf[PCACHE_NCLASSES * 56], *p = buf;
 	pcache_page_t *pg;
 	pcache_chunk_t *ch;
 	unsigned long off, out[PCACHE_NCLASSES], strand = 0;
@@ -3256,14 +3302,15 @@ int pcache_arena_selftest(void)
 	warm = arena->nfree_warm;
 	CHK(warm >= retired1 - retired0, "retired slots not on the warm list "
 		"(%u warm)\n", warm);
-	/* the largest class holds 3 cells per slot and owns exactly one chunk
-	 * here: the 4th allocation must cut a new chunk, and that cut must
-	 * take a retired slot (warm count down by one), stamped for ITS class */
+	/* the largest class owns exactly one chunk here: one allocation past what a chunk
+	 * holds must cut a new chunk, from a retired slot (warm count down by one) */
 	{
-		void *big[4];
+		void *big[8];
 		unsigned int bc = PCACHE_NCLASSES - 1;
+		unsigned int per = (unsigned int)((PCACHE_SLOT - PCACHE_CHUNK_HDR) / cell_sizes[bc]);
+		unsigned int nb = per + 1 < 8 ? per + 1 : 8;
 
-		for (i = 0; i < 4; i++) {
+		for (i = 0; i < nb; i++) {
 			big[i] = pcache_cell_alloc(cell_sizes[bc]);
 			CHK(big[i] != NULL, "alloc %u of %u after retire failed\n",
 				i, cell_sizes[bc]);
@@ -3274,9 +3321,9 @@ int pcache_arena_selftest(void)
 		}
 		CHK(arena->nfree_warm == warm - 1, "the carve did not take a "
 			"retired slot (%u -> %u warm)\n", warm, arena->nfree_warm);
-		CHK(cell_chunk(big[3]) != cell_chunk(big[0]),
-			"4th cell of %u came from the same chunk\n", cell_sizes[bc]);
-		for (i = 0; i < 4; i++)
+		CHK(cell_chunk(big[nb - 1]) != cell_chunk(big[0]),
+			"cell %u of %u came from the first chunk\n", nb, cell_sizes[bc]);
+		for (i = 0; i < nb; i++)
 			pcache_cell_free(big[i]);
 	}
 	pcache_arena_stats(&n3, &by1);

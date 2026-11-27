@@ -4,6 +4,7 @@
  * them); a node without [mail] relays to the elected mailer, which alone mails fleet events */
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,10 +53,13 @@ struct akey {
 	long long since_wall;              /* raised at (wall ms) */
 	long long true_since, false_since; /* monotonic ms; 0 = not in that phase */
 	long long last_mail;               /* monotonic ms of the last mailed raise */
+	unsigned int mail_h;               /* and a hash of its text */
 	int fleet;                         /* a fleet event - the elected mailer's to send */
 	int oneoff;                        /* an event (event()): nothing clears it */
 	long long pend_since;              /* waiting for a mailer since */
 	int pend_slot;                     /* and its ring entry */
+	long long clr_since;               /* its clear waiting for a mailer since */
+	int clr_slot;                      /* and that ring entry */
 	char text[PC_ALERT_TEXT];
 	/* the problem as a whole - when it began, its worst, the value
 	 * when it cleared, and the mail its resolve answers */
@@ -139,6 +143,9 @@ static struct {
 	unsigned long long base_in, base_out, base_drop;
 	long long nmr_said;                /* "no mailer reachable" last logged */
 	unsigned long nmr_quiet;           /* and since then, unlogged */
+	unsigned long long keys_refused;   /* conditions the full key table could not track */
+	long long kfull_said;              /* that last logged */
+	unsigned long kfull_quiet;
 	int fleet_seen;                    /* the most members listed */
 	unsigned int forget_seen;          /* pc_cluster_forget_gen() last read */
 	struct pc_member *mem;             /* pc_cluster_members' scratch */
@@ -149,6 +156,37 @@ static struct {
 static int link_pct_pub = -1, link_lvl_pub;   /* read by the cluster thread */
 
 static struct akey *key_find(const char *key, int create);
+
+/* FNV-1a */
+static unsigned int text_hash(const char *s)
+{
+	unsigned int h = 2166136261u;
+
+	for (; *s; s++)
+		h = (h ^ (unsigned char)*s) * 16777619u;
+	return h;
+}
+
+/* an alert key; one longer than KEYLEN keeps its head and ends in a hash of the whole, so two
+ * long collection names never share one (two conditions on one key undo each other) */
+static void __attribute__((format(printf, 2, 3))) akey_fmt(char *key, const char *fmt, ...)
+{
+	char full[256];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(full, sizeof full, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		n = 0;
+	full[n < (int)sizeof full ? n : (int)sizeof full - 1] = 0;
+	if (n < KEYLEN) {
+		memcpy(key, full, (size_t)n + 1);
+		return;
+	}
+	snprintf(key, KEYLEN, "%.*s~%08x", KEYLEN - 10, full, text_hash(full));
+}
 static int hw_level(const char *key, int pct, int warn, int crit);
 static void link_init(const struct pc_config *cfg);
 
@@ -266,7 +304,7 @@ static void ring_add(const struct akey *k, int cleared, const char *mail)
  * list the same table); a key matches exactly, or by prefix if it ends in '.' or is "fleet.node" */
 static const struct acat {
 	const char *key;
-	const char *title, *title_failed;  /* node.state's title when its text says FAILED */
+	const char *title, *title_failed;  /* the title at critical (node.state: when FAILED) */
 	const char *node;                  /* "The node": NULL when nothing */
 	const char *todo;                  /* "What to do" */
 	const char *cause;                 /* raised by this key, NULL */
@@ -466,14 +504,15 @@ static const struct acat *cat_of(const char *key)
 	return NULL;
 }
 
-static const char *title_of(const char *key, const char *text)
+static const char *title_of(const char *key, const char *text, int level)
 {
 	const struct acat *c = cat_of(key);
 
 	if (!c)
 		return key;
-	return c->title_failed && !strncmp(text, "node FAILED", 11) ?
-		c->title_failed : c->title;
+	/* node.state is critical too when healing has lasted: that is still "healing" */
+	return c->title_failed && level >= PC_AL_CRITICAL &&
+		strncmp(text, "node HEALING", 12) ? c->title_failed : c->title;
 }
 
 static int key_is_event(const char *key)
@@ -600,11 +639,12 @@ static void status_url(char *b, size_t n)
 	b[0] = 0;
 	if (!A.http_port)
 		return;
-	if (!h[0] || !strcmp(h, "0.0.0.0") || !strcmp(h, "*"))
+	if (!h[0] || !strcmp(h, "0.0.0.0") || !strcmp(h, "*") || !strcmp(h, "::"))
 		h = A.self_ip;
-	if (!h[0] || !strncmp(h, "127.", 4) || !strcmp(h, "localhost"))
+	if (!h[0] || !strncmp(h, "127.", 4) || !strcmp(h, "localhost") || !strcmp(h, "::1"))
 		return;
-	snprintf(b, n, "http://%s:%d/", h, A.http_port);
+	/* an IPv6 literal goes in brackets */
+	snprintf(b, n, strchr(h, ':') ? "http://[%s]:%d/" : "http://%s:%d/", h, A.http_port);
 }
 
 /* one mail for one origin: @ix the entries, worst first */
@@ -644,7 +684,7 @@ static void mail_one(const int *ix, int n, int more)
 		: worst >= PC_AL_WARNING ? "WARNING" : "INFO";
 	state_colours(worst, resolved_only, &bar, &ink);
 	snprintf(host, sizeof host, "%.63s", own ? A.host : top->host);
-	snprintf(title, sizeof title, "%s", title_of(top->key, top->text));
+	snprintf(title, sizeof title, "%s", title_of(top->key, top->text, top->level));
 	if (n + more > 1)
 		snprintf(plus, sizeof plus, " (+%d)", n + more - 1);
 	/* "<STATE>: <title> on <host> (+N)", at most 78 characters: the
@@ -830,7 +870,7 @@ static void mail_one(const int *ix, int n, int more)
 		state_colours(e->level, e->cleared, &eb, &ei);
 		fprintf(t, "\n%s - %s\n", e->cleared ? "RESOLVED" : e->level >=
 			PC_AL_CRITICAL ? "CRITICAL" : e->level >= PC_AL_WARNING ?
-			"WARNING" : "INFO", title_of(e->key, e->text));
+			"WARNING" : "INFO", title_of(e->key, e->text, e->level));
 		fprintf(h, "<tr><td style=\"padding:%s20px 2px;\"><span style=\""
 			"font-family:Arial,Helvetica,sans-serif;font-size:13px;color:%s;"
 			"border:1px solid %s;border-radius:4px;padding:2px 10px;\">%s"
@@ -839,7 +879,7 @@ static void mail_one(const int *ix, int n, int more)
 			"10px ", ei, eb, e->cleared ? "Resolved" : e->level >=
 			PC_AL_CRITICAL ? "Critical" : e->level >= PC_AL_WARNING ?
 			"Warning" : "Info");
-		html_esc(h, title_of(e->key, e->text));
+		html_esc(h, title_of(e->key, e->text, e->level));
 		fputs("</span></td></tr>\n<tr><td style=\"padding:2px 20px 4px;\">"
 			"<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" "
 			"cellspacing=\"0\">\n", h);
@@ -899,9 +939,10 @@ static void mail_one(const int *ix, int n, int more)
 		snprintf(line, sizeof line, "%d more in /stats alerts on %s.", more,
 			A.host);
 		fprintf(t, "\n%s\n", line);
-		fprintf(h, "<tr><td style=\"font-family:Arial,Helvetica,sans-serif;"
-			"font-size:14px;color:#5f5e5a;padding:10px 20px;\">%s</td></tr>\n",
-			line);
+		fputs("<tr><td style=\"font-family:Arial,Helvetica,sans-serif;"
+			"font-size:14px;color:#5f5e5a;padding:10px 20px;\">", h);
+		html_esc(h, line);
+		fputs("</td></tr>\n", h);
 	}
 
 	/* ---- the footer ---- */
@@ -1101,7 +1142,7 @@ static int dent_rank(const struct dent *e)
 static void digest_flush(int force)
 {
 	int ix[DMAX], done[DMAX] = { 0 };
-	int i, j, n, a, b, tmp;
+	int i, j, n, a, b, tmp, more = A.dmore;
 
 	if (!A.dn || (!force && mono_ms() < A.ddeadline))
 		return;
@@ -1122,10 +1163,19 @@ static void digest_flush(int force)
 				ix[b] = ix[b - 1];
 				ix[b - 1] = tmp;
 			}
-		mail_one(ix, n, A.dq[i].from ? 0 : A.dmore);
+		/* what did not fit is said once, in the first mail */
+		mail_one(ix, n, more);
+		more = 0;
 	}
 	A.dn = 0;
 	A.dmore = 0;
+}
+
+void pc_alerts_stop(void)
+{
+	pthread_mutex_lock(&A.mx);
+	digest_flush(1);
+	pthread_mutex_unlock(&A.mx);
 }
 
 /* an alert no member can mail: logged when it starts and at most every ten minutes while
@@ -1175,7 +1225,7 @@ static int relay_out(const struct akey *k, int cleared, char *w, size_t wn)
 }
 
 /* one raise or clear due by mail: own mailer, the elected mailer by relay, or nothing (a fleet event off
- * the mailer).  1 went, 0 not now (no mailer, or a raise's relay failed), -1 cannot go; @w the ring's words */
+ * the mailer).  1 went, 0 not now (no mailer, or the relay failed), -1 cannot go; @w the ring's words */
 static int deliver(struct akey *k, int cleared, char *w, size_t wn)
 {
 	if (k->fleet && !(A.mailer_self && pc_mail_ready())) {
@@ -1195,8 +1245,8 @@ static int deliver(struct akey *k, int cleared, char *w, size_t wn)
 	}
 	if (!A.mailer)
 		return 0;
-	/* nothing went, so a raise waits and retries as if no mailer were heard yet */
-	return relay_out(k, cleared, w, wn) == 0 ? 1 : cleared ? -1 : 0;
+	/* nothing went, so it waits and retries as if no mailer were heard yet */
+	return relay_out(k, cleared, w, wn) == 0 ? 1 : 0;
 }
 
 /* where a raise goes by mail; @w gets the ring's words for it */
@@ -1213,8 +1263,9 @@ static void mail_raise(struct akey *k, long long now, int worse, char *w,
 			return;
 		}
 		/* min_interval quiets a REPEAT; a condition that got worse (healing -> failed) is
-		 * news and goes out whatever the window says */
-		if (!worse && k->last_mail && now - k->last_mail < A.min_interval) {
+		 * news and goes out whatever the window says, as is a one-off that says something else */
+		if (!worse && k->last_mail && now - k->last_mail < A.min_interval &&
+		    !(k->oneoff && text_hash(k->text) != k->mail_h)) {
 			snprintf(w, wn, "suppressed");
 			return;
 		}
@@ -1227,28 +1278,37 @@ static void mail_raise(struct akey *k, long long now, int worse, char *w,
 		snprintf(w, wn, "%s", PEND_WORD);
 	} else if (r > 0) {
 		k->last_mail = now;
+		k->mail_h = text_hash(k->text);
 		k->raise_mailed = 1;
 	}
 }
 
-/* the clear of a raise that went out goes the same way - at once */
-static void mail_clear(struct akey *k, char *w, size_t wn)
+/* the clear of a raise that went out goes the same way - at once, or as a raise
+ * does, after waiting PEND_MS for a mailer */
+static void mail_clear(struct akey *k, long long now, char *w, size_t wn)
 {
-	if (deliver(k, 1, w, wn) == 0)
-		unreachable(k->text, w, wn);
+	if (deliver(k, 1, w, wn) == 0) {
+		k->clr_since = now;
+		snprintf(w, wn, "%s", PEND_WORD);
+	}
 }
 
-/* the ring entry of a raise that waited, told what became of it */
-static void pend_word(const struct akey *k, const char *w)
+/* the ring entry of a raise (or clear) that waited, told what became of it */
+static void ring_word(int slot, const struct akey *k, int cleared, const char *w)
 {
-	struct aring *e = &A.r[k->pend_slot];
+	struct aring *e = &A.r[slot];
 
-	if (!e->cleared && !e->from && !strcmp(e->key, k->key) &&
+	if (e->cleared == cleared && !e->from && !strcmp(e->key, k->key) &&
 	        !strcmp(e->mail, PEND_WORD))
 		snprintf(e->mail, sizeof e->mail, "%s", w);
 }
 
-/* the raises waiting for a mailer - out as soon as one is heard,
+static void pend_word(const struct akey *k, const char *w)
+{
+	ring_word(k->pend_slot, k, 0, w);
+}
+
+/* the raises and clears waiting for a mailer - out as soon as one is heard,
  * "no mailer reachable" once PEND_MS has passed without one */
 static void pend_tick(void)
 {
@@ -1259,6 +1319,15 @@ static void pend_tick(void)
 	for (i = 0; i < A.nk; i++) {
 		struct akey *k = &A.k[i];
 
+		if (k->clr_since) {
+			r = deliver(k, 1, w, sizeof w);
+			if (r != 0 || now - k->clr_since >= PEND_MS) {
+				if (r == 0)
+					unreachable(k->text, w, sizeof w);
+				ring_word(k->clr_slot, k, 1, w);
+				k->clr_since = 0;
+			}
+		}
 		if (!k->pend_since)
 			continue;
 		if (!k->active && !k->oneoff) {
@@ -1274,6 +1343,7 @@ static void pend_tick(void)
 			unreachable(k->text, w, sizeof w);
 		} else if (r > 0) {
 			k->last_mail = now;
+			k->mail_h = text_hash(k->text);
 			k->raise_mailed = 1;
 		}
 		pend_word(k, w);
@@ -1292,11 +1362,24 @@ static struct akey *key_find(const char *key, int create)
 		return NULL;
 	for (i = 0; i < A.nk; i++)             /* reuse a long-quiet slot */
 		if (!A.k[i].active && !A.k[i].true_since && !A.k[i].pend_since &&
+		    !A.k[i].clr_since &&
 		    (!A.k[i].last_mail || mono_ms() - A.k[i].last_mail > A.min_interval))
 			break;
 	if (i == A.nk) {
-		if (A.nk == PC_ALERT_KEYS)
+		if (A.nk == PC_ALERT_KEYS) {
+			/* counted, and said when it starts and at most every ten minutes */
+			A.keys_refused++;
+			if (A.kfull_said && mono_ms() - A.kfull_said < S(600)) {
+				A.kfull_quiet++;
+				return NULL;
+			}
+			LM_WARN("alerts: all %d alert keys are taken - '%s' is not watched "
+				"(%lu more refused since this was last said)\n", PC_ALERT_KEYS,
+				key, A.kfull_quiet);
+			A.kfull_said = mono_ms();
+			A.kfull_quiet = 0;
 			return NULL;
+		}
 		A.nk++;
 	}
 	memset(&A.k[i], 0, sizeof A.k[i]);
@@ -1313,6 +1396,10 @@ static void raise_now(struct akey *k, int level, const char *text, long long now
 	if (k->pend_since) {                   /* said again before it went */
 		pend_word(k, "superseded");
 		k->pend_since = 0;
+	}
+	if (k->clr_since) {                    /* back before its clear went */
+		ring_word(k->clr_slot, k, 1, "superseded");
+		k->clr_since = 0;
 	}
 
 	/* a new problem (or any one-off) starts its record */
@@ -1395,8 +1482,10 @@ static void cond(const char *key, int on, int level, long long hold,
 	if (k->raise_mailed) {                  /* its clear goes the same way */
 		char w[MAILW];
 
-		mail_clear(k, w, sizeof w);
+		mail_clear(k, now, w, sizeof w);
 		ring_add(k, 1, w);
+		if (k->clr_since)
+			k->clr_slot = (A.rnext - 1 + PC_ALERT_RING) % PC_ALERT_RING;
 	} else {
 		ring_add(k, 1, "-");
 	}
@@ -1650,6 +1739,12 @@ static void check_memory(void)
 
 /* ---- the host's high-water alarms ------------------------------------------- */
 
+/* where a level held drops: HM_HYST points under it, never below 1, so a low threshold can clear */
+static int hw_edge(int lvl)
+{
+	return lvl - HM_HYST > 1 ? lvl - HM_HYST : 1;
+}
+
 /* the level a high-water condition is at: critical from @crit, a warning from @warn, with HM_HYST
  * points of hysteresis under the level it holds so a value on a line does not flap; 0 = none */
 static int hw_level(const char *key, int pct, int warn, int crit)
@@ -1657,9 +1752,9 @@ static int hw_level(const char *key, int pct, int warn, int crit)
 	struct akey *k = key_find(key, 0);
 	int cur = k && k->active ? k->level : 0;
 
-	if (pct >= crit || (cur >= PC_AL_CRITICAL && pct >= crit - HM_HYST))
+	if (pct >= crit || (cur >= PC_AL_CRITICAL && pct >= hw_edge(crit)))
 		return PC_AL_CRITICAL;
-	if (pct >= warn || (cur && pct >= warn - HM_HYST))
+	if (pct >= warn || (cur && pct >= hw_edge(warn)))
 		return PC_AL_WARNING;
 	return 0;
 }
@@ -2012,7 +2107,7 @@ static void check_upstreams(void)
 			unsigned long long d = h.chained - chain_seen[i];
 
 			chain_seen[i] = h.chained;
-			snprintf(key, sizeof key, "chain.%s", h.col);
+			akey_fmt(key, "chain.%s", h.col);
 			snprintf(t, sizeof t, "another perfcached reads collection %.20s "
 				"through this node, which reads it through its own "
 				"upstream: %llu reads in the last check, answered from "
@@ -2030,14 +2125,14 @@ static void check_upstreams(void)
 			char wk[160];
 			long long pw, fw;
 
-			snprintf(key, sizeof key, "write.%s", h.col);
+			akey_fmt(key, "write.%s", h.col);
 			snprintf(t, sizeof t, nt ? "collection %.20s writes through to "
 				"its master and has none - %s; every write is refused" :
 				"collection %.20s writes through to its master again%s",
 				h.col, nt ? wsn[h.w_state] : "");
 			cond(key, nt, PC_AL_CRITICAL, S(10), S(10), t);
 			/* no RedisJSON there: JSON writes are refused */
-			snprintf(key, sizeof key, "write.%s.json", h.col);
+			akey_fmt(key, "write.%s.json", h.col);
 			snprintf(t, sizeof t, "the master of collection %.20s has no "
 				"RedisJSON - JSON writes are refused, not forwarded", h.col);
 			cond(key, h.w_json == 0 && h.w_target >= 0, PC_AL_WARNING,
@@ -2048,7 +2143,7 @@ static void check_upstreams(void)
 			pw = pc_win_delta(wk, h.w_passed, 0, NULL);
 			snprintf(wk, sizeof wk, "col.%.64s.upw.forwarded", h.col);
 			fw = pc_win_delta(wk, h.w_forwarded, 0, NULL);
-			snprintf(key, sizeof key, "write.%s.passed", h.col);
+			akey_fmt(key, "write.%s.passed", h.col);
 			snprintf(t, sizeof t, "collection %.20s: %lld of %lld writes in "
 				"5 min were commands perfcached does not know, passed "
 				"through to Redis - a client relies on them",
@@ -2067,7 +2162,7 @@ static void check_upstreams(void)
 				snprintf(wk, sizeof wk, "col.%.64s.upw.queue_expired",
 					h.col);
 				qe = pc_win_delta(wk, h.w_qexpired, 1, NULL);
-				snprintf(key, sizeof key, "write.%s.queue", h.col);
+				akey_fmt(key, "write.%s.queue", h.col);
 				snprintf(t, sizeof t, "collection %.20s, 5 min: %lld writes "
 					"refused (queue full), %lld not applied (waited too "
 					"long) - the master is slower than the writes",
@@ -2076,7 +2171,7 @@ static void check_upstreams(void)
 			}
 			/* without broadcast tracking a change another Redis
 			 * client makes to a key written through here is not seen */
-			snprintf(key, sizeof key, "write.%s.tracking", h.col);
+			akey_fmt(key, "write.%s.tracking", h.col);
 			snprintf(t, sizeof t, "collection %.20s writes through but "
 				"does not follow other clients' changes in Redis "
 				"(broadcast tracking %s)", h.col,
@@ -2088,7 +2183,7 @@ static void check_upstreams(void)
 			why = up_why(&h.srv[0], h.role_replica);
 			down = h.conns_up == 0 || h.srv[0].state == PC_UPS_OFF;
 			trk = h.tracking_wanted && !h.tracking_on;
-			snprintf(key, sizeof key, "upstream.%s", h.col);
+			akey_fmt(key, "upstream.%s", h.col);
 			if (down)
 				snprintf(t, sizeof t, "the read-through upstream %.32s:%d "
 					"of collection %.20s is %.60s - misses answer per "
@@ -2117,7 +2212,7 @@ static void check_upstreams(void)
 			why = up_why(u, h.role_replica);
 			trk = h.tracking_wanted && !u->tracking_on &&
 				u->state != PC_UPS_OFF;
-			snprintf(key, sizeof key, "upstream.%s.%d", h.col, j + 1);
+			akey_fmt(key, "upstream.%s.%d", h.col, j + 1);
 			if (why)
 				snprintf(t, sizeof t, "upstream %.32s:%d of read-through "
 					"collection %.20s is %.60s - the others take its "
@@ -2130,14 +2225,14 @@ static void check_upstreams(void)
 			cond(key, (why != NULL && !by_design) || trk, PC_AL_WARNING,
 				S(60), S(60), t);
 		}
-		snprintf(key, sizeof key, "upstream.%s", h.col);
+		akey_fmt(key, "upstream.%s", h.col);
 		snprintf(t, sizeof t, "no upstream of read-through collection %s "
 			"serves (%d configured) - misses are answered as its on_error "
 			"says", h.col, h.nsrv);
 		cond(key, !h.serving && !h.fallback, PC_AL_CRITICAL, S(60), S(60), t);
 		/* failed over: the primary not serving and another active; cleared once the
 		 * primary serves again (with upstream_preempt it then takes over) */
-		snprintf(key, sizeof key, "upstream.%s.failover", h.col);
+		akey_fmt(key, "upstream.%s.failover", h.col);
 		if (h.failover && h.active >= 0 && h.active != h.primary) {
 			const struct pc_up_srv_health *pp = &h.srv[h.primary],
 				*aa = &h.srv[h.active];
@@ -2151,7 +2246,7 @@ static void check_upstreams(void)
 				S(10), t);
 		} else
 			cond(key, 0, PC_AL_WARNING, S(10), S(10), "");
-		snprintf(key, sizeof key, "upstream.%s.master", h.col);
+		akey_fmt(key, "upstream.%s.master", h.col);
 		if (h.fallback)
 			snprintf(t, sizeof t, "read-through collection %s is reading "
 				"from the master %.60s:%d: no replica serves "
@@ -2190,6 +2285,23 @@ static void check_fleet(void)
 		A.fleet_seen = n;
 	expect = pc_cluster_expect();
 	size = expect > A.fleet_seen ? expect : A.fleet_seen;
+	/* the fleet as a whole first, so a large fleet's per-member keys cannot take
+	 * every slot before missing and majority have theirs */
+	for (i = 0; i < n; i++)
+		ready += A.mem[i].is_self || (A.mem[i].gone_s < 0 && A.mem[i].live &&
+			A.mem[i].state == PC_NST_READY);
+	A.fleet_size = size;                   /* the mail's header */
+	A.fleet_ready = ready;
+	snprintf(t, sizeof t, "%d member(s) missing - %d listed of the fleet's "
+		"%d (%s)", size - n, n, size, expect >= size ? "[cluster] expect"
+		: "the most this node has listed");
+	cond("fleet.missing", size > n, PC_AL_WARNING, S(60), S(30), t);
+	if (size >= 2) {
+		snprintf(t, sizeof t, "only %d of the fleet's %d members are "
+			"ready - below a majority", ready, size);
+		cond("fleet.majority", ready < size / 2 + 1, PC_AL_CRITICAL,
+			S(60), S(30), t);
+	}
 	for (i = 0; i < n; i++) {
 		const struct pc_member *m = &A.mem[i];
 		const char *why;
@@ -2197,7 +2309,6 @@ static void check_fleet(void)
 		int bad = 1;
 
 		if (m->is_self) {
-			ready++;                       /* READY, by the gate above */
 			if (!inet_ntop(AF_INET, &m->addr, A.self_ip, sizeof A.self_ip))
 				A.self_ip[0] = 0;          /* the mail's header */
 			continue;
@@ -2236,8 +2347,6 @@ static void check_fleet(void)
 				pc_node_reason_text(m->reason));
 		} else {
 			bad = 0;
-			if (m->state == PC_NST_READY)
-				ready++;
 		}
 		snprintf(key, sizeof key, "fleet.node%d", m->node);
 		cond(key, bad, PC_AL_WARNING, hold, S(30), bad ? t : "");
@@ -2256,18 +2365,6 @@ static void check_fleet(void)
 			snprintf(key, sizeof key, "%s", A.k[i].key);
 			cond(key, 0, 0, 0, S(30), "");
 		}
-	}
-	A.fleet_size = size;                   /* the mail's header */
-	A.fleet_ready = ready;
-	snprintf(t, sizeof t, "%d member(s) missing - %d listed of the fleet's "
-		"%d (%s)", size - n, n, size, expect >= size ? "[cluster] expect"
-		: "the most this node has listed");
-	cond("fleet.missing", size > n, PC_AL_WARNING, S(60), S(30), t);
-	if (size >= 2) {
-		snprintf(t, sizeof t, "only %d of the fleet's %d members are "
-			"ready - below a majority", ready, size);
-		cond("fleet.majority", ready < size / 2 + 1, PC_AL_CRITICAL,
-			S(60), S(30), t);
 	}
 }
 
@@ -2474,9 +2571,15 @@ static void check_tombstones(void)
 			t[0] = 0;
 		cond("cluster.acks_stuck", w >= 0, PC_AL_WARNING, S(10), S(60), t);
 	}
+	/* one event per member back, each with its own line (the last few of a busy tick) */
 	if (ta.gaps > A.tomb_gaps) {
+		unsigned long long g = ta.gaps - A.tomb_gaps > PC_TOMB_GAP_KEEP ?
+			ta.gaps - PC_TOMB_GAP_KEEP : A.tomb_gaps;
+
+		for (; g < ta.gaps; g++)
+			event("cluster.peer_absent", PC_AL_WARNING,
+				ta.gap_text[g % PC_TOMB_GAP_KEEP]);
 		A.tomb_gaps = ta.gaps;
-		event("cluster.peer_absent", PC_AL_WARNING, ta.gap_text);
 	}
 }
 
@@ -2679,6 +2782,8 @@ void pc_alerts_stats_tree(struct pc_tw *out)
 	pc_tw_str(out, mw);
 	pc_tw_key(out, "fleet_mailer");
 	pc_tw_i64(out, A.mailer);
+	pc_tw_key(out, "keys_refused");
+	pc_tw_i64(out, (long long)A.keys_refused);
 	pc_tw_key(out, "active");
 	pc_tw_arr(out);
 	for (i = 0; i < A.nk; i++) {

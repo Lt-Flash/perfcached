@@ -201,6 +201,7 @@ int main(void)
 				"C3 and the queue is finite: an offer past its "
 				"slots is refused, so the plane still applies "
 				"back-pressure");
+			chk(!clbulk_room(&B), "C3 and a full queue says there is no room");
 		}
 		chk(clbulk_take(&B, &taken, &tlen, &trecs, &tkind, &got_to) == 1 &&
 			taken == b1 && tlen == 16 && trecs == 3 &&

@@ -93,6 +93,21 @@ int main(void)
 	chk(strncmp(s, "01000000-", 9) == 0 && strcmp(s + 24, "0000000000ef") == 0,
 		"D3 the bytes land where a reader expects them");
 
+	/* ---- E. the interfaces considered: the smallest names, whatever readdir's order ---- */
+	{
+		char nm[4][CLPLAT_IFNAME], in[8][CLPLAT_IFNAME];
+		int k, n = 0;
+
+		for (k = 0; k < 8; k++)
+			snprintf(in[k], sizeof in[k], "eth%d", 7 - k);
+		for (k = 0; k < 8; k++)
+			n = clplat_keep_smallest(nm, n, 4, in[k]);
+		chk(n == 4 && !strcmp(nm[0], "eth0") && !strcmp(nm[3], "eth3"),
+			"E1 read last, the four smallest names are the four kept");
+		n = clplat_keep_smallest(nm, n, 4, "a-very-long-interface-name");
+		chk(n == 4 && !strcmp(nm[0], "eth0"), "E2 a name past IFNAMSIZ is skipped");
+	}
+
 	printf("clplattest: %d passed, %d failed\n", pass, fail);
 	return fail ? 1 : 0;
 }

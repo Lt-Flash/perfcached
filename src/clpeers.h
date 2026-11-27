@@ -202,7 +202,7 @@ int clpeers_count_live(struct clpeers *pt, long long now);
 
 /* find or create @addr's slot, NULL when full; purged slots are reused in place so
  * workers can iterate.  *created only when one was APPENDED.  Peer thread. */
-struct peer *clpeers_upsert(struct clpeers *pt, const pc_addr *a,
+struct peer *clpeers_upsert(struct clpeers *pt, const pc_addr *a, long long now,
 		int *created);
 
 /* Duplicate-id arbitration: a colliding joiner is tolerated for DUP_GRACE_MS (it

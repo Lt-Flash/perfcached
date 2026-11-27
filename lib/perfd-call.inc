@@ -19,6 +19,7 @@ static int bin_roundtrip_once(perfd_t *p, int verb, const char *col,
 		const char *key, const void *val, size_t vlen,
 		long long by, long long ttl, char **out, size_t *outlen)
 {
+	p->reply_late = 0;
 	if (p->nids - p->idhead || p->qlen)
 		return errk(p, PERFD_E_STATE, "pipeline in progress");
 	if (enqueue_bin(p, verb, col, key, val, vlen, by, ttl) != 0 ||
@@ -26,11 +27,23 @@ static int bin_roundtrip_once(perfd_t *p, int verb, const char *col,
 		pipeline_drop(p);
 		return -1;
 	}
+	p->io_silent = 0;
 	if (collect_head(p, out, outlen) != 0) {
+		p->reply_late = p->io_silent;
 		pipeline_drop(p);
 		return -1;
 	}
 	return 0;
+}
+
+/* a write whose reply did not come in time is not sent again: said so, the link left poisoned
+ * (the next call moves) */
+static int late_refusal(perfd_t *p, const perfd_t *t)
+{
+	return errk(p, PERFD_E_TRANSPORT, "no reply from node %d within the timeout - the write may "
+		"still be applied there, so it was NOT replayed elsewhere (a replay could land "
+		"after this caller's next write); %s", t->active_node, p->pin ?
+		"a pinned handle does not move" : "the next call moves to a live member");
 }
 
 /* a member not READY yet, or a FAILED or HEALING one refusing a write, applied nothing: the request
@@ -201,6 +214,13 @@ static int bin_roundtrip_body(perfd_t *p, int verb, const char *col,
 		died = t->poisoned;
 		if (!died)                     /* not READY: this node answers */
 			member_down(p, t->active_node, "", perfd_error(t));
+		if (died && t->reply_late && !bin_verb_reads(verb)) {
+			rc = late_refusal(p, t);
+			route_retire(p, t);
+			p->hinted = 0;
+			p->hh_got = 0;
+			return rc;
+		}
 		route_retire(p, t);    /* dead standby: fall through to us */
 		p->hinted = 0;
 		p->hh_got = 0;
@@ -238,6 +258,8 @@ static int bin_roundtrip_body(perfd_t *p, int verb, const char *col,
 	}
 	if (!p->poisoned || p->is_child || !p->nmem)
 		return rc;
+	if (p->reply_late && !bin_verb_reads(verb))
+		return late_refusal(p, p);
 	if (!bin_verb_idempotent(verb))
 		return errk(p, PERFD_E_TRANSPORT, "connection lost during a counter update - NOT "
 			"replayed (add/sub are not idempotent); retry if a double "
@@ -350,6 +372,7 @@ static int roundtrip_once(perfd_t *p, const char *method,
 {
 	*out = NULL;
 	*outlen = 0;
+	p->reply_late = 0;
 	if (p->nids - p->idhead || p->qlen)
 		return errk(p, PERFD_E_STATE, "pipeline in progress");
 	/* every sender of enable passes here: the replay on an adopted link and perfd_command too */
@@ -361,7 +384,9 @@ static int roundtrip_once(perfd_t *p, const char *method,
 		pipeline_drop(p);
 		return -1;
 	}
+	p->io_silent = 0;
 	if (collect_head(p, out, outlen) != 0) {
+		p->reply_late = p->io_silent;
 		pipeline_drop(p);
 		return -1;
 	}
@@ -397,6 +422,12 @@ static int roundtrip_key(perfd_t *p, const char *method,
 		p->hinted = 0;
 		p->hh_got = 0;
 		return roundtrip(p, method, tree, tlen, out, outlen);
+	}
+	if (t->reply_late && !method_reads(method)) {
+		int rc = late_refusal(p, t);
+
+		route_retire(p, t);
+		return rc;
 	}
 	route_retire(p, t);            /* dead standby: we carry it */
 	if (!method_idempotent(method) || p->once)
@@ -459,6 +490,8 @@ static int roundtrip_body(perfd_t *p, const char *method,
 	}
 	if (!p->poisoned || p->is_child || !p->nmem)
 		return rc;
+	if (p->reply_late && !method_reads(method))
+		return late_refusal(p, p);
 	if (!method_idempotent(method) || p->once)
 		return errk(p, PERFD_E_TRANSPORT, "connection lost during '%s' - NOT replayed (the "
 			"verb is not idempotent); retry if the operation is safe "

@@ -126,6 +126,21 @@ int main(void)
 	clboot_tick_state(&B, &MX, &pending, &failed);
 	chk(!failed, "D6 and clears the failure as it goes");
 
+	{
+		pc_addr many[BOOT_MAX_CAND + 4];
+		int mid[BOOT_MAX_CAND + 4];
+
+		memset(&B, 0, sizeof B);
+		for (i = 0; i < BOOT_MAX_CAND + 4; i++) {
+			many[i] = A((unsigned char)(i + 1));
+			mid[i] = 100 + i;
+		}
+		clboot_handoff(&B, &MX, many, mid, BOOT_MAX_CAND + 4);
+		n = clboot_take_cands(&B, &MX, cand, node);
+		chk(n == BOOT_MAX_CAND && node[BOOT_MAX_CAND - 1] == 100 + BOOT_MAX_CAND - 1,
+			"D7 more candidates than fit: the count taken is the copy's");
+	}
+
 	printf("clboottest: %d passed, %d failed\n", pass, fail);
 	return fail ? 1 : 0;
 }

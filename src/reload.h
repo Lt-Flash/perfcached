@@ -24,6 +24,9 @@
  * the outcome file goes to $RUNTIME_DIRECTORY, else state_dir, else none */
 void pc_reload_init(const char *path, struct pc_keymap *boot,
 		const char *state_dir);
+/* the daemon, once it holds its directories: the outcome file restarts at generation 0 under
+ * this pid, so -H never takes a previous run's for this one's */
+void pc_reload_started(void);
 /* async-signal-safe: SIGHUP's handler */
 void pc_reload_ask(void);
 /* the maintenance thread, once a second: run an asked reload */
@@ -31,9 +34,9 @@ void pc_reload_tick(void);
 /* one reload, now (the verb, and the tick).  0 applied or nothing to do,
  * 1 refused or failed; @msg says which and why. */
 int pc_reload_run(char *msg, size_t ml);
-/* stats: reloads applied, refused, the last one's time and words */
+/* stats: reloads applied, refused, the last one's time and its words, copied into @last_msg */
 void pc_reload_stats(unsigned long long *ok, unsigned long long *refused,
-		long long *last_unix, const char **last_msg);
+		long long *last_unix, char *last_msg, size_t ml);
 
 /* -H <pid>: the ExecReload side.  Checks the file, signals the daemon and
  * waits for its outcome; prints it; 0 applied or nothing to do, 1 not. */

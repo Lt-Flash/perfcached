@@ -75,6 +75,8 @@ int rv_parse(char *buf, size_t len, size_t *pos, struct rv *v, int depth)
 			                        * drops the connection (the stream is mid value) */
 		if (len - (e + 1) < (size_t)n + 2)
 			return 0;
+		if (buf[e + 1 + (size_t)n] != '\r' || buf[e + 2 + (size_t)n] != '\n')
+			return -1;
 		v->s = buf + e + 1;
 		v->len = (size_t)n;
 		if (v->t == '=' && v->len >= 4) {   /* verbatim: "txt:" prefix */
@@ -96,6 +98,9 @@ int rv_parse(char *buf, size_t len, size_t *pos, struct rv *v, int depth)
 		if (n > 1000000)
 			return -1;
 		cnt = (v->t == '%' || v->t == '|') ? (int)n * 2 : (int)n;
+		/* each element takes three bytes or more of a reply read_reply holds */
+		if ((size_t)cnt > (rv_max + 65536) / 3)
+			return -1;
 		v->n = n;
 		if (cnt) {
 			v->el = calloc((size_t)cnt, sizeof *v->el);

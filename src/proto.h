@@ -222,6 +222,11 @@ void pc_conn_upstream_hold(void *conn, unsigned int req);
  * verdict a re-run carries (PC_UPV_NONE on a first run) */
 void pc_conn_upstream_park_frame(unsigned int req);
 int pc_conn_upstream_frame_verdict(void);
+/* the removal count a parking read took (pc_upstream_rm_mark), carried to its re-run */
+void pc_conn_upstream_park_frame_mark(unsigned long long m);
+unsigned long long pc_conn_upstream_frame_mark(void);
+/* a re-run read lost its key: gate it again with the verdict cleared, so it fetches */
+void pc_conn_upstream_frame_regate(void);
 /* the connection named itself perfcached-readthrough */
 void pc_conn_set_rt_fetcher(void *conn);
 int pc_conn_rt_fetcher(void *conn);

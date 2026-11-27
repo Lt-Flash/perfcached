@@ -19,6 +19,7 @@
 #include "resident.h"
 #include "clunk.h"
 #include "fnv1a.h"                     /* the one FNV-1a */
+#include "colname.h"                   /* pc_col_name_print */
 
 #define OBS_CMDS   64                  /* distinct command names per row */
 #define OBS_NAME   PC_OBS_NAME
@@ -127,11 +128,12 @@ int pc_obs_init(int nworkers, long long slowlog_usec)
 	return (obs_cmds && obs_slow && obs_slowpos && obs_unk && obs_wkc) ? 0 : -1;
 }
 
+/* workers are 1..N on rows 0..N-1; every other thread shares the spare, row N */
 static int obs_row(void)
 {
 	int w = pc_worker_id();
 
-	return (w >= 0 && w < obs_rows - 1) ? w : obs_rows - 1;
+	return (w >= 1 && w <= obs_rows - 1) ? w - 1 : obs_rows - 1;
 }
 
 unsigned long long pc_obs_usec_now(void)
@@ -294,6 +296,12 @@ void pc_obs_cmd(const char *name, size_t nlen, unsigned long long usec)
 	 * monitoring, not accounting */
 }
 
+/* a figure less its snapshot; never below 0 when a roll lands between the two reads */
+static unsigned long long obs_since(unsigned long long now, unsigned long long then)
+{
+	return now > then ? now - then : 0;
+}
+
 /* the one merge every reader shares (INFO commandstats and latencystats, /stats, /metrics);
  * the space is small enough for the quadratic walk */
 int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
@@ -331,23 +339,26 @@ int pc_obs_cmd_merge(struct pc_obs_cmdsum *out, int cap)
 				unsigned int w, fill, old_slot = PC_OBS_WIN;
 				unsigned int oldest = 0, nowt = (unsigned int)get_ticks();
 
+				/* a slot being rewritten reads 0 (obs_win_roll) and is passed over */
 				for (w = 0; w < PC_OBS_WIN; w++) {
-					if (!r[i].s_at[w])
+					unsigned int at = __atomic_load_n(&r[i].s_at[w],
+						__ATOMIC_ACQUIRE);
+
+					if (!at)
 						continue;
-					if (old_slot == PC_OBS_WIN ||
-					    r[i].s_at[w] < oldest) {
-						oldest = r[i].s_at[w];
+					if (old_slot == PC_OBS_WIN || at < oldest) {
+						oldest = at;
 						old_slot = w;
 					}
 				}
 				if (old_slot < PC_OBS_WIN) {
-					out[j].w_calls += r[i].calls -
-						r[i].s_calls[old_slot];
-					out[j].w_usec += r[i].usec -
-						r[i].s_usec[old_slot];
+					out[j].w_calls += obs_since(r[i].calls,
+						r[i].s_calls[old_slot]);
+					out[j].w_usec += obs_since(r[i].usec,
+						r[i].s_usec[old_slot]);
 					for (k = 0; k < PC_OBS_HIST; k++)
-						out[j].w_hist[k] += r[i].hist[k] -
-							r[i].s_hist[old_slot][k];
+						out[j].w_hist[k] += obs_since(r[i].hist[k],
+							r[i].s_hist[old_slot][k]);
 					if (nowt - oldest > out[j].w_secs)
 						out[j].w_secs = nowt - oldest;
 				} else {
@@ -440,6 +451,10 @@ void pc_obs_cmdstats(struct pc_jw *w)
 			(int)out[i].nlen, out[i].name, out[i].calls,
 			out[i].usec, out[i].calls ?
 			(double)out[i].usec / (double)out[i].calls : 0.0);
+		if (ln < 0)
+			continue;
+		if ((size_t)ln >= sizeof line)  /* snprintf says what it would have written */
+			ln = (int)sizeof line - 1;
 		pc_jw_raw(w, line, (size_t)ln);
 	}
 }
@@ -458,6 +473,10 @@ void pc_obs_latencystats(struct pc_jw *w)
 			(double)obs_pct_us(&out[i], 500) / 1000.0,
 			(double)obs_pct_us(&out[i], 990) / 1000.0,
 			(double)obs_pct_us(&out[i], 999) / 1000.0);
+		if (ln < 0)
+			continue;
+		if ((size_t)ln >= sizeof line)
+			ln = (int)sizeof line - 1;
 		pc_jw_raw(w, line, (size_t)ln);
 	}
 }
@@ -572,7 +591,7 @@ void pc_obs_qlog(const char *dialect, void *row, const char *verb,
 		size_t klen, const char *outcome, unsigned long long usec)
 {
 	struct connrow *cr = row;
-	char kb[96], sb[24];
+	char kb[300], sb[24], vb[200], cb[264], ke[264];
 	const char *ks = "", *ss = "";
 
 	if (!qlog_every)
@@ -596,8 +615,8 @@ void pc_obs_qlog(const char *dialect, void *row, const char *verb,
 			klen = 0;
 	}
 	if (klen && qlog_keys == 2) {
-		snprintf(kb, sizeof kb, " key=%.*s%s", (int)(klen > 64 ? 64 : klen),
-			key, klen > 64 ? "..." : "");
+		pc_col_name_print(ke, sizeof ke, key, klen > 64 ? 64 : klen);
+		snprintf(kb, sizeof kb, " key=%s%s", ke, klen > 64 ? "..." : "");
 		ks = kb;
 	} else if (klen && qlog_keys == 1) {
 		/* FNV-1a, folded to 32 bits: the same key hashes the same way
@@ -607,10 +626,13 @@ void pc_obs_qlog(const char *dialect, void *row, const char *verb,
 		snprintf(kb, sizeof kb, " key=#%08x", (unsigned int)(h ^ (h >> 32)));
 		ks = kb;
 	}
+	/* a client's bytes as a log line may carry them; a verb is never longer than 47 */
+	pc_col_name_print(vb, sizeof vb, verb, vlen > 47 ? 47 : vlen);
+	pc_col_name_print(cb, sizeof cb, clen ? col : "-", clen ? (clen > 64 ? 64 : clen) : 1);
 	/* the outcome (hit, miss, ok or err) before the latency: what a miss hunt reads for */
-	LM_INFO("query: %s %s %.*s %.*s%s %s %llu us%s\n", dialect,
-		cr ? cr->addr : "-", (int)vlen, verb, (int)clen, clen ? col : "-",
-		ks, outcome ? outcome : "ok", usec, ss);
+	LM_INFO("query: %s %s %s%s %s%s %s %llu us%s\n", dialect,
+		cr ? cr->addr : "-", vb, vlen > 47 ? "..." : "", cb, ks,
+		outcome ? outcome : "ok", usec, ss);
 }
 
 /* snapshot the cumulative figures into the slot we are LEAVING and clear the one about to be
@@ -627,11 +649,14 @@ static void obs_win_roll(unsigned int now)
 		for (i = 0; i < OBS_CMDS; i++) {
 			if (!r[i].nlen)
 				continue;
+			/* stamped 0 while the copy is written, so a reader passes the slot over */
+			__atomic_store_n(&r[i].s_at[cur], 0, __ATOMIC_RELAXED);
+			__atomic_thread_fence(__ATOMIC_RELEASE);
 			r[i].s_calls[cur] = r[i].calls;
 			r[i].s_usec[cur] = r[i].usec;
 			for (k = 0; k < PC_OBS_HIST; k++)
 				r[i].s_hist[cur][k] = r[i].hist[k];
-			r[i].s_at[cur] = now;
+			__atomic_store_n(&r[i].s_at[cur], now, __ATOMIC_RELEASE);
 			r[i].w_max[nxt] = 0;   /* the slot about to be filled */
 		}
 	}
@@ -878,7 +903,7 @@ void pc_obs_clients_tree(struct pc_tw *w, unsigned int now_ticks, int cap)
 		pc_tw_key(w, "name");
 		pc_tw_bulk(w, e->name, e->nlen);
 		pc_tw_key(w, "age_s");
-		pc_tw_i64(w, (long long)(now_ticks - e->created));
+		pc_tw_i64(w, now_ticks >= e->created ? (long long)(now_ticks - e->created) : 0);
 		pc_tw_key(w, "idle_s");
 		pc_tw_i64(w, now_ticks >= e->last ? (long long)(now_ticks - e->last) : 0);
 		pc_tw_key(w, "cmds");
@@ -913,7 +938,7 @@ void pc_obs_client_list(struct pc_jw *w, unsigned int now_ticks)
 			"flags=N db=0 sub=0 psub=0 multi=-1 cmd=%.*s "
 			"lib-name=%s lib-ver=%s\n",
 			r->id, r->addr, r->fd, (int)r->nlen, r->name,
-			now_ticks - r->created,
+			now_ticks >= r->created ? now_ticks - r->created : 0,
 			now_ticks >= r->last ? now_ticks - r->last : 0,
 			r->lastcmdlen ? (int)r->lastcmdlen : 4,
 			r->lastcmdlen ? r->lastcmd : "NULL",

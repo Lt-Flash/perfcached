@@ -6,6 +6,7 @@
 #define PC_PUBSUB_H
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 int  pc_pubsub_init(int nworkers);
 void pc_pubsub_worker_register(int worker, int efd);
 
@@ -62,9 +63,25 @@ struct pc_pubsub_stats {
 };
 void pc_pubsub_stats(struct pc_pubsub_stats *out);
 
+/* the longest channel or pattern a client may name */
+#define PC_PUBSUB_NAME_MAX 4096
+
 /* the reserved prefix: internal events publish under it; clients may subscribe
  * to it but not publish into it */
 #define PC_PUBSUB_RESERVED "__pc."
+
+/* the reserved prefix @chan starts with - __pc. or a keyspace notification's two - or NULL;
+ * the doors refuse a client's publish under any of them */
+static inline const char *pc_pubsub_reserved(const char *chan, size_t clen)
+{
+	static const char *const pfx[] = { PC_PUBSUB_RESERVED, "__keyspace@", "__keyevent@" };
+	size_t i;
+
+	for (i = 0; i < sizeof pfx / sizeof pfx[0]; i++)
+		if (clen >= strlen(pfx[i]) && !memcmp(chan, pfx[i], strlen(pfx[i])))
+			return pfx[i];
+	return NULL;
+}
 
 /* cluster.c: relay a publish to every live peer; returns peers sent to, 0 with no
  * cluster, -1 when the frame does not fit a datagram (delivered locally only) */
@@ -110,7 +127,7 @@ int pc_conn_kill(void *conn, const char *why);
 void pc_pubsub_push_failed(void *conn, int rc);
 /* a client publish leaving a target queue at >= half its cap sets pc_ps_pressed;
  * pressure_wait answers 1 once every target is below a quarter, else arms a wake */
-#define PC_PS_MASK_WORDS 8
+#define PC_PS_MASK_WORDS 9
 extern __thread int pc_ps_pressed;
 int  pc_pubsub_pressure_take(uint64_t *mask);   /* mask may be NULL */
 int  pc_pubsub_pressure_wait(const uint64_t *mask);

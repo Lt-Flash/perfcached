@@ -113,11 +113,16 @@ int main(void)
 	rc = parse("*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n:1\r\n",
 		&pos, &v);
 	CHK(rc == -1 && v.nel == 0, "D: nesting past 8 is refused, nothing kept");
+	rc = parse("$3\r\nabcXY:1\r\n", &pos, &v);
+	CHK(rc == -1, "D: a bulk not followed by its CRLF is malformed");
 	rv_max = 4;
 	rc = parse("$5\r\nhello\r\n", &pos, &v);
 	CHK(rc == -3, "D: a bulk over this thread's rv_max (4) is -3");
 	rc = parse("$4\r\nhell\r\n", &pos, &v);
 	CHK(rc == 1 && str_is(&v, "hell"), "D: one at rv_max is read");
+	rc = parse("*30000\r\n", &pos, &v);
+	CHK(rc == -1 && v.el == NULL,
+		"D: an array counting more elements than rv_max's reply can hold is refused");
 	rv_max = UP_RBUF_MAX;
 	rc = parse("$5\r\nhello\r\n", &pos, &v);
 	CHK(rc == 1, "D: back at the default, it is read");

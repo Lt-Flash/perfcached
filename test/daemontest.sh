@@ -148,6 +148,17 @@ if grep -q "perfcached ready" "$D/log4"; then ok
 else bad "a daemon on a free port was refused"; tail -2 "$D/log4"; fi
 kill -9 $P4 2>/dev/null
 
+# RED: a unix path that holds a regular file is refused and the file kept - only a socket nobody
+# answers is stale
+sed 's/16479/16481/; s|other.sock|notsock|' "$D/samesock.conf" > "$D/notsock.conf"
+echo keep > "$D/notsock"
+if timeout 10 "$BIN" -f "$D/notsock.conf" > "$D/log5" 2>&1; then
+	bad "a daemon whose unix path is a regular file exited 0"
+elif grep -q "perfcached ready" "$D/log5"; then
+	bad "a daemon started over a regular file at its unix path"
+else ok; fi
+[ "$(cat "$D/notsock" 2>/dev/null)" = keep ] && ok || bad "the regular file at the unix path was removed"
+
 # clean shutdown on SIGTERM
 kill -TERM $PID
 i=0; rc=-1

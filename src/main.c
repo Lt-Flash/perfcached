@@ -93,9 +93,18 @@ int main(int argc, char **argv)
 				"%llu, crc ok\n", n, ncols, marker);
 			return 0;
 		}
-		case 'H':                  /* the ExecReload side */
-			hup_pid = atol(optarg);
+		case 'H': {                /* the ExecReload side */
+			char *end;
+
+			hup_pid = strtol(optarg, &end, 10);
+			/* 0 would mean "no -H" and start a daemon in the caller's place */
+			if (end == optarg || *end || hup_pid < 1) {
+				fprintf(stderr, "perfcached -H: '%s' is not a daemon pid - "
+					"not reloaded\n", optarg);
+				return 1;
+			}
 			break;
+		}
 		case 'K':                  /* after -f, wherever it stands */
 			kfile = optarg;
 			break;

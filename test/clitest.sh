@@ -66,6 +66,9 @@ R=$(pc add c ctr 5)
 echo "$R" | grep -q '"value":5' && ok || bad "add: $R"
 R=$(pc add c ctr)
 echo "$R" | grep -q '"value":6' && ok || bad "add default: $R"
+R=$(pc -j '{"method":"sub","params":{"col":"c","key":"ctr","by":-9223372036854775808}}')
+echo "$R" | grep -q 'by out of range' && pc get c ctr | grep -Eq '"value":"?6"?[,}]' && ok \
+	|| bad "sub by LLONG_MIN not refused, or the counter moved: $R / $(pc get c ctr)"
 R=$(pc exists c k1)
 echo "$R" | grep -q '"exists":true' && ok || bad "exists: $R"
 R=$(pc del c k1)
@@ -111,6 +114,12 @@ sys.exit(0 if n["conns"] > 0 and b["conns"] > 0 and b["requests"] > 0 else 1)' 2
 # jsonrpc/id are ignored
 R=$(pc -j '{"jsonrpc":"2.0","id":9,"method":"exists","params":{"col":"c","key":"a"}}')
 echo "$R" | grep -q '"exists":true' && ok || bad "raw json: $R"
+# an empty key is refused at the CMD door, as at the binary door and RESP
+R=$(pc -j '{"method":"set","params":{"col":"c","key":"","value":"x"}}')
+echo "$R" | grep -q 'missing or bad key' && ok || bad "set of an empty key not refused: $R"
+R=$(pc -j '{"method":"mset","params":{"col":"c","items":[{"key":"","value":"x"},{"key":"e1","value":"y"}]}}')
+echo "$R" | grep -q '"stored":1' && echo "$R" | grep -q '"dropped":1' && ok \
+	|| bad "mset with an empty key: not dropped: $R"
 
 # pipe mode: several commands, one connection
 R=$(printf 'set c p1 v1\nget c p1\n# comment\nping\n' | pc -q)
@@ -317,6 +326,18 @@ echo "$R" | grep -q "'help' for commands" && bad "S71: the banner is printed bef
 sed -e 's/^\(tcp = .*\)$/\1   # the node'"'"'s own door/' -e 's/^\(client = .*\)$/\1   # rotated yearly/' "$D/nx.conf" > "$D/nxc.conf"
 R=$(env -u PERFCLI_AUTH PERFCACHED_CONF="$D/nxc.conf" "$CLI" ping 2>&1)
 echo "$R" | grep -q pong && ok || bad "an inline comment in the config broke bare perfcli: $(echo "$R" | head -1)"
+
+# keys whose listing outgrows the reply: answered truncated, in both forms, not refused as too large
+PAD=$(printf '%03990d' 0)
+i=1; while [ $i -le 280 ]; do printf 'set c K%04d%s v\n' $i "$PAD"; i=$((i+1)); done | pc -q >/dev/null 2>&1
+R=$(pc -q -j '{"method":"keys","params":{"col":"c","limit":1000}}' 2>&1 | python3 -c '
+import json,sys; d=json.load(sys.stdin); k=[x for x in d.get("keys",[]) if x.startswith("K")]
+print("ok" if d.get("truncated") is True and 200 < len(k) < 280 else "bad:%s"%str(d)[:160])' 2>&1)
+[ "$R" = ok ] && ok || bad "keys over the reply size: not answered truncated: $R"
+R=$(pc -q keys 'c*' '*' 1000 2>&1 | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+print("ok" if d.get("truncated") is True and "c" in d.get("truncated_collections",[]) else "bad:%s"%str(d)[:160])' 2>&1)
+[ "$R" = ok ] && ok || bad "keys by collection glob over the reply size: not answered truncated: $R"
 
 kill -TERM $P1 $P2 2>/dev/null; wait 2>/dev/null; P1= P2=
 # ---- the query log ---------------------------------------------------

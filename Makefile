@@ -232,6 +232,9 @@ clacktest: test/clacktest.c src/clack.o
 clackftest: test/clackftest.c src/clackf.o
 	$(CC) $(CFLAGS) -o $@ test/clackftest.c src/clackf.o
 
+ackstatetest: test/ackstatetest.c src/ackstate.o src/clack.o src/clackf.o src/crc32c.o
+	$(CC) $(CFLAGS) -o $@ test/ackstatetest.c src/ackstate.o src/clack.o src/clackf.o src/crc32c.o $(LDLIBS)
+
 # the address type
 pcaddrtest: test/pcaddrtest.c src/pcaddr.o
 	$(CC) $(CFLAGS) -o $@ test/pcaddrtest.c src/pcaddr.o $(LDLIBS)
@@ -312,8 +315,8 @@ noisechantest: test/noisechantest.c src/noisechan.o src/pc_noise.o src/pcaddr.o 
 	$(CC) $(CFLAGS) -Isrc -o $@ test/noisechantest.c src/noisechan.o src/pc_noise.o src/pcaddr.o $(LDLIBS)
 
 # the cluster wire epoch, clstate.h stubbed
-clepochtest: test/clepochtest.c src/clepoch.o src/clepoch.h src/clstate.h
-	$(CC) $(CFLAGS) -Isrc -o $@ test/clepochtest.c src/clepoch.o
+clepochtest: test/clepochtest.c src/clepoch.o src/statefile.o src/clepoch.h src/clstate.h
+	$(CC) $(CFLAGS) -Isrc -o $@ test/clepochtest.c src/clepoch.o src/statefile.o -lpthread
 clfoundtest: test/clfoundtest.c src/clfound.o src/pcaddr.o src/clfound.h src/clstate.h
 	$(CC) $(CFLAGS) -Isrc -o $@ test/clfoundtest.c src/clfound.o src/pcaddr.o
 
@@ -601,7 +604,7 @@ check-g-fault2: perfcached perfcli
 # must pass; `check` in full rides tag pushes.
 check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe noisetest noiseboundtest wipetest perfcached pubsubcli udppushcli \
 		perfcli pcbench clmaptest cltermtest clsynctest clhisttest \
-		clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest clprobetest nodetest asyncbintest routedpairtest movedhinttest hinttest workerbaltest respreadtest frozentest quietlinktest asyncstatetest libperfd.a thrtabtest promlabeltest obstest upjsontest perfdlinktest apooltest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest loadrefusetest \
+		clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest ackstatetest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest clprobetest nodetest asyncbintest routedpairtest movedhinttest hinttest workerbaltest respreadtest frozentest quietlinktest asyncstatetest libperfd.a thrtabtest promlabeltest obstest upjsontest perfdlinktest apooltest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest loadrefusetest \
 		clustersim psrelaytest psindextest psqueuetest psinteresttest psudptest rpsbench legmetatest legwalkremovetest htfuzztest cellpoisontest chainhinttest clordertest draincarrytest chainwalktest wintest scanremovetest histtest capracetest verstamptest arenadbgtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc threadfreeze clapplytest evactest arenacaptest addexptest respmaptest
 	./clustersim 500
 	./clapplytest
@@ -723,6 +726,7 @@ check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe 
 	./clretaintest
 	./clacktest
 	./clackftest
+	./ackstatetest
 	./pcaddrtest
 	./uprespctest
 	./respouttest
@@ -993,7 +997,7 @@ CHECK_BINS = $(DASH_BIN) $(DASH_TEST) pagedump rollload selftest selftest_broken
 	wipetest perfcached perfcli perfdump perfload pcbench libtest execcmp failovertest \
 	routedpairtest movedhinttest hinttest workerbaltest respreadtest privmovetest frozentest quietlinktest asyncstatetest mgetextest wedgetest asynctest asyncbintest clmaptest \
 	cltermtest clsynctest clhisttest clplacetest clseltest clpeerstest \
-	clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest perfdlinktest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest loadrefusetest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest \
+	clpendtest clloctest clretaintest clacktest clackftest ackstatetest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest perfdlinktest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest loadrefusetest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest \
 	clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest \
 	clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest \
 	clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest apooltest apoollivetest nodetest clprobetest thrtabtest promlabeltest obstest clustersim upjsontest \
@@ -1066,6 +1070,7 @@ check-g-core1: check-edition-guard $(CHECK_BINS)
 	./clretaintest
 	./clacktest
 	./clackftest
+	./ackstatetest
 	./pcaddrtest
 	./uprespctest
 	./respouttest
@@ -1357,7 +1362,7 @@ check-g-durability: check-edition-guard $(CHECK_BINS)
 	sh test/emptywraptest.sh ./perfcached
 	sh test/walobstest.sh ./perfcached
 	sh test/waldisktest.sh ./perfcached
-	sh test/backupsynctest.sh ./perfcached ./perfcli
+	sh test/backupsynctest.sh ./perfcached ./perfcli ./clinject
 	sh test/dirlocktest.sh ./perfcached
 	sh test/loadfactortest.sh ./perfcached
 	sh test/restarttest.sh ./perfcached
@@ -1866,8 +1871,8 @@ threadfreeze: test/threadfreeze.c
 
 # a cluster frame sealed as a node seals it, from an address
 # the suite picks - the gates' suites play a sender the fleet does not know
-clinject: test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/clinit.o src/pcaddr.o src/compat/compat.o
-	$(CC) $(CFLAGS) -Isrc -o $@ test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/clinit.o src/pcaddr.o src/compat/compat.o $(LDLIBS)
+clinject: test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/clinit.o src/pcaddr.o src/clmap.o src/clhist.o src/clsync.o src/compat/compat.o
+	$(CC) $(CFLAGS) -Isrc -o $@ test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/clinit.o src/pcaddr.o src/clmap.o src/clhist.o src/clsync.o src/compat/compat.o $(LDLIBS)
 
 clean:
 	rm -rf lib/obj lib/obj-pic
@@ -1876,7 +1881,7 @@ clean:
 	rm -f libperfd.so libperfd.so.* libtest-so abicaller src/*.o src/compat/*.o src/core/*.o lib/*.o perfcached \
 		perfcli perfdump perfload libperfd.a libtest execcmp failovertest routedpairtest apooltest apoollivetest movedhinttest hinttest workerbaltest respreadtest privmovetest frozentest quietlinktest asyncstatetest clordertest draincarrytest mgetextest htfuzztest cellpoisontest capracetest verstamptest arenadbgtest noiseboundtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc netcutshim.so lingershim.so threadfreeze clinject getbusy clapplytest evactest arenacaptest addexptest respmaptest wedgetest selftest selftest_broken threadfailshim.so \
 		memprobe noisetest pcbench routebench mmclient policybench concbench \
-		asynctest clmaptest cltermtest clsynctest clhisttest clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest perfdlinktest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest dashlocktest loadrefusetest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest
+		asynctest clmaptest cltermtest clsynctest clhisttest clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest ackstatetest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest perfdlinktest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest dashlocktest loadrefusetest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest
 
 # install: binary + annotated example config + systemd unit.
 # The live config is NEVER written - only the .example is refreshed.

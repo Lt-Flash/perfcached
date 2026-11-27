@@ -82,8 +82,8 @@ ready_writer() {
 	i=0; while [ $i -lt 100 ] && [ "$(st 'sum(1 for x in u["upstreams"] if x.get("role")=="master")')" != 1 ]; do sleep 0.1; i=$((i+1)); done
 	sleep 1
 }
-drive() { # drive <A|B|C|D|E|F|G> - prints one result line
-	python3 - "$1" $RESP $PM "$D" <<'PY'
+drive() { # drive <A|B|C|D|E|F|G|N> - prints one result line
+	python3 - "$1" $RESP $PM "$D" "$T" $TCP <<'PY'
 import json, os, socket, sys, time
 what, port, pm, d = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 class R:
@@ -149,6 +149,26 @@ elif what == "F":
     m.cmd("SET", "lost:1", "x2")       # M pushes: the copy goes from every shadow
     th.join(10)
     print("%s %s %.0f" % (first, res.get("g", "noreply"), (time.time() - t0) * 1000))
+elif what == "N":
+    # F at the native door: a get held between the gate and its read, its copy taken
+    import threading
+    sys.path.insert(0, sys.argv[5])
+    import pcnative
+    m = R(pm); m.cmd("SET", "nlost:1", "x1")                     # another client; never written here
+    time.sleep(1.0)
+    def nget():
+        f = pcnative.wrap(socket.create_connection(("127.0.0.1", int(sys.argv[6])), 10))
+        r = pcnative.call(f, "get", col="0", key="nlost:1").get("result") or {}
+        return r.get("value") if r.get("found") else None
+    first = nget()
+    res = {}
+    def held():
+        res["g"] = nget()
+    th = threading.Thread(target=held); th.start()
+    time.sleep(0.1)                    # inside the 300 ms hold
+    m.cmd("SET", "nlost:1", "x2")
+    th.join(10)
+    print("%s %s" % (first, res.get("g", "noreply")))
 elif what == "H":
     import threading
     bad = []
@@ -228,6 +248,10 @@ r=$(drive F); set -- $r; nl=$(st 'u.get("read_lost")')
 [ "${1:-}" = x1 ] && { [ "${2:-}" = x1 ] || [ "${2:-}" = x2 ]; } && [ "${nl:-0}" -ge 1 ] 2>/dev/null &&
 	ok "F. the held read whose copy an invalidation took is gated again and fetches: '${2:-}' (read_lost $nl)" ||
 	bad "F. the held read: '$r', read_lost '$nl' - expected x1, then x1 or x2, read_lost >= 1"
+r=$(drive N); set -- $r; nl2=$(st 'u.get("read_lost")')
+[ "${1:-}" = x1 ] && { [ "${2:-}" = x1 ] || [ "${2:-}" = x2 ]; } && [ "${nl2:-0}" -gt "${nl:-0}" ] 2>/dev/null &&
+	ok "F. the native door too: a held get whose copy went is gated again: '${2:-}' (read_lost $nl -> $nl2)" ||
+	bad "F. the native held get: '$r', read_lost $nl -> '$nl2' - expected x1, then x1 or x2, read_lost up"
 stop
 # H: the read held past its record's drop while the mark lingers
 fakes; conf gap

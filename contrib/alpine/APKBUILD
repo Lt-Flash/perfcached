@@ -3,7 +3,7 @@
 # perfcached for Alpine: one source tarball, six packages (README.md here); both daemon
 # packages write INSTALL-MODE = package, so apk, not the daemon's upgrade_stage, upgrades them
 pkgname=perfcached
-pkgver=0.7.5.2
+pkgver=0.7.5.3
 pkgrel=0
 pkgdesc="Clustered in-memory cache and store with a durable write-ahead log"
 url="https://github.com/Lt-Flash/perfcached"

@@ -130,6 +130,19 @@ int pc_clhist_decode(const unsigned char *buf, size_t n, struct pc_clhist *out,
 		*why = "trunc";
 		return -1;
 	}
+	/* A duplicate identity would make find() - and so the STARTING/RECOVERING decision -
+	 * depend on iteration order; checked on the wire, so a refused frame leaves @out alone. */
+	{
+		unsigned int j;
+
+		for (i = 0; i < cnt; i++)
+			for (j = i + 1; j < cnt; j++)
+				if (!memcmp(buf + 2 + (size_t)i * PC_CLHIST_ENTSZ,
+				            buf + 2 + (size_t)j * PC_CLHIST_ENTSZ, 16)) {
+					*why = "dup";
+					return -1;
+				}
+	}
 	pc_clhist_init(out);
 	out->n = (uint16_t)cnt;
 	p = buf + 2;
@@ -141,19 +154,6 @@ int pc_clhist_decode(const unsigned char *buf, size_t n, struct pc_clhist *out,
 		if (out->ent[i].seen > out->clock)
 			out->clock = out->ent[i].seen;
 		p += PC_CLHIST_ENTSZ;
-	}
-	/* A duplicate identity would make find() - and so the whole
-	 * STARTING/RECOVERING decision - depend on iteration order. */
-	{
-		unsigned int j;
-
-		for (i = 0; i < cnt; i++)
-			for (j = i + 1; j < cnt; j++)
-				if (!memcmp(out->ent[i].ident,
-				            out->ent[j].ident, 16)) {
-					*why = "dup";
-					return -1;
-				}
 	}
 	*why = "ok";
 	return 0;

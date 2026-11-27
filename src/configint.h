@@ -19,6 +19,7 @@ struct pstate {
 	enum sect sect;
 	struct pc_collection *col;    /* current [collection X] */
 	struct pc_config *cfg;
+	char wal_key[32];             /* the first [wal] key other than dir, or "" */
 };
 
 #define PERR(ps, ...) do { \
@@ -33,6 +34,8 @@ struct pstate {
 
 /* the value parsers (config.c) */
 char *trim(char *s);
+/* strdup, or NULL with "out of memory" said */
+char *cfg_dup(struct pstate *ps, const char *s);
 /* an integer in [@lo, @hi] into *out; 0, or -1 with the error said */
 int parse_int(struct pstate *ps, const char *v, int lo, int hi, int *out);
 int level_of(const char *v);                  /* a log level's name: L_* or -1 */

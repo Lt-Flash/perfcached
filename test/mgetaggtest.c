@@ -159,6 +159,14 @@ int main(void)
 	CHK(!strcmp(resp(m), "*3\r\n$2\r\nv0\r\n$-1\r\n$2\r\nv2\r\n"),
 		"A: the RESP array");
 	pc_mget_free(m);
+	/* A2: hits one tick and two ticks past their expiry - ttl 0, never -1 (no expiry) */
+	m = pc_mget_new("c", 1, 2);
+	pc_mget_hit(m, 0, dupz("a"), 1, now_ticks - 1);
+	pc_mget_hit(m, 1, dupz("b"), 1, now_ticks - 2);
+	CHK(!strcmp(tree_json(m), "{\"values\":[{\"found\":true,\"value\":\"a\","
+		"\"ttl\":0},{\"found\":true,\"value\":\"b\",\"ttl\":0}]}"),
+		"A2: expired by one tick or two - ttl 0: %s", tree_json(m));
+	pc_mget_free(m);
 
 	/* B: lookups - the last answer hands the mget back; a timed-out key is -TRYAGAIN */
 	m = pc_mget_new("c", 1, 4);

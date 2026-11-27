@@ -14,7 +14,7 @@ static int fails;
 #define CHK(c, ...) do { if (c) printf("  ok   " __VA_ARGS__); \
 	else { printf("  FAIL " __VA_ARGS__); fails++; } printf("\n"); } while (0)
 
-/* ---- the stubs: the log, the cluster's setter -------------------------- */
+/* ---- the stubs: the log, the cluster's setters ------------------------- */
 int compat_log_level = L_NOTICE;
 static char logbuf[2048];
 static int warns;
@@ -39,6 +39,18 @@ void pc_cluster_set_cfgsig(const struct pc_cfgsig *e, int n)
 {
 	memcpy(got, e, (size_t)n * sizeof *e);
 	ngot = n;
+}
+
+/* as the cluster's: the entry of that name takes the value */
+void pc_cluster_set_cfgsig_one(const struct pc_cfgsig *e)
+{
+	int i;
+
+	for (i = 0; i < ngot; i++)
+		if (got[i].name_h == e->name_h && !strcmp(got[i].name, e->name)) {
+			memcpy(got[i].val, e->val, sizeof got[i].val);
+			got[i].val_h = e->val_h;
+		}
 }
 
 /* ---- the harness ------------------------------------------------------- */
@@ -199,6 +211,18 @@ int main(void)
 	cfg.col[2].nondurable = 0;
 	cfgsig_build(&cfg);
 	CHK(says("caches", "sess"), "F: one - caches says sess");
+
+	/* G: a reload that sets or drops the HTTP token - its entry follows, nothing else moves */
+	base();
+	cfgsig_build(&cfg);
+	nh = ngot;
+	cfg.http_token = "reloaded-token";
+	cfgsig_reloaded(&cfg);
+	CHK(ngot == nh && says("http.token", "set") && says("wal.fsync", "off"),
+		"G: a token added by reload - the signature says set");
+	cfg.http_token = NULL;
+	cfgsig_reloaded(&cfg);
+	CHK(ngot == nh && says("http.token", "none"), "G: and dropped again - none");
 
 	printf("cfgsigtest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

@@ -4,6 +4,7 @@
 set -u
 
 BIN=${1:-./perfcached}
+INJ=${3:-./clinject}
 SEC=bs-client-secret
 D=$(mktemp -d /var/tmp/pcbsy.XXXXXX)
 # daemons die by the pids this script started, each checked against its command line so a reused pid
@@ -15,6 +16,7 @@ pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
 
+[ -x "$INJ" ] || { echo "backupsynctest: $INJ is missing (make clinject)" >&2; exit 1; }
 for pf in 17921 17922 17923; do
 	ss -ltn 2>/dev/null | grep -q ":$pf[[:space:]]" && {
 		echo "backupsynctest: port $pf already bound" >&2; exit 1; }
@@ -118,6 +120,20 @@ SENT=$(q $MI sync.sent); ACKED=$(q $MI sync.acked)
 	&& ok "the master syncs and is acknowledged (sent $SENT, acked $ACKED)" \
 	|| bad "no acknowledged sync (sent $SENT, acked $ACKED) - publication
          is not actually going past the standby"
+
+# ---- 3b. a sync from a member naming itself master is not held --------
+# from the plain member's own address, at the fleet's term: that term has one master
+PI=$(for n in 1 2 3; do [ "$n" != "$MI" ] && [ "$n" != "$BI" ] && echo $n; done | head -1)
+CID=$(q $MI cluster_id); PN=$(q $PI node); T=$(q $MI term)
+HS0=$(q $BI sync.held_seq); RF0=$(q $BI sync.refused)
+"$INJ" -r -s bs-cluster-secret -c "$CID" -f 127.0.70.$PI:17321 -t 127.0.70.$BI:17321 \
+	clsync "$PN" "$T" 60000 >/dev/null 2>&1
+i=0; while [ $i -lt 20 ]; do RF1=$(q $BI sync.refused); [ "${RF1:-0}" -gt "${RF0:-0}" ] 2>/dev/null && break; sleep 0.1; i=$((i+1)); done
+HS1=$(q $BI sync.held_seq)
+[ "$HS1" != 60000 ] && [ "${RF1:-0}" -gt "${RF0:-0}" ] 2>/dev/null \
+	&& ok "the standby refuses a sync from node $PN, not the master of term $T" \
+	|| bad "the standby took a sync from member node $PN at term $T (held seq
+         $HS0 -> $HS1, refused $RF0 -> $RF1) - a deposed master can overwrite it"
 
 # ---- 4. losing the STANDBY must not wedge publishing ------------------
 SEQ_BEFORE=$(q $MI map.seq)

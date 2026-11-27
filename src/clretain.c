@@ -91,6 +91,12 @@ static unsigned int hash_of(const char *col, size_t cn, const char *key,
 	return h;
 }
 
+/* held @hold seconds by @now_s; an entry stamped after the caller read its clock is young */
+static int aged(unsigned int t_s, unsigned int now_s, unsigned int hold)
+{
+	return t_s <= now_s && now_s - t_s >= hold;
+}
+
 void clretain_init(unsigned int retain_s, unsigned int max)
 {
 	unsigned int i, per;
@@ -106,7 +112,7 @@ void clretain_init(unsigned int retain_s, unsigned int max)
 	pthread_mutex_lock(&FG_mx);
 	nfg = 0;
 	/* PERFCACHED_TEST_FG_FULL: the loss table starts full, as a fleet past SPL_MAX spaces leaves it */
-	fg_full = getenv("PERFCACHED_TEST_FG_FULL") != NULL;
+	__atomic_store_n(&fg_full, getenv("PERFCACHED_TEST_FG_FULL") != NULL, __ATOMIC_RELAXED);
 	pthread_mutex_unlock(&FG_mx);
 	pthread_mutex_lock(&SUP_mx);
 	SUP_n = 0;
@@ -298,7 +304,7 @@ static void lost_seq(uint64_t oid, uint32_t incarn, uint64_t seq)
 		FG[nfg++].lost = 0;
 	}
 	if (i == nfg)
-		fg_full = 1;
+		__atomic_store_n(&fg_full, 1, __ATOMIC_RELAXED);
 	else if (seq > FG[i].lost)
 		FG[i].lost = seq;
 	pthread_mutex_unlock(&FG_mx);
@@ -487,7 +493,7 @@ static void note_in(const char *col, size_t cn, const char *key, size_t kn,
 			pthread_mutex_unlock(&s->mx);
 			return;
 		}
-		if (now_s - o->t_s < R_retain_s) {
+		if (!aged(o->t_s, now_s, R_retain_s)) {
 			__atomic_fetch_add(&R_dropped_early, 1, __ATOMIC_RELAXED);
 			if (o->expiry)
 				__atomic_fetch_add(&R_dropped_early_exp, 1,
@@ -603,7 +609,7 @@ unsigned long clretain_forget(uint64_t oid, uint32_t incarn, uint64_t upto,
 			FG[nfg++].through = 0;
 		}
 		if (i == nfg)
-			fg_full = 1;
+			__atomic_store_n(&fg_full, 1, __ATOMIC_RELAXED);
 		if (i < nfg) {
 			if (upto > FG[i].through)
 				FG[i].through = upto;
@@ -719,7 +725,7 @@ void clretain_expire_expiries(unsigned int now_s, unsigned int hold_s)
 		return;
 	for (i = 0; i < NSHARD; i++) {
 		pthread_mutex_lock(&sh[i].mx);
-		while (sh[i].xhead && now_s - sh[i].xhead->t_s >= hold_s) {
+		while (sh[i].xhead && aged(sh[i].xhead->t_s, now_s, hold_s)) {
 			ent_drop(&sh[i], sh[i].xhead, ent_hash(sh[i].xhead) / NSHARD);
 			n++;
 		}
@@ -747,7 +753,7 @@ uint64_t clretain_get(const char *col, size_t cn, const char *key, size_t kn,
 		return 0;
 	}
 	for (e = s->tab[(h / NSHARD) & (s->nb - 1)]; e; e = e->hnext)
-		if (ent_is(e, col, cn, key, kn) && now_s - e->t_s < R_retain_s &&
+		if (ent_is(e, col, cn, key, kn) && !aged(e->t_s, now_s, R_retain_s) &&
 		    e->ver > v)
 			v = e->ver;            /* a local drop's and a delete's: the higher */
 	pthread_mutex_unlock(&s->mx);
@@ -792,7 +798,7 @@ void clretain_expire(unsigned int now_s)
 		return;
 	for (i = 0; i < NSHARD; i++) {
 		pthread_mutex_lock(&sh[i].mx);
-		while (sh[i].head && now_s - sh[i].head->t_s >= R_retain_s) {
+		while (sh[i].head && aged(sh[i].head->t_s, now_s, R_retain_s)) {
 			if (sh[i].head->nseq)
 				lost_note(&sh[i], sh[i].head);
 			else
@@ -816,7 +822,7 @@ void clretain_get_stats(struct clretain_stats *out, unsigned int now_s)
 	for (i = 0; i < NSHARD; i++) {
 		pthread_mutex_lock(&sh[i].mx);
 		n += sh[i].n;
-		if (sh[i].head && now_s - sh[i].head->t_s > oldest)
+		if (sh[i].head && sh[i].head->t_s <= now_s && now_s - sh[i].head->t_s > oldest)
 			oldest = now_s - sh[i].head->t_s;
 		pthread_mutex_unlock(&sh[i].mx);
 	}
@@ -850,6 +856,9 @@ int clretain_lost_since(unsigned int since_s)
 {
 	if (!R_on)
 		return 0;
+	/* a space past the ledger lost what nobody can name: fail safe */
+	if (__atomic_load_n(&fg_full, __ATOMIC_RELAXED))
+		return 1;
 	return __atomic_load_n(&R_lost_upto_s, __ATOMIC_RELAXED) >= since_s ||
 		__atomic_load_n(&R_time_hi_s, __ATOMIC_RELAXED) >= since_s;
 }
@@ -860,6 +869,8 @@ unsigned int clretain_complete_since(unsigned int now_s)
 
 	if (!R_on)
 		return UINT_MAX;
+	if (__atomic_load_n(&fg_full, __ATOMIC_RELAXED))
+		return now_s;                  /* as clretain_lost_since */
 	/* clretain_expire keeps what is younger than retain_s */
 	c = now_s > R_retain_s ? now_s - R_retain_s : 0;
 	lost = __atomic_load_n(&R_lost_upto_s, __ATOMIC_RELAXED);

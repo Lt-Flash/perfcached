@@ -347,6 +347,26 @@ int main(void)
 	CHK(clretain_complete_since(4100) == 4000,
 		"D: S392 - nothing lost: complete since retain_s's floor (%u, want 4000)",
 		clretain_complete_since(4100));
+	/* a space past the ledger's rows lost what no row can name: every question fails safe */
+	setenv("PERFCACHED_TEST_FG_FULL", "1", 1);
+	clretain_init(100, 640);
+	unsetenv("PERFCACHED_TEST_FG_FULL");
+	clretain_note("c", 1, "held", 4, 1, 9000);
+	CHK(clretain_lost_since(9000) == 1 && clretain_complete_since(9050) == 9050,
+		"D: the space ledger full - a returning member counts as having lost, the table "
+		"vouches for nothing (%d, %u)", clretain_lost_since(9000), clretain_complete_since(9050));
+	clretain_init(100, 640);
+	CHK(clretain_lost_since(9000) == 0, "D: and a fresh table with a ledger to spare lost nothing");
+	/* an entry planted a second after the caller read its clock is young, not 4 billion s old */
+	clretain_init(100, 640);
+	clretain_note("c", 1, "ahead", 5, 3, 5001);
+	clretain_note_expiry("c", 1, "xahead", 6, 4, 5001, 0);
+	clretain_expire(5000);
+	clretain_expire_expiries(5000, 10);
+	clretain_get_stats(&st, 5000);
+	CHK(st.entries == 2 && clretain_get("c", 1, "ahead", 5, 5000) == 3,
+		"D: a delete and an expiry stamped 5001, expired at 5000 - both kept (%llu)",
+		(unsigned long long)st.entries);
 
 	/* ---- G: what the table no longer holds, for a member back from an absence */
 	{

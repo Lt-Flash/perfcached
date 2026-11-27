@@ -50,6 +50,10 @@ i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/n.log"; do sleep 0
 grep -q "perfcached ready" "$D/n.log" || { echo "daemon did not start"; tail -5 "$D/n.log"; exit 1; }
 
 reload() { "$BIN" -f "$D/n.conf" -H $P > "$D/h.out" 2>&1; echo $?; }
+
+# ---- 0. the outcome file restarts with the run: -H never takes another run's of the same pid ------
+[ "$(head -n 1 "$D/state/reload" 2>/dev/null)" = "gen=0 ok=1 pid=$P" ] &&
+	ok "0. at start the outcome file says gen=0 under this pid" || bad "0. outcome file at start: '$(head -n 1 "$D/state/reload" 2>/dev/null)'"
 http() { # http <token> -> status of GET /stats
 	curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" "http://127.0.0.1:$HTTP/stats"
 }
@@ -147,6 +151,12 @@ st=$(curl -s -H "Authorization: Bearer rl-token-5" "http://127.0.0.1:$HTTP/stats
 # applied: A, B, B's privileged verb (nothing changed), C twice, D, E, H, I = 9; refused: F = 1
 # (G is refused by -H before the daemon is asked, I's unprivileged verb before it runs)
 [ "$st" = "9 1 True" ] && ok "I. stats.reload: 9 applied, 1 refused, the last one stamped" || bad "I. stats.reload: '$st'"
+# ---- J. -H with no pid, or not a number: refused, never a daemon started in its place -------------------
+for a in "" abc 0; do
+	timeout 20 "$BIN" -f "$D/n.conf" -H "$a" > "$D/hx.out" 2>&1; rc=$?
+	[ "$rc" = 1 ] && grep -q "is not a daemon pid" "$D/hx.out" && ! grep -q "perfcached ready" "$D/hx.out" &&
+		ok "J. -H '$a': refused, exit 1, nothing started" || bad "J. -H '$a': rc $rc: $(head -3 "$D/hx.out" | tr '\n' '|')"
+done
 kill -0 $P 2>/dev/null && ok "the daemon ran through every reload" || bad "the daemon is gone: $(tail -5 "$D/n.log")"
 grep -h 'an fsync has been stuck' "$D/n.log" 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
 grep -E 'ERROR|CRIT' "$D/n.log" | grep -vE 'reload refused|does not load|this line is not a key|expected key = value|an fsync has been stuck' | head -3 > "$D/errs"

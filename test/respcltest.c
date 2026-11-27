@@ -17,8 +17,8 @@ static int fails;
 
 /* ---- the stubs: what respcl.c reaches outside itself -------------------- */
 unsigned int pc_resp_slots_hits, pc_resp_slots_builds;
-static struct pc_member fleet[3];
-static int fleet_n, alternate, unk_calls;
+static struct pc_member fleet[PC_CL_MAXMEMBERS];
+static int fleet_n, alternate, unk_calls, owner_node;
 
 struct pc_member *members_scratch(void)
 {
@@ -33,6 +33,21 @@ int pc_cluster_members(struct pc_member *out, int max)
 
 	memcpy(out, fleet, sizeof *out * (size_t)n);
 	return n;
+}
+
+static unsigned int map_term, map_seq;
+static int map_usable;
+
+int pc_cluster_map_stamp(unsigned int *term, unsigned int *seq)
+{
+	*term = map_term;
+	*seq = map_seq;
+	return map_term != 0;
+}
+
+int pc_cluster_map_usable(void)
+{
+	return map_usable;
 }
 
 int resp_cluster_on(void)
@@ -50,6 +65,8 @@ void unk_sub(const struct resp_ctx *c)
  * slot when @alternate */
 int pc_shard_owner_slot(unsigned slot)
 {
+	if (owner_node)
+		return owner_node;
 	if (alternate)
 		return slot % 2 ? 2 : 0;
 	return slot < 8192 ? 0 : 2;
@@ -156,6 +173,31 @@ int main(void)
 	cluster("SLOTS", NULL);
 	CHK(!strncmp(out.buf, "*16384\r\n", 8) && pc_resp_slots_builds == 2,
 		"C: every slot alternating owners - 16384 ranges, built afresh");
+	alternate = 0;
+	fleet[1].state = 0;
+	cluster("SLOTS", NULL);
+	CHK(pc_resp_slots_builds == 3, "C: back to halves - built");
+	/* a restart: same members, a new id */
+	fleet[0].incarn = 0x9abcdef0u;
+	cluster("SLOTS", NULL);
+	CHK(pc_resp_slots_builds == 4 && has("00112233445566778899aabbccddeeff9abcdef0"),
+		"C: a new incarnation - built afresh, the new id served");
+	fleet[0].ident[3] = 0xEE;
+	cluster("SLOTS", NULL);
+	CHK(pc_resp_slots_builds == 5, "C: a new identity - built afresh");
+	map_term = 1;
+	map_seq = 7;
+	cluster("SLOTS", NULL);
+	CHK(pc_resp_slots_builds == 6, "C: the placement map's stamp moved - built afresh");
+	map_usable = 1;
+	cluster("SLOTS", NULL);
+	CHK(pc_resp_slots_builds == 7, "C: placement switched to the map - built afresh");
+	cluster("SLOTS", NULL);
+	CHK(pc_resp_slots_builds == 7, "C: nothing moved - from the cache");
+	fleet[0].ident[3] = 0x33;
+	fleet[0].incarn = 0x12345678u;
+	alternate = 1;
+	fleet[1].state = 1;
 
 	/* D: an unknown subcommand is counted and refused */
 	unk_calls = 0;
@@ -186,6 +228,29 @@ int main(void)
 	fleet[2].client_port = 6482;
 	cluster("NODES", NULL);
 	CHK(has("127.0.0.3:6482@6482 master"), "E: once it has one, it is");
+
+	/* F: more than 255 members - a member's index is not cut to a byte: index 255 is not "no
+	 * owner", 256 is not index 0; an id from a node number past 255 keeps its high digits */
+	for (i = 3; i < 300; i++) {
+		memset(&fleet[i], 0, sizeof fleet[i]);
+		fleet[i].node = 1000 + i;
+		fleet[i].addr.s_addr = htonl(0x0a000000u + (unsigned)i);
+		fleet[i].client_port = 7000;
+		fleet[i].gone_s = -1;
+		fleet[i].live = 1;
+	}
+	fleet_n = 300;
+	owner_node = fleet[255].node;
+	cluster("SLOTS", NULL);
+	CHK(!strncmp(out.buf, "*1\r\n*3\r\n:0\r\n:16383\r\n", 22) && has("10.0.0.255"),
+		"F: every slot owned by member 255 - one range, its address");
+	CHK(has("$40\r\n00000000000000000000000000000000000004e7\r\n"),
+		"F: node 1255's id keeps all its digits (04e7)");
+	owner_node = fleet[256].node;
+	cluster("SLOTS", NULL);
+	CHK(has("10.0.1.0") && !has("127.0.0.1"), "F: member 256 - its own address, not member 0's");
+	owner_node = 0;
+	fleet_n = 3;
 
 	printf("respcltest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

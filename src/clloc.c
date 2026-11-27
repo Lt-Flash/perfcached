@@ -129,10 +129,11 @@ void clloc_neg_set(struct clloc *l, const char *col, size_t cn,
 	uint64_t h = clloc_hash(col, cn, key, kn);
 	size_t i = neg_slot_for(l, neg_base(h), h, now);
 
+	/* raised before the entry shows: a clear that sees the entry also sees the bar */
+	neg_until(l, now + ms);
 	neg_wlock(l, i);
 	neg_put(l, i, h, now + ms, 0);
 	neg_wunlock(l, i);
-	neg_until(l, now + ms);
 }
 
 void clloc_neg_set_ver(struct clloc *l, const char *col, size_t cn,
@@ -143,12 +144,12 @@ void clloc_neg_set_ver(struct clloc *l, const char *col, size_t cn,
 
 	/* a later delete of the same key carries a later version; an older
 	 * tombstone arriving late must not lower the bar */
+	neg_until(l, now + ms);
 	neg_wlock(l, i);
 	if (l->neg[i].h == h && l->neg[i].exp_ms > now && l->neg[i].ver > ver)
 		ver = l->neg[i].ver;
 	neg_put(l, i, h, now + ms, ver);
 	neg_wunlock(l, i);
-	neg_until(l, now + ms);
 }
 
 int clloc_neg_ver(struct clloc *l, const char *col, size_t cn,

@@ -83,14 +83,14 @@ int main(void)
 	fill(2, now);
 	created = 7;
 	a = A(2);
-	p = clpeers_upsert(&PT, &a, &created);
+	p = clpeers_upsert(&PT, &a, now, &created);
 	check(p == &PT.peers[1] && !created,
 		"an address already in the table returns its slot, not a new one");
 	check(PT.n_peers == 2, "and does not grow the table");
 
 	a = A(9);
 	created = 0;
-	p = clpeers_upsert(&PT, &a, &created);
+	p = clpeers_upsert(&PT, &a, now, &created);
 	check(p == &PT.peers[2] && created == 1,
 		"a new address is appended and reports created");
 	check(PT.n_peers == 3, "the table grew by one");
@@ -105,13 +105,35 @@ int main(void)
 	PT.peers[0].repl_bfcycle[0] = 1;
 	a = A(77);
 	created = 1;
-	p = clpeers_upsert(&PT, &a, &created);
+	p = clpeers_upsert(&PT, &a, now, &created);
 	check(p == &PT.peers[0] && !created,
 		"a dead slot is reclaimed in place, not appended");
 	check(!p->backfill[0] && !p->repl_mark[0] && !p->repl_cursor[0] &&
 		!p->repl_bfcycle[0],
 		"S102: the reclaimed slot carries none of the old peer\'s "
 		"replication state");
+
+	/* a reused slot is a new peer: not "back from a silence", not the old identity */
+	fill(2, now);
+	PT.peers[0].node = 0;
+	PT.peers[0].last_seen_ms = now - 60000;
+	PT.peers[0].gone_ms = now - PEER_SLOT_GRACE_MS;
+	PT.peers[0].has_ident = 1;
+	PT.peers[0].incarn = 5;
+	a = A(78);
+	p = clpeers_upsert(&PT, &a, now, &created);
+	check(p == &PT.peers[0] && !p->last_seen_ms && !p->gone_ms && !p->has_ident &&
+		!p->incarn, "the reclaimed slot's last sighting, purge time and identity are cleared");
+
+	/* a slot purged inside its placement grace still holds its slots: appended past it */
+	fill(2, now);
+	PT.peers[0].node = 0;
+	PT.peers[0].gone_ms = now - 1000;
+	a = A(79);
+	created = 0;
+	p = clpeers_upsert(&PT, &a, now, &created);
+	check(p == &PT.peers[2] && created == 1 && PT.peers[0].gone_ms == now - 1000,
+		"a slot inside its grace is not reused while the table has room");
 
 	/* a full table refuses rather than overruns */
 	memset(&PT, 0, sizeof PT);
@@ -124,7 +146,7 @@ int main(void)
 	a = A(200);
 	a.in4.sin_port = htons(7000);                  /* an address not present */
 	created = 0;
-	check(!clpeers_upsert(&PT, &a, &created),
+	check(!clpeers_upsert(&PT, &a, now, &created),
 		"a full table of live peers refuses a new address");
 
 	/* ---- duplicate-id arbitration ----------------------------------- */

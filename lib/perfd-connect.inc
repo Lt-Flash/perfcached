@@ -274,6 +274,8 @@ static perfd_t *pd_alloc(const perfd_opts *opts)
 		return NULL;
 	}
 	p->io_ms = o->io_timeout_ms > 0 ? o->io_timeout_ms : DEF_TIMEOUT_MS;
+	p->call_ms = o->call_timeout_ms > 0 ? o->call_timeout_ms :
+		o->call_timeout_ms < 0 ? 0 : 4 * p->io_ms;
 	p->eager_push = o->eager_push != 0;
 	p->want_enc = o->encrypt > 0;
 	p->conn_name = o->name && *o->name ? strdup(o->name) : NULL;
@@ -511,7 +513,7 @@ void perfd_free_value(void *buf)
 	free(buf);
 }
 
-void perfd_free(perfd_t *p)
+static void free_now(perfd_t *p)
 {
 	if (p) {
 		free(p->enable_sec);
@@ -556,6 +558,15 @@ void perfd_free(perfd_t *p)
 	free(p->calls);
 	free(p->nj);
 	free(p);
+}
+
+void perfd_free(perfd_t *p)
+{
+	if (p && p->disp > 0) {
+		p->free_req = 1;
+		return;
+	}
+	free_now(p);
 }
 
 /* ==== the event-loop surface: the consumer's loop watches perfd_fd() for perfd_events();

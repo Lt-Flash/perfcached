@@ -95,6 +95,14 @@ static struct {
 } L = { .mx = PTHREAD_MUTEX_INITIALIZER, .lfd = -1, .wake_fd = -1,
 	.rx_fd = -1 };
 
+/* a figure counted outside L.mx's other work: clane_figures copies them under it */
+static void fig_bump(unsigned long long *c)
+{
+	pthread_mutex_lock(&L.mx);
+	(*c)++;
+	pthread_mutex_unlock(&L.mx);
+}
+
 /* rx frames carry their sender in front of the data */
 struct rxhdr { pc_addr from; };
 
@@ -344,14 +352,18 @@ static void rx_queue(struct rxacct *acct, const pc_addr *from, const unsigned ch
 		wake(L.rx_fd);
 }
 
+/* here and below, what other threads read of a peer (fd, connected, probe, conn_start_ms,
+ * next_try_ms) and the figures change under L.mx */
 static void peer_close(struct lpeer *p, long long now)
 {
+	int fd;
+
+	pthread_mutex_lock(&L.mx);
 	if (p->probe && !p->connected) {
 		p->probe = 0;                  /* the probe's answer is no */
 		p->conn_start_ms = 0;
 	}
-	if (p->fd >= 0)
-		close(p->fd);
+	fd = p->fd;
 	p->fd = -1;
 	p->connected = 0;
 	p->woff = 0;
@@ -362,6 +374,9 @@ static void peer_close(struct lpeer *p, long long now)
 	/* jitter: 50-100% of the backoff */
 	p->next_try_ms = now + p->backoff_ms / 2 +
 		(long long)(random() % (p->backoff_ms / 2 + 1));
+	pthread_mutex_unlock(&L.mx);
+	if (fd >= 0)
+		close(fd);
 }
 
 /* a host lost without an RST must read as gone in seconds, not at the retransmission limit */
@@ -402,6 +417,7 @@ static void peer_connect(struct lpeer *p, long long now)
 			return;
 		}
 	}
+	pthread_mutex_lock(&L.mx);
 	p->fd = fd;
 	p->connected = 0;
 	memcpy(p->hello, "PCL1", 4);
@@ -412,10 +428,29 @@ static void peer_connect(struct lpeer *p, long long now)
 	if (!p->conn_start_ms)
 		p->conn_start_ms = now;
 	L.f.connects++;
+	pthread_mutex_unlock(&L.mx);
 	if (connect(fd, &a.sa, pc_addr_len(&a)) != 0 &&
 	        errno != EINPROGRESS) {
-		L.f.connect_fail++;
+		fig_bump(&L.f.connect_fail);
 		peer_close(p, now);
+	}
+}
+
+/* a connect in flight failed: counted, and said once until the lane is up again */
+static void connect_failed(struct lpeer *p, int err)
+{
+	fig_bump(&L.f.connect_fail);
+	if (!p->said_down) {
+		char ab[PC_ADDR_STRLEN];
+
+		pc_addr_ntop(&p->to, ab, sizeof ab);
+		LM_WARN("cluster: frame lane to %s:%d (TCP %d) "
+			"cannot connect (%s) - frames over the "
+			"datagram limit to it are dropped until "
+			"it can\n", ab, pc_addr_port(&p->to),
+			pc_addr_port(&p->to) + L.lane_off,
+			strerror(err));
+		p->said_down = 1;
 	}
 }
 
@@ -428,25 +463,15 @@ static int peer_write(struct lpeer *p, long long now)
 
 		if (getsockopt(p->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 ||
 		        err) {
-			L.f.connect_fail++;
-			if (!p->said_down) {
-				char ab[PC_ADDR_STRLEN];
-
-				pc_addr_ntop(&p->to, ab, sizeof ab);
-				LM_WARN("cluster: frame lane to %s:%d (TCP %d) "
-					"cannot connect (%s) - frames over the "
-					"datagram limit to it are dropped until "
-					"it can\n", ab, pc_addr_port(&p->to),
-					pc_addr_port(&p->to) + L.lane_off,
-					strerror(err ? err : errno));
-				p->said_down = 1;
-			}
+			connect_failed(p, err ? err : errno);
 			return -1;
 		}
+		pthread_mutex_lock(&L.mx);
 		p->connected = 1;
 		p->backoff_ms = 0;
 		p->probe = 0;                  /* answered */
 		p->conn_start_ms = 0;
+		pthread_mutex_unlock(&L.mx);
 		if (p->said_down) {
 			char ab[PC_ADDR_STRLEN];
 
@@ -566,7 +591,7 @@ static int lin_read(struct lin *c)
 			        getpeername(c->fd, &peer.sa, &pl) != 0 ||
 			        pc_addr_family(&peer) != AF_INET ||
 			        pc_addr_v4(&peer) != a4) {
-				L.f.refused++;
+				fig_bump(&L.f.refused);
 				return -1;
 			}
 			pc_addr_from_v4(&c->from, a4, ntohs(p2));
@@ -625,7 +650,7 @@ static void *lane_main(void *arg)
 	static struct lin in[CLANE_MAX_INBOUND];
 	struct pollfd pf[2 + MAX_PEERS + CLANE_MAX_INBOUND];
 	int pi[MAX_PEERS];                 /* pf slot -> peer index */
-	int nin = 0, i;
+	int nin = 0, npoll, i;
 
 	(void)arg;
 	for (;;) {
@@ -683,7 +708,9 @@ static void *lane_main(void *arg)
 			pf[n].fd = in[i].fd;
 			pf[n++].events = POLLIN;
 		}
-		if (poll(pf, (nfds_t)n, timeout) < 0 && errno != EINTR)
+		npoll = nin;
+		/* revents are filled only by a poll that returned: on EINTR too they are stale */
+		if (poll(pf, (nfds_t)n, timeout) < 0)
 			continue;
 		now = mono_ms();
 		if (pf[1].revents & POLLIN) {
@@ -702,7 +729,7 @@ static void *lane_main(void *arg)
 				lane_keepalive(fd);
 				if (nin >= CLANE_MAX_INBOUND ||
 				        lin_from(in, nin, &pa) >= LIN_PER_ADDR) {
-					L.f.refused++;     /* counted before the peer sees it */
+					fig_bump(&L.f.refused);    /* counted before the peer sees it */
 					close(fd);
 					pl = sizeof pa;
 					continue;
@@ -734,14 +761,23 @@ static void *lane_main(void *arg)
 				gone = r == 0 || (r < 0 && errno != EAGAIN &&
 					errno != EWOULDBLOCK);
 			}
+			/* a refused or timed-out connect shows as POLLERR|POLLHUP alone */
+			if (gone && !p->connected) {
+				int err = 0;
+				socklen_t el = sizeof err;
+
+				if (getsockopt(p->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0)
+					err = errno;
+				connect_failed(p, err ? err : ECONNRESET);
+			}
 			/* a connect in flight is done only when POLLOUT says so */
 			if (gone || ((p->connected || (re & POLLOUT)) &&
 			        peer_write(p, now) != 0))
 				peer_close(p, now);
 		}
-		/* backwards: an entry removed takes the LAST one's place, which
-		 * this loop has already handled */
-		for (i = nin - 1; i >= 0; i--) {
+		/* backwards: an entry removed takes the LAST one's place, which this loop has
+		 * already handled; those accepted in this pass were not polled */
+		for (i = npoll - 1; i >= 0; i--) {
 			short re = pf[2 + np + i].revents;
 
 			if (!re)
@@ -757,7 +793,7 @@ static void *lane_main(void *arg)
 		for (i = nin - 1; i >= 0; i--)
 			if (now - in[i].since_ms >
 			        (in[i].hello_ok ? LIN_IDLE_MS : LIN_HELLO_MS)) {
-				L.f.inbound_timeouts++;
+				fig_bump(&L.f.inbound_timeouts);
 				lin_drop(&in[i]);
 				in[i] = in[--nin];
 			}

@@ -989,6 +989,7 @@ void stats_tree_cluster(struct pc_tw *out)
 			pc_tw_key(out, "pend_used");
 			pc_tw_i64(out, (long long)cs.pend_used);
 			pc_tw_ctr(out, "cluster.pend_exhausted", "pend_exhausted", (unsigned long long)(cs.pend_exhausted));
+			pc_tw_ctr(out, "cluster.pend_cq_dropped", "pend_cq_dropped", (unsigned long long)(cs.pend_cq_dropped));
 			/* the other two refusal causes, split so "forward
 			 * failed" does not point at a healthy network */
 			pc_tw_ctr(out, "cluster.fwd_no_route", "fwd_no_route", (unsigned long long)(cs.fwd_no_route));

@@ -217,14 +217,15 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 		else if (!strcasecmp(val, "all"))
 			cfg->query_log = 1;
 		else if (!strncasecmp(val, "sampled:", 8)) {
-			int n = atoi(val + 8);
+			char *end;
+			long n = strtol(val + 8, &end, 10);
 
-			if (n < 2 || n > 1000000) {
+			if (end == val + 8 || *end || n < 2 || n > 1000000) {
 				PERR(ps, "query_log: sampled:N needs "
 					"2 <= N <= 1000000\n");
 				return -1;
 			}
-			cfg->query_log = n;
+			cfg->query_log = (int)n;
 		} else {
 			PERR(ps, "query_log: off | all | sampled:N\n");
 			return -1;
@@ -250,8 +251,8 @@ int cfg_kv_daemon(struct pstate *ps, char *key, char *val)
 			return -1;
 		}
 		free(cfg->state_dir);
-		cfg->state_dir = strdup(val);
-		return 0;
+		cfg->state_dir = cfg_dup(ps, val);
+		return cfg->state_dir ? 0 : -1;
 	}
 	return CFG_KV_UNKNOWN;
 }
@@ -326,7 +327,9 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 				PC_MAX_CLIENT_SECRETS);
 			return -1;
 		}
-		cfg->client_secret[cfg->n_client_secrets++] = strdup(val);
+		if (!(cfg->client_secret[cfg->n_client_secrets] = cfg_dup(ps, val)))
+			return -1;
+		cfg->n_client_secrets++;
 		return 0;
 	}
 	if (!strcasecmp(key, "enable")) {
@@ -341,7 +344,9 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 				PC_MAX_CLIENT_SECRETS);
 			return -1;
 		}
-		cfg->enable_secret[cfg->n_enable_secrets++] = strdup(val);
+		if (!(cfg->enable_secret[cfg->n_enable_secrets] = cfg_dup(ps, val)))
+			return -1;
+		cfg->n_enable_secrets++;
 		return 0;
 	}
 	if (!strcasecmp(key, "cluster")) {
@@ -349,16 +354,16 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 			PERR(ps, "duplicate cluster secret\n");
 			return -1;
 		}
-		cfg->cluster_secret = strdup(val);
-		return 0;
+		cfg->cluster_secret = cfg_dup(ps, val);
+		return cfg->cluster_secret ? 0 : -1;
 	}
 	if (!strcasecmp(key, "cluster_accept")) {         /* a rotation's other secret */
 		if (cfg->cluster_accept_secret) {
 			PERR(ps, "duplicate cluster_accept secret\n");
 			return -1;
 		}
-		cfg->cluster_accept_secret = strdup(val);
-		return 0;
+		cfg->cluster_accept_secret = cfg_dup(ps, val);
+		return cfg->cluster_accept_secret ? 0 : -1;
 	}
 	if (!strcasecmp(key, "http")) {
 		/* a second layer, never the first: it rides plaintext and can be replayed - it only
@@ -367,8 +372,8 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 			PERR(ps, "duplicate http token\n");
 			return -1;
 		}
-		cfg->http_token = strdup(val);
-		return 0;
+		cfg->http_token = cfg_dup(ps, val);
+		return cfg->http_token ? 0 : -1;
 	}
 	if (!strcasecmp(key, "resp")) {
 		/* a plain shared secret compared in constant time, not an Argon2id PSK: stock Redis
@@ -377,8 +382,8 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 			PERR(ps, "duplicate resp secret\n");
 			return -1;
 		}
-		cfg->resp_password = strdup(val);
-		return 0;
+		cfg->resp_password = cfg_dup(ps, val);
+		return cfg->resp_password ? 0 : -1;
 	}
 	if (!strcasecmp(key, "upstream")) {
 		PERR(ps, "[secrets] upstream moved in 0.6.1: write "
@@ -395,8 +400,8 @@ int cfg_kv_secrets(struct pstate *ps, char *key, char *val)
 			PERR(ps, "empty mail secret\n");
 			return -1;
 		}
-		cfg->mail.pass = strdup(val);
-		return 0;
+		cfg->mail.pass = cfg_dup(ps, val);
+		return cfg->mail.pass ? 0 : -1;
 	}
 	return CFG_KV_UNKNOWN;
 }
@@ -449,9 +454,10 @@ static int add_door_listener(struct pstate *ps, char *val, int kind)
 		*sp = 0;
 		for (opt = sp + 1; *opt == ' ' || *opt == '\t'; opt++)
 			;
+		/* the words are not echoed: a [secrets] line typed under [listen] lands here */
 		if (strcasecmp(opt, "tls")) {
-			PERR(ps, "a %s listener takes one option, tls (got '%s')\n",
-				kind == 1 ? "resp" : "http", opt);
+			PERR(ps, "a %s listener is <addr:port> and one option, tls\n",
+				kind == 1 ? "resp" : "http");
 			return -1;
 		}
 		tls = 1;
@@ -477,14 +483,14 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 	if (!strcasecmp(key, "http"))
 		return add_door_listener(ps, val, 2);
 	if (!strcasecmp(key, "tls_cert") || !strcasecmp(key, "tls_key")) {
-		char **dst = key[4] == 'c' ? &cfg->tls_cert : &cfg->tls_key;
+		char **dst = !strcasecmp(key, "tls_cert") ? &cfg->tls_cert : &cfg->tls_key;
 
 		if (*dst || !*val) {
 			PERR(ps, "%s: %s\n", key, *dst ? "given twice" : "empty");
 			return -1;
 		}
-		*dst = strdup(val);
-		return 0;
+		*dst = cfg_dup(ps, val);
+		return *dst ? 0 : -1;
 	}
 	if (!strcasecmp(key, "auth_needs_tls"))
 		return yesno(ps, key, val, &cfg->auth_needs_tls);
@@ -504,7 +510,7 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 	if (!strcasecmp(key, "http_cache_ms"))
 		return parse_int(ps, val, 0, 60000, &cfg->http_cache_ms);
 	if (!strcasecmp(key, "http_allow")) {
-		char *tok, *save = NULL, *dup = strdup(val);
+		char *tok, *save = NULL, *dup = cfg_dup(ps, val);
 		int rc = 0;
 
 		if (!dup)
@@ -519,7 +525,7 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 		return rc;
 	}
 	if (!strcasecmp(key, "resp_allow")) {
-		char *tok, *save = NULL, *dup = strdup(val);
+		char *tok, *save = NULL, *dup = cfg_dup(ps, val);
 		int rc = 0;
 
 		if (!dup)
@@ -535,11 +541,11 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 	}
 	if (!strcasecmp(key, "resp_collections")) {
 		free(cfg->resp_collections);
-		cfg->resp_collections = strdup(val);
-		return 0;
+		cfg->resp_collections = cfg_dup(ps, val);
+		return cfg->resp_collections ? 0 : -1;
 	}
 	if (!strcasecmp(key, "keepalive_s"))
-		return parse_int(ps, val, 0, 86400, &cfg->keepalive_s);
+		return parse_int(ps, val, 0, 32767, &cfg->keepalive_s);
 	if (!strcasecmp(key, "pubsub_udp")) {
 		if (!strcasecmp(val, "yes") || !strcasecmp(val, "on"))
 			cfg->pubsub_udp = 1;
@@ -579,7 +585,7 @@ int cfg_kv_listen(struct pstate *ps, char *key, char *val)
 }
 
 /* [wal] */
-int cfg_kv_wal(struct pstate *ps, char *key, char *val)
+static int wal_kv(struct pstate *ps, char *key, char *val)
 {
 	struct pc_config *cfg = ps->cfg;
 
@@ -589,8 +595,8 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 			return -1;
 		}
 		free(cfg->wal_dir);
-		cfg->wal_dir = strdup(val);
-		return 0;
+		cfg->wal_dir = cfg_dup(ps, val);
+		return cfg->wal_dir ? 0 : -1;
 	}
 	if (!strcasecmp(key, "probe")) {
 		if (!strcasecmp(val, "auto"))
@@ -659,13 +665,20 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 		/* Redis-style OR'd rules: "900 1, 300 10" - or "off" */
 		char *tok, *sp, *dup;
 
+		if (cfg->n_rdb_rules >= 0) {
+			PERR(ps, "save: given twice - write every rule on one line, "
+				"\"SECS CHANGES, SECS CHANGES, ...\"\n");
+			return -1;
+		}
 		cfg->n_rdb_rules = 0;
 		if (!strcasecmp(val, "off"))
 			return 0;
-		dup = strdup(val);
+		dup = cfg_dup(ps, val);
+		if (!dup)
+			return -1;
 		for (tok = strtok_r(dup, ",", &sp); tok;
 		        tok = strtok_r(NULL, ",", &sp)) {
-			int secs;
+			int secs, end = 0;
 			long long ch;
 
 			if (sscanf(tok, "%d %lld", &secs, &ch) == 2 &&
@@ -682,11 +695,12 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 					"run out before one could finish\n", ch);
 				return -1;
 			}
-			if (sscanf(tok, "%d %lld", &secs, &ch) != 2 ||
-			        secs < 1 || ch < 1 ||
+			if (sscanf(tok, "%d %lld %n", &secs, &ch, &end) != 2 ||
+			        tok[end] || secs < 1 || ch < 1 ||
 			        cfg->n_rdb_rules >= PC_RDB_MAX_RULES) {
 				free(dup);
-				PERR(ps, "save: \"SECS CHANGES, ...\" or off\n");
+				PERR(ps, "save: \"SECS CHANGES, ...\" (rules "
+					"separated by commas) or off\n");
 				return -1;
 			}
 			cfg->rdb_rules[cfg->n_rdb_rules].secs = secs;
@@ -699,4 +713,13 @@ int cfg_kv_wal(struct pstate *ps, char *key, char *val)
 	if (!strcasecmp(key, "rdb_mb_s"))
 		return parse_int(ps, val, 0, 4000, &cfg->rdb_mb_s);
 	return CFG_KV_UNKNOWN;
+}
+
+int cfg_kv_wal(struct pstate *ps, char *key, char *val)
+{
+	int rc = wal_kv(ps, key, val);
+
+	if (rc == 0 && strcasecmp(key, "dir") && !ps->wal_key[0])
+		snprintf(ps->wal_key, sizeof ps->wal_key, "%s", key);
+	return rc;
 }

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include "hostlink.h"
@@ -37,23 +38,46 @@ static int rd_line(const char *path, char *out, size_t n)
 	return out[0] ? 0 : -1;
 }
 
-static unsigned long long rd_fd(int fd)
+/* one counter; -1 when it cannot be read (a device gone under its descriptor) */
+static int rd_fd(int fd, unsigned long long *v)
 {
 	char b[32];
 	ssize_t n;
 
+	*v = 0;
 	if (fd < 0)
-		return 0;
+		return -1;
 	n = pread(fd, b, sizeof b - 1, 0);
 	if (n <= 0)
-		return 0;
+		return -1;
 	b[n] = 0;
-	return strtoull(b, NULL, 10);
+	*v = strtoull(b, NULL, 10);
+	return 0;
+}
+
+static unsigned long long rd_ctr(int fd)
+{
+	unsigned long long v;
+
+	rd_fd(fd, &v);
+	return v;
 }
 
 static int net_path(char *p, size_t n, const char *dev, const char *leaf)
 {
 	return snprintf(p, n, "%s/sys/class/net/%s/%s", root, dev, leaf) < (int)n ? 0 : -1;
+}
+
+/* the open rx counter is not @phys's now: a device made again under the same name */
+static int fds_stale(const char *phys)
+{
+	struct stat a, b;
+	char p[384];
+
+	if (fd_rx < 0 || net_path(p, sizeof p, phys, "statistics/rx_bytes") != 0)
+		return 1;
+	return stat(p, &a) != 0 || fstat(fd_rx, &b) != 0 || a.st_ino != b.st_ino ||
+		a.st_dev != b.st_dev;
 }
 
 /* a VLAN's (or macvlan's) one lower device; 0 = none, or more than one */
@@ -321,7 +345,7 @@ void hl_read(struct hl_obs *o, long long now)
 	if (now - resolved_ms >= HL_RESOLVE_MS) {
 		resolved_ms = now;
 		if (resolve(HL.dev, o->phys, sizeof o->phys, o->path, sizeof o->path,
-		        &o->speed) == 0 && strcmp(o->phys, open_phys)) {
+		        &o->speed) == 0 && (strcmp(o->phys, open_phys) || fds_stale(o->phys))) {
 			fds_open(o->phys);
 			nic_queues(o->phys, &o->rx_queues, &o->irqs, &o->irq_cpus);
 			o->moved = 1;
@@ -330,11 +354,12 @@ void hl_read(struct hl_obs *o, long long now)
 			o->phys[0] = o->path[0] = 0;
 	} else
 		o->speed = -2;                 /* not read this second */
-	o->rx = rd_fd(fd_rx);
-	o->tx = rd_fd(fd_tx);
-	o->drops = rd_fd(fd_rxd) + rd_fd(fd_txd) + rd_fd(fd_miss);
+	o->ok = rd_fd(fd_rx, &o->rx) == 0 && rd_fd(fd_tx, &o->tx) == 0;
+	o->drops = rd_ctr(fd_rxd) + rd_ctr(fd_txd) + rd_ctr(fd_miss);
 	snmp_read(&o->udperr, &o->retrans);
-	o->ok = fd_rx >= 0 && fd_tx >= 0;
+	/* a counter that cannot be read is no reading: reopened at the next resolve */
+	if (!o->ok)
+		open_phys[0] = 0;
 }
 
 static int pct_of(long long bps, int mbps)

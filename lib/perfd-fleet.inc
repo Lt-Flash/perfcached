@@ -31,6 +31,25 @@ static int method_idempotent(const char *m)
 	return 0;
 }
 
+/* a reply that did not come says nothing of whether a write was applied: the node may still apply
+ * it after a replay elsewhere and after the caller's next write, so only a read is sent again */
+static int method_reads(const char *m)
+{
+	static const char *const rd[] = { "get", "exists", "ttl", "mget", "keys", "scan",
+		"ping", "stats", "members", "jget", NULL };
+	int i;
+
+	for (i = 0; rd[i]; i++)
+		if (!strcmp(m, rd[i]))
+			return 1;
+	return 0;
+}
+
+static int bin_verb_reads(int verb)
+{
+	return verb == BV_PING || verb == BV_GET || verb == BV_EXISTS || verb == BV_TTL;
+}
+
 static int bin_verb_idempotent(int verb)
 {
 	/* the counter verbs double on a replay; a conditional set replayed after its reply was lost
@@ -456,6 +475,7 @@ static void child_opts(perfd_t *p, perfd_opts *o, const char **sec, int connect_
 	o->secrets = p->nsec ? sec : NULL;
 	o->connect_timeout_ms = connect_ms > 0 ? connect_ms : p->o_connect_ms;
 	o->io_timeout_ms = p->o_io_ms;
+	o->call_timeout_ms = p->call_ms ? p->call_ms : -1;
 	o->spares = PERFD_SPARES_NONE;  /* children never recurse */
 	o->keepalive_s = p->keepalive_s ? p->keepalive_s : -1;
 	o->idle_ping_ms = -1;           /* a child is pinged by its parent */
@@ -705,6 +725,7 @@ static void adopt_conn(perfd_t *dst, perfd_t *src)
 		dst->next_id = src->next_id;
 	dst->active_node = src->active_node;
 	dst->poisoned = 0;
+	dst->io_silent = dst->reply_late = 0;
 
 	src->fd = -1;
 	src->rbuf = NULL; src->q = NULL; src->ids = NULL; src->early = NULL;

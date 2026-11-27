@@ -23,6 +23,8 @@ void pc_alerts_init(const struct pc_config *cfg);
 
 /* the maintenance thread, once a second */
 void pc_alerts_tick(void);
+/* after the maintenance thread, before pc_mail_stop: the digest being collected is mailed now */
+void pc_alerts_stop(void);
 /* the CPUs this process may use - its affinity, capped by a cgroup
  * cpu.max quota (fractional when a quota is) */
 double pc_process_cpus(void);

@@ -306,6 +306,12 @@ int main(void)
 		"A. a newer resize of the name takes the older's place: 2 + 3 frames, all repeats "
 		"at %llu (not %llu)", g2, g);
 	reset();
+	g = pc_cluster_col_announce_gen("orders", 6, 9, CLCOL_OP_SET, 480);
+	g2 = pc_cluster_col_announce_gen("orders", 6, 0, CLCOL_OP_DROP, 481);
+	CHK(g == 480 && g2 == 481 && n_sent == 2 && sent[0].a.gen == 480 && sent[1].a.gen == 481 &&
+		sent[1].a.op == CLCOL_OP_DROP,
+		"A. a create and a drop go out under the generation the store stamped, not the clock's");
+	reset();
 	pc_cluster_col_announce2("users", 5, "people", 6);
 	CHK(n_sent == 1 && sent[0].a.op == CLCOL_OP_RENAME && !strcmp(sent[0].name, "users") &&
 		!strcmp(sent[0].to_name, "people"), "A. a rename: both names in one frame");
@@ -388,6 +394,11 @@ int main(void)
 	feed(CLCOL_OP_AUTOSCALE, 0, 711, "users", NULL);
 	CHK(strstr(calls, "mode users 1 710;persist;") && !strstr(calls, "711"),
 		"D. a mode applied and persisted; ignored by a deaf member (%s)", calls);
+	reset();
+	feed(CLCOL_OP_AUTOSCALE + 1, 9, 712, "newcol", NULL);
+	CHK(!strstr(calls, "create") && !strstr(calls, "persist") &&
+		strstr(logbuf, "a peer announced op 6, which this build does not know"),
+		"D. an op this build does not know: ignored and logged, not made (%s)", calls);
 	CHK(sync_writes == 0, "D. the receive side wrote no file itself, %d times: pc-maint writes "
 		"what it marks due", sync_writes);
 

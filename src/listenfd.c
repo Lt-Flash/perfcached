@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include "compat/dprint.h"
 #include "pcaddr.h"
@@ -101,6 +102,7 @@ int tcp_listener_fd(const struct pc_listener *l)
 int unix_listener_fd(const char *path)
 {
 	struct sockaddr_un sa;
+	struct stat st;
 	int fd, probe;
 
 	if (strlen(path) >= sizeof sa.sun_path) {
@@ -113,17 +115,33 @@ int unix_listener_fd(const char *path)
 
 	/* a stale socket file is normal after a crash; a LIVE one means
 	 * another instance - probe before unlinking */
-	probe = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (probe >= 0) {
-		if (connect(probe, (struct sockaddr *)&sa, sizeof sa) == 0) {
-			close(probe);
+	if (lstat(path, &st) == 0) {
+		int e;
+
+		if (!S_ISSOCK(st.st_mode)) {
+			LM_ERR("%s exists and is not a socket - not removing it\n", path);
+			return -1;
+		}
+		probe = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (probe < 0) {
+			LM_ERR("cannot probe unix socket %s (%s)\n", path, strerror(errno));
+			return -1;
+		}
+		e = connect(probe, (struct sockaddr *)&sa, sizeof sa) == 0 ? 0 : errno;
+		close(probe);
+		if (!e) {
 			LM_ERR("%s is accepting connections - another perfcached "
 				"is running\n", path);
 			return -1;
 		}
-		close(probe);
+		/* only a refused connect proves nobody listens; a full backlog does not */
+		if (e != ECONNREFUSED) {
+			LM_ERR("cannot tell whether %s is in use (%s) - not removing it\n",
+				path, strerror(e));
+			return -1;
+		}
+		unlink(path);
 	}
-	unlink(path);
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0 ||

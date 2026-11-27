@@ -23,7 +23,7 @@ void clbulk_fini(struct clbulk *b)
 	for (i = 0; i < b->n; i++)
 		free(b->q[(b->head + i) % CLBULK_SLOTS].buf);
 	b->n = 0;
-	free(b->cur.buf);
+	/* a taken batch is the taker's to free (clbulk_take) */
 	b->cur.buf = NULL;
 	pthread_mutex_destroy(&b->mx);
 }
@@ -62,6 +62,16 @@ int clbulk_pending(struct clbulk *b)
 	p = b->n > 0;
 	pthread_mutex_unlock(&b->mx);
 	return p;
+}
+
+int clbulk_room(struct clbulk *b)
+{
+	int r;
+
+	pthread_mutex_lock(&b->mx);
+	r = b->n < CLBULK_SLOTS;
+	pthread_mutex_unlock(&b->mx);
+	return r;
 }
 
 int clbulk_take(struct clbulk *b, unsigned char **buf, size_t *len,

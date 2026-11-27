@@ -3,6 +3,7 @@
 /* respdoor.c - RESP door framing: one multibulk or inline command from the input,
  * run through pc_verb_resp, timed and counted, parked, or begun as a walk */
 #include <string.h>
+#include <strings.h>
 
 #include "compat/timer.h"                /* get_ticks */
 #include "json.h"
@@ -11,6 +12,10 @@
 #include "proto.h"
 #include "protoint.h"
 #include "mgetfan.h"
+
+/* a RESP hash command goes to the hash codec, forwarded or local, with every argument */
+_Static_assert(PC_RESP_MAXARGS <= PC_HCMD_MAXARGS,
+	"a RESP command's arguments must fit the hash codec's");
 
 /* ---- RESP dialect --------------------------------------------------------
  * same consumed/0/-1 contract as bin_frame; compaction is the caller's */
@@ -173,6 +178,18 @@ static int resp_execute(struct pc_conn *c, char **argv, size_t *argl,
 	return rc;
 }
 
+/* an HTTP request sent to the RESP port (a browser's cross-site POST): its request
+ * line or a header line; the caller drops the connection, as Redis does */
+static int resp_inline_http(char *const *argv, const size_t *argl, int na)
+{
+	if ((argl[0] == 4 && !strncasecmp(argv[0], "POST", 4)) ||
+	        (argl[0] == 3 && !strncasecmp(argv[0], "PUT", 3)) ||
+	        (argl[0] == 7 && !strncasecmp(argv[0], "OPTIONS", 7)) ||
+	        argv[0][argl[0] - 1] == ':')
+		return 1;
+	return na == 3 && argl[2] >= 5 && !memcmp(argv[2], "HTTP/", 5);
+}
+
 int resp_one(struct pc_conn *c, size_t off)
 {
 	char *base = c->in + off;
@@ -210,6 +227,17 @@ int resp_one(struct pc_conn *c, size_t off)
 			argl[na] = e - s;
 			na++;
 			s = e;
+		}
+		if (na && resp_inline_http(argv, argl, na))
+			return -1;
+		while (s < n && (base[s] == ' ' || base[s] == '\t'))
+			s++;
+		if (s < n) {
+			static const char msg[] = "-ERR too many arguments\r\n";
+
+			if (out_append(c, msg, sizeof msg - 1) < 0)
+				return -1;
+			return (int)((size_t)(nl - base) + 1);
 		}
 		if (na && resp_execute(c, argv, argl, na) < 0)
 			return -1;

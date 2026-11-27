@@ -389,6 +389,43 @@ PY
 	fi
 	stop -TERM
 
+	# ---- F. the HTTP door on [::]: the status-page link is not "http://:::port/" ----------
+	if python3 -c 'import socket; socket.socket(socket.AF_INET6).bind(("::", 0))' 2>/dev/null; then
+		n0=$(mails)
+		rm -rf "$D/wal"
+		conf "$D/f.conf" "$M" "$M2" "$M3" "$M4" "digest_s = 1"
+		sed -i "s/^http = 127.0.0.1:$HTTP\$/http = [::]:$HTTP\nhttp_allow = 127.0.0.0\/8/" "$D/f.conf"
+		export PERFCACHED_ALERT_TEST_EVENT='status link check'
+		start "$MBIN" "$D/f.conf"
+		unset PERFCACHED_ALERT_TEST_EVENT
+		waitfor 12 '[ -n "$(findmail $n0 "^WARNING: test event on ")" ]'
+		F=$(findmail $n0 "^WARNING: test event on ")
+		[ -n "$F" ] && ! body $F | grep -q 'http://::' &&
+			ok "F. http on [::]: the mail carries no 'http://:::' link ($(body $F | grep -o 'Status page.*' || echo 'no status page link'))" ||
+			bad "F. http on [::]: mail '$F', $(body ${F:-$((n0 + 1))} | grep -o 'Status page.*')"
+		stop -TERM
+	else
+		skp "F. no IPv6 socket here - the [::] status link"
+	fi
+
+	# ---- G. a stop inside the digest window: the digest is mailed, not lost ------------
+	n0=$(mails)
+	rm -rf "$D/wal"
+	conf "$D/g.conf" "$M" "$M2" "$M3" "$M4" "digest_s = 600"
+	export PERFCACHED_ALERT_TEST_EVENT='stop flush check'
+	start "$MBIN" "$D/g.conf"
+	unset PERFCACHED_ALERT_TEST_EVENT
+	waitfor 10 'case "$(al recent test.event)" in raised/mailed*) true;; *) false;; esac'
+	r=$(al recent test.event)
+	sleep 1
+	m1=$(mails)
+	stop -TERM
+	waitfor 5 '[ -n "$(findmail $n0 "^WARNING: test event on ")" ]'
+	F=$(findmail $n0 "^WARNING: test event on ")
+	[ "$m1" = "$n0" ] && [ -n "$F" ] && body $F | grep -q "stop flush check" &&
+		ok "G. digest_s = 600 and a stop 1 s after the event: the digest went out at the stop (mail $F)" ||
+		bad "G. ring '$r', mails before the stop $m1 (was $n0), the event's mail '$F'"
+
 	# ---- every mail: the MIME form ----------------------------------------------------
 	python3 - "$D/m" "$(hostname)" > "$D/form.out" 2>&1 <<'PY'
 import email, glob, json, re, sys

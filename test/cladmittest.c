@@ -311,6 +311,14 @@ int main(void)
 	fleet(4);
 	cladmit_master_begin(now - 1);
 	nsent = joins = 0;
+	{
+		unsigned char big[129] = { M_JOIN_REQ };
+		pc_addr jb = addr(140);
+
+		CHK(cladmit_hold(big, sizeof big, &jb, 9) == 1 && joins == 0 && !nsent &&
+			!clpeers_by_addr(&PT, &jb),
+			"B. a join frame past the queue's 128 bytes: dropped, not admitted around it");
+	}
 	CHK(cladmit_hold(jf, sizeof jf, &j1, 1) == 1 && joins == 1 && !count_sent(M_JOIN_WAIT, &j1, NULL),
 		"B. the first joiner admitted at once (%d admission(s))", joins);
 	p = clpeers_by_addr(&PT, &j1);
@@ -657,6 +665,20 @@ int main(void)
 		CHK(published == 2 && p && p->node == 40 && clpeers_by_addr(&PT, &gone10)->gone_ms != 0,
 			"G. from its master: the one it lacked added and the one gone 31 s revived (%d); "
 			"itself, one live and one gone 10 s left alone", published);
+		/* ids a master never hands out: 0 and past PC_CL_NODE_MAX */
+		pc_addr a142 = addr(142);
+
+		m[0].addr = a142.in4.sin_addr;      m[0].port = a142.in4.sin_port;      m[0].node = 0;
+		m[1].addr = addr(141).in4.sin_addr; m[1].port = addr(141).in4.sin_port;
+		m[1].node = PC_CL_NODE_MAX + 1;
+		off = clmemb_assign_hdr_write(f, sizeof f, M_MEMBERS, &h);
+		for (k = 0; k < 2; k++)
+			off += clmemb_member_write(f + off, sizeof f - off, &m[k]);
+		clmemb_assign_count_set(f, 2);
+		published = 0;
+		cladmit_members(f, off, &master_a);
+		CHK(!published && !clpeers_by_addr(&PT, &a142),
+			"G. member records under id 0 or past %d: not published", PC_CL_NODE_MAX);
 	}
 
 	printf("--- H: the joiner's later parts and its ONLINE\n");

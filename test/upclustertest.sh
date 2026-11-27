@@ -72,10 +72,10 @@ for k, n in enumerate(names):
         cl["moved_empty_host"] = True
     if n == os.environ.get("DOWN", ""):
         ctl["down"] = True
-    if askkey:      # its shard says -ASK, the next shard's master imports it
+    if askkey:      # its shard says -ASK, the next shard's master imports it (ASKTO: that port)
         from_ = json.load(open(d + "/askshard"))
         if shard == from_:
-            cl["ask"] = {askkey: [H, pm[(from_ + 1) % 3]]}
+            cl["ask"] = {askkey: [H, int(os.environ.get("ASKTO") or pm[(from_ + 1) % 3])]}
         if n == names[(from_ + 1) % 3]:
             cl["importing"] = [askkey]
     json.dump(ctl, open(d + "/" + n + "/ctl.json.tmp", "w"))
@@ -250,6 +250,13 @@ w=$(st 0 'u["redis_cluster"]["asked"], u["redis_cluster"]["moved"]')
 n=$(grep -c '^ASKING' "$D/m$UT/counts" 2>/dev/null)
 [ "$GOT" = "m$UT" ] && [ "$w" = "(1, 1)" ] && [ "$n" -ge 1 ] && ok "D. {u}a answered -ASK: read from m$UT after ASKING ($n), the map unchanged" ||
 	bad "D. {u}a = '$GOT' (want m$UT), asked/moved $w, ASKING at m$UT $n"
+# an -ASK naming a node the cluster does not list is not dialled: it would get the collection's credentials
+set -- $(slot "{v}a"); echo "$2" > "$D/askshard"
+ASKTO=$PP topo both "$TS" - "{v}a"
+GOT=$(get 0 "{v}a")
+w=$(st 0 '"127.0.0.1:'$PP'" in a')
+[ "$w" = False ] && ok "D. -ASK naming 127.0.0.1:$PP, a node the cluster does not list: not dialled, not added ('$GOT')" ||
+	bad "D. -ASK naming an unlisted node: in the upstreams '$w', {v}a read '$GOT'"
 topo both "$TS"
 
 # ---- E. a failover: shard 1's master down, its replica promoted (and answering SHARDS) - the next round maps

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 #include <sodium.h>
 #include "compat/dprint.h"
 #include "pcaddr.h"
@@ -23,6 +24,8 @@ static struct {
 	struct pc_live *l;
 	long long at;
 } live_retired[LIVE_RETIRED];
+/* the install runs on whichever thread reloaded, the tick on the maintenance thread */
+static pthread_mutex_t live_retired_mx = PTHREAD_MUTEX_INITIALIZER;
 
 static char *live_dup(const char *s)
 {
@@ -66,7 +69,16 @@ struct pc_live *live_from(const struct pc_config *c)
 	for (i = 0; i < c->n_enable_secrets; i++)
 		l->enable_secret[i] = live_dup(c->enable_secret[i]);
 	l->auth_needs_tls = c->auth_needs_tls;
+	/* a configured secret that could not be copied would read as "none": refuse */
+	if ((c->http_token && !l->http_token) || (c->resp_password && !l->resp_password))
+		goto fail;
+	for (i = 0; i < c->n_enable_secrets; i++)
+		if (c->enable_secret[i] && !l->enable_secret[i])
+			goto fail;
 	return l;
+fail:
+	live_free(l);
+	return NULL;
 }
 
 int pc_auth_needs_tls(void)
@@ -95,11 +107,13 @@ void pc_live_retire_tick(void)
 	long long now = live_now_s();
 	int i;
 
+	pthread_mutex_lock(&live_retired_mx);
 	for (i = 0; i < LIVE_RETIRED; i++)
 		if (live_retired[i].l && now - live_retired[i].at >= LIVE_RETIRE_S) {
 			live_free(live_retired[i].l);
 			live_retired[i].l = NULL;
 		}
+	pthread_mutex_unlock(&live_retired_mx);
 }
 
 /* replace the snapshot; the old one is retired, not freed.  Called under
@@ -111,6 +125,7 @@ void live_install(struct pc_live *nl)
 
 	if (!old)
 		return;
+	pthread_mutex_lock(&live_retired_mx);
 	for (i = 0; i < LIVE_RETIRED; i++)
 		if (!live_retired[i].l) {
 			slot = i;
@@ -128,6 +143,7 @@ void live_install(struct pc_live *nl)
 	}
 	live_retired[slot].l = old;
 	live_retired[slot].at = live_now_s();
+	pthread_mutex_unlock(&live_retired_mx);
 }
 
 /* ---- RESP listener guards: no handshake, so access control is all config ---- */

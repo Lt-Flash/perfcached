@@ -1,6 +1,7 @@
 #!/bin/sh
 # alertfleettest.sh - a node without [mail] relays alerts to the elected mailer; a fleet event is mailed once
-# by it (test/fakesmtp.py); the SMTP password shows nowhere; a relayed clear is mailed whatever its level.
+# by it (test/fakesmtp.py); the SMTP password shows nowhere; a relayed clear is mailed whatever its level;
+# a clear with no mailer waits for one.
 # Usage: test/alertfleettest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
@@ -241,4 +242,24 @@ echo "clear" > "$D/cond3"
 waitfor 20 '[ "$(mails "(?s)RESOLVED.*relay-clear-probe")" -ge 1 ]' &&
 	ok "e. its clear, relayed at warning, is mailed as resolved by node 1 ($(st 1 from $N3))" ||
 	bad "e. the clear never mailed: node 1's ring from node 3 '$(st 1 from $N3)'"
+
+# ---- f. a clear with no mailer waits PEND_MS (10 s) for one, as a raise does -------------------
+# node 2 back (a fresh process: no min_interval behind its test alert), raised critical through
+# node 1; node 1 gone, then the clear: kept as waiting, "no mailer reachable" only after the wait
+start 2 "$BIN" || { bad "f. node 2 did not start again"; summary; }
+waitfor 30 '[ "$(st 2 mailer)" = "node $(st 1 node)/$(st 1 node)" ]' ||
+	{ bad "f. node 2 does not relay to node 1: $(st 2 mailer)"; summary; }
+echo "critical clear-wait-probe" > "$D/cond2"
+waitfor 20 '[ "$(mails "(?s)CRITICAL.*clear-wait-probe")" -ge 1 ]' ||
+	bad "f. node 2's critical test alert was not mailed through node 1: $(st 2 ring test.cond)"
+kill -TERM $P1; wait $P1 2>/dev/null; P1=
+waitfor 30 '[ "$(st 2 mailer)" = "none/0" ]' || bad "f. node 2 still sees a mailer: $(st 2 mailer)"
+echo "clear" > "$D/cond2"
+waitfor 10 'case "$(st 2 ring test.cond)" in cleared/*) true;; *) false;; esac'
+R=$(st 2 ring test.cond)
+case "$R" in "cleared/waiting for a mailer"*) ok "f. the clear with no mailer is kept waiting for one ($R)";;
+	*) bad "f. the clear with no mailer: node 2's ring '$R'";; esac
+waitfor 15 'case "$(st 2 ring test.cond)" in "cleared/no mailer reachable"*) true;; *) false;; esac' &&
+	ok "f. and is 'no mailer reachable' once the wait has passed" ||
+	bad "f. after the wait: node 2's ring '$(st 2 ring test.cond)'"
 summary

@@ -162,12 +162,30 @@ int main(void)
 	chk(!sl->answered && !sl->first_node && !sl->probe_op && !sl->stash &&
 		!sl->collen && !sl->klen,
 		"C3 every other field starts zeroed");
+	{
+		struct clpend_fill f = { .col = "c", .collen = 1, .key = "kk", .klen = 2, .jop = 5 };
+		struct pending *s2;
+		uint32_t r2;
+
+		chk(clpend_fill(&P, sl, req, &f) == 1 && sl->collen == 1 && sl->klen == 2 &&
+			!memcmp(sl->key, "kk", 2) && sl->jop == 5,
+			"C4 the request's fields are stored into its own slot");
+		/* the slot expired and went to another request before the first filled it */
+		clpend_release(&P, sl);
+		r2 = park(1, 0, 8, 1000, &s2);
+		f.jop = 9;
+		chk(s2 == sl && r2 != req && clpend_fill(&P, sl, req, &f) == 0 &&
+			s2->jop == 0 && !s2->klen,
+			"C4 a slot that is another request's now is left alone");
+		clpend_release(&P, s2);
+	}
 
 	/* ---- D. completion queue ---------------------------------------- */
 	chk(clpend_cq_drain(&P, 0, d, 4) == 0, "D4 before register, drain is empty");
 	clpend_cq_post(&P, 0, 1, PC_DONE_PULL, 1, 1, 0, 2, 0, NULL, 0, 0, 0, 0, 0);
 	chk(clpend_cq_drain(&P, 0, d, 4) == 0, "D4 and a post before register is a safe no-op");
-	clpend_cq_register(&P, 0, -1);
+	chk(clpend_cq_dropped(&P) == 1, "D4 and counted as dropped");
+	chk(clpend_cq_register(&P, 0, -1) == 0, "D4 registering a worker allocates its queue");
 	clpend_cq_post(&P, 0, 42, PC_DONE_PULL, 1, 1, 99, 5, 7, NULL, 0, 0, 0, 0, 0);
 	n = clpend_cq_drain(&P, 0, d, 4);
 	chk(n == 1 && d[0].req == 42 && d[0].found == 1 && d[0].newval == 99 &&
@@ -180,7 +198,12 @@ int main(void)
 	for (i = 0; i < CAP; i++)
 		clpend_cq_post(&P, 0, (uint32_t)i, PC_DONE_PULL, 1, 1, 0, 0, 0,
 			NULL, 0, 0, 0, 0, 0);
-	clpend_cq_post(&P, 0, 9999, PC_DONE_PULL, 1, 1, 0, 0, 0, NULL, 0, 0, 0, 0, 0);
+	{
+		unsigned long long dr = clpend_cq_dropped(&P);
+
+		clpend_cq_post(&P, 0, 9999, PC_DONE_PULL, 1, 1, 0, 0, 0, NULL, 0, 0, 0, 0, 0);
+		chk(clpend_cq_dropped(&P) == dr + 1, "D2a a post into a full ring is counted as dropped");
+	}
 	{
 		int total = 0, saw_over = 0, k;
 
@@ -396,6 +419,17 @@ int main(void)
 		chk(r == CLPEND_ANS_MISS, "H2 the last negative is a miss");
 		chk(a.worker == 3, "H2 the miss names the worker to wake");
 		chk(!clpend_find(&P, req), "H2 and the slot is freed");
+
+		/* H2b  the same node's negative twice (a duplicated datagram) counts once */
+		req = park(3, 0, 3, 1000, &sl);
+		chk(clpend_answer(&P, req, 0, 1, 0, 0, 0, &a) == CLPEND_ANS_WAIT,
+			"H2b a first negative waits");
+		chk(clpend_answer(&P, req, 0, 1, 0, 0, 0, &a) == CLPEND_ANS_IGNORE,
+			"H2b the same node's negative again is ignored");
+		chk(clpend_answer(&P, req, 0, 2, 0, 0, 0, &a) == CLPEND_ANS_WAIT,
+			"H2b so a second node's negative still waits for the third");
+		chk(clpend_answer(&P, req, 0, 3, 0, 0, 0, &a) == CLPEND_ANS_MISS,
+			"H2b and the third node's is the miss");
 
 		/* H3  a late positive after the miss */
 		chk(clpend_answer(&P, req, 1, 5, 0, 0, 0, &a) == CLPEND_ANS_IGNORE,

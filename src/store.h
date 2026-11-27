@@ -164,6 +164,8 @@ pcache_htable_t *pc_store_ht(int i);
  * (or NULL), held so until pc_store_walk_end - the old one is walked first */
 void pc_store_walk_begin(int i, pcache_htable_t **live, pcache_htable_t **old);
 void pc_store_walk_end(void);
+/* the old table a swapped resize of @ht still drains, or NULL; valid inside a quiescent turn */
+pcache_htable_t *pc_store_draining(pcache_htable_t *ht);
 int pc_store_slot_of(pcache_htable_t *ht);
 /* key + value bytes a collection holds, from a walk the maintenance thread repeats; *age_s =
  * seconds since it was taken, (unsigned)-1 before the first walk */

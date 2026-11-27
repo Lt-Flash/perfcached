@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "../src/clfwd.h"
+#include "../src/clmsg.h"
 
 static int pass, fail;
 static void chk(int cond, const char *what)
@@ -461,6 +462,30 @@ int main(void)
 			a.newval = -55555LL; a.cnt = 9; a.frag = val; a.fraglen = 8;
 			check_golden(g, clfwd_jack_build(g, 24, &a), "FWD_JACK");
 		}
+	}
+
+	/* E. the key a client door could have named: 1..4096 bytes */
+	{
+		static unsigned char big[CLFWD_OP_HDR + 6 + CL_KEY_MAX + 1 + 16];
+		static char kb[CL_KEY_MAX + 1];
+		struct clfwd_key k, kr;
+		uint64_t ver;
+
+		memset(kb, 'k', sizeof kb);
+		w.op = 1; w.val = NULL; w.vlen = 0;
+		w.key = kb; w.klen = CL_KEY_MAX + 1;
+		len = clfwd_op_build(big, 0x42, &w);
+		chk(len && clfwd_op_parse(big, len, &r) == 0, "E1 a key past KEY_MAX is refused");
+		w.klen = CL_KEY_MAX;
+		len = clfwd_op_build(big, 0x42, &w);
+		chk(len && clfwd_op_parse(big, len, &r) == 1, "E2 one of KEY_MAX is taken");
+		w.klen = 0;
+		len = clfwd_op_build(big, 0x42, &w);
+		chk(len && clfwd_op_parse(big, len, &r) == 0, "E3 an empty key is refused");
+		k.col = "orders"; k.collen = 6; k.key = kb; k.klen = 0;
+		len = clfwd_tomb_build(big, 0x42, &k, 7);
+		chk(len && clfwd_tomb_parse(big, len, &kr, &ver) == 0,
+			"E4 and a tombstone naming no key");
 	}
 
 	printf("clfwdtest: %d passed, %d failed\n", pass, fail);

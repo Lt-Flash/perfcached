@@ -1,7 +1,10 @@
 /* tailflighttest.c - a carve while a tail punch is in flight must not land in the punched tail: the
- * hook carves cells into it mid-punch, and after the tick each cell must still hold its pattern */
+ * hook carves cells into it mid-punch, and after the tick each cell must still hold its pattern;
+ * a carve on another thread meanwhile waits for the landing rather than taking a new page */
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include "../src/compat/compat.h"
 #include "../src/compat/mem/mem.h"
 #include "../src/core/pcache_arena.h"
@@ -18,6 +21,23 @@ static int fails;
 static unsigned char *cells[NCELL];
 static int ncells, inside, hooked;
 static char *fl_lo, *fl_hi;
+#define OSIZE  200000                    /* the top class: one to a chunk */
+static unsigned char *other;
+static int other_armed, other_done;
+static unsigned long pages_before, pages_after;
+static pthread_t oth;
+static int oth_started;
+
+static void *other_carve(void *arg)
+{
+	(void)arg;
+	__atomic_store_n(&other_armed, 1, __ATOMIC_RELEASE);
+	other = pcache_cell_alloc(OSIZE);
+	if (other)
+		memset(other, 0x5A, OSIZE);
+	__atomic_store_n(&other_done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
 
 static void hook(char *lo, char *hi)
 {
@@ -38,6 +58,20 @@ static void hook(char *lo, char *hi)
 			inside++;
 		if ((char *)c > lo + 2 * 2097152)
 			break;                     /* well past the tail's start */
+	}
+	{
+		struct pcache_arena_pressure pr;
+
+		pcache_arena_pressure(&pr);
+		pages_before = pr.page_slack_bytes;
+		if (pthread_create(&oth, NULL, other_carve, NULL) == 0) {
+			oth_started = 1;
+			while (!__atomic_load_n(&other_armed, __ATOMIC_ACQUIRE))
+				usleep(1000);
+			usleep(100000);            /* its carve, had it not waited */
+		}
+		pcache_arena_pressure(&pr);
+		pages_after = pr.page_slack_bytes;
 	}
 }
 
@@ -60,6 +94,8 @@ int main(void)
 	for (t = 0; t < 12 && !hooked; t++)
 		pcache_arena_reclaim_tick();
 	pcache_arena_tail_hook = NULL;
+	if (oth_started)
+		pthread_join(oth, NULL);
 	if (!hooked) {
 		printf("tailflighttest: no tail punch on this backing - SKIPPED, and a skip is not a pass\n");
 		return 0;
@@ -76,6 +112,18 @@ int main(void)
 		ncells, (long)(fl_hi - fl_lo) / 1024);
 	CHK(inside == 0, "none of them inside the tail in flight (%d were)", inside);
 	CHK(bad == 0, "every cell still holds what was written into it (%d zeroed or torn)", bad);
+	{
+		int k = 0;
+
+		if (other)
+			for (k = 0; k < OSIZE && other[k] == 0x5A; k++)
+				;
+		CHK(oth_started && other_done && other && k == OSIZE,
+			"a carve on another thread mid-punch was served and holds its pattern");
+		CHK(pages_after == pages_before,
+			"and it waited for the landing instead of taking a new page (%lu -> %lu KB of pages)",
+			pages_before >> 10, pages_after >> 10);
+	}
 	printf("tailflighttest: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
 	return fails ? 1 : 0;
 }

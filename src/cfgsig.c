@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* cfgsig.c - the settings the fleet's members must agree on, built from the config at start and
- * handed to the cluster for its keepalive */
+ * handed to the cluster for its keepalive; the reloadable one updated after a reload */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -36,6 +36,21 @@ static int cfgsig_add(struct pc_cfgsig *e, int n, const char *name,
 	return n + 1;
 }
 
+#define TOKEN_WHAT "the HTTP token ([secrets] http)"
+
+static const char *token_val(const struct pc_config *cfg)
+{
+	return cfg->http_token ? "set" : "none";
+}
+
+void cfgsig_reloaded(const struct pc_config *cfg)
+{
+	struct pc_cfgsig e[1];
+
+	if (cfgsig_add(e, 0, "http.token", TOKEN_WHAT, token_val(cfg)) == 1)
+		pc_cluster_set_cfgsig_one(&e[0]);
+}
+
 void cfgsig_build(const struct pc_config *cfg)
 {
 	static const char *const fs[] = { "everysec", "always", "no", "sync" };
@@ -46,8 +61,7 @@ void cfgsig_build(const struct pc_config *cfg)
 	n = cfgsig_add(e, n, "wal.fsync", "[wal] fsync", !cfg->wal_dir ? "off"
 		: cfg->wal_fsync >= 0 && cfg->wal_fsync <= 3 ? fs[cfg->wal_fsync]
 		: "?");
-	n = cfgsig_add(e, n, "http.token", "the HTTP token ([secrets] http)",
-		cfg->http_token ? "set" : "none");
+	n = cfgsig_add(e, n, "http.token", TOKEN_WHAT, token_val(cfg));
 	snprintf(v, sizeof v, "cpu %d/%d io %d/%d memory %d/%d arena %d/%d "
 		"epoll %d", cfg->alerts.cpu_warn, cfg->alerts.cpu_crit,
 		cfg->alerts.io_warn, cfg->alerts.io_crit, cfg->alerts.mem_warn,

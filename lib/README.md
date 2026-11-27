@@ -6,7 +6,7 @@
   <br>libperfd
 </h1>
 
-The C client for perfcached: **libperfd 0.7.6.1**, for perfcached 0.7.5.1.
+The C client for perfcached: **libperfd 0.7.6.3**, for perfcached 0.7.5.3.
 Blocking calls with one thread per handle, pipelining, an opt-in
 event-loop surface, and a handle that follows the fleet - standby
 connections, failover, routing each key to its node.  It speaks the
@@ -83,6 +83,7 @@ field left 0 takes its default.
 | `secrets` | NULL (plaintext) | client secrets, tried in order |
 | `connect_timeout_ms` | 5000 | the whole dial, TCP and handshake |
 | `io_timeout_ms` | 5000 | each send and receive |
+| `call_timeout_ms` | 4 x `io_timeout_ms` (-1 none) | one blocking call's whole reply: a reply that trickles in, or notifications arriving on a subscribed handle, cannot hold a call longer; past it the link is given up as a lost reply (`PERFD_E_TRANSPORT`): on a fleet handle a read is tried on another member, a write is not sent again (0.7.6.3) |
 | `policy` | `PERFD_POLICY_FAILOVER` | where the handle works: `FAILOVER` stays where it connected; `ROUND_ROBIN` (random start per client), `LEAST_CONN` (most free arena) and `WEIGHTED` (random by free bytes) spread, and move one handle in N to a member that comes up, at its next call |
 | `spares` | 0 = one standby per other member (at most 8) | standby connections; `PERFD_SPARES_NONE` = a bare handle that learns no fleet |
 | `refresh_ms` | 30000 | how often the member list is learned again |
@@ -340,7 +341,10 @@ established socket, not a new handshake.
   hits are not - the caller gets the error, because a double increment
   is worse than a visible one.  A routed counter update whose standby
   dies mid-request fails with `PERFD_E_TRANSPORT` rather than risk a
-  second apply.
+  second apply.  A write whose reply did not come in time (silence,
+  not a closed connection) is not replayed either, since the node may
+  still apply it: it fails with `PERFD_E_TRANSPORT` and the next call
+  moves to a live member; a read is replayed (0.7.6.3).
 - **Refusals that applied nothing** - a node not READY (recovering,
   connecting), FAILED or HEALING, or a `forward failed` - are
   `PERFD_E_REFUSED`, and the handle takes the call to another member at
@@ -358,7 +362,7 @@ established socket, not a new handshake.
   reply that says the handle is behind makes it re-learn the members,
   `perfd_moved_hints()`).  `proxy` keys are not computable:
   `route_hints = 1` remembers who answered each key in a fixed 4,096-entry
-  table (`perfd_hint_hits()`, `perfd_hint_stale()`).  libperfd 0.7.6.1
+  table (`perfd_hint_hits()`, `perfd_hint_stale()`).  libperfd 0.7.6.3
   routes against perfcached 0.7.5.x (wire epoch 4); `perfd_wire_epoch()`
   shows what the daemon advertised.
 - **A frozen member** that accepts the connection and says nothing costs

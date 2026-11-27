@@ -1,6 +1,7 @@
 #!/bin/sh
 # mailtest.sh - the alert mailer's transport against test/fakesmtp.py: -C validation, STARTTLS/smtps
-# delivery with AUTH, refusals that send nothing in the clear, bounded waits, the password shown nowhere.
+# delivery with AUTH, refusals that send nothing in the clear, bounded waits, the password shown nowhere,
+# a subject outside ASCII as RFC 2047 encoded-words.
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -247,6 +248,30 @@ M=$(ls "$D/st3"/*.json 2>/dev/null | head -1)
 	ok "9. still over TLS (STARTTLS)" || bad "9. not over TLS, or not delivered"
 grep -q "the server's certificate is NOT verified" "$D/n.log" && ok "9. the start says the certificate is not verified" ||
 	bad "9. no start notice of tls_verify = no"
+
+# ---- 10. a subject outside ASCII goes as RFC 2047 encoded-words ---------------------------
+start_node "smtp://127.0.0.1:$P_ST" "$(printf 'subject_prefix = [PROD \342\200\223 Sydney]')"
+n0=$(ls "$D/st3"/*.json 2>/dev/null | wc -l)
+R=$(mt 1)
+M=$(ls -t "$D/st3"/*.json 2>/dev/null | head -1)
+if [ "$(ls "$D/st3"/*.json 2>/dev/null | wc -l)" -gt "$n0" ]; then
+	python3 - "$M" <<'PY' > "$D/s10.chk" 2>&1
+import email, json, sys
+from email import policy
+d = json.load(open(sys.argv[1]))["data"]
+hdr = d.split("\r\n\r\n", 1)[0]
+raw = [l for l in hdr.split("\r\n") if l.startswith("Subject:")]
+m = email.message_from_string(d, policy=policy.default)
+ok = bool(raw) and all(ord(c) < 128 for c in hdr) and "=?utf-8?Q?" in raw[0] and \
+    m["Subject"].startswith("[PROD \u2013 Sydney] perfcached test mail from ") and \
+    all(len(l) <= 78 for l in hdr.split("\r\n") if l.startswith(("Subject:", " =?")))
+print("ok" if ok else "bad", repr(raw[:1]), repr(m["Subject"]))
+PY
+	case "$(cat "$D/s10.chk")" in ok*) ok "10. a subject_prefix with an en dash: an ASCII header, encoded-words, decoded whole ($(cut -c1-120 "$D/s10.chk"))";;
+		*) bad "10. the subject with an en dash: $(cat "$D/s10.chk")";; esac
+else
+	bad "10. the mail with a non-ASCII subject_prefix did not arrive: $R"
+fi
 
 # ---- 8. the password, nowhere ---------------------------------------------------------
 python3 -c 'import urllib.request;print(urllib.request.urlopen("http://127.0.0.1:'$HTTP'/stats",timeout=5).read().decode())' > "$D/stats.json" 2>/dev/null

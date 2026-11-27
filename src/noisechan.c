@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sodium.h>
 
 #include "compat/dprint.h"
 #include "pc_noise.h"
@@ -55,6 +56,8 @@ static int plain_switch(struct pc_conn *c)
 	c->raw_len -= 2 + n;
 	memmove(c->raw, c->raw + 2 + n, c->raw_len);
 	c->pa_stage = 0;
+	sodium_memzero(&c->send_cs, sizeof c->send_cs);
+	sodium_memzero(&c->recv_cs, sizeof c->recv_cs);
 	c->encrypted = 0;
 	c->plain_auth = 1;
 	c->established = 1;
@@ -140,8 +143,11 @@ int channel_handshake(struct pc_conn *c)
 	plain = c->pa_ok && key_id == PC_PRIN_CLIENT && pl >= 2 && pay[1] == PC_HS_PLAIN;
 	status[0] = 0x00;
 	status[1] = PC_HS_PLAIN;
-	if (pc_hs_write_msg2(&c->hs, status, plain ? 2 : 1, m2, &m2len,
-	        &c->send_cs, &c->recv_cs) != 0)
+	i = pc_hs_write_msg2(&c->hs, status, plain ? 2 : 1, m2, &m2len,
+	        &c->send_cs, &c->recv_cs);
+	/* the ephemeral key and the chaining key: forward secrecy needs them gone */
+	sodium_memzero(&c->hs, sizeof c->hs);
+	if (i != 0)
 		return -1;
 	put16(frame, (uint16_t)m2len);
 	memcpy(frame + 2, m2, m2len);

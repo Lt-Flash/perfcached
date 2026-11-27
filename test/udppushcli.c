@@ -126,6 +126,14 @@ static int is_active(void *a)
 	return st.active;
 }
 static int got_20(void *a) { (void)a; return ha.messages >= 20; }
+static int plain_warns;
+static void count_log(int level, const char *msg, void *ctx)
+{
+	(void)level;
+	(void)ctx;
+	if (strstr(msg, "plaintext connection"))
+		plain_warns++;
+}
 
 int main(int argc, char **argv)
 {
@@ -139,6 +147,7 @@ int main(int argc, char **argv)
 	long long t0;
 
 	setvbuf(stdout, NULL, _IONBF, 0);      /* lines survive a timeout */
+	perfd_set_log(count_log, NULL);
 	memset(&o, 0, sizeof o);
 	s = perfd_connect("127.0.0.1", port, &o);
 	pub = perfd_connect("127.0.0.1", port, &o);
@@ -264,6 +273,8 @@ int main(int argc, char **argv)
 
 	/* ---- idle but acknowledged, and silent ---- */
 	OK(perfd_subscribe(t, "t") == 1 && perfd_pubsub_udp(t, 0, 3000) == 0, "a third handle takes UDP pushes too");
+	OK(plain_warns == 1, "three streams on plaintext connections, one warning that the key travels in the clear (%d)",
+		plain_warns);
 	t0 = now_ms();
 	while (now_ms() - t0 < 17500) {
 		pump(s, 100, NULL, NULL);          /* s acks on its timer */

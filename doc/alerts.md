@@ -157,4 +157,10 @@ what is raised now and the recent ring.  `/stats` carries
 `relayed_out` and `relay_dropped`; `/metrics` has
 `perfcached_alerts_active{level}`, `perfcached_mail_ready`,
 `perfcached_mail_{sent,failed,dropped}_total` and
-`perfcached_alert_relays_total{direction}`.
+`perfcached_alert_relays_total{direction}`.  A node watches at most 64
+alert conditions at once (a cleared one's place is reused once
+`min_interval_s` has passed since its last mail); a condition that finds every place taken
+is not watched - logged as a WARNING naming it, at most every ten
+minutes - and counted in `/stats` `alerts.keys_refused`.  The fleet's
+own `fleet.missing` and `fleet.majority` are judged before the
+per-member alerts, so a large fleet's members cannot crowd them out.

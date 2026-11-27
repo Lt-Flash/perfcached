@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include "compat/dprint.h"
 #include "clwire.h"
 #include "config.h"
@@ -82,6 +83,26 @@ static int refused(const char *what)
 	return check() == -1 && errs == 1 && strstr(logbuf, what) != NULL;
 }
 
+/* @body as a config file, through pc_config_load into @lc: its answer, the log in logbuf */
+static int load_text(const char *body, struct pc_config *lc)
+{
+	char tmp[64];
+	FILE *f;
+	int fd, rc;
+
+	snprintf(tmp, sizeof tmp, "/tmp/cfgchecktest.XXXXXX");
+	if ((fd = mkstemp(tmp)) < 0 || !(f = fdopen(fd, "w")))
+		return -2;
+	fputs(body, f);
+	fclose(f);
+	chmod(tmp, 0640);
+	logbuf[0] = 0;
+	errs = warns = notices = 0;
+	rc = pc_config_load(tmp, lc);
+	unlink(tmp);
+	return rc;
+}
+
 static void cluster(void)
 {
 	cfg.cl_enabled = 1;
@@ -152,6 +173,18 @@ int main(void)
 	base();
 	cfg.n_listen = 0;
 	CHK(refused("no listeners configured"), "D: no listeners - refused");
+	base();
+	cfg.listen[1].type = PC_LISTEN_UNIX;
+	cfg.listen[1].addr = "/run/pc/a.sock";
+	cfg.listen[1].loopback = 1;
+	cfg.listen[2] = cfg.listen[1];
+	cfg.listen[2].addr = "/run/pc/b.sock";
+	cfg.n_listen = 3;
+	CHK(refused("more than one 'unix =' listener"), "D: two unix listeners - refused");
+	cfg.n_listen = 2;
+	errs = 0;
+	logbuf[0] = 0;
+	CHK(check() == 0, "D: one unix listener beside a TCP one - valid");
 	base();
 	cfg.listen[0].resp = 1;
 	cfg.listen[0].loopback = 0;
@@ -262,6 +295,16 @@ int main(void)
 	cluster();
 	cfg.cl_port = 0;
 	CHK(refused("discovery = unicast needs port = <cluster port>"), "G: unicast with no port - refused");
+	base();
+	cluster();
+	cfg.cl_port = 65534;
+	cfg.cl_max_dgram = 1232;
+	CHK(refused("the cluster port is 65534, so lane_port must be set"),
+		"G: unicast on 65534 with a lane and no lane_port - refused, not a lane on port 0");
+	cfg.cl_lane_port = 7002;
+	errs = 0;
+	logbuf[0] = 0;
+	CHK(check() == 0 && cfg.cl_lane_port == 7002, "G: ... and with lane_port = 7002 - valid");
 	base();
 	cluster();
 	cfg.cl_colname[0] = "c";
@@ -415,6 +458,35 @@ int main(void)
 	cfg.wal_segments = 8;
 	cfg.wal_segments_max = 32;
 	CHK(check() == 0 && cfg.wal_segments_max == 32, "K: segments_max above segments - kept");
+	{
+		static const struct { const char *wal; int warned; } wk[] = {
+			{ "[wal]\nfsync = always\nsave = 900 1\n", 1 },
+			{ "[wal]\ndir = /var/tmp/cfgcheck-wal\nfsync = always\n", 0 } };
+		static struct pc_config lc;
+		unsigned int i;
+		FILE *f;
+		int fd, rc;
+
+		for (i = 0; i < sizeof wk / sizeof wk[0]; i++) {
+			snprintf(tmp, sizeof tmp, "/tmp/cfgchecktest.XXXXXX");
+			if ((fd = mkstemp(tmp)) < 0 || !(f = fdopen(fd, "w")))
+				return 2;
+			fprintf(f, "[secrets]\nclient = cfgcheck-client-secret-1\n[listen]\n"
+				"tcp = 127.0.0.1:6480\nplaintext = loopback\n%s"
+				"[collection c]\nbuckets_log2 = 9\n", wk[i].wal);
+			fclose(f);
+			chmod(tmp, 0640);
+			logbuf[0] = 0;
+			warns = 0;
+			rc = pc_config_load(tmp, &lc);
+			CHK(rc == 0 && (strstr(logbuf, "[wal] fsync is set but [wal] has no dir") != NULL) ==
+				wk[i].warned, "K: [wal] fsync %s dir - %s (rc %d)",
+				wk[i].warned ? "without" : "with", wk[i].warned ? "warned" : "nothing said", rc);
+			if (rc == 0)
+				pc_config_free(&lc);
+			unlink(tmp);
+		}
+	}
 
 	/* L: an empty HTTP token is refused, as every other secret is; a set one is kept */
 	base();
@@ -425,6 +497,190 @@ int main(void)
 	cfg.listen[0].http = 1;
 	cfg.http_token = "http-token-1";
 	CHK(check() == 0, "L: [secrets] http = http-token-1 - kept");
+
+	/* M: no secret shared across principals - cluster_accept and enable against the clients,
+	 * the clear-text RESP password and HTTP token against every principal's */
+	base();
+	{
+		char same[] = "client-secret-1";
+
+		cluster();
+		cfg.cluster_accept_secret = same;
+		CHK(refused("the cluster_accept secret EQUALS client secret #1"),
+			"M: cluster_accept equal to a client secret - refused");
+	}
+	base();
+	{
+		char same[] = "client-secret-1";
+
+		cfg.enable_secret[0] = same;
+		cfg.n_enable_secrets = 1;
+		CHK(refused("enable secret #1 EQUALS client secret #1"),
+			"M: the enable secret equal to a client secret - refused");
+	}
+	base();
+	{
+		char same[] = "enable-secret-1";
+
+		cfg.enable_secret[0] = "enable-secret-1";
+		cfg.n_enable_secrets = 1;
+		cfg.listen[0].http = 1;
+		cfg.http_token = same;
+		CHK(refused("the http token EQUALS enable secret #1"),
+			"M: the HTTP token equal to the enable secret - refused");
+	}
+	base();
+	{
+		char same[] = "client-secret-1";
+
+		cfg.listen[0].http = 1;
+		cfg.http_token = same;
+		CHK(refused("the http token EQUALS client secret #1"),
+			"M: the HTTP token equal to a client secret - refused");
+	}
+	base();
+	{
+		char same[] = "accept-secret-1";
+
+		cluster();
+		cfg.cluster_accept_secret = "accept-secret-1";
+		cfg.listen[0].resp = 1;
+		cfg.resp_password = same;
+		CHK(refused("the resp password EQUALS the cluster_accept secret"),
+			"M: the RESP password equal to cluster_accept - refused");
+	}
+	base();
+	cfg.enable_secret[0] = "enable-secret-1";
+	cfg.n_enable_secrets = 1;
+	cfg.listen[0].http = 1;
+	cfg.http_token = "http-token-1";
+	CHK(check() == 0 && !errs, "M: every secret its own - valid");
+
+	/* N: an unquoted '#' inside a secret is refused, not a cut-short secret; after a space it
+	 * starts a comment, and quoted it is part of the secret */
+	{
+		static struct pc_config lc;
+		static const char *const tail = "[listen]\ntcp = 127.0.0.1:6480\nplaintext = loopback\n"
+			"[collection c]\nbuckets_log2 = 9\n";
+		char body[512];
+		int rc;
+
+		snprintf(body, sizeof body, "[secrets]\nclient = Tr0ub4dor#3xtra\n%s", tail);
+		rc = load_text(body, &lc);
+		CHK(rc == -1 && strstr(logbuf, "must be quoted"),
+			"N: client = Tr0ub4dor#3xtra - refused, quote it (rc %d)", rc);
+		snprintf(body, sizeof body, "[secrets]\nclient = Tr0ub4dor-3xtra   # rotated 11-26\n%s", tail);
+		rc = load_text(body, &lc);
+		CHK(rc == 0 && lc.n_client_secrets == 1 && !strcmp(lc.client_secret[0], "Tr0ub4dor-3xtra"),
+			"N: a comment after a space - the secret without it (rc %d)", rc);
+		if (rc == 0)
+			pc_config_free(&lc);
+		snprintf(body, sizeof body, "[secrets]\nclient = \"Tr0ub4dor#3xtra\"\n%s", tail);
+		rc = load_text(body, &lc);
+		CHK(rc == 0 && lc.n_client_secrets == 1 && !strcmp(lc.client_secret[0], "Tr0ub4dor#3xtra"),
+			"N: quoted - the whole secret (rc %d)", rc);
+		if (rc == 0)
+			pc_config_free(&lc);
+	}
+
+	/* O: the reload's keymap folds a section's word, not a collection's name */
+	{
+		static struct pc_config lc;
+		static struct pc_keymap km;
+		char tmp2[64];
+		FILE *f;
+		int fd, rc, i, foo = 0, Foo = 0, lst = 0;
+
+		snprintf(tmp2, sizeof tmp2, "/tmp/cfgchecktest.XXXXXX");
+		if ((fd = mkstemp(tmp2)) < 0 || !(f = fdopen(fd, "w")))
+			return 2;
+		fputs("[secrets]\nclient = cfgcheck-client-secret-1\n[LISTEN]\ntcp = 127.0.0.1:6480\n"
+			"plaintext = loopback\n[collection Foo]\nbuckets_log2 = 9\n"
+			"[collection foo]\nbuckets_log2 = 9\n", f);
+		fclose(f);
+		chmod(tmp2, 0640);
+		rc = pc_config_load_km(tmp2, &lc, &km);
+		unlink(tmp2);
+		for (i = 0; i < km.n; i++) {
+			foo += !strcmp(km.e[i].sect, "collection foo");
+			Foo += !strcmp(km.e[i].sect, "collection Foo");
+			lst += !strcmp(km.e[i].sect, "listen");
+		}
+		CHK(rc == 0 && foo == 1 && Foo == 1 && lst == 2,
+			"O: [collection Foo] and [collection foo] - two keymap sections; [LISTEN] is listen "
+			"(rc %d, %d %d %d)", rc, foo, Foo, lst);
+		if (rc == 0)
+			pc_config_free(&lc);
+	}
+
+	/* P: the -E dump names an HTTP door as HTTP and a TLS door as TLS, with the HTTP allow-list
+	 * and every secret masked */
+	{
+		char tmp3[] = "/var/tmp/cfgchecktest.XXXXXX", out[16384];
+		int fd = mkstemp(tmp3), save;
+		ssize_t n = 0;
+
+		if (fd < 0)
+			return 2;
+		base();
+		cfg.listen[1].type = PC_LISTEN_TCP;
+		cfg.listen[1].addr = "0.0.0.0";
+		cfg.listen[1].port = 9100;
+		cfg.listen[1].http = 1;
+		cfg.listen[2].type = PC_LISTEN_TCP;
+		cfg.listen[2].addr = "127.0.0.1";
+		cfg.listen[2].port = 6479;
+		cfg.listen[2].resp = 1;
+		cfg.listen[2].tls = 1;
+		cfg.n_listen = 3;
+		cfg.http_allow[0].family = AF_INET;
+		cfg.http_allow[0].bits = 8;
+		cfg.http_allow[0].net[0] = 10;
+		cfg.n_http_allow = 1;
+		cfg.enable_secret[0] = "enable-secret-1";
+		cfg.n_enable_secrets = 1;
+		cfg.http_token = "http-token-1";
+		cfg.resp_password = "resp-password-1";
+		fflush(stdout);
+		save = dup(1);
+		dup2(fd, 1);
+		pc_config_dump(&cfg);
+		fflush(stdout);
+		dup2(save, 1);
+		close(save);
+		n = pread(fd, out, sizeof out - 1, 0);
+		close(fd);
+		unlink(tmp3);
+		out[n > 0 ? n : 0] = 0;
+		CHK(strstr(out, "http = 0.0.0.0:9100") && !strstr(out, "tcp = 0.0.0.0:9100"),
+			"P: http = 0.0.0.0:9100 dumped as http, not as a native door");
+		CHK(strstr(out, "resp = 127.0.0.1:6479 tls") && !strstr(out, "6479   # RESP2 only, plaintext"),
+			"P: a TLS RESP door dumped with tls, not as plaintext");
+		CHK(strstr(out, "http_allow = 10.0.0.0/8") != NULL, "P: http_allow dumped");
+		CHK(strstr(out, "enable = ******** (len 15)") && strstr(out, "http = ******** (len 12)") &&
+			strstr(out, "resp = ******** (len 15)") && !strstr(out, "enable-secret-1") &&
+			!strstr(out, "http-token-1") && !strstr(out, "resp-password-1"),
+			"P: the enable secret, HTTP token and RESP password - said, masked");
+	}
+
+	/* Q: the descriptor reserve counts every worker's socket on each TCP listener */
+	base();
+	cluster();
+	cfg.workers = 64;
+	{
+		int k;
+
+		for (k = 1; k < 4; k++) {
+			cfg.listen[k] = cfg.listen[0];
+			cfg.listen[k].port = 6480 + k;
+		}
+	}
+	cfg.listen[4].type = PC_LISTEN_UNIX;
+	cfg.listen[4].addr = "/run/pc/a.sock";
+	cfg.n_listen = 5;
+	CHK(pc_config_fd_reserve(&cfg) >= 64L * (2 + 4) + 1 + 16,
+		"Q: 64 workers, 4 TCP listeners and a unix one - at least 64 x (2 + 4) + 1 + 16 held "
+		"apart (%ld)", pc_config_fd_reserve(&cfg));
 
 	printf("cfgchecktest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

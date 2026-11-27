@@ -83,7 +83,7 @@ int main(void)
 	int efd1 = eventfd(0, EFD_NONBLOCK), efd2 = eventfd(0, EFD_NONBLOCK);
 	int drains;
 
-	pc_pubsub_init(4);
+	pc_pubsub_init(512 + 8);                   /* as the daemon, at the config's most workers */
 	pc_pubsub_worker_register(1, efd1);
 	pc_pubsub_worker_register(2, efd2);
 	pc_qs_attach();
@@ -184,6 +184,25 @@ int main(void)
 		stats(&s);
 		CHECK(s.queue_bytes == 0, "queue bytes %llu after the big ones",
 			s.queue_bytes);
+	}
+
+	/* 6. with 512 workers, ids 1-based, the last worker subscribes and delivers too */
+	{
+		char conn512;
+		int efd512 = eventfd(0, EFD_NONBLOCK);
+		unsigned long long base = pushed;
+
+		pc_pubsub_worker_register(512, efd512);
+		my_worker = 512;
+		CHECK(pc_pubsub_subscribe(&conn512, 512, "w", 1, 0) == 1,
+			"worker 512 cannot subscribe");
+		my_worker = 1;
+		pc_pubsub_publish("w", 1, "v", 1, 0);
+		CHECK(woken(efd512), "a message for worker 512 did not wake it");
+		my_worker = 512;
+		pc_pubsub_drain(512);
+		CHECK(pushed == base + 1, "worker 512 delivered %llu of 1", pushed - base);
+		close(efd512);
 	}
 
 	pc_qs_exit();

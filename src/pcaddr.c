@@ -223,9 +223,12 @@ int pc_addr_parse(const char *host, uint16_t port, pc_addr *out)
 {
 	char h[INET6_ADDRSTRLEN + 1 + IF_NAMESIZE];
 	const char *pct;
+	struct in_addr a4;
 
 	memset(out, 0, sizeof *out);
-	if (inet_pton(AF_INET, host, &out->in4.sin_addr) == 1) {
+	/* a failed parse may still have written octets: never into the union */
+	if (inet_pton(AF_INET, host, &a4) == 1) {
+		out->in4.sin_addr = a4;
 		out->in4.sin_family = AF_INET;
 		out->in4.sin_port = htons(port);
 		return 0;

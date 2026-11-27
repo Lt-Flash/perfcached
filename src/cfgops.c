@@ -27,13 +27,13 @@ int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 		if (!mail_url_ok(ps, val))
 			return -1;
 		free(cfg->mail.url);
-		cfg->mail.url = strdup(val);
-		return 0;
+		cfg->mail.url = cfg_dup(ps, val);
+		return cfg->mail.url ? 0 : -1;
 	}
 	if (!strcasecmp(key, "user")) {
 		free(cfg->mail.user);
-		cfg->mail.user = strdup(val);
-		return 0;
+		cfg->mail.user = cfg_dup(ps, val);
+		return cfg->mail.user ? 0 : -1;
 	}
 	if (!strcasecmp(key, "from")) {
 		if (!mail_addr_ok(val)) {
@@ -42,11 +42,11 @@ int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 			return -1;
 		}
 		free(cfg->mail.from);
-		cfg->mail.from = strdup(val);
-		return 0;
+		cfg->mail.from = cfg_dup(ps, val);
+		return cfg->mail.from ? 0 : -1;
 	}
 	if (!strcasecmp(key, "to")) {
-		char *dup = strdup(val), *save = NULL, *t;
+		char *dup = cfg_dup(ps, val), *save = NULL, *t;
 
 		if (!dup)
 			return -1;
@@ -67,7 +67,11 @@ int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 				free(dup);
 				return -1;
 			}
-			cfg->mail.to[cfg->mail.nto++] = strdup(t);
+			if (!(cfg->mail.to[cfg->mail.nto] = cfg_dup(ps, t))) {
+				free(dup);
+				return -1;
+			}
+			cfg->mail.nto++;
 		}
 		free(dup);
 		return 0;
@@ -78,8 +82,8 @@ int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 			return -1;
 		}
 		free(cfg->mail.ca_file);
-		cfg->mail.ca_file = strdup(val);
-		return 0;
+		cfg->mail.ca_file = cfg_dup(ps, val);
+		return cfg->mail.ca_file ? 0 : -1;
 	}
 	if (!strcasecmp(key, "tls_verify")) {
 		if (!strcasecmp(val, "yes") || !strcasecmp(val, "on"))
@@ -94,8 +98,8 @@ int cfg_kv_mail(struct pstate *ps, char *key, char *val)
 	}
 	if (!strcasecmp(key, "subject_prefix")) {
 		free(cfg->mail.subject_prefix);
-		cfg->mail.subject_prefix = strdup(val);
-		return 0;
+		cfg->mail.subject_prefix = cfg_dup(ps, val);
+		return cfg->mail.subject_prefix ? 0 : -1;
 	}
 	if (!strcasecmp(key, "timeout_s"))
 		return parse_int(ps, val, 1, 300, &cfg->mail.timeout_s);
@@ -154,7 +158,7 @@ int cfg_kv_upgrade(struct pstate *ps, char *key, char *val)
 	if (!strcasecmp(key, "trusted_keys")) {
 		/* ed25519 public keys, 64 hex characters each, comma
 		 * separated; the release key is built in, not listed */
-		char *dup = strdup(val), *tok, *sp = NULL;
+		char *dup = cfg_dup(ps, val), *tok, *sp = NULL;
 
 		if (!dup)
 			return -1;

@@ -386,6 +386,33 @@ int main(void)
 		chk(delivered == 2 && dups == 0,
 			"receive from id 2000, past PC_CL_NODE_MAX: no lanes either");
 	}
+	/* the relay port: a publish only from the member that holds the id it names */
+	relay("rp");
+	i5 = to(5);
+	if (i5 >= 0) {
+		static unsigned char fr[MAX_DGRAM];
+		size_t fn = out[i5].n;
+		pc_addr s5 = from_addr(5), s3 = from_addr(3), s8 = from_addr(8);
+
+		memcpy(fr, out[i5].pt, fn);
+		s5.in4.sin_port = s3.in4.sin_port = s8.in4.sin_port = htons(40001);   /* ephemeral */
+		delivered = 0;
+		fr[1] = 0;
+		fr[2] = 5;
+		chk(!clps_handle_relay_publish(fr, fn, &s3) && delivered == 0,
+			"relay port: member 5's id from an address no member holds - refused");
+		fr[2] = 7;
+		chk(!clps_handle_relay_publish(fr, fn, &s5) && delivered == 0,
+			"relay port: member 7's id from member 5's address - refused");
+		fr[2] = 0;
+		chk(!clps_handle_relay_publish(fr, fn, &s8) && delivered == 0,
+			"relay port: no id, from a departed peer's slot - refused");
+		fr[2] = 5;
+		chk(clps_handle_relay_publish(fr, fn, &s5) && delivered == 1 && !strcmp(got_chan, "rp"),
+			"relay port: member 5's id from its own host - delivered");
+	} else {
+		chk(0, "relay port: no relay to member 5 to build the frame from");
+	}
 
 	/* ---- one lane, two receive threads ------------------------------------ */
 	relay("rx");

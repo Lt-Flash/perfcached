@@ -37,7 +37,8 @@ void pc_tls_free(struct pc_tls *t);
 int pc_tls_up(const struct pc_tls *t);  /* the handshake is done */
 
 /* raw bytes in: the handshake advanced, plaintext handed to @plain, what OpenSSL has to
- * send (handshake, alerts, tickets) to @wire.  0 ok, -1 the connection goes (*why) */
+ * send (handshake, alerts, tickets) to @wire.  0 ok, 1 the client closed (serve what was
+ * handed over, then close: *why), -1 the connection goes (*why) */
 int pc_tls_input(struct pc_tls *t, const char *p, size_t n, pc_tls_out_fn plain,
 		pc_tls_out_fn wire, void *ctx, const char **why);
 

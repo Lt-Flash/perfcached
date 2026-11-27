@@ -19,6 +19,9 @@
 #include "clpull.h"
 #include "clfwd.h"
 #include "clinit.h"
+#include "clmap.h"
+#include "clhist.h"
+#include "clsync.h"
 #include "config.h"
 
 static long long mono_ms(void)
@@ -32,9 +35,9 @@ static long long mono_ms(void)
 static int usage(void)
 {
 	fprintf(stderr, "usage: clinject -s SECRET -c CLUSTER_ID -f FROM_IP:PORT "
-		"-t TO_IP:PORT [-n COUNT] [-i GAP_MS] [-w WAIT_MS] [-g EAGER,WAL,COL...] [-I INCARN] raw HEX | pullreq COL "
+		"-t TO_IP:PORT [-r] [-n COUNT] [-i GAP_MS] [-w WAIT_MS] [-g EAGER,WAL,COL...] [-I INCARN] raw HEX | pullreq COL "
 		"KEY | joinreq | alive NODE [IDENT] | malive NODE MEMBERS TERM | fwdadd COL KEY "
-		"DELTA\n");
+		"DELTA | clsync MASTER TERM SEQ | tombrpl COL KEY\n");
 	return 2;
 }
 
@@ -76,11 +79,11 @@ int main(int argc, char **argv)
 	unsigned char psk[32], ident[16];
 	pc_addr from, to;
 	size_t n = 0, sl;
-	int count = 1, gap_ms = 0, wait_ms = 0, i, fd, opt, got = 0;
+	int count = 1, gap_ms = 0, wait_ms = 0, i, fd, opt, got = 0, reuse = 0;
 	const char *cfgs = NULL;
 	uint32_t incarn_fix = 0;
 
-	while ((opt = getopt(argc, argv, "s:c:f:t:n:i:w:g:I:")) != -1)
+	while ((opt = getopt(argc, argv, "s:c:f:t:n:i:w:g:I:r")) != -1)
 		switch (opt) {
 		case 's': secret = optarg; break;
 		case 'c': cidhex = optarg; break;
@@ -90,6 +93,7 @@ int main(int argc, char **argv)
 		case 'i': gap_ms = atoi(optarg); break;
 		case 'w': wait_ms = atoi(optarg); break;
 		case 'g': cfgs = optarg; break;
+		case 'r': reuse = 1; break;
 		case 'I': incarn_fix = (uint32_t)strtoul(optarg, NULL, 10); break;
 		default: return usage();
 		}
@@ -113,7 +117,7 @@ int main(int argc, char **argv)
 
 		if (clpull_req_size(strlen(col), strlen(key)) > sizeof pt)
 			return usage();
-		n = clpull_req_frame(pt, 0x5eed, 0, col, strlen(col), key, strlen(key));
+		n = clpull_req_frame(pt, sizeof pt, 0x5eed, 0, col, strlen(col), key, strlen(key));
 	} else if (!strcmp(argv[optind], "joinreq")) {
 		struct clmemb_joinreq j;
 
@@ -178,6 +182,40 @@ int main(int argc, char **argv)
 
 		n = clfwd_op_frame(pt, 0x5eed, 0, 2, 0, atoll(argv[optind + 3]),
 			col, strlen(col), key, strlen(key), NULL, 0);
+	} else if (!strcmp(argv[optind], "tombrpl") && optind + 2 < argc) {
+		/* a witness's replayed delete, unversioned: [type][req4][seq4] + the tombstone */
+		struct clfwd_key k;
+
+		k.col = argv[optind + 1];
+		k.collen = (unsigned int)strlen(k.col);
+		k.key = argv[optind + 2];
+		k.klen = (unsigned int)strlen(k.key);
+		if (9 + 1 + 3 + k.collen + k.klen + 8 > sizeof pt)
+			return usage();
+		memset(pt, 0, 9);
+		pt[0] = M_TOMB_RPL;
+		n = clfwd_tomb_build(pt + 9, M_TOMBSTONE, &k, 0);
+		n = n ? n + 9 : 0;
+	} else if (!strcmp(argv[optind], "clsync") && optind + 3 < argc) {
+		/* a control-state sync naming MASTER at (TERM, SEQ): an empty map and history */
+		static struct pc_clmap m;
+		static struct pc_clhist h;
+		long ml, hl;
+		size_t off;
+
+		memset(&m, 0, sizeof m);
+		m.master_id = (uint16_t)atoi(argv[optind + 1]);
+		m.term = (uint32_t)strtoul(argv[optind + 2], NULL, 10);
+		m.seq = (uint32_t)strtoul(argv[optind + 3], NULL, 10);
+		pc_clhist_init(&h);
+		ml = pc_clmap_encode(&m, pt + CLSYNC_ENV_MAP_AT, sizeof pt - CLSYNC_ENV_MAP_AT);
+		if (ml <= 0)
+			return usage();
+		off = clsync_env_hist_at((uint32_t)ml);
+		hl = pc_clhist_encode(&h, pt + off, sizeof pt - off);
+		if (hl < 0)
+			return usage();
+		n = clsync_env_finish(pt, sizeof pt, M_CLSYNC, (uint32_t)ml, (uint32_t)hl);
 	} else
 		return usage();
 	if (!n)
@@ -187,6 +225,9 @@ int main(int argc, char **argv)
 	clwire_set_self(from.in4.sin_addr.s_addr, ntohs(from.in4.sin_port));
 	sl = clwire_seal(psk, pt, n, sealed);
 	fd = socket(pc_addr_family(&from), SOCK_DGRAM, 0);
+	/* -r: share a live node's address, as its own socket sets SO_REUSEADDR */
+	if (fd >= 0 && reuse)
+		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
 	if (fd < 0 || bind(fd, &from.sa, pc_addr_len(&from)) != 0) {
 		fprintf(stderr, "clinject: bind %s: %s\n", froms, strerror(errno));
 		return 1;

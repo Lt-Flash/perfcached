@@ -7,13 +7,31 @@
  * helpers, reply framing (take_msg) and the blocking collector (collect_head) */
 /* ---- raw IO ------------------------------------------------------------ */
 
+/* a blocking collect past its deadline: the reply is late however it trickles in */
+static int past_deadline(const perfd_t *p)
+{
+	return p->deadline_ms && now_ms_lib() >= p->deadline_ms;
+}
+
+static int call_late(perfd_t *p)
+{
+	p->poisoned = 1;
+	p->io_silent = 1;
+	return errk(p, PERFD_E_TRANSPORT, "no whole reply within call_timeout_ms (%d ms)",
+		p->call_ms);
+}
+
 static int io_all(perfd_t *p, int wr, void *buf, size_t n)
 {
 	size_t off = 0;
 
 	while (off < n) {
-		ssize_t r = wr ? send(p->fd, (char *)buf + off, n - off, MSG_NOSIGNAL)
-		               : read(p->fd, (char *)buf + off, n - off);
+		ssize_t r;
+
+		if (!wr && past_deadline(p))
+			return call_late(p);
+		r = wr ? send(p->fd, (char *)buf + off, n - off, MSG_NOSIGNAL)
+		       : read(p->fd, (char *)buf + off, n - off);
 
 		if (r <= 0) {
 			if (r < 0 && errno == EINTR)
@@ -103,9 +121,11 @@ static int fill(perfd_t *p)
 
 		if (rbuf_reserve(p, 65536) != 0)
 			return -1;
-		do              /* under SO_RCVTIMEO a handled signal is EINTR, SA_RESTART or not */
+		do {            /* under SO_RCVTIMEO a handled signal is EINTR, SA_RESTART or not */
+			if (past_deadline(p))
+				return call_late(p);
 			r = read(p->fd, p->rbuf + p->rlen, p->rcap - p->rlen);
-		while (r < 0 && errno == EINTR);
+		} while (r < 0 && errno == EINTR);
 		if (r <= 0) {
 			p->poisoned = 1;
 			p->io_silent = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
@@ -208,9 +228,13 @@ static void notify_hook(perfd_t *p, const unsigned char *tree, size_t n)
 		p->njcap = need;
 	}
 	pc_jw_init(&w, p->nj, p->njcap);
-	if (pc_tree_json(&w, tree, n) != n || w.overflow)
-		return;                        /* not a whole tree: nothing to show */
-	p->ncb(w.buf, w.len, p->nctx);
+	if (pc_tree_json(&w, tree, n) == n && !w.overflow)
+		p->ncb(w.buf, w.len, p->nctx);
+	if (p->njcap > PERFD_KEEP_BUF) {       /* one large notification is not kept */
+		free(p->nj);
+		p->nj = NULL;
+		p->njcap = 0;
+	}
 }
 
 /* ONE frame from rbuf, socket untouched (blocking and event-loop paths share it): 1 = got (NULL
@@ -424,7 +448,7 @@ static int park_msg(perfd_t *p, unsigned long long got, char *result,
 
 /* read replies until the FIFO head's arrives, parking those that overtake it: 0 = *out (*outlen
  * bytes) BORROWED until the next collect, malloc'd only with own_reply; -1 with p->err set */
-static int collect_head(perfd_t *p, char **out, size_t *outlen)
+static int collect_head_body(perfd_t *p, char **out, size_t *outlen)
 {
 	unsigned long long want;
 	struct early **pe, *e;
@@ -489,3 +513,24 @@ static int collect_head(perfd_t *p, char **out, size_t *outlen)
 	}
 }
 
+/* the same within call_ms; a reply far larger than usual is not kept for the handle's life - its
+ * buffers go back before the next collect, until which the caller may read it */
+static int collect_head(perfd_t *p, char **out, size_t *outlen)
+{
+	int rc;
+
+	if (!p->own_reply && p->rscap > PERFD_KEEP_BUF) {
+		free(p->rsc);
+		p->rsc = NULL;
+		p->rscap = 0;
+	}
+	if (p->rcap > PERFD_KEEP_BUF && p->rlen == p->roff) {
+		free(p->rbuf);
+		p->rbuf = NULL;
+		p->rcap = p->rlen = p->roff = 0;
+	}
+	p->deadline_ms = p->call_ms ? now_ms_lib() + p->call_ms : 0;
+	rc = collect_head_body(p, out, outlen);
+	p->deadline_ms = 0;
+	return rc;
+}

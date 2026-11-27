@@ -1,5 +1,6 @@
 /* draincarrytest.c - while a resize drains, the new table answers for records the old one still
- * holds: a miss reads the old one, a write carries the record first, a delete is never undone. */
+ * holds: a miss reads the old one, a write carries the record first, a delete is never undone, and a
+ * carry the arena refuses makes the write answer full. */
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -325,6 +326,32 @@ int main(void)
 	CHK(pcache_ht_add(nw, &k, 1, 0, &nv) == 0 && nv == 1,
 		"J4 and an add starts from nothing (%lld; the older \"a\" would refuse it)", nv);
 	pcache_ht_set_drain(nw, NULL);
+
+	/* K: the arena refuses the carried copy - the write says the cache is full, not absent */
+	old = pcache_htable_new(4);
+	nw = pcache_htable_new(6);
+	{
+		static char big[40000];
+		str v;
+		int got = 0;
+
+		memset(big, 'k', sizeof big);
+		v.s = big;
+		v.len = (int)sizeof big;
+		k = S("k-full");
+		pcache_ht_store(old, &k, &v, 0);
+		pcache_ht_set_drain(nw, old);
+		/* no page past the reservation, then every cell of the record's class taken */
+		pcache_arena_max_bytes = 1;
+		while (pcache_cell_alloc(sizeof big + 64))
+			got++;
+		CHK(pcache_ht_touch(nw, &k, 0) == -2,
+			"K1 a TTL bump whose carry the arena refused answers full, not absent (%d cells taken first)",
+			got);
+		CHK(pcache_ht_add(nw, &k, 1, 0, &nv) == -2,
+			"K2 and so does an add: it never counts on from nothing beside the old value");
+		pcache_ht_set_drain(nw, NULL);
+	}
 
 	printf("draincarrytest: %s\n", fails ? "FAILED" : "all ok");
 	return fails ? 1 : 0;

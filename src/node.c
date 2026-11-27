@@ -169,6 +169,19 @@ void pc_node_state_set(int st)
 	pthread_mutex_unlock(&node_mx);
 }
 
+int pc_node_state_move(int from, int to)
+{
+	int moved = 0;
+
+	pthread_mutex_lock(&node_mx);
+	if (__atomic_load_n(&node_state, __ATOMIC_RELAXED) == from) {
+		state_set_locked(to, 0);
+		moved = __atomic_load_n(&node_state, __ATOMIC_RELAXED) == to;
+	}
+	pthread_mutex_unlock(&node_mx);
+	return moved;
+}
+
 /* the WAL has been discarding acknowledged writes: leave the client map so the load goes to nodes
  * that can honour it, while still serving READS - unsafe is accepting writes, not the data held */
 void pc_node_wal_shed(int why)

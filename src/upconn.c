@@ -316,6 +316,7 @@ again:
 	}
 	if ((v.t == '$' || v.t == '=') && v.s) {
 		const char *p = v.s, *e = v.s + v.len;
+		int clu = 0;
 
 		for (; p + 7 <= e; p++) {
 			if ((p == v.s || p[-1] == '\n') && !memcmp(p, "run_id:", 7)) {
@@ -333,11 +334,9 @@ again:
 		}
 		/* a Redis Cluster node says so, and a sentinel too (not a data server,
 		 * the topology's source) */
-		__atomic_store_n(&c->s->is_cluster, 0, __ATOMIC_RELAXED);
 		for (p = v.s; p + 19 <= e; p++)
 			if ((p == v.s || p[-1] == '\n') && !memcmp(p, "redis_mode:", 11)) {
-				__atomic_store_n(&c->s->is_cluster, !memcmp(p + 11, "cluster", 7),
-					__ATOMIC_RELAXED);
+				clu = !memcmp(p + 11, "cluster", 7);
 				if (p + 19 <= e && !memcmp(p + 11, "sentinel", 8))
 					__atomic_store_n(&c->s->is_sentinel, 1, __ATOMIC_RELAXED);
 				break;
@@ -352,7 +351,8 @@ again:
 		/* a perfcached reports redis_mode:cluster when its RESP door's cluster mode is
 		 * on, yet any node serves any key: it is a perfcached, not a Redis Cluster */
 		if (__atomic_load_n(&c->s->is_pc, __ATOMIC_RELAXED))
-			__atomic_store_n(&c->s->is_cluster, 0, __ATOMIC_RELAXED);
+			clu = 0;
+		__atomic_store_n(&c->s->is_cluster, clu, __ATOMIC_RELAXED);
 	}
 	rv_free(&v);
 	return 0;

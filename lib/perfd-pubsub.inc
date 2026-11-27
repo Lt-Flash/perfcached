@@ -5,6 +5,7 @@
  * exactly the MIT set to consumers. */
 /* perfd-pubsub.inc - pub/sub over the connection and over UDP; #included by perfd.c as one
  * translation unit (statics stay file-local), never compiled on its own. */
+#include <compat/dprint.h>        /* lib/shim's (-Ilib/shim): LM_WARN */
 /* ---- pub/sub ------------------------------------------------------------ */
 
 /* the reply map's integer @field, or -1 with p->err */
@@ -280,6 +281,8 @@ static size_t udp_port_tree(unsigned char *buf, size_t cap, int port)
 	return pc_tw_done(&w) == 0 ? w.n : 0;
 }
 
+static int udp_plain_warned;
+
 int perfd_pubsub_udp(perfd_t *p, int port, int timeout_ms)
 {
 	struct pd_udp *u;
@@ -292,6 +295,9 @@ int perfd_pubsub_udp(perfd_t *p, int port, int timeout_ms)
 		return -1;
 	if (port < 0 || port > 65535)
 		return errk(p, PERFD_E_ARG, "port must be 0..65535");
+	/* the stream key comes back on this connection: in the clear, the seal guards nothing */
+	if (!p->encrypted && !__atomic_exchange_n(&udp_plain_warned, 1, __ATOMIC_RELAXED))
+		LM_WARN("pubsub_udp: the stream key travels on a plaintext connection - open the handle with encrypt = 1 to keep the datagrams private\n");
 	if (p->udp)
 		perfd_pubsub_udp_off(p);
 	if (!p->udp) {
@@ -513,7 +519,9 @@ bad:
 	u->rejected++;
 }
 
-int perfd_pubsub_udp_ready(perfd_t *p)
+static int disp_leave(perfd_t *p, int rc);
+
+static int pubsub_udp_ready_in(perfd_t *p)
 {
 	struct pd_udp *u = p ? p->udp : NULL;
 	unsigned char dg[PFP_MAX + 64], pt[PFP_MAX + 64], nonce[12];
@@ -577,6 +585,8 @@ int perfd_pubsub_udp_ready(perfd_t *p)
 		}
 		udp_deliver(p, pt, (size_t)ptlen);
 		delivered++;
+		if (p->free_req)
+			return delivered;
 		if (!p->udp || p->udp->fd < 0)
 			break;                     /* the hook turned it off */
 	}
@@ -609,5 +619,13 @@ int perfd_pubsub_udp_ready(perfd_t *p)
 			p->udp->acks++;
 	}
 	return delivered;
+}
+
+int perfd_pubsub_udp_ready(perfd_t *p)
+{
+	if (!p)
+		return 0;
+	p->disp++;
+	return disp_leave(p, pubsub_udp_ready_in(p));
 }
 

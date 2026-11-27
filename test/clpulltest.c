@@ -80,6 +80,23 @@ int main(void)
 	chk(la == lb, "A1 PULL_REQ length matches the old builder");
 	chk(la == lb && memcmp(a, b, la) == 0, "A2 PULL_REQ bytes unchanged");
 	chk(lb == clpull_req_size(8, 7), "A3 and the size helper agrees");
+	{
+		static unsigned char big[70000], kb[70000];
+		static char longc[300];
+
+		memset(longc, 'c', sizeof longc);
+		memset(kb, 'k', sizeof kb);
+		q.col = longc; q.collen = 256; q.key = key; q.klen = 7;
+		chk(clpull_req_write(big, sizeof big, 2, &q) == 0,
+			"A4 a collection longer than the header's byte is refused, not cut");
+		q.col = col; q.collen = 8; q.key = (const char *)kb; q.klen = 0x10000;
+		chk(clpull_req_write(big, sizeof big, 2, &q) == 0,
+			"A4 and so is a key longer than its 16 bits");
+		chk(clpull_req_frame(big, clpull_req_size(8, 7) - 1, 1, 1, col, 8, key, 7) == 0,
+			"A5 the frame builder honours the buffer it is given");
+		chk(clpull_req_frame(big, sizeof big, 1, 1, col, 8, key, 7) == clpull_req_size(8, 7),
+			"A5 and fills one that holds it");
+	}
 
 	/* ---- B. PULL_REQ parse, at every length ----------------------- */
 	for (n = 0; n <= la; n++) {

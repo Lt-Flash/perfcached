@@ -788,7 +788,7 @@ int pcache_ht_getver_here(pcache_htable_t *ht, const str *key,
  * stores and then re-stamps.  Boot-time only: it takes the bucket lock
  * per record, and lying about a live record's version would make a newer
  * copy look older to every peer that asks.
- * 1 = re-stamped; 0 = absent; -1 = bad args. */
+ * 1 = re-stamped; 0 = absent; -1 = bad args; -2 = arena full. */
 int pcache_ht_setver(pcache_htable_t *ht, const str *key,
 		unsigned long long ver);
 
@@ -807,7 +807,8 @@ int pcache_ht_remove_ver(pcache_htable_t *ht, const str *key,
 
 /* re-arm an existing key's TTL without rewriting the value (MI perf_ttl):
  * one aligned store of expires under the bucket lock, the versionless bump
- * of 2.7.  @expires is absolute ticks (0 = never).  1 = re-armed, 0 = absent */
+ * of 2.7.  @expires is absolute ticks (0 = never).  1 = re-armed, 0 = absent,
+ * -2 = a resize's old copy could not be carried (the arena is full) */
 int pcache_ht_touch(pcache_htable_t *ht, const str *key, unsigned int expires);
 /* S213: as pcache_ht_touch, and the record becomes THIS node's: a PASSIVE
  * copy loses the flag under the bucket lock and *@was_passive says so,

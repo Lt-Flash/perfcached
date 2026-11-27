@@ -314,6 +314,8 @@ with open(sys.argv[1], "r+b") as f:
 EOF
 newlog; start
 grep -q "starting from the WAL alone" "$D/log" && ok || bad "no cold-start CRIT"
+# the unreadable snapshot is kept aside, byte for byte, not overwritten by the next checkpoint
+ls "$D"/wal/dump.rdb.bad.* >/dev/null 2>&1 && ok || bad "the corrupt snapshot was not kept aside: $(ls "$D/wal" | tr '\n' ' ')"
 python3 - <<'EOF'
 import json, pcnative, socket
 s = socket.create_connection(("127.0.0.1", 16487), timeout=5)

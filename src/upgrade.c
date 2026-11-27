@@ -282,6 +282,45 @@ static void staged_remove(const char *sha)  /* under SL */
 	}
 }
 
+/* the build a request waiting for the helper names (upgrade/request's sha256=), or "" */
+static void request_sha(char out[65])  /* under SL */
+{
+	char p[800], line[128];
+	FILE *f;
+
+	out[0] = 0;
+	if (upath(p, sizeof p, "request", NULL) != 0 || !(f = fopen(p, "r")))
+		return;
+	while (fgets(line, sizeof line, f))
+		if (!strncmp(line, "sha256=", 7) && strspn(line + 7, "0123456789abcdef") == 64) {
+			memcpy(out, line + 7, 64);
+			out[64] = 0;
+			break;
+		}
+	fclose(f);
+}
+
+/* room once @keep is published and verified: the oldest go first, so it stays beside at most
+ * PC_UPG_KEEP - 1 others inside stage_mb; never the build a waiting request names */
+static void staged_prune(const char *keep)  /* under SL */
+{
+	struct sent e[16];
+	char req[65];
+	long long cap = (long long)UC.stage_mb << 20, used = 0;
+	int n = staged_list(e, 16), left = n, i;
+
+	request_sha(req);
+	for (i = 0; i < n; i++)
+		used += e[i].size;
+	for (i = 0; i < n && (left > PC_UPG_KEEP || used > cap); i++) {
+		if (!strcmp(e[i].sha, keep) || !strcmp(e[i].sha, req))
+			continue;
+		staged_remove(e[i].sha);
+		used -= e[i].size;
+		left--;
+	}
+}
+
 static int hexsha(const char *h, unsigned char out[32])
 {
 	size_t bl = 0;
@@ -348,11 +387,9 @@ int pc_upg_stage_begin(long long size, const char *sha_hex,
 		const unsigned char *sig, const char *version, char *id,
 		size_t idl, const char **err)
 {
-	struct sent e[16];
 	unsigned char rnd[8];
-	long long cap = (long long)UC.stage_mb << 20, used = 0;
+	long long cap = (long long)UC.stage_mb << 20;
 	char d[700], p[800], nm[64];
-	int n, i;
 
 	if (!N.dir[0]) {
 		*err = "this node has no state directory - nowhere to stage";
@@ -392,17 +429,6 @@ int pc_upg_stage_begin(long long size, const char *sha_hex,
 		pthread_mutex_unlock(&SL);
 		*err = "sha256 must be 64 lowercase hex characters";
 		return -1;
-	}
-	/* room: the oldest staged go first, so this one lands beside at
-	 * most PC_UPG_KEEP - 1 others, all inside stage_mb */
-	n = staged_list(e, 16);
-	for (i = 0; i < n; i++)
-		used += e[i].size;
-	for (i = 0; i < n && (n - i >= PC_UPG_KEEP || used + size > cap); i++) {
-		if (!strcmp(e[i].sha, sha_hex))
-			continue;               /* the same build again: kept */
-		staged_remove(e[i].sha);
-		used -= e[i].size;
 	}
 	if (upath(d, sizeof d, "staging", NULL) != 0 ||
 	        (mkdir(d, 0750) != 0 && errno != EEXIST) ||
@@ -580,6 +606,7 @@ int pc_upg_stage_end(const char *id, char *sha_hex, size_t shl, char *who,
 	U.id[0] = 0;                          /* the part is now the build */
 	U.got = U.size = 0;
 	staged_n++;
+	staged_prune(hx);
 	snprintf(sha_hex, shl, "%s", hx);
 	pthread_mutex_unlock(&SL);
 	LM_NOTICE("upgrade: staged %s as %s, signed by %s\n", ver, hx, who);
@@ -827,6 +854,11 @@ int pc_upg_switch(const char *sha_hex, int force, char *id, size_t idl,
 	sodium_bin2hex(rid, sizeof rid, rnd, sizeof rnd);
 	n = snprintf(body, sizeof body, "id=%s\nartifact=staged/%.64s.tar.gz\n"
 		"sha256=%.64s\nversion=%s\n", rid, sha_hex, sha_hex, ver);
+	if (n < 0 || (size_t)n >= sizeof body) {
+		pthread_mutex_unlock(&SL);
+		*err = "the request does not fit its buffer - not requested";
+		return -1;
+	}
 	/* the id first, so the process the helper starts knows what to ask */
 	if (upath(p, sizeof p, "requested", NULL) == 0 &&
 	        upath(tmp, sizeof tmp, "requested.tmp", NULL) == 0) {

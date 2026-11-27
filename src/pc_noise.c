@@ -30,6 +30,7 @@ static void hmac(const uint8_t *key, size_t keylen, const uint8_t *d1,
 	if (n2)
 		crypto_auth_hmacsha256_update(&st, d2, n2);
 	crypto_auth_hmacsha256_final(&st, out);
+	sodium_memzero(&st, sizeof st);
 }
 
 void pc_noise_hkdf(const uint8_t ck[32], const uint8_t *ikm, size_t ikmlen,
@@ -150,6 +151,7 @@ static void sym_mix_key(struct pc_symstate *ss, const uint8_t *ikm, size_t n)
 	pc_noise_hkdf(ss->ck, ikm, n, 2, o1, o2, NULL);
 	memcpy(ss->ck, o1, 32);
 	cs_init_key(&ss->cs, o2);
+	sodium_memzero(o1, sizeof o1);
 	sodium_memzero(o2, sizeof o2);
 }
 
@@ -162,6 +164,8 @@ static void sym_mix_key_and_hash(struct pc_symstate *ss, const uint8_t *ikm,
 	memcpy(ss->ck, o1, 32);
 	sym_mix_hash(ss, o2, 32);
 	cs_init_key(&ss->cs, o3);
+	sodium_memzero(o1, sizeof o1);
+	sodium_memzero(o2, sizeof o2);
 	sodium_memzero(o3, sizeof o3);
 }
 
@@ -352,13 +356,16 @@ int pc_hs_read_msg2(struct pc_handshake *hs, const uint8_t *msg, size_t mlen,
 int pc_transport_encrypt(struct pc_cipherstate *cs, const uint8_t *pt,
 		size_t ptlen, uint8_t *out)
 {
+	/* the copy-through is the handshake's; a transport without a key sends nothing */
+	if (!cs->has_key)
+		return -1;
 	return cs_encrypt(cs, NULL, 0, pt, ptlen, out);
 }
 
 int pc_transport_decrypt(struct pc_cipherstate *cs, const uint8_t *ct,
 		size_t ctlen, uint8_t *out)
 {
-	if (ctlen < PC_NOISE_TAGLEN)
+	if (ctlen < PC_NOISE_TAGLEN || !cs->has_key)
 		return -1;
 	return cs_decrypt(cs, NULL, 0, ct, ctlen, out);
 }

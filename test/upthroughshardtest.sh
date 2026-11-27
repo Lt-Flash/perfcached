@@ -242,6 +242,11 @@ grep -q "^SET $WK rv$" "$D/upm/writes" && grep -q "^SET $WK nope NX$" "$D/upm/wr
 ft1=$(st $OWN "s['cluster']['fwd_through']"); fa1=$(st $OWN "s['cluster']['fwd_through_acked']")
 [ "$ft1" = $((ft0 + 5)) ] && [ "$fa1" = "$ft1" ] && ok "9. all five ran through at the owner (node $OWN: fwd_through $ft0 -> $ft1, acked $fa1)" || bad "9. owner $OWN fwd_through $ft0 -> $ft1, acked $fa1 (5 more expected)"
 [ "$(nget 1 $WK)" = 7 ] && ok "9. $WK reads 7 through node 1" || bad "9. $WK via node 1: $(nget 1 $WK)"
+# the smallest increment has no positive twin to send as a DECRBY
+r6=$(rsp 2 INCRBY "$WK" -9223372036854775808)
+[ "$r6" = -9223372036854775801 ] && grep -q "^INCRBY $WK -9223372036854775808$" "$D/upm/writes" &&
+	ok "9. INCRBY -9223372036854775808 runs through as sent: -9223372036854775801" ||
+	bad "9. INCRBY LLONG_MIN: $r6, master writes: $(grep " $WK" "$D/upm/writes" | tail -2 | tr '\n' '|')"
 
 
 # ---- 10. the drain sweep takes over each node's share --------------------------------------

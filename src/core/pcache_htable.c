@@ -473,9 +473,10 @@ static PC_NO_ASAN int scan_bucket(pcache_bucket_t *b, const str *key, unsigned i
 		 * too small learns what it would need.  Trusted, like every other
 		 * field here, only once the version re-check passes */
 		*vlen_out = vlen;
+		/* the version first: its writer stores it last (a versionless TTL bump) */
+		*ver_out = __atomic_load_n(&r->ver, __ATOMIC_ACQUIRE);
 		*exp_out = r->expires;
 		*fl_out = r->rflags;
-		*ver_out = r->ver;
 		/* probe: the caller wants existence, length and expiry, not the
 		 * bytes.  The metadata above is already published, so a probe
 		 * validates exactly what a read would - it just stops here,
@@ -544,7 +545,7 @@ static __thread int ht_nostat;
 static __thread pcache_htable_t *relay_ht;        /* S490: pcache_ht_set_relay */
 static __thread const struct pcache_relay *relay_rl;
 
-static void drain_carry(pcache_htable_t *ht, const str *key);
+static int drain_carry(pcache_htable_t *ht, const str *key);
 static void drain_forget(pcache_htable_t *ht, const str *key);
 
 /* does @dr hold a copy newer than @ver that has expired?  It deleted every
@@ -1280,9 +1281,10 @@ static pcache_bucket_t *chain_remove_at(pcache_bucket_t *home,
 	bkt_set_used(t, tu);
 	if (!prev || tu != 1)
 		return NULL;
+	/* LINK goes before slot 5 turns into a record: a reader never walks a record as a bucket */
+	prev->meta &= (unsigned short)~PCACHE_BKT_LINK;
 	prev->tags[PCACHE_SLOTS - 1] = t->tags[0];
 	prev->slot[PCACHE_SLOTS - 1] = t->slot[0];
-	prev->meta &= (unsigned short)~PCACHE_BKT_LINK;
 	bkt_set_used(prev, PCACHE_SLOTS);
 	return t;
 }
@@ -1496,7 +1498,7 @@ static int store_body(pcache_htable_t *ht, const str *key, const str *val,
 		return -1;
 	}
 	if (!keep_wt)
-		drain_carry(ht, key);         /* S459: not for a copy */
+		(void)drain_carry(ht, key);   /* S459: not for a copy; the write supersedes it */
 
 	/* A peer's version has to reach the clock BEFORE the comparison, and
 	 * whatever the comparison decides.  Otherwise a copy stored at a
@@ -1594,9 +1596,11 @@ again:
 			 * which refused it, and the refresh stopped at the
 			 * author (caught by eagertest, the same failure the
 			 * touch path had). */
+			/* last, with release: a reader that loads the new version first
+			 * then sees the new expiry and flags */
 			__atomic_store_n(&old->ver,
 				use_ver ? inver : ver_local(old),
-				__ATOMIC_RELAXED);
+				__ATOMIC_RELEASE);
 			pcache_last_ver = old->ver;
 			hint_update(ht, idx, expires);
 			if (!nr)
@@ -1794,7 +1798,8 @@ static int add_ex_body(pcache_htable_t *ht, const str *key, long long delta,
 	eff = expires;
 	if (key->len > 0xFFFF)
 		return -1;
-	drain_carry(ht, key);                 /* S459 */
+	if (drain_carry(ht, key) == -2)       /* S459: its copy could not be carried */
+		return -2;
 
 	hash = pcache_key_hash(key);
 	tag = tag_of(hash);
@@ -2072,8 +2077,9 @@ static void drain_forget(pcache_htable_t *ht, const str *key)
 
 /* S459: a write to a key the drain has not carried yet carries it first,
  * under the drained table's bucket lock - the order the drain copies in -
- * so a delete, which takes that lock before this table's, cannot be undone */
-static void drain_carry(pcache_htable_t *ht, const str *key)
+ * so a delete, which takes that lock before this table's, cannot be undone.
+ * 0, or -2 when the arena refused the carried copy */
+static int drain_carry(pcache_htable_t *ht, const str *key)
 {
 	pcache_htable_t *dr = __atomic_load_n(&ht->drain_from, __ATOMIC_ACQUIRE);
 	unsigned long long nver = 0;
@@ -2081,10 +2087,10 @@ static void drain_carry(pcache_htable_t *ht, const str *key)
 	uint64_t route;
 	unsigned int hash, idx, len = 0, now;
 	unsigned char tag;
-	int i;
+	int i, rc = 0;
 
 	if (!dr)
-		return;
+		return 0;
 	now = get_ticks();
 	ht_nostat++;
 	i = fetch_core(ht, key, NULL, 0, &len, now, NULL, NULL, NULL, &nver);
@@ -2122,9 +2128,10 @@ again:
 				v.len = snprintf(nb, sizeof nb, "%lld", ll);
 				v.s = nb;
 			}
-			(void)store_body(ht, &k, &v, r->expires, (unsigned char)
+			if (store_body(ht, &k, &v, r->expires, (unsigned char)
 				(r->rflags & (PCACHE_F_PASSIVE | PCACHE_F_CARRY)),
-				r->ver, 1, 1, r->wtick);
+				r->ver, 1, 1, r->wtick) == -2)
+				rc = -2;
 		} else if (nver && r->ver > nver) {
 			/* newer and expired: the older copy here is deleted, not carried */
 			(void)pcache_ht_remove_below(ht, key, r->ver);
@@ -2132,6 +2139,7 @@ again:
 	}
 	bkt_clear_owner(b);
 	lock_release(&b->lock);
+	return rc;
 }
 
 int pcache_ht_getver(pcache_htable_t *ht, const str *key,
@@ -2179,7 +2187,8 @@ static int setver_body(pcache_htable_t *ht, const str *key,
 
 	if (!ht || !key)
 		return -1;
-	drain_carry(ht, key);                 /* S459 */
+	if (drain_carry(ht, key) == -2)       /* S459: its copy could not be carried */
+		return -2;
 	hash = pcache_key_hash(key);
 	tag = tag_of(hash);
 
@@ -2233,7 +2242,8 @@ static int touch_body(pcache_htable_t *ht, const str *key,
 	unsigned char tag;
 	int i, rc = 0;
 
-	drain_carry(ht, key);                 /* S459 */
+	if (drain_carry(ht, key) == -2)       /* S459: its copy could not be carried */
+		return -2;
 	hash = pcache_key_hash(key);
 	tag = tag_of(hash);
 
@@ -2278,7 +2288,7 @@ again:
 		 * re-armed deadline that kept its old number is refused as a
 		 * duplicate and the refresh stops at the author.  Measured -
 		 * the peer's TTL simply never moved. */
-		__atomic_store_n(&r->ver, ver_local(r), __ATOMIC_RELAXED);
+		__atomic_store_n(&r->ver, ver_local(r), __ATOMIC_RELEASE);
 		pcache_last_ver = r->ver;
 		hint_update(ht, idx, expires);
 		rc = 1;
@@ -2482,10 +2492,10 @@ static PC_NO_ASAN int snapshot_slot(pcache_bucket_t *b, unsigned int i,
 			 * key that KEYS/SCAN then never read */
 			if (vbuf)
 				pc_raw_copy(vbuf, r->data + klen, vlen);
+			ver = __atomic_load_n(&r->ver, __ATOMIC_ACQUIRE);
 			exp = r->expires;
 			wt = r->wtick;
 			fl = r->rflags;
-			ver = r->ver;
 		}
 		__atomic_thread_fence(__ATOMIC_ACQUIRE);
 		v2 = __atomic_load_n(&b->version, __ATOMIC_RELAXED);
@@ -3530,8 +3540,9 @@ unsigned long pcache_ht_entries(pcache_htable_t *ht)
 void pcache_ht_totals(pcache_htable_t *ht, pcache_ht_totals_t *out)
 {
 	sum_slots(ht, 0, ht->pstats_n, out);
-	/* live gauge: always absolute, never relative to a reset */
-	out->entries = out->created - out->destroyed;
+	/* live gauge: always absolute, never relative to a reset; the lines are read unlocked,
+	 * so destroyed can pass created by a record in flight */
+	out->entries = out->created > out->destroyed ? out->created - out->destroyed : 0;
 	sub_base(out, &ht->base);
 }
 
@@ -3541,7 +3552,8 @@ void pcache_ht_totals_client(pcache_htable_t *ht, pcache_ht_totals_t *out)
 
 	sum_slots(ht, 0, ht->pstats_n, &all);
 	sum_slots(ht, ht->client_lo, ht->client_hi, out);
-	out->entries = all.created - all.destroyed;   /* the TABLE's gauge */
+	out->entries = all.created > all.destroyed    /* the TABLE's gauge */
+		? all.created - all.destroyed : 0;
 	sub_base(out, &ht->base_client);
 }
 

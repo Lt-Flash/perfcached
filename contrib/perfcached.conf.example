@@ -303,7 +303,8 @@ tcp = 0.0.0.0:6479
 #encrypt = no
 ## TCP keepalive on every accepted data-door socket (native, unix, RESP):
 # a subscriber whose host died silently is found by the kernel, since the
-# daemon never closes an idle connection itself.  0 = off.
+# daemon never closes an idle connection itself.  0 = off; at most
+# 32767, the kernel's TCP_KEEPIDLE limit.
 #keepalive_s = 300
 # pub/sub over UDP: a native connection may ask for its deliveries as
 # sealed datagrams to its own address (never one it names), sent from

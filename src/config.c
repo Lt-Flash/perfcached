@@ -63,6 +63,15 @@ char *trim(char *s)
 	return s;
 }
 
+char *cfg_dup(struct pstate *ps, const char *s)
+{
+	char *d = strdup(s);
+
+	if (!d)
+		PERR(ps, "out of memory\n");
+	return d;
+}
+
 /* value: rest of line; optional double quotes protect '#' and spaces */
 static char *parse_value(struct pstate *ps, char *v)
 {
@@ -79,6 +88,12 @@ static char *parse_value(struct pstate *ps, char *v)
 		return v + 1;
 	}
 	e = strchr(v, '#');
+	/* a '#' inside a secret would cut it short without a word */
+	if (e && e > v && e[-1] != ' ' && e[-1] != '\t' && ps->sect == S_SECRETS) {
+		PERR(ps, "a secret with '#' in it must be quoted (\"...\") - "
+			"unquoted, '#' starts a comment\n");
+		return NULL;
+	}
 	if (e)
 		*e = 0;
 	return trim(v);
@@ -121,6 +136,12 @@ int mail_url_ok(struct pstate *ps, const char *url)
 {
 	const char *h, *e;
 
+	/* first, so a URL with credentials is never printed */
+	if (strchr(url, '@')) {
+		PERR(ps, "smtp: no credentials in the URL - user = in [mail], "
+			"the password as [secrets] mail\n");
+		return 0;
+	}
 	if (!strncasecmp(url, "smtp://", 7))
 		h = url + 7;
 	else if (!strncasecmp(url, "smtps://", 8))
@@ -128,11 +149,6 @@ int mail_url_ok(struct pstate *ps, const char *url)
 	else {
 		PERR(ps, "smtp = '%s': want smtp://host:port (STARTTLS) or "
 			"smtps://host:port (TLS)\n", url);
-		return 0;
-	}
-	if (strchr(h, '@')) {
-		PERR(ps, "smtp: no credentials in the URL - user = in [mail], "
-			"the password as [secrets] mail\n");
 		return 0;
 	}
 	e = h + strcspn(h, "/?#");
@@ -224,7 +240,9 @@ static int enter_section(struct pstate *ps, char *hdr)
 		}
 		ps->sect = S_COLLECTION;
 		ps->col = &cfg->col[cfg->n_col++];
-		ps->col->name = strdup(arg);
+		ps->col->name = cfg_dup(ps, arg);
+		if (!ps->col->name)
+			return -1;
 		ps->col->buckets_log2 = -1;
 		ps->col->mode = PC_MODE_STORE;
 		ps->col->up_negative_ms = 2000;
@@ -292,14 +310,14 @@ int split_hostport(struct pstate *ps, const char *v, const char *form,
 	const char *c;
 
 	if (pc_hostport_split(v, h, sizeof h, port) == 0) {
-		*host = strdup(h);
+		*host = cfg_dup(ps, h);
 		return *host ? 0 : -1;
 	}
 	c = strrchr(v, ':');
 	if (!c || c == v || (*v == '[' && !strchr(v, ']')))
 		PERR(ps, "%s\n", form);
 	else
-		PERR(ps, "'%s' is not a port in [1..65535] (%s)\n", c + 1, form);
+		PERR(ps, "the port is not in [1..65535] (%s)\n", form);
 	return -1;
 }
 
@@ -323,7 +341,9 @@ int add_listener_ex(struct pstate *ps, enum pc_listen_type type,
 			PERR(ps, "unix socket path must be absolute\n");
 			return -1;
 		}
-		addr = strdup(v);
+		addr = cfg_dup(ps, v);
+		if (!addr)
+			return -1;
 	} else {
 		pc_addr a6;
 		const char *why;
@@ -347,10 +367,14 @@ int add_listener_ex(struct pstate *ps, enum pc_listen_type type,
 	l->resp = kind == 1;
 	l->http = kind == 2;
 	l->encrypt = -1;
-	/* loopback classification decides plaintext ELIGIBILITY only */
-	l->loopback = type == PC_LISTEN_UNIX ||
-		!strncmp(addr, "127.", 4) || !strcmp(addr, "::1") ||
-		!strcmp(addr, "localhost");
+	/* loopback classification decides plaintext ELIGIBILITY only: a numeric loopback address
+	 * (a name is bound through the resolver, whatever it starts with), or localhost */
+	{
+		pc_addr la;
+
+		l->loopback = type == PC_LISTEN_UNIX || !strcmp(addr, "localhost") ||
+			(pc_addr_parse(addr, 0, &la) == 0 && pc_addr_is_loopback(&la));
+	}
 	cfg->n_listen++;
 	return 0;
 }
@@ -524,10 +548,12 @@ static int handle_kv(struct pstate *ps, char *key, char *val)
 static unsigned char km_key[crypto_generichash_KEYBYTES];
 static int km_key_set;
 
-static void km_norm(char *dst, size_t cap, const char *src)
+/* blanks collapsed; lower case up to the first blank, or all of it with @fold_all - a
+ * section's name ([collection Foo]) is case-sensitive, its word is not */
+static void km_norm(char *dst, size_t cap, const char *src, int fold_all)
 {
 	size_t n = 0;
-	int sp = 0;
+	int sp = 0, fold = 1;
 
 	for (; *src && n + 1 < cap; src++) {
 		unsigned char ch = (unsigned char)*src;
@@ -536,10 +562,12 @@ static void km_norm(char *dst, size_t cap, const char *src)
 			sp = n > 0;
 			continue;
 		}
-		if (sp && n + 2 < cap)
+		if (sp && n + 2 < cap) {
 			dst[n++] = ' ';
+			fold = fold_all;
+		}
 		sp = 0;
-		dst[n++] = (char)(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+		dst[n++] = (char)(fold && ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
 	}
 	dst[n] = 0;
 }
@@ -560,8 +588,8 @@ static void km_add(struct pc_keymap *km, const char *sect, const char *key,
 		km_key_set = 1;
 	}
 	e = &km->e[km->n++];
-	km_norm(e->sect, sizeof e->sect, sect);
-	km_norm(e->key, sizeof e->key, key);
+	km_norm(e->sect, sizeof e->sect, sect, 0);
+	km_norm(e->key, sizeof e->key, key, 1);
 	crypto_generichash(e->h, sizeof e->h, (const unsigned char *)val,
 		strlen(val), km_key, sizeof km_key);
 }
@@ -577,6 +605,9 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 	struct pstate ps;
 	char line[1024], *s, *eq, *val;
 	char cursect[96] = "";
+	/* stdio reads into this, not a buffer of its own that fclose frees uncleared: both it
+	 * and @line hold the file, secrets included, and are zeroed on every way out */
+	char iobuf[4096];
 	FILE *f;
 
 	memset(cfg, 0, sizeof *cfg);
@@ -672,6 +703,7 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 		LM_ERR("cannot open config %s\n", path);
 		return -1;
 	}
+	setvbuf(f, iobuf, _IOFBF, sizeof iobuf);
 	while (fgets(line, sizeof line, f)) {
 		ps.line++;
 		if (strlen(line) == sizeof line - 1 && line[sizeof line - 2] != '\n') {
@@ -708,6 +740,8 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 			goto err;
 	}
 	fclose(f);
+	sodium_memzero(iobuf, sizeof iobuf);
+	sodium_memzero(line, sizeof line);
 
 	/* the environment beats the file, so `make check` can switch the schedule
 	 * off: a suite spanning midnight would see its counters restart under it */
@@ -727,9 +761,36 @@ int pc_config_load_km(const char *path, struct pc_config *cfg,
 
 err:
 	fclose(f);
+	sodium_memzero(iobuf, sizeof iobuf);
+	sodium_memzero(line, sizeof line);
 err_noclose:
 	pc_config_free(cfg);
 	return -1;
+}
+
+long pc_config_fd_reserve(const struct pc_config *cfg)
+{
+	int i, n_tcp = 0;
+
+	for (i = 0; i < cfg->n_listen; i++)
+		n_tcp += cfg->listen[i].type == PC_LISTEN_TCP;
+	/* each worker: an eventfd, an epoll or ring fd, and its own SO_REUSEPORT socket per TCP
+	 * listener; the unix socket is one, shared */
+	return 64 + 2L * (cfg->workers + 8) + (long)cfg->workers * n_tcp +
+		(cfg->n_listen - n_tcp) + (cfg->cl_enabled ? 16 : 0) + 16;
+}
+
+static void dump_allow(const char *key, const struct pc_cidr *list, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		char t[INET6_ADDRSTRLEN];
+
+		if (!inet_ntop(list[i].family, list[i].net, t, sizeof t))
+			snprintf(t, sizeof t, "?");
+		printf("%s = %s/%d\n", key, t, list[i].bits);
+	}
 }
 
 void pc_config_dump(const struct pc_config *cfg)
@@ -763,6 +824,13 @@ void pc_config_dump(const struct pc_config *cfg)
 	if (cfg->cluster_accept_secret)
 		printf("cluster_accept = ******** (len %zu)\n",
 			strlen(cfg->cluster_accept_secret));
+	for (i = 0; i < cfg->n_enable_secrets; i++)
+		printf("enable = ******** (len %zu)\n",
+			strlen(cfg->enable_secret[i]));
+	if (cfg->resp_password)
+		printf("resp = ******** (len %zu)\n", strlen(cfg->resp_password));
+	if (cfg->http_token)
+		printf("http = ******** (len %zu)\n", strlen(cfg->http_token));
 	if (cfg->cluster_secret)
 		printf("cluster = ******** (len %zu)\n\n",
 			strlen(cfg->cluster_secret));
@@ -829,22 +897,21 @@ void pc_config_dump(const struct pc_config *cfg)
 				cfg->plaintext == PC_PLAINTEXT_LOOPBACK ?
 				"   # plaintext-eligible" : "");
 		else if (l->resp)
-			printf("resp = %s:%d   # RESP2 only, plaintext\n",
-				l->addr, l->port);
+			printf("resp = %s:%d%s   # RESP2 only, %s\n",
+				l->addr, l->port, l->tls ? " tls" : "",
+				l->tls ? "TLS" : "plaintext");
+		else if (l->http)
+			printf("http = %s:%d%s   # HTTP, %s\n",
+				l->addr, l->port, l->tls ? " tls" : "",
+				l->tls ? "TLS" : "plaintext");
 		else
 			printf("tcp = %s:%d%s%s\n", l->addr, l->port,
 				l->encrypt < 0 ? "" : l->encrypt ? " encrypt=yes" :
 				" encrypt=no", l->loopback && cfg->plaintext == PC_PLAINTEXT_LOOPBACK ?
 				"   # plaintext-eligible" : "");
 	}
-	for (i = 0; i < cfg->n_resp_allow; i++) {
-		char t[INET6_ADDRSTRLEN];
-
-		if (!inet_ntop(cfg->resp_allow[i].family, cfg->resp_allow[i].net,
-		        t, sizeof t))
-			snprintf(t, sizeof t, "?");
-		printf("resp_allow = %s/%d\n", t, cfg->resp_allow[i].bits);
-	}
+	dump_allow("resp_allow", cfg->resp_allow, cfg->n_resp_allow);
+	dump_allow("http_allow", cfg->http_allow, cfg->n_http_allow);
 	if (cfg->resp_collections)
 		printf("resp_collections = %s\n", cfg->resp_collections);
 	if (cfg->cl_enabled) {

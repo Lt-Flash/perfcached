@@ -14,6 +14,30 @@
 #include "config.h"
 #include "configint.h"
 
+/* the secret @s equals, named into @buf, or NULL: a client's, the cluster's,
+ * cluster_accept and the enable secrets */
+static const char *same_secret(const struct pc_config *cfg, const char *s,
+		char *buf, size_t cap)
+{
+	int i;
+
+	for (i = 0; i < cfg->n_client_secrets; i++)
+		if (!strcmp(s, cfg->client_secret[i])) {
+			snprintf(buf, cap, "client secret #%d", i + 1);
+			return buf;
+		}
+	if (cfg->cluster_secret && !strcmp(s, cfg->cluster_secret))
+		return "the cluster secret";
+	if (cfg->cluster_accept_secret && !strcmp(s, cfg->cluster_accept_secret))
+		return "the cluster_accept secret";
+	for (i = 0; i < cfg->n_enable_secrets; i++)
+		if (!strcmp(s, cfg->enable_secret[i])) {
+			snprintf(buf, cap, "enable secret #%d", i + 1);
+			return buf;
+		}
+	return NULL;
+}
+
 /* is @hp ("host:port") one of the upstreams @list names
  * ("redis://[user@]host:port[/db], ...")? */
 static int up_listed(const char *list, const char *hp)
@@ -126,6 +150,12 @@ int cfg_validate(struct pstate *ps, const char *path,
 		PERR(ps, "no listeners configured\n");
 		return -1;
 	}
+	/* the workers serve one unix socket: a second would be bound and never accepted */
+	for (i = 0, j = 0; i < cfg->n_listen; i++)
+		if (cfg->listen[i].type == PC_LISTEN_UNIX && ++j > 1) {
+			PERR(ps, "more than one 'unix =' listener - one is served\n");
+			return -1;
+		}
 
 	if (!cfg->n_client_secrets) {
 		PERR(ps, "no client secret configured\n");
@@ -171,6 +201,23 @@ int cfg_validate(struct pstate *ps, const char *path,
 		PERR(ps, "cluster_accept needs a cluster secret, and must differ from it\n");
 		return -1;
 	}
+	/* the two-principal rule holds for every secret that opens the peer plane or grants DDL */
+	for (i = 0; i < cfg->n_client_secrets; i++) {
+		if (cfg->cluster_accept_secret &&
+		        !strcmp(cfg->client_secret[i], cfg->cluster_accept_secret)) {
+			PERR(ps, "the cluster_accept secret EQUALS client secret #%d - the "
+				"two principals must not share a secret; refusing to "
+				"start\n", i + 1);
+			return -1;
+		}
+		for (j = 0; j < cfg->n_enable_secrets; j++)
+			if (!strcmp(cfg->client_secret[i], cfg->enable_secret[j])) {
+				PERR(ps, "enable secret #%d EQUALS client secret #%d - "
+					"every client link could enable; refusing to "
+					"start\n", j + 1, i + 1);
+				return -1;
+			}
+	}
 	for (i = 0; i < cfg->n_enable_secrets; i++)
 		if (strlen(cfg->enable_secret[i]) < 8)
 			LM_WARN("enable secret #%d is under 8 characters\n", i + 1);
@@ -194,6 +241,16 @@ int cfg_validate(struct pstate *ps, const char *path,
 		if (cfg->http_token && !cfg->http_token[0]) {
 			PERR(ps, "empty http secret - an empty bearer would match it\n");
 			return -1;
+		}
+		if (cfg->http_token) {
+			char nb[32];
+			const char *w = same_secret(cfg, cfg->http_token, nb, sizeof nb);
+
+			if (w) {
+				PERR(ps, "the http token EQUALS %s - it crosses the wire "
+					"in the clear; refusing to start\n", w);
+				return -1;
+			}
 		}
 		if (!n_resp && (cfg->n_resp_allow || cfg->resp_password ||
 		        cfg->resp_collections)) {
@@ -309,23 +366,14 @@ int cfg_validate(struct pstate *ps, const char *path,
 				PERR(ps, "empty resp secret\n");
 				return -1;
 			}
-			if (cfg->cluster_secret &&
-			        !strcmp(cfg->resp_password, cfg->cluster_secret)) {
-				PERR(ps, "the resp password EQUALS the cluster "
-					"secret - a plaintext-transmitted password "
-					"must never be a principal's secret; "
-					"refusing to start\n");
+			char nb[32];
+			const char *w = same_secret(cfg, cfg->resp_password, nb, sizeof nb);
+
+			if (w) {
+				PERR(ps, "the resp password EQUALS %s - it crosses "
+					"the wire in the clear; refusing to start\n", w);
 				return -1;
 			}
-			for (i = 0; i < cfg->n_client_secrets; i++)
-				if (!strcmp(cfg->resp_password,
-				        cfg->client_secret[i])) {
-					PERR(ps, "the resp password EQUALS client "
-						"secret #%d - it crosses the wire "
-						"in the clear; refusing to "
-						"start\n", i + 1);
-					return -1;
-				}
 			if (strlen(cfg->resp_password) < 8)
 				LM_WARN("the resp password is under 8 characters "
 					"and crosses the wire in the clear\n");
@@ -479,7 +527,9 @@ int cfg_validate(struct pstate *ps, const char *path,
 			}
 			nf = &cfg->col[cfg->n_col++];
 			memset(nf, 0, sizeof *nf);
-			nf->name = strdup(nm);
+			nf->name = cfg_dup(ps, nm);
+			if (!nf->name)
+				return -1;
 			nf->buckets_log2 = pc->buckets_log2;
 			/* and the parent's autoscale: under the default an empty companion shrinks, then grows back
 			 * while a sweep writes one entry per key - the pair is sized together */
@@ -500,7 +550,9 @@ int cfg_validate(struct pstate *ps, const char *path,
 						"%s\n", nm);
 					return -1;
 				}
-				cfg->cl_colname[cfg->n_cl_col++] = strdup(nm);
+				if (!(cfg->cl_colname[cfg->n_cl_col] = cfg_dup(ps, nm)))
+					return -1;
+				cfg->n_cl_col++;
 			}
 		}
 	}
@@ -551,6 +603,11 @@ int cfg_validate(struct pstate *ps, const char *path,
 				"<cluster port>\n");
 			return -1;
 		}
+		if (cfg->cl_max_dgram && !cfg->cl_lane_port) {
+			PERR(ps, "[cluster] the cluster port is %d, so lane_port "
+				"must be set\n", cfg->cl_port);
+			return -1;
+		}
 		if (!cfg->cl_seeds || !cfg->cl_seeds[strspn(cfg->cl_seeds, ", \t")])
 			LM_WARN("[cluster] discovery = unicast with no seeds - "
 				"this node finds peers only when they find it\n");
@@ -563,6 +620,11 @@ int cfg_validate(struct pstate *ps, const char *path,
 			"= unicast with port and seeds)\n");
 		return -1;
 	}
+	/* said, not refused: a node running such a file today must still start */
+	if (ps->wal_key[0] && !cfg->wal_dir)
+		LM_WARN("[wal] %s is set but [wal] has no dir - there is no WAL and "
+			"no snapshot, and nothing written survives a restart\n",
+			ps->wal_key);
 	if (cfg->wal_segments_max &&
 	    cfg->wal_segments_max < cfg->wal_segments) {
 		PERR(ps, "[wal] segments_max %d is below segments (the floor) "
@@ -694,7 +756,9 @@ int cfg_validate(struct pstate *ps, const char *path,
 					PC_MAX_COLLECTIONS);
 				return -1;
 			}
-			cfg->col[cfg->n_col].name = strdup(cfg->cl_colname[j]);
+			cfg->col[cfg->n_col].name = cfg_dup(ps, cfg->cl_colname[j]);
+			if (!cfg->col[cfg->n_col].name)
+				return -1;
 			cfg->col[cfg->n_col].buckets_log2 = PC_DEFAULT_BUCKETS_LOG2;
 			cfg->n_col++;
 			LM_NOTICE("collection '%s' comes from the cluster and has "

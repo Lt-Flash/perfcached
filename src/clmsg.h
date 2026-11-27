@@ -5,6 +5,9 @@
 #ifndef PC_CLMSG_H
 #define PC_CLMSG_H
 
+/* the longest key a frame may name: every client door's KEY_MAX */
+#define CL_KEY_MAX  4096
+
 #define M_PULL_REQ  2
 #define M_PULL_RSP  3
 #define M_TOMBSTONE 4

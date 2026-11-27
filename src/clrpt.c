@@ -53,6 +53,7 @@ struct tx {
 	int fd, up;
 	unsigned char *q;
 	size_t qlen, qoff, qcap;
+	size_t qfr;                        /* where the first frame not wholly written begins */
 	long long retry_ms, sent_ms;
 };
 static size_t q_total;                 /* queue capacity held, every thread's */
@@ -61,31 +62,45 @@ static __thread int ntx;
 
 static struct tx *tx_for(const pc_addr *to)
 {
+	struct tx *t;
 	int i;
 
 	for (i = 0; i < ntx; i++)
 		if (pc_addr_eq(&tx[i].to, to))
 			return &tx[i];
-	if (ntx >= CLRPT_PEERS)
-		return NULL;
-	memset(&tx[ntx], 0, sizeof tx[ntx]);
-	tx[ntx].to = *to;
-	tx[ntx].fd = -1;
-	return &tx[ntx++];
+	if (ntx < CLRPT_PEERS) {
+		t = &tx[ntx++];
+	} else {
+		/* full: a peer with no connection and nothing queued (gone, or failing) gives
+		 * its entry and its queue's budget to the new one */
+		for (i = 0; i < ntx && (tx[i].fd >= 0 || tx[i].qlen); i++)
+			;
+		if (i == ntx)
+			return NULL;
+		t = &tx[i];
+		free(t->q);
+		__atomic_sub_fetch(&q_total, t->qcap, __ATOMIC_RELAXED);
+	}
+	memset(t, 0, sizeof *t);
+	t->to = *to;
+	t->fd = -1;
+	return t;
+}
+
+static size_t frame_len(const struct tx *t, size_t o)
+{
+	return (size_t)t->q[o] << 24 | (size_t)t->q[o + 1] << 16 |
+		(size_t)t->q[o + 2] << 8 | t->q[o + 3];
 }
 
 /* frames queued and not wholly written: what a broken connection loses */
 static unsigned long long unsent(const struct tx *t)
 {
-	size_t o = 0, n = 0;
+	size_t o = t->qfr, n = 0;
 
 	while (o + 4 <= t->qlen) {
-		size_t fl = (size_t)t->q[o] << 24 | (size_t)t->q[o + 1] << 16 |
-			(size_t)t->q[o + 2] << 8 | t->q[o + 3];
-
-		o += 4 + fl;
-		if (o > t->qoff)
-			n++;
+		o += 4 + frame_len(t, o);
+		n++;
 	}
 	return n;
 }
@@ -97,7 +112,7 @@ static void tx_close(struct tx *t)
 	BUMP(lost_frames, unsent(t));
 	t->fd = -1;
 	t->up = 0;
-	t->qlen = t->qoff = 0;
+	t->qlen = t->qoff = t->qfr = 0;
 	t->retry_ms = mono_ms() + CLRPT_RETRY_MS;
 }
 
@@ -184,8 +199,10 @@ static void tx_write(struct tx *t)
 		tx_close(t);
 		return;
 	}
+	while (t->qfr + 4 <= t->qoff && t->qfr + 4 + frame_len(t, t->qfr) <= t->qoff)
+		t->qfr += 4 + frame_len(t, t->qfr);
 	if (t->qoff == t->qlen)
-		t->qlen = t->qoff = 0;
+		t->qlen = t->qoff = t->qfr = 0;
 }
 
 int clrpt_send(const pc_addr *relay, const unsigned char *f, size_t n)
@@ -204,10 +221,12 @@ int clrpt_send(const pc_addr *relay, const unsigned char *f, size_t n)
 	need = t->qlen - t->qoff + 4 + n;
 	if (need > qmax)
 		goto fallback;
-	if (t->qoff && t->qlen + 4 + n > t->qcap) {
-		memmove(t->q, t->q + t->qoff, t->qlen - t->qoff);
-		t->qlen -= t->qoff;
-		t->qoff = 0;
+	/* compacted from a frame's start, so the queue still parses from qfr */
+	if (t->qfr && t->qlen + 4 + n > t->qcap) {
+		memmove(t->q, t->q + t->qfr, t->qlen - t->qfr);
+		t->qlen -= t->qfr;
+		t->qoff -= t->qfr;
+		t->qfr = 0;
 	}
 	if (t->qlen + 4 + n > t->qcap) {
 		size_t cap = t->qcap ? t->qcap : 65536;
@@ -251,8 +270,9 @@ void clrpt_flush(void)
 
 		tx_check(t);
 		tx_write(t);
-		/* a drained queue a second quiet gives its memory back */
-		if (!t->qlen && t->qcap > 65536 && now - t->sent_ms > 1000) {
+		/* a drained queue gives its memory back: one grown past the base a second
+		 * quiet, the base itself after a minute */
+		if (!t->qlen && t->qcap && now - t->sent_ms > (t->qcap > 65536 ? 1000 : 60000)) {
 			free(t->q);
 			t->q = NULL;
 			__atomic_sub_fetch(&q_total, t->qcap, __ATOMIC_RELAXED);

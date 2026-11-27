@@ -2,6 +2,7 @@
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* clepoch.c - the cluster wire epoch (clepoch.h): owns the committed epoch and the newest this
  * build speaks.  test/clepochtest.c. */
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -12,11 +13,15 @@
 #include "clstate.h"
 #include "clepoch.h"
 #include "logrl.h"
+#include "statefile.h"
 
 /* the epoch this node speaks (the fleet's committed one, from the master's keepalive, persisted
  * as node-epoch so a new master continues with it) and the newest it can */
 static int cl_committed = PC_CL_EPOCH;
 static int cl_epoch_max = PC_CL_EPOCH_MAX;
+/* a commit runs on a client door's thread, an adopt on the peer thread: one at a time, and
+ * one writer of node-epoch */
+static pthread_mutex_t epoch_mx = PTHREAD_MUTEX_INITIALIZER;
 
 /* may we talk to a peer announcing @theirs?  About what the BYTES mean, so checked before the
  * config digest and nothing rescues it; a peer sending no epoch reads as 0 and is refused */
@@ -68,21 +73,24 @@ int peer_speaks(const struct peer *p, int epoch, int *lo, int *hi)
 	return epoch >= *lo && epoch <= *hi;
 }
 
-void epoch_save(void)
+static void epoch_save_locked(void)
 {
-	char path[600], tmp[620];
-	FILE *f;
+	char buf[16];
+	int n;
 
 	if (!cl_state_dir()[0])
 		return;
-	snprintf(path, sizeof path, "%.520s/node-epoch", cl_state_dir());
-	snprintf(tmp, sizeof tmp, "%.600s.tmp", path);
-	f = fopen(tmp, "w");
-	if (!f)
-		return;
-	fprintf(f, "%d\n", cl_committed);
-	if (fclose(f) != 0 || rename(tmp, path) != 0)
-		unlink(tmp);
+	n = snprintf(buf, sizeof buf, "%d\n", cl_committed);
+	if (pc_state_write(cl_state_dir(), "node-epoch", buf, (size_t)n) != 0)
+		LM_WARN("cluster: could not persist wire epoch %d to %s/node-epoch\n",
+			cl_committed, cl_state_dir());
+}
+
+void epoch_save(void)
+{
+	pthread_mutex_lock(&epoch_mx);
+	epoch_save_locked();
+	pthread_mutex_unlock(&epoch_mx);
 }
 
 void epoch_load(void)
@@ -130,7 +138,7 @@ int pc_cluster_epoch_max(void)
 	return cl_epoch_max;
 }
 
-int pc_cluster_epoch_commit(int epoch, char *why, size_t n)
+static int epoch_commit_locked(int epoch, char *why, size_t n)
 {
 	long long now = cl_now_ms();
 	int i, lo, hi;
@@ -174,15 +182,27 @@ int pc_cluster_epoch_commit(int epoch, char *why, size_t n)
 		"live member speaks it; the keepalive carries it\n", cl_committed,
 		epoch, cl_node_id());
 	__atomic_store_n(&cl_committed, epoch, __ATOMIC_RELAXED);
-	epoch_save();
+	epoch_save_locked();
 	cl_st_epoch_commits();
 	return 0;
 }
 
+int pc_cluster_epoch_commit(int epoch, char *why, size_t n)
+{
+	int rc;
+
+	pthread_mutex_lock(&epoch_mx);
+	rc = epoch_commit_locked(epoch, why, n);
+	pthread_mutex_unlock(&epoch_mx);
+	return rc;
+}
+
 void epoch_adopt(int epoch)
 {
+	pthread_mutex_lock(&epoch_mx);
 	__atomic_store_n(&cl_committed, epoch, __ATOMIC_RELAXED);
-	epoch_save();
+	epoch_save_locked();
+	pthread_mutex_unlock(&epoch_mx);
 }
 
 void epoch_set_max(int epoch)

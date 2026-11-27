@@ -19,6 +19,7 @@
 #define PEND_DEFAULT  8192
 #define PEND_LIMIT    (1 << PEND_SLOT_BITS)
 #define PEND_MIN      64
+#define CLPEND_NODE_WORDS 16           /* 1024 bits: node ids are 1..1023 (PC_CL_NODE_MAX) */
 
 /* the parked-request id is a HANDLE: bit 31 tags it, the low PEND_SLOT_BITS index the slot, a
  * per-slot generation between, so a reply after its slot was recycled fails the compare */
@@ -61,6 +62,8 @@ struct pending {
 	int stash_len;
 	long long by;
 	unsigned int ttl_rel;
+	/* the nodes (1..PC_CL_NODE_MAX) whose negative is counted: a duplicated datagram is one */
+	uint64_t neg_from[CLPEND_NODE_WORDS];
 };
 
 struct cqueue {
@@ -89,6 +92,8 @@ struct clpend {
 	/* PC_DONE_RECONCILE slots gone with no verdict; clpend_expire's
 	 * thread reads and zeroes it */
 	unsigned long long reconcile_expired;
+	/* completions that found no queue (none allocated, or full): relaxed atomic */
+	unsigned long long cq_dropped;
 	struct cqueue cq[WORKERS_MAX];
 };
 
@@ -108,6 +113,29 @@ uint32_t clpend_alloc(struct clpend *p, int kind, int expect, int extra_ms,
 		int worker, long long now, int pull_timeout_ms,
 		struct pending **out, int *reason);
 
+/* what a parked request carries besides its handle; col/key are kept only when they fit, or
+ * through @key_long (heap, the slot's once stored) */
+struct clpend_fill {
+	const char *col, *key;
+	size_t collen, klen;
+	char *key_long;
+	unsigned char jop, probe_op;
+	char *stash;
+	int stash_len;
+	long long by;
+	unsigned int ttl_rel;
+};
+
+/* store @f into @slot under the lock while it is still @req's (an expired slot may be another
+ * request's by now): 1 stored, 0 lost - nothing stored, the caller keeps key_long and stash */
+int clpend_fill(struct clpend *p, struct pending *slot, uint32_t req,
+		const struct clpend_fill *f);
+
+/* a broadcast parked for @asked answers reached only @sent peers: what was never asked is not
+ * awaited.  0 = none can answer any more - the slot is released (its stash freed), fail it */
+int clpend_sent(struct clpend *p, struct pending *slot, uint32_t req, int asked,
+		int sent);
+
 /* O(1) by slot; needs the tag AND an exact req match, so a reply for a
  * recycled slot fails the compare.  Caller holds the lock. */
 struct pending *clpend_find(struct clpend *p, uint32_t req);
@@ -122,9 +150,11 @@ int clpend_peak(const struct clpend *p);
 /* the peak of the last five minutes */
 int clpend_peak_win(const struct clpend *p);
 unsigned long long clpend_exhausted(const struct clpend *p);
+unsigned long long clpend_cq_dropped(const struct clpend *p);
 
 /* completion queues: sized to cap, so a post cannot find one full */
-void clpend_cq_register(struct clpend *p, int worker, int efd);
+/* -1 when the queue cannot be allocated: that worker's completions are then dropped */
+int clpend_cq_register(struct clpend *p, int worker, int efd);
 void clpend_cq_post(struct clpend *p, int worker, uint32_t req, int kind,
 		int found, int ok, long long newval, int from_node,
 		unsigned int ttl_left, const unsigned char *val, int vlen,
