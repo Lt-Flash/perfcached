@@ -423,11 +423,12 @@ PY
 	sleep 1
 	m1=$(mails)
 	stop -TERM
-	waitfor 5 '[ -n "$(findmail $n0 "^WARNING: test event on ")" ]'
-	F=$(findmail $n0 "^WARNING: test event on ")
-	[ "$m1" = "$n0" ] && [ -n "$F" ] && body $F | grep -q "stop flush check" &&
+	# found by its text: another entry in the same digest may lead the subject
+	waitfor 5 '[ -n "$(mailwith $n0 "stop flush check")" ]'
+	F=$(mailwith $n0 "stop flush check")
+	[ "$m1" = "$n0" ] && [ -n "$F" ] &&
 		ok "G. digest_s = 600 and a stop 1 s after the event: the digest went out at the stop (mail $F)" ||
-		bad "G. ring '$r', mails before the stop $m1 (was $n0), the event's mail '$F'"
+		bad "G. ring '$r', mails before the stop $m1 (was $n0), the event's mail '$F'; subjects since: $(for i in $(seq $((n0 + 1)) $(mails)); do subj $i; done | tr '\n' '|')"
 
 	# ---- every mail: the MIME form ----------------------------------------------------
 	python3 - "$D/m" "$(hostname)" > "$D/form.out" 2>&1 <<'PY'
