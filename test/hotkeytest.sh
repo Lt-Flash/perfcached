@@ -33,7 +33,6 @@ CONF
 	chmod 600 "$1"
 }
 start() { # start <conf> <log> <half-life s> -> pid in $STARTED
-	: > "$2"
 	PERFCACHED_TEST_HOT_HALF_S=$3 "$BIN" -f "$1" > "$2" 2>&1 &
 	STARTED=$!
 	i=0; while [ $i -lt 80 ] && ! grep -q "perfcached ready" "$2"; do sleep 0.1; i=$((i+1)); done

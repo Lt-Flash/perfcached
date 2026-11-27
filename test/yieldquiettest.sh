@@ -97,12 +97,10 @@ out("ONE_MASTER", int(one) if one >= 0 else -1)
 EOF
 
 for n in 9 1; do conf $n; done
-: > "$D/n9.log"
 "$BIN" -f "$D/n9.conf" > "$D/n9.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n9.log" || { bad "the founder did not start"; echo "yieldquiettest: $pass passed, $fail failed"; exit 1; }
 sleep 1
-: > "$D/n1.log"
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n1.log" || { bad "the member did not start"; echo "yieldquiettest: $pass passed, $fail failed"; exit 1; }

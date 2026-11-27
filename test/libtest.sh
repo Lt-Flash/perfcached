@@ -32,10 +32,8 @@ EOF
 }
 mkconf "$D/pt.conf" 17055 loopback
 mkconf "$D/nx.conf" 17056 never
-: > "$D/pt.log"
 "$BIN" -f "$D/pt.conf" > "$D/pt.log" 2>&1 &
 P1=$!
-: > "$D/nx.log"
 "$BIN" -f "$D/nx.conf" > "$D/nx.log" 2>&1 &
 P2=$!
 i=0

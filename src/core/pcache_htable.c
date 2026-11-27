@@ -547,21 +547,6 @@ static __thread const struct pcache_relay *relay_rl;
 static void drain_carry(pcache_htable_t *ht, const str *key);
 static void drain_forget(pcache_htable_t *ht, const str *key);
 
-/* does @dr hold a copy newer than @ver that has expired?  It deleted every
- * older one: their answer must not come back (no expiry filter here) */
-static int drain_dead_above(pcache_htable_t *dr, const str *key,
-		unsigned long long ver, unsigned int now)
-{
-	unsigned long long vo = 0;
-	unsigned int lo = 0, eo = 0;
-	int r;
-
-	ht_nostat++;
-	r = fetch_core(dr, key, NULL, 0, &lo, 0, &eo, NULL, NULL, &vo);
-	ht_nostat--;
-	return r >= 0 && vo > ver && eo && eo <= now;
-}
-
 /* S459: @ht's own read, and on a miss the table its resize is draining -
  * a record written there after the copier passed it is not here yet.  An
  * answer from there counts as this table's hit (S340's rule). */
@@ -580,18 +565,6 @@ static int fetch_main(pcache_htable_t *ht, const str *key,
 		*ver_out = vn;
 	if (!(dr = __atomic_load_n(&ht->drain_from, __ATOMIC_ACQUIRE)))
 		return rc;
-	if (rc != -2 && drain_dead_above(dr, key, vn, now)) {
-		*vlen_out = 0;
-		if (ll_out)
-			*ll_out = 0;
-		if (ver_out)
-			*ver_out = 0;
-		if (rc != -1 && !ht_nostat && (unsigned int)process_no < ht->pstats_n) {
-			ht->pstats[process_no].hits--;
-			ht->pstats[process_no].misses++;
-		}
-		return -2;
-	}
 	if (rc != -2) {
 		/* a hit can be older: the live table took a write after the last
 		 * pre-swap pass copied this key (applythreadstest, a read backwards) */
@@ -731,22 +704,6 @@ void pcache_ht_set_shadow(pcache_htable_t *ht, pcache_htable_t *shadow)
 void pcache_ht_set_drain(pcache_htable_t *ht, pcache_htable_t *from)
 {
 	__atomic_store_n(&ht->drain_from, from, __ATOMIC_RELEASE);
-}
-
-void pcache_ht_set_write_to(pcache_htable_t *ht, pcache_htable_t *to)
-{
-	__atomic_store_n(&ht->write_to, to, __ATOMIC_RELEASE);
-}
-
-/* a write resolved to a resize's old table before the swap goes to the live one: the closing
- * drain empties the old table, and what landed there after its walk would be lost */
-pcache_htable_t *pcache_ht_write_target(pcache_htable_t *ht)
-{
-	pcache_htable_t *to;
-
-	while (ht && (to = __atomic_load_n(&ht->write_to, __ATOMIC_ACQUIRE)) != NULL)
-		ht = to;
-	return ht;
 }
 
 int pcache_ht_probe_present(pcache_htable_t *ht, const str *key,
@@ -1297,10 +1254,7 @@ static int store_impl(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned long long inver, int use_ver, int keep_wt,
 		unsigned int inwtick)
 {
-	int rc;
-
-	ht = pcache_ht_write_target(ht);
-	rc = store_body(ht, key, val, expires, rflags, inver, use_ver,
+	int rc = store_body(ht, key, val, expires, rflags, inver, use_ver,
 		keep_wt, inwtick);
 
 	drain_forget(ht, key);                /* OM2-9 */
@@ -1747,13 +1701,6 @@ int pcache_ht_store_copy(pcache_htable_t *ht, const str *key, const str *val,
 	return store_impl(ht, key, val, expires, rflags, ver, 1, 1, wtick);
 }
 
-int pcache_ht_store_copy_held(pcache_htable_t *ht, const str *key, const str *val,
-		unsigned int expires, unsigned char rflags,
-		unsigned long long ver, unsigned int wtick)
-{
-	return store_body(ht, key, val, expires, rflags, ver, 1, 1, wtick);
-}
-
 static int add_ex_body(pcache_htable_t *ht, const str *key, long long delta,
 		unsigned int expires, long long *new_val,
 		unsigned int *eff_expires);
@@ -1762,10 +1709,7 @@ int pcache_ht_add_ex(pcache_htable_t *ht, const str *key, long long delta,
 		unsigned int expires, long long *new_val,
 		unsigned int *eff_expires)
 {
-	int rc;
-
-	ht = pcache_ht_write_target(ht);
-	rc = add_ex_body(ht, key, delta, expires, new_val, eff_expires);
+	int rc = add_ex_body(ht, key, delta, expires, new_val, eff_expires);
 
 	drain_forget(ht, key);                /* OM2-9 */
 	return rc;
@@ -1800,20 +1744,19 @@ static int add_ex_body(pcache_htable_t *ht, const str *key, long long delta,
 	tag = tag_of(hash);
 
 	/* the counter record is pre-built outside any lock (3.5b); it either
-	 * becomes the entry (absent key / string conversion) or is freed.  A
-	 * refused carve does not end an accumulate in place (as store_body) */
+	 * becomes the entry (absent key / string conversion) or is freed */
 	nr = pcache_cell_alloc(PCACHE_REC_SIZE(key->len, 8));
-	if (nr) {
-		nr->rflags = PCACHE_F_INT;
-		nr->klen = (unsigned short)key->len;
-		nr->vlen = 8;
-		nr->expires = expires;
-		nr->hash = hash;
-		nr->wtick = get_ticks();
-		nr->ver = 0;                  /* stamped under the lock (S234) */
-		memcpy(nr->data, key->s, key->len);
-		memcpy(nr->data + key->len, &delta, 8);
-	}
+	if (!nr)
+		return -1;
+	nr->rflags = PCACHE_F_INT;
+	nr->klen = (unsigned short)key->len;
+	nr->vlen = 8;
+	nr->expires = expires;
+	nr->hash = hash;
+	nr->wtick = get_ticks();
+	nr->ver = 0;                          /* stamped under the lock (S234) */
+	memcpy(nr->data, key->s, key->len);
+	memcpy(nr->data + key->len, &delta, 8);
 	cur = delta;
 
 again:
@@ -1832,24 +1775,11 @@ again:
 	i = chain_find(b, key, hash, tag, &w);
 	if (i >= 0) {
 		r = w->slot[i];
-		if (r->expires && r->expires <= get_ticks()) {
-			/* past its deadline, not swept yet: absent, as a read says */
-			if (!nr)
-				goto full;
-			nr->ver = pcache_last_ver = ver_local(r);
-			__atomic_add_fetch(&b->version, 1, __ATOMIC_ACQ_REL);
-			w->slot[i] = nr;
-			__atomic_add_fetch(&b->version, 1, __ATOMIC_ACQ_REL);
-			hint_update(ht, idx, eff);
-			old = r;
-			goto done;
-		}
 		if (r->rflags & PCACHE_F_INT) {
 			/* fixed-width accumulate; the payload may be unaligned, so
 			 * it changes under the version, never bare */
 			memcpy(&cur, r->data + r->klen, 8);
-			if (__builtin_add_overflow(cur, delta, &cur))
-				goto ovf;
+			cur += delta;
 			__atomic_add_fetch(&b->version, 1, __ATOMIC_ACQ_REL);
 			memcpy(r->data + r->klen, &cur, 8);
 			if (!keep) {
@@ -1870,10 +1800,7 @@ again:
 		/* string record: convert on first touch if numeric */
 		if (pcache_str2ll(r->data + r->klen, r->vlen, &cur) < 0)
 			goto nan;
-		if (__builtin_add_overflow(cur, delta, &cur))
-			goto ovf;
-		if (!nr)
-			goto full;
+		cur += delta;
 		memcpy(nr->data + key->len, &cur, 8);
 		if (keep)
 			nr->expires = r->expires;
@@ -1889,8 +1816,6 @@ again:
 	}
 
 	/* absent: nr already carries the delta as the initial value */
-	if (!nr)
-		goto full;
 	tail = chain_tail(b, &n);
 	if (bkt_used(tail) == PCACHE_SLOTS && !node) {
 		bkt_clear_owner(b);
@@ -1935,27 +1860,10 @@ nan:
 	bkt_clear_owner(b);
 	lock_release(&b->lock);
 	PCACHE_REJECT_LOG("value of <%.*s> is not an integer\n", key->len, key->s);
-	if (nr)
-		pcache_cell_free(nr);
+	pcache_cell_free(nr);
 	if (node)
 		pcache_opool_put(&ht->opool, node);
 	return -1;
-
-ovf:
-	bkt_clear_owner(b);
-	lock_release(&b->lock);
-	if (nr)
-		pcache_cell_free(nr);
-	if (node)
-		pcache_opool_put(&ht->opool, node);
-	return -3;
-
-full:
-	bkt_clear_owner(b);
-	lock_release(&b->lock);
-	if (node)
-		pcache_opool_put(&ht->opool, node);
-	return -2;
 }
 
 int pcache_ht_add(pcache_htable_t *ht, const str *key, long long delta,
@@ -1977,7 +1885,6 @@ int pcache_ht_add(pcache_htable_t *ht, const str *key, long long delta,
  * path is written beside the line that has to publish it. */
 __thread unsigned long long pcache_last_ver;
 __thread unsigned long long pcache_last_del_ver;
-__thread int pcache_last_del_dead;
 
 /* Both of these take the bucket lock rather than riding the optimistic
  * read path.  They are a boot-time replay and an inspection surface, not
@@ -2047,11 +1954,6 @@ static int getver_impl(pcache_htable_t *ht, const str *key,
 		*ver = vo;                     /* the newer copy, as fetch_main reads */
 		if (wtick)
 			*wtick = wo;
-	} else if (rc == 0 && drain_dead_above(dr, key, *ver, now)) {
-		*ver = 0;
-		if (wtick)
-			*wtick = 0;
-		return -2;
 	}
 	return rc;
 }
@@ -2125,9 +2027,6 @@ again:
 			(void)store_body(ht, &k, &v, r->expires, (unsigned char)
 				(r->rflags & (PCACHE_F_PASSIVE | PCACHE_F_CARRY)),
 				r->ver, 1, 1, r->wtick);
-		} else if (nver && r->ver > nver) {
-			/* newer and expired: the older copy here is deleted, not carried */
-			(void)pcache_ht_remove_below(ht, key, r->ver);
 		}
 	}
 	bkt_clear_owner(b);
@@ -2158,10 +2057,7 @@ static int setver_body(pcache_htable_t *ht, const str *key,
 int pcache_ht_setver(pcache_htable_t *ht, const str *key,
 		unsigned long long ver)
 {
-	int rc;
-
-	ht = pcache_ht_write_target(ht);
-	rc = setver_body(ht, key, ver);
+	int rc = setver_body(ht, key, ver);
 
 	drain_forget(ht, key);                /* OM2-9 */
 	return rc;
@@ -2213,10 +2109,7 @@ static int touch_body(pcache_htable_t *ht, const str *key,
 static int touch_inner(pcache_htable_t *ht, const str *key,
 		unsigned int expires, int adopt, int *was_passive)
 {
-	int rc;
-
-	ht = pcache_ht_write_target(ht);
-	rc = touch_body(ht, key, expires, adopt, was_passive);
+	int rc = touch_body(ht, key, expires, adopt, was_passive);
 
 	drain_forget(ht, key);                /* OM2-9 */
 	return rc;
@@ -2250,8 +2143,6 @@ again:
 	}
 
 	i = chain_find(b, key, hash, tag, &w);
-	if (i >= 0 && w->slot[i]->expires && w->slot[i]->expires <= get_ticks())
-		i = -1;                        /* expired, not swept: absent */
 	if (i >= 0) {
 		r = w->slot[i];
 		__atomic_fetch_or(&r->rflags, shortened_fl(r, expires),
@@ -2301,28 +2192,9 @@ int pcache_ht_touch_adopt(pcache_htable_t *ht, const str *key,
 	return touch_inner(ht, key, expires, 1, was_passive);
 }
 
-static int remove_one(pcache_htable_t *ht, const str *key,
-		unsigned long long *ver, unsigned long long below, int drop);
-
-/* a delete reaches the table a resize drains first, the order drain_carry
- * copies in; it answers 1 when either table held the key */
-static int remove_impl(pcache_htable_t *ht, const str *key,
-		unsigned long long *ver, unsigned long long below, int drop)
-{
-	pcache_htable_t *dr = drop ? NULL :
-		__atomic_load_n(&ht->drain_from, __ATOMIC_ACQUIRE);
-	int d = dr ? remove_one(dr, key, NULL, below, 0) : 0;
-
-	if (remove_one(ht, key, ver, below, drop))
-		return 1;
-	if (d)
-		HT_ST(ht, removes);
-	return d;
-}
-
 /* @below: 0 = any copy, else only one whose version is under it.  @drop:
  * S244's drop - the delete's bookkeeping (last_del_ver, removes) left alone */
-static int remove_one(pcache_htable_t *ht, const str *key,
+static int remove_impl(pcache_htable_t *ht, const str *key,
 		unsigned long long *ver, unsigned long long below, int drop)
 {
 	pcache_bucket_t *b;
@@ -2366,8 +2238,6 @@ again:
 	 * pcache_ht_remove_ver.  S240: EVERY remove stamps it, and leaves it
 	 * for the WAL's delete record (pcache_last_del_ver) */
 	if (!drop) {
-		if (dead)
-			pcache_last_del_dead = dead->expires && dead->expires <= get_ticks();
 		pcache_last_del_ver = ver_local(dead);
 		/* S252: a write of this key after the delete - on any thread,
 		 * under this lock - must stamp above it, and with no record
@@ -2473,8 +2343,8 @@ static PC_NO_ASAN int snapshot_slot(pcache_bucket_t *b, unsigned int i,
 			if (PCACHE_REC_HDR + klen > bound)
 				klen = bound - PCACHE_REC_HDR;
 			vlen = r->vlen;
-			if (vlen > bound - PCACHE_REC_HDR - klen)
-				vlen = bound - PCACHE_REC_HDR - klen;  /* subtractive: see scan_bucket */
+			if (PCACHE_REC_HDR + klen + vlen > bound)
+				vlen = bound - PCACHE_REC_HDR - klen;  /* see scan_bucket */
 			pc_raw_copy(kbuf, r->data, klen);
 			/* vbuf NULL = keys-only enumeration (S40): the value
 			 * memcpy is not just cycles, it TOUCHES the value's
@@ -2833,57 +2703,6 @@ out:
 	return rc < 0 ? rc : 0;
 }
 
-/* one record handed over in place, its bucket locked by the caller */
-static int emit_locked(pcache_iter_meta_cb cb, void *ctx, const pcache_rec_t *r)
-{
-	struct pcache_rec_meta mt = { .expires = r->expires, .wtick = r->wtick,
-		.rflags = r->rflags, .ver = r->ver };
-	char nb[24];
-	long long ll;
-	str k, v;
-
-	k.s = (char *)r->data;
-	k.len = r->klen;
-	v.s = (char *)r->data + r->klen;
-	v.len = (int)r->vlen;
-	if ((r->rflags & PCACHE_F_INT) && r->vlen == 8) {
-		memcpy(&ll, v.s, 8);
-		v.len = snprintf(nb, sizeof nb, "%lld", ll);
-		v.s = nb;
-	}
-	return cb(&k, &v, &mt, ctx);
-}
-
-int pcache_ht_iter_locked_from(pcache_htable_t *ht, unsigned int *cursor,
-		pcache_iter_meta_cb cb, void *ctx)
-{
-	unsigned int idx, j;
-	int rc = 0;
-
-	idx = (*cursor & PCACHE_CURSOR_OVF) ? 0 : *cursor & ~PCACHE_CURSOR_BKT;
-	for (; idx < ht->nbuckets; idx++) {
-		pcache_bucket_t *home = bucket_at(ht, idx), *b;
-
-		if (!bkt_tag_word(home) && !(home->meta & PCACHE_BKT_LINK))
-			continue;                  /* empty, as walk_bucket reads it */
-		/* LOCK ORDER: the callback takes the other table's bucket locks under this one; a
-		 * resize goes old table -> new table only (drain_carry, the copier), never back */
-		lock_get(&home->lock);
-		bkt_set_owner(home);
-		for (b = home; b && rc >= 0; b = bkt_next(b))
-			for (j = 0; j < bkt_used(b) && rc >= 0; j++)
-				rc = emit_locked(cb, ctx, b->slot[j]);
-		bkt_clear_owner(home);
-		lock_release(&home->lock);
-		if (rc < 0) {
-			*cursor = PCACHE_CURSOR_BKT | idx;   /* this bucket again, whole */
-			return rc;
-		}
-	}
-	*cursor = 0;
-	return 0;
-}
-
 int pcache_ht_iter_meta(pcache_htable_t *ht, pcache_iter_meta_cb cb,
 		void *ctx)
 {
@@ -2975,8 +2794,7 @@ int pcache_ht_scan_ex(pcache_htable_t *ht, unsigned int *cursor,
 			goto out;
 	}
 
-	/* a split during the walk adds buckets past @nb: complete only against a fresh count */
-	*cursor = idx < __atomic_load_n(&ht->nbuckets, __ATOMIC_ACQUIRE) ? idx : 0;
+	*cursor = idx < nb ? idx : 0;     /* more, or complete */
 out:
 	return rc < 0 ? rc : 0;
 }
@@ -3640,10 +3458,8 @@ static int ensure_segment(pcache_htable_t *ht, unsigned int idx)
 	for (i = 0; i < PCACHE_SEG_SIZE; i++)
 		lock_init(&seg[i].lock);
 	hseg = hint_block(ht, s);
-	if (!hseg) {
-		(void)pcache_region_free(seg, (unsigned long)PCACHE_SEG_SIZE * sizeof *seg);
+	if (!hseg)
 		return -1;
-	}
 	ht->hint_seg[s] = hseg;
 	__atomic_store_n(&ht->seg[s], seg, __ATOMIC_RELEASE);
 	return 1;
@@ -3909,7 +3725,7 @@ pcache_htable_t *pcache_htable_new(unsigned int size_log2)
 		seg = pcache_region_alloc(
 			(unsigned long)PCACHE_SEG_SIZE * sizeof *seg);
 		if (!seg)
-			goto fail;
+			return NULL;
 		memset(seg, 0, (unsigned long)PCACHE_SEG_SIZE * sizeof *seg);
 		for (i = 0; i < PCACHE_SEG_SIZE; i++)
 			lock_init(&seg[i].lock);
@@ -3917,7 +3733,7 @@ pcache_htable_t *pcache_htable_new(unsigned int size_log2)
 
 		ht->hint_seg[s] = hint_block(ht, s);
 		if (!ht->hint_seg[s])
-			goto fail;
+			return NULL;
 	}
 	(void)done;
 
@@ -3925,7 +3741,7 @@ pcache_htable_t *pcache_htable_new(unsigned int size_log2)
 	ht->pstats = pcache_region_alloc(
 		(unsigned long)ht->pstats_n * sizeof *ht->pstats);
 	if (!ht->pstats)
-		goto fail;
+		return NULL;
 	memset(ht->pstats, 0,
 		(unsigned long)ht->pstats_n * sizeof *ht->pstats);
 	/* S151: inherit the client slot range, or every slot if none was set */
@@ -3942,9 +3758,6 @@ pcache_htable_t *pcache_htable_new(unsigned int size_log2)
 
 	LM_DBG("table ready: %u buckets in %u segments\n", nbuckets, s);
 	return ht;
-fail:
-	(void)pcache_htable_retire(ht);        /* what was carved; its loops skip the rest */
-	return NULL;
 }
 
 

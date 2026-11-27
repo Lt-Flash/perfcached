@@ -55,7 +55,7 @@ CONF
 	chmod 600 "$D/n$1.conf"; mkdir -p "$D/s$1" "$D/w$1"
 }
 start() {
-	LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_LINGER_MARK="$D/linger" PC_LINGER_LOG="$D/linger.log" PC_LINGER_S=4 \
+	LD_PRELOAD="$PRELOAD" PC_LINGER_MARK="$D/linger" PC_LINGER_LOG="$D/linger.log" PC_LINGER_S=4 \
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & echo $! > "$D/n$1.pid"; }
 st() { # st <n> <python expr over r> -> value or ?
 	python3 -c 'import json,sys,urllib.request

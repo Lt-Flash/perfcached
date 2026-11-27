@@ -42,8 +42,7 @@ collections = 0
 buckets_log2 = 10
 C
 	chmod 600 "$D/n$1.conf"
-	: >> "$D/n$1.log"   # before the start: the background child may open it after the first grep
-	n0=$(grep -c "perfcached ready" "$D/n$1.log")
+	n0=$(grep -c "perfcached ready" "$D/n$1.log" 2>/dev/null || echo 0)
 	if [ -n "${2:-}" ]; then PERFCACHED_TEST_EPOCH_MAX=$2 "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
 	else "$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & fi
 	eval "P${1}ID=\$!"
@@ -82,12 +81,6 @@ M=$(master); [ "$M" != 0 ] && ok "the master is node $M" || bad "no master"
 	ok "1. the fleet speaks wire epoch 4; node 1 speaks 4..4, nodes 2 and 3 speak 4..5 (the test flag)" || bad "1. committed $(ep 1 committed)/$(ep 2 committed)/$(ep 3 committed), max $(ep 1 max)/$(ep 2 max)/$(ep 3 max), min $(ep 1 min)/$(ep 2 min)"
 r=$(st 1 "sorted(tuple(m['wire_epochs']) for m in s['cluster']['members'] if m.get('wire_epochs'))" 2>&1)
 case "$r" in *"(4, 4)"*"(4, 5)"*) ok "1. /members lists every member's range: $r" ;; *) r=$(python3 -c 'import json,urllib.request; m=json.load(urllib.request.urlopen("http://127.0.86.1:18821/members",timeout=5)); print(sorted(tuple(x["wire_epochs"]) for x in (m.get("members") or m) if isinstance(x,dict) and x.get("wire_epochs")))' 2>&1); case "$r" in *"(4, 4)"*"(4, 5)"*) ok "1. /members lists every member's range: $r" ;; *) bad "1. members' wire_epochs: $r" ;; esac ;; esac
-r=$(python3 -c 'import json,urllib.request
-g=lambda p: json.load(urllib.request.urlopen("http://127.0.86.1:18821"+p,timeout=5))
-m=g("/members"); m=[x for x in (m.get("members") if isinstance(m,dict) else m) if isinstance(x,dict)]
-own=g("/stats")["rev"][:7]; revs=[x.get("rev") for x in m]
-print(("ok" if len(m)==3 and len(own)==7 and all(v==own for v in revs) else "bad"), own, revs)' 2>&1)
-case "$r" in ok*) ok "1. /members names every member's build rev, the same as this node's own: ${r#ok }" ;; *) bad "1. members' rev: $r" ;; esac
 grep -q "PERFCACHED_TEST_EPOCH_MAX=5 - this build CLAIMS to speak wire epochs 4..5 (a test flag; the codecs are those of 4)" "$D/n2.log" && ! grep -q "PERFCACHED_TEST_EPOCH_MAX" "$D/n1.log" &&
 	ok "1. the test flag is announced in the log - a claim, the codecs are 4's (node 2; node 1, without it, says nothing)" || bad "1. flag warning: n2.log $(grep -h -m1 PERFCACHED_TEST_EPOCH_MAX "$D/n2.log" | cut -c1-140), n1.log $(grep -c PERFCACHED_TEST_EPOCH_MAX "$D/n1.log")"
 # ---- 2. a commit refused: node 1 cannot speak 5; a non-master cannot commit ------------------
@@ -118,12 +111,6 @@ sleep 4
 [ "$(st $M "s['cluster']['epoch_refused']")" -gt "$R0" ] && ok "4. epoch_refused counts it on the master ($R0 -> $(st $M "s['cluster']['epoch_refused']"))" || bad "4. epoch_refused $R0 -> $(st $M "s['cluster']['epoch_refused']")"
 # the fleet SPEAKS 5: node 4 refuses the master's keepalive by both numbers before it could even adopt
 grep -q -E "REFUSING master keepalive .* speaks cluster wire epoch 5 and we speak 4..4|committed the fleet to wire epoch 5, which this build does not speak" "$D/n4.log" && ok "4. node 4 says why it cannot stay: the fleet speaks 5, it speaks 4..4" || bad "4. n4.log: $(grep -h -E 'epoch|REFUS' "$D/n4.log" | tail -2 | cut -c1-140 | tr '\n' '|')"
-# its keepalives keep coming once a second: refused before they are taken in, so said once, not
-# admitted and expelled again on every beat
-RF=$(grep -c "REFUSING node .*(127.0.86.4) - it speaks wire epochs" "$D/n$M.log")
-DR=$(grep -c "(127.0.86.4) was dropped (refused)" "$D/n$M.log")
-[ "$RF" -le 1 ] && [ "$DR" -le 2 ] && ok "4. the master refused node 4's keepalives before taking them in: $RF refusal line(s), dropped $DR time(s) in 4 s" \
-	|| bad "4. the master logged $RF refusals and dropped node 4 $DR time(s) in 4 s - each keepalive was published first, then expelled"
 kill -9 $P4ID 2>/dev/null; P4ID=
 # ---- 5. the master restarted: the committed epoch survives ------------------------------------------
 eval "mp=\$P${M}ID"; kill $mp 2>/dev/null; wait $mp 2>/dev/null; eval "P${M}ID="

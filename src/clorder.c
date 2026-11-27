@@ -32,20 +32,15 @@ int clorder_take_back(pcache_htable_t *ht, const str *k, unsigned long long ver,
 int clorder_del(pcache_htable_t *ht, pcache_htable_t *shadow, const str *k,
 		unsigned long long ver)
 {
-	int rc, rs = 0;
-
 	if (clorder_test_hook)
 		clorder_test_hook(CLORDER_DEL, k);
-	/* @ht first, the resize copier's source (pc_store_del_order): either one's hit is a delete */
 	if (!ver) {                        /* an older sender: unversioned */
-		rc = pcache_ht_remove(ht, k) == 1;
 		if (shadow)
-			rs = pcache_ht_remove(shadow, k);
-		return rc || rs == 1;
+			(void)pcache_ht_remove(shadow, k);
+		return pcache_ht_remove(ht, k) == 1;
 	}
 	/* a write newer than the delete stays, checked under the bucket lock */
-	rc = pcache_ht_remove_upto(ht, k, ver) == 1;
 	if (shadow)
-		rs = pcache_ht_remove_upto(shadow, k, ver);
-	return rc || rs == 1;
+		(void)pcache_ht_remove_upto(shadow, k, ver);
+	return pcache_ht_remove_upto(ht, k, ver) == 1;
 }

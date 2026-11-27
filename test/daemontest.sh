@@ -31,7 +31,6 @@ plaintext = loopback
 buckets_log2 = 12
 EOF
 
-: > "$D/log"
 "$BIN" -f "$D/s6.conf" > "$D/log" 2>&1 &
 PID=$!
 
@@ -136,7 +135,6 @@ fi
 # check above would be refusing everything
 sed 's/16479/16480/; s|other.sock|third.sock|' "$D/samesock.conf" \
 	> "$D/otherport.conf"
-: > "$D/log4"
 "$BIN" -f "$D/otherport.conf" > "$D/log4" 2>&1 &
 P4=$!
 i=0

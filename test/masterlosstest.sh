@@ -62,14 +62,7 @@ start() { # start <n>
 	done
 	echo "node $1 did not start: $(tail -2 "$D/n$1.log" | tr '\n' ' ')"; return 1
 }
-# killed, reaped and its port free: kill -9 returns before the process is gone, and the next phase
-# starting node <n> at once found "127.0.0.1:1736<n> is already in use"
-stop_kill() {
-	_p=$(cat "$D/n$1.pid" 2>/dev/null); rm -f "$D/n$1.pid"
-	[ -n "$_p" ] || return 0
-	kill -9 "$_p" 2>/dev/null; wait "$_p" 2>/dev/null
-	_i=0; while [ $_i -lt 100 ] && ss -ltn 2>/dev/null | grep -q "127.0.0.1:1736$1[[:space:]]"; do sleep 0.1; _i=$((_i+1)); done
-}
+stop_kill() { kill -9 "$(cat "$D/n$1.pid" 2>/dev/null)" 2>/dev/null; rm -f "$D/n$1.pid"; }
 st() { # st <n>: "role mapnodes term seq entries"
 	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"stats"}' | timeout 10 python3 -c '
 import json, socket, sys, pcnative

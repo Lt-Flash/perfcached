@@ -37,7 +37,6 @@ collections = c
 EOF
 }
 start() { # start <id> <pidvar>
-	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "$2=\$!"
 	i=0

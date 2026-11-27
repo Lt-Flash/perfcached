@@ -389,8 +389,8 @@ static int add_allow(struct pstate *ps, const char *v, const char *what,
 		host++;
 	}
 	memset(&list[*n], 0, sizeof list[*n]);
-	if (inet_pton(AF_INET, host, &ia) == 1) {
-		/* IPv4, a full dotted quad: inet_aton's "10/8" would be 0.0.0.10 */
+	if (inet_aton(host, &ia)) {
+		/* IPv4 - inet_aton's short forms ("10/8") included */
 		if (slash && parse_int(ps, slash + 1, 0, 32, &len))
 			return -1;
 		list[*n].family = AF_INET;
@@ -410,22 +410,16 @@ static int add_allow(struct pstate *ps, const char *v, const char *what,
 	list[*n].bits = len;
 	{
 		/* the network, masked */
-		int i, nb = list[*n].family == AF_INET ? 4 : 16, cut = 0;
-		char net[INET6_ADDRSTRLEN];
+		int i, nb = list[*n].family == AF_INET ? 4 : 16;
 
 		for (i = 0; i < nb; i++) {
 			int keep = len - i * 8;
-			unsigned char was = list[*n].net[i];
 
 			if (keep <= 0)
 				list[*n].net[i] = 0;
 			else if (keep < 8)
 				list[*n].net[i] &= (unsigned char)(0xFFu << (8 - keep));
-			cut |= was != list[*n].net[i];
 		}
-		if (cut && inet_ntop(list[*n].family, list[*n].net, net, sizeof net))
-			compat_log(L_WARN, "WARNING", "%s:%d: %s '%s' has host bits set past "
-				"its prefix - taken as %s/%d\n", ps->path, ps->line, what, v, net, len);
 	}
 	(*n)++;
 	return 0;
@@ -897,7 +891,7 @@ void pc_config_dump(const struct pc_config *cfg)
 }
 
 /* CWE-14: the raw secrets are zeroed once the PSKs are derived; NULL-tolerant for a failed
- * parse.  The enable secrets, resp_password and http_token are wiped in pc_config_free. */
+ * parse.  resp_password and http_token are compared for life: wiped at teardown instead. */
 #ifdef PC_TESTHOOKS
 int pc_test_secret_wipes;
 #endif
@@ -940,28 +934,6 @@ void pc_config_free(struct pc_config *cfg)
 	if (cfg->http_token)
 		sodium_memzero(cfg->http_token, strlen(cfg->http_token));
 	free(cfg->http_token);
-	/* the enable secrets and the RESP password: compared through doorlive's copies */
-	for (i = 0; i < cfg->n_enable_secrets; i++) {
-		if (!cfg->enable_secret[i])
-			continue;
-		sodium_memzero(cfg->enable_secret[i], strlen(cfg->enable_secret[i]));
-#ifdef PC_TESTHOOKS
-		pc_test_secret_wipes++;
-#endif
-		free(cfg->enable_secret[i]);
-	}
-	if (cfg->resp_password) {
-		sodium_memzero(cfg->resp_password, strlen(cfg->resp_password));
-#ifdef PC_TESTHOOKS
-		pc_test_secret_wipes++;
-#endif
-	}
-	free(cfg->resp_password);
-	free(cfg->resp_collections);
-	free(cfg->cl_site_salt);
-	free(cfg->cl_collections);
-	for (i = 0; i < cfg->n_cl_col; i++)
-		free(cfg->cl_colname[i]);
 	free(cfg->tls_cert);
 	free(cfg->tls_key);
 	for (i = 0; i < cfg->n_listen; i++)

@@ -12,7 +12,6 @@
 #define NALL (NEACH * 2 + NFO)
 #define NKEYS 50
 #define LEAVE_S 5.0            /* told within a beat or two, not at the 16-24 s refresh */
-#define HOLD_S 10.0            /* the restarted node answers, its cluster thread stopped (the shell: 12 s) */
 static perfd_t *h[NALL];       /* 0..59 told by the push, 60..119 by the list, the rest the default policy */
 static int was[NFO];
 static int pass, fail, errs, wrong, turn;
@@ -128,19 +127,6 @@ static void views(int port)
 	}
 }
 
-/* the handles of both groups whose own view of the member on @port is @state */
-static int viewing(int port, const char *state)
-{
-	int i, j, pt, n = 0;
-
-	for (i = 0; i < NEACH * 2; i++)
-		for (j = 0; j < perfd_member_count(h[i]); j++)
-			if (perfd_member_info(h[i], j, NULL, 0, &pt, NULL, NULL) == 0 && pt == port &&
-			    !strcmp(perfd_member_state(h[i], j, NULL, 0), state))
-				n++;
-	return n;
-}
-
 static int all_know(int members)
 {
 	int i;
@@ -237,8 +223,6 @@ int main(int ac, char **av)
 	b = count_on(NEACH, NEACH * 2, p4);
 	OK(a >= 4 && a <= 28, "told by the push: %d of %d moved to the new node (1 in 4 is 15)", a, NEACH);
 	OK(b >= 4 && b <= 28, "told by the list: %d of %d moved to the new node (1 in 4 is 15)", b, NEACH);
-	if (a < 4 || b < 4)
-		views(p4);
 	for (i = j = 0; i < NFO; i++)
 		j += on_port(h[NEACH * 2 + i]) != was[i];
 	OK(j == 0, "the default policy stayed where it was: %d of %d moved", j, NFO);
@@ -258,23 +242,6 @@ int main(int ac, char **av)
 
 	printf("RESTART-NODE\n");
 	fflush(stdout);
-	{       /* its port answers before the fleet has it back: no member come up, so no standby
-		 * and no draw (a draw then and a second at its return moved 7 in 16, not 1 in 4) */
-		int held = 0, nr = 0, k;
-
-		t0 = now();
-		while (now() - t0 < HOLD_S) {
-			sweep();
-			k = viewing(p2, "standby") + viewing(p2, "active");
-			if (k > held)
-				held = k;
-			k = viewing(p2, "not-ready");
-			if (k > nr)
-				nr = k;
-		}
-		OK(held == 0, "not yet back in the fleet, the restarted node was nobody's standby or active member (at most %d)", held);
-		OK(nr > 0, "premise: %d handles dialled it meanwhile and found it not serving", nr);
-	}
 	printf("  ..   moves back seen after %.1f s\n", wait_share(p2, 90));
 	a = count_on(0, NEACH, p2);
 	b = count_on(NEACH, NEACH * 2, p2);

@@ -33,11 +33,8 @@ EOF
 }
 mkconf "$D/pt.conf" 17045 loopback
 mkconf "$D/nx.conf" 17046 never
-sed -i 's/^cluster = cli-cluster-secret$/&\nenable = cli-enable-secret/' "$D/nx.conf"
-: > "$D/pt.log"
 "$BIN" -f "$D/pt.conf" > "$D/pt.log" 2>&1 &
 P1=$!
-: > "$D/nx.log"
 "$BIN" -f "$D/nx.conf" > "$D/nx.log" 2>&1 &
 P2=$!
 i=0
@@ -185,39 +182,6 @@ assert h == ['set c pty "edited value"', "get c pty"], h
 os.unlink(hist)
 EOF
 [ $? -eq 0 ] && ok || bad "line editor pty session"
-# three lines pasted at the prompt in one write: each runs, none is thrown away between them
-python3 - "$CLI" "$D" <<'EOF'
-import os, pty, select, subprocess, sys, time
-m, sl = pty.openpty()
-env = dict(os.environ, HOME=sys.argv[2])
-p = subprocess.Popen([sys.argv[1], "-p", "17045"], stdin=sl, stdout=sl, stderr=sl,
-    env=env, close_fds=True)
-os.close(sl)
-out = b""
-def drain(t):
-    global out
-    end = time.time() + t
-    while time.time() < end:
-        r, _, _ = select.select([m], [], [], 0.1)
-        if r:
-            try:
-                d = os.read(m, 65536)
-                if not d: break
-                out += d
-            except OSError: break
-end = time.time() + 15
-while time.time() < end and b">" not in out:
-    drain(0.2)
-os.write(m, b"set c paste1 one\rset c paste2 two\rset c paste3 three\r")
-end = time.time() + 10
-while time.time() < end and out.count(b'"stored"') < 3:
-    drain(0.2)
-os.write(m, b"\x04"); drain(0.5)
-p.wait()
-EOF
-R=$(pc get c paste2; pc get c paste3)
-echo "$R" | grep -q '"value":"two"' && echo "$R" | grep -q '"value":"three"' && ok \
-	|| bad "a paste of three lines at the prompt lost the lines after the first: $R"
 
 # ---- the Noise path -----------------------------------------------------
 R=$("$CLI" -p 17046 -a cli-test-secret set c nk noise-value)
@@ -228,10 +192,6 @@ R=$(printf 'set c np pv\nget c np\n' | "$CLI" -p 17046 -a cli-test-secret -q)
 echo "$R" | grep -q '"value":"pv"' && ok || bad "noise pipe: $R"
 "$CLI" -p 17046 -a wrong-secret ping >/dev/null 2>&1 \
 	&& bad "wrong secret accepted" || ok
-# -A and -e together: two prompts that say which secret they ask, each answer kept as typed
-R=$(printf 'cli-test-secret\ncli-enable-secret\n' | "$CLI" -p 17046 -A -e ping 2>&1)
-echo "$R" | grep -q pong && echo "$R" | grep -q "privileged" && echo "$R" | grep -q "client secret: " \
-	&& echo "$R" | grep -q "enable secret: " && ok || bad "-A with -e: $(echo "$R" | tr '\n' '|' | head -c 300)"
 "$CLI" -p 17046 ping >/dev/null 2>&1 \
 	&& bad "plaintext on never-listener accepted" || ok
 
@@ -261,12 +221,6 @@ print("ok" if d.get("collection")=="c" and d.get("complete") is True and d.get("
 R=$(pc -q keys '*' '*' 1 2>/dev/null | python3 -c '
 import json,sys; d=json.load(sys.stdin); print("ok" if d.get("truncated") is True else "bad:%s"%str(d)[:120])')
 [ "$R" = ok ] && ok || bad "S88: the limit applies across the whole result: $R"
-# a session line of more words than a line takes is refused whole, not cut to its first 512
-L="mset c$(i=1; while [ $i -le 300 ]; do printf ' w%d v%d' $i $i; i=$((i+1)); done)"
-R=$(printf '%s\n' "$L" | pc -q 2>&1); rc=$?
-G=$(pc get c w1)
-[ $rc -ne 0 ] && echo "$R" | grep -q "512 words" && echo "$G" | grep -q '"found":false' && ok \
-	|| bad "a 602-word mset line: rc $rc, '$(echo "$R" | head -c 200)', w1: $G, w300: $(pc get c w300)"
 printf 'quit\n' | pc >/dev/null 2>&1 && ok || bad "S88: quit is not a way out"
 printf 'exit\n' | pc 2>&1 | grep -q "unknown command" && bad "S88: exit is still unknown" || ok
 # stats names the doors, and a RESP greeting on the native door is named
@@ -325,7 +279,6 @@ grep -q "^.*query:" "$D/pt.log" && bad "S65: query lines with query_log off" || 
 mkconf "$D/ql.conf" 17047 loopback
 # the keys are [daemon] keys: put them THERE, not after the last section
 sed -i 's/^log_level = notice$/log_level = info\nquery_log = all\nquery_log_keys = full/' "$D/ql.conf"
-: > "$D/ql.log"
 "$BIN" -f "$D/ql.conf" > "$D/ql.log" 2>&1 &
 QP=$!
 i=0; while [ $i -lt 50 ]; do grep -q "perfcached ready" "$D/ql.log" && break; sleep 0.1; i=$((i+1)); done
@@ -344,7 +297,6 @@ grep -c "query: bin" "$D/ql.log" | grep -qE "^[3-9]|^[1-9][0-9]" && ok || bad "S
 kill -TERM $QP 2>/dev/null; wait $QP 2>/dev/null
 mkconf "$D/qs.conf" 17048 loopback
 sed -i 's/^log_level = notice$/log_level = info\nquery_log = sampled:3\nquery_log_keys = hashed/' "$D/qs.conf"
-: > "$D/qs.log"
 "$BIN" -f "$D/qs.conf" > "$D/qs.log" 2>&1 &
 QP=$!
 i=0; while [ $i -lt 50 ]; do grep -q "perfcached ready" "$D/qs.log" && break; sleep 0.1; i=$((i+1)); done

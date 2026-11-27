@@ -26,7 +26,6 @@ trap '[ -n "$P" ] && kill -9 "$P" 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
 printf '[daemon]\nworkers = 1\n[memory]\narena_mb = 16\n[secrets]\nclient = abitest-secret\n[listen]\ntcp = 127.0.0.1:18591\nplaintext = loopback\n[collection c]\nbuckets_log2 = 8\n' > "$D/c.conf"
 chmod 600 "$D/c.conf"
-: > "$D/log"
 "$BIN" -f "$D/c.conf" > "$D/log" 2>&1 & P=$!
 i=0; while [ $i -lt 50 ] && ! grep -q "perfcached ready" "$D/log"; do sleep 0.1; i=$((i+1)); done
 R=$("$CALLER" 18591 2>&1); rc=$?

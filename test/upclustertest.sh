@@ -159,7 +159,6 @@ upstream_timeout_ms = 2000
 C
 chmod 600 "$D/n.conf"
 start() {
-	: > "$D/$1"
 	PERFCACHED_TEST_CL_REFRESH_MS=2000 "$BIN" -f "$D/n.conf" > "$D/$1" 2>&1 & PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$1" || { bad "the node did not start: $(tail -3 "$D/$1")"; exit 1; }
@@ -170,9 +169,9 @@ s=json.loads(urllib.request.urlopen("http://127.0.0.1:'$HTTP'/stats", timeout=5)
 u=[c for c in s["collections"] if c["name"]==sys.argv[1]][0]["upstream"]
 a={x["addr"]: x for x in u["upstreams"]}
 print(eval(sys.argv[2]))' "$1" "$2" 2>/dev/null; }
-mapped() { # mapped <rounds after> [collection]: up to 25 s (a round every 2 s here) for every slot served, after that many rounds
+mapped() { # mapped <rounds after>: up to 25 s (a round every 2 s here) for every slot served, after that many rounds
 	k=0; while [ $k -lt 125 ]; do
-		[ "$(st "${2:-0}" '"16384 of 16384" in u["redis_cluster"]["said"] and u["redis_cluster"]["rounds"] > '"${1:-0}")" = True ] && return 0
+		[ "$(st 0 '"16384 of 16384" in u["redis_cluster"]["said"] and u["redis_cluster"]["rounds"] > '"${1:-0}")" = True ] && return 0
 		sleep 0.2; k=$((k+1))
 	done; return 1
 }
@@ -294,8 +293,6 @@ w=$(st pc 'a["127.0.0.1:'$PP'"]["state"], a["127.0.0.1:'$PP'"]["redis_cluster"],
 # shard 1's master is r1 since E
 owner() { set -- $(slot "$1"); case $2 in 0) echo r1;; 1) echo m2;; 2) echo m3;; esac; }
 bad_i=""
-# its own map first: a SET before wt has learnt the masters is refused, not sent (GitHub rc4: w0)
-mapped 0 wt || bad_i=" wt never mapped every slot"
 for k in w0 w1 w2 w3 w4 w5; do
 	r=$(run wt SET "$k" "v-$k"); o=$(owner "$k")
 	n=$(grep -c "^SET $k " "$D/$o/writes" 2>/dev/null); a=$(cat "$D"/*/writes 2>/dev/null | grep -c "^SET $k ")

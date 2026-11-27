@@ -37,8 +37,6 @@ buckets_log2 = 10
 C
 chmod 600 "$D/d.conf"
 daemon() {
-	# the child creates the log only once it runs: a grep -c on no file yet is no number
-	: >> "$D/d.log"
 	"$BIN" -f "$D/d.conf" >> "$D/d.log" 2>&1 &
 	PD=$!
 	W=$1; i=0
@@ -65,12 +63,9 @@ C
 	[ -S "$D/fpm$A.sock" ] || { echo "phpfpmtest: FPM $A did not start: $(tail -3 "$D/fpm$A.log" "$D/fpm$A.out" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"; exit 1; }
 }
 fpm_stop() { kill "$PF" 2>/dev/null; wait "$PF" 2>/dev/null; PF=; }
-CGI=$(command -v cgi-fcgi)
-req() { # req <arm> [query]: the reply's JSON line (cgi-fcgi's own errors go to req.err)
-	# the CGI variables alone: cgi-fcgi sends its environment in 8 KB records and php-fpm drops,
-	# unanswered, a request with a variable split across two - a CI job's environment did that
-	env -i SCRIPT_FILENAME="$T/phpfpm_req.php" SCRIPT_NAME=/r REQUEST_METHOD=GET \
-	QUERY_STRING="port=$PORT&sec=$SEC${2:+&$2}" "$CGI" -bind -connect "$D/fpm$1.sock" 2>>"$D/req.err" | tail -1
+req() { # req <arm> [query]: the reply's JSON line
+	SCRIPT_FILENAME=$T/phpfpm_req.php SCRIPT_NAME=/r REQUEST_METHOD=GET \
+	QUERY_STRING="port=$PORT&sec=$SEC${2:+&$2}" cgi-fcgi -bind -connect "$D/fpm$1.sock" 2>/dev/null | tail -1
 }
 reqs() { # reqs <arm> <n> <file>
 	: > "$3"; i=0; while [ $i -lt "$2" ]; do req "$1" >> "$3"; i=$((i+1)); done
@@ -138,7 +133,7 @@ kill -STOP "$PD"
 req C "io=20000" > "$D/c.out" &
 RQ=$!
 sleep 0.5
-kill -9 "$P1" 2>/dev/null; KP=$P1      # the one worker this test kills: its SIGKILL is no crash
+kill -9 "$P1" 2>/dev/null
 kill -CONT "$PD"
 wait "$RQ" 2>/dev/null
 i=0; R=; while [ $i -lt 50 ]; do
@@ -193,14 +188,8 @@ R=$(req F "seeds=127.0.0.2")
 fpm_stop
 
 for l in "$D"/fpm?.log "$D"/fpm?.out; do
-	# a worker dead of any signal, or exiting non-zero, answers its request with nothing (SIGBUS, SIGTERM too)
-	[ -f "$l" ] && grep -E "SIGSEGV|exited on signal|exited with code [1-9]|zend_mm_heap|double free|AddressSanitizer" "$l" \
-		| grep -v "child ${KP:-none} exited on signal 9 " | head -2
+	[ -f "$l" ] && grep -E "SIGSEGV|exited on signal 11|signal 6|zend_mm_heap|double free|AddressSanitizer" "$l" | head -2
 done > "$D/crash"
 [ -s "$D/crash" ] && bad "a worker crashed: $(head -2 "$D/crash" | cut -c1-200)" || ok "no worker crashed"
-# a CI-only failure leaves no other trace: the pools' logs (child exits), the client's errors, the daemon
-[ $fail -eq 0 ] || for l in "$D"/fpm?.log "$D"/fpm?.out "$D/req.err" "$D/d.log"; do
-	[ -s "$l" ] && tail -5 "$l" | cut -c1-200 | sed "s|^|  ..   ${l##*/}: |"
-done
 echo "phpfpmtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

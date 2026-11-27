@@ -541,28 +541,23 @@ void pc_cluster_admission_stuck_text(char *out, size_t cap)
 
 /* a new master admits nobody until every live member's ALIVE is newer than its mastership,
  * nor while a CONNECTING member an earlier master admitted is being checked again */
-static int admit_gate_open(long long now, int *heard, int *live, int *again)
+static int admit_gate_open(long long now, int *heard, int *live)
 {
 	struct clpeers *pt = cl_peers();
-	int i;
+	int i, again = 0;
 
-	*heard = *live = *again = 0;
+	*heard = *live = 0;
 	for (i = 0; i < pt->n_peers; i++) {
 		const struct peer *p = &pt->peers[i];
 		const struct admitq *q = aq_find(&p->addr);
-		const struct lchk *l;
 
 		if (!clpeers_live(p, now) || (q && q->state != AQ_QUEUED))
 			continue;              /* one in flight or held is the batch's to count */
-		if (p->nstate == PC_NST_CONNECTING) {
-			if ((l = lchk_find(p->node)) != NULL && l->stuck)
-				continue;      /* held, as a joiner of ours is */
-			(*again)++;
-		}
+		again += p->nstate == PC_NST_CONNECTING;
 		(*live)++;
 		*heard += p->alive_ms >= master_since_ms;
 	}
-	return *heard == *live && !*again;
+	return *heard == *live && !again;
 }
 
 void cladmit_master_begin(long long now)
@@ -576,7 +571,7 @@ void cladmit_master_begin(long long now)
 void cladmit_tick(long long now)
 {
 	struct clpeers *pt = cl_peers();
-	int i, inflight = 0, batch, heard, live, again;
+	int i, inflight = 0, batch, heard, live;
 
 	if (!is_master()) {
 		aq_n = 0;
@@ -592,11 +587,10 @@ void cladmit_tick(long long now)
 	}
 	if (!aq_n)
 		return;
-	if (!admit_gate_open(now, &heard, &live, &again)) {
+	if (!admit_gate_open(now, &heard, &live)) {
 		if (admit_said != 1)
 			LM_NOTICE("cluster: admission held - %d of %d live member(s) heard since "
-				"this mastership began, %d CONNECTING member(s) checked again; "
-				"%d joiner(s) queued\n", heard, live, again, aq_n);
+				"this mastership began; %d joiner(s) queued\n", heard, live, aq_n);
 		admit_said = 1;
 		return;
 	}

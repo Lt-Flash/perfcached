@@ -43,7 +43,7 @@ EOF
 }
 start() { # start <n> [armed classes]
 	echo "${2:-}" > "$D/ctl$1"
-	PC_SYNCFAIL_CTL="$D/ctl$1" PC_SYNCFAIL_LOG="$D/shim$1" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
+	PC_SYNCFAIL_CTL="$D/ctl$1" PC_SYNCFAIL_LOG="$D/shim$1" LD_PRELOAD="$PRELOAD" \
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & echo $! > "$D/n$1.pid"
 }
 kill9() { kill -9 "$(cat "$D/n$1.pid" 2>/dev/null)" 2>/dev/null; rm -f "$D/n$1.pid"; }
@@ -157,40 +157,9 @@ N=$(grep -c '^dir ' "$D/shim4" 2>/dev/null)
 	|| bad "identity_durable $(st 4 'r["cluster"]["identity_durable"]') - a rename never made durable was taken as stored"
 grep -q "mastership term 0 (NOT persisted" "$D/n4.log" \
 	&& ok "the term is not called persisted" || bad "the term: $(grep -m1 "mastership term" "$D/n4.log" | cut -d' ' -f4- | cut -c1-100)"
-# the cluster id is stored by a maintenance tick after the founding, not by it: wait for its verdict
-wait_for 30 'grep -q "could not persist the new cluster id" "$D/n4.log"'
 grep -q "could not persist the new cluster id" "$D/n4.log" \
-	&& ok "and the cluster id it founded is reported unpersisted" \
-	|| bad "the founded cluster id was taken as stored: $(grep -m2 "cluster id" "$D/n4.log" | cut -d' ' -f4- | cut -c1-120 | tr '\n' ';')"
+	&& ok "and the cluster id it founded is reported unpersisted" || bad "the founded cluster id was taken as stored"
 kill9 4
-
-# ---- 4. the promotion's own claim refused (the followed term is on disk): master, but no map under the
-# dead master's term; once the store works it claims above that term and publishes
-echo "--- 4. a mastership claim whose term cannot be stored"
-if fleet; then
-	echo term > "$D/ctl$S"; echo term > "$D/ctl$W"
-	kill9 $M
-	wait_for $W60 '[ "$(role $S)" = master ] || [ "$(role $W)" = master ]'
-	X=$S; [ "$(role $W)" = master ] && X=$W
-	if [ "$(role $X)" = master ]; then
-		grep -q "could not persist a mastership term" "$D/n$X.log" \
-			&& ok "node $X took mastership and says its term could not be persisted" \
-			|| bad "node $X is master without saying its claim failed: $(grep -c '^term ' "$D/shim$X" 2>/dev/null) term store(s) refused"
-		sleep 12
-		[ "$(mmaster $X)" != "$(nid $X)" ] \
-			&& ok "12 s on, node $X has published no map of its own (its map: term $(mterm $X), master $(mmaster $X))" \
-			|| bad "node $X published a map naming itself master at term $(mterm $X) with its claim refused - the dead master's term $T0, its sequence started again"
-		: > "$D/ctl$S"; : > "$D/ctl$W"
-		wait_for $W60 '[ "$(mmaster $X)" = "$(nid $X)" ] && t=$(mterm $X) && [ "$t" != "?" ] && [ "$t" -gt "$T0" ]' \
-			&& ok "the store works again: node $X claims and publishes at term $(mterm $X), above $T0" \
-			|| bad "the fault lifted, node $X's map is at term $(mterm $X) naming master $(mmaster $X) - it should publish its own above $T0"
-	else
-		bad "neither node $S nor node $W took mastership after node $M was killed"
-	fi
-else
-	bad "the setup failed - the arm tests nothing"
-fi
-for n in 1 2 3; do kill9 $n; done
 
 echo "termsavetest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

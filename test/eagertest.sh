@@ -39,9 +39,6 @@ mode = eager
 EOF
 }
 start() { # start <id>
-	# the child truncates the log only once it runs: a restart's old ready line must be gone first
-	rm -f "$D/n$1.log"
-	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P$1=\$!"
 	i=0
@@ -268,19 +265,6 @@ start 1
 # a start with nothing of its own reads "cold" in its members entry for 30 s; no entries == 0
 # check here - the backfill completes inside the first sample, the start kind is the property
 ST1=$(selfstart 17071)
-if [ -z "$ST1" ]; then             # nothing answered right after its ready line: what listened, and for how long not
-	echo "  ..   listening on 17071: $(ss -ltn 2>/dev/null | grep -c ':17071[[:space:]]') socket(s); refused for $(python3 -c '
-import socket, time
-t0 = time.time()
-while time.time() - t0 < 5:
-    try:
-        socket.create_connection(("127.0.0.1", 17071), 0.5).close(); break
-    except OSError:
-        time.sleep(0.05)
-print("%.0f ms more" % ((time.time() - t0) * 1000))')"
-	echo "  ..   port 17071 sockets by state: $(ss -tan 2>/dev/null | awk '$4 ~ /:17071$/ {print $1}' | sort | uniq -c | tr '\n' ' ')"
-	grep -E "ERROR|WARN|listener|perfcached ready" "$D/n1.log" | head -8 | cut -c1-200 | sed 's/^/  ..   n1: /'
-fi
 [ "$ST1" = "cold" ] && ok || bad "node1 did not come back cold (start=$ST1)"
 i=0
 while [ $i -lt 45 ]; do

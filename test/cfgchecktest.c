@@ -416,16 +416,6 @@ int main(void)
 	cfg.wal_segments_max = 32;
 	CHK(check() == 0 && cfg.wal_segments_max == 32, "K: segments_max above segments - kept");
 
-	/* L: an empty HTTP token is refused, as every other secret is; a set one is kept */
-	base();
-	cfg.listen[0].http = 1;
-	cfg.http_token = "";
-	CHK(refused("empty http secret"), "L: [secrets] http = (empty) - refused");
-	base();
-	cfg.listen[0].http = 1;
-	cfg.http_token = "http-token-1";
-	CHK(check() == 0, "L: [secrets] http = http-token-1 - kept");
-
 	printf("cfgchecktest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;
 }

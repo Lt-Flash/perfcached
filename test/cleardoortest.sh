@@ -46,7 +46,6 @@ plaintext = loopback
 buckets_log2 = 10
 CONF
 chmod 600 "$D/a.conf"
-: > "$D/a.log"
 "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 &
 P1=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/a.log" && break; sleep 0.1; i=$((i+1)); done
@@ -101,7 +100,7 @@ tcp = $LANIP:$PORT
 [secrets]
 client = $SEC
 CONF
-OUT=$(env -u PERFCLI_AUTH -u PERFCACHED_CONF HOME="$E" LD_PRELOAD="$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
+OUT=$(env -u PERFCLI_AUTH -u PERFCACHED_CONF HOME="$E" LD_PRELOAD="$SHIM" \
 	PC_FOPEN_FROM=/etc/perfcached.conf PC_FOPEN_TO="$D/etc.conf" \
 	timeout 10 "$CLI" ping 2>&1); rc=$?
 if [ $rc -eq 0 ] && echo "$OUT" | grep -q -i "pong"; then

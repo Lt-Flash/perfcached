@@ -29,7 +29,6 @@ buckets_log2 = 6
 buckets_log2 = 6
 EOF
 
-: > "$D/log"
 "$BIN" -f "$D/s9.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0

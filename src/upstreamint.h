@@ -48,7 +48,7 @@ struct up_wait {
 };
 
 struct up_key {                        /* one key in flight */
-	struct up_key *next;               /* its bucket's chain in the in-flight table */
+	struct up_key *next;               /* the collection's in-flight list */
 	struct up_key *qnext;              /* the job queue */
 	struct up_wait *waiters;
 	int own;                           /* an OWNERSHIP check rides on it: the worker
@@ -62,7 +62,6 @@ struct up_key {                        /* one key in flight */
 	                                    * may predate the change.  Under uc->mx */
 	int rounds;                        /* fetched again for that */
 	int rw;                            /* created by the re-warm */
-	int bgown;                         /* created by a plain write's ownership check */
 	int ask;                           /* an -ASK sent it here: ASKING first */
 	int redirs;                        /* MOVED/ASK followed for it */
 	char rhost[64];                    /* where the redirect points */
@@ -351,7 +350,7 @@ struct up_col {
 	int max_lag_ms;                    /* 0 = not checked */
 	int echo_ms;                       /* upstream_echo_ms, 0 off */
 	struct up_echo *echo;              /* UP_ECHO_N slots, through only */
-	unsigned long long wt_seq;         /* the writer and the pass reader count, atomically */
+	unsigned long long wt_seq;         /* the writer thread's own count */
 	struct up_order *order;            /* UP_ORDER_N slots, through only */
 	pthread_mutex_t order_mx[UP_ORDER_LOCKS];
 	int allow_pc;                      /* upstream_allow_perfcached */
@@ -423,8 +422,7 @@ struct up_col {
 	int neg_ms, timeout_ms, conns, tracking, on_error;
 
 	pthread_mutex_t mx;                /* inflight, the queues, requests */
-	struct up_key **inflight;          /* UP_IFH buckets by echo_hash, made on first use */
-	int own_bg;                        /* in-flight entries a plain write's check created */
+	struct up_key *inflight;
 	volatile int stop;
 	/* the drain sweep (an operator's one-shot): a thread reading every allowed upstream key,
 	 * the workers writing what the fleet does not have yet */
@@ -553,7 +551,6 @@ struct uconn {
 	char peer[80];                     /* host:port dialled, for a TLS failure */
 	int resp3;
 	int tracked;                       /* tracking on, redirected */
-	int untrackable;                   /* tracking refused, or another server */
 	unsigned int gen;                  /* the s->inv_gen it armed at */
 	unsigned int incarn;               /* the s->incarn it dialled */
 	int inv;                           /* THE invalidation connection */

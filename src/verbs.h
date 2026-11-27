@@ -32,9 +32,6 @@
 /* a record type the fleet cannot carry yet - a live member does not
  * advertise it: refused, never written half-typed */
 #define PC_OP_ERR_GATE    (-12)
-/* an add whose sum would pass int64: refused, the counter kept (Redis's overflow error) */
-#define PC_OP_ERR_OVF     (-13)
-#define PC_OVF_MSG "increment or decrement would overflow"
 
 /* the RESP door's text writer and the binary verbs' byte sink (json.h); a hash
  * reply tree is a ptree item and renders through src/ptree.h */
@@ -51,11 +48,6 @@ int pc_glob_match(const char *p, int pn, const char *s, int sn);
 void pc_verb_remove_local(pcache_htable_t *ht, const str *k);
 /* dropped HERE only (Redis changed it): table + WAL, no tombstone */
 void pc_verb_forget_local(pcache_htable_t *ht, const str *k);
-/* the same with no remembered delete: a copy the peers send back is taken (T600) */
-void pc_verb_forget_unguarded(pcache_htable_t *ht, const str *k);
-/* as forget_local, while the record is still at @ver or older */
-void pc_verb_forget_upto(pcache_htable_t *ht, const str *k,
-		unsigned long long ver);
 /* store a record as a client write does (table, WAL, eager push) */
 int pc_verb_store_local(pcache_htable_t *ht, const str *k, const char *v,
 		size_t n, unsigned int exp, unsigned char fl);
@@ -191,9 +183,6 @@ struct pc_enum_start {
 	int patlen;                    /* <0 = no pattern */
 	int limit;
 };
-
-/* 1 when the RESP door implements @cmd (any case) */
-int pc_verb_resp_known(const char *cmd, size_t cl);
 
 /* the RESP codec: one framed command in, the COMPLETE reply (errors too) out; @cur_col is the
  * SELECTed collection (cap 40); *quit: flush, then close; *authed 0: AUTH/HELLO/QUIT only */

@@ -19,12 +19,6 @@ class PerfcachedAdapter extends AbstractAdapter
     /** The largest record, less its 28-byte header: key and value together fit this */
     public const MAX_KEY_AND_VALUE = 262052;
 
-    /** Keys listed and deleted per pass of clear() */
-    private const CLEAR_BATCH = 10000;
-
-    /** keys() takes &$complete from extension 0.2.0 on */
-    private static ?bool $keysComplete = null;
-
     private \Perfcached $client;
     private string $collection;
     private MarshallerInterface $marshaller;
@@ -65,29 +59,14 @@ class PerfcachedAdapter extends AbstractAdapter
 
     protected function doClear(string $namespace): bool
     {
-        $whole = true;
         do {
             // S498: the server's glob reads \ * ? [ ] - the namespace's own are literal
-            $match = addcslashes($namespace, '\\*?[]') . '*';
-            $complete = null;
-            if (self::$keysComplete ??= version_compare(phpversion('perfcached') ?: '0', '0.2.0', '>=')) {
-                $ids = $this->client->keys($this->collection, $match, self::CLEAR_BATCH, $complete);
-            } else {
-                // an extension before 0.2.0 cannot say whether the listing was complete
-                $ids = $this->client->keys($this->collection, $match, self::CLEAR_BATCH);
-            }
-            $whole = $whole && $complete !== false;
+            $ids = $this->client->keys($this->collection, addcslashes($namespace, '\\*?[]') . '*');
             foreach ($ids as $id) {
                 $this->client->del($this->collection, $id);
             }
-        } while (count($ids) >= self::CLEAR_BATCH);
-        if (!$whole) {
-            // a sharded collection: the node lists its own share, the other nodes' keys stay (up or down)
-            $this->log(LogLevel::WARNING, sprintf('perfcached: clear() of "%s" reached only the connected'
-                . ' node\'s keys - the collection is sharded, the other nodes (up or down) still hold theirs',
-                $this->collection));
-        }
-        return $whole;
+        } while ($ids);
+        return true;
     }
 
     protected function doDelete(array $ids): bool

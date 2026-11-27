@@ -49,12 +49,10 @@ save = off
 buckets_log2 = 12
 C
 	chmod 600 "$D/n$i.conf"
-	: > "$D/n$i.log"
 	if [ $i = 3 ]; then
-		LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut3" PC_NETCUT_LOG="$D/cutlog3" \
+		LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut3" PC_NETCUT_LOG="$D/cutlog3" \
 			"$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 &
 	else
-		: > "$D/n$i.log"
 		"$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 &
 	fi
 	PIDS="$PIDS $!"

@@ -80,12 +80,10 @@ EOF
 }
 
 for n in 1 2; do conf $n; done
-: > "$D/n2.log"
 "$BIN" -f "$D/n2.conf" > "$D/n2.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n2.log" || { bad "the founder did not start"; echo "bulkgatetest: $pass passed, $fail failed"; exit 1; }
 N=$(fill)
-: > "$D/n1.log"
 "$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n1.log" || { bad "the joiner did not start"; echo "bulkgatetest: $pass passed, $fail failed"; exit 1; }
@@ -110,33 +108,6 @@ case "$R" in eof*|rst*) [ "${R##* }" -ge 700 ] && [ "${R##* }" -le 2500 ] \
 	&& ok "an idle connection from a member's host is closed after ${R##* } ms - the opening message's second, not the 5 s receive timeout" \
 	|| bad "the member host's idle connection closed after ${R##* } ms (want 0.7-2.5 s)";;
 *) bad "the member host's idle connection: $R";; esac
-
-# the opening message's second is a deadline, not a per-read timeout: a length and then a byte every
-# 0.6 s, each read finishing inside its own second, is still closed about a second after the connect
-drip() {
-	python3 - "$PORT" <<'EOF'
-import select, socket, struct, sys, time
-s = socket.socket(); s.bind(("127.0.76.1", 0)); s.settimeout(10)
-t = time.time(); s.connect(("127.0.76.2", int(sys.argv[1])))
-r = "held"
-try:
-    s.sendall(struct.pack("<H", 64))
-    for i in range(10):
-        if select.select([s], [], [], 0.6)[0]:
-            r = "eof" if s.recv(1) == b"" else "data"
-            break
-        s.sendall(b"\x01" if i == 0 else b"\x07")
-except (ConnectionResetError, BrokenPipeError):
-    r = "rst"
-print("%s %d" % (r, int((time.time() - t) * 1000)))
-EOF
-}
-R=$(drip)
-case "$R" in eof*|rst*) [ "${R##* }" -le 2500 ] \
-	&& ok "a member host's connection dripping its opening message a byte every 0.6 s is closed after ${R##* } ms" \
-	|| bad "the dripping connection closed only after ${R##* } ms (want under 2.5 s)";;
-*) bad "a connection dripping its opening message a byte every 0.6 s is still open after ${R##* } ms ($R) - every byte restarts the 1 s receive timeout, so it holds the bulk thread for as long as it drips";;
-esac
 
 # an opening message of the largest length the frame field holds, cluster principal, no secret:
 # its payload must never be opened into a buffer sized for the real two bytes

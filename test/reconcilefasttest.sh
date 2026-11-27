@@ -65,7 +65,6 @@ buckets_log2 = 12
 EOF
 }
 start() { # start <node> <tag>
-	: > "$D/n$1.$2.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.$2.log" 2>&1 &
 	PIDS="$PIDS $!"
 	echo $! > "$D/n$1.pid"

@@ -18,12 +18,10 @@
  * bytes>" (a torn-write detector).  The legacy 8-byte form (magic + term) is read, rewritten. */
 #define TERM_HEADER "perfcached-node-term 1"
 
-/* term = the highest adopted (claimed, or seen and followed), which a claim goes above, the cluster
- * thread's; stored = the highest on disk, pc-maint's (pc_term_persist_tick); claim = a term asked to be
- * stored for a promotion, refused = one whose store failed; unsaved = an adopted term its store
- * refused, until a later store lands (set only on a failure: stats read it) */
+/* term = the highest adopted (claimed, or seen and followed), which a claim goes above; unsaved = an
+ * adopted term its store refused, until a later store lands (set only on a failure: stats read it) */
 static struct {
-	uint32_t term, stored, claim, refused, unsaved;
+	uint32_t term, unsaved;
 	int durable, err;
 	char dir[512];
 } T;
@@ -113,7 +111,7 @@ static int term_store(uint32_t t)
 	n = snprintf(buf, sizeof buf, TERM_HEADER "\nterm %u\ncheck %016llx\n",
 		(unsigned)t, (unsigned long long)term_check(t));
 	if (pc_state_write(T.dir, PC_TERM_FILE, buf, (size_t)n) != 0) {
-		__atomic_store_n(&T.err, errno, __ATOMIC_RELAXED);
+		T.err = errno;
 		return 0;
 	}
 	return 1;
@@ -135,8 +133,6 @@ int pc_term_init(const char *state_dir)
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
-		if (errno != ENOENT)
-			return -1;         /* there but unreadable: refuse, never overwrite */
 		/* absent is the normal first boot; prove we CAN write before claiming
 		 * durability, so a read-only state dir is caught now, not at a promotion */
 		T.durable = term_store(0);
@@ -153,17 +149,15 @@ int pc_term_init(const char *state_dir)
 		if (!term_store(T.term))
 			return -1;
 		T.durable = 1;
-		T.stored = T.term;
 		return 0;
 	}
 	if (term_parse(buf, (size_t)got, &T.term) != 0)
 		return -1;                 /* present but invalid: refuse */
 	T.durable = 1;
-	T.stored = T.term;
 	return 0;
 }
 
-uint32_t pc_term_current(void) { return __atomic_load_n(&T.term, __ATOMIC_ACQUIRE); }
+uint32_t pc_term_current(void) { return T.term; }
 int pc_term_durable(void) { return T.durable; }
 
 int pc_term_plausible(uint32_t seen)
@@ -180,65 +174,35 @@ int pc_term_observe(uint32_t seen)
 		return 0;
 	if (!pc_term_plausible(seen))
 		return -1;
-	/* adopted at once - the node follows it, and a claim must go above it; pc-maint writes it, and
-	 * until it is on disk a claim waits for it (pc_term_claim_ready) */
-	__atomic_store_n(&T.term, seen, __ATOMIC_RELEASE);
-	return 1;
-}
-
-int pc_term_persist_tick(void)
-{
-	uint32_t t = __atomic_load_n(&T.term, __ATOMIC_ACQUIRE);
-	uint32_t c = __atomic_load_n(&T.claim, __ATOMIC_ACQUIRE);
-	uint32_t want = c > t ? c : t;
-
-	if (!T.dir[0] || want <= __atomic_load_n(&T.stored, __ATOMIC_ACQUIRE))
-		return 0;
-	if (!term_store(want)) {
-		if (t > __atomic_load_n(&T.stored, __ATOMIC_ACQUIRE))
-			__atomic_store_n(&T.unsaved, t, __ATOMIC_RELEASE);
-		if (c > t) {               /* the promotion goes on without a term, as it always did */
-			__atomic_store_n(&T.refused, c, __ATOMIC_RELEASE);
-			__atomic_compare_exchange_n(&T.claim, &c, 0, 0,
-				__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-		}
-		return -1;
+	/* adopted even unstored - the node follows it, and a claim must go above it; while it is
+	 * not on disk the node stands for nothing (pc_term_unpersisted) and a tick retries it */
+	T.term = seen;
+	if (!T.dir[0])
+		return 1;
+	if (!term_store(seen)) {
+		__atomic_store_n(&T.unsaved, seen, __ATOMIC_RELEASE);
+		return PC_TERM_UNSAVED;
 	}
-	__atomic_store_n(&T.stored, want, __ATOMIC_RELEASE);
+	__atomic_store_n(&T.unsaved, 0, __ATOMIC_RELEASE);
 	return 1;
 }
 
 uint32_t pc_term_unpersisted(void)
 {
-	uint32_t u = __atomic_load_n(&T.unsaved, __ATOMIC_ACQUIRE);
-
-	return u > __atomic_load_n(&T.stored, __ATOMIC_ACQUIRE) ? u : 0;
+	return __atomic_load_n(&T.unsaved, __ATOMIC_ACQUIRE);
 }
 
 int pc_term_retry(void)
 {
-	uint32_t u = __atomic_load_n(&T.unsaved, __ATOMIC_ACQUIRE);
-
-	if (!u)
+	if (!pc_term_unpersisted())
 		return 0;
-	if (u > __atomic_load_n(&T.stored, __ATOMIC_ACQUIRE))
+	if (!term_store(T.term))
 		return -1;
-	return __atomic_compare_exchange_n(&T.unsaved, &u, 0, 0, __ATOMIC_ACQ_REL,
-		__ATOMIC_ACQUIRE) ? 1 : -1;
+	__atomic_store_n(&T.unsaved, 0, __ATOMIC_RELEASE);
+	return 1;
 }
 
-int pc_term_store_errno(void) { return __atomic_load_n(&T.err, __ATOMIC_RELAXED); }
-
-int pc_term_claim_ready(void)
-{
-	uint32_t next = T.term + 1;
-
-	if (!T.dir[0] || __atomic_load_n(&T.stored, __ATOMIC_ACQUIRE) >= next ||
-	        __atomic_load_n(&T.refused, __ATOMIC_ACQUIRE) >= next)
-		return 1;
-	__atomic_store_n(&T.claim, next, __ATOMIC_RELEASE);
-	return 0;
-}
+int pc_term_store_errno(void) { return T.err; }
 
 uint32_t pc_term_claim(void)
 {
@@ -247,17 +211,14 @@ uint32_t pc_term_claim(void)
 	if (next < T.term)
 		return 0;                  /* wrap: unreachable, never silent */
 	if (T.dir[0]) {
-		if (__atomic_load_n(&T.stored, __ATOMIC_ACQUIRE) < next) {
-			/* not on disk: must not use it - pc-maint is asked again for a later call */
-			__atomic_store_n(&T.refused, 0, __ATOMIC_RELEASE);
-			__atomic_store_n(&T.claim, next, __ATOMIC_RELEASE);
-			return 0;
-		}
+		if (!term_store(next))
+			return 0;          /* cannot remember it: must not use it */
+		__atomic_store_n(&T.unsaved, 0, __ATOMIC_RELEASE);
 	} else if (T.durable) {
 		return 0;                  /* claimed durable with nowhere to
 		                            * write - a contradiction, refuse */
 	}
-	__atomic_store_n(&T.term, next, __ATOMIC_RELEASE);
+	T.term = next;
 	return next;
 }
 

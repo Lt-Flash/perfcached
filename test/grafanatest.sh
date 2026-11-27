@@ -35,7 +35,6 @@ EOF
 }
 
 start() { # start <conf> <log> -> pid via $STARTED
-	: > "$2"
 	"$BIN" -f "$1" > "$2" 2>&1 &
 	STARTED=$!
 	i=0

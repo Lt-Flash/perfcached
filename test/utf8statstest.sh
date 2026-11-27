@@ -26,7 +26,6 @@ plaintext = loopback
 buckets_log2 = 12
 CONF
 chmod 600 "$D/a.conf"
-: > "$D/a.log"
 "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 &
 P=$!
 i=0

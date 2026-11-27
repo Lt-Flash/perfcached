@@ -105,10 +105,8 @@ stop_clean() { # stop_clean <n>: SIGTERM and wait for the clean-shutdown line
 	rm -f "$D/n$1.pid"
 	[ "$(grep -c "clean shutdown" "$D/n$1.log")" -gt "$before" ]
 }
-stop_kill() { # stop_kill <n>: kill -9 and wait, bounded, until it is gone - one killed inside a stalled fsync holds its ports
-	p=$(cat "$D/n$1.pid" 2>/dev/null); kill -9 "$p" 2>/dev/null; rm -f "$D/n$1.pid"; i=0
-	while [ -n "$p" ] && [ $i -lt 300 ] && s=$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null) && [ "$s" != Z ]; do
-		sleep 0.1; i=$((i+1)); done
+stop_kill() { # stop_kill <n>
+	kill -9 "$(cat "$D/n$1.pid" 2>/dev/null)" 2>/dev/null; rm -f "$D/n$1.pid"
 }
 call() { printf '%s\n' "$2" | timeout 15 python3 -c '
 import json, socket, sys, pcnative
@@ -367,9 +365,8 @@ split_fleet() { # split_fleet <binary>: nodes 1+2, then 3 with term 50
 	echo "   node 3 not admitted in 45 s: map term $(mapterm 17343), role $(cl 17343 role), node 1 peers up $(cl 17341 peers_up)" >&2
 	return 1
 }
-s233() { # s233 <binary> <label>: prints "<split ok> <stop ok> <lost>", "nofleet" with no fleet; <lost>:
-	# 1 reported lost, 0 reported stopped (the reverted reply), x neither - no answer to judge
-	split_fleet "$1" >&2 || { echo "nofleet nofleet nofleet"; return; }   # its reason to the log, never into the result
+s233() { # s233 <binary> <label>: prints "<split ok> <stop ok> <lost ok>"
+	split_fleet "$1" || { echo "0 0 0"; return; }
 	T3=$(cl 17343 term); M3=$(mapterm 17343)
 	sp=0; [ "$T3" != "?" ] && [ "$M3" != "?" ] && [ "$T3" -ge 50 ] && [ "$M3" -ge 1 ] && [ "$M3" -lt 50 ] && sp=1
 	echo "   $2: node 3 claims term $T3 and follows a map at term $M3" >&2
@@ -380,36 +377,29 @@ s233() { # s233 <binary> <label>: prints "<split ok> <stop ok> <lost>", "nofleet
 	echo "   $2: $up process(es) still running after the stop" >&2
 	for n in 1 2 3; do stop_kill $n; done
 	# lost: a fleet that loads, node 3 killed -9 just before the stop
-	lo=x
-	if load_fleet "$1" >/dev/null 2>&1; then
-		stop_kill 3
-		R=$(priv_stop); echo "   $2: node 3 killed -9, then fleetstop -> $(reply "$R")" >&2
-		lo=$(echo "$R" | python3 -c 'import json,sys
+	load_fleet "$1" >/dev/null 2>&1
+	stop_kill 3
+	R=$(priv_stop); echo "   $2: node 3 killed -9, then fleetstop -> $(reply "$R")" >&2
+	lo=0; echo "$R" | python3 -c 'import json,sys
 r=json.load(sys.stdin).get("result") or {}
-st, lo = len(r.get("stopped",[])), len(r.get("lost",[]))
-print(1 if r.get("asked")==2 and st==1 and lo==1 else 0 if r.get("asked")==2 and st==2 and lo==0 else "x")' 2>/dev/null)
-		[ -n "$lo" ] || lo=x
-	else
-		echo "   $2: the fleet for the lost arm did not load" >&2
-	fi
+sys.exit(0 if r.get("asked")==2 and len(r.get("stopped",[]))==1 and len(r.get("lost",[]))==1 else 1)' && lo=1
 	all_down
 	for n in 1 2 3; do stop_kill $n; done
 	echo "$sp $st $lo"
 }
-nofleet() { [ "$1" = nofleet ] && echo " - the fleet did not start (its reason is above)"; }
 echo "--- 6. S233: a claimed term above the followed map; a stop that is not a goodbye"
 set -- $(s233 "$BIN" "this build")
 [ "$1" = 1 ] && ok "node 3 joined claiming a term above the map it follows (the split F3 left)" \
-	|| bad "the split was not set up - the arm tests nothing$(nofleet "$1")"
+	|| bad "the split was not set up - the arm tests nothing"
 [ "$2" = 1 ] && ok "its master's fleet stop stopped it anyway - all three exited, nothing ignored" \
-	|| bad "the fleet stop left a node running or was ignored$(nofleet "$2")"
+	|| bad "the fleet stop left a node running or was ignored"
 [ "$3" = 1 ] && ok "a peer killed -9 before the stop is reported lost, not stopped" \
-	|| bad "a peer that never said goodbye was not reported lost$(nofleet "$3")"
+	|| bad "a peer that never said goodbye was not reported lost"
 set -- $(s233 "$D/perfcached.s233old" "fixes reverted")
 [ "$1" = 1 ] && [ "$2" = 0 ] && ok "fail-first: with the gate on the claim again, node 3 ignored the stop and kept running" \
-	|| bad "fail-first: the reverted gate did not leave node 3 running (split $1, stop $2)$(nofleet "$1")"
+	|| bad "fail-first: the reverted gate did not leave node 3 running (split $1, stop $2)"
 [ "$3" = 0 ] && ok "fail-first: with 'stopped' = 'left the live set', the killed peer was reported stopped" \
-	|| bad "fail-first: want the killed peer reported stopped (2 stopped, 0 lost), got '$3' - 1 lost, x no such answer$(nofleet "$3")"
+	|| bad "fail-first: the reverted reply still reported the killed peer lost"
 
 # ---- 7. perfcli: a stop that outwaits the read timeout ----------------------
 stuck_fleet() { # nodes 1+2 on this build, node 3 on the reverted one
@@ -425,14 +415,14 @@ stuck_fleet() { # nodes 1+2 on this build, node 3 on the reverted one
 	joined3 || { echo "   node 3 not admitted in 45 s: role $(cl 17343 role), node 1 peers up $(cl 17341 peers_up)" >&2; return 1; }
 }
 asks() { grep -c "FLEET STOP - asking" "$D/n1.log" 2>/dev/null; }
-cli7() { # cli7 <perfcli> <label>: prints "<pipe ok> <oneshot ok>", "nofleet" for an arm with no fleet
-	stuck_fleet >&2 || { echo "nofleet nofleet"; return; }   # its reason to the log, never into the result
+cli7() { # cli7 <perfcli> <label>: prints "<pipe ok> <oneshot ok>"
+	stuck_fleet || { echo "0 0"; return; }
 	printf '{"method":"fleetstop","params":{"timeout_ms":40000}}\n' |
 		timeout 100 "$1" -q -h 127.0.0.1 -p 17341 -E st-enable-secret > "$D/cli7p.out" 2>&1
 	sleep 12                           # the 40 s wait ends, node 1 goes
 	a=$(asks); echo "   $2, piped: node 1 was asked to stop $a time(s); perfcli: $(grep -m1 "not sending it again\|reconnected" "$D/cli7p.out" | cut -c1-90)" >&2
 	pp=0; [ "$a" = 1 ] && grep -q "not sending it again" "$D/cli7p.out" && pp=1
-	stuck_fleet >&2 || { echo "$pp nofleet"; return; }
+	stuck_fleet || { echo "$pp 0"; return; }
 	# 40 s: past the 30 s read timeout perfcli used for everything
 	timeout 150 "$1" -q -h 127.0.0.1 -p 17341 -E st-enable-secret fleetstop 40000 > "$D/cli7o.out" 2>&1
 	rc=$?; a=$(asks)
@@ -444,14 +434,14 @@ cli7() { # cli7 <perfcli> <label>: prints "<pipe ok> <oneshot ok>", "nofleet" fo
 echo "--- 7. S233: perfcli and a stop that outwaits its read timeout"
 set -- $(cli7 "$CLI" "this perfcli")
 [ "$1" = 1 ] && ok "piped: the read timed out, perfcli redialled and did NOT send the stop again" \
-	|| bad "piped: perfcli sent the fleet stop again after its redial, or said nothing$(nofleet "$1")"
+	|| bad "piped: perfcli sent the fleet stop again after its redial, or said nothing"
 [ "$2" = 1 ] && ok "one-shot: it waited for the answer, which names the peer still up" \
-	|| bad "one-shot fleetstop did not get its answer$(nofleet "$2")"
+	|| bad "one-shot fleetstop did not get its answer"
 set -- $(cli7 "$D/perfcli.s233old" "perfcli before S233")
 [ "$1" = 0 ] && ok "fail-first: the old perfcli sent the stop twice, piped" \
-	|| bad "fail-first: the old perfcli did not resend - the piped arm proves nothing$(nofleet "$1")"
+	|| bad "fail-first: the old perfcli did not resend - the piped arm proves nothing"
 [ "$2" = 0 ] && ok "fail-first: and one-shot it timed out before the answer" \
-	|| bad "fail-first: the old perfcli got the one-shot answer - the timeout arm proves nothing$(nofleet "$2")"
+	|| bad "fail-first: the old perfcli got the one-shot answer - the timeout arm proves nothing"
 
 echo "stoptest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

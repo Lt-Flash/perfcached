@@ -12,7 +12,6 @@
 #include "compat/dprint.h"
 #include "config.h"                    /* pc_autoscale_name */
 #include "store.h"
-#include "wal.h"                       /* a fleet rename is logged */
 #include "colname.h"
 #include "respmap.h"
 #include "cluster.h"
@@ -329,7 +328,7 @@ void handle_col_set(const unsigned char *pt, size_t n)
 		}
 		if (pc_respmap_apply((int)idx, col, strlen(col), gen, set, was,
 		        sizeof was) == 1) {
-			pc_respmap_persist_later();
+			pc_respmap_persist();
 			if (set)
 				LM_NOTICE("resp: DB index %ld mapped to collection "
 					"'%s' by the fleet (was '%s')\n", idx, col,
@@ -350,13 +349,11 @@ void handle_col_set(const unsigned char *pt, size_t n)
 		/* a collection not here yet is skipped: the resync sends the
 		 * mode again once the create has reached this node */
 		if (pc_store_autoscale_apply(name, nl, a.buckets_log2, gen,
-		        &was) == 1) {
-			pc_store_persist_later();
+		        &was) == 1)
 			LM_NOTICE("collection '%s': autoscale = %s, set by the "
 				"fleet (was %s)\n", name,
 				pc_autoscale_name(a.buckets_log2),
 				pc_autoscale_name(was));
-		}
 		return;
 	}
 	if (a.op == CLCOL_OP_RENAME) {     /* a rename, two names */
@@ -369,10 +366,8 @@ void handle_col_set(const unsigned char *pt, size_t n)
 		to[tl] = 0;
 		if (col_name_refused("as a new name", to, tl))
 			return;
-		if (pc_store_find(name, nl) && !pc_store_find(to, tl) &&
-		        pc_store_rename(name, nl, to, tl, gen) == 0) {
-			pc_wal_col_rename(name, to);   /* as the verb does */
-			pc_store_persist_later();
+		if (pc_store_find(name, nl) && !pc_store_find(to, tl)) {
+			(void)pc_store_rename(name, nl, to, tl, gen);
 			LM_NOTICE("collection '%s' renamed to '%s' by the "
 				"fleet\n", name, to);
 		}
@@ -404,6 +399,5 @@ void handle_col_set(const unsigned char *pt, size_t n)
 			LM_ERR("collection '%s' announced by a peer could not "
 				"be created here (%d)\n", name, rc);
 	}
-	/* not here: this is the cluster thread, and the fsync would hold every pull and forward */
-	pc_store_persist_later();
+	pc_store_persist();
 }

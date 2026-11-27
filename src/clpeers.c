@@ -127,18 +127,16 @@ int clpeers_dup_persisted(struct clpeers *pt, const pc_addr *from,
 
 	for (i = 0; i < PC_CL_MAXPEER; i++) {
 		if (pt->dup_seen[i].addr.s_addr == pc_addr_v4(from)) {
-			/* a joiner knocks every second: a grace with no sighting ended that episode */
-			if (now - pt->dup_seen[i].last_ms >= DUP_GRACE_MS)
-				pt->dup_seen[i].first_ms = now;
-			pt->dup_seen[i].last_ms = now;
-			return now - pt->dup_seen[i].first_ms >= DUP_GRACE_MS;
+			if (now - pt->dup_seen[i].first_ms >= DUP_GRACE_MS)
+				return 1;
+			return 0;
 		}
 		if (slot < 0 && !pt->dup_seen[i].addr.s_addr)
 			slot = i;
 	}
 	if (slot >= 0) {
 		pt->dup_seen[slot].addr.s_addr = pc_addr_v4(from);
-		pt->dup_seen[slot].first_ms = pt->dup_seen[slot].last_ms = now;
+		pt->dup_seen[slot].first_ms = now;
 	}
 	return 0;
 }

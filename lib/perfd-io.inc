@@ -12,7 +12,7 @@ static int io_all(perfd_t *p, int wr, void *buf, size_t n)
 	size_t off = 0;
 
 	while (off < n) {
-		ssize_t r = wr ? send(p->fd, (char *)buf + off, n - off, MSG_NOSIGNAL)
+		ssize_t r = wr ? write(p->fd, (char *)buf + off, n - off)
 		               : read(p->fd, (char *)buf + off, n - off);
 
 		if (r <= 0) {
@@ -103,12 +103,9 @@ static int fill(perfd_t *p)
 
 		if (rbuf_reserve(p, 65536) != 0)
 			return -1;
-		do              /* under SO_RCVTIMEO a handled signal is EINTR, SA_RESTART or not */
-			r = read(p->fd, p->rbuf + p->rlen, p->rcap - p->rlen);
-		while (r < 0 && errno == EINTR);
+		r = read(p->fd, p->rbuf + p->rlen, p->rcap - p->rlen);
 		if (r <= 0) {
 			p->poisoned = 1;
-			p->io_silent = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
 			return errk(p, PERFD_E_TRANSPORT, "connection %s",
 				r == 0 ? "closed" : strerror(errno));
 		}
@@ -252,13 +249,9 @@ static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 	type = (unsigned char)rb[2];
 	*got = rle64(rb + 8);
 	if (type == BIN_NOTIFY) {
-		/* consumed first: a hook that calls its handle must not meet this frame again */
-		p->roff += BIN_HDR + plen;
+		/* membership is acted on here, then the hook sees it */
 		notify_internal(p, (const unsigned char *)rb + BIN_HDR, plen);
-		p->hook_refuses = p->in_call > 0;
 		notify_hook(p, (const unsigned char *)rb + BIN_HDR, plen);
-		p->hook_refuses = 0;
-		return 2;
 	} else if (type != BIN_RSP) {
 		p->poisoned = 1;
 		return errk(p, PERFD_E_PROTOCOL, "bad frame type");
@@ -302,7 +295,7 @@ static int take_msg(perfd_t *p, unsigned long long *got, char **result,
 		*rlen = body;
 	}
 	p->roff += BIN_HDR + plen;             /* consume by offset */
-	return 1;
+	return type == BIN_NOTIFY ? 2 : 1;
 }
 
 /* a malloc'd copy of a reply (out of order, or asked for owned) */
@@ -365,45 +358,12 @@ static int hand_reply(perfd_t *p, const char *r, size_t n, char **out)
 	return 0;
 }
 
-/* the parked replies belong to one connection: they go with it */
-static void early_free(perfd_t *p)
-{
-	struct early *e;
-
-	while ((e = p->early)) {
-		p->early = e->next;
-		free(e->result);
-		free(e);
-	}
-}
-
-/* is @got a request still waiting, with no reply parked for it yet? */
-static int park_due(const perfd_t *p, unsigned long long got)
-{
-	const struct early *e;
-	int i;
-
-	for (e = p->early; e; e = e->next)
-		if (e->id == got)
-			return 0;
-	for (i = p->idhead; i < p->nids; i++)
-		if (p->ids[i] == got)
-			return 1;
-	return 0;
-}
-
-/* park an out-of-order reply until its turn comes (blocking collector); one nobody waits for
- * (never issued, late, a duplicate) is dropped and counted */
+/* park an out-of-order reply until its turn comes (blocking collector) */
 static int park_msg(perfd_t *p, unsigned long long got, char *result,
 		size_t rlen, const char *ebuf)
 {
-	struct early *e;
+	struct early *e = malloc(sizeof *e);
 
-	if (!park_due(p, got)) {
-		p->stray_replies++;
-		return 0;
-	}
-	e = malloc(sizeof *e);
 	if (!e) {
 		p->poisoned = 1;
 		return errk(p, PERFD_E_NOMEM, "out of memory");

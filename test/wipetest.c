@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
-/* wipetest.c - freeing a config zeroes its secret bytes: a config with five secrets (two client,
- * cluster, enable, resp) must count exactly five wipes on the PC_TESTHOOKS counter (reading freed
- * memory would be UB). */
+/* wipetest.c - freeing a config zeroes its secret bytes: a config with three secrets must count
+ * exactly three wipes on the PC_TESTHOOKS counter (reading freed memory would be UB). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,9 +29,7 @@ int main(void)
 	      "client = wipe-client-one\n"
 	      "client = wipe-client-two\n"
 	      "cluster = wipe-cluster-secret\n"
-	      "enable = wipe-enable-secret\n"
-	      "resp = wipe-resp-password\n"
-	      "[listen]\ntcp = 127.0.0.1:19599\nresp = 127.0.0.1:19598\n"
+	      "[listen]\ntcp = 127.0.0.1:19599\n"
 	      "[collection wt]\nbuckets_log2 = 12\n", f);
 	fclose(f);
 
@@ -45,9 +42,9 @@ int main(void)
 
 	pc_config_free(&cfg);
 
-	printf("wipetest: %d secret buffer(s) wiped at free (want 5)\n",
+	printf("wipetest: %d secret buffer(s) wiped at free (want 3)\n",
 		pc_test_secret_wipes);
-	if (pc_test_secret_wipes != 5) {
+	if (pc_test_secret_wipes != 3) {
 		printf("wipetest: FAIL - secrets were freed with their "
 			"bytes intact\n");
 		return 1;

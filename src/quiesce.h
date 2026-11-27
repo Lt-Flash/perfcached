@@ -8,8 +8,6 @@
 /* this thread takes a line; a thread that never attached is never
  * counted, and its enter/exit are no-ops */
 void pc_qs_attach(void);
-/* a thread that attached gives its line back before it ends */
-void pc_qs_detach(void);
 void pc_qs_enter(void);
 void pc_qs_exit(void);
 

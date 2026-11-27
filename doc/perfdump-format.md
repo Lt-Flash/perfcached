@@ -47,22 +47,13 @@ manifest.
 
 ```json
 {"format":"perfdump-format","format_version":2,"tool":"perfdump 0.2",
- "source":"192.0.2.10:6479","started":1788930000,"node_state":"ready","threads":4,
+ "source":"192.0.2.10:6479","started":1788930000,"threads":4,
  "collections":[{"name":"sessions","buckets":262144}],
  "files":[{"file":"sessions.0000.pcd.zst","collection":"sessions",
            "bucket_lo":0,"bucket_hi":65536,"records":12345,"bytes":3456789,
            "crc32":1234567890,"zstd":3,"complete":true}],
  "records":12345,"bytes":3456789}
 ```
-
-`node_state` is the source node's lifecycle state (`stats` `state`) when
-the dump started. perfdump refuses a node that is not `ready` - a
-starting one is still filling, a draining one is handing its records
-away - unless given `--force`, which dumps what the node holds and
-leaves the state here: `perfdump --inspect` shows it and `perfload`
-warns when it is not `ready`. A manifest without it (an older perfdump,
-or a node that reports no state) is read as before; the field
-is optional, so the format version stays 2.
 
 `bucket_lo`/`bucket_hi` are the walker's range in the table's buckets at
 the time of the dump; `bucket_hi` equal to the collection's bucket count
@@ -110,9 +101,8 @@ under the file's version, so the copy a node ends up with is the copy
 the dump read, however many nodes or which mode the target has.
 
 `DIR/perfload.done` is the loader's side file: one line per chunk whose
-last batch was acknowledged (`file records target policy`, the policy
-`set` for a `--via-set` run).  A run skips the chunks listed for its own
-target and mode (restore or `--via-set`); `--restart` ignores the file.  The at-least-
+last batch was acknowledged (`file records target policy`).  A run
+skips the chunks listed; `--restart` ignores the file.  The at-least-
 once repeats a growing table can put into a dump cost nothing on the
 way back: a record already held at the same version is refused by the
 store as "as old" and counted `older`, never installed twice.

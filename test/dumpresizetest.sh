@@ -39,7 +39,6 @@ plaintext = loopback
 buckets_log2 = 10
 CONF
 chmod 600 "$D/n.conf"
-: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 PID=$!
 i=0

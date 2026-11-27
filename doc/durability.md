@@ -9,7 +9,7 @@ startup:
 
     [wal]
     dir = /var/lib/perfcached
-    fsync = everysec             # everysec | always | sync | no
+    fsync = everysec             # always | everysec | no
     save = 900 1                 # RDB snapshot rules, Redis-style,
     save = 300 10000             # repeatable and OR-ed
 
@@ -28,33 +28,6 @@ nothing derives it, so set it).  Since 0.7.3 a full ring under
 slow `fdatasync` shows as write latency (`/stats` `wal.ring_waits`,
 `ring_wait_ms`) - with the derived depth alone, a fast NVMe disk
 still dropped 9% of a burst from the log.
-
-**What each `fsync` promises.**  Under `everysec`, `always` and `no`
-a write is acknowledged once it is in the node's table and its worker's
-log ring - before the log thread has written it.  A `kill -9` loses
-what the ring still held; a power cut also loses what was written but
-not yet synced: up to about a second under `everysec`, a batch under
-`always`, whatever the kernel held under `no`.  `fsync = sync` (0.7.5.2)
-syncs as `always` does, and the client's reply to a write leaves only
-once the device has synced that write's record: an OK means on disk.
-Replies pipelined behind the write wait with it, so they stay in
-order; the connection's other requests are still read and run, and
-other connections are not held.  The cost is latency - each write's
-reply waits for one sync, so it follows the device's fdatasync time,
-and a client that waits for each reply before sending the next writes
-at most one batch per sync.  The log still batches across clients: many
-connections writing at once share each sync.  `/stats` `wal.sync_held`
-(connections waiting now), `sync_holds` and `sync_hold_ms` show it.  If
-the device refuses a sync, the replies held for it are never sent: the
-connection closes and those writes are uncertain.  Only the node that
-logs a write holds its reply: a write forwarded to its holder (`shard`,
-`proxy`) is answered once the holder has taken it, and an `eager`
-copy on another node is in memory there.  The probe never recommends
-`sync`; choose it where an acknowledged write must survive a crash of
-the node.  The log's directory is synced when a segment is made, retired
-or moved (under every policy but `no`), and the collections file's
-directory after the file is replaced, so a power loss cannot leave the
-old directory entry behind synced data.
 
 **When the log cannot keep up (`on_full`).**  Since 0.7.4 a writer waits
 under every policy (`[wal] on_full = wait`, the default).  When a

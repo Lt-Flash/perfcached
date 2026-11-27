@@ -59,7 +59,6 @@ buckets_log2 = 14
 EOF
 
 echo "=== waloverruntest ==="
-: > "$D/log"
 "$BIN" -f "$D/c.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 200 ]; do grep -q "perfcached ready" "$D/log" && break
@@ -192,7 +191,6 @@ esac
 
 # what it acknowledged survives - the overwritten records too (healtest covers the ring-drop path)
 kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null; PID=
-: > "$D/log2"
 "$BIN" -f "$D/c.conf" > "$D/log2" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 300 ]; do grep -q "perfcached ready" "$D/log2" && break
@@ -204,35 +202,16 @@ f = pcnative.wrap(socket.create_connection(("127.0.54.4", 17994), timeout=60))
 def call(m, **p):
     f.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p}) + "\n").encode()); f.flush()
     return json.loads(f.readline())
-t0 = time.time(); st0 = "?"
 for _ in range(200):
-    st0 = (call("stats").get("result") or {}).get("state")
-    if st0 == "ready": break
+    if (call("stats").get("result") or {}).get("state") == "ready": break
     time.sleep(0.25)
-tw = time.time() - t0
-missing = []; why = {}
-for k in keys:
-    r = call("get", col="th", key=k)
-    if (r.get("result") or {}).get("value") == "v" * 800: continue
-    missing.append(int(k[1:]))
-    e = r.get("error")
-    c = "refused (%s)" % str(e.get("message", e) if isinstance(e, dict) else e)[:60] if e else \
-        "absent" if (r.get("result") or {}).get("value") is None else "wrong value"
-    why[c] = why.get(c, 0) + 1
-rng = []
-for x in missing:
-    if rng and x == rng[-1][1] + 1: rng[-1][1] = x
-    else: rng.append([x, x])
-print("acked %d missing %d" % (len(keys), len(missing)) + ("".join(" k%06d-%06d" % tuple(r) for r in rng[:8]) if rng else "")
-      + ("; state %s after %.1f s, then %s" % (st0, tw, ", ".join("%d %s" % (n, c) for c, n in why.items())) if missing else ""))
+miss = sum(1 for k in keys if (call("get", col="th", key=k).get("result") or {}).get("value") != "v" * 800)
+print("acked %d missing %d" % (len(keys), miss))
 PY
 )
 case "$R" in "acked "*" missing 0")
 	ok "after kill -9 and a restart every acknowledged write is there ($R) - the overwritten ones included";;
-	*) bad "after the restart: $R"   # which snapshot and WAL the restart had, and what it loaded (114805: 365 of 6500)
-	   ls -l "$D/wal" | awk 'NR > 1 {print "  ..   wal/" $9, $5}'
-	   grep -E "healed|HEALING|rdb: snapshot|rdb: .*fail|torn" "$D/log" | cut -c1-170 | sed 's/^/  ..   run 1: /'
-	   grep -E "rdb|recover|replay|snapshot|marker|torn|segment" "$D/log2" | head -12 | cut -c1-170 | sed 's/^/  ..   restart: /';; esac
+	*) bad "after the restart: $R";; esac
 
 kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; PID=
 echo "waloverruntest: $pass passed, $fail failed"

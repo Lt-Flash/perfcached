@@ -42,7 +42,6 @@ run() {
 	if [ "$1" = - ]; then
 		env -u PERFCACHED_PLATFORM_KEY ${RUNAS:-} "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 	else
-		: > "$D/n.log"
 		PERFCACHED_PLATFORM_KEY="$1" ${RUNAS:-} "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 	fi
 	PID=$!

@@ -50,7 +50,6 @@ C
 }
 start() { # start <n> - each start logs to its own file, n<n>.log.<k>
 	k=$(ls "$D"/n$1.log.* 2>/dev/null | wc -l); L="$D/n$1.log.$k"
-	: > "$L"
 	"$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 200 ]; do

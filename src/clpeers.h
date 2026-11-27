@@ -129,13 +129,6 @@ struct peer {
 	/* set when this peer's incarnation changes: it came back empty, so
 	 * it needs the PASSIVE copies too - once, not for ever */
 	unsigned char backfill[PC_MAX_COLLECTIONS];
-	/* it asked for this collection whole (M_ASKFILL): a backfill walk from every peer */
-	unsigned char askfill[PC_MAX_COLLECTIONS];
-	/* it restarted from its WAL: diff rounds toward it (rounds run + 1, 0 none), the slots
-	 * the last round found differing and how many rounds did not shrink them */
-	unsigned char dsync[PC_MAX_COLLECTIONS];
-	unsigned char dsync_stall[PC_MAX_COLLECTIONS];
-	unsigned int dsync_prev[PC_MAX_COLLECTIONS];
 	/* when this peer last arrived empty - the sender holdoff is
 	 * measured from here, not from the flag, which can go stale */
 	long long fresh_ms;
@@ -149,7 +142,7 @@ struct peer {
 struct clpeers {
 	struct peer peers[PC_CL_MAXPEER];
 	int n_peers;
-	struct { struct in_addr addr; long long first_ms, last_ms; }
+	struct { struct in_addr addr; long long first_ms; }
 		dup_seen[PC_CL_MAXPEER];   /* joiners with a duplicate id */
 };
 

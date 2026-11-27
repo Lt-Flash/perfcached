@@ -44,8 +44,6 @@ struct pc_mget {
 	size_t collen;
 	unsigned int n, waiting, unanswered;
 	int count;                         /* pc_mget_set_count */
-	int over;                          /* past PC_MGET_MAX_BYTES */
-	size_t bytes;                      /* the hits' value bytes */
 	long long deadline;
 	int linked;                        /* its waiting keys are in the map */
 	struct pc_mget *next;              /* the worker's attached mgets */
@@ -145,29 +143,9 @@ void pc_mget_set_count(struct pc_mget *m)
 	m->count = 1;
 }
 
-/* 0 when @vlen more value bytes fit the budget; else the mget is over */
-static int budget(struct pc_mget *m, int vlen)
-{
-	if (vlen > 0 && (m->over || (size_t)vlen > PC_MGET_MAX_BYTES - m->bytes))
-		m->over = 1;
-	else if (vlen > 0)
-		m->bytes += (size_t)vlen;
-	return m->over ? -1 : 0;
-}
-
-int pc_mget_over(const struct pc_mget *m)
-{
-	return m->over;
-}
-
 void pc_mget_hit(struct pc_mget *m, unsigned int i, char *val, int vlen,
 		unsigned int exp)
 {
-	if (budget(m, vlen) != 0) {
-		free(val);
-		m->k[i].st = PC_MK_ABSENT;
-		return;
-	}
 	m->k[i].st = PC_MK_HIT;
 	m->k[i].val = val;
 	m->k[i].vlen = vlen;
@@ -228,10 +206,6 @@ void pc_mget_tree(const struct pc_mget *m, struct pc_tw *w)
 {
 	unsigned int i;
 
-	if (m->over) {
-		w->over = 1;
-		return;
-	}
 	pc_tw_map(w);
 	pc_tw_key(w, "values");
 	pc_tw_arr(w);
@@ -264,10 +238,6 @@ void pc_mget_resp(const struct pc_mget *m, struct pc_jw *w)
 {
 	unsigned int i, hits = 0;
 
-	if (m->over) {
-		w->overflow = 1;
-		return;
-	}
 	if (m->unanswered) {
 		/* all or nothing: never values beside nils for keys it could
 		 * not reach - a nil would read as "absent" */
@@ -431,10 +401,6 @@ static void settle(struct pc_mget *m, unsigned int i,
 		/* a document answers an mget as a miss under strict */
 		if (ht && (d->newval & PCACHE_F_TYPES) &&
 		        pc_store_types_strict(ht)) {
-			k->st = PC_MK_ABSENT;
-			return;
-		}
-		if (budget(m, d->vlen) != 0) {
 			k->st = PC_MK_ABSENT;
 			return;
 		}

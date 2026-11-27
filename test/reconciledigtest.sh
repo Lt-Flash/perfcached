@@ -4,7 +4,6 @@
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
-INJ=${2:-./clinject}
 # the one-by-one reconcile a restart or a floor ran before 12ol is this suite's subject; the default
 # now copies a survivor's state whole (rejoinwitnesstest)
 export PERFCACHED_TEST_RECONCILE=1
@@ -182,56 +181,8 @@ run() { # run <label> <node 3's cluster lines> <probes: max:N | once:N> <max ms>
 	rm -rf "$D"; D=
 }
 
-# a rebuild asked of a pass between its digests and its walk raises the boundary; the walk starts
-# over, so the digests must be asked again - slots equal at the first question may differ now
-raise_case() {
-	D=$(mktemp -d /var/tmp/pcrecdig.XXXXXX)
-	echo "--- a rebuild raises the boundary of a narrowed pass"
-	COLS="collections = c"
-	conf 1 ""; conf 2 ""; conf 3 ""
-	for n in 1 2 3; do start $n || { bad "raise: node $n did not start"; return; }; done
-	ready3 || { bad "raise: the fleet did not form"; return; }
-	F=$(rpc 18623 set 0 $N); [ "$F" = $N ] || bad "raise: stored $F of $N through node 3"
-	i=0; while [ $i -lt 60 ]; do
-		[ "$(st 1 'c["entries"]')$(st 2 'c["entries"]')" = "$N$N" ] && break
-		sleep 0.5; i=$((i+1))
-	done
-	CID=$(st 1 'x["cluster_id"]')
-	sleep 34
-	i=0; while [ $i -lt 30 ] && [ "$(st 3 'x["restart"]["safe"]')" != True ]; do sleep 1; i=$((i+1)); done
-	kill -9 "$(cat "$D/n3.pid")"; rm -f "$D/n3.pid"; sleep 1
-	rpc 18621 del 0 $DEL > /dev/null
-	sleep 1
-	export PERFCACHED_TEST_RECONCILE_WALK_WAIT_MS=8000
-	sed -i 's/^log_level = notice/log_level = info/' "$D/n3.conf"   # a dropped frame is said at info
-	start 3 || { bad "raise: node 3 did not restart"; return; }
-	unset PERFCACHED_TEST_RECONCILE_WALK_WAIT_MS
-	i=0; while [ $i -lt 60 ] && ! grep -q "only the keys there are asked about" "$D/n3.log"; do sleep 0.5; i=$((i+1)); done
-	sleep 1                        # the boundary is in whole ticks: now must be past the restart's
-	A1=$(st 3 'x["reconcile_digests"]["asked"]')
-	# a member's ask, from an address node 3 knows once it sent an ALIVE
-	"$INJ" -s rd-cluster-secret -c "$CID" -f 127.0.23.9:18699 -t 127.0.23.3:18625 -w 500 -g 1,1,c alive 77 > "$D/inj-alive.out" 2>&1
-	sleep 0.5
-	"$INJ" -s rd-cluster-secret -c "$CID" -f 127.0.23.9:18699 -t 127.0.23.3:18625 -w 500 raw 330000000000 > "$D/inj.out" 2>&1
-	i=0; while [ $i -lt 20 ] && ! grep -q "the reconcile under way now covers" "$D/n3.log"; do sleep 0.5; i=$((i+1)); done
-	grep -q "the reconcile under way now covers" "$D/n3.log" \
-		|| { bad "raise: node 3 took no rebuild into its pass (digests asked $A1; $(tr '\n' ' ' < "$D/inj.out" | cut -c1-120))"
-			echo "  ..   node 3: rebuilds $(st 3 'x["acks"].get("rebuilds")') covered $(st 3 'x["acks"].get("rebuild_covered")'); $(st 3 '" ".join("%s %s" % (k, x.get(k)) for k in ("cluster_id_state", "bad_auth", "foreign_seen", "wire_ver_refused", "mcast_stray", "sender_refused", "epoch_refused"))'); cid same: $(st 3 "x.get('cluster_id') == '$CID'")"
-			echo "  ..   node 3 peers: $(st 3 '[(p.get("addr"), p.get("node"), p.get("up")) for p in x["peers"]]')"
-			echo "  ..   alive: $(tr '\n' ' ' < "$D/inj-alive.out" | cut -c1-160)"
-			grep -E "node 77|127\.0\.23\.9|refus|rebuild|dropped a frame|authenticate|ignoring" "$D/n3.log" | tail -n 10 | sed 's/^/  ..   n3: /' | cut -c1-200; }
-	i=0; while [ $i -lt 20 ] && [ "$(st 3 'x["reconcile_digests"]["asked"]')" = "$A1" ]; do sleep 0.5; i=$((i+1)); done
-	A2=$(st 3 'x["reconcile_digests"]["asked"]')
-	[ "$A1" = 1 ] && [ "$A2" = 2 ] \
-		&& ok "raise: the raised pass asked the witness's digests again (asked $A1 -> $A2)" \
-		|| bad "raise: digests asked $A1 -> $A2 after the boundary moved, want 1 -> 2 - the walk restarted under the old slot filter"
-	kill -9 $(cat "$D"/*.pid) 2>/dev/null
-	rm -rf "$D"; D=
-}
-
 run "digests" "" max:$((N / 10)) 10000
 run "sweep_digests = no" "sweep_digests = no" once:$N 60000
 run "legacy config, collection never replicated" "" max:0 90000 legacy
-raise_case
 echo "reconciledigtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

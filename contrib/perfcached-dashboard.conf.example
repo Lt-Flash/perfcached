@@ -42,10 +42,6 @@ secret = change-me
 # a request slower than this is dropped
 #timeout_s = 10
 
-# how long a DDL from the page (create, drop, resize, rename, map) waits for the
-# daemon's answer - a create waits on the WAL's fsync, which a slow disk can hold
-#ddl_timeout_s = 60
-
 # wrong enable secrets from one address before it is locked out, and for
 # how long
 #lockout_after = 5

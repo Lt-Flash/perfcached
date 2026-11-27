@@ -498,9 +498,7 @@ int pc_upg_stage_end(const char *id, char *sha_hex, size_t shl, char *who,
 		*err = "not all of it has arrived";
 		return -1;
 	}
-	ok = fsync(U.fd) == 0;
-	ok &= close(U.fd) == 0;                 /* closed on every path */
-	if (!ok) {
+	if (fsync(U.fd) != 0 || close(U.fd) != 0) {
 		U.fd = -1;
 		upload_drop();
 		pthread_mutex_unlock(&SL);
@@ -940,7 +938,7 @@ static int last_ok_result(char *from, size_t fl, char *to, size_t tl,
  * answered) - what a roll driver re-reading the fleet needs to tell the states apart */
 static void revert_tree(struct pc_tw *out)
 {
-	char lp[512], from[200], to[200], p[800], rid[40] = "", rat[40] = "", rsha[80];
+	char lp[512], from[200], to[200], p[800], rid[40] = "", rat[40] = "";
 	long long at;
 	struct stat st;
 	FILE *f;
@@ -968,8 +966,8 @@ static void revert_tree(struct pc_tw *out)
 	if (upath(p, sizeof p, "requested", NULL) == 0 && (f = fopen(p, "r"))) {
 		if (fgets(rid, sizeof rid, f))
 			rid[strcspn(rid, "\r\n")] = 0;
-		if (!fgets(rsha, sizeof rsha, f))        /* line 2 is the sha / "revert" */
-			rsha[0] = 0;
+		if (fgets(rat, sizeof rat, f))           /* line 2 is the sha / "revert" */
+			rat[0] = 0;
 		if (fgets(rat, sizeof rat, f))
 			rat[strcspn(rat, "\r\n")] = 0;
 		fclose(f);

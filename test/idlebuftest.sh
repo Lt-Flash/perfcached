@@ -33,7 +33,6 @@ if [ "$(ulimit -n)" != unlimited ] && [ "$(ulimit -n)" -lt 7000 ]; then
 fi
 # THP off (prctl 41, survives the exec; P is the daemon's pid): khugepaged would refill 2 MB ranges
 # holding one live page, and RSS would move in 2 MB steps of host policy
-: > "$D/pc.log"
 python3 -c 'import ctypes, os, sys
 ctypes.CDLL(None).prctl(41, 1, 0, 0, 0)
 os.execv(sys.argv[1], sys.argv[1:])' "$BIN" -f "$D/pc.conf" -D > "$D/pc.log" 2>&1 & P=$!

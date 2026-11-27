@@ -43,7 +43,6 @@ C
 }
 start() { # start <name> - sets P
 	rm -rf "$D/$1.state"; mkdir -p "$D/$1.state"
-	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & P=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1.log"; do
 		kill -0 $P 2>/dev/null || break; sleep 0.1; i=$((i+1)); done

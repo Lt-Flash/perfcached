@@ -45,9 +45,7 @@ So an acknowledgement means "in memory, and in the log's queue".  A
 last 200 ms or so of that node's writes, more while the log is
 behind - and a power cut also loses what was written but not yet
 synced, up to about a second under `fsync = everysec`.  `fsync =
-always` syncs sooner; it does not make the acknowledgement wait.
-`fsync = sync` (0.7.5.2) does: a write's reply leaves once the node
-that logged it has synced it ([durability.md](durability.md)).  A
+always` syncs sooner; it does not make the acknowledgement wait.  A
 client that needs a write on disk sends the `sync` verb after it
 (`perfcli sync`), a barrier for everything acknowledged before.  A ring
 that fills makes the writer wait (`on_full = wait`, the default since
@@ -123,11 +121,6 @@ and `copies` how many copies the mode keeps: `1`, the copy factor K,
 | `spread` | its keys survive while one of their K holders is up | as eager |
 | `shard` | its slice is out of reach until it returns | the keys it owns wait for it |
 | `proxy` | its keys are out of reach until it returns | the keys it holds wait for it |
-
-A read another node must answer and does not within `pull_timeout_ms` (it is slow, frozen,
-or gone and not yet dropped from the fleet) is refused as retryable, never answered absent:
-RESP `-TRYAGAIN`, the native door's "cluster busy", `PERFD_E_REFUSED` in libperfd (0.7.5.1).
-Once a dead node is dropped, the reads it alone could answer are misses.
 
 **A split.**  Both sides keep serving and taking writes: the fleet
 favours availability, and no side waits for a majority.  On the heal

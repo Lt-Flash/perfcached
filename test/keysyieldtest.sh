@@ -1,7 +1,6 @@
 #!/bin/sh
 # keysyieldtest.sh - a KEYS walk does not hold the worker: on one worker a PING on another connection
-# overtakes it; answers stay exact and ordered per connection, a vanished client hurts nothing, and
-# input pipelined behind a walk waits in the socket.
+# overtakes it; answers stay exact and ordered per connection, and a vanished client hurts nothing.
 set -u
 
 BIN=${1:-./perfcached}
@@ -30,7 +29,6 @@ plaintext = loopback
 buckets_log2 = 17
 EOF
 chmod 600 "$D/n.conf"
-: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 PID=$!
 i=0
@@ -156,40 +154,6 @@ if b.recv(64).startswith(b"+PONG"):
 else:
     bad("daemon unhealthy after mid-walk disconnect")
 b.close()
-
-# ---- 4. pipelined past the input cap behind a KEYS walk ----
-# nothing behind a walk is served until it ends: what follows must wait in the socket, not be
-# read into the connection's input, which holds one request's worth (1 MB)
-import threading
-a = conn()
-N4 = 1000
-body = cmd([b"KEYS", b"zzz*"]) + b"".join(cmd([b"SET", b"p4:%04d" % i, b"v" * 4000])
-                                         for i in range(N4))
-def push():
-    try:
-        a.sendall(body)
-    except OSError:
-        pass
-threading.Thread(target=push, daemon=True).start()
-got = b""; oks = 0; dead = False
-deadline = time.time() + 30
-while oks < N4 and time.time() < deadline:
-    try:
-        d = a.recv(1 << 16)
-    except socket.timeout:
-        break
-    except OSError:
-        dead = True; break
-    if not d:
-        dead = True; break
-    got += d
-    oks = got.count(b"+OK\r\n")
-if got.startswith(b"*0\r\n") and oks == N4:
-    ok("4 MB pipelined behind a KEYS walk: the walk's reply, then all %d SETs" % N4)
-else:
-    bad("4 MB pipelined behind a KEYS walk: %d of %d SETs answered%s (reply starts %r)"
-        % (oks, N4, ", the connection was closed" if dead else "", got[:12]))
-a.close()
 
 print("PYRESULT %d %d" % (pass_n, fail_n))
 sys.exit(1 if fail_n else 0)

@@ -16,16 +16,7 @@ trap 'exit 1' INT TERM
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL $1"; }
-gone() { # on a failure: each node whose process has exited, its status and its sanitizer lines
-	for i in 1 2 3; do
-		eval "p=\$P$i"; [ -n "$p" ] || continue
-		case "$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)" in Z|'') ;; *) continue;; esac
-		wait "$p" 2>/dev/null; echo "    node $i (pid $p) is gone, exit status $?"
-		grep -hE "runtime error|AddressSanitizer|LeakSanitizer|SUMMARY|^ *#[0-9]+ 0x|fatal|abort" "$D/n$i.log" | head -40 | cut -c1-200 | sed 's/^/      /'
-		tail -3 "$D/n$i.log" | cut -c1-200 | sed 's/^/      last: /'
-	done
-}
-done_() { [ $fail -gt 0 ] && gone; [ $fail -gt 0 ] && grep -hE "stuck|floor|no longer holds|rebuild|resync -|reconcile" "$D"/n2.log "$D"/n3.log | grep -v "reconcile dropped" | tail -12 | cut -c1-170 | sed 's/^/    /'; echo "gapfloortest: $pass passed, $fail failed"; [ $fail -eq 0 ]; exit; }
+done_() { [ $fail -gt 0 ] && grep -hE "stuck|floor|no longer holds|rebuild|resync -|reconcile" "$D"/n2.log "$D"/n3.log | grep -v "reconcile dropped" | tail -12 | cut -c1-170 | sed 's/^/    /'; echo "gapfloortest: $pass passed, $fail failed"; [ $fail -eq 0 ]; exit; }
 [ -f "$SHIM" ] || { echo "gapfloortest: no netcut shim at $SHIM" >&2; exit 1; }
 for p in 19641 19642 19643 19649; do
 	ss -ltn 2>/dev/null | grep -qE ":$p[[:space:]]" && { echo "gapfloortest: port $p already bound" >&2; exit 1; }
@@ -67,7 +58,7 @@ C
 done
 start() { # start <i>: node 2 under the shim
 	if [ "$1" = 2 ]; then
-		LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut2" PC_NETCUT_LOG="$D/cutlog2" \
+		LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut2" PC_NETCUT_LOG="$D/cutlog2" \
 			"$BIN" -f "$D/n2.conf" >> "$D/n2.log" 2>&1 &
 	else
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &

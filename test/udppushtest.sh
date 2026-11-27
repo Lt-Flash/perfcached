@@ -29,7 +29,6 @@ buckets_log2 = 12
 CONF
 	chmod 640 "$D/n$1.conf"; }
 start() { # start <n>
-	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" -D > "$D/n$1.log" 2>&1 & eval "P$1=\$!"
 	i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n$1.log" && return 0; sleep 0.1; i=$((i+1)); done
 	echo "  node $1 did not start:"; tail -3 "$D/n$1.log"; return 1; }

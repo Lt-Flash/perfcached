@@ -1,15 +1,13 @@
 #!/bin/sh
 # cmdstatstest.sh - the native door counts into the RESP door's command rows and slow log under its
-# wire's name (cmd:get, bin:get), on /stats, /metrics and INFO latencystats, counted exactly; /metrics
-# grows past its first buffer instead of being cut.
+# wire's name (cmd:get, bin:get), on /stats, /metrics and INFO latencystats, counted exactly.
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
 D=$(mktemp -d /var/tmp/pccs.XXXXXX)
-P1= P2= P3=
+P1= P2=
 trap '[ -n "$P1" ] && kill -9 $P1 2>/dev/null; \
-     [ -n "$P2" ] && kill -9 $P2 2>/dev/null; \
-     [ -n "$P3" ] && kill -9 $P3 2>/dev/null; rm -rf "$D"' EXIT
+     [ -n "$P2" ] && kill -9 $P2 2>/dev/null; rm -rf "$D"' EXIT
 trap 'exit 1' INT TERM   # a TERM trap that returns lets the script run on
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "  ok   $1"; }
@@ -37,7 +35,6 @@ CONF
 	chmod 600 "$1"
 }
 start() { # start <conf> <log> -> pid in $STARTED
-	: > "$2"
 	"$BIN" -f "$1" > "$2" 2>&1 &
 	STARTED=$!
 	i=0
@@ -232,29 +229,5 @@ while IFS= read -r l; do
 	case "$l" in P\ *) ok "${l#P }" ;; F\ *) bad "${l#F }" ;; esac
 done < "$RES"
 [ -s "$RES" ] || bad "driver produced no results"
-
-# ---- daemon C: /metrics never cut ---------------------------------------------------------
-# PERFCACHED_TEST_METRICS_BUF=8192: the exposition starts in an 8 KB buffer; it must still come whole,
-# every line complete and the last family (UDP datagrams, relay rx) at its end - not cut mid-line
-mkconf "$D/c.conf" 17765 17766 18765 ""
-: > "$D/c.log"
-PERFCACHED_TEST_METRICS_BUF=8192 "$BIN" -f "$D/c.conf" > "$D/c.log" 2>&1 & P3=$!
-i=0; while [ $i -lt 80 ] && ! grep -q "perfcached ready" "$D/c.log"; do sleep 0.1; i=$((i+1)); done
-if grep -q "perfcached ready" "$D/c.log"; then
-	timeout 20 python3 - > "$D/cm.out" 2>&1 <<'PY'
-import re, urllib.request
-m = urllib.request.urlopen("http://127.0.0.1:18765/metrics", timeout=5).read().decode()
-ls = m.split("\n")
-cut = [l for l in ls[:-1] if not (l.startswith("# ") or re.match(r'^[a-zA-Z_:][a-zA-Z0-9_:]*(\{[^}]*\})? \S+$', l))]
-last = ls[-2] if len(ls) > 1 else ""
-print("len %d end %r cut %d last %r" % (len(m), m[-1:], len(cut), last[:60]))
-PY
-	grep -qE "^len [0-9]{5,} end '\\\\n' cut 0 last 'perfcached_udp_datagrams_total\{plane=\"relay\",dir=\"rx\"\} " "$D/cm.out" &&
-		ok "/metrics from an 8 KB start: whole, every line complete, the last family at its end ($(cut -c1-24 "$D/cm.out"))" ||
-		bad "/metrics from an 8 KB start is cut: $(cat "$D/cm.out")"
-	kill $P3 2>/dev/null; wait $P3 2>/dev/null; P3=
-else
-	bad "daemon C did not start: $(tail -2 "$D/c.log")"
-fi
 echo "cmdstatstest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

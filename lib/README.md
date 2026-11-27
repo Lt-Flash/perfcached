@@ -6,7 +6,7 @@
   <br>libperfd
 </h1>
 
-The C client for perfcached: **libperfd 0.7.6.1**, for perfcached 0.7.5.1.
+The C client for perfcached: **libperfd 0.7.6**, for perfcached 0.7.5.
 Blocking calls with one thread per handle, pipelining, an opt-in
 event-loop surface, and a handle that follows the fleet - standby
 connections, failover, routing each key to its node.  It speaks the
@@ -158,166 +158,6 @@ standbys: to route by key, keep a handle per node and pick it with
 that joins or turns ready opens no standby behind its caller, who polls
 one fd.
 
-The blocking connect tries each of `opts.secrets` in turn; the event-loop
-connect (`perfd_connect_async`) tries the first only, since a second dial
-would change `perfd_fd()` under the caller's loop.  A node that refuses
-that secret now fails the handle as `PERFD_E_AUTH`, not
-`PERFD_E_TRANSPORT` "connection closed", and `perfd_secret_index(p)` says
-which secret it tried: free the handle and dial again with
-`opts.secrets + perfd_secret_index(p) + 1` while one is left.  On a
-handle that connected it names the secret in use (`-1` in plaintext).
-
-```c
-/* ... the loop reports PERFD_ST_FAILED ... */
-if (perfd_error_kind(p) == PERFD_E_AUTH && opts.secrets[perfd_secret_index(p) + 1]) {
-	opts.secrets += perfd_secret_index(p) + 1;
-	perfd_free(p);
-	p = perfd_connect_async(host, port, &opts);
-}
-```
-
-## URLs, conditional JSON sets, describing a handle
-
-A client configured by one string can hand it to `perfd_url_parse`:
-
-```
-perfd[:group]://[user[:secret]@]host:port[,host:port...]/collection[?opt,opt...]
-```
-
-Hosts are names, IPv4 addresses or `[IPv6]` literals; every seed names its
-port (1-65535); up to 8 seeds.  The secret is the password field, or the
-user field when there is no password; `%XX` escapes a `:`, `@` or `/` in
-either.  The options, split by `,` or `&`, are `route=0|1` (default 1),
-`encrypt=0|1` (default 1), `spares=-1..8` (0 none, -1 one per member, the
-default), `policy=failover|rr|least|weighted` (default failover) and
-`dial_wait_ms=-1|1..60000`: how long an async pool's get waits on a new
-connection before it fails while the dial goes on in the background (default
-500, never past connect_timeout; -1 waits all of it).  The
-parse is strict: an unknown option, a repeated one or a bad value is an
-error, and the reason comes back in the caller's buffer.
-`perfd_url_collection`, `perfd_url_secret`, `perfd_url_group` and
-`perfd_url_seed` read the parts back; `perfd_url_apply` writes the four
-options (the URL's or their defaults), `dial_wait_ms` when the URL gives it, and the secret into a `perfd_opts`,
-touching only the fields the caller's struct holds - timeouts, name and the
-rest stay the caller's.
-
-`perfd_url_connect(u, opts)` makes a blocking handle from the seeds, the
-first tried chosen by the process id so a pre-forked server spreads its
-children.  A seed that fails is logged once (through `perfd_set_log`, at
-warning level) and its return once, so an outage costs two lines, not one
-per call.  After a dial that no seed answered, the next calls fail at once
-with `PERFD_E_BACKOFF` and "backing off" in `perfd_error(NULL)`: for 1 s,
-doubling to 30 s, until a dial succeeds.  The state lives in the
-`perfd_url`, per process - a forked child starts without its parent's
-hold - and one thread at a time may use it.
-
-```c
-char err[256];
-perfd_url *u = perfd_url_parse("perfd://app:s3cret@10.0.0.1:6380,10.0.0.2:6380/sessions",
-	err, sizeof err);
-perfd_t *p = u ? perfd_url_connect(u, NULL) : NULL;
-if (!p && perfd_error_kind(NULL) == PERFD_E_BACKOFF)
-	/* a recent dial found every seed down: answer from elsewhere */;
-```
-
-`perfd_jset_ex(p, col, key, path, json, ttl, flags)` is `perfd_jset` with
-`PERFD_JSET_NX` (only where the path holds nothing) or `PERFD_JSET_XX`
-(only where it holds a value), as `JSON.SET ... NX|XX`: 1 set, 0 declined
-(and no error left on the handle), -1 an error.  An `NX` below a key that
-does not exist is the daemon's error, not a decline.  A conditional set is
-never sent again after a failover: replayed after its reply was lost, it
-would meet its own write and answer declined.
-
-`perfd_describe(p, buf, cap)` writes one line for a log -
-`perfcached 0.7.5.1, 3 members, routing on, 2 standbys` - and returns the
-length it needed, as `snprintf` does.  `perfd_fleet_changes(p)` is a
-counter that moves whenever the handle's member list, or a member's state
-as the handle sees it (ready, draining, down), changes: compare two
-readings to know when to log or re-read `perfd_member_info`.
-
-`perfd_exec(p, col, argc, argv, argvlen)` runs a Redis-style command
-through this library's verbs, each on its key's node, and answers a typed
-`perfd_reply` (nil, integer, string, status, error or array; free it with
-`perfd_reply_free`) shaped as perfcached's RESP door answers the same
-command.  It covers the keyed data commands: `GET`, `SET` (with `EX`, `PX`,
-`NX`, `XX`, `IFEQ`, `IFNE`), `SETEX`, `PSETEX`, `DEL`, `UNLINK`, `EXISTS`,
-`EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `INCR`, `INCRBY`, `DECR`, `DECRBY`,
-`MGET`, `MSET`, every hash command (`HSET` ... `HSCAN`), and `JSON.GET`,
-`JSON.SET` (with `NX`, `XX`, `EX`) and `JSON.DEL`.  Any other command is an
-error reply, "unsupported command" - never a guess.  Arguments are
-binary-safe (`argvlen` NULL reads them as C strings) except that a key
-cannot hold a NUL byte.  A daemon's error is an error reply in the door's
-words; NULL means the call itself failed (`perfd_error`).  Two differences
-from the door: `MSET` is a set per key, each on its own node, not one
-atomic write (the door has no `MSET`), and a multi-key `DEL` counts the
-keys actually deleted.
-
-```c
-const char *argv[] = { "SET", "session:42", "{...}", "EX", "600", "NX" };
-perfd_reply *r = perfd_exec(p, "sessions", 6, argv, NULL);
-if (!r)
-	/* transport: perfd_error(p) */;
-else if (r->type == PERFD_REPLY_NIL)
-	/* NX did not hold */;
-perfd_reply_free(r);
-```
-
-## An async pool, one descriptor per request
-
-Some event loops suspend a task on one file descriptor and resume it when
-that descriptor turns readable, so every request in flight needs a socket
-of its own.  `perfd_apool` keeps those sockets for a process
-(`PERFD_HAS_APOOL`):
-
-```c
-const char *hosts[] = { "10.0.0.1", "10.0.0.2" };
-int ports[] = { 6380, 6380 };
-perfd_opts o = PERFD_OPTS_INIT;          /* secrets, timeouts, route_keys = 1 */
-perfd_apool *pool = perfd_apool_new_seeds(hosts, ports, 2, "sessions", &o, 16);
-
-int fd = perfd_apool_get(pool, key, on_reply, task);
-if (fd >= 0)
-	suspend_on(fd);                  /* on readability: perfd_apool_ready(pool, fd) */
-else if (fd == -1)
-	fall_back(perfd_error(NULL));    /* on_reply was not called */
-/* PERFD_APOOL_DONE: on_reply already ran */
-```
-
-- Every GET has an event-loop handle of its own.  With `opts.route_keys`
-  the handle is pinned to the key's owner, which a separate handle on a
-  seed learns (again every `refresh_ms` and on membership pushes);
-  without routing, or before the fleet is known, it goes to a seed.  The
-  seeds are tried from a start rotated by the process id.
-- The callback gets the GET reply as `perfd_submit_kv` gives it -
-  `[u8 found][u32 ttl][value]`, one zero byte for a miss - or NULL and
-  the error.  It runs once at most, from `perfd_apool_ready()` (1 = it
-  ran, 0 = not yet), `perfd_apool_wait()` or, rarely, inside
-  `perfd_apool_get()` itself.
-- `perfd_apool_wait(pool, fd, timeout_ms)` blocks for a caller that
-  cannot suspend; when the time passes the request is cancelled.
-  `perfd_apool_cancel(pool, fd)` gives up on a request: its callback
-  never runs, and its handle is never used again - a reply that arrives
-  later is not read, and the handle is replaced at a later get.  Stop
-  watching the descriptor before that get, which may reuse its number.
-- A new handle must be ready within `connect_timeout_ms`, TCP and
-  handshake.  When no node answers, the pool's dials back off for 1 s,
-  doubling to 30 s, and a get fails at once meanwhile.  A handle that
-  failed is replaced; an idle one whose node closed it is found closed
-  and replaced before it is used.  When all `max_conns` handles exist
-  and the get needs a node none of the idle ones is on, the least
-  recently used idle handle is closed and dialled to that node; when
-  every handle is busy the get fails (`PERFD_E_STATE`).
-- After `fork()` the pool belongs to the process that uses it: the
-  first call in the child closes the child's copies of the parent's
-  sockets, without a byte sent, and dials its own; the parent's
-  requests are not the child's and their callbacks never run there.
-- `perfd_apool_new(u, opts, max_conns)` builds the same pool from a parsed
-  `perfd_url`: its seeds, collection, options and secret over `opts`.
-- `perfd_apool_node(pool, fd, ...)` names the node a request went to,
-  `perfd_apool_stats()` counts handles, gets, dials, rebuilds,
-  evictions, cancels and fork resets.  A pool is not thread-safe: keep
-  one per thread or process.
-
 ## In a fleet
 
 By default a handle learns the members on connect and keeps a standby
@@ -358,8 +198,8 @@ established socket, not a new handshake.
   reply that says the handle is behind makes it re-learn the members,
   `perfd_moved_hints()`).  `proxy` keys are not computable:
   `route_hints = 1` remembers who answered each key in a fixed 4,096-entry
-  table (`perfd_hint_hits()`, `perfd_hint_stale()`).  libperfd 0.7.6.1
-  routes against perfcached 0.7.5.x (wire epoch 4); `perfd_wire_epoch()`
+  table (`perfd_hint_hits()`, `perfd_hint_stale()`).  libperfd 0.7.6
+  routes against perfcached 0.7.5 (wire epoch 4); `perfd_wire_epoch()`
   shows what the daemon advertised.
 - **A frozen member** that accepts the connection and says nothing costs
   at most `connect_timeout_ms`, reported as `PERFD_E_TRANSPORT`.
@@ -393,13 +233,12 @@ Branch on `perfd_error_kind(p)`, never on the text:
 |---|---|
 | `PERFD_E_TRANSPORT` | connect, send, receive, a lost connection (the handle is poisoned) |
 | `PERFD_E_AUTH` | the handshake: wrong or missing secret |
-| `PERFD_E_REFUSED` | the daemon applied nothing: limits, not READY, busy, a forward lost, an mget timeout, a read whose owner did not answer in time - retry |
+| `PERFD_E_REFUSED` | the daemon applied nothing: limits, not READY, busy, a forward lost, an mget timeout - retry |
 | `PERFD_E_SERVER` | any other error the daemon answered (`value too large`, ...) |
 | `PERFD_E_ARG` | a bad argument |
 | `PERFD_E_NOMEM` | out of memory, or the crypto library failed |
 | `PERFD_E_PROTOCOL` | a reply the library could not read |
 | `PERFD_E_STATE` | the call does not fit the handle's state (`perfd_enable` on a plaintext link, a typed call inside a pipeline) |
-| `PERFD_E_BACKOFF` | a recent dial found no seed answering: the call failed at once, nothing sent (1 s, doubling to 30 s) |
 
 `perfd_set_log(cb, ctx)`, set once before the first connect, takes the
 library's log lines (errors go to stderr otherwise).

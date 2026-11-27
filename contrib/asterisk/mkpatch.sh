@@ -48,11 +48,11 @@ apply_changes() {
 		'AST_EXT_LIB_SETUP([PERFD], [libperfd], [perfd])'
 	insert_before "$D/configure.ac" \
 		'AST_EXT_LIB_CHECK([SPEEX], [speex], [speex_encode], [speex/speex.h], [-lm])' \
-		'AST_PKG_CONFIG_CHECK([PERFD], [libperfd >= 0.7.6.1])'
+		'AST_PKG_CONFIG_CHECK([PERFD], [libperfd >= 0.5.0])'
 	# no pkg-config, or --with-perfd=DIR: the plain header + library probe
 	insert_before "$D/configure.ac" \
 		'AST_EXT_LIB_CHECK([SPEEX], [speex], [speex_encode], [speex/speex.h], [-lm])' \
-		'AST_EXT_LIB_CHECK([PERFD], [perfd], [perfd_url_connect], [perfd.h])'
+		'AST_EXT_LIB_CHECK([PERFD], [perfd], [perfd_opts_init], [perfd.h])'
 	insert_before "$D/makeopts.in" 'SPEEX_INCLUDE=@SPEEX_INCLUDE@' 'PERFD_INCLUDE=@PERFD_INCLUDE@'
 	insert_before "$D/makeopts.in" 'SPEEX_INCLUDE=@SPEEX_INCLUDE@' 'PERFD_LIB=@PERFD_LIB@'
 	insert_before "$D/build_tools/menuselect-deps.in" 'SPEEX=@PBX_SPEEX@' 'PERFD=@PBX_PERFD@'

@@ -25,7 +25,6 @@ plaintext = loopback
 buckets_log2 = 12
 CONF
 chmod 640 "$D/e.conf"
-: > "$D/e.log"
 "$BIN" -f "$D/e.conf" -D > "$D/e.log" 2>&1 & P1=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/e.log" && break; sleep 0.1; i=$((i+1)); done
 if ! grep -q "perfcached ready" "$D/e.log"; then

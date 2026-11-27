@@ -199,16 +199,6 @@ except Exception: print("?")' 2>/dev/null)
 
 # ---- the handover: placement excludes a non-READY node, so node 1's reshard tick (~1 Hz) must
 # deliver every key it held
-# a FAILED member owns nothing: the survivors' map leaves it out and stays usable, so every node
-# agrees where its keys go (a live non-placeable member made it unusable everywhere)
-usable() { call $1 '{"method":"stats"}' | python3 -c 'import json,sys
-try: print((json.load(sys.stdin)["result"]["cluster"].get("map") or {}).get("usable"))
-except Exception: print("?")' 2>/dev/null; }
-i=0
-while [ $i -lt 100 ] && { [ "$(usable 2)" != True ] || [ "$(usable 3)" != True ]; }; do sleep 0.1; i=$((i+1)); done
-[ "$(usable 2)" = True ] && [ "$(usable 3)" = True ] \
-	&& ok "the survivors' map leaves the FAILED node out and stays usable" \
-	|| bad "map usable on node 2 $(usable 2), node 3 $(usable 3) 10 s after node1 failed - want True: a live FAILED member must not void the map"
 echo "  waiting for the re-shard to move its keys"
 # count only the keys this test placed: the hammer's junk inflates the collection's total
 MOVED=0

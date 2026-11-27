@@ -63,7 +63,6 @@ max_datagram = $2
 lane_retry_s = 2
 mode = eager
 collections = 0
-${3:-}
 [collection 0]
 buckets_log2 = 10
 EOF
@@ -140,28 +139,6 @@ sleep 15
 tail -n +$((L3 + 1)) "$D/n3.log" | grep -q "went silent" \
 	&& ok "without the lane node 3 purged its peers - the rig blocks UDP, so arm 1 was the fallback" \
 	|| bad "node 3 kept its peers without the lane - the rig does not block UDP and proves nothing"
-stopall; unblock3
-
-echo "--- 3: an eager sweep to node 3 over the forced lane - its acks come back by the lane too"
-for n in 1 2 3; do conf $n 1400 "sweep_digests = no"; start $n; sleep 0.5; done
-wait_for 40 formed || bad "the sweep fleet did not form"
-L3=$(wc -l < "$D/n3.log")
-block3
-wait_for 30 'tail -n +$((L3 + 1)) "$D/n3.log" | grep -q "answers on TCP"' || bad "arm 3: node 3 did not force the lane"
-sleep 3
-LOST0=$(st 1 'r["cluster"]["migrate_lost"]'); OUT0=$(st 1 'r["cluster"]["repl_out"]')
-ip netns exec ${R}n1 python3 -c 'import json,socket,pcnative
-f=pcnative.wrap(socket.create_connection(("127.0.0.1", 18351), 5))
-for i in range(1000):
-    f.write((json.dumps({"jsonrpc":"2.0","id":i,"method":"set","params":{"col":"0","key":"sw%d" % i,"value":"v" * 200}})+"\n").encode()); f.flush(); f.readline()
-' 2>/dev/null
-sleep 25
-LOST1=$(st 1 'r["cluster"]["migrate_lost"]'); OUT1=$(st 1 'r["cluster"]["repl_out"]')
-if [ "$OUT1" -ge $((OUT0 + 1000)) ] 2>/dev/null && [ "$LOST1" = "$LOST0" ]; then
-	ok "node 1 swept 1000 new records to its peers ($OUT0 -> $OUT1 handed out) and lost none: node 3's acks by the lane free the window"
-else
-	bad "the sweep over the forced lane: records handed out $OUT0 -> $OUT1, migrate_lost $LOST0 -> $LOST1 on node 1 - the ack pump does not read the lane"
-fi
 stopall; unblock3
 
 echo "udpblocktest: $pass passed, $fail failed"

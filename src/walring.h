@@ -7,23 +7,6 @@
 #include <stdint.h>
 #include <string.h>
 
-/* a ring of @kb KB (<= 2^21), rounded up to a power of two: only a size that divides 2^32
- * keeps the free-running counters' places continuous across their wrap */
-static inline uint32_t walring_size(int kb)
-{
-	uint32_t want = (uint32_t)kb << 10, size = 1;
-
-	while (size < want)
-		size <<= 1;
-	return size;
-}
-
-/* where the free-running byte counter @c falls in a ring of @size (a power of two) */
-static inline uint32_t walring_pos(uint32_t c, uint32_t size)
-{
-	return c & (size - 1);
-}
-
 /* copy @n (<= @size) bytes from ring offset @pos (< @size), wrapping */
 static inline void walring_copy(const unsigned char *buf, uint32_t size,
 		uint32_t pos, unsigned char *dst, uint32_t n)

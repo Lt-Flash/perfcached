@@ -3,7 +3,6 @@
 /* clcid.c - the cluster id's lifecycle.  See clcid.h. */
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,16 +23,6 @@ static struct {
 	int state;                     /* CLWIRE_CID_* */
 	long long since_ms;            /* when it became provisional */
 } K;
-
-/* what the file should hold, written by pc-maint (pc_cid_persist_tick) in the order asked: the fsync
- * waits on storage, and the cluster thread answers every pull and forward */
-static pthread_mutex_t pmx = PTHREAD_MUTEX_INITIALIZER;
-static struct {
-	unsigned char cid[16];
-	int have;                      /* 0 = no file */
-	const char *what;              /* "new", "adopted": for the log */
-	unsigned int gen, tried;       /* asked, attempted */
-} P;
 
 static int is_zero(const unsigned char *b)
 {
@@ -113,58 +102,6 @@ static int cid_store(const unsigned char cid[16])
 	pc_cid_str(cid, s);
 	n = snprintf(buf, sizeof buf, CID_HEADER "\n%s\n", s);
 	return pc_state_write(K.dir, PC_CID_FILE, buf, (size_t)n) == 0;
-}
-
-/* @cid, or NULL for no file */
-static void cid_store_later(const unsigned char *cid, const char *what)
-{
-	if (!K.dir[0])
-		return;
-	pthread_mutex_lock(&pmx);
-	if (cid)
-		memcpy(P.cid, cid, 16);
-	P.have = cid != NULL;
-	P.what = what;
-	P.gen++;
-	pthread_mutex_unlock(&pmx);
-}
-
-int pc_cid_persist_tick(void)
-{
-	static unsigned int said;
-	static int failed;
-	unsigned char c[16];
-	char path[600];
-	const char *what;
-	unsigned int g;
-	int have, ok;
-
-	pthread_mutex_lock(&pmx);
-	g = P.gen;
-	have = P.have;
-	what = P.what;
-	memcpy(c, P.cid, 16);
-	pthread_mutex_unlock(&pmx);
-	if (g == __atomic_load_n(&P.tried, __ATOMIC_ACQUIRE) && !failed)
-		return 0;
-	if (have)
-		ok = cid_store(c);
-	else {
-		snprintf(path, sizeof path, "%s/" PC_CID_FILE, K.dir);
-		ok = unlink(path) == 0 || errno == ENOENT;
-	}
-	__atomic_store_n(&P.tried, g, __ATOMIC_RELEASE);
-	failed = !ok;
-	if (ok)
-		return 1;
-	if (said != g && have)
-		LM_WARN("cluster: could not persist the %s cluster id (%s) - retrying\n",
-			what, strerror(errno));
-	else if (said != g)
-		LM_WARN("cluster: could not remove the given-up cluster id from %s (%s) - "
-			"retrying\n", K.dir, strerror(errno));
-	said = g;
-	return -1;
 }
 
 static int cid_load(unsigned char out[16])
@@ -276,7 +213,8 @@ void pc_cid_mint(long long now_ms)
 		c[i] = (unsigned char)(ms >> (40 - 8 * i));
 	c[6] = (unsigned char)((c[6] & 0x0f) | 0x70);
 	c[8] = (unsigned char)((c[8] & 0x3f) | 0x80);
-	cid_store_later(c, "new");
+	if (!cid_store(c))
+		LM_WARN("cluster: could not persist the new cluster id\n");
 	set(c, CLWIRE_CID_PROVISIONAL, now_ms);
 	pc_cid_str(c, s);
 	LM_NOTICE("cluster: founded cluster %s (provisional for %d s - a "
@@ -292,7 +230,8 @@ void pc_cid_adopt(const unsigned char cid[16], long long now_ms)
 		return;
 	if (K.state != CLWIRE_CID_NONE && !memcmp(K.cid, cid, 16))
 		return;
-	cid_store_later(cid, "adopted");
+	if (!cid_store(cid))
+		LM_WARN("cluster: could not persist the adopted cluster id\n");
 	set(cid, CLWIRE_CID_PROVISIONAL, now_ms);
 	pc_cid_str(cid, s);
 	LM_NOTICE("cluster: joined cluster %s\n", s);
@@ -300,9 +239,14 @@ void pc_cid_adopt(const unsigned char cid[16], long long now_ms)
 
 void pc_cid_drop(void)
 {
+	char path[600];
+
 	if (K.state != CLWIRE_CID_PROVISIONAL)
 		return;
-	cid_store_later(NULL, NULL);             /* after any write still due, never before it */
+	if (K.dir[0]) {
+		snprintf(path, sizeof path, "%s/" PC_CID_FILE, K.dir);
+		unlink(path);
+	}
 	memset(K.cid, 0, sizeof K.cid);
 	K.state = CLWIRE_CID_NONE;
 	clwire_set_cid(NULL, CLWIRE_CID_NONE);
@@ -310,10 +254,8 @@ void pc_cid_drop(void)
 
 void pc_cid_tick(long long now_ms)
 {
-	/* not established (what a restart loads it as) before its write was made */
 	if (K.state == CLWIRE_CID_PROVISIONAL &&
-	        now_ms - K.since_ms >= PC_CID_GRACE_MS && (!K.dir[0] ||
-	        __atomic_load_n(&P.tried, __ATOMIC_ACQUIRE) == P.gen)) {
+	        now_ms - K.since_ms >= PC_CID_GRACE_MS) {
 		K.state = CLWIRE_CID_ESTABLISHED;
 		clwire_set_cid(K.cid, CLWIRE_CID_ESTABLISHED);
 	}

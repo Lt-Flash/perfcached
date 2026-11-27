@@ -34,48 +34,26 @@ static __thread uint32_t slc_term, slc_seq;
 static __thread uint16_t slc_owner[PC_SLOTS];
 static __thread uint8_t slc_have[PC_SLOTS / 8];
 
-/* the map is rewritten in place (cl_map_gen): a read counts only if the generation was even before
- * and the same after; a few tries, then 0 and the caller's fallback */
-#define MAP_READ_TRIES 8
-
-static int map_read_ok(unsigned int g)
-{
-	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	return !(g & 1) && cl_map_gen() == g;
-}
-
 static uint16_t slot_map_owner(const struct pc_clmap *m, unsigned slot)
 {
-	int tries;
+	uint32_t t = __atomic_load_n(&m->term, __ATOMIC_ACQUIRE);
+	uint32_t s = __atomic_load_n(&m->seq, __ATOMIC_ACQUIRE);
+	uint16_t o;
 
-	for (tries = 0; tries < MAP_READ_TRIES; tries++) {
-		unsigned int g = cl_map_gen();
-		uint32_t t, s;
-		uint16_t o;
-
-		if (g & 1)
-			continue;
-		t = m->term;
-		s = m->seq;
-		if (!map_read_ok(g))
-			continue;
-		if (t != slc_term || s != slc_seq) {
-			memset(slc_have, 0, sizeof slc_have);
-			slc_term = t;
-			slc_seq = s;
-		}
-		if (slc_have[slot >> 3] & (1u << (slot & 7)))
-			return slc_owner[slot];
-		o = pc_clplace_owner(m, slot);
-		if (!map_read_ok(g))
-			continue;
-		if (o) {
-			slc_owner[slot] = o;
-			slc_have[slot >> 3] |= (uint8_t)(1u << (slot & 7));
-		}
-		return o;
+	if (t != slc_term || s != slc_seq) {
+		memset(slc_have, 0, sizeof slc_have);
+		slc_term = t;
+		slc_seq = s;
 	}
-	return 0;
+	if (slc_have[slot >> 3] & (1u << (slot & 7)))
+		return slc_owner[slot];
+	o = pc_clplace_owner(m, slot);
+	if (o && __atomic_load_n(&m->term, __ATOMIC_ACQUIRE) == t &&
+	    __atomic_load_n(&m->seq, __ATOMIC_ACQUIRE) == s) {
+		slc_owner[slot] = o;
+		slc_have[slot >> 3] |= (uint8_t)(1u << (slot & 7));
+	}
+	return o;
 }
 
 /* placement hashes the SLOT, not the key, so a RESP client reaches the same owner (and a key
@@ -110,9 +88,7 @@ int pc_shard_owner_slot(unsigned slot)
 			self.in4.sin_port)
 		: 0;
 	for (i = 0; i < pt->n_peers; i++) {
-		/* a FAILED peer owns nothing; a stall, a join, a heal or a resize keeps its rank */
-		if (!clpeers_usable(&pt->peers[i], now) ||
-		    pt->peers[i].nstate == PC_NST_FAILED)
+		if (!clpeers_usable(&pt->peers[i], now))   /* not a CONNECTING one */
 			continue;
 		h = pc_hrw_mix(kh, pt->peers[i].addr.in4.sin_addr.s_addr,
 			pt->peers[i].addr.in4.sin_port);
@@ -146,25 +122,11 @@ int pc_spread_in_set(unsigned slot, int node_id, int k)
 		for (i = 0; i < pt->n_peers; i++)
 			if (clpeers_holds_slots(&pt->peers[i], now))
 				seen++;
-		if (m) {
+		if (m && (int)m->nnodes >= seen) {
 			uint16_t want = (uint16_t)(me ? self_id : node_id);
-			int tries;
 
-			for (tries = 0; tries < MAP_READ_TRIES; tries++) {
-				unsigned int g = cl_map_gen();
-				int r, use;
-
-				if (g & 1)
-					continue;
-				use = (int)m->nnodes >= seen;
-				r = use ? pc_clplace_in_set(m, kh, want, k) : 0;
-				if (!map_read_ok(g))
-					continue;
-				if (!use)
-					break;
-				cl_place_map_hit();
-				return r;
-			}
+			cl_place_map_hit();
+			return pc_clplace_in_set(m, kh, want, k);
 		}
 	}
 	cl_place_hrw_hit();
@@ -261,37 +223,22 @@ int pc_spread_set_live(unsigned slot, int k)
 		for (i = 0; i < pt->n_peers; i++)
 			if (clpeers_holds_slots(&pt->peers[i], now))
 				seen++;
-		if (m) {
+		if (m && (int)m->nnodes >= seen) {
 			uint16_t top[PC_CL_MAXPEER + 1];
-			int got = -2, s, tries, self_id = cl_node_id();
+			int got, s, self_id = cl_node_id();
 
-			for (tries = 0; tries < MAP_READ_TRIES && got == -2; tries++) {
-				unsigned int g = cl_map_gen();
-				int r = -1;
-
-				if (g & 1)
-					continue;
-				if ((int)m->nnodes >= seen) {
-					if (k > (int)(sizeof top / sizeof top[0]))
-						return 0;
-					r = pc_clplace_rank(m, kh, top, k);
-				}
-				if (map_read_ok(g))
-					got = r;
+			if (k > (int)(sizeof top / sizeof top[0]))
+				return 0;
+			got = pc_clplace_rank(m, kh, top, k);
+			if (got < k)
+				return 0;      /* the map cannot fill the set */
+			for (s = 0; s < got; s++) {
+				if (top[s] == (uint16_t)self_id)
+					continue;   /* ourselves, by definition */
+				if (!clpeers_by_id_live(pt, (int)top[s], now))
+					return 0;
 			}
-			if (got == -2)
-				return 0;      /* the map never held still: keep the copy */
-			if (got >= 0) {
-				if (got < k)
-					return 0;      /* the map cannot fill the set */
-				for (s = 0; s < got; s++) {
-					if (top[s] == (uint16_t)self_id)
-						continue;   /* ourselves, by definition */
-					if (!clpeers_by_id_live(pt, (int)top[s], now))
-						return 0;
-				}
-				return 1;
-			}
+			return 1;
 		}
 	}
 	if (pc_node_state() == PC_NST_READY) {
@@ -505,15 +452,13 @@ uint32_t pc_probe_fwd_begin(int op, const char *col, size_t collen,
 {
 	unsigned char msg[1 + 4 + 2 + 1 + 2 + 256 + 4096];
 	struct pending *slot = NULL;
-	char *stash = NULL, *klong = NULL;
+	char *stash = NULL;
 	uint32_t req;
 	int up;
 	size_t n;
 
-	cl_set_fail(PC_CLFAIL_NONE);           /* BUSY only when the table refuses the slot */
 	/* col/key must fit the slot: the transform re-sends them */
-	if (!cl_enabled() || collen >= sizeof slot->col || klen > CLPEND_KEY_MAX ||
-	        vlen > PC_MAX_FWD_VAL)
+	if (!cl_enabled() || collen >= 40 || klen >= 256 || vlen > PC_MAX_FWD_VAL)
 		return 0;
 	up = clpeers_count_live(cl_peers(), cl_now_ms());
 	if (!up)
@@ -524,27 +469,15 @@ uint32_t pc_probe_fwd_begin(int op, const char *col, size_t collen,
 			return 0;
 		memcpy(stash, val, vlen);
 	}
-	if (klen >= sizeof slot->key) {
-		klong = malloc(klen);
-		if (!klong) {
-			free(stash);
-			return 0;
-		}
-		memcpy(klong, key, klen);
-	}
 	req = cl_pend_alloc(PC_DONE_PULL, up, 700, &slot);
 	if (!req) {
 		free(stash);
-		free(klong);
 		return 0;
 	}
 	/* fields land BEFORE the datagrams leave: no answer can race them */
 	memcpy(slot->col, col, collen);
 	slot->collen = (unsigned char)collen;
-	if (klong)
-		slot->key_long = klong;    /* the slot's release frees it */
-	else
-		memcpy(slot->key, key, klen);
+	memcpy(slot->key, key, klen);
 	slot->klen = (unsigned short)klen;
 	slot->probe_op = op == 2 ? 2 : op == 3 ? 3 : op == 1 ? 4 : 1;
 	slot->stash = stash;

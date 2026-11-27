@@ -54,7 +54,7 @@ EOF
 }
 start() {
 	: > "$D/cut$1"
-	LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" PC_NETCUT_CTL="$D/cut$1" PC_NETCUT_LOG="$D/cutlog$1" \
+	LD_PRELOAD="${SANRT:+$SANRT }$SHIM" PC_NETCUT_CTL="$D/cut$1" PC_NETCUT_LOG="$D/cutlog$1" \
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & echo $! > "$D/n$1.pid"
 }
 st() {
@@ -103,28 +103,7 @@ NI=$(for n in 1 2 3 4 5 6 7 8; do ident $n; done | grep -c .)   # all 8, or LOW 
 	&& ok "A. the master is node $M, the lowest identity ($(ident $M))" \
 	|| bad "A. the master is node $M ($(ident $M)), the lowest identity is node $LOW ($(ident $LOW)); $NI of 8 identities read"
 F=$(grep -l "founded the cluster" "$D"/n[1-8].log 2>/dev/null | wc -l)
-# the founder's loop stuck 3 s+ persisting its term (JOINER_LIVE_MS) drops it from the next one's
-# joiner table, which founds too and must yield to it: not counted when that is what the logs show
-LATE=$(grep -A3 "founded the cluster" "$D/n$M.log" 2>/dev/null | grep -m1 -o "own loop ran [0-9]* ms late" | awk '{print $4}')
-NY=0
-for n in 1 2 3 4 5 6 7 8; do
-	[ "$n" != "$M" ] && grep -q "founded the cluster" "$D/n$n.log" && ! grep -q "yielding mastership to" "$D/n$n.log" && NY=$((NY+1))
-done
-if [ "$F" = 1 ]; then
-	ok "A. one node founded"
-elif [ "$F" -gt 1 ] && [ "$M" = "$LOW" ] && [ "$NY" = 0 ] && [ "${LATE:-0}" -ge 3000 ]; then
-	echo "  ..   not counted, the runner's storage stalled: $F nodes founded - node $M's own loop ran $LATE ms late as it founded, and every other founder yielded to it"
-else
-	bad "A. $F nodes logged that they founded: $(grep -l "founded the cluster" "$D"/n[1-8].log | tr '\n' ' ')(node $M ran ${LATE:-0} ms late as it founded; $NY other founder(s) never yielded)"
-fi
-if [ "$F" != 1 ] || [ "$M" != "$LOW" ]; then   # who decided what, and whether its own loop stalled
-	for n in 1 2 3 4 5 6 7 8; do
-		grep -q "founded the cluster" "$D/n$n.log" || [ "$n" = "$LOW" ] || [ "$n" = "$M" ] || continue
-		echo "  ..   node $n: self_late $(st $n 'r["cluster"].get("self_late")'), role $(role $n), peers_up $(up $n)"
-		grep -E "founded|founding|ran [0-9]+ ms late|queued for admission|yield|stepping down|re-joining|assigned|claimed mastership" "$D/n$n.log" \
-			| head -n 12 | sed "s/^/  ..   n$n: /" | cut -c1-220
-	done
-fi
+[ "$F" = 1 ] && ok "A. one node founded" || bad "A. $F nodes logged that they founded: $(grep -l "founded the cluster" "$D"/n[1-8].log | tr '\n' ' ')"
 NA=$(grep -c "cluster: admitting 127.0.113.[0-9]* from the queue" "$D/n$M.log" 2>/dev/null)
 N1=$(grep -c "cluster: admitting 127.0.113.[0-9]* from the queue (1 in flight" "$D/n$M.log" 2>/dev/null)
 [ "$NA" -ge 7 ] && [ "$NA" = "$N1" ] \

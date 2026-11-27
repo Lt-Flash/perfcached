@@ -164,36 +164,6 @@ eq "HRANDFIELD -20: twenty, repeats allowed" "$n" 20
 n=$(r 1 HRANDFIELD h 2 WITHVALUES | tr -d '[]' | tr ',' '\n' | wc -l)
 eq "HRANDFIELD 2 WITHVALUES: two pairs" "$n" 4
 eq "HRANDFIELD bad option" "$(r 1 HRANDFIELD h 2 WITHX)" "-ERR syntax error"
-# a negative count is up to a million picks: each must be an index into the fields, not a walk
-# from the record's start (4500 fields: ~2.25 billion steps that way, seconds on the worker); 4500
-# fields of 12 bytes stay under the hash ceiling, which 4800 do not
-hr=$(python3 - 18611 <<'PY'
-import socket, sys, time
-port = int(sys.argv[1])
-def cmd(*a):
-    return ("*%d\r\n" % len(a) + "".join("$%d\r\n%s\r\n" % (len(x), x) for x in a)).encode()
-s = socket.create_connection(("127.0.0.1", port), timeout=60); f = s.makefile("rb")
-added = 0
-for b in range(0, 4500, 250):              # a RESP command takes at most 512 arguments
-    a = ["HSET", "hr"]
-    for i in range(b, b + 250): a += ["f%04d" % i, "1"]
-    s.sendall(cmd(*a)); l = f.readline()
-    added += int(l[1:]) if l[:1] == b":" else 0
-if added != 4500: print("HSET added %d fields, last answer %r" % (added, l)); sys.exit(0)
-t0 = time.time()
-s.sendall(cmd("HRANDFIELD", "hr", "-1000000"))
-l = f.readline()
-if l[:1] == b"*":
-    for _ in range(int(l[1:])): f.readline(); f.readline()
-dt = time.time() - t0
-s2 = socket.create_connection(("127.0.0.1", port), timeout=10); s2.sendall(cmd("PING"))
-print("%.2f %s %s" % (dt, l[:1].decode() or "eof", s2.makefile("rb").readline().decode().strip()))
-PY
-)
-case "$hr" in
-	[01].*" +PONG") ok "HRANDFIELD -1000000 on 4500 fields answers in ${hr%% *} s";;
-	*) bad "HRANDFIELD -1000000 on 4500 fields: $hr (seconds, reply type, a PING after)";;
-esac
 eq "HSCAN MATCH f*" "$(r 1 HSCAN h 0 MATCH 'f[12]')" "[0,[f1,v1,f2,V2]]"
 eq "HSCAN NOVALUES" "$(r 1 HSCAN h 0 MATCH 'f[12]' NOVALUES)" "[0,[f1,f2]]"
 eq "HSCAN bad cursor" "$(r 1 HSCAN h x)" "-ERR invalid cursor"

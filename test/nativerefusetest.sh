@@ -31,7 +31,6 @@ CONF
 	chmod 640 "$D/pc.conf"
 }
 start() {
-	: > "$D/pc.log"
 	"$BIN" -f "$D/pc.conf" -D > "$D/pc.log" 2>&1 & P=$!
 	i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/pc.log" && return 0; sleep 0.1; i=$((i+1)); done
 	echo "  daemon did not start:"; tail -3 "$D/pc.log"; return 1

@@ -98,11 +98,6 @@ extern int pcache_reclaim_giveback;          /* 0 = retire/re-cut only */
  * DROPPED, before the madvise, with the bytes the punch is about to zero.
  * NULL (always, outside test/tailflighttest.c) */
 extern void (*pcache_arena_tail_hook)(char *lo, char *hi);
-/* a test's pause in a free: the first cell home on a chunk, after the count and before
- * the chunk is announced.  NULL outside test/arenacaptest.c */
-extern void (*pcache_arena_home_hook)(void *chunk);
-/* a test's refusal of an index carve: nonzero refuses it.  NULL outside test/regiontest.c */
-extern int (*pcache_region_hook)(size_t size);
 int pcache_arena_backing(void);
 const char *pcache_arena_backing_str(void);
 void pcache_arena_backing_notice(void);
@@ -115,8 +110,6 @@ void pcache_arena_destroy(void);
  * share a bump pointer. */
 void pcache_arena_child_init(void);
 void pcache_arena_flush_private(void);       /* a done process sends cells home */
-/* a thread outside the broadcast's reach: its cells home once a flush was asked since its last look */
-void pcache_arena_flush_if_asked(void);
 void pcache_arena_reclaim_tick(void);        /* the reclaim process, 1/s */
 /*
  * S188: top up the commit-ahead window, and nothing else.

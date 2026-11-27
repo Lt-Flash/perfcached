@@ -27,7 +27,6 @@ tcp = 127.0.64.1:17964
 buckets_log2 = 12
 EOF
 
-: > "$D/log"
 "$BIN" -f "$D/n.conf" > "$D/log" 2>&1 &
 PIDS="$PIDS $!"
 i=0

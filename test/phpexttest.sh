@@ -38,10 +38,8 @@ C
 }
 mkconf "$D/pt.conf" 17155 loopback
 mkconf "$D/nx.conf" 17156 never
-: > "$D/pt.log"
 "$BIN" -f "$D/pt.conf" > "$D/pt.log" 2>&1 &
 P1=$!
-: > "$D/nx.log"
 "$BIN" -f "$D/nx.conf" > "$D/nx.log" 2>&1 &
 P2=$!
 i=0; while [ $i -lt 150 ]; do
@@ -60,7 +58,7 @@ w2=$(PX -d perfcached.prepare_secrets_file="$D/sec" -r 'echo "x";' 2>&1)
 case "$w1" in *"read by others than its owner"*) case "$w2" in *"read by others"*) bad "S499: a 0600 secrets file warned about: $w2";;
 	*) ok "S499: a group-readable secrets file is warned about, a 0600 one is not";; esac;;
 	*) bad "S499: a 0640 secrets file drew no warning: $(echo "$w1" | head -2 | tr '\n' ' ')";; esac
-PX "$T/phpexttest.php" 17155 17156 php-test-secret "$EXT"
+PX "$T/phpexttest.php" 17155 17156 php-test-secret
 PF=$?
 [ $PF = 0 ] || fail=$((fail+1))
 echo "phpexttest: $pass passed, $fail failed"

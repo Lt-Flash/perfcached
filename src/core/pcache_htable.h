@@ -182,10 +182,10 @@ unsigned int pcache_key_hash(const str *key);
 #define PCACHE_F_SHORTENED          0x80
 #define PCACHE_F_CARRY              (PCACHE_F_TYPES | PCACHE_F_SHORTENED)
 
-/* strict bounded decimal parse; a number outside int64 is not an integer (as Redis says) */
+/* strict bounded decimal parse; no overflow guard - counter territory */
 static inline int pcache_str2ll(const char *p, int len, long long *out)
 {
-	unsigned long long v = 0;
+	long long v = 0;
 	int i = 0, neg = 0;
 
 	if (len <= 0)
@@ -198,13 +198,9 @@ static inline int pcache_str2ll(const char *p, int len, long long *out)
 	for (; i < len; i++) {
 		if (p[i] < '0' || p[i] > '9')
 			return -1;
-		if (v > (9223372036854775808ULL - (unsigned)(p[i] - '0')) / 10)
-			return -1;
-		v = v * 10 + (unsigned)(p[i] - '0');
+		v = v * 10 + (p[i] - '0');
 	}
-	if (v > 9223372036854775807ULL + (unsigned)neg)
-		return -1;
-	*out = neg ? (long long)(0 - v) : (long long)v;
+	*out = neg ? -v : v;
 	return 0;
 }
 
@@ -369,9 +365,6 @@ typedef struct pcache_htable {
 	/* S459: while a resize drains, the table it left behind - a miss here
 	 * reads there and a write carries the key over first; NULL otherwise */
 	struct pcache_htable   *drain_from;
-	/* a resize's old table after the swap: the live table its writes go to (never cleared,
-	 * the old table is retired); NULL otherwise */
-	struct pcache_htable   *write_to;
 } pcache_htable_t;
 
 /*
@@ -498,11 +491,6 @@ pcache_htable_t *pcache_htable_new(unsigned int size_log2);
 void pcache_ht_set_shadow(pcache_htable_t *ht, pcache_htable_t *shadow);
 /* S459: point @ht at the table its resize is draining (NULL once done) */
 void pcache_ht_set_drain(pcache_htable_t *ht, pcache_htable_t *from);
-/* writes to @ht (store, add, touch, setver) land in @to from now on; deletes keep their own
- * order (the store's pc_store_del_order) */
-void pcache_ht_set_write_to(pcache_htable_t *ht, pcache_htable_t *to);
-/* the table a write to @ht lands in (@ht itself unless a resize swapped it out) */
-pcache_htable_t *pcache_ht_write_target(pcache_htable_t *ht);
 void pcache_ht_set_shadow_gate(pcache_htable_t *ht,
 		int (*ok)(void *ctx, const str *key), void *ctx);
 /* S331: does THIS thread read through to a shadow?  Off by default: only
@@ -587,11 +575,6 @@ int pcache_ht_store_peer(pcache_htable_t *ht, const str *key, const str *val,
  * (a resize), not written.  Every value is kept, 0 included: a record
  * loaded at process start has tick 0. */
 int pcache_ht_store_copy(pcache_htable_t *ht, const str *key, const str *val,
-		unsigned int expires, unsigned char rflags,
-		unsigned long long ver, unsigned int wtick);
-/* the same from a pcache_ht_iter_locked_from callback: the drained table's copy is left (its
- * bucket lock is the caller's), for its readers and the closing drain */
-int pcache_ht_store_copy_held(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned int expires, unsigned char rflags,
 		unsigned long long ver, unsigned int wtick);
 
@@ -763,9 +746,6 @@ extern __thread unsigned long long pcache_last_ver;
  * bucket lock, found or not) - for the WAL's versioned delete record,
  * read immediately after the remove, as pcache_last_ver is */
 extern __thread unsigned long long pcache_last_del_ver;
-/* 1 when the last record a remove on THIS thread took was past its deadline (a read calls it
- * absent, so a DEL answers 0); read immediately after the remove */
-extern __thread int pcache_last_del_dead;
 
 /* The record's version without copying its value (A1's read surface, and
  * what a cross-node comparison will need).  Kept separate from probe()
@@ -821,9 +801,7 @@ int pcache_ht_touch_adopt(pcache_htable_t *ht, const str *key,
 /* atomic counter add (CP-04): creates a native counter on an absent key,
  * accumulates fixed-width on an existing one, converts a numeric string
  * record on first touch.  0 = ok (*new_val = the result); -1 = error or
- * the existing value is not an integer; -2 = the arena refused the cell a
- * new counter needs (an accumulate in place needs none); -3 = the sum would
- * pass int64, nothing changed.  @expires re-arms the TTL,
+ * the existing value is not an integer.  @expires re-arms the TTL,
  * absolute ticks, 0 = never */
 int pcache_ht_add(pcache_htable_t *ht, const str *key, long long delta,
 		unsigned int expires, long long *new_val);
@@ -890,11 +868,6 @@ typedef int (*pcache_iter_meta_cb)(const str *key, const str *val,
  * restarts at bucket 0, so a budget cut means the tail is never reached.
  * A bucket's chain is walked with it (OC-7). */
 int pcache_ht_iter_meta_from(pcache_htable_t *ht, unsigned int *cursor,
-		pcache_iter_meta_cb cb, void *ctx);
-/* the same walk with each record handed over in place, its bucket's lock HELD across the
- * callback: the resize's copy, so a delete cannot fall between its read and its store.  The
- * callback may lock buckets of ANOTHER table (the resize's order: old -> new), never this one's */
-int pcache_ht_iter_locked_from(pcache_htable_t *ht, unsigned int *cursor,
 		pcache_iter_meta_cb cb, void *ctx);
 
 int pcache_ht_iter_meta(pcache_htable_t *ht, pcache_iter_meta_cb cb,

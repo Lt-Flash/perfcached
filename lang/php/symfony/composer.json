@@ -9,9 +9,6 @@
         "psr/log": "^1.1 || ^2 || ^3",
         "symfony/cache": "^5.4 || ^6.4 || ^7"
     },
-    "suggest": {
-        "symfony/lock": "for PerfcachedLockStore (^5.4 || ^6.4 || ^7)"
-    },
     "autoload": {
         "psr-4": { "Perfcached\\Symfony\\": "src/" }
     }

@@ -40,6 +40,9 @@ static char *find_bytes(char *hay, size_t hn, const char *needle, size_t nn)
 			return hay + i;
 	return NULL;
 }
+/* 64 collections of three series each fit; the renderer truncates rather than overruns */
+#define PC_METRICS_MAX ((size_t)256 * 1024)
+
 
 /* Authorization: Bearer <token>, constant time.  Header only: a query parameter would
  * land the token in every proxy log and browser history. */
@@ -382,12 +385,13 @@ int http_one(struct pc_conn *c, size_t off)
 	} else if (!strcmp(path, "/metrics")) {
 		if (hc_send(c, &hc_metrics, "text/plain; version=0.0.4; charset=utf-8"))
 			return (int)hlen;
-		body = pc_metrics_render(&blen);       /* grown to fit, never cut */
+		body = malloc(PC_METRICS_MAX);
 		if (!body) {
 			http_send(c, "503 Service Unavailable", "text/plain",
 				"out of memory\n", 14);
 			return (int)hlen;
 		}
+		blen = pc_metrics_render(body, PC_METRICS_MAX);
 		/* the exposition's own content type, so Prometheus and a
 		 * human with curl both get what they expect */
 		http_send(c, "200 OK",

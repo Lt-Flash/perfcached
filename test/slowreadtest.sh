@@ -31,7 +31,6 @@ plaintext = loopback
 buckets_log2 = 10
 C
 chmod 600 "$D/c.conf"
-: > "$D/c.log"
 "$BIN" -f "$D/c.conf" > "$D/c.log" 2>&1 & P=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/c.log"; do sleep 0.1; i=$((i+1)); done
 grep -q "perfcached ready" "$D/c.log" || { echo "slowreadtest: the daemon did not start: $(tail -2 "$D/c.log")"; exit 1; }

@@ -41,7 +41,6 @@ CONF
 # is the smaller wherever that allows
 ulimit -n "$(ulimit -H -n)" 2>/dev/null
 start() {  # start <name> - env from the caller
-	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" -D > "$D/$1.log" 2>&1 & P=$!
 	i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/$1.log" && return 0; sleep 0.1; i=$((i+1)); done
 	echo "  daemon $1 did not start:"; tail -5 "$D/$1.log"; return 1
@@ -214,26 +213,6 @@ r=$(timeout 10 python3 -c "
 import json, urllib.request; m = json.load(urllib.request.urlopen('http://127.0.0.1:17397/stats', timeout=5))['clients']['memory']
 print(m['available'], m['floor'])")
 [ "$r" = "$((1073741824 - 524288000 + 20971520)) $((200 * MB))" ] && ok "v1 headroom uses total_inactive_file ($r)" || bad "v1 figures: $r"
-stop
-
-# ---- H: a leaf at its limit under a parent with headroom - the leaf's 0 is the headroom
-mkdir -p "$D/cg4/par/leaf"
-echo 536870912 > "$D/cg4/par/leaf/memory.max"                    # 512 MB, all used
-echo 536870912 > "$D/cg4/par/leaf/memory.current"
-printf 'anon 1\ninactive_file 0\n' > "$D/cg4/par/leaf/memory.stat"
-echo 805306368 > "$D/cg4/par/memory.max"                         # 768 MB, 500 MB used
-echo 524288000 > "$D/cg4/par/memory.current"
-printf 'anon 1\ninactive_file 0\n' > "$D/cg4/par/memory.stat"
-echo "0::/par/leaf" > "$D/cgroup4"
-printf 'MemTotal:        4194304 kB\nMemAvailable:     3145728 kB\n' > "$D/meminfo"
-conf h "" 17394
-export PERFCACHED_TEST_MEMINFO=$D/meminfo PERFCACHED_TEST_PROC_CGROUP=$D/cgroup4 PERFCACHED_TEST_CGROUP_ROOT=$D/cg4
-start h || bad "daemon h did not start"
-r=$(timeout 10 python3 -c "
-import json, urllib.request; m = json.load(urllib.request.urlopen('http://127.0.0.1:17397/stats', timeout=5))['clients']['memory']
-print(m['limit'], m['available'])")
-[ "$r" = "536870912 0" ] && ok "a leaf cgroup at its limit leaves 0 available, whatever its parent's headroom ($r)" \
-	|| bad "a leaf at its limit: limit and available $r, want 536870912 0 (the parent's $((805306368 - 524288000)) replaced the leaf's 0)"
 stop
 
 # ---- G: a cgroup limit that can never hold the floor, the arena and the process

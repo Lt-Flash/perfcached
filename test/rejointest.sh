@@ -51,7 +51,6 @@ buckets_log2 = 12
 EOF
 }
 start() {
-	: > "$D/n$1.$2.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.$2.log" 2>&1 &
 	eval "P$1=\$!"
 	i=0
@@ -107,12 +106,11 @@ R=$(getv 1 k1)
 echo "  ..   node1 after the fleet settled: $R"
 echo "$R" | grep -q V2 && ok "OBLIGATION 1: peers did not overwrite the newer value" \
 	|| bad "OBLIGATION 1: a peer's older copy overwrote the recovered V2: $R"
-# ...and prove why: a node that came back holding data gets a diff, not a blind backfill, and says
-# so - the diff sends a slot's records and the version compare keeps the newer V2
-if grep -q "recovered from its WAL - diffing it" "$D"/n2.a.log "$D"/n3.a.log 2>/dev/null; then
-	ok "the gate fired: a peer diffs a node holding data instead of backfilling it"
+# ...and prove why: a node that came back holding data is refused a blind backfill, and says so
+if grep -q "NOT backfilling" "$D"/n2.a.log "$D"/n3.a.log 2>/dev/null; then
+	ok "the gate fired: a peer refused to backfill a node holding data"
 else
-	bad "no peer logged the diff - obligation 1 may have \
+	bad "no peer logged the backfill refusal - obligation 1 may have \
 passed by luck rather than by the gate"
 fi
 

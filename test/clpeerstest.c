@@ -146,20 +146,6 @@ int main(void)
 	check(!clpeers_dup_persisted(&PT, &a, now + DUP_GRACE_MS),
 		"and the window restarts from the next sighting");
 
-	/* a sighting from an episode that ended (no join for a grace window) does not
-	 * count: the next collision from that host starts its own clock */
-	memset(&PT, 0, sizeof PT);
-	a = A(6);
-	check(!clpeers_dup_persisted(&PT, &a, now),
-		"the first sighting of a duplicate is not yet persistent");
-	check(!clpeers_dup_persisted(&PT, &a, now + 5 * DUP_GRACE_MS),
-		"a collision long after the last sighting was refused at once - the "
-		"grace was measured from an earlier episode");
-	check(!clpeers_dup_persisted(&PT, &a, now + 5 * DUP_GRACE_MS + DUP_GRACE_MS / 2),
-		"the new episode is not yet persistent half a grace in");
-	check(clpeers_dup_persisted(&PT, &a, now + 6 * DUP_GRACE_MS),
-		"the new episode, refreshed, is persistent a grace after its start");
-
 	printf("clpeerstest: %d passed, %d failed\n", pass, fail);
 	return fail ? 1 : 0;
 }

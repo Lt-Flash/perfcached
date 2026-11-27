@@ -39,7 +39,6 @@ b=json.load(urllib.request.urlopen("http://127.0.0.1:19802/stats", timeout=5))["
 print(eval(sys.argv[1]))' "$1" 2>/dev/null; }
 start() {
 	rm -rf "$D/s"; mkdir -p "$D/s"
-	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & P=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1.log"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$1.log"
@@ -114,7 +113,6 @@ conf deny "busy_poll_us = 50"
 PERFCACHED_BUSYPOLL_DENY=1 "$BIN" -C -f "$D/deny.conf" 2>/dev/null | grep -q "^busy poll: 50 us asked, but this host refuses it - the workers would run without: refused by PERFCACHED_BUSYPOLL_DENY" &&
 	ok "4. -C reports the refusal" || bad "4. -C: $(PERFCACHED_BUSYPOLL_DENY=1 "$BIN" -C -f "$D/deny.conf" 2>&1 | grep -i busy)"
 rm -rf "$D/s"; mkdir -p "$D/s"
-: > "$D/deny.log"
 PERFCACHED_BUSYPOLL_DENY=1 "$BIN" -f "$D/deny.conf" > "$D/deny.log" 2>&1 & P=$!
 i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/deny.log"; do sleep 0.1; i=$((i+1)); done
 if grep -q "perfcached ready" "$D/deny.log"; then

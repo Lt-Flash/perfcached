@@ -83,25 +83,6 @@ static void *consumer(void *arg)
 	return NULL;
 }
 
-static struct clapply *P;                    /* the pusher's */
-static int pushed, refused, push_done;
-static const struct clapply_rec *prec;
-
-static void *pusher(void *arg)
-{
-	int i;
-
-	(void)arg;
-	for (i = 0; i < 40; i++) {
-		if (clapply_push(P, prec, NULL) < 0)
-			refused++;
-		else
-			pushed++;
-	}
-	__atomic_store_n(&push_done, 1, __ATOMIC_RELEASE);
-	return NULL;
-}
-
 int main(void)
 {
 	pthread_t th[NT];
@@ -266,37 +247,6 @@ int main(void)
 		CHK(b == 5000, "stamp: busy_since_ms is the clock at the take (%lld), not the pre-wait argument", b);
 		clapply_done(&S, j, &it);
 		clapply_free(&S);
-	}
-
-	/* the owner sets no stop (the daemon does not): the consumer's stop is the push's, so a push
-	 * into a full ring whose consumer has left at shutdown returns for the caller to apply */
-	{
-		static struct clapply E;
-		struct clapply_item it;
-		pthread_t t;
-		int j;
-
-		stop = 1;
-		clapply_init(&E, 2, apply_cb, ack_cb, NULL);
-		r.col = (const unsigned char *)"c"; r.collen = 1;
-		r.klen = (unsigned)snprintf((char *)key, sizeof key, "k5");
-		r.key = key;
-		r.val = val; r.vlen = 60000; r.ver = 9;
-		j = clapply_shard(&E, r.col, r.collen, r.key, r.klen);
-		CHK(clapply_take(&E, j, &stop, &it, 1) == 0, "stop: the consumer leaves an empty ring at shutdown");
-		P = &E;
-		prec = &r;
-		pthread_create(&t, NULL, pusher, NULL);
-		for (i = 0; i < 300 && !__atomic_load_n(&push_done, __ATOMIC_ACQUIRE); i++) {
-			struct timespec ts = { 0, 10000000L };
-			nanosleep(&ts, NULL);
-		}
-		CHK(__atomic_load_n(&push_done, __ATOMIC_ACQUIRE) && refused > 0,
-			"stop: 40 x 60 KB into its 1 MiB ring returned within 3 s: %d queued, %d handed back", pushed, refused);
-		if (push_done) {
-			pthread_join(t, NULL);
-			clapply_free(&E);
-		}
 	}
 
 	printf("clapplytest: %s\n", fails ? "FAILED" : "passed");

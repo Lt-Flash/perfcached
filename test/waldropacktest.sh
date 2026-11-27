@@ -58,7 +58,7 @@ done
 start() { # start <i>: node 2 under the shim; its log kept across a restart
 	if [ "$1" = 2 ]; then
 		PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim" PC_SYNCFAIL_SLOW_MS=500 PC_SYNCFAIL_DIR_MS=10000 \
-			LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" "$BIN" -f "$D/n2.conf" >> "$D/n2.log" 2>&1 &
+			LD_PRELOAD="${SANRT:+$SANRT }$SHIM" "$BIN" -f "$D/n2.conf" >> "$D/n2.log" 2>&1 &
 	else
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
 	fi

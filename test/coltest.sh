@@ -73,27 +73,6 @@ for c in json.load(sys.stdin)['result']['collections']:
         print(c['buckets']); break
 else:
     print('gone')" "$2"; }
-# jseq <port> <method> <json params> [<method> <json params>...] - on ONE connection, back to back
-jseq() {
-	python3 - "$@" <<'PYEOF'
-import json, os, pcnative, socket, sys
-port, a = int(sys.argv[1]), sys.argv[2:]
-s = socket.create_connection(("127.0.0.1", port), timeout=20); f = pcnative.wrap(s)
-f.write((json.dumps({"jsonrpc": "2.0", "id": 0, "method": "enable",
-    "params": {"secret": os.environ["PC_ENABLE"]}}) + "\n").encode()); f.flush(); f.readline()
-for i in range(0, len(a), 2):
-    f.write((json.dumps({"jsonrpc": "2.0", "id": i + 1, "method": a[i],
-        "params": json.loads(a[i + 1])}) + "\n").encode())
-f.flush()
-for i in range(0, len(a), 2):
-    print(f.readline().decode().strip())
-PYEOF
-}
-# entries <port> <col>: the records it holds on that node, 0 when it is not there
-# (by name off the collections list: a clustered node's stats carry other "entries" fields)
-entries() { j "$1" collections | python3 -c "
-import json, sys
-print(sum(c['entries'] for c in json.load(sys.stdin)['result']['collections'] if c['name'] == sys.argv[1]))" "$2"; }
 resp() { # resp <port> <cmd...>
 	python3 - "$@" <<'PYEOF'
 import socket, sys
@@ -220,70 +199,6 @@ case "$R" in *"already exists"*) ok "a rename onto a name in use is refused";; *
 R=$(j 17751 rename '{"col":"nothing","to":"x"}')
 case "$R" in *"no such collection"*) ok "renaming a collection that does not exist is an error";; *) bad "rename missing: $R";; esac
 
-# ---- 4e. a create of a live name is refused even with a reusable dead slot ahead of it
-j 17751 create '{"col":"sh_a","buckets_log2":6}' > /dev/null
-j 17751 create '{"col":"sh_b","buckets_log2":6}' > /dev/null
-j 17751 set '{"col":"sh_b","key":"k","value":"kept"}' > /dev/null
-j 17751 drop '{"col":"sh_a"}' > /dev/null
-sleep 3                                # the retire tick frees sh_a's slot for reuse
-R=$(j 17751 create '{"col":"sh_b","buckets_log2":6}')
-case "$R" in *"already exists"*) ok "a create of a live name behind a reusable dead slot is refused";; *) bad "duplicate behind a dead slot: $R";; esac
-R=$(j 17751 get '{"col":"sh_b","key":"k"}')
-case "$R" in *'"value": "kept"'*) ok "and the live collection is not shadowed by an empty one";; *) bad "shadowed: $R";; esac
-
-# ---- 4f. a drop and a re-create of one name leave one registry entry for it, not a tombstone beside it
-j 17751 create '{"col":"dup","buckets_log2":6}' > /dev/null
-jseq 17751 drop '{"col":"dup"}' create '{"col":"dup","buckets_log2":6}' > /dev/null
-N=$(grep -c '^collection dup ' "$D/st1/collections")
-[ "$N" = 1 ] && ok "the collections file names a dropped and re-created collection once" \
-	|| bad "the collections file names 'dup' $N times: $(grep '^collection dup ' "$D/st1/collections" | tr '\n' ';')"
-
-# ---- 4g. a drop during a resize takes both tables with it; the slot's next collection starts clean
-conf 3 17753 yes
-start 3
-j 17753 create '{"col":"rz","buckets_log2":8}' > /dev/null
-python3 - <<'PYEOF'
-import json, pcnative, socket
-s = socket.create_connection(("127.0.0.1", 17753), timeout=30); f = pcnative.wrap(s)
-reqs = [json.dumps({"jsonrpc":"2.0","id":i,"method":"set","params":{"col":"rz","key":"rz%d"%i,"value":"v"}}) for i in range(6000)]
-f.write(("\n".join(reqs)+"\n").encode()); f.flush()
-for _ in reqs: f.readline()
-PYEOF
-j 17753 resize '{"col":"rz","buckets_log2":14}' > /dev/null
-# the drop lands after the swap: the live table is the new one, the old one still holds every record
-i=0
-while [ $i -lt 100 ]; do
-	R=$(j 17753 stats '{"col":"rz"}')
-	case "$R" in *'"buckets": 16384'*resizing_to*|*resizing_to*'"buckets": 16384'*) break;; esac
-	sleep 0.1; i=$((i+1))
-done
-[ $i -lt 100 ] || bad "the resize's drain phase was never seen: $R"
-j 17753 drop '{"col":"rz","force":true}' > /dev/null
-sleep 3                                # the dropped table is retired and the slot reusable
-j 17753 create '{"col":"rz2","buckets_log2":8}' > /dev/null
-R=$(j 17753 stats '{"col":"rz2"}')
-case "$R" in *resizing_to*) bad "a collection created after a drop mid-resize inherits the resize: $R";; *) ok "a collection created after a drop mid-resize is not resizing";; esac
-sleep 4                                # resize ticks that would carry a stale table's records in
-[ "$(entries 17753 rz2)" = 0 ] && ok "and it holds none of the dropped collection's records" \
-	|| bad "rz2 holds $(entries 17753 rz2) record(s) of the dropped rz"
-[ "$(bkt 17753 rz2)" = 256 ] && ok "at the size it was created at" || bad "rz2 buckets: $(bkt 17753 rz2), want 256"
-stop 3
-
-# ---- 4h. a collection change whose collections file cannot be written says so (no WAL here: the
-# file is the only record, and a restart would bring a dropped collection back)
-mkdir "$D/st1/collections.tmp"         # fopen of the temp file fails, as on a full or read-only dir
-R=$(j 17751 create '{"col":"nofile","buckets_log2":6}')
-case "$R" in *'"created": true'*'"persisted": false'*) ok "a create whose file write fails says persisted false";; *) bad "create with an unwritable file: $R";; esac
-R=$(j 17751 rename '{"col":"nofile","to":"nofile2"}')
-case "$R" in *'"renamed": true'*'"persisted": false'*) ok "so does a rename";; *) bad "rename with an unwritable file: $R";; esac
-R=$(j 17751 drop '{"col":"nofile2"}')
-case "$R" in *'"dropped": true'*'"persisted": false'*) ok "and a drop";; *) bad "drop with an unwritable file: $R";; esac
-N=$(grep -c "collections file could not be written" "$D/n1.log")
-[ "$N" -ge 3 ] && ok "each is logged as an error ($N)" || bad "the failed writes were logged $N times, want 3"
-rmdir "$D/st1/collections.tmp"
-R=$(j 17751 create '{"col":"nofile3","buckets_log2":6}')
-case "$R" in *'"persisted"'*) bad "a create whose file write succeeds still carries persisted: $R";; *'"created": true'*) ok "with the file writable again the reply is as before";; *) bad "create after: $R";; esac
-
 # ---- 5. the RESP door's index map
 for i in 0 1 2 3; do j 17751 set "{\"col\":\"sbcha\",\"key\":\"s$i\",\"value\":\"v\"}" > /dev/null; done
 j 17751 set '{"col":"th","key":"t0","value":"v"}' > /dev/null
@@ -335,27 +250,6 @@ case "$(cols 17762)" in *whiledown*) ok "a node that was down through a create p
 j 17761 drop '{"col":"whiledown"}' > /dev/null
 i=0; while [ $i -lt 60 ]; do case "$(cols 17762)" in *whiledown*) sleep 0.1; i=$((i+1));; *) break;; esac; done
 case "$(cols 17762)" in *whiledown*) bad "the drop did not reach node 2: $(cols 17762)";; *) ok "a drop reaches the fleet too";; esac
-
-# a drop and a re-create in one breath: the old drop, re-announced every resync, must not empty the
-# collection the create made, on the peer or back on the originator
-j 17761 create '{"col":"dc","buckets_log2":8}' > /dev/null
-i=0; while [ $i -lt 60 ]; do case "$(cols 17762)" in *dc*) break;; esac; sleep 0.1; i=$((i+1)); done
-jseq 17761 drop '{"col":"dc","force":true}' create '{"col":"dc","buckets_log2":8}' > /dev/null
-sleep 1
-python3 - <<'PYEOF'
-import json, pcnative, socket
-s = socket.create_connection(("127.0.0.1", 17761), timeout=30); f = pcnative.wrap(s)
-reqs = [json.dumps({"jsonrpc":"2.0","id":i,"method":"set","params":{"col":"dc","key":"d%d"%i,"value":"v"}}) for i in range(20)]
-f.write(("\n".join(reqs)+"\n").encode()); f.flush()
-for _ in reqs: f.readline()
-PYEOF
-sleep 2                                # what the writes send the peer has landed
-S0=$(( $(entries 17761 dc) + $(entries 17762 dc) ))
-sleep 12                               # two resyncs of the created set
-S1=$(( $(entries 17761 dc) + $(entries 17762 dc) ))
-[ "$S0" -ge 20 ] && [ "$S1" -ge "$S0" ] \
-	&& ok "a re-created collection keeps its records through the fleet's resyncs ($S1)" \
-	|| bad "the re-created 'dc' held $S0 record(s) across both nodes, $S1 after two resyncs - a stale drop emptied it"
 
 echo "coltest: $pass passed, $fail failed"
 [ $fail = 0 ]

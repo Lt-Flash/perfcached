@@ -113,16 +113,6 @@ static int resp_execute_inner(struct pc_conn *c, char **argv,
 }
 
 
-/* a row is named only by a command the door has: anything else is the one row "unknown" */
-static void *resp_obs_row(const char *name, size_t nlen)
-{
-	if (!pc_verb_resp_known(name, nlen)) {
-		name = "unknown";
-		nlen = 7;
-	}
-	return pc_obs_cmd_slot(name, nlen);
-}
-
 /* the stats row from the last four names this worker ran, matched on the bytes
  * as sent, so pc_obs_cmd_slot's fold and hash run only for a new name or case */
 static void *resp_obs_slot(const char *name, size_t nlen)
@@ -133,14 +123,14 @@ static void *resp_obs_slot(const char *name, size_t nlen)
 	unsigned int i;
 
 	if (nlen >= sizeof nm[0])
-		return resp_obs_row(name, nlen);
+		return pc_obs_cmd_slot(name, nlen);
 	for (i = 0; i < 4; i++)
 		if (nl[i] == nlen && slot[i] && memcmp(nm[i], name, nlen) == 0)
 			return slot[i];
 	i = next++ & 3;
 	memcpy(nm[i], name, nlen);
 	nl[i] = (unsigned char)nlen;
-	slot[i] = resp_obs_row(name, nlen);
+	slot[i] = pc_obs_cmd_slot(name, nlen);
 	return slot[i];
 }
 
@@ -158,8 +148,7 @@ static int resp_execute(struct pc_conn *c, char **argv, size_t *argl,
 		dt = obs_carry - t0;
 		if (c->up_hold)
 			return rc;                     /* parked: counted on its re-run */
-		pc_obs_cmd_at(c->resp_authed ? resp_obs_slot(argv[0], argl[0])
-			: resp_obs_slot("unknown", 7), dt);
+		pc_obs_cmd_at(resp_obs_slot(argv[0], argl[0]), dt);
 		pc_obs_conn_touch(c->obs, argv[0], argl[0], get_ticks());
 		pc_obs_slow(argv, argl, nargs, dt, c->obs);
 		if (pc_obs_qlog_on())

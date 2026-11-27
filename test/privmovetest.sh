@@ -56,7 +56,7 @@ C
 }
 start() {
 	: > "$D/ctl$1"; : > "$D/shim$1"
-	PC_SYNCFAIL_CTL="$D/ctl$1" PC_SYNCFAIL_LOG="$D/shim$1" LD_PRELOAD="${SANRT:+$SANRT }$SHIM${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
+	PC_SYNCFAIL_CTL="$D/ctl$1" PC_SYNCFAIL_LOG="$D/shim$1" LD_PRELOAD="${SANRT:+$SANRT }$SHIM" \
 		"$BIN" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 &
 	eval "P$1=\$!"
 }

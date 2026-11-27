@@ -40,7 +40,6 @@ buckets_log2 = 18
 buckets_log2 = 14
 EOF
 chmod 600 "$D/n.conf"
-: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 PID=$!
 i=0

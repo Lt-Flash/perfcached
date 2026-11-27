@@ -98,9 +98,7 @@ misses cold
 [ "$FINAL" = True ] && [ "$S1" = 0 ] && [ "$V2" = 0 ] && [ "$V3" = 0 ] \
 	&& ok "node 3 back cold (bootstrapped): node 1 doubts nobody - its misses stay final, 0 pulls sent, 0 served by nodes 2 and 3" \
 	|| bad "after a cold return: node 1 final $FINAL, pulls sent $S1, served by node 2 $V2, by node 3 $V3"
-# only the doubt's own line: a return after over 3 s of silence also logs the deletes replayed to it
-DOUBT="node [0-9]* is back (from a partition|with a recovered log)"
-grep -qE "$DOUBT" "$D/n1.log" && bad "node 1 logged a doubt for a cold return: $(grep -m1 -E "$DOUBT" "$D/n1.log" | cut -c1-120)" \
+grep -q "node [0-9]* is back" "$D/n1.log" && bad "node 1 logged a doubt for a cold return: $(grep -m1 'is back' "$D/n1.log" | cut -c1-120)" \
 	|| ok "and node 1's log names no doubt"
 
 echo "--- 2: node 3 back with a recovered log"

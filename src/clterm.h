@@ -29,31 +29,23 @@ int pc_term_durable(void);
  * counted in pc_term_rejected; ours does not move (a frame with such a term is refused whole) */
 int pc_term_plausible(uint32_t seen);
 
-/* Fold in a term seen from a peer.  1 = ours moved, to be written by pc_term_persist_tick; 0 = not
- * moved; -1 = refused as implausible (counted, never silent) */
+/* Fold in a term seen from a peer.  1 = ours moved, and is persisted; PC_TERM_UNSAVED = ours moved
+ * but could not be persisted; 0 = not moved; -1 = refused as implausible (counted, never silent) */
+#define PC_TERM_UNSAVED 2
 int pc_term_observe(uint32_t seen);
 
-/* pc-maint: write the adopted term, or a claim asked for, when above what is on disk; the fsync waits
- * on storage, so never the cluster thread's.  1 written, 0 nothing due, -1 refused (retried next call) */
-int pc_term_persist_tick(void);
-
 /* an adopted term its store refused, until a later store lands, else 0: a node holding one must not
- * claim (it could not remember the claim's floor across a restart) - pc-maint retries it */
+ * claim (it could not remember the claim's floor across a restart) - membership retries each tick */
 uint32_t pc_term_unpersisted(void);
 
-/* the refused term since landed: 1 once when it has, 0 nothing pending, -1 still refused */
+/* store the unpersisted term again: 1 stored now, 0 nothing pending, -1 still refused */
 int pc_term_retry(void);
 
 /* the errno of the last refused term store */
 int pc_term_store_errno(void);
 
-/* 1 = pc_term_claim() may be called: the next term is on disk (or its store was refused, or there is
- * no state dir); 0 = pc-maint is asked to write it - promote on a later call */
-int pc_term_claim_ready(void);
-
 /* the next term for a promotion: above everything EVER seen, not just our own last, PERSISTED
- * BEFORE IT IS RETURNED; 0 if it was not (pc-maint is asked to write it for a later call), and then
- * the caller must NOT publish under it */
+ * BEFORE IT IS RETURNED; 0 if it could not be, and then the caller must NOT promote */
 uint32_t pc_term_claim(void);
 
 /* peer terms refused as implausible - non-zero means a defect or a

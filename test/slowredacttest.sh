@@ -31,7 +31,6 @@ buckets_log2 = 12
 EOF
 chmod 600 "$D/a.conf"
 
-: > "$D/a.log"
 "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 &
 P1=$!
 i=0

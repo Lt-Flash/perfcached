@@ -149,8 +149,7 @@ static int raise_privilege(void)
 static int unsafe_twice(const char *m)
 {
 	static const char *const once[] = { "fleetstop", "create", "drop",
-		"rename", "resize", "restore", "mailtest", "map", "unmap", "forget",
-		NULL };
+		"rename", "resize", "restore", "mailtest", "map", "unmap", NULL };
 	int i;
 
 	for (i = 0; once[i]; i++)
@@ -294,7 +293,7 @@ static int raw_command(const char *json)
 }
 
 /* tokenize a command line: whitespace-separated, double quotes group,
- * backslash escapes inside quotes; -1 when it has more than @max words */
+ * backslash escapes inside quotes */
 static int split_words(char *s, char **argv, int max)
 {
 	int n = 0;
@@ -302,10 +301,8 @@ static int split_words(char *s, char **argv, int max)
 	while (*s) {
 		while (*s == ' ' || *s == '\t')
 			s++;
-		if (!*s)
+		if (!*s || n >= max)
 			break;
-		if (n >= max)
-			return -1;
 		if (*s == '"') {
 			char *w = ++s, *o = s;
 
@@ -559,11 +556,6 @@ static int build(char *out, size_t cap, int argc, char **argv)
 		pc_jw_lit(&w, "{\"timeout_ms\":");
 		pc_jw_i64(&w, atoll(argv[1]));
 		pc_jw_lit(&w, "}");
-	} else if (!strcmp(m, "forget")) {
-		NEED(1);
-		pc_jw_lit(&w, "{\"node\":");
-		pc_jw_i64(&w, atoll(argv[1]));
-		pc_jw_lit(&w, "}");
 	} else if (!strcmp(m, "master_prefer")) {
 		NEED(1);
 		pc_jw_lit(&w, "{\"node\":");
@@ -806,8 +798,6 @@ static int build(char *out, size_t cap, int argc, char **argv)
 	  "      last, after waiting up to timeout_ms (30000) for its\n"
 	  "      peers: stopped (said goodbye), still_up, or lost (left\n"
 	  "      without a goodbye)\n"
-	  "  forget <node> - a member removed for good: its reserved id\n"
-	  "      released on this node (run it on each); needs -E\n"
 	  "  master_prefer <node> - on the master: hand mastership to that\n"
 	  "      member once it is the synced standby; needs -E.\n"
 	  "      master_auto cancels one not yet taken\n"
@@ -852,17 +842,18 @@ usage:
 
 /* ---- secret input ------------------------------------------------------ */
 
-static char *prompt_secret(const char *what, char *buf, size_t cap)
+static char *prompt_secret(void)
 {
+	static char buf[512];
 	struct termios t, t0;
 	char *nl;
 
-	fprintf(stderr, "%s secret: ", what);
+	fprintf(stderr, "secret: ");
 	tcgetattr(0, &t0);
 	t = t0;
 	t.c_lflag &= ~(tcflag_t)ECHO;
 	tcsetattr(0, TCSANOW, &t);
-	if (!fgets(buf, (int)cap, stdin))
+	if (!fgets(buf, sizeof buf, stdin))
 		buf[0] = 0;
 	tcsetattr(0, TCSANOW, &t0);
 	fprintf(stderr, "\n");
@@ -990,7 +981,6 @@ int main(int argc, char **argv)
 	const char *secret = getenv("PERFCLI_AUTH"), *rawjson = NULL;
 	const char *conn_name = NULL;          /* -N */
 	const char *enable_secret = NULL;
-	static char auth_buf[512], enable_buf[512];   /* typed at -A, -e */
 	int prompt_enable = 0, encrypt = getenv("PERFCLI_ENCRYPT") != NULL;
 	char req[REQ_CAP];
 	int i, rc = 0, prompt_auth = 0, explicit_target = 0;
@@ -1072,9 +1062,9 @@ int main(int argc, char **argv)
 	}
 
 	if (prompt_auth)
-		secret = prompt_secret("client", auth_buf, sizeof auth_buf);
+		secret = prompt_secret();
 	if (prompt_enable)
-		enable_secret = prompt_secret("enable", enable_buf, sizeof enable_buf);
+		enable_secret = prompt_secret();
 	/* the privilege secret is NOT the app password: PERFCLI_ENABLE, distinct from
 	 * PERFCLI_AUTH, so a shell exporting the client secret holds no DDL privilege */
 	if (!enable_secret)
@@ -1260,11 +1250,7 @@ int main(int argc, char **argv)
 				rc |= raw_command(s);
 			} else if (*s && *s != '#') {
 				wc = split_words(s, wv, 512);
-				if (wc < 0) {
-					fprintf(stderr, "perfcli: more than 512 words on "
-						"one line - nothing sent\n");
-					rc |= tty ? 0 : 1;
-				} else if (wc > 0 && !strcmp(wv[0], "fleet-status")) {
+				if (wc > 0 && !strcmp(wv[0], "fleet-status")) {
 					rc |= fleet_status_cmd();
 				} else if (wc > 0 && !strcmp(wv[0], "upgrade-stage")) {
 					rc |= upgrade_stage_cmd(wc, wv);

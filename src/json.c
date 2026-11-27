@@ -74,47 +74,6 @@ static int parse_string(struct jp *p)
 	return -1;
 }
 
-/* JSON allows four bare words: true, false, null, and a number */
-static int prim_ok(const char *s, size_t n)
-{
-	size_t i = 0;
-	int digits = 0;
-
-	if ((n == 4 && (!memcmp(s, "true", 4) || !memcmp(s, "null", 4))) ||
-	        (n == 5 && !memcmp(s, "false", 5)))
-		return 1;
-	if (i < n && s[i] == '-')
-		i++;
-	if (i < n && s[i] == '0') {
-		i++;
-		digits = 1;
-	} else
-		for (; i < n && s[i] >= '0' && s[i] <= '9'; i++)
-			digits = 1;
-	if (!digits)
-		return 0;
-	if (i < n && s[i] == '.') {
-		size_t f = ++i;
-
-		while (i < n && s[i] >= '0' && s[i] <= '9')
-			i++;
-		if (i == f)
-			return 0;
-	}
-	if (i < n && (s[i] == 'e' || s[i] == 'E')) {
-		size_t x;
-
-		i++;
-		if (i < n && (s[i] == '+' || s[i] == '-'))
-			i++;
-		for (x = i; i < n && s[i] >= '0' && s[i] <= '9'; i++)
-			;
-		if (i == x)
-			return 0;
-	}
-	return i == n;
-}
-
 static int parse_prim(struct jp *p)
 {
 	size_t s = p->pos;
@@ -123,12 +82,12 @@ static int parse_prim(struct jp *p)
 	while (p->pos < p->len) {
 		char c = p->b[p->pos];
 
-		if (c == ',' || c == '}' || c == ']' || c == ':' || c == ' ' ||
-		        c == '\t' || c == '\n' || c == '\r')
+		if (c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' ||
+		        c == '\n' || c == '\r')
 			break;
 		p->pos++;
 	}
-	if (!prim_ok(p->b + s, p->pos - s))
+	if (p->pos == s)
 		return -1;
 	i = tok_new(p, PC_J_PRIM, (int)s);
 	if (i < 0)
@@ -140,73 +99,61 @@ static int parse_prim(struct jp *p)
 int pc_json_parse(const char *buf, size_t len, struct pc_jtok *t, int maxt)
 {
 	struct jp p = { buf, len, 0, t, maxt, 0, -1 };
-	/* what may come next: every separator in its place per container (RFC 8259) */
-	enum { S_VAL, S_VAL_OR_END, S_KEY, S_KEY_OR_END, S_COLON, S_AFTER } st = S_VAL;
-	int i;
+	int i, expect_key = 0;
 
-	for (;;) {
-		char c;
+	while (p.pos < p.len) {
+		char c = p.b[p.pos];
 
-		while (p.pos < p.len && (p.b[p.pos] == ' ' || p.b[p.pos] == '\t' ||
-		        p.b[p.pos] == '\n' || p.b[p.pos] == '\r'))
+		switch (c) {
+		case ' ': case '\t': case '\n': case '\r':
 			p.pos++;
-		if (p.pos == p.len)
-			return st == S_AFTER && p.parent == -1 ? p.ntok : -1;
-		c = p.b[p.pos];
-		switch (st) {
-		case S_VAL_OR_END:
-		case S_KEY_OR_END:
-			if (c == (st == S_VAL_OR_END ? ']' : '}')) {
-				p.t[p.parent].end = (int)p.pos + 1;
-				p.parent = p.t[p.parent].parent;
-				p.pos++;
-				st = S_AFTER;
-				break;
-			}
-			if (st == S_KEY_OR_END)
-				goto key;
-			/* fall through */
-		case S_VAL:
+			break;
+		case '{': case '[':
 			count_in_parent(&p);
-			if (c == '{' || c == '[') {
-				i = tok_new(&p, c == '{' ? PC_J_OBJ : PC_J_ARR, (int)p.pos);
-				if (i < 0)
-					return -1;
-				p.parent = i;
-				st = c == '{' ? S_KEY_OR_END : S_VAL_OR_END;
-				p.pos++;
-			} else {
-				if ((c == '"' ? parse_string(&p) : parse_prim(&p)) < 0)
-					return -1;
-				st = S_AFTER;
-			}
-			break;
-		case S_KEY:
-key:
-			if (c != '"' || parse_string(&p) < 0)
+			i = tok_new(&p, c == '{' ? PC_J_OBJ : PC_J_ARR, (int)p.pos);
+			if (i < 0)
 				return -1;
-			st = S_COLON;
-			break;
-		case S_COLON:
-			if (c != ':')
-				return -1;
+			p.parent = i;
+			expect_key = c == '{';
 			p.pos++;
-			st = S_VAL;
 			break;
-		case S_AFTER:
-			if (p.parent < 0)
-				return -1;             /* text after the one value */
-			if (c == ',')
-				st = p.t[p.parent].type == PC_J_OBJ ? S_KEY : S_VAL;
-			else if (c == (p.t[p.parent].type == PC_J_OBJ ? '}' : ']')) {
-				p.t[p.parent].end = (int)p.pos + 1;
-				p.parent = p.t[p.parent].parent;
-			} else
+		case '}': case ']':
+			if (p.parent < 0 ||
+			        p.t[p.parent].type != (c == '}' ? PC_J_OBJ : PC_J_ARR))
 				return -1;
+			p.t[p.parent].end = (int)p.pos + 1;
+			p.parent = p.t[p.parent].parent;
+			expect_key = 0;
 			p.pos++;
+			break;
+		case ':':
+			expect_key = 0;
+			p.pos++;
+			break;
+		case ',':
+			if (p.parent >= 0 && p.t[p.parent].type == PC_J_OBJ)
+				expect_key = 1;
+			p.pos++;
+			break;
+		case '"':
+			if (!expect_key)
+				count_in_parent(&p);
+			i = parse_string(&p);
+			if (i < 0)
+				return -1;
+			if (expect_key)
+				expect_key = 0;        /* the ':' resets properly */
+			break;
+		default:
+			count_in_parent(&p);
+			if (parse_prim(&p) < 0)
+				return -1;
 			break;
 		}
 	}
+	if (p.parent != -1)
+		return -1;                     /* unclosed container */
+	return p.ntok;
 }
 
 int pc_json_get(const char *buf, const struct pc_jtok *t, int ntok,
@@ -224,8 +171,7 @@ int pc_json_get(const char *buf, const struct pc_jtok *t, int ntok,
 		 * text equals the key name must not match) */
 		if ((child++ & 1) == 0 && t[i].type == PC_J_STR &&
 		        (size_t)(t[i].end - t[i].start) == klen &&
-		        !memcmp(buf + t[i].start, key, klen) && i + 1 < ntok &&
-		        t[i + 1].parent == obj)
+		        !memcmp(buf + t[i].start, key, klen) && i + 1 < ntok)
 			return i + 1;
 	}
 	return -1;
@@ -258,8 +204,8 @@ int pc_json_unescape(const char *buf, const struct pc_jtok *tok,
 	size_t n = 0;
 	int u;
 
-	/* the decoded length never exceeds the source span (\uXXXX: 6 source bytes -> at most 3, a
-	 * surrogate pair 12 -> 4), so the bound is checked per write against the bytes about to land */
+	/* the decoded length never exceeds the source span (\uXXXX: 6 source bytes -> at most 3),
+	 * so the bound is checked per write against the ACTUAL bytes about to land */
 #define PUT1(ch) do { if (n + 1 > outcap) return -1; out[n++] = (ch); } while (0)
 	while (s < e) {
 		if (*s != '\\') {
@@ -281,23 +227,11 @@ int pc_json_unescape(const char *buf, const struct pc_jtok *tok,
 			if (e - s < 5)
 				return -1;
 			u = hex4(s + 1);
-			if (u < 0 || (u >= 0xDC00 && u <= 0xDFFF))
+			if (u < 0)
 				return -1;
 			s += 4;
-			if (u >= 0xD800 && u <= 0xDBFF) {
-				/* a high surrogate names one character with the low one after it */
-				int lo = e - s >= 7 && s[1] == '\\' && s[2] == 'u' ? hex4(s + 3) : -1;
-
-				if (lo < 0xDC00 || lo > 0xDFFF || n + 4 > outcap)
-					return -1;
-				u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
-				s += 6;
-				out[n++] = (char)(0xF0 | (u >> 18));
-				out[n++] = (char)(0x80 | ((u >> 12) & 0x3F));
-				out[n++] = (char)(0x80 | ((u >> 6) & 0x3F));
-				out[n++] = (char)(0x80 | (u & 0x3F));
-			} else if (u < 0x80) {
-				/* a NUL here is legitimate (the whole point) */
+			/* BMP only; a NUL here is legitimate (the whole point) */
+			if (u < 0x80) {
 				PUT1((char)u);
 			} else if (u < 0x800) {
 				if (n + 2 > outcap)
@@ -451,37 +385,6 @@ void pc_jw_i64(struct pc_jw *w, long long v)
 		pc_jw_raw_slow(w, p, n);
 }
 
-/* the length of the well-formed UTF-8 sequence at @s (RFC 3629: no overlong form, no surrogate,
- * nothing past U+10FFFF), 0 when none starts there */
-static size_t utf8_seq(const unsigned char *s, size_t n)
-{
-	unsigned char c = s[0], lo = 0x80, hi = 0xBF;
-	size_t len, k;
-
-	if (c >= 0xC2 && c <= 0xDF)
-		len = 2;
-	else if (c >= 0xE0 && c <= 0xEF)
-		len = 3;
-	else if (c >= 0xF0 && c <= 0xF4)
-		len = 4;
-	else
-		return 0;
-	if (c == 0xE0)
-		lo = 0xA0;
-	else if (c == 0xED)
-		hi = 0x9F;
-	else if (c == 0xF0)
-		lo = 0x90;
-	else if (c == 0xF4)
-		hi = 0x8F;
-	if (n < len || s[1] < lo || s[1] > hi)
-		return 0;
-	for (k = 2; k < len; k++)
-		if ((s[k] & 0xC0) != 0x80)
-			return 0;
-	return len;
-}
-
 /* like pc_jw_str, but a byte that cannot be part of valid UTF-8 becomes U+FFFD: client bytes in a
  * diagnostic sample (slow log, client rows) need no fidelity and must not break strict readers */
 void pc_jw_str_utf8(struct pc_jw *w, const char *s, size_t n)
@@ -513,7 +416,20 @@ void pc_jw_str_utf8(struct pc_jw *w, const char *s, size_t n)
 			i++;
 			continue;
 		}
-		len = utf8_seq((const unsigned char *)s + i, n - i);
+		/* the same sequence rules pc_utf8_clean applies, one
+		 * character at a time */
+		if ((c & 0xE0) == 0xC0 && c >= 0xC2 && i + 1 < n &&
+		        ((unsigned char)s[i + 1] & 0xC0) == 0x80)
+			len = 2;
+		else if ((c & 0xF0) == 0xE0 && i + 2 < n &&
+		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
+		        ((unsigned char)s[i + 2] & 0xC0) == 0x80)
+			len = 3;
+		else if ((c & 0xF8) == 0xF0 && i + 3 < n &&
+		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
+		        ((unsigned char)s[i + 2] & 0xC0) == 0x80 &&
+		        ((unsigned char)s[i + 3] & 0xC0) == 0x80)
+			len = 4;
 		if (len) {
 			pc_jw_raw(w, (const char *)&s[i], len);
 			i += len;
@@ -536,12 +452,20 @@ int pc_utf8_clean(const char *s, size_t n)
 			return 0;
 		if (c < 0x80) {
 			i++;
+		} else if ((c & 0xE0) == 0xC0 && i + 1 < n &&
+		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 && c >= 0xC2) {
+			i += 2;
+		} else if ((c & 0xF0) == 0xE0 && i + 2 < n &&
+		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
+		        ((unsigned char)s[i + 2] & 0xC0) == 0x80) {
+			i += 3;
+		} else if ((c & 0xF8) == 0xF0 && i + 3 < n &&
+		        ((unsigned char)s[i + 1] & 0xC0) == 0x80 &&
+		        ((unsigned char)s[i + 2] & 0xC0) == 0x80 &&
+		        ((unsigned char)s[i + 3] & 0xC0) == 0x80) {
+			i += 4;
 		} else {
-			size_t len = utf8_seq((const unsigned char *)s + i, n - i);
-
-			if (!len)
-				return 0;
-			i += len;
+			return 0;
 		}
 	}
 	return 1;

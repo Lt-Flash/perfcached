@@ -9,7 +9,6 @@
 
 #include "cluster.h"
 #include "clterm.h"
-#include "clcid.h"
 #include "clunk.h"
 #include "clfleet.h"
 #include "clpeers.h"
@@ -225,11 +224,6 @@ int pc_cluster_peers(struct pc_cl_peer_info *out, int max)
 {
 	(void)out;
 	(void)max;
-	return 0;
-}
-
-int pc_cluster_peers_known(void)
-{
 	return 0;
 }
 
@@ -776,17 +770,6 @@ uint32_t pc_term_current(void)
 	return 0;
 }
 
-/* no cluster: no term or cluster id to write */
-int pc_term_persist_tick(void)
-{
-	return 0;
-}
-
-int pc_cid_persist_tick(void)
-{
-	return 0;
-}
-
 /* no cluster: the plain record of a delete that removed a copy; nothing to number or send */
 void pc_delete_originate(const char *col, size_t collen, const char *key,
 		size_t klen, unsigned long long ver, int removed)
@@ -920,27 +903,10 @@ int pc_cluster_eager_doubt_one(void)
 	return 0;
 }
 
-void pc_cluster_ask_fill(const char *col, size_t collen)
-{
-	(void)col;
-	(void)collen;
-}
-
 const char *pc_cluster_master_prefer(int node)
 {
 	(void)node;
 	return "this node is not clustered";
-}
-
-const char *pc_cluster_forget(int node)
-{
-	(void)node;
-	return "this node is not clustered";
-}
-
-unsigned int pc_cluster_forget_gen(void)
-{
-	return 0;
 }
 
 int pc_cluster_eager_miss_final(void)

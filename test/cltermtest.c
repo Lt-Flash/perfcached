@@ -1,5 +1,5 @@
 /* cltermtest.c - the mastership term, which orders maps from different masters: claimed above the
- * fleet, persisted (by pc-maint's tick) before use, a higher term obeyed, and no poison value accepted. */
+ * fleet, persisted before use, a higher term obeyed, and no poison value accepted. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,24 +41,17 @@ int main(void)
 		"a writable state dir did not report durable - a read-only "
 		"dir must be caught here, not at the moment of a promotion");
 
-	/* ---- 2. claiming persists BEFORE returning: the claim waits for pc-maint's write ---- */
-	CHK(pc_term_claim_ready() == 0 && pc_term_claim() == 0,
-		"a claim was ready, or given, before its term was written");
-	CHK(pc_term_persist_tick() == 1 && pc_term_claim_ready() == 1,
-		"the tick did not write the asked claim, or it is still not ready");
+	/* ---- 2. claiming persists BEFORE returning ------------------ */
 	t = pc_term_claim();
 	CHK(t == 1, "first claim gave %u, expected 1", t);
-	CHK(pc_term_persist_tick() == 0, "a tick with the claim on disk wrote again");
 	CHK(pc_term_init(dir) == 0 && pc_term_current() == 1,
 		"a claimed term did not survive a reload - it could be "
 		"reissued with different content");
 
-	/* ---- 3. observing a peer moves us at once, and the tick persists it ---- */
+	/* ---- 3. observing a peer moves us, and persists -------------- */
 	CHK(pc_term_observe(5) == 1, "a higher peer term was not adopted");
 	CHK(pc_term_current() == 5, "term is %u after observing 5",
 		pc_term_current());
-	CHK(pc_term_unpersisted() == 0, "a term not yet tried was reported refused");
-	CHK(pc_term_persist_tick() == 1, "the tick did not write the observed term");
 	CHK(pc_term_observe(3) == 0, "a LOWER peer term moved us");
 	CHK(pc_term_current() == 5, "a lower term rewound us to %u",
 		pc_term_current());
@@ -69,8 +62,6 @@ int main(void)
 	/* the case this rule exists for: we were away, the fleet moved on,
 	 * we hear term 9, and must promote above 9 - not above our own 5 */
 	pc_term_observe(9);
-	(void)pc_term_claim_ready();
-	(void)pc_term_persist_tick();
 	t = pc_term_claim();
 	CHK(t == 10, "claimed %u after seeing 9 - a term someone else may "
 		"already have used", t);
@@ -206,13 +197,9 @@ int main(void)
 		rm_state();
 		CHK(pc_term_init(dir) == 0 && pc_term_observe(5) == 1,
 			"a fresh term file did not take term 5");
-		(void)pc_term_persist_tick();
 		CHK(rename(dir, away) == 0, "could not move the state dir away");
 		pc_term_observe(6);
-		CHK(pc_term_persist_tick() == -1, "term 6 was written with the dir gone");
 		CHK(rename(away, dir) == 0, "could not put the state dir back");
-		CHK(pc_term_claim_ready() == 0 && pc_term_persist_tick() == 1 &&
-			pc_term_claim_ready() == 1, "the claim above 6 was not written");
 		t = pc_term_claim();
 		CHK(t > 6, "claimed %u after seeing 6 it could not persist - the "
 			"term the master that sent 6 published under", t);
@@ -229,45 +216,24 @@ int main(void)
 		snprintf(away, sizeof away, "%s.away", dir);
 		rm_state();
 		CHK(pc_term_init(dir) == 0 && pc_term_observe(5) == 1 &&
-			pc_term_persist_tick() == 1 &&
 			pc_term_unpersisted() == 0, "a stored term 5 was reported unpersisted");
 		CHK(rename(dir, away) == 0, "could not move the state dir away");
 		r = pc_term_observe(6);
-		CHK(r == 1 && pc_term_unpersisted() == 0, "observing returned %d, or a term "
-			"not yet tried was reported refused", r);
-		CHK(pc_term_persist_tick() == -1, "term 6 was written with the dir gone");
+		CHK(r == PC_TERM_UNSAVED, "an unstored term returned %d, not "
+			"PC_TERM_UNSAVED", r);
 		CHK(pc_term_current() == 6 && pc_term_unpersisted() == 6,
 			"term %u, unpersisted %u - want 6 and 6", pc_term_current(),
 			pc_term_unpersisted());
 		CHK(pc_term_store_errno() != 0, "the refused store kept no errno");
-		CHK(pc_term_persist_tick() == -1 && pc_term_retry() == -1 &&
-			pc_term_unpersisted() == 6,
+		CHK(pc_term_retry() == -1 && pc_term_unpersisted() == 6,
 			"a retry with the dir still gone did not fail, or cleared it");
 		CHK(rename(away, dir) == 0, "could not put the state dir back");
-		CHK(pc_term_persist_tick() == 1 && pc_term_unpersisted() == 0 &&
-			pc_term_retry() == 1, "a retry with the dir back did not store term 6");
+		CHK(pc_term_retry() == 1 && pc_term_unpersisted() == 0,
+			"a retry with the dir back did not store term 6");
 		CHK(pc_term_retry() == 0, "a retry with nothing pending did something");
 		CHK(pc_term_init(dir) == 0 && pc_term_current() == 6,
 			"the retried term did not survive a reload (term %u)",
 			pc_term_current());
-	}
-
-	/* ---- 13. a term file that is there but cannot be opened refuses startup and is
-	 * left as it was: only ENOENT is a first boot (a symlink loop gives ELOOP, root too) ---- */
-	{
-		char p[512], back[512];
-		ssize_t n;
-
-		rm_state();
-		snprintf(p, sizeof p, "%s/node-term", dir);
-		CHK(symlink("node-term", p) == 0, "could not make the looping link");
-		CHK(pc_term_init(dir) == -1,
-			"an unopenable term file (ELOOP) was taken as absent - "
-			"term 0 was written over it and the node started");
-		n = readlink(p, back, sizeof back - 1);
-		CHK(n == 9 && memcmp(back, "node-term", 9) == 0,
-			"the unopenable term file was replaced");
-		rm_state();
 	}
 
 	rm_state();

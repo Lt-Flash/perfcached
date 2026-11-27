@@ -29,7 +29,6 @@ plaintext = loopback
 [collection 0]
 buckets_log2 = 12
 EOF
-: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 P=$!
 i=0

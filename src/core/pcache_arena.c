@@ -78,7 +78,6 @@
 #include <strings.h>
 #include <errno.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <sys/mman.h>
 
 #include "../compat/dprint.h"
@@ -238,8 +237,8 @@ _Static_assert(PCACHE_CELL_MAX % 32 == 0,
  * window's size can be argued from figures rather than taste. */
 #define PCACHE_AHEAD_GROUPS   4
 #define PCACHE_REFILL_BATCH   32            /* cells pulled home per refill */
-#define PCACHE_PRIVATE_MAX    256           /* private stack size that sends half home */
-#define PCACHE_PRIVATE_BYTES  (1U << 20)    /* the stack and a refill, in bytes, a class */
+#define PCACHE_PRIVATE_MAX    256           /* private stack size that triggers */
+#define PCACHE_DONATE         128           /*   sending this many cells home  */
 #define PCACHE_CLS_FREE       0xffffffffU   /* chunk header: the slot is free */
 
 typedef struct pcache_page pcache_page_t;
@@ -264,7 +263,6 @@ typedef struct pcache_chunk {
 	unsigned char cold;          /* memory punched out; a carve re-faults it */
 	unsigned char sparse;        /* a handful of survivors pin it - set by
 	                              * the reclaim tick, read by the evacuator */
-	unsigned short pushers;      /* frees between their nfree bump and announce */
 #ifdef PCACHE_ARENA_DEBUG
 	unsigned char *dbg_state;    /* RV-3: one byte per cell, where it is */
 #endif
@@ -344,14 +342,12 @@ typedef struct pcache_arena {
 	unsigned int npages;
 	unsigned int slots_total;               /* reservation slots cut + page slots */
 	unsigned int chunks_used;               /* slots holding a chunk */
-	unsigned int rchunks;                   /* of them, reservation slots */
 	unsigned int tick;                      /* reclaim ticks (1/s) */
 	unsigned int carve_tick;                /* tick of the last carve */
 	unsigned int giveback_off;              /* give-back refused: stay resident */
 	unsigned long chunks_retired;           /* cumulative */
 	unsigned long flush_broadcasts;         /* "send your hoard home" rounds */
 	unsigned int flush_tick;                /* tick of the last broadcast */
-	unsigned int full_flush_at;             /* tick + 1 of the last one a refused carve sent */
 	unsigned long pages_freed;              /* cumulative */
 	unsigned long released_bytes;           /* cumulative give-back */
 	unsigned long cold_bytes;               /* currently punched out */
@@ -566,8 +562,6 @@ static void dbg_register(struct pcache_palloc *pl)
  * class the first time its count leaves zero - one membership flag keeps
  * it on the avail stack once.
  */
-void (*pcache_arena_home_hook)(void *chunk);
-
 static void cell_home(void *cell)
 {
 	pcache_chunk_t *ch = cell_chunk(cell);
@@ -587,25 +581,18 @@ static void cell_home(void *cell)
 	} while (!__atomic_compare_exchange_n(&ch->free_head, &old, cell, 0,
 	                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 
-	/* in before the bump, out after the announce: nfree == cells with no pusher
-	 * inside is what lets the tick retire it (the bump's release carries this) */
-	__atomic_add_fetch(&ch->pushers, 1, __ATOMIC_RELAXED);
 	if (__atomic_add_fetch(&ch->nfree, 1, __ATOMIC_ACQ_REL) != 1)
-		goto out;
-	if (pcache_arena_home_hook)
-		pcache_arena_home_hook(ch);
+		return;
 	__atomic_store_n(&ch->home_since, arena->tick, __ATOMIC_RELAXED);
 	old = NULL;
 	if (!__atomic_compare_exchange_n(&ch->in_avail, (unsigned int *)&old,
 	        1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-		goto out;
+		return;
 	do {
 		top = __atomic_load_n(&arena->avail[c], __ATOMIC_RELAXED);
 		ch->link = top;
 	} while (!__atomic_compare_exchange_n(&arena->avail[c], &top, ch, 0,
 	                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED));
-out:
-	__atomic_sub_fetch(&ch->pushers, 1, __ATOMIC_RELEASE);
 }
 
 /* pop one cell from a chunk - arena lock held (single popper) */
@@ -1081,8 +1068,6 @@ static pcache_chunk_t *slot_take(void)
 		arena->nfree_warm--;
 	}
 	arena->chunks_used++;
-	if (!ch->page)
-		arena->rchunks++;
 	arena->carve_tick = arena->tick;
 	arena_ceiling_since = 0;           /* S98: a carve succeeded - off it */
 	/* TM-2: a slot reused has the cells of its last class closed; the new
@@ -1159,14 +1144,6 @@ static int carve_chunk(int c, struct pcache_palloc *pl)
 	return 0;
 }
 
-static void pcache_flush_rpc(int sender, void *param);
-
-/* a thread's allocator state is sent home and freed at its exit */
-static pthread_key_t palloc_key;
-static pthread_once_t palloc_once = PTHREAD_ONCE_INIT;
-static int palloc_key_ok;
-static void palloc_key_init(void);
-
 static struct pcache_palloc *get_palloc(void)
 {
 	if (!my_palloc) {
@@ -1177,9 +1154,6 @@ static struct pcache_palloc *get_palloc(void)
 		}
 		memset(my_palloc, 0, sizeof *my_palloc);
 		dbg_register(my_palloc);
-		(void)pthread_once(&palloc_once, palloc_key_init);
-		if (palloc_key_ok)
-			(void)pthread_setspecific(palloc_key, my_palloc);
 	}
 	return my_palloc;
 }
@@ -1193,38 +1167,6 @@ static void bump_home(struct pcache_palloc *pl, int c)
 		pl->cls[c].left--;
 	}
 	pl->cls[c].bump = NULL;
-}
-
-static void palloc_flush(struct pcache_palloc *pl)
-{
-	void *cell;
-	int c;
-
-	for (c = 0; c < PCACHE_NCLASSES; c++) {
-		while ((cell = pl->cls[c].free_head) != NULL) {
-			pl->cls[c].free_head = cell_next(cell);
-			pl->cls[c].nfree--;
-			cell_home(cell);
-		}
-		bump_home(pl, c);
-	}
-}
-
-static void palloc_exit(void *p)
-{
-	struct pcache_palloc *pl = p;
-
-	if (arena && backing == PCACHE_BACKING_OWN)
-		palloc_flush(pl);
-	my_palloc = NULL;
-#ifndef PCACHE_ARENA_DEBUG
-	pkg_free(pl);                      /* the debug census keeps it, emptied */
-#endif
-}
-
-static void palloc_key_init(void)
-{
-	palloc_key_ok = pthread_key_create(&palloc_key, palloc_exit) == 0;
 }
 
 int pcache_arena_init(void)
@@ -1339,7 +1281,7 @@ int pcache_arena_init(void)
 				arena->hsize >> 20);
 			arena->hsize = 0;
 		} else {
-			unsigned long ngroups = (arena->hsize + PCACHE_HPS - 1) / PCACHE_HPS, g;
+			unsigned long ngroups = arena->hsize / PCACHE_HPS, g;
 
 			arena->hcommit = shm_malloc(((ngroups + BITS_PER_LONG - 1)
 				/ BITS_PER_LONG) * sizeof(unsigned long));
@@ -1592,16 +1534,12 @@ unsigned long pcache_region_free(void *p, size_t size)
  * destroy walk are the shm fallback's).  The payload is the slot
  * boundary, 64-aligned by construction.
  */
-int (*pcache_region_hook)(size_t size);
-
 void *pcache_region_alloc(size_t size)
 {
 	pcache_region_t *rg;
 	unsigned long need = size + sizeof(pcache_region_t) + 64, slots;
 	char *aligned;
 
-	if (pcache_region_hook && pcache_region_hook(size))
-		return NULL;
 	if (backing != PCACHE_BACKING_OWN) {
 		/* HG hands out whole regions too; nothing to register - the
 		 * arena's extents and accounting are HG's */
@@ -1738,8 +1676,6 @@ void pcache_arena_destroy(void)
 	arena = NULL;
 
 	if (my_palloc) {
-		if (palloc_key_ok)
-			(void)pthread_setspecific(palloc_key, NULL);
 		pkg_free(my_palloc);
 		my_palloc = NULL;
 	}
@@ -1782,8 +1718,6 @@ void pcache_arena_child_init(void)
 	 * reference, exactly as documented - no free, no donation, nothing.
 	 * pl's memory is reclaimed for free when the child process exits.
 	 */
-	if (palloc_key_ok)
-		(void)pthread_setspecific(palloc_key, NULL);
 	my_palloc = NULL;
 }
 
@@ -1793,24 +1727,18 @@ void pcache_arena_child_init(void)
 void pcache_arena_flush_private(void)
 {
 	struct pcache_palloc *pl = my_palloc;
+	void *cell;
+	int c;
 
 	if (backing != PCACHE_BACKING_OWN || !pl)
 		return;
-	palloc_flush(pl);
-}
-
-static __thread unsigned long my_flush_seen;
-
-void pcache_arena_flush_if_asked(void)
-{
-	unsigned long g;
-
-	if (!arena || backing != PCACHE_BACKING_OWN || !my_palloc)
-		return;
-	g = __atomic_load_n(&arena->flush_broadcasts, __ATOMIC_RELAXED);
-	if (g != my_flush_seen) {
-		my_flush_seen = g;
-		palloc_flush(my_palloc);
+	for (c = 0; c < PCACHE_NCLASSES; c++) {
+		while ((cell = pl->cls[c].free_head) != NULL) {
+			pl->cls[c].free_head = cell_next(cell);
+			pl->cls[c].nfree--;
+			cell_home(cell);
+		}
+		bump_home(pl, c);
 	}
 }
 
@@ -1867,8 +1795,7 @@ void *pcache_cell_alloc(unsigned int size)
 
 	/* slow path: pull a batch home from the class's chunks, else carve */
 	lock_get(&arena->lock);
-	for (got = 0; got < PCACHE_REFILL_BATCH &&
-	     (!got || (got + 1) * cell_sizes[c] <= PCACHE_PRIVATE_BYTES); ) {
+	for (got = 0; got < PCACHE_REFILL_BATCH; ) {
 		ch = arena->cur[c];
 		if (!ch) {
 			ch = avail_pop(c);
@@ -1887,16 +1814,7 @@ void *pcache_cell_alloc(unsigned int size)
 		got++;
 	}
 	if (!got && carve_chunk(c, pl) < 0) {
-		/* other threads' hoards may hold this class: ask them home, once a tick */
-		int ask = arena->full_flush_at != arena->tick + 1;
-
-		if (ask) {
-			arena->full_flush_at = arena->tick + 1;
-			__atomic_add_fetch(&arena->flush_broadcasts, 1, __ATOMIC_RELAXED);
-		}
 		lock_release(&arena->lock);
-		if (ask)
-			ipc_send_rpc_all(pcache_flush_rpc, NULL);
 		return NULL;
 	}
 	lock_release(&arena->lock);
@@ -1955,13 +1873,10 @@ void pcache_cell_free(void *cell)
 	pl->cls[c].free_head = cell;
 	pl->cls[c].nfree++;
 
-	if (pl->cls[c].nfree > PCACHE_PRIVATE_MAX || (pl->cls[c].nfree > 1 &&
-	    pl->cls[c].nfree * cell_sizes[c] > PCACHE_PRIVATE_BYTES)) {
-		unsigned int n = pl->cls[c].nfree / 2;
-
+	if (pl->cls[c].nfree > PCACHE_PRIVATE_MAX) {
 		/* the surplus goes home, and so does an idle bump remainder -
 		 * a process hoarding cells would otherwise pin their chunks */
-		for (i = 0; i < n; i++) {
+		for (i = 0; i < PCACHE_DONATE; i++) {
 			d = pl->cls[c].free_head;
 			pl->cls[c].free_head = cell_next(d);
 			pl->cls[c].nfree--;
@@ -2132,7 +2047,6 @@ static void chunk_retire(pcache_chunk_t *ch)
 		ch->page->nfree++;
 	} else {
 		bit_set(arena->rwarm, rslot_idx(ch));
-		arena->rchunks--;
 	}
 	arena->nfree_warm++;
 	arena->chunks_cls[c]--;
@@ -2457,9 +2371,9 @@ static void giveback_tick(void)
 		 * growth now lives inside the reservation rather than in 4K
 		 * pages a free() could return - so a pinned run is unpinned
 		 * first.  Nothing is lost: a punched group is not resident, and
-		 * group_commit() pins it again when a carve brings it back.
-		 * Always: a later mlock failure clears pinned, not the groups locked before it. */
-		(void)munlock(p, (size_t)runs[done].n * PCACHE_HPS);
+		 * group_commit() pins it again when a carve brings it back. */
+		if (arena->pinned)
+			(void)munlock(p, (size_t)runs[done].n * PCACHE_HPS);
 		if (madvise(p, (size_t)runs[done].n * PCACHE_HPS, MADV_DONTNEED) < 0) {
 			err = errno;
 			break;
@@ -2603,7 +2517,6 @@ void pcache_arena_reclaim_tick(void)
 			next = ch->link;
 			nfree = __atomic_load_n(&ch->nfree, __ATOMIC_ACQUIRE);
 			if (nfree == ch->cells &&
-			    !__atomic_load_n(&ch->pushers, __ATOMIC_ACQUIRE) &&
 			    kept++ >= (unsigned int)pcache_reclaim_keep) {
 				chunk_retire(ch);
 				continue;
@@ -2626,12 +2539,10 @@ void pcache_arena_reclaim_tick(void)
 				sparse_now++;
 			avail_push(c, ch);
 		}
-		/* the allocator's current chunk is not on the stack; the loads in this order, so a
-		 * pusher seen gone has its announce (in_avail) seen too */
+		/* the allocator's current chunk is not on the stack */
 		ch = arena->cur[c];
-		if (ch && __atomic_load_n(&ch->nfree, __ATOMIC_ACQUIRE) == ch->cells &&
-		    !__atomic_load_n(&ch->pushers, __ATOMIC_ACQUIRE) &&
-		    !__atomic_load_n(&ch->in_avail, __ATOMIC_ACQUIRE) &&
+		if (ch && !__atomic_load_n(&ch->in_avail, __ATOMIC_ACQUIRE) &&
+		    __atomic_load_n(&ch->nfree, __ATOMIC_ACQUIRE) == ch->cells &&
 		    kept++ >= (unsigned int)pcache_reclaim_keep)
 			chunk_retire(ch);
 	}
@@ -2641,7 +2552,7 @@ void pcache_arena_reclaim_tick(void)
 	if (lingering &&
 	    arena->tick - arena->flush_tick >= (unsigned int)pcache_reclaim_quiet_s) {
 		arena->flush_tick = arena->tick;
-		__atomic_add_fetch(&arena->flush_broadcasts, 1, __ATOMIC_RELAXED);
+		arena->flush_broadcasts++;
 		lock_release(&arena->lock);
 		ipc_send_rpc_all(pcache_flush_rpc, NULL);
 		return;
@@ -2665,7 +2576,7 @@ unsigned int pcache_arena_cell_size(size_t n)
 	size_t idx = (n + 31) >> 5;
 	unsigned char c;
 
-	if (idx >= PCACHE_S2C_N)
+	if (idx > 2048)
 		return 0;
 	c = size2class[idx];
 	return c < PCACHE_NCLASSES ? cell_sizes[c] : 0;
@@ -2785,9 +2696,6 @@ int pcache_arena_mi(mi_item_t *aobj)
 	 * every page slot */
 	for (off = 0; off < arena->hoff; off += PCACHE_SLOT) {
 		ch = (pcache_chunk_t *)(arena->hbase + off);
-		if (bit_get(arena->rwarm, rslot_idx(ch)) ||
-		    bit_get(arena->rcold, rslot_idx(ch)))
-			continue;              /* free; a punched header is not there */
 		if (ch->cls < PCACHE_NCLASSES)
 			out[ch->cls] += ch->cells - ch->nfree;
 	}
@@ -2917,7 +2825,8 @@ static void pcache_arena_hg_capacity(int *active, unsigned long *total,
 void pcache_arena_hugepage_capacity(int *active, unsigned long *total,
 		unsigned long *used, unsigned long *free)
 {
-	unsigned long n;
+	unsigned long off, n = 0;
+	pcache_chunk_t *ch;
 
 	if (backing == PCACHE_BACKING_OWN_HG) {
 		pcache_arena_hg_capacity(active, total, used, free);
@@ -2931,7 +2840,11 @@ void pcache_arena_hugepage_capacity(int *active, unsigned long *total,
 		return;
 	}
 	lock_get(&arena->lock);
-	n = arena->rchunks;            /* no header read: a punched slot has none */
+	for (off = 0; off < arena->hoff; off += PCACHE_SLOT) {
+		ch = (pcache_chunk_t *)(arena->hbase + off);
+		if (ch->cls != PCACHE_CLS_FREE)
+			n++;
+	}
 	*active = 1;
 	*total = arena->hsize;
 	/* the room records can still be carved from: below rtop, less the
@@ -3280,22 +3193,6 @@ int pcache_arena_selftest(void)
 			pcache_cell_free(big[i]);
 	}
 	pcache_arena_stats(&n3, &by1);
-
-	/* a thread outside the broadcast's reach lets go at its next look once a flush was asked,
-	 * and keeps its hoard while none was */
-	a = pcache_cell_alloc(64);
-	CHK(a != NULL, "alloc before the asked flush failed\n");
-	pcache_cell_free(a);
-	pcache_arena_flush_if_asked();
-	a = pcache_cell_alloc(64);
-	pcache_cell_free(a);
-	c = size2class[(64 + 31) / 32];
-	CHK(my_palloc->cls[c].nfree > 0, "the free stack emptied with no flush asked\n");
-	__atomic_add_fetch(&arena->flush_broadcasts, 1, __ATOMIC_RELAXED);
-	pcache_arena_flush_if_asked();
-	CHK(my_palloc->cls[c].nfree == 0 && !my_palloc->cls[c].free_head &&
-	    !my_palloc->cls[c].bump, "an asked flush kept %u cells on the free stack\n",
-		my_palloc->cls[c].nfree);
 
 	/* fork-reset path: drop the private state, then allocate fresh */
 	pcache_arena_child_init();

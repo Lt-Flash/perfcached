@@ -54,7 +54,8 @@ CLUSTER_OBJS = src/cluster.o src/clmap.o src/clterm.o src/clsync.o src/clhist.o 
 	src/clmemb.o src/clpull.o src/clhold.o src/clrecon.o src/clepoch.o src/clcol.o src/clplat.o src/clsend.o \
 	src/clfleet.o src/clps.o src/clspread.o src/clcid.o \
 	src/clmesh.o src/clane.o src/clorder.o src/clrp.o src/clrpt.o src/clreplay.o \
-	src/clrecv.o src/cltomb.o src/cladmit.o src/clfound.o src/clddl.o src/clconn.o
+	src/clrecv.o src/cltomb.o src/cladmit.o src/clfound.o src/clddl.o src/clconn.o \
+	src/statefile.o
 ifeq ($(PC_EDITION),standalone)
 EDITION_OBJS = src/cluster_stub.o
 CFLAGS += -DPC_EDITION_STANDALONE
@@ -136,7 +137,6 @@ endif
 DASH_CFLAGS = $(shell pkg-config --cflags libmicrohttpd)
 DASH_LIBS = $(shell pkg-config --libs libmicrohttpd)
 DASH_BIN = perfcached-dashboard
-DASH_TEST = dashlocktest
 else ifneq ($(PC_DASH),no)
 $(error PC_DASH must be auto, yes or no, not '$(PC_DASH)')
 endif
@@ -160,9 +160,9 @@ check-standalone: selftest verstamptest perfcached perfcli perfdump perfload pag
 
 perfcached: src/main.o src/tls.o src/config.o src/cfgcore.o src/cfgcluster.o src/cfgops.o src/cfgcheck.o src/daemon.o src/doorlive.o src/listenfd.o src/cfgsig.o src/autosize.o src/addrwait.o src/dirlock.o src/proto.o src/httpdoor.o src/respdoor.o src/enumwalk.o src/noisechan.o src/json.o \
 		src/pc_noise.o src/verbs.o src/jsonpath.o src/hashrec.o src/sha1.o src/ptree.o src/store.o src/storage.o \
-		src/walprobe.o src/wal.o src/walscan.o src/statefile.o src/crc32c.o src/rdb.o src/recover.o $(EDITION_OBJS) \
+		src/walprobe.o src/wal.o src/walscan.o src/crc32c.o src/rdb.o src/recover.o $(EDITION_OBJS) \
 		src/node.o src/clretain.o src/clack.o src/clackf.o src/ackstate.o src/clunk.o src/pcaddr.o \
-		src/obs.o src/metrics.o src/events.o src/quiesce.o src/psindex.o src/pubsub.o src/upstream.o src/upjson.o src/upstats.o src/upconn.o src/upsentinel.o src/upcluster.o src/uptls.o src/uprespc.o src/respout.o src/respcl.o src/resppubsub.o src/respkv.o src/respjson.o src/respscript.o src/respsrv.o src/respscan.o src/pcglob.o src/statstree.o src/statscluster.o src/statsreset.o src/winctr.o src/memguard.o src/mail.o src/alerts.o src/hostmon.o src/hostlink.o src/iostat.o src/uring.o src/busypoll.o src/upgrade.o src/upgverify.o src/logrl.o src/relkey.o src/reload.o src/respmap.o src/mgetfan.o src/presence.o src/keeps.o $(CORE_OBJS) src/compat/compat.o
+		src/obs.o src/metrics.o src/events.o src/quiesce.o src/psindex.o src/pubsub.o src/upstream.o src/upstats.o src/upconn.o src/upsentinel.o src/upcluster.o src/uptls.o src/uprespc.o src/respout.o src/respcl.o src/resppubsub.o src/respkv.o src/respjson.o src/respscript.o src/respsrv.o src/respscan.o src/pcglob.o src/statstree.o src/statscluster.o src/statsreset.o src/winctr.o src/memguard.o src/mail.o src/alerts.o src/hostmon.o src/hostlink.o src/iostat.o src/uring.o src/busypoll.o src/upgrade.o src/upgverify.o src/logrl.o src/relkey.o src/reload.o src/respmap.o src/mgetfan.o src/presence.o src/keeps.o $(CORE_OBJS) src/compat/compat.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS) $(TLS_LIBS)
 
 # src/core/*.h belongs here: the daemon's sources read the core's constants (VAL_MAX is
@@ -484,18 +484,6 @@ walringtest: test/walringtest.c src/walring.h
 rpcqtest: test/rpcqtest.c src/rpcq.h
 	$(CC) $(CFLAGS) -Isrc -o $@ test/rpcqtest.c
 
-# the node's state set from two threads (node.c, its test hook)
-nodetest: test/nodetest.c src/node.c src/cluster.h src/compat/compat.c
-	$(CC) $(CFLAGS) -DPC_TESTHOOKS -Isrc -o $@ test/nodetest.c src/node.c src/compat/compat.c $(LDLIBS)
-clprobetest: test/clprobetest.c src/clprobe.h src/pcaddr.o
-	$(CC) $(CFLAGS) -Isrc -o $@ test/clprobetest.c src/pcaddr.o $(LDLIBS)
-thrtabtest: test/thrtabtest.c src/thrtab.h src/clapply.h
-	$(CC) $(CFLAGS) -Isrc -o $@ test/thrtabtest.c
-promlabeltest: test/promlabeltest.c src/promlabel.h
-	$(CC) $(CFLAGS) -Isrc -o $@ test/promlabeltest.c
-upjsontest: test/upjsontest.c src/upjson.o src/json.o src/compat/compat.o src/upjson.h
-	$(CC) $(CFLAGS) -Isrc -o $@ test/upjsontest.c src/upjson.o src/json.o src/compat/compat.o $(LDLIBS)
-
 psindextest: test/psindextest.c src/psindex.o
 	$(CC) $(CFLAGS) -Isrc -o $@ test/psindextest.c src/psindex.o
 
@@ -559,7 +547,7 @@ selftest_broken: test/selftest.c src/compat/compat.c src/core/pcache_mem.c \
 # scratch and the obs registries live for the process by design; halt_on_error makes UBSan loud.
 check-asan:
 	$(MAKE) clean
-	ASAN_OPTIONS=detect_leaks=0$${LD_PRELOAD:+:verify_asan_link_order=0} \
+	ASAN_OPTIONS=detect_leaks=0 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	$(MAKE) SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -DPCACHE_ARENA_DEBUG" \
 		check
@@ -568,7 +556,7 @@ check-asan:
 # flags as check-asan, which runs every group)
 check-asan-g-%:
 	$(MAKE) clean
-	ASAN_OPTIONS=detect_leaks=0$${LD_PRELOAD:+:verify_asan_link_order=0} \
+	ASAN_OPTIONS=detect_leaks=0 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	$(MAKE) SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -DPCACHE_ARENA_DEBUG" \
 		check-g-$*
@@ -599,16 +587,14 @@ check-g-fault2: perfcached perfcli
 
 # The FAST gate: every unit binary plus the suites that finish in seconds - what a branch push
 # must pass; `check` in full rides tag pushes.
-check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe noisetest noiseboundtest wipetest perfcached pubsubcli udppushcli \
+check-fast: pagedump $(DASH_BIN) selftest selftest_broken memprobe noisetest noiseboundtest wipetest perfcached pubsubcli udppushcli \
 		perfcli pcbench clmaptest cltermtest clsynctest clhisttest \
-		clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest clprobetest nodetest asyncbintest routedpairtest movedhinttest hinttest workerbaltest respreadtest frozentest quietlinktest asyncstatetest libperfd.a thrtabtest promlabeltest obstest upjsontest perfdlinktest apooltest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest loadrefusetest \
-		clustersim psrelaytest psindextest psqueuetest psinteresttest psudptest rpsbench legmetatest legwalkremovetest htfuzztest cellpoisontest chainhinttest clordertest draincarrytest chainwalktest wintest scanremovetest histtest capracetest verstamptest arenadbgtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc threadfreeze clapplytest evactest arenacaptest addexptest respmaptest
+		clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest asyncbintest routedpairtest movedhinttest hinttest workerbaltest respreadtest frozentest quietlinktest asyncstatetest libperfd.a \
+		clustersim psrelaytest psindextest psqueuetest psinteresttest psudptest rpsbench legmetatest legwalkremovetest htfuzztest cellpoisontest chainhinttest clordertest draincarrytest chainwalktest wintest scanremovetest histtest capracetest verstamptest arenadbgtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc threadfreeze clapplytest evactest respmaptest
 	./clustersim 500
 	./clapplytest
 	./respmaptest
 	./evactest
-	./arenacaptest
-	./addexptest
 	./slottest
 	./legmetatest
 	./legwalkremovetest
@@ -634,13 +620,6 @@ check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe 
 	./hashrectest
 	./walringtest
 	./rpcqtest
-	./apooltest
-	./nodetest
-	./clprobetest
-	./thrtabtest
-	./promlabeltest
-	./obstest
-	./upjsontest
 	sh test/readmetest.sh
 	# cluster.c, upstream.c and verbs.c within their line budgets
 	sh test/sizeratchet.sh
@@ -668,7 +647,6 @@ check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe 
 	sh test/wiredraintest.sh ./perfcached
 	sh test/expireleaktest.sh ./perfcached
 	sh test/scanresizetest.sh ./perfcached
-	sh test/resizedeltest.sh ./perfcached
 	sh test/refusedlogtest.sh ./perfcached
 	sh test/prefetchtest.sh ./perfcached
 	sh test/pubsubpressuretest.sh ./perfcached ./rpsbench
@@ -683,7 +661,7 @@ check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe 
 	sh test/plaintextdoortest.sh ./perfcached ./perfcli
 	sh test/movedhinttest.sh ./perfcached ./movedhinttest
 	sh test/workerbaltest.sh ./perfcached ./workerbaltest
-	sh test/respreadtest.sh ./perfcached ./respreadtest ./syncfailshim.so ./threadfreeze
+	sh test/respreadtest.sh ./perfcached ./respreadtest ./syncfailshim.so
 	sh test/frozentest.sh ./perfcached ./frozentest
 	sh test/quietlinktest.sh ./perfcached ./quietlinktest
 	sh test/asyncstatetest.sh ./perfcached ./asyncstatetest
@@ -748,14 +726,6 @@ check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe 
 	./clddltest
 	./clconntest
 	./perfdkindtest
-	./perfdlinktest
-	./perfdurltest
-	./perfdexectest
-	./cliupgtest
-	$(if $(DASH_TEST),./$(DASH_TEST))
-	./dumpreadytest
-	./dumpchunktest
-	./loadrefusetest
 	./cfgkvtest
 	./cfgchecktest
 	./doorlivetest
@@ -798,7 +768,7 @@ check-fast: pagedump $(DASH_BIN) $(DASH_TEST) selftest selftest_broken memprobe 
 	./noiseboundtest
 	./wipetest
 	sh test/configtest.sh ./perfcached
-	sh test/stagetest.sh ./perfcached ./perfcli ./syncfailshim.so
+	sh test/stagetest.sh ./perfcached ./perfcli
 	sh test/daemontest.sh ./perfcached
 	sh test/prototest.sh ./perfcached
 	sh test/bintest.sh ./perfcached
@@ -926,10 +896,6 @@ scanremovetest: test/scanremovetest.c $(CORE_OBJS) src/compat/compat.o
 histtest: test/histtest.c src/pcaddr.o src/obs.o src/json.o src/ptree.o src/clunk.o src/compat/compat.o
 	$(CC) $(CFLAGS) -Isrc -o $@ test/histtest.c src/pcaddr.o src/obs.o src/json.o src/ptree.o src/clunk.o \
 		src/compat/compat.o $(LDLIBS)
-# what the command rows and the query log keep of a client's bytes
-obstest: test/obstest.c src/pcaddr.o src/obs.o src/json.o src/ptree.o src/clunk.o src/compat/compat.o
-	$(CC) $(CFLAGS) -Isrc -o $@ test/obstest.c src/pcaddr.o src/obs.o src/json.o src/ptree.o src/clunk.o \
-		src/compat/compat.o $(LDLIBS)
 
 # the index geometry - a segment is one slot and a sixteenth - and that what index_bytes
 # quotes is what regions_bytes moves by.
@@ -975,36 +941,26 @@ evactest: test/evactest.c $(CORE_OBJS) src/compat/compat.o
 	$(CC) $(CFLAGS) -o $@ test/evactest.c $(CORE_OBJS) \
 		src/compat/compat.o $(LDLIBS)
 
-# a punched slot read as used by the capacity scan
-arenacaptest: test/arenacaptest.c $(CORE_OBJS) src/compat/compat.o
-	$(CC) $(CFLAGS) -o $@ test/arenacaptest.c $(CORE_OBJS) \
-		src/compat/compat.o $(LDLIBS)
-
-# INCR and EXPIRE on a record past its deadline, not swept yet
-addexptest: test/addexptest.c $(CORE_OBJS) src/compat/compat.o
-	$(CC) $(CFLAGS) -o $@ test/addexptest.c $(CORE_OBJS) \
-		src/compat/compat.o $(LDLIBS)
-
 check-wired:
 	@for t in test/*.sh; do grep -q "sh $$t" Makefile || { echo "check: $$t is not run by make check - wire it in or remove it"; exit 1; }; done
 
 # The binaries every suite group needs - check and each group build them.
-CHECK_BINS = $(DASH_BIN) $(DASH_TEST) pagedump rollload selftest selftest_broken memprobe noisetest noiseboundtest libtest-so abicaller \
-	wipetest perfcached perfcli perfdump perfload pcbench libtest execcmp failovertest \
+CHECK_BINS = $(DASH_BIN) pagedump rollload selftest selftest_broken memprobe noisetest noiseboundtest libtest-so abicaller \
+	wipetest perfcached perfcli perfdump perfload pcbench libtest failovertest \
 	routedpairtest movedhinttest hinttest workerbaltest respreadtest privmovetest frozentest quietlinktest asyncstatetest mgetextest wedgetest asynctest asyncbintest clmaptest \
 	cltermtest clsynctest clhisttest clplacetest clseltest clpeerstest \
-	clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest perfdlinktest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest loadrefusetest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest \
+	clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest \
 	clbulktest clmigtest clfwdtest clinittest clrestest clmembtest clunktest \
 	clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest \
-	clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest apooltest apoollivetest nodetest clprobetest thrtabtest promlabeltest obstest clustersim upjsontest \
+	clcoltest clplattest natbench slottest jwtest ptreetest hashrectest walringtest rpcqtest clustersim \
 	reachtest origintest indextest quiesctest regiontest tailflighttest legmetatest \
 	legwalkremovetest htfuzztest cellpoisontest chainhinttest clordertest draincarrytest chainwalktest wintest scanremovetest histtest capracetest verstamptest \
-	arenadbgtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc netcutshim.so lingershim.so threadfreeze clinject getbusy clapplytest threadfailshim.so \
-	evactest arenacaptest addexptest respmaptest
+	arenadbgtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc netcutshim.so lingershim.so threadfreeze clinject clapplytest \
+	evactest respmaptest
 
 # The full ladder in GROUPS, one CI job each: `make check` runs every group, check-g-<group> one,
 # check-asan-g-<group> one under ASan+UBSan; check-wired keeps every test/*.sh in some group.
-CHECK_GROUPS = core1 core2 durability cluster1 cluster2 cluster3 repl1 repl2 repl3 fault3 fault4
+CHECK_GROUPS = core1 core2 durability cluster1 cluster2 repl1 repl2 repl3 fault3 fault4
 
 check-edition-guard:
 	@if [ "$(PC_EDITION)" = standalone ]; then \
@@ -1018,8 +974,6 @@ check-g-core1: check-edition-guard $(CHECK_BINS)
 	./clustersim 5000
 	./clapplytest
 	./evactest
-	./arenacaptest
-	./addexptest
 	./reachtest
 	./origintest
 	./indextest
@@ -1047,13 +1001,6 @@ check-g-core1: check-edition-guard $(CHECK_BINS)
 	./hashrectest
 	./walringtest
 	./rpcqtest
-	./apooltest
-	./nodetest
-	./clprobetest
-	./thrtabtest
-	./promlabeltest
-	./obstest
-	./upjsontest
 	./clmaptest
 	./cltermtest
 	./clsynctest
@@ -1091,14 +1038,6 @@ check-g-core1: check-edition-guard $(CHECK_BINS)
 	./clddltest
 	./clconntest
 	./perfdkindtest
-	./perfdlinktest
-	./perfdurltest
-	./perfdexectest
-	./cliupgtest
-	$(if $(DASH_TEST),./$(DASH_TEST))
-	./dumpreadytest
-	./dumpchunktest
-	./loadrefusetest
 	./cfgkvtest
 	./cfgchecktest
 	./doorlivetest
@@ -1154,10 +1093,6 @@ check-g-core1: check-edition-guard $(CHECK_BINS)
 	sh test/upwtordertest.sh ./perfcached
 # fleet_owned counts no write in flight
 	sh test/upownedtest.sh ./perfcached
-# an upstream answering out of the ordinary - errors, odd COMMAND INFO numbers, late replies
-	sh test/upfaulttest.sh ./perfcached
-# a resize under the upfill sweep: the upstream threads re-find their tables
-	sh test/upfillresizetest.sh ./perfcached
 	sh test/upclustertest.sh ./perfcached
 	sh test/updiscovertest.sh ./perfcached
 	sh test/upsentineltest.sh ./perfcached
@@ -1211,7 +1146,7 @@ check-g-core1: check-edition-guard $(CHECK_BINS)
 	sh test/rxlagtest.sh ./perfcached
 	sh test/hugetlbtest.sh ./perfcached
 	sh test/configtest.sh ./perfcached
-	sh test/stagetest.sh ./perfcached ./perfcli ./syncfailshim.so
+	sh test/stagetest.sh ./perfcached ./perfcli
 	sh test/daemontest.sh ./perfcached
 	sh test/prototest.sh ./perfcached
 	sh test/bintest.sh ./perfcached
@@ -1234,8 +1169,6 @@ check-g-core2: check-edition-guard $(CHECK_BINS)
 	sh test/grafanatest.sh ./perfcached
 	sh test/storagetest.sh ./perfcached
 	sh test/pinbothtest.sh ./perfcached
-	# a thread start-up cannot create stops the start; a SIGHUP during start-up is a reload
-	sh test/startuptest.sh ./perfcached ./threadfailshim.so
 	sh test/colstattest.sh ./perfcached
 	sh test/resizeheldtest.sh ./perfcached ./threadfreeze ./netcutshim.so
 	sh test/autoscaletest.sh ./perfcached ./perfcli
@@ -1259,13 +1192,8 @@ check-g-core2: check-edition-guard $(CHECK_BINS)
 	sh test/tombgaptest.sh ./perfcached
 	# numbered deletes logged, counted, confirmed when synced; the marks over a restart
 	sh test/tombacktest.sh ./perfcached
-	# a member on yes among members on no keeps the time rule; the fleet switched one at a time confirms
-	sh test/tombmixtest.sh ./perfcached ./netcutshim.so
-	# a hole over deletes the origin has superseded is floored with no rebuild, its loss table full
-	sh test/tombsupertest.sh ./perfcached ./netcutshim.so
 	# a delete forgotten once every member holds it; a frozen member keeps what it missed
 	sh test/tombforgettest.sh ./perfcached
-	sh test/tombspacetest.sh ./perfcached
 	# a lost delete is a hole the member asks for
 	sh test/tombholetest.sh ./perfcached ./netcutshim.so
 	# a joiner floors its spaces at what its bootstrap's sources confirmed
@@ -1285,8 +1213,6 @@ check-g-core2: check-edition-guard $(CHECK_BINS)
 	sh test/tombresynctest.sh ./perfcached ./netcutshim.so
 	sh test/pagejstest.sh ./perfcached
 	sh test/dashtest.sh ./perfcached ./perfcached-dashboard
-	# a learned member that left the fleet: shown left, not dialled
-	sh test/dashlefttest.sh ./perfcached ./perfcached-dashboard
 	sh test/sketchtest.sh ./perfcached ./perfcached-dashboard
 	sh test/winstatstest.sh ./perfcached ./perfcli
 	sh test/pagelayouttest.sh ./perfcached
@@ -1302,7 +1228,6 @@ check-g-core2: check-edition-guard $(CHECK_BINS)
 	sh test/clitest.sh ./perfcached ./perfcli
 	sh test/libtest.sh ./perfcached ./libtest
 	sh test/libtest.sh ./perfcached ./libtest-so
-	sh test/exectest.sh ./perfcached ./execcmp
 	sh test/abitest.sh ./perfcached ./abicaller
 	sh test/expiretest.sh ./perfcached
 	sh test/plaintextdoortest.sh ./perfcached ./perfcli
@@ -1324,14 +1249,7 @@ check-g-durability: check-edition-guard $(CHECK_BINS)
 	sh test/legwalktest.sh ./perfcached
 	sh test/walprobetest.sh ./perfcached
 	sh test/waltest.sh ./perfcached
-	sh test/walmarktest.sh ./perfcached
-	# a start that restored nothing resumes the WAL sequence above the snapshot's marker
-	sh test/walmarkertest.sh ./perfcached
-	# a durable file's directory is synced: the WAL's new segments, the collections file
-	sh test/dirsynctest.sh ./perfcached ./syncfailshim.so ./perfcli
 	sh test/waldroptest.sh ./perfcached ./pcbench ./perfcli ./syncfailshim.so
-	# fsync = sync: a reply waits for its write's sync, on both doors, in order; always does not
-	sh test/walsynctest.sh ./perfcached ./syncfailshim.so
 	# a full log waits - no overwrite, no heal - and /stats answers while writers are held
 	sh test/walfulltest.sh ./perfcached ./pcbench ./perfcli ./syncfailshim.so
 	# the segments follow the load - grow under a fill, kept across a restart, given back when quiet
@@ -1373,8 +1291,6 @@ check-g-cluster1: check-edition-guard $(CHECK_BINS)
 	sh test/splitkeeptest.sh ./perfcached
 	sh test/upstreamclustertest.sh ./perfcached
 	sh test/resizefleettest.sh ./perfcached
-	sh test/ddlstalltest.sh ./perfcached ./syncfailshim.so
-	sh test/termstalltest.sh ./perfcached ./syncfailshim.so
 	# the reconcile asks by hold-check; a fleet with an older member by pull
 	sh test/reconcileholdtest.sh ./perfcached
 	sh test/refusedpeertest.sh ./perfcached
@@ -1422,19 +1338,18 @@ phpext: libperfd.so lang/php/perfcached.c lang/php/php_perfcached.h lang/php/con
 	cd lang/php && $(PHPIZE) >/dev/null && \
 		./configure --with-php-config=$(PHP_CONFIG) --with-perfcached=$(CURDIR) >/dev/null && \
 		$(MAKE) >/dev/null
-# symfony/cache and symfony/lock for phpsymfonytest: fetched here, outside tools/netns-run.sh; the
-# target is the last package added, so a tree vendored before it fetches again
-phpvendor: .phpvendor/vendor/symfony/lock/LockFactory.php
-.phpvendor/vendor/symfony/lock/LockFactory.php:
+# symfony/cache for phpsymfonytest: fetched here, outside tools/netns-run.sh
+phpvendor: .phpvendor/vendor/autoload.php
+.phpvendor/vendor/autoload.php:
 	mkdir -p .phpvendor
-	[ -f .phpvendor/composer.phar ] || curl -fsSL --retry 3 -o .phpvendor/composer.phar https://getcomposer.org/download/latest-2.x/composer.phar
+	curl -fsSL --retry 3 -o .phpvendor/composer.phar https://getcomposer.org/download/latest-2.x/composer.phar
 	cd .phpvendor && COMPOSER_HOME=$(CURDIR)/.phpvendor/home COMPOSER_ALLOW_SUPERUSER=1 $(PHP_BIN) composer.phar require -q \
-		--no-interaction --no-progress --ignore-platform-reqs symfony/cache:5.4.* symfony/lock:5.4.* psr/log:^1.1
+		--no-interaction --no-progress --ignore-platform-reqs symfony/cache:5.4.* psr/log:^1.1
 check-php: phpext phpvendor perfcached
 	sh test/phpexttest.sh ./perfcached $(PHP_BIN) lang/php/modules/perfcached.so
 	sh test/phpfpmtest.sh ./perfcached php-fpm$(PHPVER) lang/php/modules/perfcached.so
 	sh test/phpsymfonytest.sh ./perfcached $(PHP_BIN) lang/php/modules/perfcached.so .phpvendor/vendor/autoload.php
-	sh test/phpfleettest.sh ./perfcached $(PHP_BIN) lang/php/modules/perfcached.so .phpvendor/vendor/autoload.php
+	sh test/phpfleettest.sh ./perfcached $(PHP_BIN) lang/php/modules/perfcached.so
 
 # the formation ladder's 64 started at once - CI's form64 job
 check-form64: check-edition-guard perfcached
@@ -1465,10 +1380,7 @@ check-g-cluster2: check-edition-guard $(CHECK_BINS) perfcached.release
 	sh test/standbypassovertest.sh ./perfcached ./netcutshim.so
 	sh test/colsfleettest.sh ./perfcached
 	sh test/fleetcolstest.sh ./perfcached
-	sh test/gonecardtest.sh ./perfcached ./perfcli
-
-# cluster2's second half, its own group since 2026-11-25: one job was the longest of every pipeline
-check-g-cluster3: check-edition-guard $(CHECK_BINS) perfcached.release
+	sh test/gonecardtest.sh ./perfcached
 	sh test/clustercfgtest.sh ./perfcached
 	sh test/mcastttltest.sh ./perfcached
 	sh test/unicasttest.sh ./perfcached
@@ -1495,12 +1407,8 @@ check-g-cluster3: check-edition-guard $(CHECK_BINS) perfcached.release
 	sh test/mcaststraytest.sh ./perfcached ./clinject
 	# an address heard only from a JOIN_REQ or a hint lapses after its trial
 	sh test/meshtrialtest.sh ./perfcached ./clinject
-	# a sweep's target leaves inside its ack pump and a new address takes the slot: nothing goes to it
-	sh test/pumpslottest.sh ./perfcached ./clinject
 	# the election defers to a higher address only so long
 	sh test/electboundtest.sh ./perfcached
-	# a member elected while its bootstrap pull is out stays RECOVERING until the pull settles
-	sh test/promotepulltest.sh ./perfcached
 	sh test/lanebyetest.sh ./perfcached ./lingershim.so
 	sh test/maxmemberstest.sh ./perfcached
 	sh test/clusteridtest.sh ./perfcached ./netcutshim.so
@@ -1513,7 +1421,7 @@ check-g-cluster3: check-edition-guard $(CHECK_BINS) perfcached.release
 check-g-repl1: check-edition-guard $(CHECK_BINS)
 	sh test/eagerparttest.sh ./perfcached ./netcutshim.so
 	sh test/ceilingreplicatest.sh ./perfcached
-	sh test/reconciledigtest.sh ./perfcached ./clinject
+	sh test/reconciledigtest.sh ./perfcached
 	sh test/shardswitchtest.sh ./perfcached ./perfcli
 	sh test/replicastest.sh ./perfcached
 	sh test/spreadroutetest.sh ./perfcached ./failovertest
@@ -1541,18 +1449,10 @@ check-g-repl2: check-edition-guard $(CHECK_BINS)
 	sh test/spreadcoldtest.sh ./perfcached
 	sh test/bigreplicatest.sh ./perfcached
 	sh test/shardtest.sh ./perfcached
-	# a shard join moves the joiner's whole share: big values past one batch, a walk past one tick
-	sh test/reshardtailtest.sh ./perfcached
-	# a read whose pull or forward to the owner times out is refused as retryable, never a miss
-	sh test/readbusytest.sh ./perfcached ./getbusy
 	sh test/delprobetest.sh ./perfcached
-	# a delete whose forward to the owner cannot start is refused, as a set is
-	sh test/delfwdfailtest.sh ./perfcached ./netcutshim.so
-	# a proxy write whose fleet probe cannot park is refused, never placed unprobed
-	sh test/probefulltest.sh ./perfcached
 	sh test/movedhinttest.sh ./perfcached ./movedhinttest
 	sh test/workerbaltest.sh ./perfcached ./workerbaltest
-	sh test/respreadtest.sh ./perfcached ./respreadtest ./syncfailshim.so ./threadfreeze
+	sh test/respreadtest.sh ./perfcached ./respreadtest ./syncfailshim.so
 	sh test/privmovetest.sh ./perfcached ./privmovetest ./syncfailshim.so ./perfcli
 	sh test/frozentest.sh ./perfcached ./frozentest
 	sh test/quietlinktest.sh ./perfcached ./quietlinktest
@@ -1578,29 +1478,15 @@ check-g-fault4: check-edition-guard $(CHECK_BINS)
 check-g-repl3: check-edition-guard $(CHECK_BINS)
 	sh test/ceilingtest.sh ./perfcached
 	sh test/expirerejointest.sh ./perfcached
-	sh test/resizeexpirytest.sh ./perfcached
-	# a peer back from a long silence is caught up, and the replay ends
-	sh test/tombpacetest.sh ./perfcached
-	# a silence while a catch-up is owed joins it: one replay on the return, not two
-	sh test/tombowedtest.sh ./perfcached
 	sh test/sweepgatetest.sh ./perfcached ./netcutshim.so
-	# a sweep whose walk could not run is no clean cycle: the mark stays
-	sh test/walkfailtest.sh ./perfcached ./netcutshim.so
 	sh test/proxytest.sh ./perfcached
 	sh test/eagertest.sh ./perfcached
 	sh test/eagerrestarttest.sh ./perfcached
-	# T600: a peer ahead for good - the pulls' empty answers settle the returning node
-	sh test/eagercatchuptest.sh ./perfcached
-	sh test/recovereddifftest.sh ./perfcached
 	sh test/stalebackfilltest.sh ./perfcached
 	sh test/fwdtest.sh ./perfcached
 	sh test/routedpairtest.sh ./perfcached ./routedpairtest
-	# the async pool: owner routing, wait/cancel and a late reply, a node restart, eviction, fork
-	sh test/apoollivetest.sh ./perfcached ./apoollivetest
 	sh test/hinttest.sh ./perfcached ./hinttest
 	sh test/proxylocatortest.sh ./perfcached
-	sh test/respparkmaptest.sh ./perfcached
-	sh test/parkcaptest.sh ./perfcached
 	sh test/applythreadstest.sh ./perfcached
 	sh test/pullordertest.sh ./perfcached
 
@@ -1610,41 +1496,20 @@ perfcli: cli/perfcli.c cli/perfcli-upgrade.inc cli/lineedit.c libperfd.a
 	$(CC) $(CFLAGS) -o $@ cli/perfcli.c cli/lineedit.c libperfd.a \
 		$(LDLIBS)
 
-# the roll driver's parsing and spawning, perfcli.c compiled in (its main renamed)
-cliupgtest: test/cliupgtest.c cli/perfcli.c cli/perfcli-upgrade.inc cli/lineedit.c libperfd.a
-	$(CC) $(CFLAGS) -o $@ test/cliupgtest.c cli/lineedit.c libperfd.a $(LDLIBS)
-
 # perfdump: the parallel dumper, on libperfd and the daemon's own
 # JSON tokenizer (inside the archive); compression through the zstd binary
 perfdump: cli/perfdump.c cli/spawnio.c cli/spawnio.h libperfd.a
 	$(CC) $(CFLAGS) -o $@ cli/perfdump.c cli/spawnio.c libperfd.a $(LDLIBS)
-
-# perfdump's readiness guard, perfdump.c compiled in (its main renamed)
-dumpreadytest: test/dumpreadytest.c cli/perfdump.c cli/spawnio.c cli/spawnio.h libperfd.a
-	$(CC) $(CFLAGS) -o $@ test/dumpreadytest.c cli/spawnio.c libperfd.a $(LDLIBS)
-
-# perfdump's chunk bookkeeping, perfdump.c compiled in (its main renamed)
-dumpchunktest: test/dumpchunktest.c cli/perfdump.c cli/spawnio.c cli/spawnio.h libperfd.a
-	$(CC) $(CFLAGS) -o $@ test/dumpchunktest.c cli/spawnio.c libperfd.a $(LDLIBS)
 
 # perfload: the parallel loader, the reverse of perfdump - the
 # `restore` verb carries each record's own version and absolute expiry
 perfload: cli/perfload.c cli/spawnio.c cli/spawnio.h libperfd.a
 	$(CC) $(CFLAGS) -o $@ cli/perfload.c cli/spawnio.c libperfd.a $(LDLIBS)
 
-# perfload's verdict on a restore reply, perfload.c compiled in (its main renamed)
-loadrefusetest: test/loadrefusetest.c cli/perfload.c cli/spawnio.c cli/spawnio.h libperfd.a
-	$(CC) $(CFLAGS) -o $@ test/loadrefusetest.c cli/spawnio.c libperfd.a $(LDLIBS)
-
 # perfcached-dashboard: the page's bytes are the daemon's own (src/statuspage.o), its data comes
 # over libperfd, its HTTP layer is libmicrohttpd.  Built only when PC_DASH says so (above).
 perfcached-dashboard: cli/perfcached-dashboard.c src/statuspage.o libperfd.a lib/perfd.h src/statuspage.h
 	$(CC) $(CFLAGS) $(DASH_CFLAGS) -o $@ cli/perfcached-dashboard.c src/statuspage.o \
-		libperfd.a $(DASH_LIBS) $(LDLIBS) -lm
-
-# the dashboard's fleet lock, perfcached-dashboard.c compiled in (its main renamed)
-dashlocktest: test/dashlocktest.c cli/perfcached-dashboard.c src/statuspage.o libperfd.a lib/perfd.h src/statuspage.h
-	$(CC) $(CFLAGS) $(DASH_CFLAGS) -o $@ test/dashlocktest.c src/statuspage.o \
 		libperfd.a $(DASH_LIBS) $(LDLIBS) -lm
 
 # libperfd: the archive and the .so share PIC objects (the archive's users are often shared objects);
@@ -1685,9 +1550,6 @@ libperfd.so: libperfd.so.$(PERFD_VER)
 # proxy holder hints, through libperfd with route_hints on
 hinttest: test/hinttest.c lib/perfd.h libperfd.a
 	$(CC) $(CFLAGS) -Ilib -o $@ test/hinttest.c libperfd.a $(LDLIBS)
-# readbusytest's binary GET: hit, miss or the error's kind per key
-getbusy: test/getbusy.c lib/perfd.h libperfd.a
-	$(CC) $(CFLAGS) -Ilib -o $@ test/getbusy.c libperfd.a $(LDLIBS)
 
 libtest: test/libtest.c lib/perfd.h libperfd.a
 	$(CC) $(CFLAGS) -o $@ test/libtest.c libperfd.a $(LDLIBS)
@@ -1695,22 +1557,6 @@ libtest: test/libtest.c lib/perfd.h libperfd.a
 # libperfd's own server_kind(), compiled in from lib/perfd.c
 perfdkindtest: test/perfdkindtest.c lib/perfd.c $(PERFD_HDRS)
 	$(CC) $(CFLAGS) $(PERFD_CPPFLAGS) -o $@ test/perfdkindtest.c $(filter-out lib/perfd.c,$(PERFD_SRCS)) $(LDLIBS)
-
-# a link's own state, perfd.c compiled in: parked replies, the id FIFO, the frame bound
-perfdlinktest: test/perfdlinktest.c lib/perfd.c $(PERFD_HDRS)
-	$(CC) $(CFLAGS) $(PERFD_CPPFLAGS) -o $@ test/perfdlinktest.c $(filter-out lib/perfd.c,$(PERFD_SRCS)) $(LDLIBS)
-
-# perfd:// URLs and the seed dial's backoff, perfd.c compiled in
-perfdurltest: test/perfdurltest.c lib/perfd.c $(PERFD_HDRS)
-	$(CC) $(CFLAGS) $(PERFD_CPPFLAGS) -o $@ test/perfdurltest.c $(filter-out lib/perfd.c,$(PERFD_SRCS)) $(LDLIBS)
-
-# perfd_exec's command table, perfd.c compiled in
-perfdexectest: test/perfdexectest.c lib/perfd.c $(PERFD_HDRS)
-	$(CC) $(CFLAGS) $(PERFD_CPPFLAGS) -o $@ test/perfdexectest.c $(filter-out lib/perfd.c,$(PERFD_SRCS)) $(LDLIBS)
-
-# perfd_exec beside the RESP door of one daemon (test/exectest.sh)
-execcmp: test/execcmp.c lib/perfd.h libperfd.a
-	$(CC) $(CFLAGS) -o $@ test/execcmp.c libperfd.a $(LDLIBS)
 
 # load through libperfd while a fleet is rolled (test/upgradeloadtest.sh)
 rollload: test/rollload.c lib/perfd.h libperfd.a
@@ -1730,13 +1576,6 @@ failovertest: test/failovertest.c lib/perfd.h libperfd.a
 
 routedpairtest: test/routedpairtest.c lib/perfd.h libperfd.a
 	$(CC) $(CFLAGS) -o $@ test/routedpairtest.c libperfd.a $(LDLIBS)
-
-# the async pool against a stand-in server, no daemon
-apooltest: test/apooltest.c lib/perfd.h libperfd.a
-	$(CC) $(CFLAGS) -o $@ test/apooltest.c libperfd.a $(LDLIBS)
-
-apoollivetest: test/apoollivetest.c lib/perfd.h libperfd.a
-	$(CC) $(CFLAGS) -o $@ test/apoollivetest.c libperfd.a $(LDLIBS)
 
 movedhinttest: test/movedhinttest.c lib/perfd.h libperfd.a
 	$(CC) $(CFLAGS) -o $@ test/movedhinttest.c libperfd.a $(LDLIBS)
@@ -1850,9 +1689,6 @@ lingershim.so: test/lingershim.c
 # test/readytest.sh: holds every worker's listen() so "ready" must wait for it
 slowlistenshim.so: test/slowlistenshim.c
 	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror -shared -fPIC -o $@ $< -ldl
-# test/startuptest.sh: the daemon's Nth thread is not created
-threadfailshim.so: test/threadfailshim.c
-	$(CC) -O2 -std=gnu11 -Wall -Wextra -Werror -shared -fPIC -o $@ $< -ldl
 
 # test/cleardoortest.sh: shows perfcli a config at /etc/perfcached.conf
 # without writing to the host's /etc
@@ -1866,17 +1702,17 @@ threadfreeze: test/threadfreeze.c
 
 # a cluster frame sealed as a node seals it, from an address
 # the suite picks - the gates' suites play a sender the fleet does not know
-clinject: test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/clinit.o src/pcaddr.o src/compat/compat.o
-	$(CC) $(CFLAGS) -Isrc -o $@ test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/clinit.o src/pcaddr.o src/compat/compat.o $(LDLIBS)
+clinject: test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/pcaddr.o src/compat/compat.o
+	$(CC) $(CFLAGS) -Isrc -o $@ test/clinject.c src/clwire.o src/pc_noise.o src/clmemb.o src/clpull.o src/clfwd.o src/pcaddr.o src/compat/compat.o $(LDLIBS)
 
 clean:
 	rm -rf lib/obj lib/obj-pic
 	-[ ! -f lang/php/configure ] || (cd lang/php && $(PHPIZE) --clean >/dev/null)
 	rm -f perfcached.release perfcached.release.tmp
 	rm -f libperfd.so libperfd.so.* libtest-so abicaller src/*.o src/compat/*.o src/core/*.o lib/*.o perfcached \
-		perfcli perfdump perfload libperfd.a libtest execcmp failovertest routedpairtest apooltest apoollivetest movedhinttest hinttest workerbaltest respreadtest privmovetest frozentest quietlinktest asyncstatetest clordertest draincarrytest mgetextest htfuzztest cellpoisontest capracetest verstamptest arenadbgtest noiseboundtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc netcutshim.so lingershim.so threadfreeze clinject getbusy clapplytest evactest arenacaptest addexptest respmaptest wedgetest selftest selftest_broken threadfailshim.so \
+		perfcli perfdump perfload libperfd.a libtest failovertest routedpairtest movedhinttest hinttest workerbaltest respreadtest privmovetest frozentest quietlinktest asyncstatetest clordertest draincarrytest mgetextest htfuzztest cellpoisontest capracetest verstamptest arenadbgtest noiseboundtest syncfailshim.so slowlistenshim.so fopenmapshim.so allocshim.so liballoc netcutshim.so lingershim.so threadfreeze clinject clapplytest evactest respmaptest wedgetest selftest selftest_broken \
 		memprobe noisetest pcbench routebench mmclient policybench concbench \
-		asynctest clmaptest cltermtest clsynctest clhisttest clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest perfdlinktest perfdurltest perfdexectest cliupgtest dumpreadytest dumpchunktest dashlocktest loadrefusetest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest
+		asynctest clmaptest cltermtest clsynctest clhisttest clplacetest clseltest clpeerstest clpendtest clloctest clretaintest clacktest clackftest pcaddrtest uprespctest respouttest respcltest resppubsubtest respkvtest mgetaggtest respjsontest respscripttest respsrvtest respscantest pcglobtest upstatstest upconntest clrecontest httpdoortest respdoortest enumwalktest noisechantest clepochtest clfoundtest cladmittest clddltest clconntest perfdkindtest cfgkvtest cfgchecktest doorlivetest listenfdtest cfgsigtest autosizetest hostmontest hostlinktest crc32ctest walscantest upgverifytest clanetest logrltest clmeshtest statsresettest clboottest clpushtest clwiretest clreplaytest clrpttest clbulktest clrestest clmembtest clunktest clsendtest clfleettest clworktest clpstest clspreadtest clpulltest clholdtest clcoltest clplattest
 
 # install: binary + annotated example config + systemd unit.
 # The live config is NEVER written - only the .example is refreshed.
@@ -1938,5 +1774,5 @@ endif
 	@echo "      see PRODUCTION.md before the first real deployment"
 
 .PHONY: all menuconfig print-libperfd print-build check-standalone shim core check perfcached.release check-wired check-fast check-fault check-asan check-asan-findings hashbench clean install check-roll \
-	check-edition-guard check-g-core1 check-g-core2 check-g-durability check-g-cluster1 check-g-cluster2 check-g-cluster3 \
+	check-edition-guard check-g-core1 check-g-core2 check-g-durability check-g-cluster1 check-g-cluster2 \
 	check-g-repl1 check-g-repl2 check-g-repl3 check-g-fault1 check-g-fault2 check-g-fault3 check-g-fault4

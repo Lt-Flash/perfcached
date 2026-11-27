@@ -24,12 +24,6 @@
 #define MAXTOK   (1 << 17)
 #define RECMAX   PCACHE_CELL_MAX    /* the store's largest record: key + value never exceed it */
 
-/* a record this file format, and perfload and --inspect reading it, can carry */
-static int pcd_rec_fits(size_t kl, size_t vl)
-{
-	return kl <= RECMAX && vl <= RECMAX - kl;
-}
-
 /* perfdump-format 2: the chunk magic, and the type byte as an index here - the daemon's
  * dump `t` (absent = a string); perfload reads it with the same table */
 #define PCD_FORMAT 2
@@ -39,7 +33,7 @@ static const char *const pcd_types[] = { NULL, "json", "rl", "hash", "lock" };
 
 struct opts {
 	const char *host, *out, *cols, *secret;
-	int port, threads, count, zstd, chunk_mb, rate, inspect, verbose, force;
+	int port, threads, count, zstd, chunk_mb, rate, inspect, verbose;
 };
 
 /* ---- crc32 (IEEE, table-driven; no zlib dependency) -------------------- */
@@ -94,7 +88,6 @@ struct shared {
 	unsigned long long tbl[64];
 	int ncols;
 	char fleet[128];
-	char node_state[32];           /* the source's lifecycle state at the start */
 	time_t started;
 };
 
@@ -106,7 +99,6 @@ struct job {
 	unsigned long long records, bytes;
 	int failed;
 	int resized;                   /* the table moved under this walker */
-	int started;                   /* its thread runs: joined */
 };
 
 /* a JSON primitive `true` in the manifest: the tokenizer's string
@@ -175,10 +167,6 @@ static int manifest_write(struct shared *sh)
 	pc_jw_str(&w, sh->fleet, strlen(sh->fleet));
 	pc_jw_lit(&w, ",\"started\":");
 	pc_jw_i64(&w, (long long)sh->started);
-	if (sh->node_state[0]) {
-		pc_jw_lit(&w, ",\"node_state\":");
-		pc_jw_str(&w, sh->node_state, strlen(sh->node_state));
-	}
 	pc_jw_lit(&w, ",\"threads\":");
 	pc_jw_i64(&w, sh->o->threads);
 	pc_jw_lit(&w, ",\"collections\":[");
@@ -272,10 +260,9 @@ static int chunk_open(struct shared *sh, struct job *j, struct chunk *c)
 	r->hi = j->hi;
 	r->zstd = sh->o->zstd;
 	c->slot = sh->nchunks++;
-	/* r is inside the table another walker's open may realloc once the lock is let go */
-	snprintf(c->path, sizeof c->path, "%s/%s", sh->o->out, r->file);
 	pthread_mutex_unlock(&sh->mx);
 
+	snprintf(c->path, sizeof c->path, "%s/%s", sh->o->out, r->file);
 	c->f = fopen(c->path, "wb");
 	if (!c->f)
 		return -1;
@@ -468,26 +455,17 @@ static void *walker(void *arg)
 			long long ttl, ver;
 			unsigned long long exp_ms;
 
-			tk = rec < 0 || v.n[rec].type != 'm' ? -1 : pc_tv_get(&v, rec, "k");
-			tvv = tk < 0 ? -1 : pc_tv_get(&v, rec, "v");
+			if (rec < 0 || v.n[rec].type != 'm')
+				continue;
+			tk = pc_tv_get(&v, rec, "k");
+			tvv = pc_tv_get(&v, rec, "v");
 			if (tk < 0 || v.n[tk].type != 'b' || tvv < 0 ||
 			    v.n[tvv].type != 'b' ||
 			    pc_tv_get_int(&v, rec, "ttl", &ttl) != 0 ||
-			    pc_tv_get_int(&v, rec, "ver", &ver) != 0) {
-				fprintf(stderr, "perfdump: connection %d: record %d of the chunk at "
-					"cursor %u is malformed - the dump would miss it\n",
-					j->idx, i, cursor);
-				j->failed = 1;
-				break;
-			}
-			if (!pcd_rec_fits(v.n[tk].len, v.n[tvv].len)) {
-				fprintf(stderr, "perfdump: connection %d: a record of %zu + %zu bytes, "
-					"past the %u a dump file carries - the dump would miss it\n",
-					j->idx, (size_t)v.n[tk].len, (size_t)v.n[tvv].len,
-					(unsigned int)RECMAX);
-				j->failed = 1;
-				break;
-			}
+			    pc_tv_get_int(&v, rec, "ver", &ver) != 0)
+				continue;
+			if (v.n[tk].len > RECMAX || v.n[tvv].len > RECMAX)
+				continue;
 			tt = pc_tv_get(&v, rec, "t");
 			type = pcd_type_of(&v, tt);
 			if (type < 0) {
@@ -565,15 +543,14 @@ static int inspect(const char *dir)
 	n = ftell(f);
 	fseek(f, 0, SEEK_SET);
 	buf = malloc((size_t)n + 1);
-	/* a token takes at least two bytes of the text: no manifest outgrows this */
-	toks = malloc(((size_t)n / 2 + 8) * sizeof *toks);
+	toks = malloc((size_t)MAXTOK * sizeof *toks);
 	if (!buf || !toks || fread(buf, 1, (size_t)n, f) != (size_t)n) {
 		fclose(f);
 		return 1;
 	}
 	fclose(f);
 	buf[n] = 0;
-	ntok = pc_json_parse(buf, (size_t)n, toks, (int)(n / 2 + 8));
+	ntok = pc_json_parse(buf, (size_t)n, toks, MAXTOK);
 	if (ntok < 0) {
 		fprintf(stderr, "perfdump: manifest unparsable\n");
 		return 1;
@@ -590,10 +567,6 @@ static int inspect(const char *dir)
 	}
 	i = pc_json_get(buf, toks, ntok, 0, "source");
 	printf("source: %.*s\n", i >= 0 ? toks[i].end - toks[i].start : 1, i >= 0 ? buf + toks[i].start : "?");
-	i = pc_json_get(buf, toks, ntok, 0, "node_state");
-	if (i >= 0)
-		printf("node state: %.*s%s\n", toks[i].end - toks[i].start, buf + toks[i].start,
-			pc_json_streq(buf, &toks[i], "ready") ? "" : " - dumped with --force, it may be partial");
 	tf = pc_json_get(buf, toks, ntok, 0, "files");
 	for (i = tf + 1; tf >= 0 && i < ntok; i++) {
 		int tn, tc, tr, tz, tcomp;
@@ -683,7 +656,7 @@ static int inspect(const char *dir)
 static void usage(FILE *f)
 {
 	fputs("usage: perfdump --from HOST:PORT --out DIR [-a SECRET] [--collections a,b] [--threads N]\n"
-	      "                [--count BUCKETS] [--chunk-mb MB] [--zstd LEVEL] [--rate RECORDS/S] [--force]\n"
+	      "                [--count BUCKETS] [--chunk-mb MB] [--zstd LEVEL] [--rate RECORDS/S]\n"
 	      "       perfdump --inspect DIR\n"
 	      "  --from        one node's client door (eager: any READY node holds everything)\n"
 	      "  --out         directory for the chunk files and manifest.json (created)\n"
@@ -694,7 +667,6 @@ static void usage(FILE *f)
 	      "  --chunk-mb    chunk file size before compression (default 64)\n"
 	      "  --zstd        0 = raw .pcd files; N = zstd -N through the zstd binary (default 3)\n"
 	      "  --rate        records per second per connection, 0 = unpaced\n"
-	      "  --force       dump from a node that is not READY; the manifest records its state\n"
 	      "  --inspect     print a dump's manifest summary and verify every file's checksum\n"
 	      "  -V            version\n", f);
 }
@@ -791,7 +763,7 @@ static int discard_collection(struct shared *sh, int c)
 static int start_collection(struct shared *sh, int c, struct job *jobs, pthread_t *th)
 {
 	unsigned int nb = sh->nb[c];
-	int i, rc, n = sh->o->threads;
+	int i, n = sh->o->threads;
 
 	if ((unsigned int)n > nb)
 		n = (int)nb;
@@ -804,48 +776,12 @@ static int start_collection(struct shared *sh, int c, struct job *jobs, pthread_
 		j->col = c;
 		j->lo = (unsigned int)((unsigned long long)nb * (unsigned long long)i / (unsigned long long)n);
 		j->hi = i == n - 1 ? nb : (unsigned int)((unsigned long long)nb * (unsigned long long)(i + 1) / (unsigned long long)n);
-		rc = pthread_create(&th[j->idx], NULL, walker, j);
-		if (rc != 0) {
-			fprintf(stderr, "perfdump: cannot start connection %d: %s\n", j->idx,
-				strerror(rc));
-			j->failed = 1;
-		} else {
-			j->started = 1;
-		}
+		pthread_create(&th[j->idx], NULL, walker, j);
 	}
 	return n;
 }
 
 #define PERFDUMP_RESIZE_ATTEMPTS 5
-
-/* the token of the node's state when it must not be dumped from, -1 when it may */
-static int not_ready(const char *res, const struct pc_jtok *toks, int ntok)
-{
-	/* the lifecycle state is the node's, a root key: a standalone node has one too */
-	int ts = pc_json_get(res, toks, ntok, 0, "state");
-
-	return ts >= 0 && !pc_json_streq(res, &toks[ts], "ready") ? ts : -1;
-}
-
-/* 0 = dump from the node whose stats are @res, its state kept for the manifest; -1 = refused */
-static int ready_gate(struct shared *sh, const char *res, const struct pc_jtok *toks, int ntok)
-{
-	int ts = pc_json_get(res, toks, ntok, 0, "state");
-
-	if (ts >= 0)
-		snprintf(sh->node_state, sizeof sh->node_state, "%.*s",
-			toks[ts].end - toks[ts].start, res + toks[ts].start);
-	if (not_ready(res, toks, ntok) < 0)
-		return 0;
-	if (sh->o->force) {
-		fprintf(stderr, "perfdump: the node is not READY (%s) - dumping anyway (--force); "
-			"the manifest records the state\n", sh->node_state);
-		return 0;
-	}
-	fprintf(stderr, "perfdump: the node is not READY (%s) - it may still be pulling; pick another, "
-		"or --force to dump what it holds\n", sh->node_state);
-	return -1;
-}
 
 int main(int argc, char **argv)
 {
@@ -880,7 +816,6 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--zstd") && v) { o.zstd = atoi(v); i++; }
 		else if (!strcmp(a, "--rate") && v) { o.rate = atoi(v); i++; }
 		else if (!strcmp(a, "--inspect") && v) { o.inspect = 1; o.out = v; i++; }
-		else if (!strcmp(a, "--force")) o.force = 1;
 		else if (!strcmp(a, "-v")) o.verbose = 1;
 		else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
 		else if (!strcmp(a, "-V")) { printf("perfdump " VERSION " (libperfd %s)\n", PERFD_VERSION); return 0; }
@@ -936,9 +871,18 @@ int main(int argc, char **argv)
 	}
 	{
 		int tcols = pc_json_get(res, toks, ntok, 0, "collections");
+		int tst = pc_json_get(res, toks, ntok, 0, "cluster");
 
-		if (ready_gate(&sh, res, toks, ntok) != 0)
-			return 1;
+		if (tst >= 0) {
+			int ts = pc_json_get(res, toks, ntok, tst, "state");
+
+			if (ts >= 0 && !pc_json_streq(res, &toks[ts], "ready") &&
+			    !pc_json_streq(res, &toks[ts], "null")) {
+				fprintf(stderr, "perfdump: the node is not READY (%.*s) - it may still be pulling; pick another\n",
+					toks[ts].end - toks[ts].start, res + toks[ts].start);
+				return 1;
+			}
+		}
 		for (i = tcols + 1; tcols >= 0 && i < ntok && sh.ncols < 64; i++) {
 			int tn, tb;
 			char name[64];
@@ -1004,8 +948,7 @@ int main(int argc, char **argv)
 			for (i = 0; i < nstarted[c]; i++) {
 				struct job *j = &jobs[c * o.threads + i];
 
-				if (j->started)
-					pthread_join(th[j->idx], NULL);
+				pthread_join(th[j->idx], NULL);
 				failed |= j->failed;
 				redo[c] |= j->resized;
 				cb += j->bytes;

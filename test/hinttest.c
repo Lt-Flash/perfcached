@@ -180,22 +180,14 @@ int main(int argc, char **argv)
 	OK(get_is(c, "t2", "x") == 0 && (long long)perfd_hint_hits(c) == hits0 + 1,
 		"3. past the TTL: absent, and not sent by the dead entry");
 
-	/* 4. membership: node 3 killed - until it is purged its keys are refused as retryable (it
-	 * does not answer, which is no miss), then they answer absent; node 2's still hit */
+	/* 4. membership: node 3 killed - its keys answer absent, never an error; node 2's still hit */
 	kill((pid_t)atoi(argv[5]), SIGKILL);
 	sleep(1);
 	for (i = 0, bad = 0; i < 20; i++) {
 		snprintf(key, sizeof key, "h3_%d", i);
-		bad += get_is(c, key, NULL) < 0 && perfd_error_kind(c) != PERFD_E_REFUSED;
+		bad += get_is(c, key, NULL) < 0;
 	}
-	OK(!bad, "4. node 3 killed: reads of its keys answer absent or are refused as retryable, no other error");
-	for (n = 0; n < 15 && get_is(c, "h3_0", NULL) != 0; n++)
-		sleep(1);
-	for (i = 0, bad = 0; i < 20; i++) {
-		snprintf(key, sizeof key, "h3_%d", i);
-		bad += get_is(c, key, NULL) != 0;
-	}
-	OK(!bad, "4. node 3 purged: reads of its keys answer absent, never an error");
+	OK(!bad, "4. node 3 killed: reads of its keys answer (absent), never an error");
 	for (i = 1, bad = 0; i < 21; i++) {
 		snprintf(key, sizeof key, "h2_%d", i); snprintf(val, sizeof val, "v2_%d", i);
 		bad += get_is(c, key, val) != 1;

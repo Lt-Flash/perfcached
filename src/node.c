@@ -2,7 +2,6 @@
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* node.c - the node's lifecycle state, its reason, and the WAL's say in it; in both builds, as a
  * standalone daemon has a lifecycle too.  cluster.c owns only the STALLED overlay's detector. */
-#include <pthread.h>
 #include "cluster.h"
 #include "wal.h"
 #include "compat/dprint.h"
@@ -23,8 +22,7 @@ void pc_node_set_stalled(int on)
 /* the node's own reason, set beside the state change that caused it; read by the ALIVE build and
  * /stats, so a FAILED card says why */
 static int node_reason = PC_NRE_NONE;
-/* every transition checks and stores under it: the WAL thread and the cluster thread both set */
-static pthread_mutex_t node_mx = PTHREAD_MUTEX_INITIALIZER;
+static int heal_releasing;             /* pc_node_wal_heal(0) only */
 
 /* STALLED is an overlay, not a transition: it masks READY while the heartbeat thread sees no
  * progress, and nothing underneath moves (PC_NST_STALLED in cluster.h) */
@@ -108,13 +106,9 @@ int pc_node_state(void)
 	return __atomic_load_n(&node_state, __ATOMIC_RELAXED);
 }
 
-#ifdef PC_TESTHOOKS
-void (*pc_node_test_mid)(void);        /* runs between a transition's checks and its store */
-#endif
-
 /* the one writer, so every transition is logged in one shape; DRAINING is terminal: a goodbye went
  * out and peers are purging us, so a late ASSIGN must not walk it back to READY */
-static void state_set_locked(int st, int heal_releasing)
+void pc_node_state_set(int st)
 {
 	int cur = __atomic_load_n(&node_state, __ATOMIC_RELAXED);
 
@@ -129,10 +123,6 @@ static void state_set_locked(int st, int heal_releasing)
 	if (cur == PC_NST_HEALING && st != PC_NST_FAILED &&
 	        st != PC_NST_DRAINING && !heal_releasing)
 		return;
-#ifdef PC_TESTHOOKS
-	if (pc_node_test_mid)
-		pc_node_test_mid();
-#endif
 	__atomic_store_n(&node_state, st, __ATOMIC_RELAXED);
 	/* every state carries its reason; one set MORE specifically for the state moved to stands
 	 * (pc_node_reason_set() first is how the WAL says WHY it failed) */
@@ -162,13 +152,6 @@ static void state_set_locked(int st, int heal_releasing)
 		pc_node_reason_text(pc_node_reason()));
 }
 
-void pc_node_state_set(int st)
-{
-	pthread_mutex_lock(&node_mx);
-	state_set_locked(st, 0);
-	pthread_mutex_unlock(&node_mx);
-}
-
 /* the WAL has been discarding acknowledged writes: leave the client map so the load goes to nodes
  * that can honour it, while still serving READS - unsafe is accepting writes, not the data held */
 void pc_node_wal_shed(int why)
@@ -176,16 +159,10 @@ void pc_node_wal_shed(int why)
 	/* no exemption for a JOINING node: the WAL sheds ONCE (the startup overrun arrives late,
 	 * still JOINING).  FAILED, not DRAINING: draining strands every key with no TTL */
 	/* the reason BEFORE the state, or a node failed by its WAL says "failed without recording a
-	 * reason"; a DRAINING node refuses the move and keeps its own */
-	pthread_mutex_lock(&node_mx);
-	if (__atomic_load_n(&node_state, __ATOMIC_RELAXED) == PC_NST_DRAINING) {
-		pthread_mutex_unlock(&node_mx);
-		return;
-	}
+	 * reason" */
 	pc_node_reason_set(why == PC_WAL_SHED_IO ? PC_NRE_WAL_IO
 		: PC_NRE_WAL_DROP);
-	state_set_locked(PC_NST_FAILED, 0);
-	pthread_mutex_unlock(&node_mx);
+	pc_node_state_set(PC_NST_FAILED);
 	LM_CRIT("node state -> FAILED: %s - still answering reads, "
 		"refusing writes until the storage or the [wal] sizing is "
 		"fixed and the node is restarted\n", why == PC_WAL_SHED_IO
@@ -197,16 +174,19 @@ void pc_node_wal_shed(int why)
  * published; a node not READY yet keeps its state (the heal completes before it serves writes) */
 void pc_node_wal_heal(int phase)
 {
-	int cur;
+	int cur = __atomic_load_n(&node_state, __ATOMIC_RELAXED);
 
-	pthread_mutex_lock(&node_mx);
-	cur = __atomic_load_n(&node_state, __ATOMIC_RELAXED);
-	if (phase && cur == PC_NST_READY) {
+	if (phase) {
+		if (cur != PC_NST_READY)
+			return;
 		pc_node_reason_set(PC_NRE_WAL_HEAL);
-		state_set_locked(PC_NST_HEALING, 0);
-	} else if (!phase && cur == PC_NST_HEALING) {
-		state_set_locked(PC_NST_READY, 1);
+		pc_node_state_set(PC_NST_HEALING);
+		return;
 	}
-	pthread_mutex_unlock(&node_mx);
+	if (cur != PC_NST_HEALING)
+		return;
+	heal_releasing = 1;
+	pc_node_state_set(PC_NST_READY);
+	heal_releasing = 0;
 }
 

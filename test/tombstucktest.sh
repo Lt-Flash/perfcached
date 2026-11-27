@@ -48,7 +48,6 @@ C
 done
 start() { # start <i> [env...]
 	i=$1; shift
-	: > "$D/n$i.log"
 	env PERFCACHED_TEST_ACKS_STUCK_MS=3000 "$@" "$BIN" -f "$D/n$i.conf" > "$D/n$i.log" 2>&1 & eval "P$i=$!"; PIDS="$PIDS $!"
 	k=0; while [ $k -lt 150 ] && ! grep -q "perfcached ready" "$D/n$i.log"; do sleep 0.1; k=$((k+1)); done
 	grep -q "perfcached ready" "$D/n$i.log" || { bad "node $i did not start: $(tail -2 "$D/n$i.log" | tr '\n' ' ')"; exit 1; }

@@ -192,9 +192,7 @@ static int enqueue_bin(perfd_t *p, int verb, const char *col,
 		else if (verb == BV_ADD || verb == BV_SUB || verb == BV_RLHIT)
 			fixed += 16;
 	}
-	/* the daemon drops a link whose frame is over PC_MAX_REQ; and the length is 32 bits */
-	if (vlen > (1u << 20) || (plen = 1 + fixed + cn + kn + vlen) > (1u << 20))
-		return errk(p, PERFD_E_ARG, "request too large");
+	plen = 1 + fixed + cn + kn + vlen;
 	need = BIN_HDR + plen;
 	if (p->qlen + need > p->qcap) {
 		while (p->qcap < p->qlen + need)
@@ -240,7 +238,7 @@ static int enqueue_bin(perfd_t *p, int verb, const char *col,
 	}
 	if (vlen)
 		memcpy(at, val, vlen);
-	if (!p->async && push_id(p, p->next_id) != 0)   /* as enqueue_cmd */
+	if (push_id(p, p->next_id) != 0)
 		return -1;
 	p->qlen += need;
 	return 0;

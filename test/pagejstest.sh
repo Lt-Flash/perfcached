@@ -41,7 +41,6 @@ plaintext = loopback
 buckets_log2 = 12
 CONF
 chmod 600 "$D/a.conf"
-: > "$D/a.log"
 "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 &
 P=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/a.log" && break; sleep 0.1; i=$((i+1)); done
@@ -167,22 +166,6 @@ cl = ctx.eval("__els['cols']?__els['cols'].innerHTML:''") or ""
 (ok if not err and "class=mtog" in cl else bad)(
     "under the dashboard: the collections drawn with the fleet's figures and a members chip each (%s; chip %s)"
     % (err or "clean", "drawn" if "class=mtog" in cl else "MISSING"))
-# behind a proxy that spreads requests over several dashboards, a card names its node as ?node=N
-# (the node's own door is not what the proxy serves), and a page opened without ?node= pins the
-# node its first /session named, so the polls that follow stay on one node
-ctx.execute("__e=null; try{ drawFleet(%s); }catch(e){ __e=String(e); }" % json.dumps(
-    [{"node": 1, "addr": "127.0.0.1", "port": 1, "http": 2, "state": "ready", "self": True, "uptime_s": 10, "gone_s": -1},
-     {"node": 2, "addr": "127.0.0.2", "port": 1, "http": 2, "state": "ready", "uptime_s": 10, "gone_s": -1}]))
-fh = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
-(ok if not ctx.eval("__e") and 'href="?node=2"' in fh and "http://127.0.0.2" not in fh else bad)(
-    "under the dashboard: another node's card links ?node=2, not that node's own door (%s; %s)"
-    % (ctx.eval("__e") or "clean", re.findall(r'href="[^"]*"', fh)))
-ctx.execute("var __rs=[]; var history={replaceState:function(a,b,u){__rs.push(u);}}; NODEQ=''; __e=null;"
-            "try{ pinNode(3); pinNode(5); }catch(e){ __e=String(e); }")
-(ok if not ctx.eval("__e") and ctx.eval("NODEQ") == "3" and ctx.eval("__rs.length") == 1 and "node=3" in (ctx.eval("__rs[0]") or "") else bad)(
-    "under the dashboard: a page without ?node= pins the first node /session named, once (%s; NODEQ %s, url %s)"
-    % (ctx.eval("__e") or "clean", ctx.eval("NODEQ"), ctx.eval("__rs.join(' ')")))
-ctx.execute("NODEQ='';")
 ctx.execute("TOOL=null; FLM=null; FLD=null;")    # the daemon's own page for what follows
 
 # the header alarm: this node's state blinks as its card would, and a chip names the
@@ -395,11 +378,6 @@ fv = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
 (ok if not h[3] and h[1] == "hal amber" and "mixed versions: 0.6.4 x1, 0.6.5 x2" in h[2]
     and "v0.6.5 \N{MIDDLE DOT} wire 2" in fv and "v0.6.4</div>" in fv else bad)(
     "UP1: versions on the cards, and 'mixed versions' in the header (%s)" % (h,))
-v1["rev"] = "2a03d3b"
-h = hal([v1, v2, v3])
-fv = ctx.eval("__els['fleet']?__els['fleet'].innerHTML:''") or ""
-(ok if "v0.6.5 (2a03d3b) \N{MIDDLE DOT} wire 2" in fv and "v0.6.4</div>" in fv else bad)(
-    "UP1: a card names its member's build rev beside the version, as perfcached -V does")
 v3["version"] = "0.6.5"
 h = hal([v1, v2, v3])
 (ok if "mixed versions" not in (h[2] or "") else bad)("UP1: one build - no versions chip (%s)" % (h,))
@@ -769,11 +747,6 @@ got10 = dict((k, r10.get(k)) for k in want10)
     "AT-11: the card says what waits for members, for whom, and the stuck one (%s; got %s)" % (e10 or "clean", got10))
 (ok if not e8 and "waiting for" not in r8 and "deletes awaiting members" not in r8 else bad)(
     "AT-11: a daemon without the marks shows neither row (%s; got %s)" % (e8 or "clean", sorted(r8)))
-# a fleet that does not confirm (a member on tombstone_acks = no) keeps its numbered deletes by time:
-# nothing awaits members, so the row says so rather than reading as a stuck queue
-r11, e11 = neg_rows(dict(t8, numbered=4800), {"fleet": {"confirming": False, "waiting_for": [2, 3]}, "held_by": []})
-(ok if not e11 and r11.get("numbered deletes (kept by time)") == ("", "4800") and "deletes awaiting members" not in r11 else bad)(
-    "the time rule: numbered deletes kept by time, not awaiting members (%s; got %s)" % (e11 or "clean", sorted(r11.items())))
 # connects per second on the clients card, from both doors' accept counters between polls
 # (the average from the five-minute windows); the door cards say "connects (5 min)"
 ctx.execute("var __now=1000000; Date.now=function(){return __now;};")

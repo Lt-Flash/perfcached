@@ -59,7 +59,6 @@ C
 run_legs() { # run_legs <io>
 	conf "$1" "$1" "resp = 127.0.0.1:$RT tls" "resp = 127.0.0.1:$RP" "http = 127.0.0.1:$HT tls" \
 		"tls_cert = $D/srv.pem" "tls_key = $D/srv.key"
-	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & PID=$!
 	i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/$1.log"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$1.log" || { bad "$1: the node did not start: $(tail -2 "$D/$1.log")"; exit 1; }
@@ -182,7 +181,6 @@ sed -i '/^resp = pctls-resp-pw$/d; /^http = pctls-http-token$/d' "$D/h4.conf"
 # K, I, J: the 2-day certificate raises tls.cert; a 30-day renewal; /stats tls
 conf ijk epoll "resp = 127.0.0.1:$RT tls" "http = 127.0.0.1:$HT" "tls_cert = $D/live.pem" "tls_key = $D/live.key"
 cp srv.pem live.pem; cp srv.key live.key
-: > "$D/ijk.log"
 "$BIN" -f "$D/ijk.conf" > "$D/ijk.log" 2>&1 & PID=$!
 i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/ijk.log"; do sleep 0.1; i=$((i+1)); done
 st() { python3 -c 'import json,sys,urllib.request
@@ -219,7 +217,6 @@ else
 	cat > "$D/l.sh" <<'SH'
 D=$1 BIN=$2 RT=$3 RP=$4 HT=$5 IP=192.0.2.10
 ip link set lo up && ip addr add $IP/32 dev lo || { echo "1:no network in the namespace"; exit 0; }
-: > "$D/l.log"
 "$BIN" -f "$D/l.conf" > "$D/l.log" 2>&1 & PID=$!
 i=0; while [ $i -lt 300 ] && ! grep -q "perfcached ready" "$D/l.log"; do sleep 0.1; i=$((i+1)); done
 cat > "$D/l.py" <<'PY'

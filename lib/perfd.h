@@ -25,8 +25,7 @@
 #define PERFD_VERSION_MAJOR 0
 #define PERFD_VERSION_MINOR 7
 #define PERFD_VERSION_PATCH 6
-#define PERFD_VERSION_TWEAK 2          /* the fourth number; 0: none */
-#define PERFD_VERSION "0.7.6.2"
+#define PERFD_VERSION "0.7.6"
 /* the oldest daemon this binary wire works with: an older one answers the first request
  * with "unknown verb", which perfd_error() names */
 #define PERFD_NEEDS_PERFCACHED "0.4.5"
@@ -93,9 +92,6 @@ typedef struct perfd_opts {
 	/* 1 = every call goes to the node dialled - the fleet is still learned, but no
 	 * policy, routing, refusal, dead link or expulsion moves the handle; its answer is the caller's */
 	int pin;
-	/* the most perfd_apool_get waits on a new handle's dial, ms: 0 = 500, -1 = all of
-	 * connect_timeout; a dial still going then fails the get and is finished unblocked */
-	int dial_wait_ms;
 } perfd_opts;
 /* designated, so -Wextra's missing-field-initializers stays quiet; C++ and
  * FFI callers use perfd_opts_init_sz() with their own struct's size */
@@ -134,8 +130,7 @@ enum perfd_error_kind {
 	PERFD_E_ARG,           /* a bad argument: size, name, range */
 	PERFD_E_NOMEM,         /* out of memory, or the crypto library failed */
 	PERFD_E_PROTOCOL,      /* a reply this library could not read */
-	PERFD_E_STATE,         /* the call does not fit the handle's state */
-	PERFD_E_BACKOFF        /* perfd_url_connect holds off after a dial no seed answered */
+	PERFD_E_STATE          /* the call does not fit the handle's state */
 };
 #define PERFD_HAS_ERROR_KIND 1
 int perfd_error_kind(const perfd_t *p);
@@ -184,7 +179,7 @@ char *perfd_reset_stats(perfd_t *p);                /* this node's running total
 char *perfd_reset_stats_fleet(perfd_t *p);          /* this node and every live peer, as of one moment */
 char *perfd_save(perfd_t *p);                       /* an RDB snapshot in the background */
 char *perfd_sync(perfd_t *p, int timeout_ms);       /* the WAL barrier; 0 = the daemon's default */
-char *perfd_load(perfd_t *p);                       /* the snapshot, additively; privileged */
+char *perfd_load(perfd_t *p);                       /* the snapshot, additively */
 char *perfd_mailtest(perfd_t *p);                   /* one mail through [mail] */
 char *perfd_upgrade_status(perfd_t *p);             /* the builds staged here, the install mode */
 char *perfd_upgrade_revert(perfd_t *p, int force);  /* back to the prefix the helper kept; {request, to, helper} */
@@ -371,13 +366,6 @@ int perfd_mget_ex(perfd_t *p, const char *col, const char *const *keys,
  * a malloc'd array of malloc'd strings for perfd_free_keys; -1 on error */
 int perfd_keys(perfd_t *p, const char *col, const char *match, int limit,
 		char ***keys_out);
-/* as perfd_keys, with *flags: PARTIAL = the listing is the answering node's share only (a sharded
- * collection on a fleet), TRUNCATED = it stopped at @limit */
-#define PERFD_HAS_KEYS_EX 1
-#define PERFD_KEYS_PARTIAL   0x1
-#define PERFD_KEYS_TRUNCATED 0x2
-int perfd_keys_ex(perfd_t *p, const char *col, const char *match, int limit,
-		char ***keys_out, int *flags);
 void perfd_free_keys(char **keys, int n);
 
 /* JSON path verbs: fragments travel as JSON text (out malloc'd, NUL-terminated); a NULL path is "$".
@@ -441,8 +429,8 @@ PERFD_MUST_CHECK int perfd_flush(perfd_t *p);
 char *perfd_next_reply(perfd_t *p);
 int perfd_pending(const perfd_t *p);   /* replies not yet collected */
 
-/* notifications go to the hook, if set: @json not NUL-terminated, valid only during the call; a hook
- * run inside a blocking call may not call its handle (PERFD_E_STATE), one between calls may */
+/* server notifications (membership, pub/sub, the UDP prune) are skipped unless a hook is set;
+ * @json is NOT NUL-terminated and valid only during the call */
 typedef void (*perfd_notify_cb)(const char *json, size_t len, void *ctx);
 void perfd_set_notify(perfd_t *p, perfd_notify_cb cb, void *ctx);
 
@@ -468,15 +456,9 @@ int perfd_events(const perfd_t *p);
 int perfd_state(const perfd_t *p);
 
 /* non-blocking connect: a handle in PERFD_ST_CONNECTING, the TCP connect and handshake driven by
- * the readiness calls; NULL only if no socket could be created.  It tries opts.secrets[0] only:
- * a node that refuses it fails the handle as PERFD_E_AUTH, and the caller dials again from the next */
+ * the readiness calls; NULL only if no socket could be created */
 perfd_t *perfd_connect_async(const char *host, int port,
 		const perfd_opts *opts);
-
-/* the index in opts.secrets of the secret the handshake used - or, after an async PERFD_E_AUTH,
- * tried: dial again with opts.secrets + index + 1.  -1 = plaintext or NULL. */
-#define PERFD_HAS_SECRET_INDEX 1
-int perfd_secret_index(const perfd_t *p);
 
 /* per-request completion: the callback OWNS @result (perfd_free_value); NULL = failed, @errmsg
  * says why.  A submit reply is JSON text, a submit_kv reply the verb's raw payload. */
@@ -517,111 +499,5 @@ int perfd_push(perfd_t *p);
 int perfd_submit_kv(perfd_t *p, int verb, const char *col, const char *key,
 		const void *val, size_t vlen, long long by, long long ttl,
 		perfd_reply_cb cb, void *ctx);
-
-/* ---- URLs, conditional jset, describing a handle (libperfd 0.7.6.1) ---- */
-
-/* perfd[:group]://[user[:secret]@]host:port[,host:port...]/collection[?opt,opt...]: names, IPv4 or
- * [IPv6], ports 1-65535, up to 8 seeds; %XX escapes in user and secret; options split by , or & */
-#define PERFD_HAS_URL 1
-#define PERFD_URL_MAX_SEEDS 8
-typedef struct perfd_url perfd_url;
-/* NULL with the reason in @err (may be NULL); every option name and value is checked:
- * route=0|1, encrypt=0|1, spares=-1..8 (0 none, -1 one per member), policy=failover|rr|least|weighted */
-perfd_url *perfd_url_parse(const char *url, char *err, size_t errcap);
-void perfd_url_free(perfd_url *u);
-const char *perfd_url_collection(const perfd_url *u);
-/* the password, or the user when there is none; NULL = none */
-const char *perfd_url_secret(const perfd_url *u);
-/* the group after "perfd:", NULL = none */
-const char *perfd_url_group(const perfd_url *u);
-/* seed @i (0..count-1): host (an IPv6 one without brackets) and port; 0, or -1 = no such seed */
-int perfd_url_seed_count(const perfd_url *u);
-int perfd_url_seed(const perfd_url *u, int i, const char **host, int *port);
-/* writes route_keys, encrypt, spares and policy into @o - what the URL says, else route 1, encrypt 1,
- * one standby per member, failover - and secrets when it has one (valid while @u lives) */
-void perfd_url_apply(const perfd_url *u, perfd_opts *o);
-/* a blocking handle from the seeds (start rotated by pid; @o as perfd_connect, the URL applied); after
- * a dial no seed answered it fails at once (PERFD_E_BACKOFF) 1 s doubling to 30 s - one thread per @u */
-perfd_t *perfd_url_connect(perfd_url *u, const perfd_opts *o);
-
-/* as perfd_jset, conditional: NX only where the path holds nothing, XX only where it holds a value;
- * 1 set, 0 declined, -1 error.  A conditional one is never replayed after a failover. */
-#define PERFD_JSET_NX 1
-#define PERFD_JSET_XX 2
-PERFD_MUST_CHECK int perfd_jset_ex(perfd_t *p, const char *col,
-		const char *key, const char *path, const char *json,
-		long long ttl, int flags);
-
-/* one line into @buf: the server's version, members learned, routing on or off, standbys held;
- * the length it needed (as snprintf), -1 on a NULL handle */
-int perfd_describe(const perfd_t *p, char *buf, size_t cap);
-/* moves whenever this handle's member list, or a member's state as it sees it (ready, draining,
- * down), changes - compare two readings */
-unsigned long long perfd_fleet_changes(const perfd_t *p);
-
-/* the RESP door's keyed data commands on @col, each on its key's node: GET SET SETEX PSETEX DEL UNLINK
- * EXISTS EXPIRE PEXPIRE TTL PTTL INCR INCRBY DECR DECRBY MGET MSET, the H commands, JSON.GET/SET/DEL */
-#define PERFD_HAS_EXEC 1
-enum perfd_reply_type {
-	PERFD_REPLY_NIL = 0, PERFD_REPLY_INTEGER, PERFD_REPLY_STRING,
-	PERFD_REPLY_STATUS, PERFD_REPLY_ERROR, PERFD_REPLY_ARRAY
-};
-typedef struct perfd_reply {
-	int type;                      /* enum perfd_reply_type */
-	long long integer;             /* INTEGER */
-	char *str;                     /* STRING, STATUS, ERROR: NUL-terminated, @len bytes */
-	size_t len;
-	size_t elements;               /* ARRAY */
-	struct perfd_reply **element;
-} perfd_reply;
-/* the reply as the RESP door shapes it - a daemon's error, or a command not in the list, is an ERROR
- * reply; NULL when the call failed (perfd_error).  @argvlen NULL: the arguments are C strings */
-perfd_reply *perfd_exec(perfd_t *p, const char *col, int argc,
-		const char *const *argv, const size_t *argvlen);
-void perfd_reply_free(perfd_reply *r);
-
-/* ---- the async pool (0.7.6.1): for loops that watch one fd per request, every in-flight GET has
- * an event-loop handle of its own.  Per process, not thread-safe; after fork() it resets itself ---- */
-#define PERFD_HAS_APOOL 1
-typedef struct perfd_apool perfd_apool;
-/* @hosts/@ports: 1 to 8 seeds, tried from a start rotated by the pid.  With opts.route_keys a GET
- * goes to a handle pinned to its key's owner, else to a seed.  @max_conns 1 to 1024 handles */
-perfd_apool *perfd_apool_new_seeds(const char *const *hosts, const int *ports,
-		int nseeds, const char *col, const perfd_opts *opts, int max_conns);
-/* the same from a parsed perfd:// URL (its options applied over @o, which may be NULL) */
-perfd_apool *perfd_apool_new(perfd_url *u, const perfd_opts *o, int max_conns);
-void perfd_apool_free(perfd_apool *pool);     /* in-flight callbacks never run */
-
-/* submit GET @key: @cb gets the get reply ([u8 found][u32 ttl][value]) or NULL + errmsg.  The fd to
- * watch for reading, PERFD_APOOL_DONE (@cb already ran), or -1 (@cb not called; perfd_error(NULL)) */
-#define PERFD_APOOL_DONE (-2)
-/* a new handle's dial blocks the get dial_wait_ms at most (500; connect_timeout if lower): one still
- * connecting fails the get at once (-1) and is finished, without blocking, by the gets after it */
-int perfd_apool_get(perfd_apool *pool, const char *key, perfd_reply_cb cb,
-		void *ctx);
-/* on readiness of @fd: 1 = @cb ran (reply or error), 0 = still pending, -1 = no request on @fd */
-int perfd_apool_ready(perfd_apool *pool, int fd);
-/* block until @cb ran (1) or @timeout_ms passed (0: cancelled, @cb never runs); -1 as above */
-int perfd_apool_wait(perfd_apool *pool, int fd, int timeout_ms);
-/* give up on the request on @fd: @cb never runs, the handle is rebuilt at a later get - stop
- * watching @fd before then */
-void perfd_apool_cancel(perfd_apool *pool, int fd);
-
-/* the node the request on @fd went to; 0, or -1 = no request on @fd */
-int perfd_apool_node(perfd_apool *pool, int fd, char *addr, size_t acap,
-		int *port);
-struct perfd_apool_stats {
-	int slots;                     /* handles held */
-	int busy;                      /* requests in flight */
-	int routing;                   /* 1 = GETs go to their key's owner */
-	unsigned long long gets;       /* perfd_apool_get calls */
-	unsigned long long dials;      /* connections opened, router included */
-	unsigned long long dial_failures;
-	unsigned long long rebuilt;    /* failed or cancelled handles replaced */
-	unsigned long long evicted;    /* idle handles of another node re-dialled */
-	unsigned long long cancelled;
-	unsigned long long resets;     /* fork() resets */
-};
-int perfd_apool_stats(perfd_apool *pool, struct perfd_apool_stats *st);
 
 #endif /* PERFD_H */

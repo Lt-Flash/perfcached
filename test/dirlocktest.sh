@@ -55,7 +55,6 @@ conf a 17830 17831 "$D/state" "$D/wal"
 conf b 17832 17833 "$D/state" "$D/wal"
 conf c 17834 17835 "$D/state2" "$D/wal"
 
-: > "$D/a.log"
 "$BIN" -f "$D/a.conf" > "$D/a.log" 2>&1 & P1=$!
 ready "$D/a.log" || { echo "daemon A did not start"; cat "$D/a.log"; exit 1; }
 
@@ -77,7 +76,6 @@ python3 -c 'import json,sys,urllib.request; json.loads(urllib.request.urlopen("h
 	|| bad "the lock file says '$(cat "$D/state/perfcached.lock" 2>/dev/null)', not $P1"
 
 echo "--- 2: its own state_dir, the same [wal] dir"
-: > "$D/c.log"
 "$BIN" -f "$D/c.conf" > "$D/c.log" 2>&1 & P2=$!
 if exited $P2 10; then
 	wait $P2; rc=$?; P2=
@@ -92,7 +90,6 @@ grep -q "wal dir $D/wal is in use by another perfcached (pid $P1)" "$D/c.log" \
 
 echo "--- 3: kill -9 the holder, start again on the same directories"
 kill -9 $P1; wait $P1 2>/dev/null; P1=
-: > "$D/b2.log"
 "$BIN" -f "$D/b.conf" > "$D/b2.log" 2>&1 & P2=$!
 ready "$D/b2.log" && ok "the next daemon starts - nothing stale to clear" \
 	|| { bad "the next daemon did not start"; tail -3 "$D/b2.log"; }

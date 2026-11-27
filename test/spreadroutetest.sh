@@ -47,7 +47,6 @@ buckets_log2 = 12
 EOF
 }
 start() { # start <n> <var>
-	: > "$D/node.$1.log"
 	"$BIN" -f "$D/node.$1.conf" > "$D/node.$1.log" 2>&1 &
 	eval "P$2=\$!"
 	i=0

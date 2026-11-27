@@ -83,12 +83,10 @@ struct dent {
 /* the relayed problems this node mailed: a clear threads under its
  * problem's mail and says how long it lasted */
 #define RMEM 64
-/* a raise whose clear never came (the origin gone for good) is forgotten after a week */
-#define RMEM_MAX_AGE_MS (7LL * 86400 * 1000)
 struct rmem {
 	int node, level, used;
 	char key[48];
-	long long started, mailed, seen;   /* wall ms; seen: its last relay */
+	long long started, mailed;
 	char worst[PC_ALERT_TEXT];
 	char msgid[160];
 };
@@ -140,7 +138,6 @@ static struct {
 	long long nmr_said;                /* "no mailer reachable" last logged */
 	unsigned long nmr_quiet;           /* and since then, unlogged */
 	int fleet_seen;                    /* the most members listed */
-	unsigned int forget_seen;          /* pc_cluster_forget_gen() last read */
 	struct pc_member *mem;             /* pc_cluster_members' scratch */
 	unsigned long long tomb_gaps;      /* cluster.peer_absent said */
 	long long link_dropped;            /* since host.link went critical */
@@ -1026,7 +1023,7 @@ static void digest_own(const struct akey *k, int cleared)
 static void digest_relay(const struct pc_alert_relay *r, int lvl)
 {
 	struct dent e;
-	int i, slot = -1, freeslot = -1, oldest = 0;
+	int i, slot = -1, freeslot = -1;
 	long long now = wall_ms();
 
 	memset(&e, 0, sizeof e);
@@ -1044,17 +1041,7 @@ static void digest_relay(const struct pc_alert_relay *r, int lvl)
 			slot = i;
 		else if (!A.rm[i].used && freeslot < 0)
 			freeslot = i;
-		if (A.rm[i].used && A.rm[i].seen < A.rm[oldest].seen)
-			oldest = i;
-		if (A.rm[i].used && now - A.rm[i].seen > RMEM_MAX_AGE_MS &&
-		    i != slot) {
-			A.rm[i].used = 0;              /* its clear never came */
-			if (freeslot < 0)
-				freeslot = i;
-		}
 	}
-	if (!r->cleared && !e.event && slot < 0 && freeslot < 0)
-		freeslot = oldest;                 /* full: the least recently heard goes */
 	if (!r->cleared && !e.event) {
 		if (slot < 0 && freeslot >= 0) {
 			slot = freeslot;
@@ -1066,7 +1053,6 @@ static void digest_relay(const struct pc_alert_relay *r, int lvl)
 			A.rm[slot].level = -1;
 		}
 		if (slot >= 0) {
-			A.rm[slot].seen = now;
 			if (lvl > A.rm[slot].level) {
 				A.rm[slot].level = lvl;
 				snprintf(A.rm[slot].worst, sizeof A.rm[slot].worst, "%s",
@@ -1788,14 +1774,7 @@ static void check_link(const struct hl_obs *o)
 	if (o->moved)
 		LM_NOTICE("link: now %s, %d Mb/s\n", HL.path, HL.speed_mbps);
 	if ((pct = hl_pct()) < 0) {
-		struct akey *k;
-
-		/* an unknown speed judges nothing: a raised alert clears */
-		cond("host.link", 0, 0, 0, S(60), "");
-		k = key_find("host.link", 0);
 		__atomic_store_n(&link_pct_pub, -1, __ATOMIC_RELAXED);
-		__atomic_store_n(&link_lvl_pub, k && k->active ? (k->level >=
-			PC_AL_CRITICAL ? 2 : 1) : 0, __ATOMIC_RELAXED);
 		return;
 	}
 	lv = hw_level("host.link", pct, A.al.link_warn, A.al.link_crit);
@@ -1971,23 +1950,20 @@ static void link_tree(struct pc_tw *out)
 	pc_tw_end(out);
 }
 
-/* why an upstream of a read-through collection is not used now; the role
- * reasons only under upstream_role = replica (@rr) */
-static const char *up_why(const struct pc_up_srv_health *s, int rr)
+/* why an upstream of a read-through collection is not used now */
+static const char *up_why(const struct pc_up_srv_health *s)
 {
 	if (s->state != PC_UPS_OFF)
 		return s->conns_up ? NULL : "unreachable";
-	if (s->failing)
-		return "unreachable";
 	if (s->perfcached)
 		return "a perfcached: daisy-chaining off (upstream_allow_perfcached)";
-	if (rr && s->role == 1)
+	if (s->role == 1)
 		return "a master - not used (upstream_role = replica)";
 	if (s->role == 2 && s->link_down)
 		return "a replica cut off from its master - skipped";
 	if (s->role == 2)
 		return "a replica lagging past upstream_max_lag_ms - skipped";
-	if (rr && (s->conns_up || s->role == 3))
+	if (s->conns_up || s->role == 3)
 		return "not a replica (ROLE) - not used (upstream_role = replica)";
 	return "unreachable";
 }
@@ -2085,7 +2061,7 @@ static void check_upstreams(void)
 		}
 		if (h.nsrv <= 1) {
 			/* one upstream: its reason said */
-			why = up_why(&h.srv[0], h.role_replica);
+			why = up_why(&h.srv[0]);
 			down = h.conns_up == 0 || h.srv[0].state == PC_UPS_OFF;
 			trk = h.tracking_wanted && !h.tracking_on;
 			snprintf(key, sizeof key, "upstream.%s", h.col);
@@ -2112,9 +2088,8 @@ static void check_upstreams(void)
 			/* a master under upstream_role = replica is skipped by design (listed to follow
 			 * failover); no alert - .master below covers it serving as the fallback */
 			by_design = (u->state == PC_UPS_OFF && u->role == 1 &&
-				h.role_replica && !u->perfcached) ||
-				u->quiet;                             /* a sentinel, gone */
-			why = up_why(u, h.role_replica);
+				!u->perfcached) || u->quiet;          /* a sentinel, gone */
+			why = up_why(u);
 			trk = h.tracking_wanted && !u->tracking_on &&
 				u->state != PC_UPS_OFF;
 			snprintf(key, sizeof key, "upstream.%s.%d", h.col, j + 1);
@@ -2142,7 +2117,7 @@ static void check_upstreams(void)
 			const struct pc_up_srv_health *pp = &h.srv[h.primary],
 				*aa = &h.srv[h.active];
 
-			why = up_why(pp, h.role_replica);
+			why = up_why(pp);
 			snprintf(t, sizeof t, "collection %.20s failed over to "
 				"%.24s:%d - its primary %.24s:%d is %.60s", h.col,
 				aa->host, aa->port, pp->host, pp->port,
@@ -2179,13 +2154,6 @@ static void check_fleet(void)
 	n = pc_cluster_members(A.mem, PC_CL_MAXMEMBERS);
 	if (n < 1 || A.mem[0].node <= 0)
 		return;                            /* no id yet */
-	{
-		/* a member the operator forgot is no longer the fleet's */
-		unsigned int fg = pc_cluster_forget_gen();
-
-		A.fleet_seen -= (int)(fg - A.forget_seen);
-		A.forget_seen = fg;
-	}
 	if (n > A.fleet_seen)
 		A.fleet_seen = n;
 	expect = pc_cluster_expect();
@@ -2223,10 +2191,6 @@ static void check_fleet(void)
 				snprintf(t, sizeof t, "member node %d (%s) left",
 					m->node, ab);
 			}
-			/* its id stays reserved for a week: removed for good, the operator says so */
-			snprintf(t + strlen(t), sizeof t - strlen(t), "; removed for "
-				"good? perfcli -E <enable> forget %d on this node",
-				m->node);
 		} else if (!m->live) {
 			snprintf(t, sizeof t, "member node %d (%s) is silent - "
 				"no heartbeat heard", m->node, ab);
@@ -2487,7 +2451,6 @@ static void relay_in(const struct pc_alert_relay *r)
 	struct aring *e = ring_next();
 	int lvl = r->level >= PC_AL_CRITICAL ? PC_AL_CRITICAL : r->level >=
 		PC_AL_WARNING ? PC_AL_WARNING : PC_AL_INFO;
-	int i, mailed = -1;
 
 	if (snprintf(e->text, sizeof e->text, "node %d (%s): %s", r->node,
 	        r->host, r->text) < 0)
@@ -2499,15 +2462,9 @@ static void relay_in(const struct pc_alert_relay *r)
 	A.relayed_in++;
 	LM_NOTICE("alert %s on node %d (%s), relayed to this node: %s\n",
 		r->cleared ? "cleared" : "raised", r->node, r->host, r->text);
-	for (i = 0; i < RMEM; i++)
-		if (A.rm[i].used && A.rm[i].node == r->node && !strcmp(A.rm[i].key, r->key))
-			mailed = i;
 	if (!pc_mail_ready()) {
-		if (r->cleared && mailed >= 0)
-			A.rm[mailed].used = 0;     /* its problem is over, mailed or not */
 		snprintf(e->mail, sizeof e->mail, "no mailer");
-	} else if (lvl < A.mail_level && !(r->cleared && mailed >= 0)) {
-		/* a clear carries its last level: one whose raise was mailed is mailed whatever it is */
+	} else if (lvl < A.mail_level) {
 		snprintf(e->mail, sizeof e->mail, "below level");
 	} else {
 		digest_relay(r, lvl);

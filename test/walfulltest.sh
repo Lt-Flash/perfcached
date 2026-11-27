@@ -109,7 +109,7 @@ kill $P 2>/dev/null; wait $P 2>/dev/null; P=
 # 3. /stats answers while the writers are held
 rm -rf "$D/wal"; mkdir -p "$D/wal"; : > "$D/n.log"; : > "$D/ctl"; : > "$D/shim.log"; NREADY=1
 mkcfg wait "ring_kb = 64"
-start PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" || exit 1
+start PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD" || exit 1
 echo walslow > "$D/ctl"
 "$PB" -h 127.0.0.1 -p "$PORT" -P perf -C c -F -n 4000 -v 4096 -c 4 -d 32 >/dev/null 2>&1 &
 PBP=$!

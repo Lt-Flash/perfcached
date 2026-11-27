@@ -49,9 +49,6 @@ int pc_respmap_overrides(void);
 
 /* write <state_dir>/respmap whole and fsync it; 0 or -1 */
 int pc_respmap_persist(void);
-/* the same off the caller's thread: pc-maint writes it on its next tick */
-void pc_respmap_persist_later(void);
-void pc_respmap_persist_tick(void);
 
 /* -C: how many overrides <state_dir>/respmap holds, without loading it;
  * 0 when there is no file, -1 when it is not one of ours */

@@ -69,7 +69,6 @@ struct shared {
 	unsigned long long records, bytes, batches;
 	unsigned long long stored, older, existing, expired, refused, bad, rerouted;
 	int failed;
-	int lost;                      /* chunks not marked done: records refused, bad or unread */
 };
 
 /* one appended request, kept until its reply is read: misrouted records are cut out of it
@@ -101,7 +100,6 @@ struct job {
 	const char *col;               /* target collection of the file in progress */
 	unsigned long long records, bytes, paced, t0;
 	int failed;
-	int lost;                      /* the chunk in progress lost records */
 };
 
 /* ---- crc32 (IEEE), the same table perfdump writes with ---------------- */
@@ -193,9 +191,8 @@ static int manifest_read(struct shared *sh)
 		fprintf(stderr, "perfload: no manifest in %s\n", sh->o->dir);
 		return -1;
 	}
-	/* sized from the text, as perfdump --inspect reads it: a fixed count capped the files */
-	toks = malloc(((size_t)n / 2 + 8) * sizeof *toks);
-	ntok = toks ? pc_json_parse(buf, (size_t)n, toks, (int)(n / 2 + 8)) : -1;
+	toks = malloc((size_t)MAXTOK * sizeof *toks);
+	ntok = toks ? pc_json_parse(buf, (size_t)n, toks, MAXTOK) : -1;
 	if (ntok < 0) {
 		fprintf(stderr, "perfload: manifest unparsable\n");
 		free(buf);
@@ -213,11 +210,6 @@ static int manifest_read(struct shared *sh)
 		free(toks);
 		return -1;
 	}
-	i = pc_json_get(buf, toks, ntok, 0, "node_state");
-	if (i >= 0 && !pc_json_streq(buf, &toks[i], "ready"))
-		fprintf(stderr, "perfload: %s was dumped from a node in state %.*s (perfdump --force) - "
-			"it may hold only part of the data\n", sh->o->dir, toks[i].end - toks[i].start,
-			buf + toks[i].start);
 	sh->files = calloc((size_t)cap, sizeof *sh->files);
 	tf = pc_json_get(buf, toks, ntok, 0, "files");
 	for (i = tf + 1; tf >= 0 && i < ntok; i++) {
@@ -266,11 +258,10 @@ static int manifest_read(struct shared *sh)
 }
 
 /* DIR/perfload.done, one line per chunk whose last batch was acknowledged: "<file> <records>
- * <target> <policy>" (policy `set` under --via-set); under policy `newer` a re-run stores
- * nothing, so a resume is safe */
+ * <target> <policy>"; under policy `newer` a re-run stores nothing, so a resume is safe */
 static void done_read(struct shared *sh)
 {
-	char path[512], line[512], target[300];
+	char path[512], line[512];
 	FILE *f;
 
 	snprintf(path, sizeof path, "%s/perfload.done", sh->o->dir);
@@ -281,15 +272,11 @@ static void done_read(struct shared *sh)
 	f = fopen(path, "r");
 	if (!f)
 		return;
-	snprintf(target, sizeof target, "%s:%d", sh->o->host, sh->o->port);
 	while (fgets(line, sizeof line, f)) {
-		char name[256], to[300], pol[32];
-		unsigned long long recs;
+		char name[256];
 		int i;
 
-		/* another target's load, or the other mode's, is not this run's */
-		if (sscanf(line, "%255s %llu %299s %31s", name, &recs, to, pol) != 4 ||
-		    strcmp(to, target) || !strcmp(pol, "set") != !!sh->o->via_set)
+		if (sscanf(line, "%255s", name) != 1)
 			continue;
 		for (i = 0; i < sh->nfiles; i++)
 			if (!strcmp(sh->files[i].name, name) && !sh->files[i].done) {
@@ -311,7 +298,7 @@ static void done_mark(struct shared *sh, struct file *f)
 	}
 	if (sh->donef) {
 		fprintf(sh->donef, "%s %llu %s:%d %s\n", f->name, f->records,
-			sh->o->host, sh->o->port, sh->o->via_set ? "set" : sh->o->policy);
+			sh->o->host, sh->o->port, sh->o->policy);
 		fflush(sh->donef);
 		fsync(fileno(sh->donef));
 	}
@@ -688,72 +675,6 @@ static long long tv_num(const struct pc_tv *v, int map, const char *key)
 	return pc_tv_get_int(v, map, key, &n) == 0 ? n : 0;
 }
 
-/* one restore reply: what it names misrouted is re-sent, the rest added up */
-static void drain_reply(struct job *j, struct sent *s, const unsigned char *res, size_t rn)
-{
-	struct shared *sh = j->sh;
-	struct pc_tv v;
-	int tm, resent = 0;
-	unsigned long long refused;
-
-	memset(&v, 0, sizeof v);
-	if (!res)
-		return;
-	if (!s->tree) {                /* a set's reply */
-		pthread_mutex_lock(&sh->mx);
-		sh->stored++;
-		pthread_mutex_unlock(&sh->mx);
-		return;
-	}
-	if (pc_tv_parse(&v, res, rn) != 0 || v.n[0].type != 'm') {
-		fprintf(stderr, "perfload: a restore reply did not parse - its records count as lost\n");
-		j->lost = 1;
-		goto next;
-	}
-	refused = (unsigned long long)tv_num(&v, 0, "refused");
-	tm = pc_tv_get(&v, 0, "misrouted");
-	if (tm >= 0 && v.n[tm].type == 'a' && !s->rerouted) {
-		unsigned int i;
-
-		/* [index, node] pairs: the record at index goes to the
-		 * handle of the node named, as it was encoded */
-		for (i = 0; i < v.n[tm].len; i++) {
-			int pair = pc_tv_at(&v, tm, i), t1, t2, midx;
-			long long idx, node;
-
-			if (pair < 0 || v.n[pair].type != 'a' || v.n[pair].len < 2)
-				continue;
-			t1 = pc_tv_at(&v, pair, 0);
-			t2 = pc_tv_at(&v, pair, 1);
-			if (t1 < 0 || t2 < 0 || v.n[t1].type != 'i' ||
-			    v.n[t2].type != 'i')
-				continue;
-			idx = v.n[t1].i;
-			node = v.n[t2].i;
-			midx = handle_by_node(sh, (int)node);
-			if (midx < 0 || midx >= j->nh || idx < 0 || idx >= s->nrec)
-				continue;
-			batch_add(j, &j->hs[midx], s->tree + s->roff[idx],
-				s->rlen[idx], NULL, 0, NULL, 0, 0, 0, 0, 1);
-			resent++;
-		}
-	}
-	pthread_mutex_lock(&sh->mx);
-	sh->batches++;
-	sh->stored += (unsigned long long)tv_num(&v, 0, "stored");
-	sh->older += (unsigned long long)tv_num(&v, 0, "older");
-	sh->existing += (unsigned long long)tv_num(&v, 0, "existing");
-	sh->expired += (unsigned long long)tv_num(&v, 0, "expired");
-	sh->bad += (unsigned long long)tv_num(&v, 0, "bad");
-	sh->refused += refused - (unsigned long long)resent;
-	sh->rerouted += (unsigned long long)resent;
-	pthread_mutex_unlock(&sh->mx);
-	if (refused > (unsigned long long)resent || tv_num(&v, 0, "bad") > 0)
-		j->lost = 1;
-next:
-	pc_tv_free(&v);
-}
-
 /* read @h's outstanding replies and tally them; the daemon never forwards a restore (no version
  * in the forward frame), so a misrouted record comes back named and is re-sent to that node */
 static void drain(struct job *j, struct handle *h)
@@ -784,28 +705,67 @@ static void drain(struct job *j, struct handle *h)
 		}
 	}
 	for (k = 0; k < n; k++) {
-		drain_reply(j, &sent[k], res[k], rn[k]);
+		struct pc_tv v;
+		int tm, resent = 0;
+		unsigned long long refused;
+
+		memset(&v, 0, sizeof v);
+		if (!res[k])
+			goto next;
+		if (!sent[k].tree) {           /* a set's reply */
+			pthread_mutex_lock(&sh->mx);
+			sh->stored++;
+			pthread_mutex_unlock(&sh->mx);
+			goto next;
+		}
+		if (pc_tv_parse(&v, res[k], rn[k]) != 0 || v.n[0].type != 'm')
+			goto next;
+		refused = (unsigned long long)tv_num(&v, 0, "refused");
+		tm = pc_tv_get(&v, 0, "misrouted");
+		if (tm >= 0 && v.n[tm].type == 'a' && !sent[k].rerouted) {
+			unsigned int i;
+
+			/* [index, node] pairs: the record at index goes to the
+			 * handle of the node named, as it was encoded */
+			for (i = 0; i < v.n[tm].len; i++) {
+				int pair = pc_tv_at(&v, tm, i), t1, t2, midx;
+				long long idx, node;
+
+				if (pair < 0 || v.n[pair].type != 'a' || v.n[pair].len < 2)
+					continue;
+				t1 = pc_tv_at(&v, pair, 0);
+				t2 = pc_tv_at(&v, pair, 1);
+				if (t1 < 0 || t2 < 0 || v.n[t1].type != 'i' ||
+				    v.n[t2].type != 'i')
+					continue;
+				idx = v.n[t1].i;
+				node = v.n[t2].i;
+				midx = handle_by_node(sh, (int)node);
+				if (midx < 0 || midx >= j->nh || idx < 0 || idx >= sent[k].nrec)
+					continue;
+				batch_add(j, &j->hs[midx], sent[k].tree + sent[k].roff[idx],
+					sent[k].rlen[idx], NULL, 0, NULL, 0, 0, 0, 0, 1);
+				resent++;
+			}
+		}
+		pthread_mutex_lock(&sh->mx);
+		sh->batches++;
+		sh->stored += (unsigned long long)tv_num(&v, 0, "stored");
+		sh->older += (unsigned long long)tv_num(&v, 0, "older");
+		sh->existing += (unsigned long long)tv_num(&v, 0, "existing");
+		sh->expired += (unsigned long long)tv_num(&v, 0, "expired");
+		sh->bad += (unsigned long long)tv_num(&v, 0, "bad");
+		sh->refused += refused - (unsigned long long)resent;
+		sh->rerouted += (unsigned long long)resent;
+		pthread_mutex_unlock(&sh->mx);
+next:
+		pc_tv_free(&v);
 		free(res[k]);
 		sent_free(&sent[k]);
 	}
 	free(res);
 	free(rn);
 	free(sent);
-}
-
-/* a chunk read to its end: marked done unless its run failed or records were lost - the next
- * run loads it again */
-static void chunk_end(struct job *j, struct file *f)
-{
-	if (j->lost) {
-		pthread_mutex_lock(&j->sh->mx);
-		j->sh->lost++;
-		pthread_mutex_unlock(&j->sh->mx);
-		j->lost = 0;
-		return;
-	}
-	if (!j->failed && !j->sh->o->dry)
-		done_mark(j->sh, f);
 }
 
 static void drain_all(struct job *j)
@@ -942,7 +902,8 @@ static void *loader(void *arg)
 		}
 		if (!o->dry)
 			drain_all(j);
-		chunk_end(j, f);
+		if (!j->failed && !o->dry)
+			done_mark(sh, f);
 	}
 	for (i = 0; i < j->nh; i++) {
 		int k;
@@ -1091,26 +1052,6 @@ static void settle(struct shared *sh, char cols[][64], int ncols)
 			perfd_free(ps[i]);
 }
 
-/* one pass: @fn on @n (at most 64) threads, one per job; a thread that cannot be started fails
- * its job, the others are joined */
-static void run_pass(pthread_t *th, struct job *jobs, int n, void *(*fn)(void *))
-{
-	char started[64];
-	int i, rc;
-
-	for (i = 0; i < n && i < 64; i++) {
-		rc = pthread_create(&th[i], NULL, fn, &jobs[i]);
-		started[i] = rc == 0;
-		if (rc != 0) {
-			fprintf(stderr, "perfload: cannot start thread %d: %s\n", i, strerror(rc));
-			jobs[i].failed = 1;
-		}
-	}
-	for (i = 0; i < n && i < 64; i++)
-		if (started[i])
-			pthread_join(th[i], NULL);
-}
-
 static void usage(FILE *f)
 {
 	fprintf(f, "perfload " VERSION " - load a perfdump file set into a perfcached node or fleet\n"
@@ -1246,8 +1187,10 @@ int main(int argc, char **argv)
 	}
 	if (o.verify) {
 		sh.next = 0;
-		run_pass(th, jobs, o.threads, verifier);
+		for (i = 0; i < o.threads; i++)
+			pthread_create(&th[i], NULL, verifier, &jobs[i]);
 		for (i = 0; i < o.threads; i++) {
+			pthread_join(th[i], NULL);
 			failed |= jobs[i].failed;
 			jobs[i].failed = 0;
 		}
@@ -1258,8 +1201,10 @@ int main(int argc, char **argv)
 	}
 	sh.next = 0;
 	t0 = now_ms();
-	run_pass(th, jobs, o.threads, loader);
+	for (i = 0; i < o.threads; i++)
+		pthread_create(&th[i], NULL, loader, &jobs[i]);
 	for (i = 0; i < o.threads; i++) {
+		pthread_join(th[i], NULL);
 		failed |= jobs[i].failed;
 		records += jobs[i].records;
 		bytes += jobs[i].bytes;
@@ -1278,14 +1223,13 @@ int main(int argc, char **argv)
 			sh.skipped ? " - some chunks already loaded (resume)" : "");
 	} else {
 		printf("perfload: %llu records, %.1f MB, %d chunk(s), %d collection(s), %.2f s, %.0f records/s; "
-			"stored %llu, older %llu, existing %llu, expired %llu, refused %llu, bad %llu, rerouted %llu%s%s%s\n",
+			"stored %llu, older %llu, existing %llu, expired %llu, refused %llu, bad %llu, rerouted %llu%s%s\n",
 			records, (double)bytes / 1048576.0, sh.nfiles - sh.skipped, nloaded,
 			(double)(t1 - t0) / 1000.0,
 			t1 > t0 ? (double)records * 1000.0 / (double)(t1 - t0) : 0.0,
 			sh.stored, sh.older, sh.existing, sh.expired, sh.refused, sh.bad, sh.rerouted,
 			sh.skipped ? " (resumed: some chunks were already loaded)" : "",
-			failed ? " - INCOMPLETE, a connection failed" : "",
-			sh.lost ? " - INCOMPLETE, records refused or unreadable: those chunks are not marked done" : "");
+			failed ? " - INCOMPLETE, a connection failed" : "");
 		if (o.settle && sh.nmem > 1 && !failed)
 			settle(&sh, loaded, nloaded);
 	}
@@ -1295,5 +1239,5 @@ int main(int argc, char **argv)
 	free(th);
 	free(sh.files);
 	pthread_mutex_destroy(&sh.mx);
-	return failed || sh.lost ? 1 : 0;
+	return failed ? 1 : 0;
 }

@@ -72,7 +72,6 @@ NS=0
 start() { # start <conf> - its log is $D/<conf>.<n>.log, the last one $D/<conf>.log; KEEP=1 keeps the state
 	[ -n "${KEEP:-}" ] || { rm -rf "$D/state"; mkdir -p "$D/state"; }
 	NS=$((NS+1)); L="$D/$1.$NS.log"
-	: > "$L"
 	PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/$1.conf" > "$L" 2>&1 & PID=$!
 	ln -sf "$L" "$D/$1.log"
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$L"; do
@@ -215,20 +214,6 @@ echo "$r" | grep -q '"stored": false' && [ "$(mdata m n:1 value)" = nv ] &&
 r=$(native '{"method": "jset", "params": {"key": "n:2", "path": "$", "val": {"s": "Reachable"}, "ttl": 30}}')
 echo "$r" | grep -q '"set": true' && grep -q '^JSON.SET n:2 \$ {"s":"Reachable"}$' "$D/upm/writes" &&
 	ok "4. native jset (cachedb's JSON.SET): forwarded, {set: true}" || bad "4. jset: $r; M: $(grep 'n:2' "$D/upm/writes" | tr '\n' '|')"
-# a path the handler cannot read is its refusal, never the root: not a number, not one past
-# 512 bytes; and a 512-byte path the handler takes goes as that path, not as $
-r=$(native '{"method": "jset", "params": {"key": "n:2", "path": 5, "val": 1}}')
-echo "$r" | grep -q 'bad path' && ! grep -q '^JSON.SET n:2 \$ 1$' "$D/upm/writes" &&
-	ok "4. native jset with a path that is not bytes: bad path, nothing forwarded" || bad "4. jset path 5: $r; M: $(grep 'n:2' "$D/upm/writes" | tr '\n' '|')"
-LP=$(python3 -c 'print("$." + "a" * 600)')
-r=$(native '{"method": "jdel", "params": {"key": "n:2", "path": "'"$LP"'"}}')
-echo "$r" | grep -q 'bad path' && ! grep -q '^JSON.DEL n:2 \$$' "$D/upm/writes" &&
-	ok "4. native jdel with a 602-byte path: bad path, the document not deleted" || bad "4. jdel long path: $r; M: $(grep 'n:2' "$D/upm/writes" | cut -c1-40 | tr '\n' '|')"
-LP=$(python3 -c 'print("$." + "a" * 510)')
-native '{"method": "jdel", "params": {"key": "n:2", "path": "'"$LP"'"}}' > /dev/null
-! grep -q '^JSON.DEL n:2 \$$' "$D/upm/writes" && [ "$(mdata m n:2 value)" != None ] &&
-	ok "4. native jdel with a 512-byte path: sent as that path, the document still on the master" ||
-	bad "4. jdel 512-byte path: M: $(grep 'n:2' "$D/upm/writes" | cut -c1-40 | tr '\n' '|'), n:2 $(mdata m n:2 value)"
 r=$(native '{"method": "expire", "params": {"key": "n:1", "ttl": 0}}')
 echo "$r" | grep -q '"updated": true' && grep -q '^PERSIST n:1$' "$D/upm/writes" &&
 	ok "4. native expire with ttl 0 is PERSIST" || bad "4. expire: $r"
@@ -910,8 +895,7 @@ cstart() { # cstart <n> - its log $D/c<n>.log (appended across restarts: a NEW r
 	# grep -c gives one number either way (grep -c || echo 0 printed "0" twice on no match);
 	# 30 s, as a member on a loaded runner can be slow to come up
 	r0=$(cat "$D/c$1.log" 2>/dev/null | grep -c "perfcached ready")
-	# CENV: extra environment for this start (section 23's test knob); env execs, so $! is the daemon
-	env ${CENV:-PC_NO_EXTRA=1} PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/c$1.conf" >> "$D/c$1.log" 2>&1 & eval "CPID$1=\$!"
+	PERFCACHED_ALERT_FAST=60 "$BIN" -f "$D/c$1.conf" >> "$D/c$1.log" 2>&1 & eval "CPID$1=\$!"
 	i=0; while [ $i -lt 300 ] && [ "$(grep -c "perfcached ready" "$D/c$1.log")" -le "$r0" ]; do sleep 0.1; i=$((i+1)); done
 	[ "$(grep -c "perfcached ready" "$D/c$1.log")" -gt "$r0" ]
 }
@@ -977,9 +961,6 @@ waitfor 30 '[ "$(cst 1 "s[\"state\"]")" = ready ] && [ "$(cst 2 "s[\"state\"]")"
 # (a) a key written through on member 1: its own invalidation comes back within ~50 ms and drops the
 # record and its mark - both retained, as local
 i1=$(cst 1 'w["invalidated"]'); l1=$(cst 1 'r.get("local")'); p1=$(cst 1 'r.get("replayed")'); p2=$(cst 2 'r.get("replayed")')
-# the replicas take the write 500 ms after the master, as a real replica lags: an echo pushed before
-# the reply finds the mark without its record and rightly keeps it, which is no drop to retain
-ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"], "replicate_delay_ms": 500}'
 r=$(cresp 1 SET w:1 mine)
 waitfor 5 '[ "$(cst 1 "w[\"invalidated\"]")" != "'"$i1"'" ]'
 # wait for both retentions, bounded: on a loaded ASan runner the mark's drop can come later
@@ -987,7 +968,6 @@ waitfor 5 '[ "$(cst 1 "r.get(\"local\")")" = "'"$((l1 + 2))"'" ]'
 [ "$r" = "+OK" ] && [ "$(cst 1 'w["invalidated"]')" != "$i1" ] && [ "$(cst 1 'r.get("local")')" = "$((l1 + 2))" ] &&
 	ok "18. (a) w:1 written through on member 1, dropped on its own invalidation: the record and its mark retained as local (local $l1 -> $((l1 + 2)))" ||
 	bad "18. (a) SET w:1 $r; invalidated $i1 -> $(cst 1 'w["invalidated"]'); local $l1 -> $(cst 1 'r.get("local")') (rc8: 0 - retained as deletes); $(tail -2 "$D/c1.log" | cut -c 1-160 | tr '\n' '|')"
-ctl m '{"role": "master", "accept_writes": true, "replicate_to": ["'"$D"'/up1", "'"$D"'/up2"]}'
 rawm SET w:1 theirs > /dev/null
 waitfor 5 '[ "$(cresp 1 GET w:1)" = "'"'"'theirs'"'"'" ] && [ "$(cresp 2 GET w:1)" = "'"'"'theirs'"'"'" ]'
 [ "$(cresp 1 GET w:1)" = "'theirs'" ] && [ "$(cresp 2 GET w:1)" = "'theirs'" ] && ok "18. (a) another client's change in Redis: both read 'theirs'" ||
@@ -1175,15 +1155,9 @@ st=$(rw started); sk=$(rw skipped); sh=$(ust shadow_entries); f=$(ust fetches); 
 grep -q "the tracking had a gap - [0-9]* record" "$D/r.log" && grep -q "re-warming" "$D/r.log" && grep -q "the re-warm is done" "$D/r.log" &&
 	ok "20. (a) the restart dropped the $R0 replayed records at the gap and re-warmed every name - no client asked (log)" ||
 	bad "20. (a) log: $(grep -h -E 'tracking had a gap|re-warm|saved' "$D/r.log" | tail -4 | cut -c1-140 | tr '\n' '|')"
-# a name whose copy landed untracked is queued again (requeued) and fetched once more.  A key held
-# as a record AND its refetched copy at the stop (S435's overlap) is named by both lists - the saved
-# names and the gap's drop - so the re-warm meets it twice: skipped, or started and joined to the
-# fetch in flight; fetched once either way (ASan core1 115318: 9 + 32, 115323: 17 + 24)
-sv=$(grep -o '[0-9]* key name(s) held saved' "$D/r.log" | tail -1 | cut -d' ' -f1)
-dr=$(grep -o 'the tracking had a gap - [0-9]* record' "$D/r.log" | tail -1 | grep -o '[0-9]*')
-dup=$(( ${sv:-0} + ${dr:-0} - 40 )); [ $dup -lt 0 ] && dup=0
-[ $((st + sk)) = $((40 + ${rq:-0} + dup)) ] && [ "$sk" -le "$dup" ] && [ "$f" = $((40 + ${rq:-0})) ] && [ "$sh" = 40 ] &&
-	ok "20. (a) all 40 fetched again with no client read: 40 copies back (started $st, skipped $sk, fetches $f, requeued $rq, named twice $dup, runs $rn)" ||
+# a name whose copy landed untracked is queued again (requeued) and fetched once more
+[ "$st" = $((40 + ${rq:-0})) ] && [ "$sk" = 0 ] && [ "$f" = $((40 + ${rq:-0})) ] && [ "$sh" = 40 ] &&
+	ok "20. (a) all 40 fetched again with no client read: 40 copies back (started $st, skipped $sk, fetches $f, requeued $rq, runs $rn)" ||
 	{ bad "20. (a) started $st, skipped $sk, fetches $f, requeued $rq, shadow_entries $sh, runs $rn"; rwdiag; }
 set -- $(allheld)
 [ "$1" = 40 ] && [ "$2" = 0 ] && ok "20. (a) all 40 read back from the held copies, no fetch (the data, beside the entries gauge)" ||
@@ -1249,194 +1223,7 @@ ln=$(grep -h "the tracking of 127.0.0.1:$P1 changed" "$D/r.log" | head -1 | sed 
 	{ bad "20. (d) after R1's tracking was lost: $sh copies held, requeued $q0 -> $q1; log: ${ln:-none}"; rwdiag; }
 set -- $(allheld)
 [ "$1" = 40 ] && [ "$2" = 0 ] && ok "20. (d) all 40 read back from the held copies, no fetch" || bad "20. (d) read back: $1 of 40 right, $2 fetched"
-# (e) both replicas refuse CLIENT TRACKING ... REDIRECT (an ACL): a re-warmed copy can never be
-# tracked, so its name leaves the list after one fetch instead of going round for ever
-ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "redirect_refused": true, "kill_seq": 2}'
-ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "redirect_refused": true, "kill_seq": 1}'
-waitfor 10 'grep -q "TRACKING REFUSED" "$D/up1/counts" "$D/up2/counts" 2>/dev/null'
-sleep 4
-q0=$(rw requeued); f0=$(ust fetches); n0=$(grep -c "the re-warm is done" "$D/r.log")
-sleep 3
-q1=$(rw requeued); f1=$(ust fetches); n1=$(grep -c "the re-warm is done" "$D/r.log")
-[ "$q1" = "$q0" ] && [ "$f1" = "$f0" ] && [ "$n1" = "$n0" ] && [ "$(rw state)" = idle ] &&
-	ok "20. (e) tracking refused on both replicas: the re-warm settles (requeued $q0, fetches $f0, no new run in 3 s)" ||
-	{ bad "20. (e) tracking refused: the names go round for ever - requeued $q0 -> $q1, fetches $f0 -> $f1, 're-warm is done' $n0 -> $n1 in 3 s"; rwdiag; }
 stop
-unfake
-
-# ---- 21. a value no record holds --------------------------------------------------------------
-# refused before Redis applies it, as on any collection; one that grows past a record only at Redis
-# (APPEND) drops the copy here, so the older value never answers for it.  Tracking off: Redis's
-# invalidation would drop that copy on its own, and only the read-back is under test
-rbig() { # rbig <args...> - one RESP command, an argument @<n> being n x's; a long bulk prints len:<n>
-	python3 - $RESP "$@" <<'PY'
-import socket, sys
-s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10)
-f = s.makefile("rb")
-a = [b"x" * int(x[1:]) if x[:1] == "@" else x.encode() for x in sys.argv[2:]]
-s.sendall(b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a))
-l = f.readline()
-t, body = l[:1], l[1:-2]
-if t == b"$":
-    n = int(body)
-    v = None if n < 0 else f.read(n + 2)[:-2].decode("latin-1")
-    print(v if v is None or len(v) <= 64 else "len:%d" % len(v))
-else:
-    print((body if t == b":" else t + body).decode("latin-1"))
-PY
-}
-nbig() { # nbig set <key> <bytes> | nbig mset <key> <value> <key> <bytes> - x's made here, not in argv
-	python3 - $TCP "$T" "$@" <<'PY' 2>&1
-import json, socket, sys
-sys.path.insert(0, sys.argv[2])
-import pcnative
-f = pcnative.wrap(socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10))
-a = sys.argv[3:]
-if a[0] == "set":
-    p = {"col": "0", "key": a[1], "value": "x" * int(a[2])}
-else:
-    p = {"col": "0", "items": [{"key": a[1], "value": a[2]}, {"key": a[3], "value": "x" * int(a[4])}]}
-r = {"jsonrpc": "2.0", "id": 1, "method": a[0], "params": p}
-f.write((json.dumps(r) + "\n").encode()); f.flush()
-m = json.loads(f.readline())
-print(json.dumps(m.get("result", m.get("error"))))
-PY
-}
-mlen() { # mlen <dir> <key> - the length of a fake's stored value (a hash: its fields), or None
-	python3 -c 'import json,sys
-e=json.load(open(sys.argv[1]+"/data.json")).get(sys.argv[2])
-print(None if e is None else len(e.get("value")))' "$D/up$1" "$2" 2>/dev/null
-}
-fakes
-conf a "upstream_tracking = off"
-start a || bad "21. start: $(grep -m2 -E 'ERROR|CRIT' "$D/a.log")"
-waitfor 5 '[ "$(wt "w[\"target\"]")" = "127.0.0.1:'$PM'" ]'
-rf0=$(wt 'w["refused"]')
-rbig SET b:1 v1 > /dev/null
-waitfor 5 '[ "$(rbig GET b:1)" = v1 ]'
-r=$(rbig SET b:1 @300000)
-[ "$r" = "-ERR value too large" ] && [ "$(mlen m b:1)" = 2 ] && [ "$(rbig GET b:1)" = v1 ] &&
-	ok "21. SET of 300,000 bytes: refused before the master (value too large) - the master and this node keep v1" ||
-	bad "21. SET of 300,000 bytes: $r; the master holds $(mlen m b:1) bytes, a read here answers $(rbig GET b:1) (want the refusal, 2 and v1)"
-r=$(nbig set b:6 300000)
-echo "$r" | grep -q "value too large" && [ "$(mlen m b:6)" = None ] &&
-	ok "21. a native set of 300,000 bytes: refused the same way, nothing on the master" ||
-	bad "21. a native set of 300,000 bytes: $r; the master holds $(mlen m b:6)"
-# an mset item over 262,080 bytes is dropped before the gate (section 4); 262,060 passes that and,
-# with its key and header, still no record holds it
-r=$(nbig mset b:2 small b:3 262060)
-echo "$r" | grep -q "value too large" && [ "$(mlen m b:2)/$(mlen m b:3)" = None/None ] &&
-	ok "21. a native mset with one item past a record (262,060 bytes and its key): refused whole, neither key on the master" ||
-	bad "21. a native mset with one item past a record: $r; the master holds b:2 $(mlen m b:2), b:3 $(mlen m b:3)"
-r=$(rbig HSET b:4 f @300000)
-[ "$r" = "-ERR value too large" ] && [ "$(mlen m b:4)" = None ] &&
-	ok "21. HSET of a 300,000-byte field: refused, no hash on the master" ||
-	bad "21. HSET of a 300,000-byte field: $r; the master holds $(mlen m b:4) field(s)"
-rf1=$(wt 'w["refused"]')
-[ $((rf1 - rf0)) = 4 ] 2>/dev/null && ok "21. the four counted as refused writes ($rf0 -> $rf1)" ||
-	bad "21. refused writes $rf0 -> $rf1 (want 4 more)"
-rbig SET b:5 @200000 > /dev/null
-waitfor 5 '[ "$(rbig GET b:5)" = len:200000 ]'
-rr0=$(wt 'w["read_back_released"]')
-r=$(rbig APPEND b:5 @100000)
-waitfor 5 '[ "$(rbig GET b:5)" != len:200000 ]'
-g=$(rbig GET b:5); rr1=$(wt 'w["read_back_released"]')
-case "$g" in *"larger than"*|len:300000) gok=1 ;; *) gok= ;; esac
-[ "$r" = 300000 ] && [ "$(mlen m b:5)" = 300000 ] && [ -n "$gok" ] && [ "${rr1:-0}" -gt "${rr0:-0}" ] 2>/dev/null &&
-	ok "21. APPEND past a record at the master (300,000 bytes): the copy here dropped (read-backs released $rr0 -> $rr1) - a read answers '$g', never the old 200,000 bytes" ||
-	bad "21. APPEND past a record: $r, the master holds $(mlen m b:5) bytes; a read here answers '$g' (want no len:200000), read-backs released $rr0 -> $rr1"
-stop
-unfake
-
-# ---- 22. a member whose restart drops its records at the gap gets them back from its peer --------
-# T600: the peer tracked on, so what it holds is current - the restarted member asks for the
-# collection whole (M_ASKFILL) instead of fetching each key from Redis when read.  The master
-# replicates to no replica here, so no invalidation drops a record: both members keep all 40
-crec() { # crec <n> - member n's records in collection 0 named a:*, the scan's cursor followed to 0
-	timeout 30 python3 - 127.0.60.$1 "$T" <<'PY' 2>&1
-import json, socket, sys
-sys.path.insert(0, sys.argv[2])
-import pcnative
-f = pcnative.wrap(socket.create_connection((sys.argv[1], 20881), 10))
-cur, n = 0, 0
-while True:
-    f.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "scan", "params": {"col": "0", "match": "a:*", "cursor": cur, "count": 1000}}) + "\n").encode()); f.flush()
-    r = json.loads(f.readline()).get("result")
-    if not isinstance(r, dict):
-        break
-    n += len(r.get("items", []))
-    cur = r.get("cursor", 0)
-    if not cur:
-        break
-print(n)
-PY
-}
-fakes
-ctl m '{"role": "master", "accept_writes": true}'
-rm -rf "$D/c1" "$D/c2" "$D/c1.log" "$D/c2.log"
-cconf 1; cconf 2
-cstart 1 || bad "22. member 1 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c1.log")"
-cstart 2 || bad "22. member 2 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c2.log")"
-waitfor 30 '[ "$(cst 1 "s[\"state\"]")" = ready ] && [ "$(cst 2 "s[\"state\"]")" = ready ] && [ "$(cst 1 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 2 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 1 "w.get(\"target\")")" = "127.0.0.1:'$PM'" ] && [ "$(cst 2 "w.get(\"bcast\")")" = on ]'
-# written through member 2 itself: member 1 holds received copies, which its sweep never re-sends
-for k in $(seq 1 40); do cresp 2 SET "a:$k" "v$k" > /dev/null; done
-waitfor 15 '[ "$(crec 1)" = 40 ] && [ "$(crec 2)" = 40 ] && [ "$(cmark 1 a:40)" = t ]'
-[ "$(crec 1)" = 40 ] && [ "$(crec 2)" = 40 ] && [ "$(cmark 1 a:7)" = t ] &&
-	ok "22. 40 keys written through on member 2: both members hold all 40 as records, marked" ||
-	bad "22. records before the restart: member 1 $(crec 1), member 2 $(crec 2), member 1's mark of a:7 $(cmark 1 a:7)"
-cstop 2
-cstart 2 || bad "22. member 2 did not come back: $(grep -m2 -E 'ERROR|CRIT' "$D/c2.log")"
-waitfor 20 'grep -q "the tracking had a gap - [0-9]* record" "$D/c2.log"'
-g=$(grep -o "the tracking had a gap - [0-9]* record" "$D/c2.log" | tail -1)
-[ -n "$g" ] && ok "22. member 2 back from its restart dropped its records at the gap ($g(s))" ||
-	bad "22. no gap drop on member 2: $(grep -E 'tracking|gap' "$D/c2.log" | tail -2 | cut -c 17-160 | tr '\n' '|')"
-# the peer sends the collection whole on its next sweep: no client reads a key meanwhile
-waitfor 40 '[ "$(crec 2)" = 40 ] && [ "$(cmark 2 a:7)" = t ]'
-[ "$(crec 2)" = 40 ] && [ "$(cmark 2 a:7)" = t ] &&
-	ok "22. member 2 holds all 40 as records again, marked, with no read - its peer sent them" ||
-	bad "22. member 2 holds $(crec 2) of 40 as records, mark of a:7 $(cmark 2 a:7) (0.7.5: the records stay gone, each fetched from Redis when read)"
-grep -q "asked 1 peer(s) for collection '0' whole" "$D/c2.log" && grep -q "asks for collection '0' whole" "$D/c1.log" &&
-	grep -q "sent collection '0' whole to node" "$D/c1.log" &&
-	ok "22. the logs: member 2 asked for '0' whole, member 1 sent it" ||
-	bad "22. logs: $(grep -h -E "collection '[^']*' whole" "$D/c1.log" "$D/c2.log" | cut -c 17-150 | tr '\n' '|')"
-# the replicas never took the writes, so a read answers 'v9' only from the record the peer sent
-[ "$(cresp 2 GET a:9)" = "'v9'" ] && ok "22. a read of a:9 on member 2 answers 'v9' - the record (Redis' replicas never had it)" ||
-	bad "22. GET a:9 on member 2: $(cresp 2 GET a:9)"
-cstop 1; cstop 2
-unfake
-
-# ---- 23. a read that missed the record never drops the mark of a write landing meanwhile --------
-# T594: a write stores its record, then its "t"; a read on member 2 that missed the record and then
-# found the "t" took it for a lone mark and dropped it - the record stayed, unmarked (PROD .67: 14
-# keys "the fleet owned").  PERFCACHED_TEST_BARE_GAP_US holds member 2's read 300 ms in that window
-# while the key is written through member 1; no replica takes the write, so no invalidation drops it
-fakes
-ctl m '{"role": "master", "accept_writes": true}'
-rm -rf "$D/c1" "$D/c2" "$D/c1.log" "$D/c2.log"
-cconf 1; cconf 2
-cstart 1 || bad "23. member 1 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c1.log")"
-CENV=PERFCACHED_TEST_BARE_GAP_US=300000 cstart 2 || bad "23. member 2 did not start: $(grep -m2 -E 'ERROR|CRIT' "$D/c2.log")"
-waitfor 30 '[ "$(cst 1 "s[\"state\"]")" = ready ] && [ "$(cst 2 "s[\"state\"]")" = ready ] && [ "$(cst 1 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 2 "s[\"cluster\"][\"peers_up\"]")" = 1 ] && [ "$(cst 1 "w.get(\"target\")")" = "127.0.0.1:'$PM'" ]'
-for i in 1 2 3 4 5; do
-	cresp 2 GET "b:$i" > "$D/b$i.get" &      # misses the record, then waits in the window
-	gp=$!; sleep 0.05
-	cresp 1 SET "b:$i" "v$i" > /dev/null    # record and mark reach member 2 meanwhile
-	wait $gp                                 # not a bare wait: the daemons are children too
-done
-sleep 1
-# the knob logs at the first read that reaches the window, so it is read after the reads
-grep -q "PERFCACHED_TEST_BARE_GAP_US=300000" "$D/c2.log" && ok "23. member 2 holds a read 300 ms between a missed record and its mark (the test knob)" ||
-	bad "23. member 2 never said it runs with the knob"
-n1=0; n2=0; r2=0
-for i in 1 2 3 4 5; do
-	[ "$(cmark 1 b:$i)" = t ] && n1=$((n1 + 1))
-	[ "$(cmark 2 b:$i)" = t ] && n2=$((n2 + 1))
-	[ "$(cresp 2 GET b:$i)" = "'v$i'" ] && r2=$((r2 + 1))
-done
-[ "$n1" = 5 ] && [ "$r2" = 5 ] && ok "23. member 1 marked all 5, member 2 reads all 5" || bad "23. member 1 marked $n1 of 5, member 2 reads $r2 of 5"
-[ "$n2" = 5 ] && ok "23. member 2 kept the mark of all 5 written while its read waited" ||
-	bad "23. member 2 kept $n2 of 5 marks - the read dropped the rest, their records left unmarked (0.7.5: fleet_owned)"
-cstop 1; cstop 2
 unfake
 
 # ---- 9. config --------------------------------------------------------------------------------

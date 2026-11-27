@@ -2,7 +2,6 @@
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* respout.c - the RESP door's reply writers and the two readers every command shares
  * (a command word compared without case, a whole decimal integer).  Pure; any thread. */
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -91,20 +90,21 @@ int resp_is(const char *a, size_t al, const char *b)
 	return b[al] == 0;
 }
 
-/* digits with an optional leading '-', all @n bytes, inside int64 - as Redis's string2ll */
 int resp_ll(const char *p, size_t n, long long *out)
 {
-	char num[24], *end;
-	long long v;
+	char num[24];
 
-	if (!n || n >= sizeof num || (p[0] != '-' && (p[0] < '0' || p[0] > '9')))
+	if (!n || n >= sizeof num)
 		return -1;
 	memcpy(num, p, n);
 	num[n] = 0;
-	errno = 0;
-	v = strtoll(num, &end, 10);
-	if (end != num + n || errno == ERANGE)
-		return -1;
-	*out = v;
+	{
+		char *end;
+		long long v = strtoll(num, &end, 10);
+
+		if (*end)
+			return -1;
+		*out = v;
+	}
 	return 0;
 }

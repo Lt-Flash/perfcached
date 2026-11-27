@@ -333,32 +333,6 @@ int main(void)
 		"G: a quarter free exactly: it waits");
 	pc_mget_free(m);
 
-	/* I: the hits an mget keeps are held to the reply's ceiling - past it the mget is void
-	 * (the verb refuses it), not 1.5 MB of copies for a reply that cannot carry them */
-	{
-		struct pc_tw hw;
-		struct pc_jw jw;
-		static char big[2 << 20];
-		unsigned int bi;
-
-		m = pc_mget_new("c", 1, 5);
-		for (bi = 0; bi < 5; bi++) {
-			char *val = malloc(300000);
-
-			memset(val, 'v', 300000);
-			pc_mget_hit(m, bi, val, 300000, 0);
-		}
-		pc_tw_init(&hw, NULL, 0);
-		pc_mget_tree(m, &hw);
-		CHK(hw.over, "I: five 300 KB hits (past the 1 MB reply ceiling): the tree "
-			"is void (%zu bytes rendered)", hw.n);
-		pc_tw_free(&hw);
-		pc_jw_init(&jw, big, sizeof big);
-		pc_mget_resp(m, &jw);
-		CHK(jw.overflow, "I: and so is the RESP reply (%zu bytes)", jw.len);
-		pc_mget_free(m);
-	}
-
 	/* H: the counters from the last stats reset, and from the start */
 	pc_mget_count_refused();
 	pc_mget_stats(1, &f, &u, &r);

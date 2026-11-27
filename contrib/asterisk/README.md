@@ -1,9 +1,9 @@
 # func_perfd - perfcached from the Asterisk dialplan
 
-An optional Asterisk module (Asterisk 22, 23 and 24) with four dialplan
-functions that read and write perfcached 0.7.5.1 - or a standalone Redis -
-through a pool of connections.  It links libperfd 0.7.6.1 or later; it
-carries no copy of it.
+An optional Asterisk module (Asterisk 22.10.1) with four dialplan
+functions that read and write perfcached 0.7.5 - or a standalone Redis -
+through a pool of connections.  It links libperfd 0.7.6; it carries no
+copy of it.
 
 | Function | Use | Returns |
 |---|---|---|
@@ -23,15 +23,11 @@ external interfaces.
 
 Install `libperfd-dev` (and `libperfd0` where Asterisk runs) from
 perfcached's packages, or `make install-lib` in a perfcached checkout;
-plus autoconf, automake and pkg-config.  libperfd older than 0.7.6.1 is
-refused at build time: the module dials through `perfd_url_connect`.
-
-A patch per release, for the supported branches: `asterisk-22.12.0-`,
-`asterisk-23.6.0-` and `asterisk-24.0.0-func_perfd.patch`.
+plus autoconf, automake and pkg-config.
 
 ```
-cd asterisk-24.0.0
-patch -p1 < asterisk-24.0.0-func_perfd.patch
+cd asterisk-22.10.1
+patch -p1 < asterisk-22.10.1-func_perfd.patch
 ./bootstrap.sh
 ./configure <your usual options>
 make menuselect        # Dialplan Functions -> func_perfd (off by default)
@@ -42,7 +38,7 @@ make && make install
   replaces the interactive step.
 - The patch does not carry `configure`; `./bootstrap.sh` regenerates it
   from the patched `configure.ac`.
-- configure finds libperfd through pkg-config (`libperfd >= 0.7.6.1`).  For a
+- configure finds libperfd through pkg-config (`libperfd >= 0.5.0`).  For a
   library under a private prefix: `PKG_CONFIG_PATH=<prefix>/lib/pkgconfig
   ./configure ...`, or `--with-perfd=<prefix>`.  Without libperfd,
   menuselect shows the module as unavailable.
@@ -127,12 +123,7 @@ deleted).  `ERROR` in `PERFDSTATUS` always has a log line with the reason.
 - **Timeouts.** A stalled server holds a call for `io_timeout_ms` per send
   and receive (default 300; libperfd's own default is 5000), and a call
   waits at most `wait_timeout_ms` for a free connection.  With a channel,
-  the wait runs under autoservice.  Over `binary`, connections dial at the
-  same time, never in turn; once a dial found no seed answering, that
-  connection's calls are `ERROR` at once for 1 s, doubling to 30 s, until a
-  dial succeeds, and each failing seed is logged once per outage.  Over
-  `resp` a whole call is bounded by `call_timeout_ms`, and a bulk declared
-  far over `max_value` closes the connection undrained.
+  the wait runs under autoservice.
 - **Delete after a lost reply.** A delete retried after a lost reply can
   answer `0` for a key the first attempt removed.
 - **Redis collections** are database numbers; a name is refused with

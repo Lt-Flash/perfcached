@@ -96,7 +96,6 @@ out("IDS1", "%s/%s/%s" % (cl(M).get("node"), cl(A).get("node"), cl(B).get("node"
 EOF
 
 for n in 9 1 2; do conf $n; done
-: > "$D/n9.log"
 "$BIN" -f "$D/n9.conf" > "$D/n9.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_ready "$D/n9.log" || { bad "the founder did not start"; echo "idduptest: $pass passed, $fail failed"; exit 1; }

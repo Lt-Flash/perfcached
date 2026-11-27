@@ -90,7 +90,7 @@ static int wbuf_push(perfd_t *p)
 	if (p->wstlen && wbuf_seal(p) != 0)   /* one seal a push */
 		return -1;
 	while (p->woff < p->wlen) {
-		ssize_t r = send(p->fd, p->w + p->woff, p->wlen - p->woff, MSG_NOSIGNAL);
+		ssize_t r = write(p->fd, p->w + p->woff, p->wlen - p->woff);
 
 		if (r > 0) {
 			p->woff += (size_t)r;
@@ -305,11 +305,11 @@ static int hs_build_msg1(perfd_t *p)
 	size_t mlen = 0;
 
 	if (psk_for(p->sec[p->hs_sec], psk) != 0)
-		return errk(p, PERFD_E_NOMEM, "key derivation failed");
+		return errk(p, PERFD_E_AUTH, "key derivation failed");
 	pc_hs_init_initiator(&p->hs, prologue, 1);
 	if (pc_hs_write_msg1(&p->hs, psk, ver, p->want_enc ? 1 : 2, msg + 3, &mlen) != 0) {
 		sodium_memzero(psk, sizeof psk);
-		return errk(p, PERFD_E_NOMEM, "handshake build failed");
+		return errk(p, PERFD_E_AUTH, "handshake build failed");
 	}
 	sodium_memzero(psk, sizeof psk);
 	msg[0] = (uint8_t)(1 + mlen);
@@ -334,16 +334,6 @@ static int hs_take_msg2(perfd_t *p)
 
 	if (p->cinlen < 2)
 		return 0;
-	if (p->cin[0] == '-' && p->cin[1] == 'E') {
-		char why[128];
-
-		if (!memchr(p->cin, '\n', p->cinlen) && p->cinlen < sizeof why)
-			return 0;              /* the rest of the line, or the close */
-		if (hs_refusal((const uint8_t *)p->cin, p->cinlen, why, sizeof why)) {
-			p->poisoned = 1;
-			return errk(p, PERFD_E_REFUSED, "refused by the node: %s", why);
-		}
-	}
 	cl = (size_t)(unsigned char)p->cin[0] |
 		((size_t)(unsigned char)p->cin[1] << 8);
 	if (cl == 0 || cl > sizeof m2) {
@@ -403,11 +393,6 @@ int perfd_events(const perfd_t *p)
 	return ev;
 }
 
-int perfd_secret_index(const perfd_t *p)
-{
-	return p && p->nsec ? p->hs_sec : -1;
-}
-
 int perfd_inflight(const perfd_t *p)
 {
 	return p ? p->ncalls : 0;
@@ -436,7 +421,7 @@ perfd_t *perfd_connect_async(const char *host, int port,
 	hints.ai_socktype = SOCK_STREAM;
 	snprintf(ps, sizeof ps, "%d", port);
 	if (getaddrinfo(host, ps, &hints, &res) != 0) {
-		errk(NULL, PERFD_E_TRANSPORT, "cannot resolve %s", host ? host : "(null)");
+		errk(p, PERFD_E_TRANSPORT, "cannot resolve %s", host ? host : "(null)");
 		perfd_free(p);
 		return NULL;
 	}
@@ -456,7 +441,7 @@ perfd_t *perfd_connect_async(const char *host, int port,
 	}
 	freeaddrinfo(res);
 	if (p->fd < 0) {
-		errk(NULL, PERFD_E_TRANSPORT, "cannot connect: %s", strerror(errno));
+		errk(p, PERFD_E_TRANSPORT, "cannot connect: %s", strerror(errno));
 		perfd_free(p);
 		return NULL;
 	}
@@ -474,14 +459,12 @@ static int submit_framed(perfd_t *p, perfd_reply_cb cb, void *ctx,
 	}
 	if (wbuf_put(p, p->q, p->qlen) != 0) {
 		p->qlen = 0;
-		p->ncalls--;           /* the -1 reports this one */
 		return -1;
 	}
 	p->qlen = 0;
 	if (!p->eager_push)
 		return 0;              /* batched; goes out on write-readiness */
 	if (wbuf_push(p) < 0) {
-		p->ncalls--;
 		call_fail_all(p, p->err);
 		p->st = PERFD_ST_FAILED;
 		return -1;
@@ -547,7 +530,6 @@ int perfd_push(perfd_t *p)
 		return errk(p, PERFD_E_STATE, "not an async handle");
 	if (p->poisoned) {
 		p->st = PERFD_ST_FAILED;
-		call_fail_all(p, p->err);
 		return -1;
 	}
 	if (p->woff >= p->wlen && !p->wstlen)
@@ -566,7 +548,6 @@ int perfd_write_ready(perfd_t *p)
 		return errk(p, PERFD_E_STATE, "not an async handle");
 	if (p->poisoned) {
 		p->st = PERFD_ST_FAILED;
-		call_fail_all(p, p->err);
 		return -1;
 	}
 	if (p->hs_stage == PD_HS_TCP) {
@@ -611,19 +592,9 @@ int perfd_read_ready(perfd_t *p)
 		return errk(p, PERFD_E_STATE, "not an async handle");
 	if (p->poisoned) {
 		p->st = PERFD_ST_FAILED;
-		call_fail_all(p, p->err);
 		return -1;
 	}
 	if (cin_pull(p) < 0) {
-		/* a node drops a msg1 its secrets cannot open, as the blocking dial reads it too */
-		char why[128];
-
-		if (p->hs_stage == PD_HS_WAIT && p->err_kind == PERFD_E_TRANSPORT &&
-		    hs_refusal((const uint8_t *)p->cin, p->cinlen, why, sizeof why))
-			errk(p, PERFD_E_REFUSED, "refused by the node: %s", why);
-		else if (p->hs_stage == PD_HS_WAIT && p->err_kind == PERFD_E_TRANSPORT)
-			errk(p, PERFD_E_AUTH, "handshake refused with secrets[%d] (wrong or retired?) - "
-				"dial again from the next", p->hs_sec);
 		p->st = PERFD_ST_FAILED;
 		call_fail_all(p, p->err);
 		return -1;

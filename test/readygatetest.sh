@@ -66,7 +66,6 @@ except OSError as e:
     print("no-conn %s" % e)' "$RPORT" "$1" 2>/dev/null
 }
 start() {
-	: > "$2"
 	"$BIN" -f "$D/n1.conf" > "$2" 2>&1 &
 	P=$!
 	k=0

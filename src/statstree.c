@@ -1446,20 +1446,12 @@ void pc_stats_tree(struct pc_tw *out, const char *only_col)
 			pc_tw_key(out, "full_waiting");
 			pc_tw_bool(out, (ws.full_waiting));
 			{
-				unsigned long long wpn, wpt, wph;
+				unsigned long long wpn, wpt;
 
 				pc_conn_wal_pause_stats(&wpn, &wpt);
 				pc_tw_ctr(out, "wal.writer_pauses", "writer_pauses", wpt);
 				pc_tw_key(out, "writers_paused");
 				pc_tw_i64(out, (long long)wpn);
-				/* fsync = sync: connections whose replies wait for the sync now, ever, and ms held */
-				pc_conn_sync_stats(&wpn, &wpt, &wph);
-				pc_tw_key(out, "sync_held");
-				pc_tw_i64(out, (long long)wpn);
-				pc_tw_key(out, "sync_holds");
-				pc_tw_i64(out, (long long)wpt);
-				pc_tw_key(out, "sync_hold_ms");
-				pc_tw_i64(out, (long long)wph);
 			}
 			pc_tw_ctr(out, "wal.late", "late", (unsigned long long)(ws.late));
 			pc_tw_key(out, "recycles");
@@ -1697,12 +1689,6 @@ void pc_members_tree(struct pc_tw *out)
 
 				if (fv >> 24)
 					snprintf(vb + k, sizeof vb - (size_t)k, ".%u", fv >> 24);
-				pc_tw_str(out, vb);
-			} else
-				pc_tw_nil(out);
-			pc_tw_key(out, "rev");          /* null: an older build, or no spare slot */
-			if (pc_member_fact(&mem[i], PC_FACT_REV, &fv)) {
-				snprintf(vb, sizeof vb, "%07x", fv);
 				pc_tw_str(out, vb);
 			} else
 				pc_tw_nil(out);

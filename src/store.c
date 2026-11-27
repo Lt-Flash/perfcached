@@ -21,7 +21,6 @@
 #include <stdlib.h>
 #include "core/pcache_arena.h"
 #include "fnv1a.h"
-#include "statefile.h"                  /* pc_state_sync_dir */
 
 /* writers (create, drop) serialize here; readers take nothing: an entry is filled before reg_n
  * is published and reg_n never shrinks, so a reader sees a new entry complete or not at all */
@@ -33,9 +32,6 @@ static struct {
 	char *name;
 	int live;                          /* 0 = dropped, slot reusable */
 	int runtime;                       /* created by a client, persisted */
-	/* the name the config registered it under, kept across renames and drops; NULL for an
-	 * entry the config never named - the interchange digest's set */
-	const char *cfgname;
 	int buckets_log2;                  /* what the table was made at */
 	int floor_log2;                    /* the size explicitly given (config, create,
 	                                    * explicit resize); FLOOR mode does not shrink below it */
@@ -80,7 +76,6 @@ static struct {
 static int reg_n;
 
 static void retire_push(pcache_htable_t *ht, int idx);
-static void reg_forget_dead(const char *name, size_t nlen, int keep);
 
 /* what a runtime-created collection inherits: the cluster's mode, set once at startup */
 int pc_col_default_pull, pc_col_default_proxy, pc_col_default_shard,
@@ -539,7 +534,6 @@ int pc_store_register(const char *name, pcache_htable_t *ht, int pull,
 	reg[reg_n].name = strdup(name);
 	if (!reg[reg_n].name)
 		return -1;
-	reg[reg_n].cfgname = reg[reg_n].name;   /* never freed: a rename swaps the pointer */
 	reg[reg_n].live = 1;
 	reg[reg_n].ht = ht;
 	/* proxy AND shard reads ride the pull path (unicast to the holder
@@ -616,8 +610,8 @@ pcache_htable_t *pc_store_find(const char *name, size_t nlen)
 	return NULL;
 }
 
-/* 0 ok, -1 no such collection, -2 the new name is taken, -3 out of memory or a bad name.  The caller
- * persists the file; a load maps older names through the WAL's rename records */
+/* 0 ok, -1 no such collection, -2 the new name is taken, -3 out of memory or a bad name.  The file
+ * keeps the old name until a checkpoint (at once without a WAL): earlier WAL records carry it */
 int pc_store_rename(const char *from, size_t flen, const char *to, size_t tlen,
 		unsigned long long gen)
 {
@@ -649,7 +643,6 @@ int pc_store_rename(const char *from, size_t flen, const char *to, size_t tlen,
 	}
 	memcpy(nm, to, tlen);
 	nm[tlen] = '\0';
-	reg_forget_dead(to, tlen, found);
 	__atomic_store_n(&reg[found].name, nm, __ATOMIC_RELEASE);
 	reg[found].runtime = 1;            /* it is ours to persist now */
 	reg[found].gen = gen;
@@ -726,50 +719,27 @@ void pc_store_set_floor(const char *name, size_t nlen, int log2)
 	pthread_mutex_unlock(&reg_mx);
 }
 int pc_store_runtime(int i)           { return reg[i].runtime; }
-const char *pc_store_cfg_name(int i)  { return reg[i].cfgname; }
 
 /* ---- runtime creation and removal, on a worker while the daemon serves: a new entry is complete
  * before the count publishes it, and a dropped one stops being findable before a record is freed */
 
 static int reg_slot_for(const char *name, size_t nlen)
 {
-	int i, slot = -1;
-
-	for (i = 0; i < reg_n; i++)
-		if (reg[i].live && strlen(reg[i].name) == nlen &&
-		        !memcmp(reg[i].name, name, nlen))
-			return -1;                 /* the name is taken */
-	/* a dead slot is reusable once its table went back to the arena (pc_store_retire_tick);
-	 * the size does not matter, the carve takes retired slots first; the name's own first */
-	for (i = 0; i < reg_n; i++) {
-		if (reg[i].live || reg[i].ht || reg[i].rs_to)
-			continue;
-		if (reg[i].name && strlen(reg[i].name) == nlen &&
-		        !memcmp(reg[i].name, name, nlen))
-			return i;
-		if (slot < 0)
-			slot = i;
-	}
-	if (slot >= 0)
-		return slot;
-	return reg_n < PC_MAX_COLLECTIONS ? reg_n : -2;
-}
-
-static char reg_noname[1];
-
-/* reg_mx held: the name's tombstones other than @keep are forgotten, so a re-announce of one
- * cannot drop the entry that now holds the name */
-static void reg_forget_dead(const char *name, size_t nlen, int keep)
-{
 	int i;
 
-	for (i = 0; i < reg_n; i++)
-		if (i != keep && !reg[i].live && reg[i].name &&
-		        strlen(reg[i].name) == nlen &&
-		        !memcmp(reg[i].name, name, nlen)) {
-			__atomic_store_n(&reg[i].name, reg_noname, __ATOMIC_RELEASE);
-			reg[i].gen = 0;
+	for (i = 0; i < reg_n; i++) {
+		if (reg[i].live) {
+			if (strlen(reg[i].name) == nlen &&
+			        !memcmp(reg[i].name, name, nlen))
+				return -1;         /* the name is taken */
+			continue;
 		}
+		/* a dead slot is reusable once its table went back to the arena (pc_store_retire_tick);
+		 * the size does not matter, the carve takes retired slots first */
+		if (!reg[i].ht)
+			return i;
+	}
+	return reg_n < PC_MAX_COLLECTIONS ? reg_n : -2;
 }
 
 int pc_store_create(const char *name, size_t nlen, int buckets_log2)
@@ -821,11 +791,8 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 		}
 		memcpy(nm, name, nlen);
 		nm[nlen] = '\0';
-		if (i == reg_n)
-			reg[i].cfgname = NULL;
 		__atomic_store_n(&reg[i].name, nm, __ATOMIC_RELEASE);
 	}
-	reg_forget_dead(name, nlen, i);
 	reg[i].ht = ht;
 	reg[i].pub++;                      /* a publish */
 	reg[i].buckets_log2 = buckets_log2;
@@ -847,11 +814,6 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 	__atomic_store_n(&reg[i].nondurable, 0, __ATOMIC_RELAXED);
 	reg[i].rs_pending = 0;
 	reg[i].rs_gen = 0;
-	reg[i].rs_cursor = 0;
-	reg[i].rs_target = reg[i].rs_pass = reg[i].rs_swapped = 0;
-	reg[i].rs_closing = reg[i].rs_unfit_said = 0;
-	reg[i].rs_unfit = 0;
-	reg[i].rs_moved = 0;
 	reg[i].as_target = reg[i].as_set = 0;
 	reg[i].as_gen = 0;
 	colst_reset(i);
@@ -934,10 +896,6 @@ long pc_store_drop_gen(const char *name, size_t nlen, unsigned long long gen)
 	if (found < 0) {
 		pthread_mutex_unlock(&reg_mx);
 		return -1;
-	}
-	if (gen < reg[found].gen) {        /* older than the create: stale news */
-		pthread_mutex_unlock(&reg_mx);
-		return -2;
 	}
 	/* off the map first: from here every lookup says "no such
 	 * collection", so nothing new lands in the table being emptied */
@@ -1030,8 +988,7 @@ unsigned long long pc_store_pub_gen(int i)
 
 
 /* ---- resize by migration: copy passes, the pointer swap, more passes; the version rule keeps
- * a copy from undoing a live write, and deletes go to both tables, the copier's source first
- * (pc_store_del_order) */
+ * a copy from undoing a live write, and deletes go to both tables (pc_store_resize_shadow) */
 #define RS_PRE_PASSES   2
 #define RS_POST_PASSES  2
 #define RS_BUDGET   50000
@@ -1042,7 +999,6 @@ struct rs_ctx {
 	pcache_htable_t *to;
 	unsigned int now, budget, n;
 	unsigned long long moved;
-	int slot;
 };
 
 /* tests only: PERFCACHED_TEST_RS_COPY_FAIL=<file> - while it exists, an
@@ -1060,31 +1016,6 @@ static int rs_test_nofit(const str *key)
 		access(path, F_OK) == 0;
 }
 
-/* tests only: PERFCACHED_TEST_RS_COPY_PAUSE=<path> - the copy of a "pz:pre" key before the swap,
- * or of a "pz:post" key after it, waits (10 s at most) while <path>.pre / <path>.post exists */
-static void rs_test_pause(const str *key, int swapped)
-{
-	static int init;
-	static const char *path;
-	const char *ph = swapped ? "post" : "pre";
-	char f[PATH_MAX];
-	int i;
-
-	if (!init) {
-		path = getenv("PERFCACHED_TEST_RS_COPY_PAUSE");
-		init = 1;
-	}
-	if (!path || key->len != 3 + (int)strlen(ph) || memcmp(key->s, "pz:", 3) ||
-	        memcmp(key->s + 3, ph, strlen(ph)))
-		return;
-	snprintf(f, sizeof f, "%s.%s", path, ph);
-	if (access(f, F_OK) != 0)
-		return;
-	LM_NOTICE("TEST HOOK - resize copy paused on '%.*s'\n", key->len, key->s);
-	for (i = 0; i < 1000 && access(f, F_OK) == 0; i++)
-		usleep(10000);
-}
-
 static int rs_copy_cb(const str *key, const str *val,
 		const struct pcache_rec_meta *mt, void *p)
 {
@@ -1093,24 +1024,18 @@ static int rs_copy_cb(const str *key, const str *val,
 
 	if (c->n >= c->budget)
 		return -1;                 /* this tick's share is spent */
-	if (!__atomic_load_n(&reg[c->slot].live, __ATOMIC_ACQUIRE))
-		return -1;                 /* dropped under the pass */
 	c->n++;
-	rs_test_pause(key, reg[c->slot].rs_swapped);
 	if (mt->expires && mt->expires <= c->now) {
 		/* it does not travel, and it is gone: counted, so the resize says so */
 		c->expired++;
 		/* gone without a delete: the new table has no record to floor a later write's version
 		 * on, so the clock carries it (pcache_ht_sweep says why) */
 		pc_lamport_publish(mt->ver);
-		/* and it superseded any older copy already made into the target; its own copy stays
-		 * for the target's sweep, which notes the expiry */
-		(void)pcache_ht_remove_below(c->to, key, mt->ver);
 		return 0;
 	}
 	/* the same record, not a fresh local write: version, expiry, PASSIVE/CARRY, type and write
 	 * tick (a recovered record the reconcile has not ruled on must stay one) */
-	rc = rs_test_nofit(key) ? -2 : pcache_ht_store_copy_held(c->to, key, val,
+	rc = rs_test_nofit(key) ? -2 : pcache_ht_store_copy(c->to, key, val,
 		mt->expires,
 		(unsigned char)(mt->rflags & (PCACHE_F_PASSIVE | PCACHE_F_CARRY)),
 		mt->ver, mt->wtick);
@@ -1267,89 +1192,6 @@ void pc_store_walk_end(void)
 	pthread_mutex_unlock(&reg_mx);
 }
 
-pcache_htable_t *pc_store_del_order(pcache_htable_t *ht, pcache_htable_t **second)
-{
-	int i, n = pc_store_count();
-	unsigned int q;
-
-	*second = NULL;
-	for (i = 0; i < n; i++) {
-		if (reg[i].ht == ht) {
-			pcache_htable_t *sh = __atomic_load_n(&reg[i].rs_to, __ATOMIC_ACQUIRE);
-
-			if (!sh)
-				return ht;
-			/* before the swap the copier reads the live table, after it the old one */
-			if (__atomic_load_n(&reg[i].rs_swapped, __ATOMIC_RELAXED)) {
-				*second = ht;
-				return sh;
-			}
-			*second = sh;
-			return ht;
-		}
-		/* resolved before the swap, applied after it: the new table holds the copy too */
-		if (__atomic_load_n(&reg[i].rs_to, __ATOMIC_ACQUIRE) == ht) {
-			*second = __atomic_load_n(&reg[i].ht, __ATOMIC_ACQUIRE);
-			return ht;
-		}
-	}
-	/* after the closing drain the old table waits to be retired, its records in the live one */
-	pthread_mutex_lock(&reg_mx);
-	for (q = 0; q < retq_n; q++)
-		if (retq[q].ht == ht && retq[q].idx >= 0 && retq[q].idx < reg_n &&
-		        reg[retq[q].idx].ht != ht) {
-			*second = reg[retq[q].idx].ht;
-			break;
-		}
-	pthread_mutex_unlock(&reg_mx);
-	return ht;
-}
-
-/* tests only: PERFCACHED_TEST_RS_COPY_PAUSE=<path> - a delete of "pz:stale", its table already
- * resolved, waits (30 s at most) while <path>.del exists */
-void pc_store_test_del_pause(const str *key)
-{
-	static int init;
-	static const char *path;
-	char f[PATH_MAX];
-	int i;
-
-	if (!init) {
-		path = getenv("PERFCACHED_TEST_RS_COPY_PAUSE");
-		init = 1;
-	}
-	if (!path || key->len != 8 || memcmp(key->s, "pz:stale", 8))
-		return;
-	snprintf(f, sizeof f, "%s.del", path);
-	if (access(f, F_OK) != 0)
-		return;
-	LM_NOTICE("TEST HOOK - delete paused on '%.*s'\n", key->len, key->s);
-	for (i = 0; i < 3000 && access(f, F_OK) == 0; i++)
-		usleep(10000);
-}
-
-/* tests only: as pc_store_test_del_pause, for a SET of "pz:late" while <path>.set exists */
-void pc_store_test_set_pause(const str *key)
-{
-	static int init;
-	static const char *path;
-	char f[PATH_MAX];
-	int i;
-
-	if (!init) {
-		path = getenv("PERFCACHED_TEST_RS_COPY_PAUSE");
-		init = 1;
-	}
-	if (!path || key->len != 7 || memcmp(key->s, "pz:late", 7))
-		return;
-	snprintf(f, sizeof f, "%s.set", path);
-	if (access(f, F_OK) != 0)
-		return;
-	LM_NOTICE("TEST HOOK - set paused on '%.*s'\n", key->len, key->s);
-	for (i = 0; i < 3000 && access(f, F_OK) == 0; i++)
-		usleep(10000);
-}
-
 pcache_htable_t *pc_store_resize_shadow(pcache_htable_t *ht)
 {
 	int i, n = pc_store_count();
@@ -1426,24 +1268,6 @@ int pc_store_resizing(int i, int *target_log2, unsigned long long *moved)
 	return 1;
 }
 
-/* a collection dropped mid-resize: its other table is emptied and retired here, on the thread
- * that runs the copy passes, and the slot is reusable only after */
-static void rs_abandon(int i)
-{
-	pcache_htable_t *t = reg[i].rs_to;
-
-	drain_table(t);
-	pthread_mutex_lock(&reg_mx);
-	__atomic_store_n(&reg[i].rs_to, (pcache_htable_t *)NULL,
-		__ATOMIC_RELEASE);
-	reg[i].rs_swapped = reg[i].rs_closing = reg[i].rs_pass = 0;
-	reg[i].rs_cursor = 0;
-	reg[i].rs_pending = 0;
-	reg[i].rs_unfit = 0;
-	retire_push(t, i);
-	pthread_mutex_unlock(&reg_mx);
-}
-
 void pc_store_resize_tick(void)
 {
 	int i, n = pc_store_count();
@@ -1453,12 +1277,8 @@ void pc_store_resize_tick(void)
 		pcache_htable_t *from, *to;
 		int pend = 0;
 
-		if (!__atomic_load_n(&reg[i].live, __ATOMIC_ACQUIRE)) {
-			if (reg[i].rs_to)
-				rs_abandon(i);
-			continue;
-		}
-		if (!reg[i].rs_to)
+		if (!__atomic_load_n(&reg[i].live, __ATOMIC_ACQUIRE) ||
+		        !reg[i].rs_to)
 			continue;
 		/* before the swap: live into new; after it rs_to holds the OLD
 		 * table and the passes drain it into the live one */
@@ -1471,9 +1291,7 @@ void pc_store_resize_tick(void)
 		c.moved = 0;
 		c.expired = 0;
 		c.unfit = 0;
-		c.slot = i;
-		/* under the source's bucket lock, so a delete (source first) is never undone */
-		if (pcache_ht_iter_locked_from(from, &reg[i].rs_cursor,
+		if (pcache_ht_iter_meta_from(from, &reg[i].rs_cursor,
 		        rs_copy_cb, &c) < 0 && !c.n)
 			continue;              /* the walk failed: try next tick */
 		reg[i].rs_moved += c.moved;
@@ -1502,7 +1320,7 @@ void pc_store_resize_tick(void)
 			/* THE COMMIT POINT: every lookup from here lands in the new table; the old one still
 			 * takes writes from requests resolved before, which the passes below collect */
 			pthread_mutex_lock(&reg_mx);
-			if (walk_holds || !reg[i].live) {   /* after the snapshot's walk */
+			if (walk_holds) {          /* after the snapshot's walk */
 				pthread_mutex_unlock(&reg_mx);
 				continue;
 			}
@@ -1522,9 +1340,6 @@ void pc_store_resize_tick(void)
 				/* before the publish: a reader of the new table falls
 				 * back to the old one, and a writer carries the key over first */
 				pcache_ht_set_drain(reg[i].rs_to, old);
-				/* and a write that resolved `old` before the swap lands in the new
-				 * table: one landing after the closing drain's walk would be lost */
-				pcache_ht_set_write_to(old, reg[i].rs_to);
 				reg[i].pub++;      /* a publish */
 				__atomic_store_n(&reg[i].ht, reg[i].rs_to,
 					__ATOMIC_RELEASE);
@@ -1549,7 +1364,7 @@ void pc_store_resize_tick(void)
 			long left;
 
 			pthread_mutex_lock(&reg_mx);
-			if (walk_holds || !reg[i].live) {   /* after the snapshot's walk */
+			if (walk_holds) {          /* after the snapshot's walk */
 				pthread_mutex_unlock(&reg_mx);
 				continue;
 			}
@@ -1616,7 +1431,6 @@ void pc_store_note_drop(const char *name, size_t nlen, unsigned long long gen)
 		memcpy(nm, name, nlen);
 		nm[nlen] = '\0';
 		reg[reg_n].name = nm;
-		reg[reg_n].cfgname = NULL;
 		reg[reg_n].gen = gen;
 		reg[reg_n].live = 0;
 		reg[reg_n].ht = NULL;
@@ -1643,53 +1457,21 @@ int pc_store_entry(int i, const char **name, int *buckets_log2,
 #define COLFILE_HEADER "perfcached-collections 1"
 
 static char colfile_dir[512];   /* remembered by pc_store_load() */
-/* callers are on several threads and share one temp file: one write and rename at a time */
-static pthread_mutex_t persist_mx = PTHREAD_MUTEX_INITIALIZER;
-/* what the last write put on disk: the same set again is not written (a resync re-sends it) */
-static char *colfile_last;
-static size_t colfile_last_len;
-static int persist_due;
-
-static int store_persist_locked(void);
 
 int pc_store_persist(void)
 {
-	int rc;
+	char path[600], tmp[620];
+	FILE *f;
+	int i, n = pc_store_count(), rc = 0;
 
 	if (!colfile_dir[0])
 		return 0;                  /* ephemeral by configuration */
-	pthread_mutex_lock(&persist_mx);
-	rc = store_persist_locked();
-	pthread_mutex_unlock(&persist_mx);
-	return rc;
-}
-
-/* the fleet's applies only mark the file due: its fsync waits on storage, and the cluster thread
- * answers every pull and forward - pc-maint writes it (pc_store_persist_tick) */
-void pc_store_persist_later(void)
-{
-	__atomic_store_n(&persist_due, 1, __ATOMIC_RELEASE);
-}
-
-void pc_store_persist_tick(void)
-{
-	if (__atomic_exchange_n(&persist_due, 0, __ATOMIC_ACQ_REL) &&
-	        pc_store_persist() != 0)
-		__atomic_store_n(&persist_due, 1, __ATOMIC_RELEASE);   /* the next tick retries */
-}
-
-static int store_persist_locked(void)
-{
-	char path[600], tmp[620];
-	char *body = NULL;
-	size_t len = 0;
-	FILE *m, *f;
-	int i, n = pc_store_count(), rc = 0;
-
-	m = open_memstream(&body, &len);
-	if (!m)
+	snprintf(path, sizeof path, "%s/collections", colfile_dir);
+	snprintf(tmp, sizeof tmp, "%s/collections.tmp", colfile_dir);
+	f = fopen(tmp, "w");
+	if (!f)
 		return -1;
-	fprintf(m, "%s\n", COLFILE_HEADER);
+	fprintf(f, "%s\n", COLFILE_HEADER);
 	pthread_mutex_lock(&reg_mx);
 	for (i = 0; i < n; i++) {
 		if (!reg[i].gen)
@@ -1698,51 +1480,24 @@ static int store_persist_locked(void)
 			continue;              /* the config file's, not ours */
 		/* tombstones are written too: a drop that a peer missed must
 		 * not be undone by that peer's re-announce after a restart */
-		fprintf(m, "collection %s %d %llu %d\n", reg[i].name,
+		fprintf(f, "collection %s %d %llu %d\n", reg[i].name,
 			reg[i].buckets_log2, reg[i].gen, reg[i].live ? 1 : 0);
 	}
 	/* a mode the verb set, config collections included, with its generation: lines an
 	 * older build skips (not "collection" lines) */
 	for (i = 0; i < n; i++)
 		if (reg[i].live && reg[i].as_set)
-			fprintf(m, "autoscale %s %s %llu\n", reg[i].name,
+			fprintf(f, "autoscale %s %s %llu\n", reg[i].name,
 				pc_autoscale_name(reg[i].autoscale), reg[i].as_gen);
 	pthread_mutex_unlock(&reg_mx);
-	if (fclose(m) != 0) {
-		free(body);
-		return -1;
-	}
-	if (colfile_last && len == colfile_last_len && !memcmp(body, colfile_last, len)) {
-		free(body);
-		return 0;
-	}
-	snprintf(path, sizeof path, "%s/collections", colfile_dir);
-	snprintf(tmp, sizeof tmp, "%s/collections.tmp", colfile_dir);
-	f = fopen(tmp, "w");
-	if (!f) {
-		free(body);
-		return -1;
-	}
-	if (fwrite(body, 1, len, f) != len || fflush(f) != 0 || fsync(fileno(f)) != 0)
+	if (fflush(f) != 0 || fsync(fileno(f)) != 0)
 		rc = -1;
-	if (fclose(f) != 0)
-		rc = -1;
+	fclose(f);
 	if (rc == 0 && rename(tmp, path) != 0)
 		rc = -1;
-	if (rc != 0) {
+	if (rc != 0)
 		unlink(tmp);
-		free(body);
-		return rc;
-	}
-	/* the new name survives a power loss only once the directory is synced */
-	if (pc_state_sync_dir(colfile_dir) != 0) {
-		free(body);
-		return -1;
-	}
-	free(colfile_last);
-	colfile_last = body;
-	colfile_last_len = len;
-	return 0;
+	return rc;
 }
 
 int pc_store_load(const char *state_dir)
@@ -1935,6 +1690,8 @@ int pc_store_autoscale_apply(const char *name, size_t nlen, int m,
 		reg[found].as_gen = gen;
 	}
 	pthread_mutex_unlock(&reg_mx);
+	if (rc == 1)
+		(void)pc_store_persist();
 	return rc;
 }
 

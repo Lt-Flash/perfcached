@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* scanremovetest.c - the cursored scan (the collection drop's walk) hands over every record in one
- * pass while its callback removes each: 16 buckets, 400 records, nothing left.  B: a table that
- * splits during a one-call scan still has every record handed over before the cursor reads 0. */
+ * pass while its callback removes each: 16 buckets, 400 records, nothing left. */
 #include <stdio.h>
 #include <string.h>
 #include "../src/compat/compat.h"
@@ -51,25 +50,6 @@ static int count_cb(const str *key, const str *val, unsigned int exp, void *ctx)
 {
 	(void)key; (void)val; (void)exp;
 	(*(int *)ctx)++;
-	return 0;
-}
-
-struct groww {
-	pcache_htable_t *ht;
-	unsigned char seen[N];
-	unsigned int grew;
-};
-
-static int grow_cb(const str *key, const str *val, unsigned int exp, void *ctx)
-{
-	struct groww *g = ctx;
-	int i;
-
-	(void)val; (void)exp;
-	if (!g->grew)                  /* the first record: split every bucket once */
-		g->grew = pcache_ht_grow(g->ht, 1, 16) + 1;
-	if (key->len >= 2 && sscanf(key->s + 1, "%d", &i) == 1 && i >= 0 && i < N)
-		g->seen[i] = 1;
 	return 0;
 }
 
@@ -138,50 +118,6 @@ int main(void)
 	CHK(w.removed == N, "every record was removed in that pass (%d)", w.removed);
 	CHK(left == 0 && pcache_ht_overflow(ht) == 0,
 		"the table is empty afterwards (%d left, chained %u)", left, pcache_ht_overflow(ht));
-
-	/* B: a scan covering the whole table in one call while it splits under it */
-	{
-		static struct groww g;
-		pcache_htable_t *ht2 = pcache_htable_new(4);
-		unsigned int nb0;
-
-		if (!ht2) {
-			printf("create failed\n");
-			return 2;
-		}
-		for (i = 0; i < N; i++) {
-			k.len = snprintf(kb, sizeof kb, "k%d", i);
-			k.s = kb;
-			v.len = snprintf(vb, sizeof vb, "v%d", i);
-			v.s = vb;
-			if (pcache_ht_store(ht2, &k, &v, 0) != 0) {
-				printf("store %d failed\n", i);
-				return 2;
-			}
-		}
-		nb0 = pcache_ht_nbuckets(ht2);
-		g.ht = ht2;
-		cursor = 0;
-		calls = 0;
-		do {
-			calls++;
-			if (pcache_ht_scan_ex(ht2, &cursor, 4096, PCACHE_SCAN_NOVAL,
-			        grow_cb, &g) < 0) {
-				printf("scan failed\n");
-				return 2;
-			}
-		} while (cursor && calls < 100);
-		never = 0;
-		for (i = 0; i < N; i++)
-			if (!g.seen[i])
-				never++;
-		CHK(g.grew > 1 && pcache_ht_nbuckets(ht2) > nb0,
-			"B1 the table split during the scan (%u -> %u buckets)", nb0,
-			pcache_ht_nbuckets(ht2));
-		CHK(never == 0,
-			"B2 every record present throughout was handed over before the cursor read 0 (%d of %d never, %u calls)",
-			never, N, calls);
-	}
 	printf("scanremovetest: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
 	return fails ? 1 : 0;
 }

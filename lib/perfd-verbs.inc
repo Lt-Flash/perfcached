@@ -347,22 +347,17 @@ int perfd_hget_buf(perfd_t *p, const char *col, const char *key,
 int perfd_hgetall(perfd_t *p, const char *col, const char *key,
 		perfd_hfield_cb cb, void *ctx)
 {
-	unsigned char *tr, *own;
+	unsigned char *tr;
 	size_t tn;
 	struct hrt t;
 	unsigned int cnt, i;
 
 	if (hcall(p, col, key, "HGETALL", 0, NULL, NULL, &tr, &tn) != 0)
 		return -1;
-	/* a copy: a callback that calls this handle overwrites the reply buffer */
-	own = (unsigned char *)dup_reply(p, (const char *)tr, tn);
-	if (!own)
-		return -1;
-	t.b = own;
+	t.b = tr;
 	t.n = tn;
 	t.o = 0;
 	if (hrt_arr(&t, &cnt) != 0 || cnt % 2) {
-		free(own);
 		return errk(p, PERFD_E_PROTOCOL, "bad reply");
 	}
 	for (i = 0; i < cnt; i += 2) {
@@ -370,13 +365,11 @@ int perfd_hgetall(perfd_t *p, const char *col, const char *key,
 		size_t fl, vl;
 
 		if (hrt_bulk(&t, &f, &fl) != 1 || hrt_bulk(&t, &v, &vl) != 1) {
-			free(own);
 			return errk(p, PERFD_E_PROTOCOL, "bad reply");
 		}
 		if (cb && cb(ctx, (const char *)f, fl, v, vl))
 			break;
 	}
-	free(own);
 	return (int)(cnt / 2);
 }
 
@@ -505,7 +498,6 @@ long long perfd_ttl(perfd_t *p, const char *col, const char *key)
 	p->err_kind = PERFD_E_NONE;        /* -1 is also "no expiry": this call's kind says */
 	if (bin_roundtrip(p, BV_TTL, col, key, NULL, 0, 0, 0, &r, &n) != 0)
 		return -1;
-	p->err_kind = PERFD_E_NONE;        /* answered: a fault the call recovered from is not this one */
 	if (!r || n < 8) {
 		
 		return errk(p, PERFD_E_PROTOCOL, "short reply");
@@ -649,8 +641,8 @@ int perfd_mget_ex(perfd_t *p, const char *col, const char *const *keys,
 
 /* keys come back as bytes and this API promises C strings, so a NUL inside
  * a key ends it there */
-static int keys_call(perfd_t *p, const char *col, const char *match, int limit,
-		char ***keys_out, int *flags)
+int perfd_keys(perfd_t *p, const char *col, const char *match, int limit,
+		char ***keys_out)
 {
 	struct pc_tw w;
 	struct pc_tv v;
@@ -696,13 +688,6 @@ static int keys_call(perfd_t *p, const char *col, const char *match, int limit,
 		
 		return errk(p, PERFD_E_NOMEM, "out of memory");
 	}
-	if (flags) {
-		/* a daemon before the flags says neither */
-		int tc = pc_tv_get(&v, 0, "complete");
-
-		*flags = (tc >= 0 && !pc_tv_get_bool(&v, 0, "complete") ? PERFD_KEYS_PARTIAL : 0) |
-			(pc_tv_get_bool(&v, 0, "truncated") ? PERFD_KEYS_TRUNCATED : 0);
-	}
 	for (i = 0; i < v.n[ta].len; i++) {
 		int e = pc_tv_at(&v, ta, i);
 		void *k;
@@ -715,20 +700,6 @@ static int keys_call(perfd_t *p, const char *col, const char *match, int limit,
 	
 	*keys_out = out;
 	return n;
-}
-
-int perfd_keys(perfd_t *p, const char *col, const char *match, int limit,
-		char ***keys_out)
-{
-	return keys_call(p, col, match, limit, keys_out, NULL);
-}
-
-int perfd_keys_ex(perfd_t *p, const char *col, const char *match, int limit,
-		char ***keys_out, int *flags)
-{
-	if (!flags)
-		return errk(p, PERFD_E_ARG, "perfd_keys_ex: no flags");
-	return keys_call(p, col, match, limit, keys_out, flags);
 }
 
 void perfd_free_keys(char **keys, int n)
@@ -916,58 +887,6 @@ int perfd_jset(perfd_t *p, const char *col, const char *key,
 	if (reply_bool(p, "jset", r, rn, "set", &ok) != 0)
 		return -1;
 	return ok ? 0 : errk(p, PERFD_E_REFUSED, "not set");
-}
-
-/* the daemon's words for a condition that did not hold: an error frame on its own path, set false
- * from a write-through collection */
-static int jset_declined(const perfd_t *p, int flags)
-{
-	if (flags & PERFD_JSET_NX)
-		return strstr(p->err, "value exists (nx)") != NULL;
-	return strstr(p->err, "no value at path") || strstr(p->err, "no such key");
-}
-
-int perfd_jset_ex(perfd_t *p, const char *col, const char *key,
-		const char *path, const char *json, long long ttl, int flags)
-{
-	struct pc_tw w;
-	char *r = NULL;
-	size_t rn;
-	int rc, ok = 0;
-
-	if (flags != 0 && flags != PERFD_JSET_NX && flags != PERFD_JSET_XX)
-		return errk(p, PERFD_E_ARG, "jset: flags are 0, PERFD_JSET_NX or PERFD_JSET_XX");
-	if (tw_scratch(p, &w, 288 + strlen(col) + strlen(key) + (path ? strlen(path) : 0) + strlen(json)) != 0)
-		return -1;
-	tw_ckp(&w, col, key, path);
-	pc_tw_key(&w, "val");
-	pc_tw_str(&w, json);
-	if (ttl > 0) {
-		pc_tw_key(&w, "ttl");
-		pc_tw_i64(&w, ttl);
-	}
-	if (flags) {
-		pc_tw_key(&w, flags == PERFD_JSET_NX ? "nx" : "xx");
-		pc_tw_bool(&w, 1);
-	}
-	pc_tw_end(&w);
-	if (tw_whole(p, &w) != 0)
-		return -1;
-	/* replayed after its reply was lost, it would meet its own write and answer declined */
-	p->once = flags != 0;
-	rc = roundtrip_key(p, "jset", w.b, w.n, col, key, &r, &rn);
-	p->once = 0;
-	pc_tw_free(&w);
-	if (rc != 0) {
-		if (!flags || p->err_kind != PERFD_E_SERVER || !jset_declined(p, flags))
-			return -1;
-		p->err[0] = 0;
-		p->err_kind = PERFD_E_NONE;
-		return 0;
-	}
-	if (reply_bool(p, "jset", r, rn, "set", &ok) != 0)
-		return -1;
-	return ok ? 1 : flags ? 0 : errk(p, PERFD_E_REFUSED, "not set");
 }
 
 int perfd_jdel(perfd_t *p, const char *col, const char *key,

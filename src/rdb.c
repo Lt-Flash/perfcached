@@ -15,7 +15,6 @@
 #include "quiesce.h"
 #include "compat/timer.h"
 #include "core/pcache_htable.h"
-#include "core/pcache_arena.h"          /* PCACHE_CELL_MAX: a record's ceiling */
 #include "store.h"
 #include "wal.h"
 #include "rdb.h"
@@ -66,41 +65,15 @@ struct wr {
 	int failed;
 };
 
-/* tests only: PERFCACHED_TEST_RDB_WRITE_FAIL=<file> - while it exists, a snapshot's
- * writes fail as on a full volume */
-static int rdb_test_write_fail(void)
-{
-	static int init;
-	static const char *path;
-
-	if (!init) {
-		path = getenv("PERFCACHED_TEST_RDB_WRITE_FAIL");
-		init = 1;
-	}
-	return path && access(path, F_OK) == 0;
-}
-
 static void wr_flush(struct wr *w)
 {
 	size_t off = 0;
 
-	if (w->failed) {
-		w->n = 0;
-		return;
-	}
 	while (off < w->n) {
-		ssize_t r;
-
-		if (rdb_test_write_fail()) {
-			errno = ENOSPC;
-			r = -1;
-		} else {
-			r = write(w->fd, w->buf + off, w->n - off);
-		}
+		ssize_t r = write(w->fd, w->buf + off, w->n - off);
 
 		if (r <= 0) {
-			w->failed = 1;             /* the save fails: nothing more goes out */
-			w->n = 0;
+			w->failed = 1;
 			return;
 		}
 		off += (size_t)r;
@@ -121,8 +94,6 @@ static void wr_put(struct wr *w, const void *p, size_t n)
 {
 	const unsigned char *b = p;
 
-	if (w->failed)
-		return;
 	w->crc = pc_crc32c(w->crc, b, n);
 	w->total += n;
 	while (n) {
@@ -429,7 +400,6 @@ void pc_rdb_thread(volatile int *stop)
 		int fire = 0, i;
 
 		usleep(250 * 1000);
-		pcache_arena_flush_if_asked();
 		if (!R.enabled || R.hold)
 			continue;
 		if (R.save_req)
@@ -588,24 +558,6 @@ static size_t read_max(void)
 	return m;
 }
 
-int pc_rdb_rec_fits(const unsigned char *data, size_t n, size_t off,
-		uint32_t fmt, uint32_t *kl, uint32_t *vl)
-{
-	size_t end = n - 4, rhdr = PC_RDB_RHDR(fmt);
-
-	if (off > end || end - off < rhdr)
-		return 0;
-	*kl = rd32(data + off);
-	*vl = rd32(data + off + 4);
-	return *kl <= 0xFFFF && *vl <= PCACHE_CELL_MAX &&
-		(size_t)*kl + *vl <= end - off - rhdr;
-}
-
-int pc_rdb_col_fits(const unsigned char *data, size_t n, size_t off)
-{
-	return off < n - 4 && (size_t)data[off] < n - 4 - off;
-}
-
 ssize_t pc_rdb_read_all(int fd, void *buf, size_t n)
 {
 	size_t got = 0;
@@ -682,16 +634,20 @@ long pc_rdb_validate(const char *dir, unsigned long long *marker,
 		if (tag == 0xFF)
 			break;
 		if (tag == 1) {
-			if (!pc_rdb_col_fits(data, n, off))
+			if (off >= n - 4)
 				goto torn;
 			off += 1u + data[off];
 			cols++;
 		} else if (tag == 2) {
 			uint32_t kl, vl;
 
-			if (!pc_rdb_rec_fits(data, n, off, fmt, &kl, &vl))
+			if (off + rhdr > n - 4)
 				goto torn;
-			off += (size_t)rhdr + kl + vl;
+			kl = rd32(data + off);
+			vl = rd32(data + off + 4);
+			off += rhdr + kl + vl;
+			if (off > n - 4)
+				goto torn;
 			recs++;
 		} else {
 			goto torn;

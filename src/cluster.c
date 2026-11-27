@@ -80,7 +80,6 @@
 #include "clddl.h"                   /* the collection DDL */
 #include "clfound.h"
 #include "clane.h"                   /* the frame lane */
-#include "clprobe.h"                 /* the lane probes' table */
 #include "clmemb.h"                  /* the keepalive frame layouts */
 #include "proto.h"                      /* the door gauges */
 #include "clpull.h"                  /* the PULL plane frame layouts */
@@ -107,11 +106,11 @@
 
 /* the watchdog re-sends the last stored keepalive and clwire_beat_store() silently drops one that
  * does not fit, so an outgrown frame would re-broadcast a stale claim: caught at compile time */
-_Static_assert(CLMEMB_ALIVE_BUF <= sizeof ((struct clwire *)0)->alive,
+_Static_assert(CLMEMB_ALIVE_MAX <= sizeof ((struct clwire *)0)->alive,
 	"ALIVE outgrew clwire's beat buffer - clwire_beat_store would drop it");
 _Static_assert(PC_CFGSIG_MAX == CLMEMB_CFG_MAX,
 	"the settings the cluster keeps must be the ones the keepalive carries");
-_Static_assert(CLMEMB_MALIVE_BUF <= sizeof ((struct clwire *)0)->malive,
+_Static_assert(CLMEMB_MALIVE_LEN <= sizeof ((struct clwire *)0)->malive,
 	"MASTER_ALIVE outgrew clwire's beat buffer - it would be dropped");
 
 #define SHARD_GRACE_S  30              /* after a membership change (extended while reshard
@@ -290,7 +289,6 @@ static struct {
 	/* the map's placeable set matches what this node sees as live; cached, since
 	 * placement is on the request path */
 	int map_usable;
-	unsigned int map_gen;          /* odd while map is rewritten (map_set) */
 	/* the master's record of identities this cluster has seen: NEW vs RETURNING is
 	 * no judgement a node can make about itself (a wiped state dir believes it is new) */
 	struct pc_clhist hist;
@@ -334,10 +332,6 @@ static struct {
 	int rejoin_on;
 	int rejoin_whole;              /* the survivor picked is short of no delete: so are its fallbacks */
 	long long surv_since;          /* a survivor's pick waits on marks too fresh to judge, since (ms) */
-	/* RECOVERING from its ONLINE (or a copy's end) until the open pass first rules: what it
-	 * replayed is never served before a survivor's copy replaces it */
-	int decide_on;
-	long long decide_ms;
 	int snap_due;
 	/* the copy counts once the node that served it (rejoin_src, the bulk thread's) is heard
 	 * again at the incarnation it had when picked, still a survivor */
@@ -418,25 +412,12 @@ static int self_no_promote;
 /* PERFCACHED_TEST_RECONCILE: a restart's or a floor's records are ruled on one by one with a
  * witness, as before 12ol, so the suites of that pass and its hold can reach it */
 static int self_test_reconcile;
-/* PERFCACHED_TEST_SURVIVOR_WAIT_MS: a rejoin's survivor is picked no sooner after the first ask, so a
- * suite sees what the node serves once admitted and before its copy */
-static int self_survivor_wait_ms;
 /* PERFCACHED_TEST_BOOT_DELAY_MS: this node's first bootstrap pull waits, so a suite can stop its
  * sources mid-copy */
 static int self_boot_delay_ms;
-/* PERFCACHED_TEST_RECONCILE_WALK_WAIT_MS: a narrowed reconcile pass waits before it walks, so a
- * suite can reach the pass between its digests and its walk */
-static int self_recon_walk_wait_ms;
-/* PERFCACHED_TEST_MIG_SCAN_RECS: a migration walk stops after this many records as at its
- * deadline, so a suite reaches a table too large for one tick's walk */
-static unsigned int self_mig_scan_recs;
-/* PERFCACHED_TEST_WALK_NOMEM_MS: for this long after the start the sweep and migration walks fail
- * as when their buffers cannot be allocated */
-static long long self_walk_nomem_until;
 /* a member's election defers to a live higher address; since when,
  * and to which.  Cleared by a master beacon followed, and by promoting */
 static long long elect_defer_ms;
-static long long elect_warned_ms;     /* the deferral the bound already said it ran out */
 static pc_addr elect_defer_to;
 
 
@@ -1350,12 +1331,12 @@ void pc_loc_clear(const char *col, size_t cn, const char *key, size_t kn)
 
 /* ---- the config identity: every ALIVE carries a digest of the interchange config (mode, its
  * parameters, the collection SET); disagreeing nodes never exchange.  Local sizing is not in it */
-static uint64_t digest_of(int cfg_only)
+static uint64_t config_digest(void)
 {
 	const char *names[PC_MAX_COLLECTIONS];
 	char ro[PC_MAX_COLLECTIONS][PC_COL_NAME_MAX + 4];
 	struct clinit_digest_in in;
-	int i, k = 0, n = pc_store_count();
+	int i, n = pc_store_count();
 
 	/* a mismatch would fold a different number of collections on one side of an
 	 * upgrade and refuse every join */
@@ -1370,16 +1351,13 @@ static uint64_t digest_of(int cfg_only)
 	/* upstream_writes = refuse must be agreed on, so a refusing collection is
 	 * digested as <name>!ro; without the flag the digest is unchanged */
 	for (i = 0; i < n; i++) {
-		const char *nm = cfg_only ? pc_store_cfg_name(i) : pc_store_name(i);
+		const char *nm = pc_store_name(i);
 
-		if (cfg_only && !nm)
-			continue;
-		names[k] = nm;
+		names[i] = nm;
 		if (nm && pc_upstream_refuses_writes(nm, strlen(nm))) {
-			snprintf(ro[k], sizeof ro[k], "%s!ro", nm);
-			names[k] = ro[k];
+			snprintf(ro[i], sizeof ro[i], "%s!ro", nm);
+			names[i] = ro[i];
 		}
-		k++;
 	}
 	in.mode = C.cfg_mode;
 	in.eager = C.cfg_eager;
@@ -1387,29 +1365,8 @@ static uint64_t digest_of(int cfg_only)
 	in.wal = C.cfg_wal;
 	in.route_algo = PC_ROUTE_ALGO;
 	in.names = names;
-	in.n_names = k;
+	in.n_names = n;
 	return clinit_config_digest(&in);
-}
-
-/* every name in the registry, runtime creates included: what a 0.7.5 peer compares */
-static uint64_t config_digest(void)
-{
-	return digest_of(0);
-}
-
-/* the config's collection set alone: a runtime create is agreed by its announce, and folding it
- * here split the fleet while the announce was on its way (cfg2 on the wire) */
-static uint64_t config_digest2(void)
-{
-	return digest_of(1);
-}
-
-/* a peer's interchange config differs from ours: by the config's set when it sends one, else
- * (an older build) by the digest that folds every name; @ours gets the one compared */
-static int digest_differs(int have2, uint64_t theirs2, uint64_t theirs, uint64_t *ours)
-{
-	*ours = have2 ? config_digest2() : config_digest();
-	return (have2 ? theirs2 : theirs) != *ours;
 }
 
 void pc_cluster_set_config(int mode, int eager,
@@ -1714,7 +1671,7 @@ int pc_cluster_members(struct pc_member *out, int max)
 /* Loud, but once per peer address: a mismatching node retries its ALIVE
  * every second and must not turn the log into a flood. */
 static void shout_mismatch(const pc_addr *from, int their_mode,
-		int their_eager, uint64_t theirs, uint64_t ours, int their_wal)
+		int their_eager, uint64_t theirs, int their_wal)
 {
 	int i, slot = -1;
 
@@ -1770,7 +1727,7 @@ static void shout_mismatch(const pc_addr *from, int their_mode,
 		C.cfg_mode == PC_MODE_SPREAD ? "spread" :
 		C.cfg_mode == PC_MODE_SHARD ? "shard" : "store",
 		C.cfg_eager, PC_ROUTE_ALGO,
-		(unsigned long long)ours,
+		(unsigned long long)config_digest(),
 		C.cfg_authoritative ? "" :
 		"  (neither side declares [cluster] collections - without it "
 		"nothing can be checked beyond this digest)",
@@ -2027,8 +1984,6 @@ int pc_cluster_col_fleet(int store, int basis, struct pc_col_fleet *out)
 	return 1;
 }
 
-static unsigned int self_entries_bias;  /* PERFCACHED_TEST_ENTRIES_BIAS: a peer ahead for good */
-
 static unsigned int self_entries(void)
 {
 	unsigned long long n = 0;
@@ -2096,54 +2051,6 @@ const char *pc_cluster_master_prefer(int node)
 	else
 		LM_NOTICE("cluster: the operator cancels the handover\n");
 	return NULL;
-}
-
-/* the operator's forget: ids queued by the verb, dropped from the reservations on the beat */
-static unsigned long long forget_q[(PC_CL_NODE_MAX + 64) / 64];
-static unsigned int forget_gen;
-
-const char *pc_cluster_forget(int node)
-{
-	if (!C.enabled)
-		return "this node is not clustered";
-	if (node < 1 || node > PC_CL_NODE_MAX)
-		return "forget wants {\"node\": <a departed member's node id>}";
-	if (node == C.node_id)
-		return "that is this node";
-	if (peer_by_node(node))
-		return "a member here now - stop it, and forget it once it has left";
-	if (!clres_holds(&reserved, node, now_ms()))
-		return "no departed member holds that id here";
-	__atomic_fetch_or(&forget_q[node / 64], 1ULL << (node % 64),
-		__ATOMIC_RELEASE);
-	return NULL;
-}
-
-unsigned int pc_cluster_forget_gen(void)
-{
-	return __atomic_load_n(&forget_gen, __ATOMIC_ACQUIRE);
-}
-
-static void forget_tick(void)
-{
-	unsigned int w;
-	int b, id;
-
-	for (w = 0; w < sizeof forget_q / sizeof forget_q[0]; w++) {
-		unsigned long long q = __atomic_exchange_n(&forget_q[w], 0,
-			__ATOMIC_ACQ_REL);
-
-		for (b = 0; q && b < 64; b++) {
-			if (!(q & (1ULL << b)))
-				continue;
-			id = (int)(w * 64 + (unsigned int)b);
-			if (peer_by_node(id) || !clres_drop(&reserved, id))
-				continue;              /* back since the ask */
-			LM_NOTICE("cluster: node %d forgotten by the operator - its id is "
-				"free and it is no longer listed\n", id);
-			__atomic_add_fetch(&forget_gen, 1, __ATOMIC_RELEASE);
-		}
-	}
 }
 
 /* ---- completion queues (clpend) ---------------------------------------- */
@@ -2287,7 +2194,7 @@ static void spread_ack_drop(struct clpush_ack *a, unsigned int stored)
 {
 	extern void pc_wal_del(const char *, const char *, int);
 	const unsigned char *r = a->nh, *end = a->nh + a->nhlen;
-	pcache_htable_t *ht = NULL, *f = NULL, *o = NULL;
+	pcache_htable_t *ht = NULL, *sh = NULL;
 	const unsigned char *htcol = NULL;
 	unsigned int htcollen = 0, dropped = 0;
 
@@ -2302,7 +2209,7 @@ static void spread_ack_drop(struct clpush_ack *a, unsigned int stored)
 		const unsigned char *col = r + 11, *key = col + collen;
 		char colz[256];
 		str k;
-		int b, live;
+		int b;
 
 		if (key + klen > end)
 			break;
@@ -2313,7 +2220,7 @@ static void spread_ack_drop(struct clpush_ack *a, unsigned int stored)
 		if (!htcol || collen != htcollen ||
 		        memcmp(col, htcol, collen) != 0) {
 			ht = pc_store_find((const char *)col, collen);
-			f = ht ? pc_store_del_order(ht, &o) : NULL;
+			sh = ht ? pc_store_resize_shadow(ht) : NULL;
 			htcol = col;
 			htcollen = collen;
 		}
@@ -2323,12 +2230,9 @@ static void spread_ack_drop(struct clpush_ack *a, unsigned int stored)
 		k.len = (int)klen;
 		/* version-guarded under the bucket lock, and from the table
 		 * a resize is filling too */
-		if (f != ht)                       /* the copier's source first */
-			(void)pcache_ht_remove_below(f, &k, ver + 1);
-		live = pcache_ht_remove_below(ht, &k, ver + 1) == 1;
-		if (f == ht && o)
-			(void)pcache_ht_remove_below(o, &k, ver + 1);
-		if (live) {
+		if (sh)
+			(void)pcache_ht_remove_below(sh, &k, ver + 1);
+		if (pcache_ht_remove_below(ht, &k, ver + 1) == 1) {
 			memcpy(colz, col, collen);
 			colz[collen] = 0;
 			pc_wal_del(colz, (const char *)key, (int)klen);
@@ -2675,10 +2579,11 @@ static void send_demote(int loser_node, int winner_node, const char *col,
  * already carried comes back at the swap */
 static int store_remove(pcache_htable_t *ht, const str *k)
 {
-	pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
-	int rs = pcache_ht_remove(f, k);                /* the copier's source first */
+	pcache_htable_t *sh = pc_store_resize_shadow(ht);
 
-	return (o ? pcache_ht_remove(o, k) : 0) == 1 || rs == 1;
+	if (sh)
+		(void)pcache_ht_remove(sh, k);
+	return pcache_ht_remove(ht, k);
 }
 
 /* as store_remove, with the delete's version stamped under the live
@@ -2686,15 +2591,11 @@ static int store_remove(pcache_htable_t *ht, const str *k)
 static int store_remove_ver(pcache_htable_t *ht, const str *k,
 		unsigned long long *ver)
 {
-	pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
-	int rc, rs = 0;
+	pcache_htable_t *sh = pc_store_resize_shadow(ht);
 
-	if (f != ht)                                    /* the copier's source first */
-		rs = pcache_ht_remove(f, k);
-	rc = pcache_ht_remove_ver(ht, k, ver) == 1;
-	if (f == ht && o)
-		rs = pcache_ht_remove(o, k);
-	return rc || rs == 1;
+	if (sh)
+		(void)pcache_ht_remove(sh, k);
+	return pcache_ht_remove_ver(ht, k, ver);
 }
 
 /* a birth race: two holders at different versions - the loser demoted in
@@ -2884,15 +2785,11 @@ static void handle_pull_rsp(const unsigned char *pt, size_t n)
 			 * bucket lock (remove_below), so a newer write landing here is kept */
 			/* and from the table a resize is filling: the copier may already
 			 * have carried this record across */
-			pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
-			int live;
+			pcache_htable_t *sh = pc_store_resize_shadow(ht);
 
-			if (ver && f != ht)            /* the copier's source first */
-				(void)pcache_ht_remove_below(f, &k, ver + 1);
-			live = ver && pcache_ht_remove_below(ht, &k, ver + 1) == 1;
-			if (ver && f == ht && o)
-				(void)pcache_ht_remove_below(o, &k, ver + 1);
-			if (live) {
+			if (ver && sh)
+				(void)pcache_ht_remove_below(sh, &k, ver + 1);
+			if (ver && pcache_ht_remove_below(ht, &k, ver + 1) == 1) {
 				memcpy(colz, a.col, a.collen);
 				colz[a.collen] = 0;
 				pc_wal_del(colz, a.key, (int)a.klen);
@@ -2984,10 +2881,7 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 				pc_neg_clear(colz, cn, k.s, (size_t)kn);
 			}
 		} else if (op == 1) {
-			int dead;
-
 			ok = store_remove_ver(ht, &k, &dver) == 1;
-			dead = ok && pcache_last_del_dead;
 			if (ok) {
 				/* logged below - numbered where it is sent */
 				pc_neg_set(colz, cn, k.s, kn, C.tombstone_ms);
@@ -3000,7 +2894,6 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 				else
 					pc_wal_del(colz, k.s, k.len);
 			}
-			ok = ok && !dead;    /* past its deadline: removed, acked absent as a DEL */
 		} else if (op == 2) {
 			/* PCACHE_EXP_PRESERVE = the Redis INCR contract: keep the
 			 * holder's existing expiry, WAL the effective one */
@@ -3181,9 +3074,8 @@ static int handle_tombstone(const unsigned char *pt, size_t n)
 		if (ht) {
 			k.s = (char *)fk.key;
 			k.len = (int)kn;
-			pcache_htable_t *o, *f = pc_store_del_order(ht, &o);
-
-			removed = clorder_del(f, o, &k, ver);
+			removed = clorder_del(ht, pc_store_resize_shadow(ht), &k,
+				ver);
 		}
 		/* a numbered delete is logged with its number and counted whether or not a
 		 * copy went: a newer write or no copy is still this node holding it */
@@ -3832,10 +3724,6 @@ void peer_publish(struct peer *p, int node, unsigned int free_mb,
 		memset(p->repl_cursor, 0, sizeof p->repl_cursor);
 		memset(p->repl_dirty, 0, sizeof p->repl_dirty);
 		memset(p->repl_bfcycle, 0, sizeof p->repl_bfcycle);
-		memset(p->askfill, 0, sizeof p->askfill);
-		memset(p->dsync, 0, sizeof p->dsync);
-		memset(p->dsync_stall, 0, sizeof p->dsync_stall);
-		memset(p->dsync_prev, 0, sizeof p->dsync_prev);
 		/* the sweep sends only AUTHORED records (copies would echo), so an empty node needs
 		 * a ONE-SHOT pass that includes copies, bounded to one clean cycle */
 		/* armed by the start kind it reports (PC_START_*), never its count; COLD arms only
@@ -3867,15 +3755,10 @@ void peer_publish(struct peer *p, int node, unsigned int free_mb,
 				"records - re-placing its share from every holder "
 				"(its copies came from a snapshot and may be older)\n",
 				node, entries);
-		} else if (incarn && start == PC_START_RECOVERED) {
-			/* its sweeps from mark 0 carry only what live peers authored: the copies
-			 * it lacks or holds older come by the diff, slot by slot */
-			memset(p->dsync, 1, sizeof p->dsync);
-			C.px.dsync_armed++;
+		} else if (incarn && start == PC_START_RECOVERED)
 			LM_NOTICE("cluster: node %d restarted holding %u records "
-				"recovered from its WAL - diffing it (the slots that "
-				"differ, copies included)\n", node, entries);
-		}
+				"recovered from its WAL - NOT backfilling (a recovered "
+				"node needs a diff, not a blind push)\n", node, entries);
 		else if (incarn && start == PC_START_UNKNOWN)
 			LM_NOTICE("cluster: node %d (older build) restarted holding "
 				"%u records - NOT backfilling (judged by its count: a "
@@ -3933,7 +3816,7 @@ uint64_t member_digest(void)
 
 static void send_join_req(const pc_addr *to)
 {
-	unsigned char msg[CLMEMB_JOINREQ_BUF];
+	unsigned char msg[CLMEMB_JOINREQ_LEN];
 	struct clmemb_joinreq j;
 
 	memset(&j, 0, sizeof j);
@@ -3943,8 +3826,6 @@ static void send_join_req(const pc_addr *to)
 	j.mode = C.cfg_mode;
 	j.eager = C.cfg_eager;
 	j.cfg_digest = config_digest();
-	j.cfg2 = 1;
-	j.cfg_digest2 = config_digest2();
 	/* a proposal only: the master rejects it if taken (two identities may hash alike) */
 	j.ident = C.self_ident;
 	j.proposed = C.proposed_id;
@@ -4012,28 +3893,6 @@ int pc_cluster_cfgsig(const struct pc_cfgsig **e)
 	return ncfgsig;
 }
 
-/* PC_BUILD_REV's first 7 hex digits (git's shortest abbreviation, so every build has them) as a
- * word: 1, or 0 for a rev too short or not hex */
-static int build_rev_word(uint32_t *w)
-{
-	const char *r = PC_BUILD_REV;
-	uint32_t v = 0;
-	int i;
-
-	for (i = 0; i < 7; i++) {
-		char c = r[i];
-
-		if (c >= '0' && c <= '9')
-			v = v << 4 | (uint32_t)(c - '0');
-		else if (c >= 'a' && c <= 'f')
-			v = v << 4 | (uint32_t)(c - 'a' + 10);
-		else
-			return 0;
-	}
-	*w = v;
-	return 1;
-}
-
 /* this node's facts, after its settings, in @name/@val from @at; returns the new count */
 static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int features)
 {
@@ -4053,8 +3912,6 @@ static int put_facts(uint32_t *name, uint32_t *val, int at, int cap, int feature
 		name[at] = PC_FACT_AUTOSCALE;
 		val[at++] = pc_store_autoscale_sig(NULL);
 	}
-	if (at < cap && build_rev_word(&val[at]))
-		name[at++] = PC_FACT_REV;
 	return at;
 }
 
@@ -4091,7 +3948,7 @@ int pc_member_fact(const struct pc_member *m, uint32_t key, uint32_t *val)
 
 void send_alive(void)
 {
-	unsigned char msg[CLMEMB_ALIVE_BUF];
+	unsigned char msg[CLMEMB_ALIVE_MAX];
 	struct clmemb_alive a;
 	size_t len;
 
@@ -4107,14 +3964,12 @@ void send_alive(void)
 	a.mode = C.cfg_mode;
 	a.eager = C.cfg_eager;
 	a.cfg_digest = config_digest();
-	a.cfg2 = 1;                        /* written behind the ext group */
-	a.cfg_digest2 = config_digest2();
 	a.client_port = C.cfg_client_port;
 	/* identity, incarnation and all after them are additive tail fields: an older peer reads
 	 * the prefix it knows and ignores the rest (clmemb's gates) */
 	a.ident = C.self_ident;
 	a.incarn = C.self_incarn;
-	a.entries = self_entries() + self_entries_bias;
+	a.entries = self_entries();
 	/* the Lamport clock rides the heartbeat: every node folds in every other's at 1 Hz,
 	 * so the fleet converges with no extra traffic */
 	a.lamport = pc_lamport_now();
@@ -4607,18 +4462,10 @@ static int all_live_eager(void)
 	return any;
 }
 
-/* T600: the counts alone never settle while the peers hold records no client reads (a 7k gap
- * stood on PROD for hours, every miss parked on a pull) - so the pulls' own answers decide too */
-#define CATCHUP_EVIDENCE   1000        /* pull answers per window */
-#define CATCHUP_HIT_PCT    1           /* at most this share found a record: the doubt is spent */
-#define CATCHUP_MIN_MS     (4 * WITNESS_GRACE_MS)  /* the sweeps' re-sends land first */
-
 static void eager_catchup_tick(long long now)
 {
-	static unsigned long long h0, m0;
-	unsigned long long dh, dm;
-	unsigned int mine, most = 0;
-	int i, seen = 0, behind = 0;
+	unsigned int mine;
+	int i, seen = 0;
 
 	if (__atomic_load_n(&eager_caught_up, __ATOMIC_RELAXED))
 		return;
@@ -4635,40 +4482,12 @@ static void eager_catchup_tick(long long now)
 		if (!__atomic_load_n(&p->node, __ATOMIC_ACQUIRE) ||
 		        !clpeers_live(p, now) || p->nstate != PC_NST_READY)
 			continue;
-		if (p->entries > mine) {
-			behind = 1;            /* behind this peer: keep asking */
-			if (p->entries > most)
-				most = p->entries;
-		}
+		if (p->entries > mine)
+			return;                /* behind this peer: keep asking */
 		seen++;
 	}
-	if (!seen) {
-		h0 = C.st.pull_hits;       /* nobody to compare with yet */
-		m0 = C.st.pull_misses;
-		return;
-	}
-	if (behind) {
-		long long t0 = __atomic_load_n(&eager_settle_ms, __ATOMIC_RELAXED);
-
-		if (!t0 || now - t0 < CATCHUP_MIN_MS) {
-			h0 = C.st.pull_hits;   /* the window opens after it */
-			m0 = C.st.pull_misses;
-			return;
-		}
-		dh = C.st.pull_hits - h0;
-		dm = C.st.pull_misses - m0;
-		if (dh + dm < CATCHUP_EVIDENCE)
-			return;
-		h0 = C.st.pull_hits;
-		m0 = C.st.pull_misses;
-		if (dh * 100 > (dh + dm) * CATCHUP_HIT_PCT)
-			return;            /* the peers still hold what it lacks */
-		__atomic_store_n(&eager_caught_up, 1, __ATOMIC_RELAXED);
-		LM_NOTICE("cluster: caught up - holding %u record(s) to a peer's %u, but %llu of "
-			"the last %llu pull answers found nothing this node lacks; an eager miss "
-			"here is final from now on\n", mine, most, dm, dh + dm);
-		return;
-	}
+	if (!seen)
+		return;                    /* nobody to compare with yet */
 	__atomic_store_n(&eager_caught_up, 1, __ATOMIC_RELAXED);
 	LM_NOTICE("cluster: caught up - holding %u record(s), as many as every "
 		"live peer; an eager miss here is final from now on\n", mine);
@@ -4743,8 +4562,6 @@ static void eager_doubt_tick(long long now, int own)
 	__atomic_store_n(&eager_doubt_n, n, __ATOMIC_RELEASE);
 }
 
-static void askfill_tick(long long now);
-
 static void eager_settle_tick(long long now)
 {
 	long long t = __atomic_load_n(&eager_settle_ms, __ATOMIC_RELAXED);
@@ -4753,7 +4570,6 @@ static void eager_settle_tick(long long now)
 		__atomic_store_n(&eager_settle_ms, (t = now), __ATOMIC_RELAXED);
 	eager_doubt_tick(now, now - t < WITNESS_GRACE_MS);
 	eager_catchup_tick(now);
-	askfill_tick(now);
 }
 
 int pc_cluster_eager_miss_final(void)
@@ -4807,7 +4623,6 @@ static struct peer *resync_source(long long now)
 
 static void resync_arm(void)
 {
-	C.decide_on = 0;                   /* the copy's end reports ready */
 	C.resync_on = 1;
 	C.resync_dropped_now = 0;
 	C.rec_col = 0;
@@ -4829,19 +4644,6 @@ static void resync_begin(const struct peer *src, const char *why)
 }
 
 #define SURVIVOR_STILL_MS 3000
-#define DECIDE_MAX_MS 10000
-
-/* the hold ends with no copy to wait for: READY, serving the records the pass still rules on, as
- * before the hold; @why when it ran out */
-static void decide_end(const char *why)
-{
-	C.decide_on = 0;
-	if (why)
-		LM_WARN("cluster: %s - ready, serving its records while the fleet rules on them\n",
-			why);
-	if (C.role != PC_ROLE_JOINING)
-		pc_node_state_set(PC_NST_READY);
-}
 
 struct spcs { struct { uint64_t oid; uint32_t incarn; } v[256]; int n; };
 
@@ -4914,15 +4716,7 @@ static struct peer *survivor(long long now, int *whole, int *wait)
 	struct spcs s;
 	int i, final, sh;
 	long long open = -1;               /* the most records an undecided witness holds */
-	static long long first_ask;
 
-	if (!first_ask)
-		first_ask = now;
-	if (self_survivor_wait_ms && now - first_ask < self_survivor_wait_ms) {
-		*whole = 0;
-		*wait = 1;
-		return NULL;
-	}
 	if (!C.surv_since || now - C.surv_since > 4 * SURVIVOR_STILL_MS)
 		C.surv_since = now;            /* this pick's first ask, not an earlier pass's */
 	final = now - C.surv_since >= SURVIVOR_STILL_MS;
@@ -5020,14 +4814,6 @@ static void rejoin_verify(void)
 		return;
 	}
 	__atomic_store_n(&C.rejoin_src, 0, __ATOMIC_RELEASE);
-	if (C.reconcile_on && C.cfg_eager && !self_test_reconcile) {
-		/* a pass asked during the copy rules first: no READY between two copies */
-		LM_NOTICE("cluster: rejoin - node %d is still the survivor that served the "
-			"copy; a pass asked during it rules before this node serves\n", node);
-		C.decide_on = 1;
-		C.decide_ms = now_ms();
-		return;
-	}
 	LM_NOTICE("cluster: rejoin - node %d is still the survivor that served the "
 		"copy; ready\n", node);
 	pc_node_state_set(PC_NST_READY);
@@ -5035,8 +4821,7 @@ static void rejoin_verify(void)
 
 struct rs_ctx {
 	pcache_htable_t *ht;
-	const char *col;
-	int n, cap, nf;
+	int n, cap;
 	str *k;
 };
 
@@ -5052,11 +4837,6 @@ static int resync_cb(const str *key, const str *val, unsigned int exp,
 	/* only a record in question (recovered, or stored before a rebuilt
 	 * member's absence): one written since is this node's own */
 	if (pcache_ht_getmeta(r->ht, key, &v, &wt) != 0 || !rec_held(wt))
-		return 0;
-	/* a write-through mark goes with its record, never alone: the record's walk may have
-	 * passed before the boundary moved up past both */
-	if (r->nf && pc_upstream_mark_held(r->col, strlen(r->col), key->s,
-	        (size_t)key->len))
 		return 0;
 	if (r->n == r->cap) {
 		int nc = r->cap ? r->cap * 2 : 64;
@@ -5113,8 +4893,6 @@ static void resync_step(long long now)
 			continue;
 		}
 		r.ht = ht;
-		r.col = pc_store_name(C.rec_col);
-		r.nf = pc_upstream_binds(r.col, strlen(r.col)) == 2;
 		r.n = 0;
 		pc_store_scan(ht, &C.rec_cursor, RECONCILE_BUCKETS,
 			PCACHE_SCAN_NOVAL, resync_cb, &r);
@@ -5184,8 +4962,6 @@ static int reconcile_find_witness(void)
 			"fleet about %ld replayed record(s)\n", node,
 			(C.recon.death_mono - p->boot_ms) / 1000,
 			pc_recovered_records());
-		if (C.decide_on)
-			decide_end(NULL);      /* ruled on one by one: served meanwhile, as before */
 		return 1;
 	}
 	/* back from a split with no witness (peers up through it, none long enough before it):
@@ -5205,8 +4981,6 @@ static int reconcile_find_witness(void)
 			"is deleted.  "
 			"A key deleted during the outage, if there was one, "
 			"stays\n", live);
-		if (C.decide_on)
-			decide_end(NULL);
 	}
 	return 0;
 }
@@ -5633,11 +5407,6 @@ static void reconcile_tick(void)
 	}
 	if (C.snap_due && pc_rdb_request_save() == 0)
 		C.snap_due = 0;
-	if (C.decide_on && (!C.reconcile_on || !C.cfg_eager))
-		decide_end(NULL);                  /* the pass closed with no copy */
-	else if (C.decide_on && now_ms() - C.decide_ms > DECIDE_MAX_MS)
-		decide_end("no ruling in 10 s on whether a peer up through this node's absence holds "
-			"the fleet's state");
 	if (!C.reconcile_on || !C.cfg_eager) {
 		clrecon_nowit_stop(&C.recon);
 		C.st.reconcile_no_witness_s = 0;
@@ -5746,12 +5515,9 @@ static void clmap_recheck_usable(void)
 
 		if (!id || id == C.node_id || !clpeers_live(p, now))
 			continue;
-		nd = pc_clmap_find(&C.map, (uint16_t)id);
-		/* a FAILED member owns nothing: a map that leaves it out agrees (STALLED passes) */
-		if (p->nstate == PC_NST_FAILED && !pc_clmap_placeable(nd))
-			continue;
 		live++;
-		if (pc_clmap_placeable(nd))
+		nd = pc_clmap_find(&C.map, (uint16_t)id);
+		if (nd && pc_clmap_placeable(nd))
 			ok++;
 	}
 	/* every live node placeable, and nothing placeable we cannot see */
@@ -5792,37 +5558,28 @@ static int clmap_membership_moved(void)
 	return want != C.map.nnodes;       /* or someone went away */
 }
 
-/* fold in a peer's term: followed at once, written by pc-maint - the node claims nothing above it
- * until it is on disk (become_master), and a refused write is said by the membership tick */
+/* fold in a peer's term; one it could not persist is still followed, and said once per term -
+ * the node stands for no election until the tick's retry stores it */
 static void term_seen(uint32_t t)
 {
-	(void)pc_term_observe(t);
+	static uint32_t said;
+
+	if (pc_term_observe(t) == PC_TERM_UNSAVED && said != t) {
+		said = t;
+		LM_CRIT("cluster: could not persist mastership term %u (%s) - "
+			"following it, but this node takes no mastership until "
+			"it is on disk (check the state directory)\n", t,
+			strerror(pc_term_store_errno()));
+	}
 }
 
 /* build, stage to the standby, broadcast only once it acked: the standby is never BEHIND the
  * fleet.  No standby = publish at once; a hung stage is abandoned and its seq never reused. */
-/* the workers rank by C.map with no lock: the copy runs between two generation bumps, and a reader
- * that saw the generation odd or changed reads again (cl_map_gen) */
-static void map_set(const struct pc_clmap *m)
-{
-	__atomic_store_n(&C.map_gen, C.map_gen + 1, __ATOMIC_RELAXED);
-	__atomic_thread_fence(__ATOMIC_RELEASE);
-	C.map = *m;
-	__atomic_store_n(&C.map_gen, C.map_gen + 1, __ATOMIC_RELEASE);
-}
-
-/* a mastership claim that could not be stored: no map until claim_term lands it */
-static int claim_owed;
-static int claim_term(void);
-
 static void clmap_stage(void)
 {
 	uint32_t seq = 0;
 
 	if (C.role != PC_ROLE_MASTER)
-		return;
-	/* a claim not stored yet: the term in hand is the last master's, so retried each beat */
-	if (claim_owed && !claim_term())
 		return;
 	if (!pc_term_current()) {
 		/* no term claimed: a map under term 0 would be unorderable
@@ -5863,7 +5620,7 @@ static void clmap_publish(void)
 		return;                    /* retry on the next tick */
 	pc_clsync_published(&C.sync);
 	spread_note_placeable(&C.staged);
-	map_set(&C.staged);
+	C.map = C.staged;
 	C.map_valid = 1;
 	C.map_pub_ms = now_ms();
 	C.map_pub_n++;
@@ -5976,7 +5733,6 @@ static int sender_gate(int type, const pc_addr *from)
 	case M_TOMBSTONE:
 	case M_PUBLISH:
 	case M_DEMOTE:
-	case M_ASKFILL:
 		/* ... except on a joiner: restarted inside the purge window it knows nobody,
 		 * yet the map still forwards its keys' writes to it; refused, each times out */
 		return C.role == PC_ROLE_JOINING || sender_known(from);
@@ -6171,7 +5927,7 @@ static void handle_clmap(const unsigned char *pt, size_t n,
 		yield_mastership(from);
 	}
 	spread_note_placeable(&m);
-	map_set(&m);
+	C.map = m;
 	C.map_valid = 1;
 	if (cl_unicast) {
 		long long nw = now_ms();
@@ -6200,7 +5956,7 @@ static void handle_clmap(const unsigned char *pt, size_t n,
  * told of a joiner answers it inside the joiner's JOIN_WAIT_MS */
 static void send_master_alive_to(const pc_addr *to)
 {
-	unsigned char msg[CLMEMB_MALIVE_BUF];
+	unsigned char msg[CLMEMB_MALIVE_LEN];
 	struct clmemb_malive m;
 	size_t len;
 
@@ -6216,8 +5972,6 @@ static void send_master_alive_to(const pc_addr *to)
 	m.mode = C.cfg_mode;
 	m.eager = C.cfg_eager;
 	m.cfg_digest = config_digest();
-	m.cfg2 = 1;
-	m.cfg_digest2 = config_digest2();
 	/* the term rides the 1 Hz keepalive, not only the map: the split-brain cure reads
 	 * this message.  Appended, so a peer that stops reading at 35 is unaffected */
 	m.term = pc_term_current();
@@ -6297,62 +6051,6 @@ static void send_assign(const pc_addr *to, uint64_t tok, int your_id)
 	C.st.assigns++;
 }
 
-/* claim a term above everything this node has SEEN, not its own last; persisted before returned,
- * so a master that dies cannot reissue it with other content.  0 while it cannot be stored */
-static int claim_term(void)
-{
-	uint32_t t = pc_term_claim();
-
-	if (!t) {
-		/* nowhere to write it: serve as master, but publish no map - a map
-		 * under a term we cannot remember is one we could contradict */
-		if (!claim_owed)
-			LM_CRIT("cluster: could not persist a mastership term "
-				"- serving as master WITHOUT publishing a "
-				"cluster map until it can (check the state directory)\n");
-		claim_owed = 1;
-		return 0;
-	}
-	claim_owed = 0;
-	{
-		uint32_t owed_t = 0, owed_s = 0;
-		int owed = pc_clsync_owed(&C.sync, &owed_t, &owed_s);
-
-		/* a promoted standby starts from the identity history it was handed:
-		 * without it every returning node looks NEW and is backfilled */
-		if (C.held_valid) {
-			C.hist = C.held_hist;
-			LM_NOTICE("cluster: promoted holding the "
-				"previous master's state - %u "
-				"identities, map epoch (%u,%u)\n",
-				C.hist.n, C.held_term, C.held_seq);
-		} else {
-			LM_WARN("cluster: promoted with NO synced "
-				"state - every returning node will "
-				"look new until this master has seen "
-				"it once\n");
-		}
-
-		/* the staging machine issues under this term: a sequence carried
-		 * over would be ordered against maps that no longer matter */
-		pc_clsync_init(&C.sync, t, 0);
-
-		/* acked but never published = COMMITTED: republished under the NEW
-		 * term, since reissuing the old one would put two maps at one epoch */
-		if (owed) {
-			spread_note_placeable(&C.held_map);
-			map_set(&C.held_map);
-			C.map_valid = 1;
-			LM_NOTICE("cluster: republishing a change the "
-				"previous master committed but never "
-				"broadcast (was %u,%u)\n",
-				owed_t, owed_s);
-		}
-		LM_NOTICE("cluster: claimed mastership term %u\n", t);
-	}
-	return 1;
-}
-
 static void become_master(int founded)
 {
 	static long long said_ms;
@@ -6370,9 +6068,6 @@ static void become_master(int founded)
 			C.join_deadline_ms = now_ms() + 1000;  /* re-announcing meanwhile */
 		return;
 	}
-	/* the term it claims is written by pc-maint before it is used: the caller comes back */
-	if (!pc_term_claim_ready())
-		return;
 	/* found under the id this identity always proposes, so a whole-fleet restart
 	 * keeps its ids; with no durable identity the proposal is 0 and the scan gives 1 */
 	if (!C.node_id)
@@ -6407,18 +6102,59 @@ static void become_master(int founded)
 		LM_NOTICE("cluster: founding with %d live peer(s) while holding "
 			"nothing - pulling a bootstrap before reporting ready\n",
 			clpeers_count_live(&C.pt, now_ms()));
-	} else if (pc_node_state() == PC_NST_RECOVERING && C.bt.pick_ms &&
-	           !clboot_done(&C.bt)) {
-		/* elected mid-bootstrap: READY means complete, so boot_tick still decides */
-		LM_NOTICE("cluster: taking mastership while its bootstrap pull is out - "
-			"RECOVERING until it settles\n");
 	} else if (!C.st.resyncing)        /* a copy under way: its pull reports ready */
 		pc_node_state_set(PC_NST_READY);
 	C.master_id = C.node_id;
 	C.master_addr = C.self_addr;
 	C.st.elections++;
-	claim_owed = 0;
-	(void)claim_term();
+	/* claim a term above everything this node has SEEN, not its own last; persisted
+	 * before returned, so a master that dies cannot reissue it with other content */
+	{
+		uint32_t t = pc_term_claim();
+
+		if (!t) {
+			/* nowhere to write it: serve as master, but publish no map - a map
+			 * under a term we cannot remember is one we could contradict */
+			LM_CRIT("cluster: could not persist a mastership term "
+				"- serving as master WITHOUT publishing a "
+				"cluster map (check the state directory)\n");
+		} else {
+			uint32_t owed_t = 0, owed_s = 0;
+			int owed = pc_clsync_owed(&C.sync, &owed_t, &owed_s);
+
+			/* a promoted standby starts from the identity history it was handed:
+			 * without it every returning node looks NEW and is backfilled */
+			if (C.held_valid) {
+				C.hist = C.held_hist;
+				LM_NOTICE("cluster: promoted holding the "
+					"previous master's state - %u "
+					"identities, map epoch (%u,%u)\n",
+					C.hist.n, C.held_term, C.held_seq);
+			} else {
+				LM_WARN("cluster: promoted with NO synced "
+					"state - every returning node will "
+					"look new until this master has seen "
+					"it once\n");
+			}
+
+			/* the staging machine issues under this term: a sequence carried
+			 * over would be ordered against maps that no longer matter */
+			pc_clsync_init(&C.sync, t, 0);
+
+			/* acked but never published = COMMITTED: republished under the NEW
+			 * term, since reissuing the old one would put two maps at one epoch */
+			if (owed) {
+				spread_note_placeable(&C.held_map);
+				C.map = C.held_map;
+				C.map_valid = 1;
+				LM_NOTICE("cluster: republishing a change the "
+					"previous master committed but never "
+					"broadcast (was %u,%u)\n",
+					owed_t, owed_s);
+			}
+			LM_NOTICE("cluster: claimed mastership term %u\n", t);
+		}
+	}
 	LM_NOTICE("cluster: %s as node %d (%d live peer(s))\n",
 		founded ? "founded the cluster - master" :
 		"elected master", C.node_id, clpeers_count_live(&C.pt, now_ms()));
@@ -6457,88 +6193,6 @@ static void handover_tick(long long now)
 	if (c.ok && seal_send(&p->addr, m, sizeof m) == 0)
 		LM_NOTICE("cluster: handing mastership to node %d, the synced "
 			"standby (term %u)\n", id, C.map.term);
-}
-
-/* ---- T600: a collection asked for whole (M_ASKFILL) ---- */
-static long long askfill_at[PC_MAX_COLLECTIONS];  /* when to ask, 0 = not; workers set it */
-/* sends left: one ask can land before the peer counts this restarted node live, and it drops it unseen */
-static int askfill_left[PC_MAX_COLLECTIONS];
-
-static int store_index(const char *col, size_t collen)
-{
-	int c;
-
-	for (c = 0; c < pc_store_count(); c++)
-		if (pc_store_live(c) && strlen(pc_store_name(c)) == collen &&
-		    !memcmp(pc_store_name(c), col, collen))
-			return c;
-	return -1;
-}
-
-/* the drop leaves a negative version for 2 s (pc_verb_forget_local): the peers' copies of the
- * same version must arrive after it, so the ask waits 3 s */
-void pc_cluster_ask_fill(const char *col, size_t collen)
-{
-	int c;
-
-	if (!C.enabled || (c = store_index(col, collen)) < 0 ||
-	    !pc_store_eager_enabled(pc_store_ht(c)))
-		return;
-	__atomic_store_n(&askfill_left[c], 3, __ATOMIC_RELAXED);
-	__atomic_store_n(&askfill_at[c], now_ms() + 3000, __ATOMIC_RELEASE);
-}
-
-static void askfill_tick(long long now)
-{
-	unsigned char m[2 + 255];
-	struct pc_wcur w;
-	int c, up, left;
-
-	for (c = 0; c < pc_store_count(); c++) {
-		long long t = __atomic_load_n(&askfill_at[c], __ATOMIC_ACQUIRE);
-		const char *cn = pc_store_name(c);
-		size_t cl = strlen(cn);
-
-		if (!t || now < t || cl > 255)
-			continue;
-		up = clpeers_count_live(&C.pt, now);
-		if (!up)
-			continue;              /* nobody yet: asked once one is up */
-		pc_wcur_init(&w, m, sizeof m);
-		pc_w8(&w, M_ASKFILL);
-		pc_w8(&w, (unsigned char)cl);
-		pc_wraw(&w, cn, cl);
-		if (!w.ok)
-			continue;
-		(void)clsend_live(&C.pt, m, 2 + cl, now);
-		left = __atomic_sub_fetch(&askfill_left[c], 1, __ATOMIC_RELAXED);
-		/* a peer that took an earlier ask ignores the repeat while it sends */
-		__atomic_store_n(&askfill_at[c], left > 0 ? now + 3000 : 0, __ATOMIC_RELEASE);
-		if (left == 2)
-			LM_NOTICE("cluster: asked %d peer(s) for collection '%s' whole - its "
-				"records written through went with the upstream tracking gap\n",
-				up, cn);
-	}
-}
-
-static void handle_askfill(const unsigned char *pt, size_t n, const pc_addr *from)
-{
-	struct peer *p = clpeers_by_addr(&C.pt, from);
-	size_t cl;
-	int c;
-
-	if (n < 2 || !p || !p->node || !clpeers_live(p, now_ms()))
-		return;
-	cl = pt[1];
-	if (n < 2 + cl || (c = store_index((const char *)pt + 2, cl)) < 0 ||
-	    !pc_store_eager_enabled(pc_store_ht(c)) || p->askfill[c])
-		return;
-	p->askfill[c] = 1;
-	p->repl_cursor[c] = 0;             /* a whole cycle from its first bucket */
-	p->repl_bfcycle[c] = 0;
-	LM_NOTICE("cluster: node %d asks for collection '%s' whole (its upstream tracking "
-		"had a gap) - sending every record held here, copies included\n",
-		p->node, pc_store_name(c));
 }
 
 static void handle_handover(const unsigned char *pt, size_t n,
@@ -6704,14 +6358,12 @@ void handle_join_req(const unsigned char *pt, size_t n,
 		return;
 	}
 	if (jq.have & CLMEMB_J_CFG) {
-		int have2 = (jq.have & CLMEMB_J_CFG2) != 0;
-		uint64_t theirs = have2 ? jq.cfg_digest2 : jq.cfg_digest, ours;
+		uint64_t theirs = jq.cfg_digest;
 
-		if (digest_differs(have2, jq.cfg_digest2, jq.cfg_digest, &ours) &&
-		    C.cfg_authoritative) {
+		if (theirs != config_digest() && C.cfg_authoritative) {
 			/* refuse the JOIN itself - no id is assigned, so
 			 * the node never becomes a member at all */
-			shout_mismatch(from, jq.mode, jq.eager, theirs, ours,
+			shout_mismatch(from, jq.mode, jq.eager, theirs,
 				(jq.have & CLMEMB_J_WAL) ? jq.wal : 0);
 			C.cfg_refused++;
 			peer_forget(from);
@@ -6858,15 +6510,6 @@ void joined_state(int members)
 		LM_NOTICE("cluster: joined as node %d (master is node %d, "
 			"%d member(s)) holding nothing - pulling a bootstrap "
 			"before reporting ready\n", C.node_id, C.master_id, members);
-	} else if (C.reconcile_on && C.cfg_eager && !self_test_reconcile) {
-		/* a survivor's copy may replace what it replayed: not served before the pass rules */
-		pc_node_state_set(PC_NST_RECOVERING);
-		C.decide_on = 1;
-		C.decide_ms = now_ms();
-		LM_NOTICE("cluster: joined as node %d (master is node %d, %d member(s)) holding "
-			"%ld replayed record(s) - RECOVERING until it knows whether a peer up "
-			"through its absence holds the fleet's state\n", C.node_id, C.master_id,
-			members, pc_recovered_records());
 	} else {
 		pc_node_state_set(PC_NST_READY);
 		LM_NOTICE("cluster: joined as node %d (master is node %d, "
@@ -6989,15 +6632,10 @@ static void handle_alive(const unsigned char *pt, size_t n,
 		}
 	}
 	if (a.have & CLMEMB_A_CFG) {
-		int have2 = (a.have & CLMEMB_A_CFG2) != 0;
-		uint64_t ours;
-
-		if (digest_differs(have2, a.cfg_digest2, a.cfg_digest, &ours) &&
-		    C.cfg_authoritative) {
+		if (a.cfg_digest != config_digest() && C.cfg_authoritative) {
 			/* differing collection config is not admitted, so the fleet splits visibly;
 			 * only a node that declared [cluster] collections can enforce it */
-			shout_mismatch(from, a.mode, a.eager, have2 ? a.cfg_digest2
-				: a.cfg_digest, ours, 0);
+			shout_mismatch(from, a.mode, a.eager, a.cfg_digest, 0);
 			C.cfg_refused++;
 			peer_forget(from);
 			return;
@@ -7007,26 +6645,6 @@ static void handle_alive(const unsigned char *pt, size_t n,
 			LM_WARN("cluster: peer %s sends no config digest (older "
 				"build) - its collection config CANNOT be checked\n",
 				pc_addr_str(from));
-	}
-	/* a member that cannot speak the fleet's committed epoch is refused by name, before it is
-	 * taken in: it joined before the commit, or an old build is back */
-	if (a.have & CLMEMB_A_CFGSIG) {
-		int k, e = pc_cluster_epoch();
-
-		for (k = 0; k < a.ncfg && a.cfg_name[k] != PC_FACT_EPOCHS; k++)
-			;
-		if (k < a.ncfg && (e < (int)(a.cfg_val[k] >> 8 & 0xff) ||
-		                   e > (int)(a.cfg_val[k] & 0xff))) {
-			if (pc_logrl_ok(LRL_EPOCH_ALIVE, from))
-				LM_ERR("cluster: REFUSING node %d (%s) - it speaks wire "
-					"epochs %d..%d and the fleet is committed to %d; "
-					"upgrade it\n", a.node, pc_addr_str(from),
-					(int)(a.cfg_val[k] >> 8 & 0xff),
-					(int)(a.cfg_val[k] & 0xff), e);
-			C.st.epoch_refused++;
-			peer_forget(from);
-			return;
-		}
 	}
 	/* this node's id at another address: two halves of a merge each handed it out.
 	 * The higher identity re-joins for a new one; a master keeps its own */
@@ -7102,10 +6720,23 @@ static void handle_alive(const unsigned char *pt, size_t n,
 		/* its settings; absent from older builds */
 		p->ncfg = (a.have & CLMEMB_A_CFGSIG) ? a.ncfg : 0;
 		if (p->ncfg) {
+			int lo, hi;
+
 			memcpy(p->cfg_name, a.cfg_name,
 				(size_t)p->ncfg * sizeof p->cfg_name[0]);
 			memcpy(p->cfg_val, a.cfg_val,
 				(size_t)p->ncfg * sizeof p->cfg_val[0]);
+			/* a member that cannot speak the fleet's committed epoch is refused by
+			 * name: it joined before the commit, or an old build is back */
+			if (peer_speaks(p, pc_cluster_epoch(), &lo, &hi) == 0) {
+				LM_ERR("cluster: REFUSING node %d (%s) - it speaks wire "
+					"epochs %d..%d and the fleet is committed to %d; "
+					"upgrade it\n", a.node, pc_addr_str(from),
+					lo, hi, pc_cluster_epoch());
+				C.st.epoch_refused++;
+				peer_forget(from);
+				return;
+			}
 		}
 		p->nreason = (a.have & CLMEMB_A_REASON) ? a.nreason : PC_NRE_NONE;
 		p->mem_tier = (a.have & CLMEMB_A_TIER)
@@ -7222,14 +6853,9 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 		}
 	}
 	if (m.have & CLMEMB_M_CFG) {
-		int have2 = (m.have & CLMEMB_M_CFG2) != 0;
-		uint64_t ours;
-
-		if (digest_differs(have2, m.cfg_digest2, m.cfg_digest, &ours) &&
-		    C.cfg_authoritative) {
+		if (m.cfg_digest != config_digest() && C.cfg_authoritative) {
 			/* a master we disagree with is not our master */
-			shout_mismatch(from, m.mode, m.eager, have2 ? m.cfg_digest2
-				: m.cfg_digest, ours, 0);
+			shout_mismatch(from, m.mode, m.eager, m.cfg_digest, 0);
 			C.cfg_refused++;
 			peer_forget(from);
 			return;
@@ -7256,12 +6882,11 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 		}
 	}
 	if (C.role == PC_ROLE_MASTER) {
-		/* split-brain cure: rank (term, then address).  A member count is the claimant's own
-		 * word; the only reach this node sees is its own peer table, the same for both sides */
+		/* split-brain cure: rank (member count, then address) */
 		int mine = clpeers_count_live(&C.pt, now_ms()) + 1;
 
-		/* rule 3 first: a term is totally ordered and an address arbitrary;
-		 * a beacon without a term falls to the address */
+		/* rule 3 first: a term is totally ordered, a member count is local and an
+		 * address arbitrary; a beacon without a term falls to the count/address rank */
 		if (m.have & CLMEMB_M_TERM) {
 			uint32_t theirs_t = m.term;
 			/* a promoted master's map is the last master's until its first
@@ -7290,14 +6915,15 @@ static void handle_master_alive(const unsigned char *pt, size_t n,
 				return;
 			}
 			/* a LOWER term never outranks us (clterm.h rule 1 on the keepalive);
-			 * EQUAL terms fall through to the address: a total order */
+			 * EQUAL terms fall through to the count, then the address: a total order */
 			if (pc_term_cmp(mine_t, theirs_t) == PC_TERM_STALE)
 				return;
 		}
-		if (addr_cmp(from, &C.self_addr) > 0) {
+		if (their_count > mine || (their_count == mine &&
+		        addr_cmp(from, &C.self_addr) > 0)) {
 			LM_WARN("cluster: yielding mastership to node %d "
-				"(the higher address; it says %d members, %d live "
-				"here) - re-joining\n", their_id, their_count, mine);
+				"(%d members vs my %d) - re-joining\n",
+				their_id, their_count, mine);
 			yield_follow(from, their_id);
 		}
 		return;
@@ -7735,8 +7361,8 @@ static void boot_tick(long long now)
 	/* a joiner that is still waiting to pull - the first
 	 * heartbeats may not have reached it at ASSIGN time */
 	if (pc_node_state() != PC_NST_RECOVERING || clboot_done(&C.bt) ||
-	    C.rejoin_on < 0 || C.decide_on)
-		return;                        /* held for the pass's ruling: nothing to pull yet */
+	    C.rejoin_on < 0)
+		return;
 	clboot_tick_state(&C.bt, clbulk_lock(&C.bk), &pending, &failed_round);
 	act = clboot_before_pick(&C.bt, now, pending, failed_round);
 	if (act == CLBOOT_PICK)
@@ -7820,11 +7446,28 @@ static void rx_sample(void)
 /* before a peer silent on UDP is purged or a master declared dead, ask whether TCP still reaches
  * it; alive on TCP means UDP is blocked on this path: force the lane both ways (unicast only) */
 #define LANE_PROBE_MS 3000
-/* TCP alone may be a new process on the old address: a UDP probe answered inside this says so.
- * Asked again every LANE_RESEND_MS: a process still starting may drop the first ask unseen */
-#define LANE_ASK_MS 3000
-#define LANE_RESEND_MS 250
-static struct clprobe_tab lane_probes;
+/* TCP alone may be a new process on the old address: a UDP probe answered inside this says so */
+#define LANE_ASK_MS 1500
+struct lprobe { pc_addr a; long long ms, ask_ms, heard_ms; };
+static struct lprobe lane_probe[64];
+static int lane_probe_n;
+static unsigned long long lane_saves;
+
+/* the cluster thread's only; NULL when @a has none and @make is 0 */
+static struct lprobe *lane_probe_slot(const pc_addr *a, int make)
+{
+	int i;
+
+	for (i = 0; i < lane_probe_n; i++)
+		if (pc_addr_eq(&lane_probe[i].a, a))
+			return &lane_probe[i];
+	if (!make)
+		return NULL;
+	i = lane_probe_n < 64 ? lane_probe_n++ : (int)(lane_saves % 64);
+	memset(&lane_probe[i], 0, sizeof lane_probe[i]);
+	lane_probe[i].a = *a;
+	return &lane_probe[i];
+}
 
 /* 1 = TCP says it lives (or may - the probe is still out): keep it */
 static int lane_keeps(const pc_addr *a, long long silent_ms,
@@ -7837,7 +7480,7 @@ static int lane_keeps(const pc_addr *a, long long silent_ms,
 	if (!cl_unicast || cl_max_dgram <= 0 || frx_since(a, now - silent_ms))
 		return 0;
 	st = clane_tcp_state(a, &age);
-	pm = clprobe_slot(&lane_probes, a, 1, now);
+	pm = lane_probe_slot(a, 1);
 	if (st == CLANE_TCP_UP) {
 		pm->ms = 0;
 		if (!clane_forced(a)) {
@@ -7849,21 +7492,15 @@ static int lane_keeps(const pc_addr *a, long long silent_ms,
 				return 0;
 			if (pm->ask_ms < now - silent_ms) {
 				m = M_LANE_PROBE;
-				pm->ask_ms = pm->sent_ms = now;
+				pm->ask_ms = now;
 				(void)clsend_seal_udp(a, &m, 1);
 				return 1;
 			}
-			if (now - pm->ask_ms < LANE_ASK_MS) {
-				if (now - pm->sent_ms >= LANE_RESEND_MS) {
-					m = M_LANE_PROBE;
-					pm->sent_ms = now;
-					(void)clsend_seal_udp(a, &m, 1);
-				}
+			if (now - pm->ask_ms < LANE_ASK_MS)
 				return 1;
-			}
 			clane_force(a, 1);
 			seal_send(a, &m, 1);       /* forced: it goes by the lane */
-			lane_probes.saves++;
+			lane_saves++;
 			if (pc_logrl_ok(LRL_LANE_FORCE, a))
 				LM_ERR("cluster: %s:%d has sent no UDP for %lld s but answers "
 					"on TCP - UDP is blocked or lost on this path; "
@@ -7913,7 +7550,7 @@ static void handle_lane_probe_r(const pc_addr *from)
 {
 	struct lprobe *pm;
 
-	if (!rx_via_lane && (pm = clprobe_slot(&lane_probes, from, 0, now_ms())))
+	if (!rx_via_lane && (pm = lane_probe_slot(from, 0)))
 		pm->heard_ms = now_ms();
 	if (!rx_via_lane)
 		cladmit_probe_answered(clpeers_by_addr(&C.pt, from), now_ms());
@@ -7939,7 +7576,7 @@ static void handle_lane_force(const pc_addr *from)
 
 unsigned long long pc_cluster_lane_saves(void)
 {
-	return lane_probes.saves;
+	return lane_saves;
 }
 
 /* a member whose master went silent asks up to MPROBE_ASK peers if they hear it; if one does,
@@ -8074,22 +7711,9 @@ static void membership_tick(void)
 	}
 
 	pc_cid_tick(now);                      /* provisional -> established */
-	{
-		static uint32_t said;
-		int r = pc_term_retry();
-		uint32_t u = pc_term_unpersisted();
-
-		if (r == 1)
-			LM_NOTICE("cluster: mastership term %u persisted - this node may "
-				"take mastership again\n", pc_term_current());
-		else if (r < 0 && u && said != u) {
-			said = u;
-			LM_CRIT("cluster: could not persist mastership term %u (%s) - "
-				"following it, but this node takes no mastership until "
-				"it is on disk (check the state directory)\n", said,
-				strerror(pc_term_store_errno()));
-		}
-	}
+	if (pc_term_retry() == 1)
+		LM_NOTICE("cluster: mastership term %u persisted - this node may "
+			"take mastership again\n", pc_term_current());
 	eager_settle_tick(now);
 	mesh_hint_tick(now);
 	lane_retry_tick(now);
@@ -8213,22 +7837,17 @@ static void membership_tick(void)
 					elect_defer_to = higher->addr;
 				} else if (now - elect_defer_ms >=
 				        MPROBE_HOLD_MS + MASTER_DEAD_MS) {
-					/* once: the promotion may wait ticks for its term on disk */
-					if (elect_warned_ms != elect_defer_ms)
-						LM_WARN("cluster: node %d at %s, a higher address, "
-							"has been live for %lld s without taking "
-							"mastership - promoting instead\n",
-							higher->node, pc_addr_str(&higher->addr),
-							(now - elect_defer_ms) / 1000);
-					elect_warned_ms = elect_defer_ms;
+					LM_WARN("cluster: node %d at %s, a higher address, "
+						"has been live for %lld s without taking "
+						"mastership - promoting instead\n",
+						higher->node, pc_addr_str(&higher->addr),
+						(now - elect_defer_ms) / 1000);
 					best = 1;
 				}
 			}
 			if (best) {
-				/* it may come back for its term on disk: the bound stays run out */
+				elect_defer_ms = 0;
 				become_master(0);
-				if (C.role == PC_ROLE_MASTER)
-					elect_defer_ms = 0;
 			} else
 				C.master_seen_ms = now - MASTER_DEAD_MS + 1000;
 				/* re-check in ~1s: the winner's MASTER_ALIVE
@@ -8448,14 +8067,13 @@ static int replay_ok(const unsigned char *buf, const pc_addr *from)
 
 	clwire_id_read(buf, &id);
 	rc = clreplay_admit(&id, from->in4.sin_addr.s_addr, now_ms());
-	if (clreplay_taken(rc))
+	if (rc == CLREPLAY_OK || rc == CLREPLAY_FULL)
 		return 1;
 	if (pc_logrl_ok(LRL_REPLAY, from))
 		LM_INFO("cluster: dropped a frame from %s - %s\n", pc_addr_str(from),
 			rc == CLREPLAY_DUP ? "its sequence was taken before" :
 			rc == CLREPLAY_OLD ? "older than its stream's window" :
 			rc == CLREPLAY_HOST ? "its header names another host" :
-			rc == CLREPLAY_FULL ? "the replay table has no room to track its sender" :
 			"from an older incarnation of its sender");
 	return 0;
 }
@@ -8549,7 +8167,6 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 	case M_GAP_REQ:   handle_gap_req(pt, ptlen, from); break;
 	case M_GAP_FLOOR: handle_gap_floor(pt, ptlen, from); break;
 	case M_HANDOVER: handle_handover(pt, ptlen, from); break;
-	case M_ASKFILL:  handle_askfill(pt, ptlen, from); break;
 	case M_MEMBERS_REQ: cladmit_members_req(pt, ptlen, from); break;
 	case M_MEMBERS:  cladmit_members(pt, ptlen, from); break;
 	case M_LINK_REPORT: cladmit_link_report(pt, ptlen, from); break;
@@ -8774,7 +8391,6 @@ void pc_cluster_thread(volatile int *stop)
 				}
 			}
 			membership_tick();
-			forget_tick();
 			self_state_tick();
 			upg_msg_tick();                /* asks and answers */
 			pull_answer_tick();            /* the owner's fetched pulls */
@@ -8823,7 +8439,6 @@ void pc_cluster_thread(volatile int *stop)
 			to = clpush_open(&C.wp) ? REPL_FLUSH_MS : 100;
 			if (waiting && to > PEND_SWEEP_MS)
 				to = PEND_SWEEP_MS;
-			pcache_arena_flush_if_asked();
 			pc_qs_exit();          /* parked across the wait */
 			prc = poll(pf, 3, to);
 			pc_qs_enter();
@@ -8974,10 +8589,7 @@ void pc_proxy_get_stats(struct pc_proxy_stats *out)
  * (NULL when the cycle is not gated) */
 #define SG_BIT(b, i)   ((b)[(i) >> 3] & (1u << ((i) & 7)))
 #define SG_SET(b, i)   ((b)[(i) >> 3] |= (unsigned char)(1u << ((i) & 7)))
-#define SG_UNSET(b, i) ((b)[(i) >> 3] &= (unsigned char)~(1u << ((i) & 7)))
 static const unsigned char *sg_walk_filter;
-/* a diff walk sends copies but, unlike a backfill, still holds this node's own recovered ones */
-static int mig_diff_walk;
 
 struct mig_ctx {
 	const char *col;
@@ -9019,10 +8631,6 @@ static int mig_cb(const str *key, const str *val,
 			return -1;
 		}
 	}
-	if (self_mig_scan_recs && m->scanned > self_mig_scan_recs) {
-		m->stopped = 1;
-		return -1;
-	}
 	if (m->budget <= 0) {
 		m->stopped = 1;
 		return -1;
@@ -9054,7 +8662,7 @@ static int mig_cb(const str *key, const str *val,
 		 * a restored copy could resurrect a key that expired everywhere else */
 		/* not for backfill/set-repair (incl_passive): reconcile waits for a cold peer,
 		 * so holding the walk that warms it would hold both forever */
-		if ((!m->incl_passive || mig_diff_walk) && rec_held(mt->wtick)) {
+		if (!m->incl_passive && rec_held(mt->wtick)) {
 			m->held++;
 			return 0;
 		}
@@ -9092,19 +8700,10 @@ static int mig_cb(const str *key, const str *val,
 	/* stub first, never reinstate: delete and locate at @to BEFORE sending - a lost
 	 * transfer is a miss, never a fork; a replication copy just retries next tick */
 	ht = pc_store_find(m->col, cn);
-	if (!ht) {
-		m->stopped = 1;
+	if (!ht)
 		return -1;
-	}
 	k.s = key->s;
 	k.len = key->len;
-	n = MIG_RHDR + cn + (size_t)key->len + (size_t)val->len;
-	/* room first: a stubbed record that cannot be sent is gone; this one waits for the next tick */
-	if (val->len > MAX_FWD_VAL ? C.bulkb_len + n > MIG_BATCH_CAP
-	    : C.migb.len + 2 + MIG_GHDR + n > C.migb.cap) {
-		m->stopped = 1;
-		return -1;
-	}
 	if (!m->repl) {
 		if (pcache_ht_remove(ht, &k) != 1)
 			return 0;
@@ -9114,8 +8713,12 @@ static int mig_cb(const str *key, const str *val,
 		C.px.repl_out++;
 	}
 
+	n = MIG_RHDR + cn + (size_t)key->len + (size_t)val->len;
+
 	/* a record above the datagram ceiling goes to the bulk TCP batch (same record format) */
 	if (val->len > MAX_FWD_VAL) {
+		if (C.bulkb_len + n > MIG_BATCH_CAP)
+			return -1;
 		{
 			unsigned char *rp = C.bulkb + C.bulkb_len;
 			struct clmig_rec br = {
@@ -9141,10 +8744,8 @@ static int mig_cb(const str *key, const str *val,
 		int opened = clmig_open_for(&C.migb, n, MIG_GHDR,
 			MIG_GATHER_CAP, &msg);
 
-		if (opened < 0) {
-			m->stopped = 1;
+		if (opened < 0)
 			return -1;
-		}
 		if (opened) {
 			/* a fresh group: the header CONTENTS belong to this protocol, not clmig */
 			/* 31 bits: a group id must never look like a parked-request
@@ -9234,64 +8835,12 @@ static void mig_retransmit(const pc_addr *to)
 	clmig_retransmit(&C.mig, now_ms(), mig_resend_one, (void *)to);
 }
 
-/* the run's target slot now holds another node, or none */
-static int mig_slot_moved(const struct peer *p, int node0, const pc_addr *to0)
-{
-	return __atomic_load_n(&p->node, __ATOMIC_ACQUIRE) != node0 || !addr_eq(&p->addr, to0);
-}
-
-/* one 20 ms turn of the migration pump: datagrams, and frames the lane received */
-static void mig_pump_poll(struct pollfd pf[2])
-{
-	if (poll(pf, 2, 20) <= 0)
-		return;
-	drain_dgrams();
-	if (pf[1].fd >= 0 && (pf[1].revents & POLLIN))
-		drain_lane();
-}
-
-/* a table walk of the sweep or a migration; -1 when it could not run, as pcache_ht_iter_meta */
-static int cl_walk(pcache_htable_t *ht, unsigned int *cursor, pcache_iter_meta_cb cb, void *ctx)
-{
-	if (self_walk_nomem_until && now_ms() < self_walk_nomem_until)
-		return -1;
-	return cursor ? pcache_ht_iter_meta_from(ht, cursor, cb, ctx)
-		: pcache_ht_iter_meta(ht, cb, ctx);
-}
-
-/* a shard or proxy walk resumes where the last tick's stopped: shard per (peer slot, collection),
- * proxy per collection; a slot that changed hands starts over */
-static unsigned int shard_cur[PC_CL_MAXPEER][PC_MAX_COLLECTIONS];
-static int shard_cur_node[PC_CL_MAXPEER];
-static unsigned int proxy_cur[PC_MAX_COLLECTIONS];
-
-static unsigned int *mig_cursor(const struct peer *to, int shard, int c)
-{
-	long i = to - C.pt.peers;
-
-	if (c < 0 || c >= PC_MAX_COLLECTIONS)
-		return NULL;
-	if (!shard)
-		return &proxy_cur[c];
-	if (i < 0 || i >= PC_CL_MAXPEER)
-		return NULL;
-	if (shard_cur_node[i] != to->node) {
-		memset(shard_cur[i], 0, sizeof shard_cur[i]);
-		shard_cur_node[i] = to->node;
-	}
-	return &shard_cur[i][c];
-}
-
 static int run_migration(struct peer *to, long long budget, int mode,
 		unsigned int since, const char *only_col, int *clean,
 		unsigned int *cursor, int incl_passive)
 {
 	struct mig_ctx m;
-	int i, moved = 0, unfinished = 0, failed = 0, moved_away = 0;
-	/* the pump dispatches datagrams: a goodbye and a join there can hand the slot to
-	 * another address, and nothing of this run is that node's */
-	int node0 = to->node;
-	pc_addr to0 = to->addr;
+	int i, moved = 0;
 
 	m.to = to;
 	m.budget = budget;
@@ -9336,18 +8885,12 @@ static int run_migration(struct peer *to, long long budget, int mode,
 		 * temperature */
 		m.min_age = (m.shard || m.repl) ? 0
 			: pick_min_age(ht, m.now, m.budget);
-		{
-			unsigned int *cur = cursor ? cursor
-				: m.repl ? NULL : mig_cursor(to, m.shard, i);
-
-			/* -1 with nothing stopping it: the walk could not run, its cursor untouched */
-			if (cl_walk(ht, cur, mig_cb, &m) < 0 && !m.stopped)
-				failed = 1;
-			unfinished |= cur && !cursor && *cur;
-		}
+		if (cursor)
+			pcache_ht_iter_meta_from(ht, cursor, mig_cb, &m);
+		else
+			pcache_ht_iter_meta(ht, mig_cb, &m);
 	}
-	/* a walk that has not reached the table's end yet keeps the shard grace open too */
-	moved = C.migb.len > 0 || C.bulkb_len > 0 || (m.shard && unfinished);
+	moved = C.migb.len > 0 || C.bulkb_len > 0;
 	C.last_run_scanned = m.scanned;
 
 	/* the pump: an ack-gated window never overruns the receiver's UDP buffer; victims are
@@ -9357,25 +8900,20 @@ static int run_migration(struct peer *to, long long budget, int mode,
 		size_t off = 0;
 		unsigned int sent = 0, lost = 0, n = 0;
 		const unsigned char *gp = NULL;
-		/* the lane too: a forced peer's acks come back by it */
-		struct pollfd pf[2] = { { .fd = C.fd, .events = POLLIN },
-			{ .fd = clane_rx_fd(), .events = POLLIN } };
+		struct pollfd pf = { .fd = C.fd, .events = POLLIN };
 
 		while (clmig_group_walk(&C.migb, &off, &gp, &n)) {
 			while (clmig_inflight(&C.mig) >= MIG_WINDOW &&
 			        now_ms() < deadline) {
-				mig_pump_poll(pf);
-				if ((moved_away = mig_slot_moved(m.to, node0, &to0)))
-					break;
+				if (poll(&pf, 1, 20) > 0)
+					drain_dgrams();
 				beat_pump();   /* the ack window may poll for as
 				                * long as PEER_UP_MS - never mute */
-				mig_retransmit(&to0);
+				mig_retransmit(&m.to->addr);
 			}
-			if (moved_away || now_ms() >= deadline) {
-				lost += clmig_group_count(gp);   /* walked past, never sent */
+			if (now_ms() >= deadline)
 				break;
-			}
-			seal_send(&to0, gp, n);
+			seal_send(&m.to->addr, gp, n);
 			/* track each group: a loss is charged in records,
 			 * and a late ack costs one re-send, not a cycle */
 			/* gp sits just past the group's len2 header; `off` has already moved on */
@@ -9384,12 +8922,11 @@ static int run_migration(struct peer *to, long long budget, int mode,
 			C.px.migrate_dgrams++;
 			sent++;
 		}
-		while (!moved_away && clmig_inflight(&C.mig) > 0 && now_ms() < deadline) {
-			mig_pump_poll(pf);
-			if ((moved_away = mig_slot_moved(m.to, node0, &to0)))
-				break;
+		while (clmig_inflight(&C.mig) > 0 && now_ms() < deadline) {
+			if (poll(&pf, 1, 20) > 0)
+				drain_dgrams();
 			beat_pump();
-			mig_retransmit(&to0);
+			mig_retransmit(&m.to->addr);
 		}
 		/* losses in records: unsent groups plus sends still unacked
 		 * after MIG_RETX re-sends each */
@@ -9409,8 +8946,7 @@ static int run_migration(struct peer *to, long long budget, int mode,
 		if (clean)
 			/* with a cursor, the cursor reports the walk's end, so
 			 * this only says whether the slice lost anything */
-			*clean = !moved_away &&
-				(cursor ? lost == 0 : (!m.stopped && lost == 0));
+			*clean = cursor ? lost == 0 : (!m.stopped && lost == 0);
 	} else if (clean) {
 		*clean = cursor ? 1 : !m.stopped;  /* nothing to send: clean
 		                                * = the peer is in sync */
@@ -9418,9 +8954,9 @@ static int run_migration(struct peer *to, long long budget, int mode,
 
 	/* oversized victims (already stubbed) go to the bulk thread */
 	if (C.bulkb_len) {
-		if (!moved_away && clbulk_offer(&C.bk, C.bulkb, C.bulkb_len, C.bulk_recs,
+		if (clbulk_offer(&C.bk, C.bulkb, C.bulkb_len, C.bulk_recs,
 		        m.repl ? CLBULK_KIND_REPLICA : CLBULK_KIND_MIGRATE,
-		        &to0)) {
+		        &m.to->addr)) {
 			C.bulkb = NULL;        /* re-alloc next tick */
 		} else if (m.repl) {
 			/* repair: the record is still here, so a refused offer only marks
@@ -9430,12 +8966,11 @@ static int run_migration(struct peer *to, long long budget, int mode,
 			if (clean)
 				*clean = 0;
 		} else {
-			/* the bulk thread is still on the last batch, or the target left:
-			 * these stubs are lost - honest misses, counted */
+			/* the bulk thread is still on the last batch: these
+			 * stubs are lost - honest misses, counted */
 			C.px.migrate_lost += C.bulk_recs;
-			LM_WARN("rebalancer: %s, %u oversized record(s) dropped to "
-				"misses\n", moved_away ? "the target left" :
-				"bulk channel busy", C.bulk_recs);
+			LM_WARN("rebalancer: bulk channel busy, %u oversized "
+				"record(s) dropped to misses\n", C.bulk_recs);
 		}
 		C.bulkb_len = 0;
 		C.bulk_recs = 0;
@@ -9445,8 +8980,6 @@ static int run_migration(struct peer *to, long long budget, int mode,
 		if (clean)
 			*clean = 0;        /* the mark must not pass them */
 	}
-	if (failed && clean)
-		*clean = 0;                /* nothing was scanned: no cycle ended */
 	return moved;
 }
 
@@ -9610,7 +9143,6 @@ struct sg_col {
 	long long deadline_ms;
 	unsigned int start;            /* the tick the digests were taken */
 	unsigned int rot;              /* the anti-entropy window's turn */
-	unsigned char full;            /* a diff round: every slot held asked */
 	unsigned char diff[PC_SLOTS / 8];
 };
 /* each cycle also compares 1/SG_ROT of all slots: a write whose push AND repeat were lost
@@ -9795,9 +9327,9 @@ static struct sg_col *sg_col_of(struct peer *pr, int i, int c)
 	return sp->c[c];
 }
 
-/* the sender's decision for one cycle of (peer, collection), taken with the cursor at 0;
- * @full, a diff round, asks every slot held here and ignores the mark */
-static int sg_gate(struct peer *pr, int i, int c, long long now, int full)
+/* the sender's decision for one ordinary cycle of (peer, collection),
+ * taken with the cursor at 0 */
+static int sg_gate(struct peer *pr, int i, int c, long long now)
 {
 	pcache_htable_t *ht = pc_store_ht(c);
 	struct sg_peer *sp;
@@ -9815,8 +9347,6 @@ static int sg_gate(struct peer *pr, int i, int c, long long now, int full)
 	sp = sg_tab[i];
 	if (sp->off_until_ms && now < sp->off_until_ms)
 		return SG_OFF;
-	if (g->st && g->full != full)
-		g->st = 0;                     /* the other kind's round: asked again */
 	if (g->st == 1) {
 		if (g->got >= g->parts) {
 			sp->fails = 0;         /* every part answered */
@@ -9863,27 +9393,16 @@ static int sg_gate(struct peer *pr, int i, int c, long long now, int full)
 	w.peer = pr->node;
 	w.kk = pc_cluster_replicas();
 	w.now = get_ticks();
-	w.mark = full ? 0 : pr->repl_mark[c];
+	w.mark = pr->repl_mark[c];
 	g->start = w.now;
-	g->full = (unsigned char)full;
-	if (cl_walk(ht, NULL, sg_walk_cb, &w) < 0) {
-		/* digests of nothing would match nothing and move the mark: the old sweep instead */
-		free(dig); free(cand); free(ungated);
-		return SG_OFF;
-	}
+	(void)pcache_ht_iter_meta(ht, sg_walk_cb, &w);
 	C.px.sweep_gate_digested += w.scanned;
 	memset(g->diff, 0, sizeof g->diff);
 	g->rot = (g->rot + 1) % SG_ROT;
 	for (s = 0; s < PC_SLOTS; s++) {
 		if (SG_BIT(ungated, s))
 			SG_SET(g->diff, s);     /* never gated: always walked */
-		else if (full) {
-			if (dig[s]) {           /* held here (a zero digest: near enough never) */
-				SG_SET(cand, s);
-				want++;
-			} else
-				SG_UNSET(cand, s);
-		} else if (SG_BIT(cand, s) ||
+		else if (SG_BIT(cand, s) ||
 		         (s % SG_ROT == g->rot &&
 		          (!w.kk || (pc_spread_in_set(s, pr->node, w.kk) &&
 		                     pc_spread_in_set(s, 0, w.kk))))) {
@@ -9937,7 +9456,6 @@ static struct rdg_col *rdg_c[PC_MAX_COLLECTIONS];
 static int rdg_phase;                  /* 0 not asked, 1 asked, 2 narrowed,
                                         * 3 probe everything */
 static long long rdg_deadline_ms;
-static long long rdg_narrowed_ms;
 
 static void rdg_drop(void)
 {
@@ -9988,7 +9506,7 @@ static int reconcile_digest_step(void)
 	int c, asked = 0, waiting = 0;
 
 	if (rdg_phase >= 2)
-		return rdg_phase == 3 || now - rdg_narrowed_ms >= self_recon_walk_wait_ms;
+		return 1;
 	if (rdg_phase == 0) {
 		w = peer_by_node(C.recon.witness);
 		if (!pc_sweep_digests || !w) {
@@ -10056,11 +9574,10 @@ static int reconcile_digest_step(void)
 			waiting++;
 	if (!waiting) {
 		rdg_phase = 2;
-		rdg_narrowed_ms = now;
 		LM_NOTICE("cluster: reconcile - node %d's digests differ in %llu "
 			"slot(s); only the keys there are asked about\n",
 			C.recon.witness, C.st.reconcile_dig_diff);
-		return self_recon_walk_wait_ms <= 0;
+		return 1;
 	}
 	if (now < rdg_deadline_ms)
 		return 0;
@@ -10196,56 +9713,6 @@ static void handle_sweep_dig_r(const unsigned char *pt, size_t n)
 	}
 }
 
-#define DSYNC_ROUNDS 8
-/* a diff round's outcome toward a member back from its WAL: all equal ends it, a round that
- * does not shrink the differing slots twice running or the last round stops it */
-static void dsync_round(struct peer *pr, int i, int c, int gate)
-{
-	struct sg_col *g;
-	unsigned int s, n = 0;
-
-	if (gate == SG_WAIT)
-		return;
-	if (gate == SG_OFF) {
-		pr->dsync[c] = 0;
-		C.px.dsync_off++;
-		LM_NOTICE("cluster: no diff for node %d (%s) - it does not answer "
-			"digests; it keeps what it recovered\n", pr->node,
-			pc_store_name(c));
-		return;
-	}
-	if (gate == SG_SKIP) {
-		LM_NOTICE("cluster: diff sync with node %d done (%s) after %u "
-			"round(s) - every slot matches\n", pr->node, pc_store_name(c),
-			(unsigned int)pr->dsync[c] - 1);
-		pr->dsync[c] = 0;
-		C.px.dsync_done++;
-		return;
-	}
-	if (!(g = sg_col_of(pr, i, c)))
-		return;
-	for (s = 0; s < PC_SLOTS; s++)
-		if (SG_BIT(g->diff, s))
-			n++;
-	C.px.dsync_rounds++;
-	C.px.dsync_slots += n;
-	if (pr->dsync[c] > 1 && n >= pr->dsync_prev[c])
-		pr->dsync_stall[c]++;
-	else
-		pr->dsync_stall[c] = 0;
-	pr->dsync_prev[c] = n;
-	if (pr->dsync_stall[c] >= 2 || pr->dsync[c] >= DSYNC_ROUNDS) {
-		LM_NOTICE("cluster: diff sync with node %d stopped (%s) after %u "
-			"round(s) - %u slot(s) still differ, newer there or deletes "
-			"its reconcile rules on\n", pr->node, pc_store_name(c),
-			(unsigned int)pr->dsync[c], n);
-		pr->dsync[c] = 0;
-		C.px.dsync_stopped++;
-		return;                        /* this last walk still runs */
-	}
-	pr->dsync[c]++;
-}
-
 static void eager_repl_tick(void)
 {
 	spread_note_set_change();
@@ -10261,7 +9728,7 @@ static void eager_repl_tick(void)
 		for (i = 0; i < C.pt.n_peers; i++) {
 			struct peer *pr = &C.pt.peers[i];
 			unsigned int start, since;
-			int clean = 0, bf, gate, ds, dswalk;
+			int clean = 0, bf, gate;
 			struct sg_col *gc;
 
 			if (!clpeers_live(pr, now))
@@ -10292,42 +9759,26 @@ static void eager_repl_tick(void)
 			/* a set repair is a backfill walk without the one-sender rule */
 			if (pr->setrepair[c] && pr->nstate != PC_NST_RECOVERING)
 				bf = 1;
-			/* asked for whole: every peer walks it, the version compare keeps one */
-			if (pr->askfill[c] && pr->nstate != PC_NST_RECOVERING)
-				bf = 1;
 			/* a backfill is a WHOLE cycle as sender: gaining the role mid-cycle
 			 * starts over, losing it leaves the flag to the new sender */
 			if (bf && pr->repl_cursor[c] && !pr->repl_bfcycle[c])
 				pr->repl_cursor[c] = 0;
 			if (!bf)
 				pr->repl_bfcycle[c] = 0;
-			if (pr->dsync[c] && (!pc_sweep_digests || pc_cluster_replicas())) {
-				pr->dsync[c] = 0;
-				C.px.dsync_off++;
-				if (!pc_cluster_replicas())
-					LM_NOTICE("cluster: no diff for node %d (%s) - "
-						"sweep_digests = no; it keeps what it recovered\n",
-						pr->node, pc_store_name(c));
-			}
-			ds = pr->dsync[c] && !bf;
 			/* an ordinary cycle asks first (SKIP matched, WAIT, WALK the diffs, OFF
 			 * the full sweep); a backfill or set repair is never gated */
 			gate = SG_OFF;
 			gc = NULL;
 			if (!bf && pc_sweep_digests) {
 				if (pr->repl_cursor[c] == 0)
-					gate = sg_gate(pr, i, c, now, ds);
+					gate = sg_gate(pr, i, c, now);
 				else if ((gc = sg_col_of(pr, i, c)) && gc->st == 2)
 					gate = SG_WALK;
 			}
-			if (ds && pr->repl_cursor[c] == 0)
-				dsync_round(pr, i, c, gate);
 			if (gate == SG_SKIP || gate == SG_WAIT)
 				continue;
 			if (gate == SG_WALK && !gc)
 				gc = sg_col_of(pr, i, c);
-			/* a diff round's walk sends copies too, in the differing slots only */
-			dswalk = gate == SG_WALK && gc && gc->full;
 			/* one slice of a resumable cycle: the start tick is taken at cursor 0
 			 * only, or records written mid-cycle would fall below the next mark */
 			if (pr->repl_cursor[c] == 0) {
@@ -10351,20 +9802,12 @@ static void eager_repl_tick(void)
 				since = 0;
 			{
 				unsigned long long out0 = C.px.repl_out;
-				int node0 = pr->node;
-				pc_addr to0 = pr->addr;
 
 				sg_walk_filter = gate == SG_WALK && gc ? gc->diff : NULL;
-				mig_diff_walk = dswalk && !bf;
 				run_migration(pr, 4 << 20, 2, since,
 					pc_store_name(c), &clean,
-					&pr->repl_cursor[c], bf || dswalk);
-				mig_diff_walk = 0;
+					&pr->repl_cursor[c], bf);
 				sg_walk_filter = NULL;
-				/* its pump handed the slot to another node: that one's
-				 * zeroed cursor and marks are no cycle of this run */
-				if (mig_slot_moved(pr, node0, &to0))
-					continue;
 				pr->repl_scanned[c] += C.last_run_scanned;
 				pr->repl_sent[c] += C.px.repl_out - out0;
 			}
@@ -10390,12 +9833,6 @@ static void eager_repl_tick(void)
 					LM_NOTICE("cluster: re-placed the keys "
 						"node %d now holds (%s)\n",
 						pr->node, pc_store_name(c));
-				}
-				if (pr->repl_bfcycle[c] && pr->askfill[c]) {
-					pr->askfill[c] = 0;
-					LM_NOTICE("cluster: sent collection '%s' whole "
-						"to node %d, as it asked\n",
-						pc_store_name(c), pr->node);
 				}
 				if (pr->repl_bfcycle[c]) {
 					pr->backfill[c] = 0;
@@ -10600,8 +10037,6 @@ void gap_floor_over(const struct pc_ack_hole *h, long long death)
 		C.rec_col = 0;
 		C.rec_cursor = 0;
 		clrecon_rounds_reset(&C.recon);
-		rdg_drop();                    /* the walk starts over: digests asked afresh */
-		rdg_phase = 0;
 		rebuild_into_pass("an origin's finished run left deletes past this "
 			"node's marks that nobody resends");
 		return;
@@ -10663,8 +10098,6 @@ static void handle_rebuild(const unsigned char *pt, size_t n,
 		C.rec_col = 0;
 		C.rec_cursor = 0;
 		clrecon_rounds_reset(&C.recon);
-		rdg_drop();                    /* the walk starts over: digests asked afresh */
-		rdg_phase = 0;
 		rebuild_into_pass(why);
 		rebuild_send(from, M_REBUILD_TAKEN, 0);
 		if (floor)
@@ -11253,10 +10686,6 @@ out:
 
 /* one candidate: 0 = clean end; -2 = nothing before the first record (an older build or a
  * refusal); -1 = the stream broke */
-/* the bulk thread's stop flag, for the transfers that run longer than one poll */
-static int bulk_never;
-static volatile int *bulk_stop = &bulk_never;
-
 static int bulk_pull_from(const pc_addr *peer,
 		unsigned int *streamed, unsigned int *stored, unsigned int *older)
 {
@@ -11312,8 +10741,6 @@ static int bulk_pull_from(const pc_addr *peer,
 		str k, v;
 		int brc;
 
-		if (*bulk_stop)
-			goto out;
 		if (clbulk_recv_exact(fd, &cs_r, stash, &slen, sizeof stash,
 		        rhdr, MIG_RHDR) != 0)
 			goto out;                  /* -2 before any record, -1 after */
@@ -11406,7 +10833,7 @@ static void bulk_pull(void)
 		usleep((useconds_t)self_boot_delay_ms * 1000);
 		self_boot_delay_ms = 0;
 	}
-	for (k = 0; k < n && !*bulk_stop; k++) {
+	for (k = 0; k < n; k++) {
 		unsigned int streamed, stored, older;
 		long long t0 = now_ms();
 		int rc = bulk_pull_from(&cand[k], &streamed, &stored, &older);
@@ -11710,34 +11137,6 @@ static int bulk_host_known(const pc_addr *a)
 
 #define BULK_M1_PAY 16                 /* message 1's payload: the version, the kind */
 
-/* exactly @n bytes by the monotonic @deadline: a receive timeout restarts with every byte read */
-static int bulk_read_by(int fd, unsigned char *buf, size_t n, long long deadline)
-{
-	size_t off = 0;
-
-	while (off < n) {
-		struct pollfd pf = { .fd = fd, .events = POLLIN };
-		long long left = deadline - now_ms();
-		ssize_t r;
-		int pr;
-
-		if (left <= 0)
-			return -1;
-		pr = poll(&pf, 1, (int)left);
-		if (pr < 0 && errno == EINTR)
-			continue;
-		if (pr <= 0)
-			return -1;
-		r = read(fd, buf + off, n - off);
-		if (r < 0 && errno == EINTR)
-			continue;
-		if (r <= 0)
-			return -1;
-		off += (size_t)r;
-	}
-	return 0;
-}
-
 static void bulk_rx(int cfd)
 {
 	extern void pc_wal_upsert(const char *, const char *, int,
@@ -11747,22 +11146,22 @@ static void bulk_rx(int cfd)
 	unsigned char *rec = NULL;
 	struct pc_handshake hs;
 	struct pc_cipherstate cs_s, cs_r;
-	struct timeval tv = { 5, 0 };
-	long long dl = now_ms() + 1000;
+	struct timeval tv = { 5, 0 }, tv1 = { 1, 0 };
 	size_t flen, mlen = 0, slen = 0;
 	unsigned int nrec, i, resolved = 0;
 	int replica = 0, stage = 0;
 
 	/* the opening message within a second - a silent connection
 	 * holds the bulk thread, and everything queued behind it, that long */
+	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv1, sizeof tv1);
 	setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-	if (bulk_read_by(cfd, frame, 2, dl) != 0)
+	if (clbulk_io(cfd, 0, frame, 2) != 0)
 		goto out;
 	flen = (size_t)frame[0] | ((size_t)frame[1] << 8);
 	/* message 1 is the principal, e, a payload of a byte or two and the tag: one longer would
 	 * be opened past pay[] below, written even when its tag fails */
 	if (flen < 1 + 48 || flen > 1 + 32 + BULK_M1_PAY + PC_NOISE_TAGLEN ||
-	        bulk_read_by(cfd, frame + 2, flen, dl) != 0)
+	        clbulk_io(cfd, 0, frame + 2, flen) != 0)
 		goto out;
 	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	if (frame[2] != PC_PRIN_CLUSTER)
@@ -11828,8 +11227,6 @@ static void bulk_rx(int cfd)
 		str k, v;
 		int brc;
 
-		if (*bulk_stop)
-			goto out;                  /* unanswered: the sender keeps its batch */
 		if (clbulk_recv_exact(cfd, &cs_r, stash, &slen, sizeof stash,
 		        rhdr, MIG_RHDR) != 0)
 			goto out;
@@ -11924,7 +11321,6 @@ void pc_bulk_thread(volatile int *stop)
 
 	if (C.blfd < 0)
 		return;
-	bulk_stop = stop;
 	pf.fd = C.blfd;
 	pf.events = POLLIN;
 	pc_qs_enter();                     /* a pull or a boot walk holds a table */
@@ -11940,7 +11336,6 @@ void pc_bulk_thread(volatile int *stop)
 			bulk_pull();
 		if (have_tx)
 			bulk_tx(stop);
-		pcache_arena_flush_if_asked();
 		pc_qs_exit();
 		prc = poll(&pf, 1, 200);
 		pc_qs_enter();
@@ -11980,7 +11375,6 @@ int cl_master_id(void)  { return C.master_id; }
 const char *cl_state_dir(void) { return C.state_dir; }
 int cl_map_usable(void) { return C.map_usable; }
 const struct pc_clmap *cl_map(void) { return &C.map; }
-unsigned int cl_map_gen(void) { return __atomic_load_n(&C.map_gen, __ATOMIC_ACQUIRE); }
 pc_addr cl_self_addr(void) { return C.self_addr; }
 
 /* per thread, folded on its first hit and then 1,024 at a time: a shared ++ from every
@@ -12138,7 +11532,6 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 	memset(&C.st, 0, sizeof C.st);
 	/* patterns the peers hold; fixed buckets, read without a lock */
 	clps_init();
-	clps_idle_fn = pcache_arena_flush_if_asked;
 	/* the parked-request table: sized ONCE, clamped not refused (the slot index rides in
 	 * the request id), never resized - clpend_find() hands out raw pointers into it */
 	clpush_init(&C.wp, PC_CL_MAXPEER, MIG_GHDR, MIG_GATHER_CAP,
@@ -12204,15 +11597,6 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 		}
 		epoch_load();
 	}
-	{
-		const char *e = getenv("PERFCACHED_TEST_ENTRIES_BIAS");
-
-		self_entries_bias = e ? (unsigned int)atoi(e) : 0;
-		if (self_entries_bias)
-			LM_WARN("cluster: PERFCACHED_TEST_ENTRIES_BIAS=%u - this node CLAIMS "
-				"that many more records to its peers (a test flag)\n",
-				self_entries_bias);
-	}
 	if (getenv("PERFCACHED_TEST_NO_RESPMAP")) {
 		self_no_respmap = 1;
 		LM_WARN("cluster: PERFCACHED_TEST_NO_RESPMAP - this member does not "
@@ -12256,35 +11640,11 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 			"floor's records are ruled on one by one instead of taken "
 			"whole from a survivor (a test flag)\n");
 	}
-	if (getenv("PERFCACHED_TEST_SURVIVOR_WAIT_MS")) {
-		self_survivor_wait_ms = atoi(getenv("PERFCACHED_TEST_SURVIVOR_WAIT_MS"));
-		LM_WARN("cluster: PERFCACHED_TEST_SURVIVOR_WAIT_MS - a rejoin's survivor is "
-			"picked no sooner than %d ms after the first ask (a test flag)\n",
-			self_survivor_wait_ms);
-	}
-	if (getenv("PERFCACHED_TEST_RECONCILE_WALK_WAIT_MS")) {
-		self_recon_walk_wait_ms = atoi(getenv("PERFCACHED_TEST_RECONCILE_WALK_WAIT_MS"));
-		LM_WARN("cluster: PERFCACHED_TEST_RECONCILE_WALK_WAIT_MS - a narrowed "
-			"reconcile pass waits %d ms before it walks (a test flag)\n",
-			self_recon_walk_wait_ms);
-	}
 	if (getenv("PERFCACHED_TEST_BOOT_DELAY_MS")) {
 		self_boot_delay_ms = atoi(getenv("PERFCACHED_TEST_BOOT_DELAY_MS"));
 		LM_WARN("cluster: PERFCACHED_TEST_BOOT_DELAY_MS - this node's first "
 			"bootstrap pull waits %d ms (a test flag)\n",
 			self_boot_delay_ms);
-	}
-	if (getenv("PERFCACHED_TEST_MIG_SCAN_RECS")) {
-		self_mig_scan_recs = (unsigned int)atoi(getenv("PERFCACHED_TEST_MIG_SCAN_RECS"));
-		LM_WARN("cluster: PERFCACHED_TEST_MIG_SCAN_RECS - a migration walk stops after "
-			"%u records, as at its deadline (a test flag)\n", self_mig_scan_recs);
-	}
-	if (getenv("PERFCACHED_TEST_WALK_NOMEM_MS")) {
-		int ms = atoi(getenv("PERFCACHED_TEST_WALK_NOMEM_MS"));
-
-		self_walk_nomem_until = now_ms() + ms;
-		LM_WARN("cluster: PERFCACHED_TEST_WALK_NOMEM_MS - the sweep and migration walks "
-			"fail for the first %d ms (a test flag)\n", ms);
 	}
 	if (getenv("PERFCACHED_TEST_NO_HOLDQ")) {
 		self_no_holdq = 1;
@@ -12556,7 +11916,6 @@ group_done:
 			ack_group, NULL);
 
 		C.ap.clock = cl_now_ms;    /* busy_since_ms stamps at the take */
-		C.ap.idle = pcache_arena_flush_if_asked;
 
 		if (n < 0)
 			LM_ERR("cluster: no memory for %d apply rings - "
@@ -12717,17 +12076,6 @@ void pc_cluster_get_stats(struct pc_cl_stats *out)
 	out->replicas_short = clspread_short_now(&replicas_short);
 	out->term_unpersisted = pc_term_unpersisted();
 	out->term_errno = out->term_unpersisted ? pc_term_store_errno() : 0;
-}
-
-int pc_cluster_peers_known(void)
-{
-	int i, n = 0;
-
-	for (i = 0; i < C.pt.n_peers; i++)
-		if (__atomic_load_n(&C.pt.peers[i].node, __ATOMIC_ACQUIRE))
-			n++;
-	/* a purged silent member keeps its id reserved - and its share */
-	return n + clres_count_why(&reserved, CLRES_GONE_SILENT, now_ms());
 }
 
 int pc_cluster_peers(struct pc_cl_peer_info *out, int max)

@@ -44,7 +44,6 @@ mode = eager
 EOF
 }
 start() { # start <n> <var>
-	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P$2=\$!"
 	i=0

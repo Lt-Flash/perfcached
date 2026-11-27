@@ -19,7 +19,6 @@ setting is refused, not ignored.
 | `pool` | both | `4` | 1..64 |
 | `connect_timeout_ms` | both | `1000` | 1..60000 |
 | `io_timeout_ms` | both | `300` | 1..60000 |
-| `call_timeout_ms` | resp | 2 x (connect + 2 x io) | 1..600000 |
 | `wait_timeout_ms` | both | `300` | 1..60000 |
 | `default_ttl` | both | `0` | 0..2147483647 seconds, 0 = no expiry |
 | `max_value` | both | `65536` | 1..67108864 bytes |
@@ -33,10 +32,7 @@ setting is refused, not ignored.
   node's listener has `encrypt = yes`), and it knows the fleet.  `resp` is
   RESP2, to perfcached's RESP door or to a Redis server.
 - **`server`** - tried in the order written.  With `binary` each line is a
-  seed: the fleet's members are learned from whichever one answers; at most 8
-  TCP seeds, each pooled connection starting at a different one (unix sockets
-  are tried after them), and after a dial no seed answered a connection fails
-  its calls at once for 1 s, doubling to 30 s (libperfd's backoff).  With
+  seed: the fleet's members are learned from whichever one answers.  With
   `resp`, a reconnect after a failure starts at the line after the one that
   failed.
 - **`secret`** - required with `binary` unless every server is loopback or a
@@ -52,10 +48,6 @@ setting is refused, not ignored.
 - **`connect_timeout_ms`** - per dial attempt.
 - **`io_timeout_ms`** - per send and per receive.  This is how long a stalled
   server can hold a call.
-- **`call_timeout_ms`** - `resp` only: the most one call may take, its dial
-  and its one retry included (2600 ms at the defaults); a server that
-  trickles a reply is cut off there.  A bulk declared more than 64 KiB past
-  `max_value` is `ERROR` at once and the connection is closed, not drained.
 - **`wait_timeout_ms`** - how long a call waits for a free connection before
   it is `ERROR`.
 - **`default_ttl`** - applies when `PERFD_SET` has no third argument.
@@ -66,8 +58,8 @@ setting is refused, not ignored.
   connected (`failover`), or spread by `round_robin`, `least_conn` or
   `weighted` free memory.
 - **`spares`** - standby connections per pooled connection, so a node failure
-  is a swap: `0` or `-1` = one to every other member, `N` = at most N (above 8
-  taken as 8), `none` = no standbys and no fleet learned (no failover).
+  is a swap: `0` or `-1` = one to every other member, `N` = at most N, `none` = no
+  standbys and no fleet learned (no failover).
 - **`route_keys`** - send each request to the node that owns its key.  Needs
   spares.
 - **`keepalive_s`** - TCP keepalive idle time on binary connections.

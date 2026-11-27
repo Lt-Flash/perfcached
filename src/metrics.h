@@ -7,9 +7,9 @@
 
 #include <stddef.h>
 
-/* the exposition in a heap buffer grown to fit, NUL-terminated, its length in @len; the caller
- * frees it.  NULL when out of memory - never a cut copy */
-char *pc_metrics_render(size_t *len);
+/* bytes written into @buf (at most @cap - 1, always NUL-terminated), or 0 if
+ * @cap is too small to be useful */
+size_t pc_metrics_render(char *buf, size_t cap);
 
 /* seconds since the daemon finished starting; the exposition's
  * perfcached_uptime_seconds, kept here so main() can stamp it */

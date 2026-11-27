@@ -68,8 +68,6 @@ clsynctest
 cltermtest
 failovertest
 routedpairtest
-apooltest
-apoollivetest
 movedhinttest
 workerbaltest
 respreadtest
@@ -103,22 +101,6 @@ clustersim
 jwtest
 walringtest
 rpcqtest
-nodetest
-clprobetest
-getbusy
-thrtabtest
-perfdlinktest
-perfdurltest
-perfdexectest
-execcmp
-promlabeltest
-cliupgtest
-obstest
-dumpreadytest
-dumpchunktest
-dashlocktest
-upjsontest
-loadrefusetest
 scancost
 wedgetest
 threadfreeze
@@ -139,8 +121,6 @@ udppushcli
 psindextest
 clapplytest
 evactest
-arenacaptest
-addexptest
 # S250: the edition chosen by make menuconfig - local, per checkout
 config.mk
 hinttest

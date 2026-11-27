@@ -1,6 +1,5 @@
 /* clpstest.c - the pub/sub relay plane on the real clps, clsend, clpeers, clwire, psindex and quiesce
  * objects, every datagram captured and parsed: who gets a relay on which sequence space, and why. */
-#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -55,14 +54,12 @@ pc_addr cl_self_addr(void)
 static uint64_t my_ver;             /* our interest version; 0 = none */
 static unsigned long long delivered, dups, lost;
 static char got_chan[64], got_data[64];
-static int got_origin, rx_threads;
+static int got_origin;
 
 int pc_pubsub_publish(const char *chan, size_t clen, const char *data,
 		size_t dlen, int origin)
 {
-	__atomic_add_fetch(&delivered, 1, __ATOMIC_RELAXED);
-	if (__atomic_load_n(&rx_threads, __ATOMIC_RELAXED))
-		return 0;                  /* several receive threads: counted only */
+	delivered++;
 	snprintf(got_chan, sizeof got_chan, "%.*s", (int)clen, chan);
 	snprintf(got_data, sizeof got_data, "%.*s", (int)dlen, data);
 	got_origin = origin;
@@ -72,8 +69,8 @@ void pc_pubsub_relay_account(unsigned long long sent, unsigned long long l,
 		unsigned long long dropped, unsigned long long d)
 {
 	(void)sent; (void)dropped;
-	__atomic_add_fetch(&lost, l, __ATOMIC_RELAXED);
-	__atomic_add_fetch(&dups, d, __ATOMIC_RELAXED);
+	lost += l;
+	dups += d;
 }
 uint64_t pc_pubsub_interest_version(void) { return my_ver; }
 size_t pc_pubsub_interest_full(unsigned char *out, size_t cap)
@@ -238,71 +235,12 @@ static size_t add_frame(unsigned char *m, unsigned node, uint64_t ver,
 	return 14 + strlen(s);
 }
 
-/* one sender lane delivered by several receive threads at once (a sender's large frames come by
- * the cluster thread, the rest by a relay thread); every counter is distinct */
-#define RX_N 2000000ULL
-static unsigned char rxf[64];
-static size_t rxn;
-static unsigned long long rx_next;
-
-static void *rx_both(void *arg)
-{
-	unsigned char f[64];
-	unsigned long long c;
-
-	(void)arg;
-	memcpy(f, rxf, rxn);
-	while ((c = __atomic_add_fetch(&rx_next, 1, __ATOMIC_RELAXED)) <= RX_N) {
-		p64(f + 3, psr_seq(0x1234, 3, c));
-		clps_handle_publish(f, rxn);
-	}
-	return NULL;
-}
-
-/* 512 publishing threads, one after another, one relay each: the sequence each sent to peer
- * `last`; the relay hands out 8-bit lanes, so the 257th thread shares the first one's */
-#define LANE_THREADS 512
-static uint64_t lane_seq[LANE_THREADS];
-static unsigned lane_to;
-
-static void *one_relay(void *arg)
-{
-	long k = (long)arg;
-
-	if (relay("lanes") > 0 && to(lane_to) >= 0)
-		lane_seq[k] = seq_of(to(lane_to));
-	return NULL;
-}
-
-static int lanes_repeated(unsigned last)
-{
-	pthread_t th;
-	long k, j;
-	int rep = 0;
-
-	memset(lane_seq, 0, sizeof lane_seq);
-	lane_to = last;
-	for (k = 0; k < LANE_THREADS; k++)
-		if (pthread_create(&th, NULL, one_relay, (void *)k) == 0)
-			pthread_join(th, NULL);
-	for (k = 0; k < LANE_THREADS; k++) {
-		if (!lane_seq[k])
-			return -1;
-		for (j = 0; j < k; j++)
-			if (lane_seq[j] == lane_seq[k]) {
-				rep++;
-				break;
-			}
-	}
-	return rep;
-}
-
 int main(void)
 {
 	pc_addr f5 = from_addr(5), f7 = from_addr(7), f8 = from_addr(8);
 	unsigned char m[128];
 	uint64_t s5, s7, iv;
-	int i5, i7, why, err, rp;
+	int i5, i7, why, err;
 	size_t n;
 
 	if (sodium_init() < 0) {
@@ -387,41 +325,6 @@ int main(void)
 			"receive from id 2000, past PC_CL_NODE_MAX: no lanes either");
 	}
 
-	/* ---- one lane, two receive threads ------------------------------------ */
-	relay("rx");
-	i5 = to(5);
-	if (i5 >= 0 && out[i5].n <= sizeof rxf) {
-		pthread_t th[4];
-		int t;
-
-		rxn = out[i5].n;
-		memcpy(rxf, out[i5].pt, rxn);
-		rxf[1] = 0;
-		rxf[2] = 7;                    /* member 7's */
-		delivered = dups = lost = 0;
-		rx_next = 0;
-		rx_threads = 1;
-		for (t = 0; t < 4; t++)
-			pthread_create(&th[t], NULL, rx_both, NULL);
-		for (t = 0; t < 4; t++)
-			pthread_join(th[t], NULL);
-		rx_threads = 0;
-		if (dups)
-			printf("  --   %llu of %llu distinct counters called duplicates\n", dups, RX_N);
-		chk(dups == 0 && delivered == RX_N,
-			"receive: one lane's window written by two threads at once - a counter that "
-			"never came before read as a duplicate and was dropped");
-	} else
-		chk(0, "receive: no frame to replay on two threads");
-
-	/* ---- more publishing threads than lanes ---------------------------- */
-	rp = lanes_repeated(5);
-	chk(rp == 0, "relay: 512 publishing threads send 512 distinct sequences - past 256 a "
-		"thread's lane wrapped onto another's and its counters repeated (the peer drops "
-		"them as duplicates)");
-	if (rp)
-		printf("  --   %d of %d sequences repeated\n", rp, LANE_THREADS);
-
 	/* ---- a peer that filters, before we have its state ------------------ */
 	iv = psv_make(3, 0, 0);
 	nout = 0;
@@ -448,11 +351,6 @@ int main(void)
 	relay("news");
 	chk(psr_counter(seq_of(to(7))) == psr_counter(s7) + 1,
 		"  counted on its own counter, so what it is not sent is not a loss to it");
-	rp = lanes_repeated(7);
-	chk(rp == 0, "  512 publishing threads send it 512 distinct sequences on its own space "
-		"too - past 256 the per-peer counters repeated");
-	if (rp)
-		printf("  --   %d of %d sequences repeated\n", rp, LANE_THREADS);
 
 	/* ---- its full state: it filters -------------------------------------- */
 	n = full_frame(7, iv, "news", NULL);

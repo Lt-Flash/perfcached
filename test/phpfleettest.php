@@ -212,39 +212,4 @@ if ($arm === 'owners') {
     }
     file_put_contents($file, $lines);
 }
-if ($arm === 'clear') {
-    require $argv[3];
-    require $argv[4];
-    $pc = new Perfcached('127.0.163.1', 19591, $opts);
-    $cache = new Perfcached\Symfony\PerfcachedAdapter($pc, 'c', 'app');
-    for ($i = 0; $i < 90; $i++) {
-        $cache->save($cache->getItem("k$i")->set($i));
-    }
-    $have = 0;
-    for ($i = 0; $i < 90; $i++) $have += $cache->hasItem("k$i") ? 1 : 0;
-    ok($have === 90, "90 items saved through node 1 ($have readable)");
-    $r = $cache->clear();
-    $left = 0;
-    for ($i = 0; $i < 90; $i++) $left += $cache->hasItem("k$i") ? 1 : 0;
-    // node 1 lists and deletes only its own share: true would claim the other nodes' were gone
-    ok($r === true ? $left === 0 : true, 'clear() says true only when the pool is empty: ' . var_export($r, true) . ", $left of 90 left");
-    ok($r === false, 'clear() through one node of a shard fleet reports it did not reach every key (' . var_export($r, true) . ')');
-    try {
-        $ids = $pc->keys('c', null, 0, $complete);
-        ok($complete === false, 'keys() says a node-scoped listing is not complete (' . var_export($complete, true) . ', ' . count($ids) . ' keys)');
-    } catch (\Throwable $e) {
-        ok(false, 'keys() says whether its listing is complete: ' . get_class($e) . ': ' . substr($e->getMessage(), 0, 100));
-    }
-}
-if ($arm === 'clearalone') {
-    require $argv[3];
-    require $argv[4];
-    $pc = new Perfcached('127.0.163.1', 19591, $opts);
-    $cache = new Perfcached\Symfony\PerfcachedAdapter($pc, 'c', 'app');
-    // nodes 2 and 3 are down and still hold their shares: no node confirmed them cleared
-    $r = $cache->clear();
-    ok($r === false, 'clear() with every other shard node down is not true (' . var_export($r, true) . ')');
-    $ids = $pc->keys('c', null, 0, $complete);
-    ok($complete === false, 'keys() with every peer down says its listing is not complete (' . var_export($complete, true) . ')');
-}
 exit($fails ? 1 : 0);

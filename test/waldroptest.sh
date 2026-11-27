@@ -62,7 +62,6 @@ except Exception: print('-1 -1 -1')"; }
 run() { # run <probe> <extra> -> echoes "appended dropped entries"
 	rm -rf "$D/wal"; mkdir -p "$D/wal"
 	mkcfg "$1" "$2"
-	: > "$D/n1.log"
 	"$BIN" -f "$D/n1.conf" > "$D/n1.log" 2>&1 &
 	P=$!
 	k=0
@@ -128,7 +127,6 @@ fi
 #    a sequence number, so the reply carries the drop count to tell a full barrier from a partial one
 rm -rf "$D/wal"; mkdir -p "$D/wal"
 mkcfg auto ""
-: > "$D/n4.log"
 "$BIN" -f "$D/n1.conf" > "$D/n4.log" 2>&1 &
 P4=$!
 k=0
@@ -164,8 +162,7 @@ fi
 #    nothing may drop, all must reach the WAL, and the waits must be counted
 rm -rf "$D/wal"; mkdir -p "$D/wal"; : > "$D/ctl"; : > "$D/shim.log"
 mkcfg no "ring_kb = 1024"
-: > "$D/n5.log"
-PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
+PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD" \
 	"$BIN" -f "$D/n1.conf" > "$D/n5.log" 2>&1 &
 P5=$!
 k=0
@@ -197,8 +194,7 @@ grep -q walslow "$D/shim.log" && ok || bad "5. the shim never slowed a WAL write
 #    waits, its connection held (writer_pauses) or its write in the ring (ring_waits)
 rm -rf "$D/wal"; mkdir -p "$D/wal"; : > "$D/ctl"; : > "$D/shim.log"
 FSYNC=everysec mkcfg no "ring_kb = 64"
-: > "$D/n6.log"
-PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD${PC_NOSYNC_LIB:+ $PC_NOSYNC_LIB}" \
+PC_SYNCFAIL_CTL="$D/ctl" PC_SYNCFAIL_LOG="$D/shim.log" LD_PRELOAD="$PRELOAD" \
 	"$BIN" -f "$D/n1.conf" > "$D/n6.log" 2>&1 &
 P6=$!
 k=0

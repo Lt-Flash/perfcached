@@ -105,14 +105,9 @@ static int buf_reserve(char **b, size_t *cap, size_t have, size_t need,
 	return 0;
 }
 
-/* records io_uring held through a pause or hold (ur_hold) decrypt into c->in under the hold's
- * limit, as a plaintext connection's held bytes do, not one request's */
-static __thread int in_hold_serve;
-
 int in_append(struct pc_conn *c, const char *p, size_t n)
 {
-	if (buf_reserve(&c->in, &c->in_cap, c->in_len, n, in_hold_serve ?
-	        PC_MAX_REQ + 4 * PC_NOISE_MAXMSG + PC_UR_HOLD_MAX :
+	if (buf_reserve(&c->in, &c->in_cap, c->in_len, n,
 	        PC_MAX_REQ + PC_BIN_HDR) < 0)
 		return -1;
 	bufs_mark(c);
@@ -120,22 +115,6 @@ int in_append(struct pc_conn *c, const char *p, size_t n)
 	c->in_len += n;
 	return 0;
 }
-
-/* the output cap; a test lowers it (PERFCACHED_TEST_OUTQ) to reach it with small replies */
-static size_t outq_max(void)
-{
-	static size_t m;
-
-	if (!m) {
-		const char *e = getenv("PERFCACHED_TEST_OUTQ");
-		long long v = e ? atoll(e) : 0;
-
-		m = v > 0 && v < PC_MAX_OUTQ ? (size_t)v : PC_MAX_OUTQ;
-	}
-	return m;
-}
-
-static void sync_note(struct pc_conn *c);
 
 int out_append(struct pc_conn *c, const char *p, size_t n)
 {
@@ -148,12 +127,12 @@ int out_append(struct pc_conn *c, const char *p, size_t n)
 	/* an io_uring send's unsent part is still backlog: the cap covers both, as on epoll, so
 	 * the send's completion merges them within PC_MAX_OUTQ */
 	if (c->ur_send &&
-	    c->out_len + n + (c->wire_len - c->wire_off) > outq_max()) {
+	    c->out_len + n + (c->wire_len - c->wire_off) > PC_MAX_OUTQ) {
 		if (!c->out_failed)
 			c->out_failed = 1;
 		return -1;
 	}
-	rc = buf_reserve(&c->out, &c->out_cap, c->out_len, n, outq_max());
+	rc = buf_reserve(&c->out, &c->out_cap, c->out_len, n, PC_MAX_OUTQ);
 
 	if (rc < 0) {                  /* -1 at the cap, -2 out of memory */
 		if (!c->out_failed)
@@ -161,14 +140,12 @@ int out_append(struct pc_conn *c, const char *p, size_t n)
 		return rc;
 	}
 	bufs_mark(c);
-	sync_note(c);
 	memcpy(c->out + c->out_len, p, n);
 	c->out_len += n;
 	return 0;
 }
 
-/* room for @n more bytes at c->wire + c->wire_len, nothing written: 0, or -1 */
-static int wire_reserve(struct pc_conn *c, size_t n)
+int wire_append(struct pc_conn *c, const char *p, size_t n)
 {
 	const size_t limit = PC_MAX_OUTQ + (PC_MAX_OUTQ >> 4);
 
@@ -187,13 +164,6 @@ static int wire_reserve(struct pc_conn *c, size_t n)
 	if (buf_reserve(&c->wire, &c->wire_cap, c->wire_len, n, limit) < 0)
 		return -1;
 	bufs_mark(c);
-	return 0;
-}
-
-int wire_append(struct pc_conn *c, const char *p, size_t n)
-{
-	if (wire_reserve(c, n) < 0)
-		return -1;
 	memcpy(c->wire + c->wire_len, p, n);
 	c->wire_len += n;
 	return 0;
@@ -466,7 +436,6 @@ static void out_pause(struct pc_conn *c);      /* with the resume pass */
 static void out_unlink(struct pc_conn *c);
 static int conn_pause(struct pc_conn *c);
 static void wal_pause(struct pc_conn *c);      /* with the resume pass */
-static void sync_unlink(struct pc_conn *c);
 static void wal_unlink(struct pc_conn *c);
 /* this worker's HTTP connections, counted at make and destroy: the wait reads this, not
  * the sweep's last answer, which predates the turn's accepts */
@@ -488,18 +457,12 @@ static unsigned long long outp_now_all, outp_pauses_all, outp_stalls_all;
 /* writers held while this worker's WAL ring is nearly full */
 static __thread struct pc_conn *walp_head;
 static __thread int walp_here;
-static __thread struct pc_conn *synch_head;
-static __thread int synch_here;
-static unsigned long long synch_now_all, synch_holds_all, synch_ms_all;
 static unsigned long long walp_now_all, walp_pauses_all;
 int pc_output_stall_s = 30;
 
-/* a hold (a KEYS walk, a read-through fetch, a parked RESP command) serves nothing behind it, so
- * its input waits in the socket as a pause's does */
 static inline int conn_input_off(const struct pc_conn *c)
 {
-	return c->ps_paused || c->out_paused || c->wal_paused ||
-		c->enum_active || c->up_hold || c->park_hold;
+	return c->ps_paused || c->out_paused || c->wal_paused;
 }
 
 static inline size_t out_pending(const struct pc_conn *c)
@@ -547,21 +510,6 @@ static void ur_starve(struct pc_conn *c)
 	c->ur_starved = 1;
 	c->ur_starved_next = ur_starved_head;
 	ur_starved_head = c;
-}
-
-/* off that list: a destroyed connection may be freed before the next retry walks it */
-static void ur_unstarve(struct pc_conn *c)
-{
-	struct pc_conn **pp = &ur_starved_head;
-
-	if (!c->ur_starved)
-		return;
-	while (*pp && *pp != c)
-		pp = &(*pp)->ur_starved_next;
-	if (*pp)
-		*pp = c->ur_starved_next;
-	c->ur_starved = 0;
-	c->ur_starved_next = NULL;
 }
 
 /* the requests in flight, brought in line with what the connection wants */
@@ -682,7 +630,6 @@ void conn_destroy(struct pc_conn *c)
 	pause_unlink(c);
 	out_unlink(c);
 	wal_unlink(c);
-	sync_unlink(c);
 	hs_unlink(c);
 	if (c->udp)
 		udp_free(c);
@@ -729,10 +676,8 @@ void conn_destroy(struct pc_conn *c)
 		*c->list = c->next;
 	if (c->next)
 		c->next->prev = c->prev;
-	if (c->ep < 0) {
-		ur_unstarve(c);
+	if (c->ep < 0)
 		ur_drop(c);
-	}
 	if (c->ur_send) {                  /* the kernel still reads it: */
 		c->ur_wire_hold = c->wire; /* the send's completion frees it */
 		c->wire = NULL;
@@ -1252,29 +1197,22 @@ static int tls_wire(void *ctx, const char *p, size_t n);
 
 static int encrypt_pending(struct pc_conn *c)
 {
-	size_t nrec = (c->out_len + PC_NOISE_MAXPT - 1) / PC_NOISE_MAXPT, off = 0;
+	uint8_t rec[2 + PC_NOISE_MAXPT + PC_NOISE_TAGLEN];
+	size_t off = 0;
 
-	/* room for every record first: one sealed and not queued would put the nonces out of
-	 * step, and the plaintext left in c->out would be sealed again */
-	if (wire_reserve(c, c->out_len + nrec * (2 + PC_NOISE_TAGLEN)) < 0)
-		return -1;
 	while (off < c->out_len) {
 		size_t chunk = c->out_len - off;
-		uint8_t *rec = (uint8_t *)c->wire + c->wire_len;
 		int cl;
 
 		if (chunk > PC_NOISE_MAXPT)
 			chunk = PC_NOISE_MAXPT;
 		cl = pc_transport_encrypt(&c->send_cs,
 			(const uint8_t *)c->out + off, chunk, rec + 2);
-		if (cl < 0) {
-			/* what was sealed is queued: a re-run seals only the rest */
-			memmove(c->out, c->out + off, c->out_len - off);
-			c->out_len -= off;
+		if (cl < 0)
 			return -1;
-		}
 		put16(rec, (uint16_t)cl);
-		c->wire_len += 2 + (size_t)cl;
+		if (wire_append(c, (char *)rec, 2 + (size_t)cl) < 0)
+			return -1;
 		off += chunk;
 	}
 	c->out_len = 0;
@@ -1300,12 +1238,8 @@ static int ur_send_wire(struct pc_conn *c)
 int conn_flush(struct pc_conn *c)
 {
 	struct epoll_event ev;
-	size_t keep = 0, front;
 	ssize_t n;
 
-	/* a reply that did not fit was lost: the stream is out of step, the caller closes it */
-	if (c->out_failed)
-		return -1;
 	/* a send in flight owns c->wire: staged replies wait in c->out for its completion,
 	 * and CLIENT LIST sees them pending */
 	if (c->ur_send) {
@@ -1320,14 +1254,6 @@ int conn_flush(struct pc_conn *c)
 	/* records OpenSSL wrote while a send was in flight (a KeyUpdate's answer) */
 	if (c->tls && !c->out_len && pc_tls_flush(c->tls, tls_wire, c) < 0)
 		return -1;
-	/* fsync = sync: what was staged from the first held reply on stays until its write is synced */
-	if (c->sync_held) {
-		if (pc_wal_synced_low() >= c->sync_seq)
-			sync_unlink(c);
-		else
-			keep = c->out_len - (c->sync_from < c->out_len ? c->sync_from : c->out_len);
-	}
-	front = c->out_len -= keep;
 	/* move staged plaintext into the socket buffer */
 	if (c->out_len) {
 		if (c->encrypted) {
@@ -1347,13 +1273,6 @@ int conn_flush(struct pc_conn *c)
 				return -1;
 			c->out_len = 0;
 		}
-	}
-	if (keep) {                        /* the held tail, to the front once the rest left */
-		if (!c->out_len) {
-			memmove(c->out, c->out + front, keep);
-			c->sync_from = 0;
-		}
-		c->out_len += keep;
 	}
 
 	if (c->ep < 0 && c->wire_off < c->wire_len && ur_send_wire(c) == 0)
@@ -1428,7 +1347,6 @@ static int bin_reply_ex(struct pc_conn *c, uint64_t id, int flags,
 		const char *payload, size_t n, const char *trail, size_t tn)
 {
 	char hdr[PC_BIN_HDR];
-	size_t at = c->out_len;
 
 	hdr[0] = (char)PC_BIN_MAGIC;
 	hdr[1] = PC_BIN_VER;
@@ -1436,13 +1354,11 @@ static int bin_reply_ex(struct pc_conn *c, uint64_t id, int flags,
 	hdr[3] = (char)flags;
 	put32(hdr + 4, (uint32_t)(n + tn));
 	put64(hdr + 8, id);
-	/* all of the frame or none of it: a lone header would frame what follows */
-	if (out_append(c, hdr, sizeof hdr) < 0 || out_append(c, payload, n) < 0 ||
-	        (tn && out_append(c, trail, tn) < 0)) {
-		c->out_len = at;
+	if (out_append(c, hdr, sizeof hdr) < 0)
 		return -1;
-	}
-	return 0;
+	if (out_append(c, payload, n) < 0)
+		return -1;
+	return tn ? out_append(c, trail, tn) : 0;
 }
 
 static int bin_reply(struct pc_conn *c, uint64_t id, int flags,
@@ -1852,29 +1768,7 @@ static int pf_gate(pcache_htable_t *ht)
 	return pf_gate_on;
 }
 
-static void pause_set_events(struct pc_conn *c);
-
-static int plaintext_drain(struct pc_conn *c);
-
-/* the drain, then input on or off as a hold began or ended in it; records io_uring held
- * through the hold (ur_hold) are served once it is over */
 int process_plaintext(struct pc_conn *c)
-{
-	int rc = plaintext_drain(c), h;
-
-	if (rc < 0 || c->dead)
-		return rc;
-	h = c->enum_active || c->up_hold || c->park_hold;
-	if (h == c->in_held)
-		return rc;
-	c->in_held = h;
-	pause_set_events(c);
-	if (!h && c->ep < 0 && c->raw_len && (c->encrypted || c->tls))
-		return conn_take(c, NULL, 0);
-	return rc;
-}
-
-static int plaintext_drain(struct pc_conn *c)
 {
 	size_t off = 0;
 	int rc = 0;
@@ -1898,7 +1792,6 @@ static int plaintext_drain(struct pc_conn *c)
 		pc_pubsub_pressure_take(NULL); /* not ours: nothing waits on it */
 
 	pc_wal_wrote = &c->wal_writer;     /* cleared on every way out */
-	pc_wal_conn_seq = pc_wal_sync_mode() ? &c->sync_want : NULL;
 	while (off < c->in_len) {
 		/* a cooperative walk's reply must precede any later request's (RESP replies are
 		 * ordered): the rest stays buffered until the walk completes */
@@ -1991,7 +1884,6 @@ static int plaintext_drain(struct pc_conn *c)
 			        !(f >= 'a' && f <= 'z') &&
 			        f != '\r' && f != '\n') {
 				pc_wal_wrote = NULL;
-				pc_wal_conn_seq = NULL;
 				return -1;
 			}
 			rc = resp_one(c, off);
@@ -2046,7 +1938,6 @@ static int plaintext_drain(struct pc_conn *c)
 			break;                 /* a queue it feeds is full: the rest waits */
 	}
 	pc_wal_wrote = NULL;
-	pc_wal_conn_seq = NULL;
 	if (rc < 0)
 		return -1;
 	if (off) {
@@ -2161,7 +2052,7 @@ static struct parked *park_find(unsigned int req)
 	return NULL;
 }
 
-static void pull_complete_body(const struct pc_pull_done *d, int rd);
+static void pull_complete_body(const struct pc_pull_done *d);
 /* a read-through fetch this worker's connection waited on is done: release the hold and
  * run the parked command, then what the client pipelined behind it, in order */
 void pc_proto_upstream_complete(unsigned int req, int status)
@@ -2230,10 +2121,6 @@ void pc_proto_upstream_complete(unsigned int req, int status)
 static void resp_park_done(struct pc_conn *c)
 {
 	c->park_hold = 0;
-	if (c->out_failed) {               /* its reply was lost: run nothing behind it */
-		conn_destroy(c);
-		return;
-	}
 	if (process_plaintext(c) < 0) {
 		c->why = "protocol error";
 		conn_destroy(c);
@@ -2262,8 +2149,7 @@ static void mget_answer(struct pc_mget *m)
 		if (!buf) {
 			pc_mget_free(m);
 			bin_reply(c, id, PC_BIN_F_ERR, "out of memory", 13);
-			if (conn_flush(c) < 0)
-				conn_destroy(c);
+			conn_flush(c);
 			return;
 		}
 		pc_tw_init(&w, (unsigned char *)buf, JW_REPLY_CAP);
@@ -2276,8 +2162,7 @@ static void mget_answer(struct pc_mget *m)
 		else
 			bin_reply(c, id, 0, (const char *)w.b, w.n);
 		pc_tw_free(&w);
-		if (conn_flush(c) < 0)
-			conn_destroy(c);
+		conn_flush(c);
 		return;
 	}
 	{
@@ -2342,7 +2227,7 @@ void pc_proto_pull_complete(const struct pc_pull_done *d)
 				dd.ok = st;
 				dd.val = st == 0 ? frag : NULL;
 				dd.vlen = st == 0 ? fl : 0;
-				pull_complete_body(&dd, 1);
+				pull_complete_body(&dd);
 				return;
 			}
 			/* a hash read pulled the record: 0 a hash, 1 absent, 3 wrong type */
@@ -2367,13 +2252,9 @@ void pc_proto_pull_complete(const struct pc_pull_done *d)
 			dd.ok = 2;             /* holder rejected / timed out */
 		}
 		d = &dd;
-		pull_complete_body(d, 1);
-		if (rendered)
-			pc_tw_free(&rt);
-		return;
 	}
 plain:
-	pull_complete_body(d, d->kind == PC_DONE_JSON && d->jop == PC_JOP_GET);
+	pull_complete_body(d);
 	if (rendered)
 		pc_tw_free(&rt);
 }
@@ -2405,25 +2286,21 @@ void pc_pull_found_keep(const char *col, size_t collen, const char *key,
 		v.len = d->vlen;
 		/* the HOLDER's version, not a local tick: clocks converge to the fleet maximum, so
 		 * a local one could outrank the holder's next genuine update */
-		/* a through collection's pulled record is Redis's, as a pushed one: marked (T594) */
-		if (pcache_ht_store_ver(ht, &k, &v, exp,
+		pcache_ht_store_ver(ht, &k, &v, exp,
 			(unsigned char)(PCACHE_F_PASSIVE |
-			(d->newval & PCACHE_F_CARRY)), d->ver) == 0)
-			pc_upstream_note_copy(col, collen, key, klen, exp, d->ver);
+			(d->newval & PCACHE_F_CARRY)), d->ver);
 	} else if (ht) {
 		/* proxy mode: serve WITHOUT storing, remember the holder */
 		pc_loc_set(col, collen, key, klen, d->from_node);
 	}
 }
 
-/* @rd: the request was a read (a pull, or a forwarded document or hash read) */
-static void pull_complete_body(const struct pc_pull_done *d, int rd)
+static void pull_complete_body(const struct pc_pull_done *d)
 {
 	struct parked *pk = NULL;
 	struct pc_conn *c;
 	long long resume_nv;
-	int resume_rc, pull_wrongtype = 0, busy;
-	const char *pull_uperr = NULL;
+	int resume_rc, pull_wrongtype = 0;
 
 	pk = park_find(d->req);
 	if (!pk)
@@ -2438,18 +2315,8 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 		pull_wrongtype = tht && pc_store_types_strict(tht);
 	}
 
-	if (d->kind == PC_DONE_PULL && !d->found && d->timedout && !pk->pres)
-		pull_uperr = pc_upstream_pull_lost(pk->col, pk->collen, pk->key,
-			pk->klen);
-	/* a read nobody answered in time is no miss: refused as retryable, nothing cached */
-	busy = d->timedout && !pull_uperr &&
-		(d->kind == PC_DONE_PULL ? !d->found : rd);
 	if (d->kind == PC_DONE_PULL && d->found) {
 		pc_pull_found_keep(pk->col, pk->collen, pk->key, pk->klen, d);
-	} else if (pull_uperr) {
-		/* the owner's upstream fetch failed: neither a miss nor a marker */
-	} else if (busy) {
-		/* answered below */
 	} else if (d->kind == PC_DONE_PULL) {
 		pcache_htable_t *ht = pc_store_find(pk->col, pk->collen);
 
@@ -2550,33 +2417,24 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 		struct pc_jw w;
 
 		pc_jw_init(&w, nb, sizeof nb);
-		if (busy)
-			out_append(c, "-TRYAGAIN cluster busy, retry\r\n",
-				sizeof "-TRYAGAIN cluster busy, retry\r\n" - 1);
-		else switch (d->kind) {
+		switch (d->kind) {
 		case PC_DONE_PULL:
 			if (pk->pres) {
 				pc_pres_resp(&w, pk->pres, d->found,
 					(unsigned int)d->newval, d->ttl_left);
 				out_append(c, w.buf, w.len);
-			} else if (pull_wrongtype || pull_uperr) {
-				const char *em = pull_uperr ? pull_uperr
-					: pc_wrongtype_msg;
-
-				out_append(c, pull_uperr ? "-ERR " : "-",
-					pull_uperr ? 5 : 1);
-				out_append(c, em, strlen(em));
+			} else if (pull_wrongtype) {
+				out_append(c, "-", 1);
+				out_append(c, pc_wrongtype_msg,
+					strlen(pc_wrongtype_msg));
 				out_append(c, "\r\n", 2);
 			} else if (d->found) {
-				size_t at = c->out_len;
-
 				pc_jw_lit(&w, "$");
 				pc_jw_i64(&w, d->vlen);
 				pc_jw_lit(&w, "\r\n");
-				if (out_append(c, w.buf, w.len) < 0 ||
-				        out_append(c, d->val, (size_t)d->vlen) < 0 ||
-				        out_append(c, "\r\n", 2) < 0)
-					c->out_len = at;   /* resp_park_done closes it */
+				out_append(c, w.buf, w.len);
+				out_append(c, d->val, (size_t)d->vlen);
+				out_append(c, "\r\n", 2);
 			} else {
 				out_append(c, "$-1\r\n", 5);
 			}
@@ -2788,8 +2646,6 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 		case PC_DONE_PULL:             /* the get reply shape */
 			if (pull_wrongtype)
 				emsg = pc_wrongtype_msg;
-			else if (pull_uperr)
-				emsg = pull_uperr;
 			break;
 		case PC_DONE_SET_RESUME:
 			if (!d->ok) {          /* probe timeout: refuse */
@@ -2821,8 +2677,6 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 		default:
 			emsg = "protocol";     /* document ops park CMD frames only */
 		}
-		if (busy)
-			emsg = "cluster busy";  /* PERFD_E_REFUSED: retry */
 		tn = park_moved(pk, &flags, trail);
 		if (!emsg)
 			tn += park_hint(pk, d, &flags, trail + tn);
@@ -2853,8 +2707,7 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 		} else {
 			bin_reply_ex(c, id, flags, pay, pn, trail, tn);
 		}
-		if (conn_flush(c) < 0)
-			conn_destroy(c);           /* drops this park too */
+		conn_flush(c);
 		free(pk->key);
 		pk->key = NULL;
 		free(pk->hargs);
@@ -2875,16 +2728,6 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 
 		if (!tb)
 			goto done;
-		if (pull_uperr || busy) {
-			/* as the same read's local upstream failure answers; a read
-			 * nobody answered in time, as a busy cluster does */
-			const char *em = pull_uperr ? pull_uperr : "cluster busy";
-
-			bin_reply(c, id, PC_BIN_F_ERR, em, strlen(em));
-			if (conn_flush(c) < 0)
-				conn_destroy(c);
-			goto done;
-		}
 		pc_tw_init(&w, tb, JW_REPLY_CAP);
 		switch (d->kind) {
 		case PC_DONE_FWD_SET:
@@ -3033,8 +2876,7 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 			bin_reply_ex(c, id, flags, (const char *)w.b, w.n, trail, tn);
 		else
 			bin_reply(c, id, PC_BIN_F_ERR, "reply too large", 15);
-		if (conn_flush(c) < 0)
-			conn_destroy(c);
+		conn_flush(c);
 	}
 
 done:
@@ -3460,8 +3302,7 @@ static int push_flush(struct pc_conn *c)
 {
 	if (conn_flush(c) == 0)
 		return 0;
-	return c->out_failed == 1 ||
-		c->out_len + (c->wire_len - c->wire_off) >= PC_MAX_OUTQ
+	return c->out_len + (c->wire_len - c->wire_off) >= PC_MAX_OUTQ
 		? PC_PS_PUSH_SLOW : PC_PS_PUSH_BROKEN;
 }
 
@@ -3736,98 +3577,6 @@ void pc_conn_resume_wal(void)
 	}
 }
 
-/* fsync = sync: a reply staged after a write this connection logged, or one this worker logged
- * outside any connection's turn, waits with all after it until the device has synced it */
-static void sync_note(struct pc_conn *c)
-{
-	unsigned long long w = c->sync_want;
-
-	if (pc_wal_tl_seq > w)             /* a completion's write: whose reply is not known */
-		w = pc_wal_tl_seq;
-	if (w <= c->sync_seq || !pc_wal_sync_mode() || w <= pc_wal_synced_low())
-		return;
-	if (!c->sync_held) {
-		c->sync_held = 1;
-		c->sync_from = c->out_len;
-		c->sync_t0_us = deny_now();
-		c->sync_next = synch_head;
-		synch_head = c;
-		synch_here++;
-		__atomic_add_fetch(&synch_now_all, 1, __ATOMIC_RELAXED);
-		__atomic_add_fetch(&synch_holds_all, 1, __ATOMIC_RELAXED);
-	}
-	c->sync_seq = w;
-	pc_wal_kick_wanted();
-}
-
-static void sync_unlink(struct pc_conn *c)
-{
-	struct pc_conn **pp;
-
-	if (!c->sync_held)
-		return;
-	for (pp = &synch_head; *pp; pp = &(*pp)->sync_next)
-		if (*pp == c) {
-			*pp = c->sync_next;
-			break;
-		}
-	c->sync_next = NULL;
-	c->sync_held = 0;
-	synch_here--;
-	__atomic_sub_fetch(&synch_now_all, 1, __ATOMIC_RELAXED);
-	__atomic_add_fetch(&synch_ms_all, (unsigned long long)(deny_now() -
-		c->sync_t0_us), __ATOMIC_RELAXED);
-}
-
-int pc_conn_sync_held_open(void)
-{
-	return synch_here;
-}
-
-void pc_conn_sync_stats(unsigned long long *now, unsigned long long *holds,
-		unsigned long long *hold_ms)
-{
-	*now = __atomic_load_n(&synch_now_all, __ATOMIC_RELAXED);
-	*holds = __atomic_load_n(&synch_holds_all, __ATOMIC_RELAXED);
-	*hold_ms = __atomic_load_n(&synch_ms_all, __ATOMIC_RELAXED);
-}
-
-/* once a turn: a connection whose held writes are synced sends its replies; if the device
- * refused, no held reply is ever sent - the connection closes, its writes uncertain */
-void pc_conn_resume_sync(void)
-{
-	struct pc_conn *c, *next;
-	unsigned long long lo;
-
-	if (!synch_head)
-		return;
-	lo = pc_wal_synced_low();
-	for (c = synch_head; c; c = next) {
-		next = c->sync_next;
-		if (c->dead)
-			continue;
-		if (pc_wal_failed() && lo < c->sync_seq) {
-			c->why = "the WAL's storage failed before its writes were synced";
-			conn_destroy(c);
-			continue;
-		}
-		if (lo < c->sync_seq)
-			continue;
-		if (conn_flush(c) < 0) {
-			c->why = "write error";
-			conn_destroy(c);
-			continue;
-		}
-		if (c->close_after && !c->out_len && c->wire_off >= c->wire_len) {
-			if (!c->why)
-				c->why = "quit";
-			conn_destroy(c);
-		}
-	}
-	if (synch_head)
-		pc_wal_kick_wanted();          /* a sync short of them: the next one kicks again */
-}
-
 void pc_conn_out_pause_stats(struct pc_out_pause_stats *st)
 {
 	st->paused_now = __atomic_load_n(&outp_now_all, __ATOMIC_RELAXED);
@@ -3907,7 +3656,6 @@ void pc_conn_flush_pushes(void)
 int pc_conn_notify(struct pc_conn *c, const char *payload, size_t n)
 {
 	char hdr[PC_BIN_HDR];
-	size_t at;
 	int rc;
 
 	if (c->encrypted && !c->established)
@@ -3920,14 +3668,11 @@ int pc_conn_notify(struct pc_conn *c, const char *payload, size_t n)
 	hdr[3] = 0;
 	put32(hdr + 4, (uint32_t)n);
 	put64(hdr + 8, 0);
-	at = c->out_len;
 	rc = out_append(c, hdr, sizeof hdr);
 	if (rc == 0)
 		rc = out_append(c, payload, n);
-	if (rc < 0) {
-		c->out_len = at;               /* never a header alone */
+	if (rc < 0)
 		return rc;                     /* SLOW at the cap, NOMEM */
-	}
 	return push_stage(c);
 }
 
@@ -4094,25 +3839,14 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 			if (c->raw_len && in_append(c, c->raw, c->raw_len) < 0)
 				return -1;
 			c->raw_len = 0;
-		} else {
-			int rc;
-
-			in_hold_serve = !n && c->ep < 0;
-			rc = channel_records(c);
-			in_hold_serve = 0;
-			if (rc < 0)
-				return -1;
-		}
+		} else if (channel_records(c) < 0)
+			return -1;
 	} else if (c->tls) {               /* records in, plaintext to the parser */
 		if (c->raw_len) {          /* records held while paused or parked (ur_hold) */
 			size_t hl = c->raw_len;
-			int rc;
 
 			c->raw_len = 0;
-			in_hold_serve = c->ep < 0;
-			rc = pc_tls_input(c->tls, c->raw, hl, tls_plain, tls_wire, c, &c->why);
-			in_hold_serve = 0;
-			if (rc < 0)
+			if (pc_tls_input(c->tls, c->raw, hl, tls_plain, tls_wire, c, &c->why) < 0)
 				return -1;
 		}
 		if (pc_tls_input(c->tls, buf, n, tls_plain, tls_wire, c, &c->why) < 0)

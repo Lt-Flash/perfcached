@@ -5,7 +5,7 @@ set -u
 
 MOD=${1:?usage: functest.sh <func_perfd.so> [phase ...]}
 shift
-PHASES=${*:-basic-binary basic-resp sizes refuse failover-binary failover-resp stall-binary stall-resp backoff-binary pool reload redis swap decline buildopts}
+PHASES=${*:-basic-binary basic-resp sizes refuse failover-binary failover-resp stall-binary stall-resp pool reload redis swap buildopts}
 AST=${ASTERISK_PREFIX:-/opt/asterisk-22.10.1-flh-fix3}
 PC=${PERFCACHED:-./perfcached}
 PCLI=${PERFCLI:-./perfcli}
@@ -18,7 +18,7 @@ case "$PCLI" in /*) ;; *) PCLI=$(pwd)/$PCLI ;; esac
 [ -x "$AST/sbin/asterisk" ] || { echo "no Asterisk at $AST"; exit 2; }
 
 D=$(mktemp -d /var/tmp/functest.XXXXXX)
-N1= N2= N3= RA= RB= BH= ASTPID=
+N1= N2= N3= RA= RB= ASTPID=
 pass=0 fail=0
 
 cleanup() {
@@ -28,7 +28,7 @@ cleanup() {
 		while kill -0 "$ASTPID" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
 		kill -9 "$ASTPID" 2>/dev/null
 	fi
-	for p in $N1 $N2 $N3 $RA $RB $BH; do
+	for p in $N1 $N2 $N3 $RA $RB; do
 		kill -CONT "$p" 2>/dev/null
 		kill -9 "$p" 2>/dev/null
 	done
@@ -353,56 +353,9 @@ loaded() { ax "module show like func_perfd" | $GREP "^func_perfd.so" | $GREP -vc
 binconf() { conf "protocol = binary" "server = 127.0.9.1:$NP1" "secret = $SECRET" "collection = c" "$@"; }
 respconf() { conf "protocol = resp" "server = 127.0.9.1:$RP1" "password = $RESPPW" "collection = c" "$@"; }
 
-# every live node READY (a joiner proves its links and pulls a bootstrap first), up to 60 s
-fleet_ready() {
-	i=0
-	while [ $i -lt 120 ]; do
-		r=1
-		for nd in 1 2 3; do
-			eval np=\$N$nd
-			[ -z "$np" ] && continue
-			[ "$(pcli $nd stats | jfield state)" = ready ] || r=0
-		done
-		[ $r = 1 ] && return 0
-		sleep 0.5; i=$((i+1))
-	done
-	echo "functest: the fleet did not get ready"
-}
 node_conf 1; node_conf 2; node_conf 3
 node_start 1; node_start 2; node_start 3
-fleet_ready
-
-# a preloaded shim notes every perfd_set_log the module makes, then passes it on to libperfd
-cat > "$D/logshim.c" <<'EOF'
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <stdio.h>
-#include <stdlib.h>
-typedef void (*cb_t)(int, const char *, void *);
-void perfd_set_log(cb_t cb, void *ctx)
-{
-	void (*real)(cb_t, void *) = (void (*)(cb_t, void *))dlsym(RTLD_NEXT, "perfd_set_log");
-	const char *out = getenv("PERFD_LOGSHIM_OUT");
-	FILE *f = out ? fopen(out, "a") : NULL;
-
-	if (!real) {
-		void *h = dlopen("libperfd.so.0", RTLD_NOW | RTLD_NOLOAD);
-
-		real = h ? (void (*)(cb_t, void *))dlsym(h, "perfd_set_log") : NULL;
-	}
-	if (f) {
-		fprintf(f, "%s\n", cb ? "set" : "cleared");
-		fclose(f);
-	}
-	if (real)
-		real(cb, ctx);
-}
-EOF
-SHIMOUT=
-if ${CC:-cc} -shared -fPIC -o "$D/logshim.so" "$D/logshim.c" -ldl 2> "$D/logshim.err"; then
-	SHIMOUT=$D/logshim.out
-	ASTERISK_ENV="${ASTERISK_ENV:-} LD_PRELOAD=$D/logshim.so PERFD_LOGSHIM_OUT=$SHIMOUT"
-fi
+sleep 4
 
 env ${ASTERISK_ENV:-} "$AST/sbin/asterisk" -C "$A/etc/asterisk.conf" -f -n > "$A/console.out" 2>&1 < /dev/null &
 ASTPID=$!
@@ -550,7 +503,7 @@ restart_node1() {
 	[ -z "$N1" ] || return 0
 	kill -CONT "$N1" 2>/dev/null
 	node_start 1
-	fleet_ready
+	sleep 4
 }
 
 kill_node1() { node_kill 1; }
@@ -602,57 +555,6 @@ phase_stall_resp() {
 	restart_node1
 	respconf "server = 127.0.9.2:$RP2" "pool = 1"; modload > /dev/null
 	stall stall-resp
-}
-
-# blackhole <port...>: listeners whose accept queue is full, so a SYN to them is dropped
-cat > "$D/blackhole.py" <<'EOF'
-import socket, sys, time
-keep = []
-for p in sys.argv[1:]:
-    ls = socket.socket()
-    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.bind(("127.0.9.1", int(p)))
-    ls.listen(0)
-    keep.append(ls)
-    for _ in range(3):
-        c = socket.socket()
-        c.setblocking(False)
-        c.connect_ex(("127.0.9.1", int(p)))
-        keep.append(c)
-print("ready", flush=True)
-while True:
-    time.sleep(60)
-EOF
-maxms() { ax "dialplan show globals" | $GREP "^ *R_one_$1" | sed 's/.*|//' | sort -n | tail -1; }
-phase_backoff_binary() {
-	busy 17641 || busy 17642 || busy 17643 && { bad "backoff: ports 17641-17643 in use"; return; }
-	python3 "$D/blackhole.py" 17641 17642 17643 > "$D/blackhole.out" 2>&1 &
-	BH=$!
-	sleep 1
-	conf "protocol = binary" "server = 127.0.9.1:17641" "server = 127.0.9.1:17642" \
-		"server = 127.0.9.1:17643" "secret = $SECRET" "collection = c" "pool = 4" \
-		"connect_timeout_ms = 1000" "wait_timeout_ms = 300"
-	modload > /dev/null
-	setg COL c
-	sleep 1.2
-	# three seeds that drop the SYN cost a dial 3 s: four calls dial at once, not in turn
-	if concurrent 4 300 bo1-; then
-		m=$(maxms bo1-)
-		[ "${m:-99999}" -lt 4500 ] && ok "backoff: 4 calls on 3 dead seeds, the slowest $m ms (one dial, not four in turn)" \
-			|| bad "backoff: 4 concurrent calls, the slowest took $m ms"
-	else
-		bad "backoff: 4 concurrent calls did not finish"
-	fi
-	sleep 1.2
-	concurrent 4 300 bo2- > /dev/null
-	# the dial just failed: the next call fails at once instead of dialling again
-	run_ext timed 100
-	res=$(glob R_timed)
-	st=${res%%|*} ms=${res#*|}
-	[ "$st" = ERROR ] && [ "$ms" -lt 500 ] 2>/dev/null && ok "backoff: a call right after the failed dial is ERROR in $ms ms" \
-		|| bad "backoff: a call right after the failed dial: '$res'"
-	kill -9 "$BH" 2>/dev/null; BH=
-	binconf; modload > /dev/null
 }
 
 onecount() { ax "dialplan show globals" | $GREP -c "^ *R_one_$1"; }
@@ -759,7 +661,7 @@ phase_redis() {
 	m=$(logmark)
 	conf "protocol = resp" "server = 127.0.0.1:$REDA" "password = ft-redis-pw" "collection = calls"
 	modload > /dev/null
-	logsince "$m" | $GREP -qE "SELECT calls refused: ERR (invalid DB index|value is not an integer)" && ok "redis: a named collection is a load-time WARN" || bad "redis: named collection warn"
+	logsince "$m" | $GREP -q "SELECT calls refused: ERR invalid DB index" && ok "redis: a named collection is a load-time WARN" || bad "redis: named collection warn"
 	check "redis: ... the module still loads" "$(loaded)" 1
 	setg COL calls; setg PFX redis2-
 	run_ext basic && check "redis: ... and a call with it is ERROR" "$(glob R_set)" "ERROR"
@@ -775,7 +677,7 @@ phase_redis() {
 	conf "protocol = resp" "server = 127.0.0.1:$REDA" "username = someone" "password = ft-redis-pw" "collection = 0"
 	modload > /dev/null
 	run_ext basic && check "redis: username against Redis 5 is ERROR" "$(glob R_set)" "ERROR"
-	logsince "$m" | $GREP -qE "wrong number of arguments|WRONGPASS" && ok "redis: ... with the server's text" || bad "redis: username log"
+	logsince "$m" | $GREP -q "wrong number of arguments" && ok "redis: ... with the server's text" || bad "redis: username log"
 	kill -9 "$RA"; RA=
 }
 
@@ -796,18 +698,6 @@ phase_swap() {
 	[ "${r:-0}" -ge 1 ] && ok "redis swap: $r reconnect(s) counted" || bad "redis swap: reconnects '$r'"
 	check "redis swap: the last write is on the new master" "$(rcli $REDB -n 0 GET swap-loop59)" "v59"
 	kill -9 "$RA" "$RB"; RA= RB=
-}
-
-phase_decline() {
-	[ -n "$SHIMOUT" ] || { bad "decline: the log shim did not build: $(head -1 "$D/logshim.err")"; return; }
-	binconf; modload > /dev/null
-	conf "protocol = binary" "collection = c"
-	: > "$SHIMOUT"
-	modload > /dev/null
-	check "a load declined for its config leaves libperfd no log hook into the module" \
-		"$(loaded)|$(tail -1 "$SHIMOUT")" "0|cleared"
-	binconf; modload > /dev/null
-	check "a good config loads again after it" "$(loaded)" "1"
 }
 
 phase_buildopts() {

@@ -30,7 +30,6 @@ plaintext = never
 buckets_log2 = 12
 EOF
 
-: > "$D/log"
 "$BIN" -f "$D/enc.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0

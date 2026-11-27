@@ -202,115 +202,6 @@ static void t_edges(void)
 	pc_jw_free(&w);
 }
 
-/* a \u escape outside the BMP comes as a surrogate pair: one character, four UTF-8 bytes; a
- * lone half is not a character and is refused */
-static int unesc(const char *doc, char *out, size_t cap)
-{
-	struct pc_jtok t[4];
-
-	if (pc_json_parse(doc, strlen(doc), t, 4) != 2 || t[1].type != PC_J_STR)
-		return -2;
-	return pc_json_unescape(doc, &t[1], out, cap);
-}
-
-static void t_unescape(void)
-{
-	char out[32];
-	int n;
-
-	n = unesc("[\"\\ud83d\\ude00\"]", out, sizeof out);
-	if (n == 4 && !memcmp(out, "\xF0\x9F\x98\x80", 4))
-		ok("a surrogate pair decodes to the one four-byte character");
-	else
-		bad("a surrogate pair did not decode to F0 9F 98 80");
-	n = unesc("[\"a\\uD834\\uDD1Eb\"]", out, sizeof out);
-	if (n == 6 && !memcmp(out, "a\xF0\x9D\x84\x9E" "b", 6))
-		ok("a pair between other bytes, upper-case hex");
-	else
-		bad("a pair between other bytes decoded wrong");
-	if (unesc("[\"\\ud83d\"]", out, sizeof out) == -1)
-		ok("a lone high surrogate is refused");
-	else
-		bad("a lone high surrogate was decoded");
-	if (unesc("[\"\\ude00\"]", out, sizeof out) == -1)
-		ok("a lone low surrogate is refused");
-	else
-		bad("a lone low surrogate was decoded");
-	if (unesc("[\"\\ud83d\\u0041\"]", out, sizeof out) == -1)
-		ok("a high surrogate followed by a non-surrogate escape is refused");
-	else
-		bad("a high surrogate followed by \\u0041 was decoded");
-	if (unesc("[\"\\ud83d\\ude00\"]", out, 3) == -1)
-		ok("a pair that does not fit the output is refused, not cut");
-	else
-		bad("a pair was written past the output's room");
-	n = unesc("[\"\\u20ac\\u0000\"]", out, sizeof out);
-	if (n == 4 && !memcmp(out, "\xE2\x82\xAC\0", 4))
-		ok("BMP escapes and a NUL are unchanged");
-	else
-		bad("a BMP escape or NUL decoded wrong");
-}
-
-/* pc_jw_str_utf8 and pc_utf8_clean take only well-formed UTF-8 (RFC 3629): no overlong form, no
- * surrogate, nothing past U+10FFFF; every byte of anything else becomes U+FFFD */
-static void t_utf8(void)
-{
-	static const struct { const char *in; size_t n; } badseq[] = {
-		{ "\xED\xA0\x80", 3 },         /* U+D800, a surrogate */
-		{ "\xED\xBF\xBF", 3 },         /* U+DFFF */
-		{ "\xE0\x80\x80", 3 },         /* overlong NUL */
-		{ "\xE0\x9F\xBF", 3 },         /* overlong U+07FF */
-		{ "\xF0\x80\x80\x80", 4 },     /* overlong */
-		{ "\xF0\x8F\xBF\xBF", 4 },     /* overlong U+FFFF */
-		{ "\xF4\x90\x80\x80", 4 },     /* U+110000 */
-		{ "\xF5\x80\x80\x80", 4 },     /* lead past F4 */
-		{ "\xF7\xBF\xBF\xBF", 4 },
-	};
-	static const char *good[] = { "\xF0\x9F\x98\x80", "\xE2\x82\xAC", "\xED\x9F\xBF",
-		"\xEE\x80\x80", "\xF4\x8F\xBF\xBF", "\xF0\x90\x80\x80", "\xC2\x80" };
-	char buf[128], want[128];
-	struct pc_jw w;
-	size_t i, k;
-	int okb = 1, okg = 1, okc = 1;
-
-	for (i = 0; i < sizeof badseq / sizeof badseq[0]; i++) {
-		pc_jw_init(&w, buf, sizeof buf);
-		pc_jw_str_utf8(&w, badseq[i].in, badseq[i].n);
-		strcpy(want, "\"");
-		for (k = 0; k < badseq[i].n; k++)
-			strcat(want, "\\ufffd");
-		strcat(want, "\"");
-		if (w.len != strlen(want) || memcmp(buf, want, w.len)) {
-			okb = 0;
-			printf("    sequence %zu rendered as %.*s\n", i, (int)w.len, buf);
-		}
-		if (pc_utf8_clean(badseq[i].in, badseq[i].n))
-			okc = 0;
-	}
-	for (i = 0; i < sizeof good / sizeof good[0]; i++) {
-		size_t n = strlen(good[i]);
-
-		pc_jw_init(&w, buf, sizeof buf);
-		pc_jw_str_utf8(&w, good[i], n);
-		if (w.len != n + 2 || memcmp(buf + 1, good[i], n))
-			okg = 0;
-		if (!pc_utf8_clean(good[i], n))
-			okc = 0;
-	}
-	if (okb)
-		ok("surrogates, overlong forms and code points past U+10FFFF become U+FFFD");
-	else
-		bad("pc_jw_str_utf8 passed an ill-formed sequence through as UTF-8");
-	if (okg)
-		ok("well-formed sequences at the range edges pass through raw");
-	else
-		bad("pc_jw_str_utf8 replaced a well-formed sequence");
-	if (okc)
-		ok("pc_utf8_clean draws the same line");
-	else
-		bad("pc_utf8_clean called an ill-formed sequence valid, or a valid one not");
-}
-
 int main(void)
 {
 	t_fixed();
@@ -318,8 +209,6 @@ int main(void)
 	t_bound();
 	t_i64();
 	t_edges();
-	t_unescape();
-	t_utf8();
 	printf("jwtest: %d passed, %d failed\n", pass, fail);
 	return fail != 0;
 }

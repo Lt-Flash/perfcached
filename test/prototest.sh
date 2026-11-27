@@ -26,7 +26,6 @@ plaintext = loopback
 buckets_log2 = 12
 EOF
 
-: > "$D/log"
 "$BIN" -f "$D/s7.conf" > "$D/log" 2>&1 &
 PID=$!
 i=0

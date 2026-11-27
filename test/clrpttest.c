@@ -65,64 +65,6 @@ static int frame(unsigned char *b, int i, size_t n)
 	return 0;
 }
 
-/* a plain listener on loopback, standing for the peer's relay port; -1 none */
-static int plain_listener(pc_addr *at, int backlog)
-{
-	socklen_t al = sizeof *at;
-	int l = socket(AF_INET, SOCK_STREAM, 0);
-
-	memset(at, 0, sizeof *at);
-	at->in4.sin_family = AF_INET;
-	at->in4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	if (l < 0 || bind(l, &at->sa, sizeof at->in4) != 0 || listen(l, backlog) != 0 ||
-	    getsockname(l, &at->sa, &al) != 0) {
-		if (l >= 0)
-			close(l);
-		return -1;
-	}
-	return l;
-}
-
-/* the next connection on @l within a second; -1 none */
-static int accept_wait(int l)
-{
-	struct pollfd pf = { .fd = l, .events = POLLIN };
-
-	if (poll(&pf, 1, 1000) != 1)
-		return -1;
-	return accept(l, NULL, NULL);
-}
-
-/* whole [len][frame]s read from @c until @want or half a second of nothing */
-static int read_frames(int c, int want)
-{
-	static unsigned char rb[65536];
-	size_t have = 0;
-	int n = 0;
-
-	while (n < want) {
-		struct pollfd pf = { .fd = c, .events = POLLIN };
-		ssize_t r;
-
-		if (poll(&pf, 1, 500) != 1)
-			break;
-		r = recv(c, rb + have, sizeof rb - have, 0);
-		if (r <= 0)
-			break;
-		have += (size_t)r;
-		while (have >= 4) {
-			size_t fl = (size_t)rb[0] << 24 | (size_t)rb[1] << 16 | (size_t)rb[2] << 8 | rb[3];
-
-			if (have < 4 + fl)
-				break;
-			memmove(rb, rb + 4 + fl, have - 4 - fl);
-			have -= 4 + fl;
-			n++;
-		}
-	}
-	return n;
-}
-
 int main(void)
 {
 	static unsigned char b[60000];
@@ -284,61 +226,6 @@ int main(void)
 			close(c);
 	}
 	clrpt_rx_free(rx);
-
-	printf("  ..   case G\n");
-	/* G: the receiver closed a connection that went quiet (its idle close): the next frames
-	 * go on a new connection, or are refused - none is taken into the dead socket */
-	{
-		pc_addr g;
-		int l = plain_listener(&g, 8), c, r1 = -1, r2 = -1, r3 = -1, n1 = 0, n2 = 0;
-
-		if (l >= 0) {
-			frame(b, 0, 100);
-			r1 = clrpt_send(&g, b, 100);
-			if ((c = accept_wait(l)) >= 0) {
-				n1 = read_frames(c, 1);
-				close(c);              /* the receiver's idle close */
-			}
-			usleep(1500000);
-			r2 = clrpt_send(&g, b, 100);
-			usleep(50000);
-			r3 = clrpt_send(&g, b, 100);
-			if ((c = accept_wait(l)) >= 0) {
-				n2 = read_frames(c, 2);
-				close(c);
-			}
-			close(l);
-		}
-		CHK(r1 == 0 && n1 == 1 && n2 == (r2 == 0) + (r3 == 0) && n2 > 0,
-			"G: after the receiver's close, every frame said queued arrives on a new connection "
-			"(first %d/%d, then queued %d %d, arrived %d)", r1, n1, r2, r3, n2);
-	}
-
-	printf("  ..   case H\n");
-	/* H: a connect the peer has not answered (its accept queue full: the SYN is dropped) queues
-	 * nothing - "no connection yet" is -1, and the caller falls back */
-	{
-		pc_addr h;
-		int l = plain_listener(&h, 0), fill[4], k, r = 0;
-
-		for (k = 0; k < 4; k++) {
-			fill[k] = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-			if (l >= 0 && fill[k] >= 0)
-				(void)connect(fill[k], &h.sa, sizeof h.in4);
-		}
-		usleep(100000);
-		frame(b, 0, 100);
-		if (l >= 0)
-			r = clrpt_send(&h, b, 100);
-		CHK(l >= 0 && r == -1,
-			"H: a connect still in flight: not queued, the caller falls back (%d)", r);
-		for (k = 0; k < 4; k++)
-			if (fill[k] >= 0)
-				close(fill[k]);
-		if (l >= 0)
-			close(l);
-	}
-
 	printf("clrpttest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;
 }

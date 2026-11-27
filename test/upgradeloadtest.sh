@@ -156,7 +156,6 @@ i=0; while [ $i -lt 100 ] && [ "$(pyn 3 peek)" != "p1999=p1999 d499=None" ]; do 
 [ "$(pyn 3 peek)" = "p1999=p1999 d499=None" ] && ok "the deletes reached node 3" || bad "node 3 after the deletes: $(pyn 3 peek)"
 
 # "-": the loopback door is plaintext, so the library connects without a secret, as perfcli does
-: > "$D/load.log"
 "$LOAD" 127.0.0.81 17711 - 0 4 2000 600 "$D/load.out" > "$D/load.log" 2>&1 &
 LP=$!
 sleep 2

@@ -66,11 +66,11 @@ out=$(T -s "$SA" -p pw12345678 -C 0 GET nokey | head -1)
 out=$(T -s "$SA" -p wrongpass -C 0 GET k1 | head -1)
 echo "$out" | $GREP -q "^FAIL 127.0.0.1:$A: AUTH refused: " && ok "wrong password refused ($out)" || bad "wrong password: $out"
 out=$(T -s "$SA" -u someone -p pw12345678 -C 0 GET k1 | head -1)
-echo "$out" | $GREP -qE "AUTH refused: (ERR wrong number of arguments|WRONGPASS)" && ok "username refused (Redis 5: no ACL; 6+: no such user) with the server's text" || bad "username: $out"
+echo "$out" | $GREP -q "AUTH refused: ERR wrong number of arguments" && ok "username against Redis 5 refused with the server's text" || bad "username: $out"
 out=$(T -s "$SA" -p pw12345678 -C calls GET k1 | head -1)
-echo "$out" | $GREP -qE "SELECT calls refused: ERR (invalid DB index|value is not an integer)" && ok "named collection refused" || bad "named collection: $out"
+echo "$out" | $GREP -q "SELECT calls refused: ERR invalid DB index" && ok "named collection refused" || bad "named collection: $out"
 out=$(T -o -s "$SA" -p pw12345678 -C calls | head -1)
-echo "$out" | $GREP -qE "^OPEN 1 .*(invalid DB index|value is not an integer)" && ok "open reports the refused SELECT, session still open" || bad "open with name: $out"
+echo "$out" | $GREP -q "^OPEN 1 .*invalid DB index" && ok "open reports the refused SELECT, session still open" || bad "open with name: $out"
 
 # ---- collections, TTL, EXISTS, DEL ---------------------------------------
 T -s "$SA" -p pw12345678 -C 3 SET k3 three > /dev/null
@@ -94,51 +94,6 @@ out=$(T -s "$SA" -p pw12345678 -C 0 -m 100 -n 3 GET big | tr '\n' '|')
 	&& ok "oversize drained, 3 in a row on one connection" || bad "oversize: $out"
 out=$(T -s "$SA" -p pw12345678 -C 0 -m 200 GET big | head -1)
 [ "$out" = "BULK 200 $big" ] && ok "a bulk exactly at the bound is returned" || bad "bound: $(echo "$out" | cut -c1-40)"
-
-# ---- a server that declares a huge bulk, or trickles one: the call ends, bounded ----
-cat > "$D/trickle.py" <<'EOF'
-import socket, sys, threading, time
-port, head, total = int(sys.argv[1]), sys.argv[2].encode(), int(sys.argv[3])
-def serve(c):
-    try:
-        c.recv(4096)
-        c.sendall(head + b"\r\n")
-        for _ in range(total):
-            c.sendall(b"x")
-            time.sleep(0.2)
-    except OSError:
-        pass
-    c.close()
-ls = socket.socket()
-ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-ls.bind(("127.0.0.1", port))
-ls.listen(8)
-while True:
-    c, _ = ls.accept()
-    threading.Thread(target=serve, args=(c,), daemon=True).start()
-EOF
-TR=$(free_port 16470)
-python3 "$D/trickle.py" "$TR" '$9223372036854775807' 100000 &
-BG=$!
-sleep 0.5
-t0=$(date +%s%N)
-out=$(timeout 10 "$TOOL" -s "127.0.0.1:$TR" -t 300 -c 300 -m 100 GET k 2>&1 | head -1)
-t1=$(date +%s%N)
-ms=$(( (t1 - t0) / 1000000 ))
-[ "$out" = "OVERSIZE 9223372036854775807" ] && [ "$ms" -lt 1000 ] \
-	&& ok "a declared bulk far over the bound: OVERSIZE at once, not drained ($ms ms)" || bad "huge declared bulk: '$out' in $ms ms"
-kill "$BG" 2>/dev/null; wait "$BG" 2>/dev/null
-python3 "$D/trickle.py" "$TR" '$1000' 1000 &
-BG=$!
-sleep 0.5
-t0=$(date +%s%N)
-out=$(timeout 10 "$TOOL" -s "127.0.0.1:$TR" -t 300 -c 300 GET k 2>&1 | head -1)
-t1=$(date +%s%N)
-ms=$(( (t1 - t0) / 1000000 ))
-echo "$out" | $GREP -q "^FAIL .*call took longer than" && [ "$ms" -lt 3000 ] \
-	&& ok "a bulk trickled a byte per 200 ms: the call gives up at its deadline ($ms ms)" || bad "trickled bulk: '$out' in $ms ms"
-kill "$BG" 2>/dev/null; wait "$BG" 2>/dev/null
-BG=
 
 # ---- a dead first server: the next one answers ---------------------------
 out=$(T -s "127.0.0.1:$DEAD" -s "$SA" -p pw12345678 -C 0 GET big | tail -1)

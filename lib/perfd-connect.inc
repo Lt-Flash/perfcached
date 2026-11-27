@@ -32,25 +32,7 @@ static int plain_switch_rec(perfd_t *p, uint8_t rec[2 + PC_HS_SWITCH_LEN + PC_NO
 	return 2 + n;
 }
 
-/* a node refusing before the handshake writes "-ERR <why>" and closes (max_clients, memory):
- * 1 and the text in @why when @b starts it */
-static int hs_refusal(const uint8_t *b, size_t n, char *why, size_t wcap)
-{
-	size_t i = 4, e;
-
-	if (n < 4 || memcmp(b, "-ERR", 4))
-		return 0;
-	while (i < n && b[i] == ' ')
-		i++;
-	for (e = i; e < n && b[e] != '\r' && b[e] != '\n'; e++)
-		;
-	snprintf(why, wcap, "%.*s", (int)(e - i), (const char *)b + i);
-	return 1;
-}
-
-/* 0 established; -1 failed (transport, or a secret the node does not hold); -2 a local key or
- * crypto failure; -3 the node refused the connection (@why) */
-static int noise_handshake(perfd_t *p, const char *secret, char *why, size_t wcap)
+static int noise_handshake(perfd_t *p, const char *secret)
 {
 	uint8_t psk[PC_NOISE_KEYLEN], prologue[1] = { PC_PRIN_CLIENT };
 	uint8_t ver[2] = { PC_CLIENT_VER, PC_HS_PLAIN };
@@ -64,12 +46,10 @@ static int noise_handshake(perfd_t *p, const char *secret, char *why, size_t wca
 	/* from the process-wide cache: deriving (Argon2id, ~100 ms of CPU and a
 	 * 64 MiB mapping) on every connect, standby and reconnect is too dear */
 	if (psk_for(secret, psk) != 0)
-		return -2;
+		return -1;
 	pc_hs_init_initiator(&hs, prologue, 1);
-	if (pc_hs_write_msg1(&hs, psk, ver, p->want_enc ? 1 : 2, msg + 3, &mlen) != 0) {
-		rc = -2;
+	if (pc_hs_write_msg1(&hs, psk, ver, p->want_enc ? 1 : 2, msg + 3, &mlen) != 0)
 		goto out;
-	}
 	msg[0] = (uint8_t)(1 + mlen);
 	msg[1] = (uint8_t)((1 + mlen) >> 8);
 	msg[2] = PC_PRIN_CLIENT;
@@ -77,19 +57,6 @@ static int noise_handshake(perfd_t *p, const char *secret, char *why, size_t wca
 		goto out;
 	if (io_all(p, 0, hdr, 2) != 0)
 		goto out;
-	if (hdr[0] == '-' && hdr[1] == 'E') {
-		uint8_t t[128];
-		size_t n = 2;
-
-		t[0] = hdr[0];
-		t[1] = hdr[1];
-		while (n < sizeof t - 1 && io_all(p, 0, t + n, 1) == 0 && t[n] != '\n')
-			n++;
-		if (hs_refusal(t, n, why, wcap)) {
-			rc = -3;
-			goto out;
-		}
-	}
 	cl = (size_t)hdr[0] | ((size_t)hdr[1] << 8);
 	if (cl == 0 || cl > sizeof m2 || io_all(p, 0, m2, cl) != 0)
 		goto out;
@@ -320,8 +287,7 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 	const perfd_opts *o = opts ? opts : &defaults;
 	int io_ms = o->io_timeout_ms > 0 ? o->io_timeout_ms : DEF_TIMEOUT_MS;
 	int hs_ms = o->connect_timeout_ms > 0 ? o->connect_timeout_ms : DEF_TIMEOUT_MS;
-	int nsec = 0, i, hr;
-	char why[128] = "";
+	int nsec = 0, i;
 	perfd_t *p;
 
 	while (o->secrets && o->secrets[nsec])
@@ -346,7 +312,7 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 		if (p->fd < 0) {
 			errk(NULL, PERFD_E_TRANSPORT, "cannot connect: %s",
 				strerror(errno));
-			perfd_free(p);
+			free(p);
 			return NULL;
 		}
 		setsockopt(p->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -356,8 +322,7 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 			return p;              /* plaintext */
 		setsockopt(p->fd, SOL_SOCKET, SO_RCVTIMEO, &hs, sizeof hs);
 		setsockopt(p->fd, SOL_SOCKET, SO_SNDTIMEO, &hs, sizeof hs);
-		hr = noise_handshake(p, o->secrets[i], why, sizeof why);
-		if (hr == 0) {
+		if (noise_handshake(p, o->secrets[i]) == 0) {
 			setsockopt(p->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 			setsockopt(p->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 			p->hs_sec = i;
@@ -366,35 +331,27 @@ static perfd_t *dial_one(const char *host, int port, const char *unixp,
 		close(p->fd);
 		p->fd = -1;
 		p->poisoned = 0;
-		if (hr == -2 || hr == -3) {
-			if (hr == -2)
-				errk(NULL, PERFD_E_NOMEM, "handshake: key derivation or crypto failed");
-			else
-				errk(NULL, PERFD_E_REFUSED, "refused by the node: %s", why);
-			perfd_free(p);
-			return NULL;
-		}
 		if (p->io_silent) {            /* no answer says nothing of the secret */
 			errk(NULL, PERFD_E_TRANSPORT, "handshake: no answer in %d ms", hs_ms);
-			perfd_free(p);
+			free(p);
 			return NULL;
 		}
 	}
 	errk(NULL, PERFD_E_AUTH,
 		"handshake failed with every secret (%d tried)", nsec);
-	perfd_free(p);
+	free(p);
 	return NULL;
 }
 
 /* where this connection landed - its worker's live native connections,
  * the least any worker holds, and how many workers; -1 from a daemon without conninfo */
-static int conn_where(perfd_t *p, int *mine, int *least, int *workers, int *serving)
+static int conn_where(perfd_t *p, int *mine, int *least, int *workers)
 {
 	struct pc_tv v;
 	long long m, l, w;
-	char *res = NULL, st[16] = "";
+	char *res = NULL;
 	size_t n = 0;
-	int own = p->own_reply, rc, sl = -1;
+	int own = p->own_reply, rc;
 
 	p->own_reply = 1;
 	rc = roundtrip_once(p, "conninfo", NULL, 0, &res, &n);
@@ -405,16 +362,12 @@ static int conn_where(perfd_t *p, int *mine, int *least, int *workers, int *serv
 	rc = pc_tv_parse(&v, (const unsigned char *)res, n) == 0 && v.n[0].type == 'm' &&
 		pc_tv_get_int(&v, 0, "mine", &m) == 0 && pc_tv_get_int(&v, 0, "least", &l) == 0 &&
 		pc_tv_get_int(&v, 0, "workers", &w) == 0 ? 0 : -1;
-	if (rc == 0)                       /* a daemon older than the field serves */
-		sl = pc_tv_get_str(&v, 0, "state", st, sizeof st - 1);
 	pc_tv_free(&v);
 	free(res);
 	if (rc == 0) {
 		*mine = (int)m;
 		*least = (int)l;
 		*workers = (int)w;
-		if (serving)
-			*serving = state_usable(st, sl);
 	}
 	return rc;
 }
@@ -426,7 +379,7 @@ static perfd_t *balance_worker(perfd_t *p, const char *host, int port,
 {
 	int mine, least, workers, tries;
 
-	if (!p->worker_bal || unixp || conn_where(p, &mine, &least, &workers, NULL) != 0 ||
+	if (!p->worker_bal || unixp || conn_where(p, &mine, &least, &workers) != 0 ||
 	    workers < 2 || mine - 1 <= least)
 		return p;
 	for (tries = 0; tries < 8 * workers && tries < 64; tries++) {
@@ -434,7 +387,7 @@ static perfd_t *balance_worker(perfd_t *p, const char *host, int port,
 
 		if (!q)
 			break;
-		if (conn_where(q, &mine, &least, &workers, NULL) == 0 && mine - 1 <= least) {
+		if (conn_where(q, &mine, &least, &workers) == 0 && mine - 1 <= least) {
 			perfd_free(p);
 			return q;
 		}
@@ -517,6 +470,7 @@ void perfd_free(perfd_t *p)
 		free(p->enable_sec);
 		free(p->conn_name);
 	}
+	struct early *e;
 	int i;
 
 	if (!p)
@@ -541,7 +495,11 @@ void perfd_free(perfd_t *p)
 	}
 	if (p->fd >= 0)
 		close(p->fd);
-	early_free(p);
+	while ((e = p->early)) {
+		p->early = e->next;
+		free(e->result);
+		free(e);
+	}
 	free(p->rbuf);
 	free(p->xbuf);
 	free(p->rsc);

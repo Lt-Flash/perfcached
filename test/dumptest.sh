@@ -194,52 +194,6 @@ case "$R" in
 	ERROR*halve*) ok "an oversized chunk is refused whole with the halving hint";;
 	*) bad "whole-table count: $R";;
 esac
-# 6b. a chunk the door cannot queue (past PC_MAX_OUTQ, 8 MB) is refused with the halving hint, never a
-#     dropped connection: 5000 values of 2000 bytes are a 10 MB whole-table chunk.  The table is sized for
-#     them and the dump waits until it stands still: a split under the walk moves records past its cursor
-cat > "$D/n4.conf" <<CONF
-[daemon]
-workers = 2
-log_level = notice
-[memory]
-arena_mb = 64
-[secrets]
-client = du-client-secret
-[listen]
-tcp = 127.0.0.1:17644
-plaintext = loopback
-[collection dc]
-buckets_log2 = 13
-CONF
-start 4
-R=$(python3 - <<'PYEOF'
-import json, pcnative, socket, time
-s = socket.create_connection(("127.0.0.1", 17644), timeout=30); f = pcnative.wrap(s)
-reqs = [json.dumps({"jsonrpc": "2.0", "id": i, "method": "set",
-    "params": {"col": "dc", "key": "big%d" % i, "value": "%04d" % i + "x" * 1996}}) for i in range(5000)]
-f.write(("\n".join(reqs) + "\n").encode()); f.flush()
-for _ in reqs: f.readline()
-last = None; still = 0
-for _ in range(60):
-    f.write((json.dumps({"jsonrpc": "2.0", "id": 8, "method": "stats", "params": {"col": "dc"}}) + "\n").encode()); f.flush()
-    c = json.loads(f.readline())["result"]["collections"][0]
-    shape = (c["entries"], c["buckets"], "resizing_to" in c)
-    still = still + 1 if shape == last and not shape[2] else 0
-    if still >= 3: break
-    last = shape; time.sleep(0.5)
-f.write((json.dumps({"jsonrpc": "2.0", "id": 9, "method": "dump",
-    "params": {"col": "dc", "cursor": 0, "count": 16384}}) + "\n").encode()); f.flush()
-l = f.readline()
-if not l: print("closed"); raise SystemExit
-r = json.loads(l)
-print(("ERROR " + json.dumps(r["error"])) if "error" in r else "records=%d more=%s, the table %s" %
-    (len(r["result"]["records"]), r["result"]["more"], shape))
-PYEOF
-)
-case "$R" in
-	ERROR*halve*) ok "a chunk past what the door can queue is refused with the halving hint";;
-	*) bad "a 10 MB chunk: $R (the connection must stay and say halve)";;
-esac
 # 7. the tool: three connections on bucket ranges dump to a directory, every record once and equal
 #    to the verb's; the manifest verifies; then the same through zstd
 if [ -x "$TOOL" ]; then

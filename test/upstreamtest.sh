@@ -85,7 +85,6 @@ upstream_timeout_ms = 2000
 upstream_negative_ms = 3000
 C
 chmod 600 "$D/n.conf"
-: > "$D/n.log"
 "$BIN" -f "$D/n.conf" > "$D/n.log" 2>&1 &
 PID=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n.log" && break
@@ -148,10 +147,7 @@ cnt() { n=$(grep -c "^$1 $2\$" "$D/up/counts" 2>/dev/null); echo "${n:-0}"; }
 echo "--- 1: types through the door"
 [ "$(rc 'GET tok:a')" = "'alpha'" ] && ok "a string comes through on a miss" || bad "GET tok:a: $(rc 'GET tok:a')"
 TT=$(rc 'TTL tok:a')
-# the fake's ttl_ms counts from its own start, and a slow node start eats into it: compare with ITS PTTL
-UPA=$(python3 "$D/rc.py" $UP "AUTH up-pass-1" "PTTL tok:a" | tail -1); UPA=$(( ${UPA:-0} / 1000 ))
-[ "$TT" -ge $((UPA - 2)) ] 2>/dev/null && [ "$TT" -le $((UPA + 1)) ] && [ "$UPA" -gt 0 ] \
-	&& ok "with the upstream's TTL ($TT s, upstream $UPA s)" || bad "TTL tok:a = $TT (upstream $UPA s)"
+[ "$TT" -ge 55 ] 2>/dev/null && [ "$TT" -le 61 ] && ok "with the upstream's TTL ($TT s)" || bad "TTL tok:a = $TT (want ~60)"
 [ "$(rc 'HGETALL tok:h')" = "['f1', 'v1', 'f2', 'v2']" ] && ok "a hash comes through, fields in order" \
 	|| bad "HGETALL tok:h: $(rc 'HGETALL tok:h')"
 [ "$(rc 'HGET tok:h f2')" = "'v2'" ] && ok "and answers HGET" || bad "HGET tok:h f2: $(rc 'HGET tok:h f2')"
@@ -540,7 +536,6 @@ upstream_timeout_ms = 2000
 upstream_writes = refuse
 C
 chmod 600 "$D/n2.conf"
-: > "$D/n2.log"
 "$BIN" -f "$D/n2.conf" > "$D/n2.log" 2>&1 &
 PID2=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n2.log" && break

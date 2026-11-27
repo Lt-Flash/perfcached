@@ -444,10 +444,6 @@ const char pc_status_page[] =
 	 * ?node=N names the member reads go to; served by the daemon, TOOL stays null */
 	"var TOOL=null,SESSTOK=null,NODEQ=((location.search||\"\").match(/[?&]node=(\\d+)/)||[])[1]||\"\";\n"
 	"function qn(u){return NODEQ?u+(u.indexOf(\"?\")<0?\"?\":\"&\")+\"node=\"+NODEQ:u;}\n"
-	/* behind a proxy over several dashboards each poll may reach another one: a page opened
-	 * without ?node= keeps the node its first /session named, in the address bar too */
-	"function pinNode(n){n=Number(n);if(NODEQ||!(n>0))return;NODEQ=String(n);\n"
-	"try{history.replaceState(null,\"\",(location.pathname||\"\")+\"?node=\"+NODEQ+(location.hash||\"\"));}catch(e){}}\n"
 	"function abtn(op,col,lab){return ' <button class=\"btn act\" data-op=\"'+op+'\" data-col=\"'+esc(col)+'\">'+lab+'</button>';}\n"
 	/* the DDL buttons on a collection's row (the tool only) */
 	"function dbtn(op,col,lab,ent){return ' <button class=\"btn act ddl\" data-op=\"'+op+'\" data-col=\"'+esc(col)+'\" data-ent=\"'+(ent||0)+'\">'+lab+'</button>';}\n"
@@ -810,14 +806,14 @@ const char pc_status_page[] =
 	"role=d.master?\"master\":d.backup?\"backup\":\"member\",\n"
 	"hp=(d.total_mb?Math.round(100*d.free_mb/d.total_mb):null),\n"
 	"tk=hp===null?\"\":(hp<15?\"crit\":hp<35?\"low\":\"\"),\n"
-	"u=TOOL?\"?node=\"+Number(d.node):\"http://\"+esc(d.addr)+\":\"+(d.http||HP)+\"/\";\n"
+	"u=\"http://\"+esc(d.addr)+\":\"+(d.http||HP)+\"/\";\n"
 	"o+=(d.self?\"<div\":'<a href=\"'+u+'\"')+' class=\"node '+esc(st)+attn+(nw?\" nowit\":lka===\"critical\"?\" linkcrit\":rcn||((old||cdf||lka)&&!attn)?\" attn\":\"\")+(d.self?\" self\":\"\")+\n"
 	"'\" title=\"node '+esc(d.node)+\" — \"+esc(d.addr)+\":\"+esc(d.port)+\" — \"+esc(st)+'\">'+\n"
 	"'<div class=top><span class=id>'+esc(d.node)+'</span><span class=chips>'+\n"
 	"'<span class=\"st '+(st===\"ready\"?\"ready\":st===\"failed\"?\"failed\":st===\"gone\"?(gr===\"silent\"?\"lost\":\"goner\"):\"attn\")+'\">'+(st===\"gone\"?(gr===\"silent\"?\"silent\":gr===\"forgotten\"?\"dropped\":\"left\"):esc(st))+\n"
 	"'</span><span class=\"role '+role+'\">'+role+'</span></span></div>'+\n"
 	/* the build it runs, beside its address (absent from older builds) */
-	"(d.version?'<div class=addr>v'+esc(d.version)+(d.rev?' ('+esc(d.rev)+')':'')+(d.wire_epochs?' \u00b7 wire '+esc(d.wire_epochs[1]):'')+'</div>':'')+\n"
+	"(d.version?'<div class=addr>v'+esc(d.version)+(d.wire_epochs?' \u00b7 wire '+esc(d.wire_epochs[1]):'')+'</div>':'')+\n"
 	"'<div class=addr>'+esc(d.addr)+'</div>'+\n"
 	"'<div class=addr>'+(d.gone_s>=0?'left '+dur(d.gone_s)+' ago':'up '+(d.uptime_s>=0?dur(d.uptime_s):\"\\u2014\"))+'</div>'+\n"
 	"'<div class=hl><span>headroom</span><span class=pct>'+(hp===null?\"-\":hp+\"%\")+'</span></div>'+\n"
@@ -1209,10 +1205,9 @@ const char pc_status_page[] =
 	"  r.entries*10>r.max*9],\n"
 	"[\"kept for\",nf(r.retain_s)+\" s\"],\n"
 	"[\"dropped before that\",nf(d)+(x?\" \\u00b7 \"+nf(x)+\" expiries\":\"\"),d>0]]\n"
-	/* the deletes waiting for members to confirm them (by time while the fleet does not confirm),
-	 * which member each space waits for (the lowest mark), the one stuck.  An older daemon: neither */
-	".concat(r.numbered===undefined?[]:[[c.acks&&c.acks.fleet&&c.acks.fleet.confirming===false?\n"
-	"  \"numbered deletes (kept by time)\":\"deletes awaiting members\",nf(r.numbered)]],\n"
+	/* the deletes waiting for members to confirm them, which member each space waits for
+	 * (the lowest mark), and the one stuck.  An older daemon says neither. */
+	".concat(r.numbered===undefined?[]:[[\"deletes awaiting members\",nf(r.numbered)]],\n"
 	"(function(a){var hb=a&&a.held_by;if(!hb||!hb.length)return [];var sk=hb.filter(function(h){return !!h.stuck;});\n"
 	"return [[\"waiting for\",hb.map(function(h){return (h.self?\"this node\":h.node?\"node \"+h.node:\"a member\")+\" \\u00b7 \"+nf(h.waiting);}).join(\", \"),sk.length>0]]\n"
 	".concat(sk.slice(0,1).map(function(h){return [\"stuck\",\"node \"+h.stuck.node+\" still \"+h.stuck.still_s+\" s \\u00b7 \"+nf(h.stuck.behind)+\" behind\",true];}));})(c.acks));})(c.tombstones_retained):[]))+\n"
@@ -1434,7 +1429,7 @@ const char pc_status_page[] =
 	"else if(op==='create'){var n=prompt('New collection name:');if(!n)return;var l=prompt('Its size as buckets_log2 (12 = 4,096 buckets):','12');body.col=n;body.buckets_log2=Number(l||12);}\n"
 	"function go(){post(\"ddl\",acted(go,'the node refused the '+op),JSON.stringify(body));}withsess(go);}\n"
 	"document.getElementById(\"newcol\").addEventListener(\"click\",function(){ddl('create','',0);});\n"
-	"get(\"session\",function(d){if(d&&d.tool){TOOL=d;pinNode(d.node);document.getElementById(\"newcol\").hidden=false;document.getElementById(\"newcolsep\").hidden=false;\n"
+	"get(\"session\",function(d){if(d&&d.tool){TOOL=d;document.getElementById(\"newcol\").hidden=false;document.getElementById(\"newcolsep\").hidden=false;\n"
 	"document.getElementById(\"stagewrap\").hidden=false;document.getElementById(\"stagenode\").textContent=\"node \"+(Number(NODEQ)||d.node);\n"
 	"document.getElementById(\"stagebtn\").addEventListener(\"click\",stageBuild);\n"
 	"document.getElementById(\"stagefile\").addEventListener(\"change\",function(){var m=/(\\d+\\.\\d+\\.\\d+(?:-rc\\d+)?)/.exec(this.files[0]?this.files[0].name:\"\"),v=document.getElementById(\"stagever\");if(m&&!v.value)v.value=m[1];});}tick();});setInterval(tick,POLL);\n"

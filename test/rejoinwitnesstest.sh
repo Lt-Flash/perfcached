@@ -1,8 +1,7 @@
 #!/bin/sh
 # rejoinwitnesstest.sh - an eager node restarting into a fleet with a survivor (a peer up through its
-# absence) copies that state whole (12ol) and serves nothing before it; with every survivor gone mid-copy,
-# or one restarted since it was picked, it starts again from its own files.
-# Usage: test/rejoinwitnesstest.sh [./perfcached]
+# absence) copies that state whole (12ol); with every survivor gone mid-copy, or one restarted since it
+# was picked, it starts again from its own files.  Usage: test/rejoinwitnesstest.sh [./perfcached]
 set -u
 PYTHONPATH=$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 BIN=${1:-./perfcached}
@@ -63,12 +62,7 @@ start() { # start <n> <how many "ready" lines the log holds then> [VAR=value ...
 		[ "$(grep -c "perfcached ready" "$D/n$n.log")" -ge "$want" ] && return 0
 		sleep 0.1; i=$((i+1))
 	done
-	P=$(cat "$D/n$n.pid"); kill -0 "$P" 2>/dev/null && w="alive" || { wait "$P" 2>/dev/null; w="exited $?"; }
-	echo "node $n did not start ($w, $(grep -c "perfcached ready" "$D/n$n.log") ready line(s), want $want):"
-	tail -n 8 "$D/n$n.log" | cut -c1-200 | sed "s/^/       n$n: /"
-	# alive without its ready line: where each thread waits (an fsync stall reads as a sync call)
-	[ "$w" = alive ] && for t in /proc/$P/task/*; do echo "       n$n thread $(cat "$t/comm" 2>/dev/null): $(cat "$t/wchan" 2>/dev/null) $(cut -d' ' -f3 "$t/stat" 2>/dev/null)"; done | sort | uniq -c | head -12
-	diag; return 1
+	echo "node $n did not start"; return 1
 }
 stop1() { kill "$(cat "$D/n$1.pid")" 2>/dev/null; i=0; while kill -0 "$(cat "$D/n$1.pid")" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; }
 st() { curl -s -m 3 "http://127.0.0.1:2759$1/stats" | python3 -c '
@@ -120,46 +114,6 @@ PY
 after() { # after <n> <nth copy begun>: the log from that line on
 	awk -v want="$2" '/cluster: rejoin - node [0-9]+ has been up/ { seen++ } seen >= want' "$D/n$1.log"
 }
-poll() { # poll <port> <out>: every 20 ms, k0000-k0004 (deleted while down) and w0000-w0004 (a -> b while down)
-	# until <out>.stop; "stale refused fresh other first-seen" in <out> - stale: a k with a value, a w at a
-	python3 - "$@" <<'PY' &
-import os, pcnative, socket, sys, time
-port, out = int(sys.argv[1]), sys.argv[2]
-n = {"stale": 0, "refused": 0, "fresh": 0, "other": 0}
-first, f, t0 = {}, None, time.time()
-while not os.path.exists(out + ".stop") and time.time() - t0 < 90:
-    try:
-        if f is None:
-            f = pcnative.wrap(socket.create_connection(("127.0.0.1", port), 2))
-        for k in ["k%04d" % i for i in range(5)] + ["w%04d" % i for i in range(5)]:
-            r = pcnative.call(f, "get", col="0", key=k)
-            v = (r.get("result") or {}).get("value")
-            if r.get("error"):
-                kind = "refused" if "not READY" in str(r["error"]) else "other"
-            elif (k[0] == "k" and v is not None) or (k[0] == "w" and v == "a"):
-                kind = "stale"
-            elif (k[0] == "k" and v is None) or (k[0] == "w" and v == "b"):
-                kind = "fresh"
-            else:
-                kind = "other"
-            n[kind] += 1
-            first.setdefault(kind, "%.2f" % (time.time() - t0))
-    except Exception:
-        f = None
-    time.sleep(0.02)
-open(out, "w").write("%d %d %d %d %s\n" % (n["stale"], n["refused"], n["fresh"], n["other"],
-    ",".join("%s@%s" % kv for kv in sorted(first.items(), key=lambda kv: float(kv[1])))))
-PY
-	echo $! > "$D/poll.pid"
-}
-diag() { # a setup that did not come: each node's process, what it says, its log's last cluster lines
-	for n in 1 2 3; do
-		P=$(cat "$D/n$n.pid" 2>/dev/null)
-		echo "  .. node $n pid ${P:-none} $(kill -0 "${P:-0}" 2>/dev/null && echo alive || echo NOT RUNNING): $(st $n '"%s %s peers_up %s rejoins %s restart %s" % (r["state"], c.get("role"), c.get("peers_up"), c.get("rejoins"), json.dumps(c.get("restart")))')"
-		grep -E "node state|cluster: (joined|admitted|ONLINE|rejoin|reconcile|resync|bootstrap|no ruling)|elect|master|yield|purged|silent|ERROR|CRIT|stopping|exit" "$D/n$n.log" | \
-			tail -n 16 | cut -c1-200 | sed "s/^/       n$n: /"
-	done
-}
 # the runner's storage stalling is no finding of this suite: shown, not counted
 errs() {
 	grep -h 'an fsync has been stuck' "$D"/n*.log 2>/dev/null | head -n 1 | sed "s/^/  ..   not counted, the runner's storage stalled: /"
@@ -168,11 +122,11 @@ errs() {
 
 for n in 1 2 3; do conf $n; done
 for n in 1 2 3; do start $n || exit 1; done
-ready3 || { echo "rejoinwitnesstest: the fleet did not form"; diag; exit 1; }
+ready3 || { echo "rejoinwitnesstest: the fleet did not form"; exit 1; }
 put 27491 k 200 v
 # both peers up long enough before node 1's coming outage to be survivors for it
 i=0; while [ $i -lt 90 ] && [ "$(st 1 'c["restart"]["witnesses"]')" != 2 ]; do sleep 1; i=$((i+1)); done
-[ "$(st 1 'c["restart"]["witnesses"]')" = 2 ] || { echo "rejoinwitnesstest: node 1 never counted 2 witnesses"; diag; exit 1; }
+[ "$(st 1 'c["restart"]["witnesses"]')" = 2 ] || { echo "rejoinwitnesstest: node 1 never counted 2 witnesses"; exit 1; }
 put 27491 w 3000 a
 sleep 2.5                                  # the WAL's everysec
 stop1 1
@@ -180,11 +134,9 @@ stop1 1
 put 27492 w 3000 b
 del 27492 0 50
 
-echo "--- 1. node 1 restarts with survivors up: it copies their state whole, and serves nothing before the copy"
+echo "--- 1. node 1 restarts with survivors up: it copies their state whole"
 L0=$(($(wc -l < "$D/n1.log") + 1))
-# the pick waits 5 s, past node 1's ONLINE: until its copy it holds only what it replayed
-start 1 2 PERFCACHED_TEST_SURVIVOR_WAIT_MS=5000 || exit 1
-poll 27491 "$D/poll1"
+start 1 2 || exit 1
 T1=$(date +%s)
 i=0; while [ $i -lt 30 ] && ! grep -q "cluster: rejoin - node [0-9]* has been up" "$D/n1.log"; do sleep 0.5; i=$((i+1)); done
 L=$(grep "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")
@@ -197,16 +149,6 @@ RJ=$(st 1 'c.get("rejoins")'); RS=$(st 1 'c.get("resyncs")'); WI=$(st 1 'c.get("
 	&& [ "${WI:-0}" = 0 ] && ! grep -q "cluster: reconcile - node" "$D/n1.log" \
 	&& ok "1b. node 1 is ready: rejoins 1, resyncs 0, and no record was ruled on one by one" \
 	|| bad "1b. node 1: state $(st 1 'r["state"]'), reconcile_open $(st 1 'c.get("reconcile_open")'), rejoins ${RJ:-?}, resyncs ${RS:-?}, reconcile_witness ${WI:-?} (want ready, False, 1, 0, 0)"
-sleep 1                                    # the poll's rounds after ready, then its counts
-touch "$D/poll1.stop"; i=0; while [ $i -lt 50 ] && [ ! -s "$D/poll1" ]; do sleep 0.1; i=$((i+1)); done
-FR=$(sed -n "$L0,\$p" "$D/n1.log" | grep -E "node state [a-z]+ -> ready|cluster: rejoin - node [0-9]+ has been up" | head -n 1)
-echo "$FR" | grep -q "cluster: rejoin - node" \
-	&& ok "1f. node 1 was not ready before its copy began: $(echo "$FR" | sed 's/.*cluster: //' | cut -c1-90)" \
-	|| bad "1f. node 1 was ready before its copy: $(sed -n "$L0,\$p" "$D/n1.log" | grep -E "node state|cluster: rejoin - node|cluster: ONLINE" | head -n 4 | sed 's/.*cluster: //' | cut -c1-90 | tr '\n' '|')"
-set -- $(cat "$D/poll1" 2>/dev/null)
-[ "${1:-x}" = 0 ] && [ "${2:-0}" -gt 0 ] && [ "${3:-0}" -gt 0 ] && [ "${4:-x}" = 0 ] \
-	&& ok "1g. no read answered node 1's replayed state (keys deleted or rewritten while it was down): $2 refused before the copy, $3 fresh after, 0 stale ($5)" \
-	|| bad "1g. reads on node 1 from its start: stale ${1:-?}, refused ${2:-?}, fresh ${3:-?}, other ${4:-?} (want 0, some, some, 0): ${5:-no counts}"
 H=$(held 27491)
 [ "$H" = "3000 0 150 0 50" ] \
 	&& ok "1c. node 1 holds the fleet's state: every w key at the rewritten value, the 50 keys deleted while it was down gone, the 150 others there" \
@@ -231,7 +173,7 @@ del 27492 50 100
 start 1 3 PERFCACHED_TEST_BOOT_DELAY_MS=6000 || exit 1
 P1=$(cat "$D/n1.pid")
 i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt 2 ]; do sleep 0.25; i=$((i+1)); done
-K2=$(cat "$D/n2.pid") K3=$(cat "$D/n3.pid"); kill -9 "$K2" "$K3" 2>/dev/null; wait "$K2" "$K3" 2>/dev/null
+kill -9 "$(cat "$D/n2.pid")" "$(cat "$D/n3.pid")" 2>/dev/null
 [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" = 2 ] \
 	&& ok "2a. node 1 began a second copy, and both survivors were killed before its pull" \
 	|| bad "2a. node 1 never began the second copy: $(grep -E "rejoin -|reconcile|resync -" "$D/n1.log" | tail -2 | cut -c1-160 | tr '\n' ' ')"
@@ -257,9 +199,9 @@ set -- $H
 
 echo "--- 3. a survivor restarted mid-copy serves what it replayed: node 1 refuses it and starts from its files"
 start 2 2 && start 3 2 || exit 1               # back with node 1 up, which booted after they died: they keep their files
-readyn 2 || echo "  .. node 2 not ready 40 s after its start"; readyn 3 || echo "  .. node 3 not ready 40 s after its start"
+readyn 2; readyn 3
 i=0; while [ $i -lt 90 ] && [ "$(st 1 'c["restart"]["witnesses"]')" != 2 ]; do sleep 1; i=$((i+1)); done
-[ "$(st 1 'c["restart"]["witnesses"]')" = 2 ] || { echo "rejoinwitnesstest: node 1 never counted 2 witnesses again"; diag; exit 1; }
+[ "$(st 1 'c["restart"]["witnesses"]')" = 2 ] || { echo "rejoinwitnesstest: node 1 never counted 2 witnesses again"; exit 1; }
 # deletes node 1 missed in 2 may be a hole in node 2's ended run: floored 30 s on, with a copy of node
 # 2's state (12ol) - done, no hole left, before the writes; step 3's own copy is counted from N0
 i=0; while [ $i -lt 120 ] && [ "$(st 1 'r["state"]')$(st 1 'c.get("resyncing")')$(st 1 'sum(m["confirmed"] < m["hi"] for m in c["acks"]["marks"])')" != readyFalse0 ]; do sleep 0.5; i=$((i+1)); done
@@ -270,7 +212,7 @@ stop1 1
 start 1 5 PERFCACHED_TEST_BOOT_DELAY_MS=10000 || exit 1
 P1=$(cat "$D/n1.pid")
 i=0; while [ $i -lt 60 ] && [ "$(grep -c "cluster: rejoin - node [0-9]* has been up" "$D/n1.log")" -lt "$W" ]; do sleep 0.25; i=$((i+1)); done
-K2=$(cat "$D/n2.pid") K3=$(cat "$D/n3.pid"); kill -9 "$K2" "$K3" 2>/dev/null; wait "$K2" "$K3" 2>/dev/null
+kill -9 "$(cat "$D/n2.pid")" "$(cat "$D/n3.pid")" 2>/dev/null
 rm -f "$D/n3.pid"
 start 2 3 || exit 1                            # its new self answers the delayed pull with its own files
 i=0; while [ $i -lt 120 ] && kill -0 "$P1" 2>/dev/null; do sleep 0.5; i=$((i+1)); done

@@ -301,89 +301,6 @@ static int in_child(int (*fn)(void))
 } while (0)
 
 
-/* perfd_jset_ex: NX and XX on the root and on a path, declined as 0 with no error left behind */
-static void jset_ex_checks(perfd_t *p)
-{
-	char *r = NULL;
-	int rc;
-
-	OK(perfd_jset_ex(p, "c", "jx", "$", "{\"a\":1}", 0, PERFD_JSET_NX) == 1,
-		"jset_ex: NX on a missing key creates it (1)");
-	OK(perfd_jset_ex(p, "c", "jx", "$", "{\"a\":2}", 0, PERFD_JSET_NX) == 0 &&
-		perfd_error_kind(p) == PERFD_E_NONE,
-		"jset_ex: NX on a key that holds a document declines (0, no error)");
-	OK(perfd_jset_ex(p, "c", "jx", "$.b", "true", 0, PERFD_JSET_NX) == 1,
-		"jset_ex: NX on an absent path sets it");
-	OK(perfd_jset_ex(p, "c", "jx", "$.b", "false", 0, PERFD_JSET_NX) == 0,
-		"jset_ex: NX on that path again declines");
-	OK(perfd_jset_ex(p, "c", "jx", "$.a", "5", 0, PERFD_JSET_XX) == 1,
-		"jset_ex: XX on a path that holds a value sets it");
-	OK(perfd_jset_ex(p, "c", "jx", "$.zz", "5", 0, PERFD_JSET_XX) == 0 &&
-		perfd_error_kind(p) == PERFD_E_NONE, "jset_ex: XX on an absent path declines");
-	rc = perfd_jget(p, "c", "jx", "$", &r);
-	OK(rc == 1 && !strcmp(r, "{\"a\":5,\"b\":true}"), "jset_ex: the document as the sets left it");
-	if (rc == 1)
-		free(r);
-	OK(perfd_jset_ex(p, "c", "jxnone", "$", "1", 0, PERFD_JSET_XX) == 0,
-		"jset_ex: XX on a missing key declines");
-	OK(perfd_jget(p, "c", "jxnone", "$", &r) == 0, "jset_ex: and the key stays missing");
-	OK(perfd_jset_ex(p, "c", "jxnone", "$.a", "1", 0, PERFD_JSET_NX) == -1 &&
-		perfd_error_kind(p) == PERFD_E_SERVER,
-		"jset_ex: NX under a missing key is the daemon's error, not a decline");
-	OK(perfd_jset_ex(p, "c", "jxt", "$", "[1]", 100, 0) == 1, "jset_ex: no flag sets (1)");
-	{
-		long long t = perfd_ttl(p, "c", "jxt");
-
-		OK(t > 90 && t <= 100, "jset_ex: with its ttl");
-	}
-	OK(perfd_jset_ex(p, "c", "jxt", "$", "{bad", 0, 0) == -1 &&
-		perfd_error_kind(p) == PERFD_E_SERVER, "jset_ex: a value that is not JSON is an error");
-}
-
-/* perfd_url_connect against the live daemons: plaintext, the Noise leg with the URL's secret, and a
- * wrong secret that turns into the backoff */
-static void url_checks(int ptport, int nxport, const char *secret)
-{
-	char url[256], err[256];
-	perfd_url *u;
-	perfd_t *p;
-	void *val;
-	size_t vlen;
-	int rc;
-
-	snprintf(url, sizeof url, "perfd://127.0.0.1:%d/c?spares=0", ptport);
-	u = perfd_url_parse(url, err, sizeof err);
-	OK(u != NULL, "url: a plaintext URL parses");
-	p = u ? perfd_url_connect(u, NULL) : NULL;
-	OK(p != NULL, "url: perfd_url_connect over its one seed");
-	if (p) {
-		OK(perfd_set(p, perfd_url_collection(u), "uk", "uv", 2, 0) == 0,
-			"url: a set in the URL's collection");
-		rc = perfd_get(p, perfd_url_collection(u), "uk", &val, &vlen, NULL);
-		OK(rc == 1 && vlen == 2 && !memcmp(val, "uv", 2), "url: and its get");
-		if (rc == 1)
-			perfd_free_value(val);
-		perfd_free(p);
-	}
-	perfd_url_free(u);
-	if (!nxport || !secret)
-		return;
-	snprintf(url, sizeof url, "perfd://app:%s@127.0.0.1:%d/c", secret, nxport);
-	u = perfd_url_parse(url, err, sizeof err);
-	p = u ? perfd_url_connect(u, NULL) : NULL;
-	OK(p != NULL && perfd_ping(p) == 0, "url: the Noise leg with the URL's secret");
-	if (p)
-		perfd_free(p);
-	perfd_url_free(u);
-	snprintf(url, sizeof url, "perfd://app:not-the-secret@127.0.0.1:%d/c", nxport);
-	u = perfd_url_parse(url, err, sizeof err);
-	OK(u && perfd_url_connect(u, NULL) == NULL && perfd_error_kind(NULL) == PERFD_E_AUTH,
-		"url: a wrong secret is PERFD_E_AUTH");
-	OK(u && perfd_url_connect(u, NULL) == NULL && perfd_error_kind(NULL) == PERFD_E_BACKOFF,
-		"url: and the next call within the second backs off");
-	perfd_url_free(u);
-}
-
 /* perfd_hgetall's callback - counts pairs, remembers "f2"'s value */
 struct hga { int n; char f2[16]; };
 static int hga_cb(void *ctx, const char *f, size_t fl, const void *v, size_t vl)
@@ -754,7 +671,6 @@ int main(int argc, char **argv)
 	OK(perfd_jdel(p, "c", "doc", "$.s") == 1, "jdel");
 	OK(perfd_jdel(p, "c", "doc", "$.s") == 0, "jdel absent");
 	OK(perfd_jget(p, "c", "nodoc", "$", &r) == 0, "jget absent: 0");
-	jset_ex_checks(p);
 
 	/* the escape hatch: the JSON edge renders the stats tree */
 	r = perfd_command(p, "stats", NULL);
@@ -1052,8 +968,6 @@ int main(int argc, char **argv)
 		if (p)
 			perfd_free(p);
 	}
-
-	url_checks(ptport, nxport, secret);       /* after the S355 legs: the PSK cache is warm here */
 
 	printf("libtest: %d passed, %d failed\n", pass, fail);
 	return fail ? 1 : 0;

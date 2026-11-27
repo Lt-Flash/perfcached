@@ -3,7 +3,6 @@
 /* respjson.c - RedisJSON on the RESP door (JSON.SET/GET/DEL/NUMINCRBY/ARRAPPEND/
  * DEBUG), mapped onto the native path operations (pc_json_rmw) */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "json.h"
@@ -143,7 +142,7 @@ int rh_json(struct resp_ctx *c)
 			} else if (resp_is(c->argv[i], c->argl[i], "EX") &&
 			        i + 1 < c->nargs) {
 				if (resp_ll(c->argv[i + 1], c->argl[i + 1], &jttl) < 0 ||
-				        jttl <= 0 || jttl > PC_TTL_MAX) {
+				        jttl <= 0) {
 					resp_err(c->out, "invalid expire time in "
 						"'json.set' command");
 					return 0;
@@ -195,53 +194,28 @@ int rh_json(struct resp_ctx *c)
 			return 0;
 		}
 		rc = op_del(c->ht, &k, c->park_req);
-		if (rc == PC_OP_ERR_BUSY)          /* refused: as SET says it */
-			resp_err_code(c->out, "TRYAGAIN", "cluster busy, retry");
-		else if (rc == PC_OP_ERR_FWD)
-			resp_err(c->out, "forward failed");
-		else if (rc == PC_OP_ERR_WRFAIL)
-			resp_err(c->out, wr_refused_msg());
-		else
-			resp_int(c->out, rc == PC_OP_OK ? 1 : 0);
+		resp_int(c->out, rc == PC_OP_OK ? 1 : 0);
 		return 0;
 	}
 	if (op == PC_JOP_APPEND) {
-		/* every value validated first, then one call with them joined: all or none */
-		size_t tot = 0;
-		char *jv, *p;
+		/* one value per call in the engine; RedisJSON takes many */
+		int total = 0;
 
 		for (i = 3; i < c->nargs; i++) {
-			if (!pc_jp_valid_value(c->argv[i], c->argl[i])) {
-				resp_err(c->out, jp_strerror(PC_JP_E_VAL));
+			rc2 = pc_json_rmw(c->ht, k.s, k.len, PC_JOP_APPEND,
+				jpath, jplen, c->argv[i], (int)c->argl[i], 0, 0, 0,
+				0, 0, 0, &frag, &fraglen, &nv, &cnt, &fmsg);
+			if (rc2 < 0) {
+				resp_err(c->out, fmsg);
 				return 0;
 			}
-			tot += c->argl[i] + 1;
+			total = cnt;
 		}
-		/* one value goes as it came: the common append allocates nothing */
-		jv = c->nargs == 4 ? c->argv[3] : malloc(tot);
-		if (!jv) {
-			resp_err(c->out, "out of memory");
-			return 0;
-		}
-		p = jv + (c->nargs == 4 ? c->argl[3] : 0);
-		for (i = 3; c->nargs > 4 && i < c->nargs; i++) {
-			if (i > 3)
-				*p++ = ',';
-			memcpy(p, c->argv[i], c->argl[i]);
-			p += c->argl[i];
-		}
-		rc2 = pc_json_rmw(c->ht, k.s, k.len, PC_JOP_APPEND, jpath, jplen,
-			jv, (int)(p - jv), c->nargs - 3, 0, 0, 0, 0, 0, &frag,
-			&fraglen, &nv, &cnt, &fmsg);
-		if (c->nargs > 4)
-			free(jv);
-		if (rc2 < 0) {
-			resp_err(c->out, fmsg);
-			return 0;
-		}
-		if (v2)
+		if (v2) {
 			resp_arr(c->out, 1);
-		resp_int(c->out, cnt);
+			resp_int(c->out, total);
+		} else
+			resp_int(c->out, total);
 		return 0;
 	}
 	rc2 = pc_json_rmw(c->ht, k.s, k.len, op, jpath, jplen, sval,

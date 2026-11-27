@@ -1,16 +1,12 @@
 #!/bin/sh
 # phpfleettest.sh - the PHP extension against a three-node fleet (test/phpfleettest.php): failover past a
-# killed node, a forked child's own channel, ownerOf() agreeing with the daemons, a list of seeds, and
-# the Symfony adapter's clear() on a shard collection.
+# killed node, a forked child's own channel, ownerOf() agreeing with the daemons, and a list of seeds.
 set -u
 BIN=${1:-./perfcached}
 PHP=${2:-php8.3}
 EXT=${3:-lang/php/modules/perfcached.so}
-VND=${4:-.phpvendor/vendor/autoload.php}
 case $EXT in /*) ;; *) EXT=$(pwd)/$EXT ;; esac
-case $VND in /*) ;; *) VND=$(pwd)/$VND ;; esac
 T=$(cd "$(dirname "$0")" && pwd)
-R=$(cd "$T/.." && pwd)
 PYTHONPATH=$T${PYTHONPATH:+:$PYTHONPATH}; export PYTHONPATH
 D=$(mktemp -d /var/tmp/pcpfl.XXXXXX)
 P1= P2= P3=
@@ -94,20 +90,5 @@ C=0; while read -r node addr want; do
 done < "$D/owners"
 [ "$C" = 3 ] && ok "ownerOf() agrees with where every key lives, on all three nodes" \
 	|| bad "ownerOf() and the daemons disagree on $((3 - C)) node(s)"
-echo "--- shard: the Symfony adapter's clear()"
-if [ -f "$VND" ]; then
-	fleet shard
-	PX clear "$SEC" "$VND" "$R/lang/php/symfony/src/PerfcachedAdapter.php" || fail=$((fail+1))
-	echo "--- shard: clear() with every other node down"
-	kill -9 $P2 $P3 2>/dev/null; wait $P2 $P3 2>/dev/null; P2= P3=
-	i=0; while [ $i -lt 100 ] && [ "$(st 1 peers)" != 0 ]; do sleep 0.2; i=$((i+1)); done
-	if [ "$(st 1 peers)" = 0 ]; then
-		PX clearalone "$SEC" "$VND" "$R/lang/php/symfony/src/PerfcachedAdapter.php" || fail=$((fail+1))
-	else
-		bad "node 1 still sees $(st 1 peers) peer(s) up after nodes 2 and 3 were killed"
-	fi
-else
-	bad "no $VND: make phpvendor"
-fi
 echo "phpfleettest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

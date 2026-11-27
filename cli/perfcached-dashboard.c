@@ -39,9 +39,6 @@
 #define MAX_SEEDS 8
 #define MAX_SESSIONS 8
 #define MAX_LOCK 64
-/* passes running in which no member lists a learned member live and it does not answer before it
- * is "left": at least 15 s at the default refresh_ms, past one member list change, not long */
-#define LEFT_PASSES 5
 #define HDR_POST "X-Perfcached-Dashboard"
 #define HDR_SESSION "X-Perfcached-Session"
 /* where every package installs the config, and its units pass with -f */
@@ -60,7 +57,6 @@ struct cfg {
 	int body_max;
 	int stage_max_mb;                 /* a build posted to /stage */
 	int timeout_s;
-	int ddl_timeout_s;                /* a DDL's answer: it may wait on the WAL's fsync */
 	int lockout_after;
 	int lockout_s;
 	int session_s;
@@ -77,7 +73,7 @@ struct cfg {
 static struct cfg CF = {
 	.listen_host = "127.0.0.1", .listen_port = 8090,
 	.cache_ms = 1000, .refresh_ms = 3000, .body_max = 4096, .timeout_s = 10,
-	.stage_max_mb = 64, .ddl_timeout_s = 60,
+	.stage_max_mb = 64,
 	.lockout_after = 5, .lockout_s = 60, .session_s = 1800,
 	.conn_limit = 64, .per_ip_limit = 16,
 };
@@ -156,8 +152,6 @@ static int cfg_set(const char *sect, const char *key, const char *val,
 		CF.stage_max_mb = atoi(val);
 	} else if (!strcmp(key, "timeout_s")) {
 		CF.timeout_s = atoi(val);
-	} else if (!strcmp(key, "ddl_timeout_s")) {
-		CF.ddl_timeout_s = atoi(val);
 	} else if (!strcmp(key, "lockout_after")) {
 		CF.lockout_after = atoi(val);
 	} else if (!strcmp(key, "lockout_s")) {
@@ -266,10 +260,6 @@ struct member {
 	int seed;                     /* came from the config, not learned */
 	perfd_t *p;
 	long long dial_at;            /* last connect attempt */
-	int dialing;                  /* a dial is out, FL.mu let go for it */
-	int listed;                   /* a member's list named it live this pass */
-	int unlisted;                 /* passes running it was not, and did not answer */
-	int left;                     /* learned, then left the fleet: not dialled */
 	char *stats, *members, *clients;
 	long long stats_at, members_at, clients_at;
 	char err[160];
@@ -291,15 +281,14 @@ static const char *SECRETS[2];
 static char CONN_NAME[128];            /* dashboard@<host> */
 static int TLS_ON;                     /* the page is served over TLS */
 
-static perfd_t *dial_io(const char *host, int port, char *err, size_t ecap,
-		int io_ms)
+static perfd_t *dial(const char *host, int port, char *err, size_t ecap)
 {
 	perfd_opts po;
 	perfd_t *p;
 
 	memset(&po, 0, sizeof po);
 	po.connect_timeout_ms = 2000;
-	po.io_timeout_ms = io_ms;
+	po.io_timeout_ms = 5000;
 	po.spares = PERFD_SPARES_NONE;   /* this node's trees, nobody else's */
 	po.policy = PERFD_POLICY_FAILOVER;
 	if (CF.secret[0])
@@ -310,11 +299,6 @@ static perfd_t *dial_io(const char *host, int port, char *err, size_t ecap,
 	if (!p)
 		snprintf(err, ecap, "%s", perfd_error(NULL));
 	return p;
-}
-
-static perfd_t *dial(const char *host, int port, char *err, size_t ecap)
-{
-	return dial_io(host, port, err, ecap, 5000);
 }
 
 static struct member *member_add(const char *addr, int port, int node,
@@ -340,29 +324,17 @@ static struct member *member_add(const char *addr, int port, int node,
 	return m;
 }
 
-/* connect a member that has no handle (rate-limited to one try a second); called under FL.mu,
- * which is let go for the dial: a host that does not answer holds no other route */
+/* connect a member that has no handle (rate-limited to one try a second) */
 static void member_connect(struct member *m)
 {
 	long long t = now_ms();
-	char addr[sizeof m->addr], err[sizeof m->err];
-	int port = m->port;
-	perfd_t *p;
 
-	if (m->p || m->dialing || m->left || t - m->dial_at < 1000)
+	if (m->p || t - m->dial_at < 1000)
 		return;
 	m->dial_at = t;
-	m->dialing = 1;
-	memcpy(addr, m->addr, sizeof addr);
-	pthread_mutex_unlock(&FL.mu);
-	p = dial(addr, port, err, sizeof err);
-	pthread_mutex_lock(&FL.mu);
-	m->dialing = 0;
-	if (!p) {
-		snprintf(m->err, sizeof m->err, "%s", err);
+	m->p = dial(m->addr, m->port, m->err, sizeof m->err);
+	if (!m->p)
 		return;
-	}
-	m->p = p;
 	m->err[0] = 0;
 	if (FL.enable[0] && perfd_enable(m->p, FL.enable) != 0)
 		logmsg("%s:%d: enable after reconnect: %s", m->addr, m->port,
@@ -392,7 +364,7 @@ static void learn_from(struct member *src, const char *json)
 	const char *p = json;
 
 	for (;;) {
-		char addr[64], port_s[16], node_s[16], st[16] = "";
+		char addr[64], port_s[16], node_s[16];
 		const char *a = strstr(p, "\"addr\":"), *next, *q;
 		size_t n;
 		int port, node, self;
@@ -414,16 +386,10 @@ static void learn_from(struct member *src, const char *json)
 			return;
 		port = atoi(port_s);
 		node = atoi(node_s);
-		jget(q + n, "state", st, sizeof st);
 		q = strstr(q + n, "\"self\":");
 		self = q && (!next || q < next) && !strncmp(q + 7, "true", 4);
-		/* one the lister holds as gone is not learned, nor counted as listed */
-		if (port > 0 && strcmp(st, "gone")) {
-			struct member *m = member_add(addr, port, node, 0);
-
-			if (m)
-				m->listed = 1;
-		}
+		if (port > 0)
+			member_add(addr, port, node, 0);
 		if (self && node)
 			src->node = node;
 		p = next ? next : q + n;
@@ -437,13 +403,11 @@ static void learn_from(struct member *src, const char *json)
 static void learn(void)
 {
 	long long t = now_ms();
-	int i, answered = 0;
+	int i;
 
 	if (t - FL.learned_at < CF.refresh_ms)
 		return;
 	FL.learned_at = t;
-	for (i = 0; i < FL.n; i++)
-		FL.m[i].listed = 0;
 	for (i = 0; i < FL.n; i++) {
 		struct member *m = &FL.m[i];
 		const char *j;
@@ -452,29 +416,11 @@ static void learn(void)
 		if (!m->p)
 			continue;
 		j = member_tree(m, 1);
-		if (j) {
+		if (j)
 			learn_from(m, j);
-			answered++;
-		}
 	}
-	/* no list read this pass: nothing is known about who left */
-	for (i = 0; answered && i < FL.n; i++) {
-		struct member *m = &FL.m[i];
-
-		if (m->seed || m->p || m->listed) {
-			if (m->left) {
-				logmsg("%s:%d is in the fleet again", m->addr, m->port);
-				m->err[0] = 0;
-			}
-			m->unlisted = m->left = 0;
-		} else if (!m->left && ++m->unlisted >= LEFT_PASSES) {
-			m->left = 1;
-			snprintf(m->err, sizeof m->err, "left");
-			logmsg("%s:%d left the fleet (no member lists it, %d passes without an "
-				"answer) - not dialled until one lists it again", m->addr, m->port,
-				LEFT_PASSES);
-		}
-	}
+	for (i = 0; i < FL.n; i++)
+		member_connect(&FL.m[i]);
 }
 
 /* the tree @which of member @m, from the cache or the daemon; NULL with
@@ -547,7 +493,6 @@ struct lock {
 	long long last;
 };
 static struct lock LOCKS[MAX_LOCK];
-static pthread_mutex_t LOCKS_MU = PTHREAD_MUTEX_INITIALIZER;   /* the HTTP threads share LOCKS */
 
 static struct lock *lock_slot(const char *addr)
 {
@@ -566,24 +511,17 @@ static struct lock *lock_slot(const char *addr)
 
 static int locked_out(const char *addr)
 {
-	struct lock *l;
+	struct lock *l = lock_slot(addr);
 	long long t = now_ms();
-	int out;
 
-	pthread_mutex_lock(&LOCKS_MU);
-	l = lock_slot(addr);
 	l->last = t;
-	out = l->until > t;
-	pthread_mutex_unlock(&LOCKS_MU);
-	return out;
+	return l->until > t;
 }
 
 static void note_failure(const char *addr)
 {
-	struct lock *l;
+	struct lock *l = lock_slot(addr);
 
-	pthread_mutex_lock(&LOCKS_MU);
-	l = lock_slot(addr);
 	l->last = now_ms();
 	if (++l->fails >= CF.lockout_after) {
 		l->until = l->last + (long long)CF.lockout_s * 1000;
@@ -591,18 +529,14 @@ static void note_failure(const char *addr)
 		logmsg("%s: %d wrong enable secrets - locked out for %d s", addr,
 			CF.lockout_after, CF.lockout_s);
 	}
-	pthread_mutex_unlock(&LOCKS_MU);
 }
 
 static void note_success(const char *addr)
 {
-	struct lock *l;
+	struct lock *l = lock_slot(addr);
 
-	pthread_mutex_lock(&LOCKS_MU);
-	l = lock_slot(addr);
 	l->fails = 0;
 	l->until = 0;
-	pthread_mutex_unlock(&LOCKS_MU);
 }
 
 /* stateless sessions: a token is hex nonce || secretbox(expiry (8 bytes, unix s, BE) || the
@@ -1345,7 +1279,7 @@ static MHD_RESULT route_fleet(struct MHD_Connection *c)
 		sb_fmt(&b, "%s{\"node\":%d,\"addr\":", i ? "," : "", m->node);
 		sb_jstr(&b, m->addr);
 		sb_fmt(&b, ",\"port\":%d,\"state\":", m->port);
-		sb_jstr(&b, m->left ? "left" : m->p ? "connected" : m->err[0] ? m->err : "dialling");
+		sb_jstr(&b, m->p ? "connected" : m->err[0] ? m->err : "dialling");
 		sb_str(&b, ",\"version\":"); sb_jstr(&b, ver);
 		sb_str(&b, ",\"rev\":"); sb_jstr(&b, rev);
 		sb_str(&b, ",\"install_mode\":"); sb_jstr(&b, mode);
@@ -1382,7 +1316,7 @@ static MHD_RESULT route_session_get(struct MHD_Connection *c)
 		sb_fmt(&b, "%s{\"node\":%d,\"addr\":", i ? "," : "", m->node);
 		sb_jstr(&b, m->addr);
 		sb_fmt(&b, ",\"port\":%d,\"state\":", m->port);
-		sb_jstr(&b, m->left ? "left" : m->p ? "connected" : m->err[0] ? m->err : "dialling");
+		sb_jstr(&b, m->p ? "connected" : m->err[0] ? m->err : "dialling");
 		sb_str(&b, "}");
 	}
 	sb_str(&b, "]}");
@@ -1516,11 +1450,10 @@ static MHD_RESULT route_ddl(struct MHD_Connection *c, const char *body,
 		const char *from)
 {
 	char op[16], col[64] = "", to[64] = "", nb[16], nodes[16], fb[8], ib[8];
-	char what[160], addr[sizeof FL.m[0].addr], en[sizeof FL.enable], err[400];
+	char what[160];
 	struct member *m;
-	perfd_t *p;
 	char *r;
-	int node = 0, log2 = 0, force = 0, index = -1, port, mnode;
+	int node = 0, log2 = 0, force = 0, index = -1;
 	MHD_RESULT rc;
 
 	if (jget(body, "op", op, sizeof op) != 1)
@@ -1564,52 +1497,42 @@ static MHD_RESULT route_ddl(struct MHD_Connection *c, const char *body,
 		pthread_mutex_unlock(&FL.mu);
 		return no_member(c, node);
 	}
-	/* its own handle, outside the fleet lock: a create waits on the WAL's fsync, which a
-	 * stalled disk holds past the page handles' 5 s */
-	snprintf(addr, sizeof addr, "%s", m->addr);
-	port = m->port;
-	mnode = m->node;
-	snprintf(en, sizeof en, "%s", FL.enable);
-	pthread_mutex_unlock(&FL.mu);
+	member_connect(m);
+	if (!m->p) {
+		char err[400];
+
+		snprintf(err, sizeof err, "node %s:%d: %s", m->addr, m->port,
+			m->err[0] ? m->err : "not connected");
+		pthread_mutex_unlock(&FL.mu);
+		return send_err(c, 502, err);
+	}
 	if (index >= 0)                    /* what the log lines name */
 		snprintf(what, sizeof what, "db %d%s%s", index, col[0] ? " -> " : "",
 			col);
 	else
 		snprintf(what, sizeof what, "%s%s%s", col, to[0] ? " -> " : "", to);
-	p = dial_io(addr, port, err, sizeof err, (CF.ddl_timeout_s > 0 ?
-		CF.ddl_timeout_s : 60) * 1000);
-	if (!p) {
-		char e2[512];
-
-		sodium_memzero(en, sizeof en);
-		snprintf(e2, sizeof e2, "node %s:%d: %s", addr, port, err);
-		return send_err(c, 502, e2);
-	}
-	r = en[0] && perfd_enable(p, en) != 0 ? NULL
-		: !strcmp(op, "create") ? perfd_create(p, col, log2)
-		: !strcmp(op, "drop") ? perfd_drop(p, col, force)
-		: !strcmp(op, "resize") ? perfd_resize(p, col, log2)
-		: !strcmp(op, "map") ? perfd_map(p, index, col)
-		: !strcmp(op, "unmap") ? perfd_unmap(p, index)
-		: perfd_rename(p, col, to);
-	sodium_memzero(en, sizeof en);
+	r = !strcmp(op, "create") ? perfd_create(m->p, col, log2)
+		: !strcmp(op, "drop") ? perfd_drop(m->p, col, force)
+		: !strcmp(op, "resize") ? perfd_resize(m->p, col, log2)
+		: !strcmp(op, "map") ? perfd_map(m->p, index, col)
+		: !strcmp(op, "unmap") ? perfd_unmap(m->p, index)
+		: perfd_rename(m->p, col, to);
 	if (!r) {
-		int kind = perfd_error_kind(p);
+		char err[300];
 
-		snprintf(err, sizeof err, "%s", perfd_error(p));
-		perfd_free(p);
+		snprintf(err, sizeof err, "%s", perfd_error(m->p));
 		logmsg("%s: %s %s on node %d (%s:%d) refused: %s", from, op, what,
-			mnode, addr, port, err);
-		return send_err(c, kind == PERFD_E_SERVER ? 409 : 502, err);
+			m->node, m->addr, m->port, err);
+		pthread_mutex_unlock(&FL.mu);
+		return send_err(c, perfd_error_kind(m->p) == PERFD_E_SERVER ? 409
+			: 502, err);
 	}
 	logmsg("%s: %s %s on node %d (%s:%d): %s", from, op, what,
-		mnode, addr, port, r);
-	pthread_mutex_lock(&FL.mu);
+		m->node, m->addr, m->port, r);
 	m->stats_at = 0;
 	pthread_mutex_unlock(&FL.mu);
 	rc = send_bytes(c, 200, "application/json", r, strlen(r), 0);
 	perfd_free_value(r);
-	perfd_free(p);
 	return rc;
 }
 
@@ -1756,7 +1679,7 @@ static MHD_RESULT handle(void *cls, struct MHD_Connection *c,
 			const char *h = MHD_lookup_connection_value(c,
 				MHD_HEADER_KIND, HDR_POST);
 			const char *ct = MHD_lookup_connection_value(c,
-				MHD_HEADER_KIND, "Content-Type"), *cl;
+				MHD_HEADER_KIND, "Content-Type");
 
 			if (!h)
 				return send_err(c, 403, "a request header " HDR_POST
@@ -1770,21 +1693,6 @@ static MHD_RESULT handle(void *cls, struct MHD_Connection *c,
 				if (!ct || strncmp(ct, "application/json", 16))
 					return send_err(c, 415, "application/json only");
 				q->limit = (size_t)CF.body_max;
-			}
-			/* no body is held for a request that will be refused: size and session first */
-			cl = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Content-Length");
-			if (cl && strtoull(cl, NULL, 10) > q->limit)
-				return send_err(c, 413, q->raw ? "the build is over stage_max_mb"
-					: "the body is over body_max");
-			if (strcmp(url, "/session")) {
-				char sec[SECRET_MAX];
-				int ok = token_open(MHD_lookup_connection_value(c, MHD_HEADER_KIND,
-					HDR_SESSION), sec, sizeof sec);
-
-				sodium_memzero(sec, sizeof sec);
-				if (!ok)
-					return send_err(c, 401, "no privileged session - enter the "
-						"enable secret first");
 			}
 		}
 		return MHD_YES;

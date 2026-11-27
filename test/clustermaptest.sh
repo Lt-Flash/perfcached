@@ -38,7 +38,6 @@ buckets_log2 = 12
 EOF
 }
 start() { # start <n>
-	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P$1=\$!"
 	i=0
@@ -339,7 +338,6 @@ plaintext = loopback
 [collection cm]
 buckets_log2 = 10
 EOF
-: > "$D/solo.log"
 "$BIN" -f "$D/solo.conf" > "$D/solo.log" 2>&1 &
 P0=$!
 i=0

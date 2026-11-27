@@ -53,7 +53,6 @@ C
 }
 start() { # start <n> - each start logs to its own file, n<n>.log.<k>
 	k=$(ls "$D"/n$1.log.* 2>/dev/null | wc -l); L="$D/n$1.log.$k"
-	: > "$L"
 	"$BIN" -f "$D/n$1.conf" > "$L" 2>&1 &
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 200 ]; do
@@ -68,16 +67,6 @@ st() { curl -s "http://127.0.0.1:1869$1/stats" | python3 -c '
 import json, sys
 r = json.load(sys.stdin); c = [x for x in r["collections"] if x["name"] == "c"][0]
 print(eval(sys.argv[1]))' "$2" 2>/dev/null; }
-# rtn <n>: what node n retains of deletes and expiries, and its arena's sparse chunks and moves
-rtn() { curl -s "http://127.0.0.1:1869$1/stats" | python3 -c '
-import json, sys
-r = json.load(sys.stdin); t = r["cluster"].get("tombstones_retained", {}); f = {}
-def walk(x):
-    for k, v in (x.items() if isinstance(x, dict) else []):
-        if k in ("arena_sparse_chunks", "arena_evacuated"): f[k] = v
-        walk(v)
-walk(r)
-print("node %s: %s; %s" % (r["cluster"].get("node"), {k: t.get(k) for k in ("entries", "expiries", "noted_expiries", "forgotten_expiries", "dropped_early_expiries", "replayed")}, f))' 2>/dev/null; }
 ready3() {
 	i=0; while [ $i -lt 120 ]; do
 		[ "$(st 1 'r["state"]')$(st 2 'r["state"]')$(st 3 'r["state"]')" = readyreadyready ] && \
@@ -145,11 +134,6 @@ arm() { # arm <term|kill> [pull]
 	if [ "$1" = term ]; then
 		kill "$(cat "$D/n3.pid")"
 	else
-		# an ack is at the WAL's ring (src/wal.h) and kill -9 takes what a ring holds - a stalled
-		# fsync holds the pump: node 3's log must hold its writes first, or nothing is replayed
-		i=0; while [ "$(st 3 'r["wal"]["staged"]')" != 0 ] && [ $i -lt 120 ]; do sleep 0.5; i=$((i+1)); done
-		SG=$(st 3 'r["wal"]["staged"]')
-		[ "$SG" = 0 ] || bad "$1: node 3's WAL still stages $SG record(s) after 60 s - a kill -9 now replays without them"
 		kill -9 "$(cat "$D/n3.pid")"
 	fi
 	i=0; while kill -0 "$(cat "$D/n3.pid")" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
@@ -159,7 +143,6 @@ arm() { # arm <term|kill> [pull]
 	[ "$R" = 1000 ] && [ "$S1$T1" = 00 ] && [ "$X1" = 500 ] && [ "$I1" = 1000 ] \
 		&& ok "$1: with node 3 down - x re-set to 600 s and t to 6 s; 15 s on node 1 holds s 0, t 0, x 500 new, i 1,000" \
 		|| bad "$1: while down: re-set $R of 1,000; node 1 s $S1 t $T1 x $X1 i $I1 (want 0 0 500 1000)"
-	RT0_1=$(rtn 1); RT0_2=$(rtn 2)
 	start 3 || { bad "$1: node 3 did not come back"; return; }
 	ready3 || bad "$1: the fleet did not re-form"
 	if [ -n "${2:-}" ]; then
@@ -205,8 +188,6 @@ arm() { # arm <term|kill> [pull]
 	HR=$(st 3 'r["cluster"].get("repl_held_recovered", 0)')
 	RC="probed $(st 3 'r["cluster"].get("reconcile_probed")'), dropped $(st 3 'r["cluster"].get("reconciled")'); the sweep held back $HR, pulls unanswered $(st 3 'r["cluster"].get("pull_held_recovered")')"
 	echo "   reconcile done + 25 s: entries $E (1,500 live); node 3: $RC"
-	echo "   retained before node 3's return - $RT0_1 | $RT0_2"
-	echo "   retained now - $(rtn 1) | $(rtn 2)"
 	# a leak's shape, printed only when the counts are off: which node
 	# holds which t key, by LOCAL ttl (the ttl verb never pulls)
 	[ "$E" = 1500/1500/1500 ] || python3 - <<'DPY'

@@ -7,28 +7,16 @@ struct qs_line {
 } __attribute__((aligned(64)));
 
 static struct qs_line lines[PC_QS_LINES];
-static unsigned char freed[PC_QS_LINES];   /* 1: given back by pc_qs_detach, to take again */
 static unsigned int nlines;
 static unsigned long long seq = 1; /* never 0: 0 is "outside" */
 static __thread int me = -1;
 
 void pc_qs_attach(void)
 {
-	unsigned int i, n;
-	unsigned char one = 1;
+	unsigned int i;
 
 	if (me >= 0)
 		return;
-	n = __atomic_load_n(&nlines, __ATOMIC_ACQUIRE);
-	for (i = 0; i < n && i < PC_QS_LINES; i++)
-		if (__atomic_load_n(&freed[i], __ATOMIC_RELAXED) &&
-		    __atomic_compare_exchange_n(&freed[i], &one, 0, 0,
-		        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-			me = (int)i;
-			return;
-		} else {
-			one = 1;
-		}
 	i = __atomic_fetch_add(&nlines, 1, __ATOMIC_ACQ_REL);
 	if (i >= PC_QS_LINES) {
 		__atomic_fetch_sub(&nlines, 1, __ATOMIC_ACQ_REL);
@@ -36,16 +24,6 @@ void pc_qs_attach(void)
 		                            * protected - far fewer threads than lines */
 	}
 	me = (int)i;
-}
-
-/* a thread that ends gives its line back (outside), so threads started per run do not use them up */
-void pc_qs_detach(void)
-{
-	if (me < 0)
-		return;
-	__atomic_store_n(&lines[me].epoch, 0, __ATOMIC_RELEASE);
-	__atomic_store_n(&freed[me], 1, __ATOMIC_RELEASE);
-	me = -1;
 }
 
 /* the store and the fence make a Dekker pair with the retirer's stamp: either a later retirer sees

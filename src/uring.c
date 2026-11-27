@@ -342,31 +342,11 @@ void pc_ur_prep_cancel(struct pc_ur_sqe *s, uint64_t target, uint64_t ud)
 	s->user_data = ud;
 }
 
-/* test hook: PERFCACHED_TEST_UR_EAGAIN=1 - a worker's ring (1024 entries, buffers in) answers its
- * thread's first submit -EAGAIN with nothing consumed, as the kernel can under memory pressure */
-static int ur_test_eagain(const struct pc_ur *r)
-{
-	static int on_ = -1;
-	static __thread int done;
-	int on = __atomic_load_n(&on_, __ATOMIC_RELAXED);
-
-	if (on < 0) {
-		const char *e = getenv("PERFCACHED_TEST_UR_EAGAIN");
-
-		on = e && *e == '1';
-		__atomic_store_n(&on_, on, __ATOMIC_RELAXED);
-	}
-	if (!on || done || r->sq_entries < 1024 || r->buf_tier == PC_UR_BUF_NONE)
-		return 0;
-	done = 1;
-	return 1;
-}
-
 int pc_ur_submit(struct pc_ur *r, int wait, int timeout_ms)
 {
 	struct ur_getevents_arg arg;
 	struct ur_timespec ts;
-	unsigned n;
+	unsigned n = r->sq_local - *r->sq_tail;
 	unsigned flags = UR_ENTER_GETEVENTS;  /* runs deferred task work too */
 	int rc;
 
@@ -377,10 +357,6 @@ int pc_ur_submit(struct pc_ur *r, int wait, int timeout_ms)
 
 	pc_ur_cqe_flush(r);
 	__atomic_store_n(r->sq_tail, r->sq_local, __ATOMIC_RELEASE);
-	/* everything the kernel has not consumed, not only what is new: a short or refused enter's rest */
-	n = r->sq_local - __atomic_load_n(r->sq_head, __ATOMIC_ACQUIRE);
-	if (ur_test_eagain(r))
-		return -EAGAIN;
 	if (wait && timeout_ms >= 0) {
 		memset(&arg, 0, sizeof arg);
 		ts.tv_sec = timeout_ms / 1000;

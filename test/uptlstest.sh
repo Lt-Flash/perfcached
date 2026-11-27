@@ -77,7 +77,6 @@ start() { # start <name> <upstream url> [extra collection lines...]
 	[ -n "$PID" ] && { kill $PID 2>/dev/null; wait $PID 2>/dev/null; }     # a bare wait waits for the fakes too
 	PID=
 	conf "$@"
-	: > "$D/$1.log"
 	"$BIN" -f "$D/$1.conf" > "$D/$1.log" 2>&1 & PID=$!
 	i=0; while [ $i -lt 100 ] && ! grep -q "perfcached ready" "$D/$1.log"; do sleep 0.1; i=$((i+1)); done
 	grep -q "perfcached ready" "$D/$1.log" || { bad "the node ($1) did not start: $(tail -2 "$D/$1.log")"; return 1; }

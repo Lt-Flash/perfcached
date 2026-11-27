@@ -30,7 +30,6 @@ notify_events = all
 buckets_log2 = 12
 CONF
 chmod 640 "$D/pc.conf"
-: > "$D/pc.log"
 "$BIN" -f "$D/pc.conf" -D > "$D/pc.log" 2>&1 & P=$!
 i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/pc.log" && break; sleep 0.1; i=$((i+1)); done
 grep -q "perfcached ready" "$D/pc.log" || { echo "  daemon did not start:"; tail -3 "$D/pc.log"; echo "keyspacetest: 0 passed, 1 failed"; exit 1; }
@@ -129,7 +128,7 @@ buckets_log2 = 12
 notify_events = store, remove
 CONF
 	chmod 640 "$D/n$1.conf"; }
-start() { : > "$D/n$1.log"; "$BIN" -f "$D/n$1.conf" -D > "$D/n$1.log" 2>&1 & eval "P$1=\$!"
+start() { "$BIN" -f "$D/n$1.conf" -D > "$D/n$1.log" 2>&1 & eval "P$1=\$!"
 	i=0; while [ $i -lt 100 ]; do grep -q "perfcached ready" "$D/n$1.log" && return 0; sleep 0.1; i=$((i+1)); done; return 1; }
 node 1; node 2; start 1 && start 2 || { bad "fleet nodes did not start"; echo "keyspacetest: $pass passed, $((fail))"; exit 1; }
 i=0; while [ $i -lt 150 ]; do

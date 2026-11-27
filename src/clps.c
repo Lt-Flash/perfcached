@@ -25,8 +25,6 @@
 #include "clreplay.h"
 #include "clstate.h"
 #include "clpeers.h"
-
-void (*clps_idle_fn)(void);
 #include "clsend.h"
 #include "clwire.h"
 #include "clmsg.h"
@@ -52,8 +50,7 @@ static ssize_t relay_sendto(int fd, const void *buf, size_t n,
 static uint16_t pubsub_epoch;          /* drawn with the incarnation */
 static unsigned int pubsub_lanes;      /* lanes handed out; wraps at 256 */
 static __thread int pubsub_lane = -1;
-/* the counters are the lane's, not the thread's: past 256 publishing threads two share one */
-static struct { uint64_t c; char pad[56]; } pubsub_lane_ctr[256];
+static __thread uint64_t pubsub_lane_ctr;
 /* the dedicated relay plane: see clps_rx_open */
 #define PS_RX_MAX 16
 static int ps_rx_port;                 /* bound and advertised; 0 = off */
@@ -108,7 +105,7 @@ static unsigned long long ps_int_seq;  /* atomic seqlock: odd while it writes */
 static unsigned ps_nfilter;            /* atomic: peers in PV_FILTER */
 static unsigned long long ps_skipped, ps_int_upd_sent, ps_int_upd_recv,
 	ps_int_full_sent, ps_int_full_recv, ps_int_req_sent;
-static uint64_t ps_peer_ctr[256][PC_CL_MAXPEER];   /* per lane, as pubsub_lane_ctr */
+static __thread uint64_t ps_peer_ctr[PC_CL_MAXPEER];
 static __thread unsigned char *ps_peer_seal;
 
 static void fpat_or(struct psi_node *x, void *arg)
@@ -184,8 +181,7 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 			__ATOMIC_RELAXED) & 0xff);
 		clwire_take_lane();
 	}
-	seq = psr_seq(pubsub_epoch, (uint8_t)pubsub_lane,
-		__atomic_add_fetch(&pubsub_lane_ctr[pubsub_lane].c, 1, __ATOMIC_RELAXED));
+	seq = psr_seq(pubsub_epoch, (uint8_t)pubsub_lane, ++pubsub_lane_ctr);
 	frame[0] = M_PUBLISH;
 	ps_put16(frame + 1, (unsigned)cl_node_id());
 	ps_put64(frame + 3, seq);
@@ -223,8 +219,7 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 			    !(ps_peer_seal = malloc(HDR_LEN + MAX_DGRAM + 16)))
 				continue;
 			ps_put64(frame + 3, psr_seq(pubsub_epoch ^ PS_PEER_EPOCH,
-				(uint8_t)pubsub_lane, __atomic_add_fetch(
-				&ps_peer_ctr[pubsub_lane][i], 1, __ATOMIC_RELAXED)));
+				(uint8_t)pubsub_lane, ++ps_peer_ctr[i]));
 			if (!(olen = clsend_wrap(frame, n, ps_peer_seal)))
 				continue;
 			out = ps_peer_seal;
@@ -255,18 +250,15 @@ int pc_cluster_pubsub_relay(const char *chan, size_t clen, const char *data,
 	return sent;
 }
 
-/* per sender id held by a live member, 256 lane windows (10 KB); never freed, as
- * the receive threads reach them unlocked, so the id space bounds it at 10 MB */
-struct ps_rxl {
-	struct psr_lane w;
-	int lk;                            /* a lane comes by the relay port and the cluster path */
-};
-static struct ps_rxl *ps_rx[PC_CL_NODE_MAX + 1];
+/* per sender id held by a live member, 256 lane windows (8 KB); never freed, as
+ * the receive threads read them unlocked, so the id space bounds it at 8 MB */
+static struct psr_lane *ps_rx[PC_CL_NODE_MAX + 1];
 
-/* a node's lanes are made under ps_rx_lk and published once */
-static struct ps_rxl *ps_rx_lanes(unsigned node)
+/* a node's lanes are made under ps_rx_lk and published once; a sender lane arrives
+ * on one receive thread (one socket), so each window has one writer */
+static struct psr_lane *ps_rx_lanes(unsigned node)
 {
-	struct ps_rxl *l;
+	struct psr_lane *l;
 
 	if (!node || node > PC_CL_NODE_MAX)
 		return NULL;                   /* delivered, unaccounted */
@@ -292,8 +284,7 @@ void clps_handle_publish(const unsigned char *pt, size_t n)
 	unsigned long dlen;
 	unsigned long long seq;
 	uint64_t lost = 0;
-	struct ps_rxl *lanes;
-	int r = PSR_DELIVER;
+	struct psr_lane *lanes;
 
 	if (n < 17)
 		return;
@@ -306,16 +297,8 @@ void clps_handle_publish(const unsigned char *pt, size_t n)
 	if (n != 17 + clen + dlen)
 		return;
 	lanes = ps_rx_lanes(node);
-	if (lanes) {
-		struct ps_rxl *x = &lanes[psr_lane(seq)];
-
-		while (__atomic_exchange_n(&x->lk, 1, __ATOMIC_ACQUIRE))
-			while (__atomic_load_n(&x->lk, __ATOMIC_RELAXED))
-				;
-		r = psr_accept(&x->w, seq, &lost);
-		__atomic_store_n(&x->lk, 0, __ATOMIC_RELEASE);
-	}
-	if (r == PSR_DUPLICATE) {
+	if (lanes && psr_accept(&lanes[psr_lane(seq)], seq, &lost) ==
+	        PSR_DUPLICATE) {
 		pc_pubsub_relay_account(0, 0, 0, 1);
 		return;
 	}
@@ -485,7 +468,7 @@ static void ps_rx_one(void *vctx, const unsigned char *buf, size_t r,
 
 		clwire_id_read(buf, &wid);
 		rr = clreplay_admit(&wid, from->in4.sin_addr.s_addr, cl_now_ms());
-		if (!clreplay_taken(rr)) {
+		if (rr != CLREPLAY_OK && rr != CLREPLAY_FULL) {
 			__atomic_add_fetch(&ps_rx_other, 1, __ATOMIC_RELAXED);
 			return;
 		}
@@ -528,8 +511,6 @@ void pc_cluster_pubsub_rx_thread(volatile int *stop, int idx)
 		int seen = 0, prc, nt = tr ? clrpt_rx_pollset(tr, pf + 1,
 			1 + CLRPT_RX_CONNS) : 0;
 
-		if (clps_idle_fn)
-			clps_idle_fn();
 		pc_qs_exit();
 		prc = poll(pf, (nfds_t)(1 + nt), 100);
 		pc_qs_enter();

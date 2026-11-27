@@ -25,8 +25,6 @@ file.
      "down": false (refuse/close every connection),
      "resp3": true (answer HELLO 3),
      "tracking": true (answer CLIENT ID / CLIENT TRACKING),
-     "redirect_refused": true (CLIENT TRACKING ... REDIRECT answered -NOPERM, as
-         for a user without that command; CLIENT ID still served),
      "client_id_delay_ms": 0 (CLIENT ID answered this late - only a
          client's invalidation connection asks it, so its tracking comes up
          that much after its fetch connections can serve),
@@ -91,13 +89,7 @@ file.
      "master_host"/"master_port" - what a replica's ROLE and INFO
          replication name as its master,
      "json": false - no RedisJSON: COMMAND INFO has no JSON.* and the
-         JSON commands are unknown,
-     "cmds": {"name": [arity, [flags], first, last, step, [cats]]} - COMMAND INFO
-         and GETKEYS answer these as well (over the table below); a "name|sub" entry
-         is listed among name's sub-commands,
-     "cmd_info_delay_ms": {"name": N} - COMMAND INFO of that name answered N ms late,
-     "error_cmds": {"TYPE": "LOADING ...", "SCAN": ...} - those commands answered with that
-         error; with "error_n": N only the first N since "error_seq" last changed}
+         JSON commands are unknown}
 COMMAND INFO / COMMAND GETKEYS answer for the commands in CMDS below, as
 Redis 7 would (flags, key positions, ACL categories).
 A key written here keeps its expiry as "exp_ms" (wall clock), so a copy in
@@ -322,24 +314,17 @@ def cmd_info(names, ctl):
     out = []
     for n in names:
         n = n.decode("latin-1").lower()
-        e = (ctl.get("cmds") or {}).get(n) or CMDS.get(n)
+        e = CMDS.get(n)
         if e is None or (n.startswith("json.") and ctl.get("json") is False):
             out.append(b"*-1\r\n")
             continue
-        tab = dict(CMDS, **(ctl.get("cmds") or {}))
-        subs = [cmd_ent(s, tab[s], b"*0\r\n") for s in sorted(tab) if s.startswith(n + "|")]
-        out.append(cmd_ent(n, e, arr(subs)))
+        ar, fl, fi, la, st, cat = e
+        out.append(arr([bulk(n), b":%d\r\n" % ar,
+                        arr([b"+%s\r\n" % x.encode() for x in fl]),
+                        b":%d\r\n" % fi, b":%d\r\n" % la, b":%d\r\n" % st,
+                        arr([b"+%s\r\n" % x.encode() for x in cat]),
+                        b"*0\r\n", b"*0\r\n", b"*0\r\n"]))
     return arr(out)
-
-
-def cmd_ent(n, e, subs):
-    """one COMMAND INFO entry; its 10th element lists a container's sub-commands, as Redis 7's does"""
-    ar, fl, fi, la, st, cat = e
-    return arr([bulk(n), b":%d\r\n" % ar,
-                arr([b"+%s\r\n" % x.encode() for x in fl]),
-                b":%d\r\n" % fi, b":%d\r\n" % la, b":%d\r\n" % st,
-                arr([b"+%s\r\n" % x.encode() for x in cat]),
-                b"*0\r\n", b"*0\r\n", subs])
 
 
 def apply_write(cmd, ctl):
@@ -504,24 +489,6 @@ def apply_write(cmd, ctl):
         else:
             bcast_now()                # S423: as Redis does, before the writer's reply
     return rep
-
-
-err_state = {"seq": None, "n": 0}
-
-
-def injected(ctl, name):
-    """error_cmds' reply for @name (counted as sent), b"" when none or error_n of them were
-    sent since error_seq changed"""
-    ec = (ctl.get("error_cmds") or {}).get(name.decode("latin-1").upper())
-    if not ec:
-        return b""
-    with lock:
-        if ctl.get("error_seq") != err_state["seq"]:
-            err_state["seq"], err_state["n"] = ctl.get("error_seq"), 0
-        if "error_n" in ctl and err_state["n"] >= ctl["error_n"]:
-            return b""
-        err_state["n"] += 1
-    return b"-%s\r\n" % ec.encode()
 
 
 def note(fname, line):
@@ -783,11 +750,6 @@ def serve(conn):
                                if c == b"PREFIX" and i + 1 < len(cmd)]
                         with lock:
                             bcast[cid] = pre
-                    if b"REDIRECT" in up and ctl.get("redirect_refused"):
-                        note("counts", "TRACKING REFUSED")
-                        conn.sendall(b"-NOPERM this user has no permissions to run the "
-                                     b"'client|tracking' command\r\n")
-                        continue
                     if b"REDIRECT" in up:
                         tgt = int(cmd[up.index(b"REDIRECT") + 1])
                         with lock:
@@ -833,15 +795,9 @@ def serve(conn):
                 sub = cmd[1].upper() if len(cmd) > 1 else b""
                 if sub == b"INFO":                    # S385
                     note("counts", "COMMAND INFO " + " ".join(c.decode() for c in cmd[2:]))
-                    cd = ctl.get("cmd_info_delay_ms") or {}
-                    late = [cd[c.decode("latin-1").lower()] for c in cmd[2:]
-                            if c.decode("latin-1").lower() in cd]
-                    if late:
-                        time.sleep(max(late) / 1000.0)
                     conn.sendall(cmd_info(cmd[2:], ctl))
                 elif sub == b"GETKEYS" and len(cmd) > 2:
-                    gk = cmd[2].decode("latin-1").lower()
-                    e = (ctl.get("cmds") or {}).get(gk) or CMDS.get(gk)
+                    e = CMDS.get(cmd[2].decode("latin-1").lower())
                     if not e or e[2] <= 0:
                         conn.sendall(b"-ERR The command has no key arguments\r\n")
                     else:
@@ -930,11 +886,6 @@ def serve(conn):
                 else:
                     conn.sendall(bulk(body))
                 continue
-            ec = injected(ctl, name) if name == b"SCAN" else b""
-            if ec:
-                note("counts", "SCAN refused")
-                conn.sendall(ec)
-                continue
             if name == b"SCAN":
                 # SCAN cursor [MATCH pat] [COUNT n]: the data file's live
                 # keys, sorted; the cursor is an index into them
@@ -967,10 +918,6 @@ def serve(conn):
                     conn.sendall(err)
                     continue
             note("counts", name.decode() + " " + key)
-            ec = injected(ctl, name)
-            if ec:                                   # -LOADING, -BUSY ...: refused, not answered
-                conn.sendall(ec)
-                continue
             dk = ctl.get("delay_keys") or []
             if ctl.get("delay_ms") and (not dk or key in dk):
                 time.sleep(ctl["delay_ms"] / 1000.0)

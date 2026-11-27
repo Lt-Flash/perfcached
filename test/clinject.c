@@ -18,8 +18,6 @@
 #include "clmemb.h"
 #include "clpull.h"
 #include "clfwd.h"
-#include "clinit.h"
-#include "config.h"
 
 static long long mono_ms(void)
 {
@@ -32,7 +30,7 @@ static long long mono_ms(void)
 static int usage(void)
 {
 	fprintf(stderr, "usage: clinject -s SECRET -c CLUSTER_ID -f FROM_IP:PORT "
-		"-t TO_IP:PORT [-n COUNT] [-i GAP_MS] [-w WAIT_MS] [-g EAGER,WAL,COL...] [-I INCARN] raw HEX | pullreq COL "
+		"-t TO_IP:PORT [-n COUNT] [-i GAP_MS] [-w WAIT_MS] raw HEX | pullreq COL "
 		"KEY | joinreq | alive NODE [IDENT] | malive NODE MEMBERS TERM | fwdadd COL KEY "
 		"DELTA\n");
 	return 2;
@@ -77,10 +75,8 @@ int main(int argc, char **argv)
 	pc_addr from, to;
 	size_t n = 0, sl;
 	int count = 1, gap_ms = 0, wait_ms = 0, i, fd, opt, got = 0;
-	const char *cfgs = NULL;
-	uint32_t incarn_fix = 0;
 
-	while ((opt = getopt(argc, argv, "s:c:f:t:n:i:w:g:I:")) != -1)
+	while ((opt = getopt(argc, argv, "s:c:f:t:n:i:w:")) != -1)
 		switch (opt) {
 		case 's': secret = optarg; break;
 		case 'c': cidhex = optarg; break;
@@ -89,8 +85,6 @@ int main(int argc, char **argv)
 		case 'n': count = atoi(optarg); break;
 		case 'i': gap_ms = atoi(optarg); break;
 		case 'w': wait_ms = atoi(optarg); break;
-		case 'g': cfgs = optarg; break;
-		case 'I': incarn_fix = (uint32_t)strtoul(optarg, NULL, 10); break;
 		default: return usage();
 		}
 	if (!secret || !cidhex || !froms || !tos || optind >= argc ||
@@ -135,33 +129,8 @@ int main(int argc, char **argv)
 		a.ident = ident;
 		randombytes_buf(&a.incarn, sizeof a.incarn);
 		a.incarn |= 1;
-		if (incarn_fix)                /* -I: one incarnation across several runs */
-			a.incarn = incarn_fix;
 		a.nstate = PC_NST_READY;
 		a.epoch = PC_CL_EPOCH;
-		/* -g: a store-mode member's config digest, which a node with [cluster] collections checks */
-		if (cfgs) {
-			char buf[512], *save = NULL, *tok;
-			const char *names[CLINIT_MAX_NAMES];
-			struct clinit_digest_in in;
-
-			memset(&in, 0, sizeof in);
-			snprintf(buf, sizeof buf, "%s", cfgs);
-			if (!(tok = strtok_r(buf, ",", &save)))
-				return usage();
-			in.eager = atoi(tok);
-			if (!(tok = strtok_r(NULL, ",", &save)))
-				return usage();
-			in.wal = atoi(tok);
-			while ((tok = strtok_r(NULL, ",", &save)) && in.n_names < CLINIT_MAX_NAMES)
-				names[in.n_names++] = tok;
-			in.mode = PC_MODE_STORE;
-			in.route_algo = PC_ROUTE_ALGO;
-			in.names = names;
-			a.mode = in.mode;
-			a.eager = in.eager;
-			a.cfg_digest = clinit_config_digest(&in);
-		}
 		n = clmemb_alive_write(pt, sizeof pt, M_ALIVE, &a);
 	} else if (!strcmp(argv[optind], "malive") && optind + 3 < argc) {
 		struct clmemb_malive m;

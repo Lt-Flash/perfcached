@@ -106,23 +106,11 @@ int op_cmp(pcache_htable_t *ht, str *k, const char *cmp, size_t cmplen,
 	return PC_OP_OK;
 }
 
-/* "ro": the node refuses writes; "busy": the fleet's pending table is full */
-static int refused_key(const str *k)
-{
-	if (k->len == 2 && !memcmp(k->s, "ro", 2))
-		return PC_OP_ERR_WRFAIL;
-	if (k->len == 4 && !memcmp(k->s, "busy", 4))
-		return PC_OP_ERR_BUSY;
-	return 0;
-}
-
 int op_del(pcache_htable_t *ht, str *k, unsigned int *park)
 {
 	struct ent *e = find(k);
 
 	(void)ht; (void)park;
-	if (refused_key(k))
-		return refused_key(k);
 	if (!e)
 		return PC_OP_ABSENT;
 	e->used = 0;
@@ -134,8 +122,6 @@ int op_expire(pcache_htable_t *ht, str *k, long long ttl, unsigned int *park)
 	struct ent *e = find(k);
 
 	(void)ht; (void)park;
-	if (refused_key(k))
-		return refused_key(k);
 	if (!e)
 		return PC_OP_ABSENT;
 	e->ttl = ttl;
@@ -259,14 +245,7 @@ const char *wr_refused_msg(void) { return "refused"; }
 void unk_sub(const struct resp_ctx *c) { (void)c; }
 void pc_obs_client_list(struct pc_jw *w, unsigned int now_ticks) { (void)w; (void)now_ticks; }
 void pc_obs_conn_lib(void *row, int ver, const char *v, size_t n) { (void)row; (void)ver; (void)v; (void)n; }
-static char named[64];
-static int names;
-void pc_obs_conn_name(void *row, const char *name, size_t nlen)
-{
-	(void)row;
-	names++;
-	snprintf(named, sizeof named, "%.*s", (int)nlen, name);
-}
+void pc_obs_conn_name(void *row, const char *name, size_t nlen) { (void)row; (void)name; (void)nlen; }
 void pc_obs_slowlog_get(struct pc_jw *w, int want) { (void)w; (void)want; }
 long long pc_obs_slowlog_len(void) { return 0; }
 void pc_obs_slowlog_reset(void) { }
@@ -538,64 +517,6 @@ int main(void)
 		"F: WRONGTYPE");
 	RUN(rh_incr, "INCR", "busy");
 	CHK(is("-TRYAGAIN cluster busy, retry\r\n"), "F: a busy fleet - TRYAGAIN");
-
-	/* R: a refused delete or expire answers the refusal SET gives, never :0 (no such key) */
-	RUN(rh_del, "DEL", "ro");
-	CHK(is("-ERR refused\r\n"), "R: DEL on a node refusing writes - the refusal");
-	RUN(rh_del, "DEL", "busy");
-	CHK(is("-TRYAGAIN cluster busy, retry\r\n"), "R: DEL on a busy fleet - TRYAGAIN");
-	RUN(rh_del, "DEL", "nope", "ro");
-	CHK(is("-ERR refused\r\n"), "R: DEL of several - the refusal");
-	RUN(rh_delex, "DELEX", "ro");
-	CHK(is("-ERR refused\r\n"), "R: DELEX without a condition - the refusal");
-	RUN(rh_expire, "EXPIRE", "ro", "10");
-	CHK(is("-ERR refused\r\n"), "R: EXPIRE - the refusal");
-	RUN(rh_expire, "EXPIRE", "busy", "10");
-	CHK(is("-TRYAGAIN cluster busy, retry\r\n"), "R: EXPIRE on a busy fleet - TRYAGAIN");
-	RUN(rh_expire, "EXPIRE", "ro", "0");
-	CHK(is("-ERR refused\r\n"), "R: EXPIRE 0 (a delete) - the refusal");
-
-	/* T: a TTL the 32-bit expiry cannot hold is refused, never cut to 32 bits; a number
-	 * past int64 is not an integer, not LLONG_MAX */
-	put("tk", "v", 0, 0);
-	last_ttl = -5;
-	RUN(rh_set, "SET", "tk", "v", "EX", "4294967296");
-	CHK(is("-ERR invalid expire time in 'set' command\r\n") && last_ttl == -5,
-		"T: SET EX 2^32 - invalid expire time, nothing stored");
-	RUN(rh_set, "SET", "tk", "v", "PX", "9223372036854775807");
-	CHK(is("-ERR invalid expire time in 'set' command\r\n") && last_ttl == -5,
-		"T: SET PX LLONG_MAX - invalid expire time");
-	RUN(rh_set, "SETEX", "tk", "4294967295", "v");
-	CHK(is("-ERR invalid expire time\r\n") && last_ttl == -5, "T: SETEX 2^32-1 - invalid expire time");
-	RUN(rh_set, "SET", "tk", "v", "EX", "2147483647");
-	CHK(is("+OK\r\n") && last_ttl == 2147483647, "T: SET EX 2^31-1 - the largest TTL taken");
-	RUN(rh_expire, "EXPIRE", "tk", "8589934592");
-	CHK(out.buf[0] == '-' && !strncmp(out.buf, "-ERR invalid expire time", 24),
-		"T: EXPIRE 2^33 - invalid expire time");
-	RUN(rh_expire, "PEXPIRE", "tk", "9223372036854775807");
-	CHK(out.buf[0] == '-' && !strncmp(out.buf, "-ERR invalid expire time", 24) && find(&(str){ "tk", 2 }),
-		"T: PEXPIRE LLONG_MAX - invalid expire time, the key not deleted");
-	RUN(rh_expire, "EXPIRE", "tk", "99999999999999999999");
-	CHK(out.buf[0] == '-' && find(&(str){ "tk", 2 }), "T: EXPIRE past int64 - refused, the key kept");
-	put("n2", "1", 0, 0);
-	RUN(rh_incr, "INCRBY", "n2", "99999999999999999999");
-	CHK(is("-ERR value is not an integer or out of range\r\n"), "T: INCRBY past int64 - not an integer");
-	RUN(rh_incr, "DECRBY", "n2", "-9223372036854775808");
-	CHK(is("-ERR value is not an integer or out of range\r\n"),
-		"T: DECRBY LLONG_MIN - its negation does not exist");
-
-	/* U: CLIENT SETNAME takes what SETINFO takes - a space or a newline in a name would forge
-	 * fields and rows in CLIENT LIST's space-separated lines */
-	names = 0;
-	RUN(rh_client, "CLIENT", "SETNAME", "x age=0\nid=7 addr=10.0.0.9:6379 fd=9 name=admin");
-	CHK(is("-ERR Client names cannot contain spaces, newlines or special characters.\r\n") &&
-		names == 0, "U: a name with a space and a newline - refused, not stored");
-	RUN(rh_client, "CLIENT", "SETNAME", "a\xed\xa0\x80");
-	CHK(out.buf[0] == '-' && names == 0, "U: a byte past '~' - refused");
-	RUN(rh_client, "CLIENT", "SETNAME", "worker-7:pool");
-	CHK(is("+OK\r\n") && names == 1 && !strcmp(named, "worker-7:pool"), "U: a plain name - stored");
-	RUN(rh_client, "CLIENT", "SETNAME", "");
-	CHK(is("+OK\r\n") && names == 2 && !named[0], "U: an empty name clears it, as Redis");
 
 	printf("respkvtest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

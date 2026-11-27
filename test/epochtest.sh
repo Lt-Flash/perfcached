@@ -46,9 +46,9 @@ cp src/cluster.h "$D/t/src/cluster.h"
 sed -i '/pc_w8(&c, (unsigned)in->epoch);/d; /pc_w8(&c, (unsigned)in->committed);/d; /pc_w8(&c, (unsigned)in->features);/d;
 	/pc_w16(&c, (uint16_t)in->sole_witness);/d;
 	s/if (in->ncfg > 0 || in->ext) {/if (0) {/; s/if (in->ext) {/if (0) {/;
-	s/if (len < 88 + 15)/if (len < 88 + 11)/; s/if (in->cfg2)$/if (0)/' \
+	s/if (len < 88 + 15)/if (len < 88 + 11)/' \
 	"$D/t/src/clmemb.c"
-grep -qE 'in->(epoch|committed|features|sole_witness)\);|if \(in->(ncfg > 0|ext|cfg2)' "$D/t/src/clmemb.c" &&
+grep -qE 'in->(epoch|committed|features|sole_witness)\);|if \(in->(ncfg > 0|ext)' "$D/t/src/clmemb.c" &&
 	{ echo "the clmemb.c sed missed - a writer still sends the field"; exit 1; }
 [ "$(grep -c 'if (0) {' "$D/t/src/clmemb.c")" -ge 2 ] && grep -q 'buf\[off\]' "$D/t/src/clmemb.c" &&
 	grep -q 'len < 88 + 11' "$D/t/src/clmemb.c" ||
@@ -91,7 +91,6 @@ EOF
 	chmod 600 "$D/n$1.conf"
 }
 start() { # start <n> <binary>; the pid goes in PIDS and in $D/n<n>.pid
-	: > "$D/n$1.log"
 	"$2" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	echo $! > "$D/n$1.pid"; PIDS="$PIDS $!"
 	i=0

@@ -44,7 +44,6 @@ buckets_log2 = 12
 EOF
 }
 start() { # start <id>
-	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	eval "P$1=\$!"
 	i=0

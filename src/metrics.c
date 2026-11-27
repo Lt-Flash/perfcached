@@ -4,7 +4,6 @@
  * locks like the stats verb: a scrape is a trend, and must never stall the data plane. */
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -28,7 +27,6 @@
 #include "core/pcache_arena.h"
 #include "core/pcache_htable.h"
 #include "mgetfan.h"
-#include "promlabel.h"
 
 static time_t started;
 
@@ -42,29 +40,11 @@ long pc_metrics_uptime(void)
 	return started ? (long)(time(NULL) - started) : 0;
 }
 
-/* a tiny append helper: the buffer grows to what is written; @oom latches a failed growth */
+/* a tiny append helper: every writer below is bounded by @cap */
 struct out {
 	char *b;
 	size_t cap, len;
-	int oom;
 };
-
-static int out_room(struct out *o, size_t need)
-{
-	size_t nc = o->cap;
-	char *nb;
-
-	while (nc - o->len <= need)
-		nc *= 2;
-	nb = realloc(o->b, nc);
-	if (!nb) {
-		o->oom = 1;
-		return -1;
-	}
-	o->b = nb;
-	o->cap = nc;
-	return 0;
-}
 
 static void emit(struct out *o, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
@@ -74,7 +54,7 @@ static void emit(struct out *o, const char *fmt, ...)
 	va_list ap;
 	int n;
 
-	if (o->oom)
+	if (o->len >= o->cap)
 		return;
 	va_start(ap, fmt);
 	/* the analyzer does not model va_start as initialising `ap`: a false positive */
@@ -83,47 +63,36 @@ static void emit(struct out *o, const char *fmt, ...)
 	va_end(ap);
 	if (n < 0)
 		return;
-	if ((size_t)n >= o->cap - o->len) {    /* did not fit: grow, write it again */
-		if (out_room(o, (size_t)n) != 0)
-			return;
-		va_start(ap, fmt);
-		/* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
-		n = vsnprintf(o->b + o->len, o->cap - o->len, fmt, ap);
-		va_end(ap);
-		if (n < 0 || (size_t)n >= o->cap - o->len)
-			return;
-	}
-	o->len += (size_t)n;
+	if ((size_t)n >= o->cap - o->len)
+		o->len = o->cap;               /* truncated; stop writing */
+	else
+		o->len += (size_t)n;
 }
 
-/* test hook: PERFCACHED_TEST_METRICS_BUF=<bytes> - the exposition starts in a buffer that small */
-static size_t test_buf(size_t dflt)
+/* a label value must not carry a quote or a backslash into the
+ * exposition - a collection name is the user's, not ours */
+static void label_escape(const char *in, char *out, size_t cap)
 {
-	static long v_ = -1;
-	long v = __atomic_load_n(&v_, __ATOMIC_RELAXED);
+	size_t i = 0;
 
-	if (v < 0) {
-		const char *e = getenv("PERFCACHED_TEST_METRICS_BUF");
-
-		v = e && atol(e) > 0 ? atol(e) : 0;
-		__atomic_store_n(&v_, v, __ATOMIC_RELAXED);
+	while (*in && i + 2 < cap) {
+		if (*in == '"' || *in == '\\')
+			out[i++] = '\\';
+		out[i++] = *in++;
 	}
-	return v >= 64 && (size_t)v < dflt ? (size_t)v : dflt;
+	out[i] = 0;
 }
 
-#define PC_METRICS_START ((size_t)256 * 1024)
-
-char *pc_metrics_render(size_t *len)
+size_t pc_metrics_render(char *buf, size_t cap)
 {
-	struct out o = { NULL, test_buf(PC_METRICS_START), 0, 0 };
+	struct out o = { buf, cap, 0 };
 	struct pcache_arena_pressure pr;
 	struct pc_wal_stats ws;
 	unsigned long held, mx;
 	int i, n;
 
-	o.b = malloc(o.cap);
-	if (!o.b)
-		return NULL;
+	if (cap < 64)
+		return 0;
 
 	emit(&o, "# HELP perfcached_build_info the running build\n"
 		"# TYPE perfcached_build_info gauge\n"
@@ -343,14 +312,14 @@ char *pc_metrics_render(size_t *len)
 		emit(&o, "# HELP perfcached_command_calls_total commands executed, by name: RESP under its Redis name, the native door as cmd:<method> and bin:<verb>\n"
 			"# TYPE perfcached_command_calls_total counter\n");
 		for (ci = 0; ci < nc; ci++) {
-			pc_prom_label(cs[ci].name, esc, sizeof esc);
+			label_escape(cs[ci].name, esc, sizeof esc);
 			emit(&o, "perfcached_command_calls_total{cmd=\"%s\"} %llu\n",
 				esc, cs[ci].calls);
 		}
 		emit(&o, "# HELP perfcached_command_usec_total microseconds the workers spent executing them\n"
 			"# TYPE perfcached_command_usec_total counter\n");
 		for (ci = 0; ci < nc; ci++) {
-			pc_prom_label(cs[ci].name, esc, sizeof esc);
+			label_escape(cs[ci].name, esc, sizeof esc);
 			emit(&o, "perfcached_command_usec_total{cmd=\"%s\"} %llu\n",
 				esc, cs[ci].usec);
 		}
@@ -361,7 +330,7 @@ char *pc_metrics_render(size_t *len)
 		for (ci = 0; ci < nc; ci++) {
 			unsigned long long cum = 0;
 
-			pc_prom_label(cs[ci].name, esc, sizeof esc);
+			label_escape(cs[ci].name, esc, sizeof esc);
 			for (k = 0; k < PC_OBS_HIST - 1; k++) {
 				cum += cs[ci].hist[k];
 				if (k != 3 && k % PC_OBS_SUB != PC_OBS_SUB - 1)
@@ -513,7 +482,7 @@ char *pc_metrics_render(size_t *len)
 		char esc[128];
 
 		pcache_ht_totals_raw(pc_store_ht(i), &t);
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_entries{collection=\"%s\"} %lu\n",
 			esc, t.entries);
 	}
@@ -526,7 +495,7 @@ char *pc_metrics_render(size_t *len)
 
 		if (!pc_store_live(i))
 			continue;
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_overflow{collection=\"%s\"} %u\n",
 			esc, pcache_ht_overflow(pc_store_ht(i)));
 	}
@@ -539,7 +508,7 @@ char *pc_metrics_render(size_t *len)
 
 		if (!pc_store_live(i))
 			continue;
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_autoscale_mode{collection=\"%s\",mode=\"%s\"} 1\n",
 			esc, pc_autoscale_name(pc_store_autoscale(i)));
 	}
@@ -551,7 +520,7 @@ char *pc_metrics_render(size_t *len)
 
 		if (!pc_store_live(i))
 			continue;
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		tl = pc_store_autoscale_target(i);
 		emit(&o, "perfcached_collection_autoscale_target_buckets{collection=\"%s\"} %llu\n",
 			esc, tl ? 1ULL << tl : 0ULL);
@@ -563,7 +532,7 @@ char *pc_metrics_render(size_t *len)
 
 		if (!pc_store_live(i))
 			continue;
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_held_walk_seconds{collection=\"%s\"} %.6f\n",
 			esc, pc_store_held_walk_us(i) / 1000000.0);
 	}
@@ -575,7 +544,7 @@ char *pc_metrics_render(size_t *len)
 			continue;   /* a dropped collection */
 		char esc[128];
 
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_index_bytes{collection=\"%s\"} %lu\n",
 			esc, pc_store_index_bytes(i));
 	}
@@ -586,7 +555,7 @@ char *pc_metrics_render(size_t *len)
 			continue;   /* a dropped collection */
 		char esc[128];
 
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_record_bytes{collection=\"%s\"} %llu\n",
 			esc, pc_store_held_cells(i));
 	}
@@ -601,7 +570,7 @@ char *pc_metrics_render(size_t *len)
 
 		if (age == (unsigned int)-1)
 			continue;                  /* not walked yet: no sample */
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_held_bytes{collection=\"%s\"} %llu\n",
 			esc, hb);
 	}
@@ -614,7 +583,7 @@ char *pc_metrics_render(size_t *len)
 		char esc[128];
 
 		pcache_ht_totals_raw(pc_store_ht(i), &t);
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_hits_total{collection=\"%s\"} %lu\n",
 			esc, t.hits);
 	}
@@ -627,7 +596,7 @@ char *pc_metrics_render(size_t *len)
 		char esc[128];
 
 		pcache_ht_totals_raw(pc_store_ht(i), &t);
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_misses_total{collection=\"%s\"} %lu\n",
 			esc, t.misses);
 	}
@@ -642,7 +611,7 @@ char *pc_metrics_render(size_t *len)
 		char esc[128];
 
 		pcache_ht_totals_client_raw(pc_store_ht(i), &t);
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_client_hits_total{collection=\"%s\"} %lu\n",
 			esc, t.hits);
 	}
@@ -655,7 +624,7 @@ char *pc_metrics_render(size_t *len)
 		char esc[128];
 
 		pcache_ht_totals_client_raw(pc_store_ht(i), &t);
-		pc_prom_label(pc_store_name(i), esc, sizeof esc);
+		label_escape(pc_store_name(i), esc, sizeof esc);
 		emit(&o, "perfcached_collection_client_misses_total{collection=\"%s\"} %lu\n",
 			esc, t.misses);
 	}
@@ -1025,7 +994,7 @@ char *pc_metrics_render(size_t *len)
 		char dev[160];
 
 		if (pc_alerts_link(&hl)) {
-			pc_prom_label(hl.phys, dev, sizeof dev);
+			label_escape(hl.phys, dev, sizeof dev);
 			emit(&o, "# HELP perfcached_link_bytes_per_second the link's bytes a second over the last minute\n"
 				"# TYPE perfcached_link_bytes_per_second gauge\n"
 				"perfcached_link_bytes_per_second{device=\"%s\",direction=\"rx\"} %lld\n"
@@ -1169,11 +1138,8 @@ char *pc_metrics_render(size_t *len)
 				plane[u], io.tx_dgrams[u], plane[u], io.rx_dgrams[u]);
 	}
 
-	if (o.oom) {
-		free(o.b);
-		return NULL;
-	}
-	o.b[o.len] = 0;                        /* emit leaves room for it */
-	*len = o.len;
-	return o.b;
+	if (o.len >= o.cap)
+		o.len = o.cap - 1;
+	buf[o.len] = 0;
+	return o.len;
 }

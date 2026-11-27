@@ -45,7 +45,7 @@ struct clwire_id { uint64_t incarn, seq; uint32_t ip; uint16_t port, stream; };
 struct clwire {
 	unsigned char alive[1408];             /* CLMEMB_ALIVE_MAX 1399 */
 	size_t alive_len;
-	unsigned char malive[56];              /* CLMEMB_MALIVE_BUF 49 */
+	unsigned char malive[48];              /* CLMEMB_MALIVE_LEN 41 */
 	size_t malive_len;
 	unsigned seq;                  /* seqlock over the two frames */
 	long long sent_ms;             /* last emission, either layer */

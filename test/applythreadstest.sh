@@ -45,7 +45,6 @@ EOF
 	chmod 600 "$D/n$1$2.conf"
 }
 start() { # <arm> <node>
-	: > "$D/n$1$2.log"
 	"$BIN" -f "$D/n$1$2.conf" > "$D/n$1$2.log" 2>&1 &
 	PIDS="$PIDS $!"
 	i=0
@@ -256,49 +255,12 @@ else
 fi
 stop_arm
 
-# ---- a retire with apply threads idle -------------------------------------
-echo "--- apply_threads = 4: a dropped collection's table is retired"
-conf 4 1 4; conf 4 2 4
-for n in 1 2; do
-	sed -i -e 's/^\[daemon\]$/[daemon]\nallow_create = yes/' -e 's/^\[secrets\]$/[secrets]\nenable = at-enable/' "$D/n4$n.conf"
-done
-if start 4 1 && start 4 2; then
-	python3 - > "$D/4.out" 2>&1 <<'PY'
-import pcnative, socket, sys, time
-f = pcnative.wrap(socket.create_connection(("127.0.71.41", 18471), timeout=20))
-def call(m, **p): return pcnative.call(f, m, **p)
-def st(): return call("stats").get("result") or {}
-def out(k, v): print("%s=%s" % (k, v)); sys.stdout.flush()
-t = time.time()
-while time.time() - t < 20 and st().get("state") != "ready": time.sleep(0.2)
-call("enable", secret="at-enable")
-r1 = call("create", col="r", buckets_log2=12)
-c0 = (st().get("retire") or {}).get("cleared", 0)
-r2 = call("drop", col="r", force=True)
-t = time.time(); rt = {}
-while time.time() - t < 10:
-    rt = st().get("retire") or {}
-    if rt.get("cleared", 0) > c0 and rt.get("pending", 1) == 0: break
-    time.sleep(0.2)
-out("DDL", "ok" if "error" not in r1 and "error" not in r2 else "%r %r" % (r1, r2))
-out("RETIRE", "%s->%s/%s/%s" % (c0, rt.get("cleared"), rt.get("pending"), rt.get("inside")))
-out("CLEARED", "yes" if rt.get("cleared", 0) > c0 and rt.get("pending", 1) == 0 else "no")
-PY
-	[ "$(val 4 DDL)" = ok ] && [ "$(val 4 CLEARED)" = yes ] \
-		&& ok "with 4 apply threads idle a dropped collection's table is retired (cleared/pending/inside $(val 4 RETIRE))" \
-		|| bad "a drop under apply_threads = 4: ddl $(val 4 DDL), retire cleared/pending/inside $(val 4 RETIRE) - an apply thread that never parks holds every retire"
-else
-	bad "the retire arm did not start: $(grep -m1 ERROR "$D/n41.log" "$D/n42.log" | cut -c1-160)"
-fi
-stop_arm
-
 # ---- one apply thread wedged ----------------------------------------------
 echo "--- one of 4 apply threads frozen, apply_stall_ms = 2000"
 if [ -x "$TF" ]; then
 	conf 3 1 4 "apply_stall_ms = 2000"; conf 3 2 4 "apply_stall_ms = 2000"
 	: > "$D/ctl3"
 	start 3 1
-	: > "$D/n32.log"
 	"$TF" "$D/ctl3" -- "$BIN" -f "$D/n32.conf" > "$D/n32.log" 2>&1 &
 	PIDS="$PIDS $!"
 	i=0; while [ $i -lt 200 ]; do grep -q "perfcached ready" "$D/n32.log" 2>/dev/null && break; sleep 0.1; i=$((i + 1)); done

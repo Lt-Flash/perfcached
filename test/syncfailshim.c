@@ -1,12 +1,11 @@
 /* syncfailshim.c - LD_PRELOAD shim: the classes the file PC_SYNCFAIL_CTL names, read at each sync,
- * make those syncs, WAL appends or term stores fail, stall or wait; each goes to PC_SYNCFAIL_LOG. */
+ * make those syncs, WAL appends or term stores fail or stall; each refusal goes to PC_SYNCFAIL_LOG. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -91,8 +90,6 @@ static int refuse(int fd)
 		cls = "ctrl";
 	else if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
 		cls = "dir";
-	else if (strlen(base) > 5 && !strcmp(base + strlen(base) - 5, ".part"))
-		cls = "part";                  /* an upgrade upload's staging file */
 	if (!cls || !has(want, cls))
 		return 0;
 	note(cls, path);
@@ -119,105 +116,19 @@ static void slow_dir(int fd)
 	usleep((useconds_t)(d > 0 ? d : 5000) * 1000);
 }
 
-/* "stateslow": the sync of a state file named PC_SYNCFAIL_STATE_NAME* (collections.tmp by default;
- * several prefixes comma-separated) is delayed, and the note names the thread that waited */
-static void slow_state(int fd)
-{
-	char want[32], lnk[64], path[512], tn[17] = "", what[560];
-	const char *base, *ms = getenv("PC_SYNCFAIL_STATE_MS"), *nm = getenv("PC_SYNCFAIL_STATE_NAME");
-	ssize_t n;
-	int d = ms ? atoi(ms) : 2000;
-
-	armed(want, sizeof want);
-	if (!has(want, "stateslow"))
-		return;
-	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
-	n = readlink(lnk, path, sizeof path - 1);
-	if (n <= 0)
-		return;
-	path[n] = 0;
-	base = strrchr(path, '/');
-	base = base ? base + 1 : path;
-	if (!nm || !*nm)
-		nm = "collections.tmp";
-	for (;;) {
-		size_t l = strcspn(nm, ",");
-
-		if (l && !strncmp(base, nm, l))
-			break;
-		if (!nm[l])
-			return;
-		nm += l + 1;
-	}
-	prctl(PR_GET_NAME, (unsigned long)tn, 0, 0, 0);
-	snprintf(what, sizeof what, "%s %s", tn, path);
-	note("stateslow", what);
-	usleep((useconds_t)(d > 0 ? d : 2000) * 1000);
-}
-
-/* "walhold": a WAL segment's sync waits while the class stays armed (60 s at most) */
-static void hold_wal(int fd)
-{
-	char want[32], lnk[64], path[512];
-	const char *base;
-	ssize_t n;
-	int i, said = 0;
-
-	armed(want, sizeof want);
-	if (!has(want, "walhold"))
-		return;
-	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
-	n = readlink(lnk, path, sizeof path - 1);
-	if (n <= 0)
-		return;
-	path[n] = 0;
-	base = strrchr(path, '/');
-	base = base ? base + 1 : path;
-	if (strncmp(base, "wal-", 4) != 0 || !strstr(base, ".seg"))
-		return;
-	for (i = 0; i < 6000 && has(want, "walhold"); i++) {
-		if (!said++)
-			note("walhold", path);
-		usleep(10000);
-		armed(want, sizeof want);
-	}
-}
-
-/* "dirlog": every directory sync is noted, not changed */
-static void log_dir(int fd)
-{
-	char want[32], lnk[64], path[512];
-	struct stat st;
-	ssize_t n;
-
-	armed(want, sizeof want);
-	if (!has(want, "dirlog") || fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode))
-		return;
-	snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
-	n = readlink(lnk, path, sizeof path - 1);
-	path[n > 0 ? n : 0] = 0;
-	note("dirlog", path);
-}
-
 int fdatasync(int fd)
 {
-	log_dir(fd);
-	hold_wal(fd);
 	if (refuse(fd))
 		return -1;
 	slow_dir(fd);
-	slow_state(fd);
 	return (int)syscall(SYS_fdatasync, fd);
 }
 
 int fsync(int fd)
 {
-	log_dir(fd);
-	hold_wal(fd);
 	if (refuse(fd))
 		return -1;
 	slow_dir(fd);
-	slow_state(fd);
 	return (int)syscall(SYS_fsync, fd);
 }
 

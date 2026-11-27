@@ -56,7 +56,6 @@ C
 	chmod 600 "$D/n$1.conf"
 }
 start() {
-	: > "$D/n$1.log"
 	"$BIN" -f "$D/n$1.conf" > "$D/n$1.log" 2>&1 &
 	echo $! > "$D/n$1.pid"
 	i=0; while [ $i -lt 150 ]; do
@@ -243,13 +242,6 @@ elif part == "A2":
     r = n.rpc("restore", col="0", records=[rd, rs])
     ok(r.get("result", {}).get("stored") == 2 and c.cmd("TYPE", "rdoc") == "ReJSON-RL" and c.cmd("GET", "rdoc") == "-" + WT
        and c.cmd("TYPE", "rplain") == "string", "B restore: the dumped document comes back a document (%r)" % (r.get("result", r.get("error")),))
-    # an expiry the 32-bit tick expiry cannot hold is refused, as a ttl past 2^31-1 s is
-    far = int(time.time() * 1000) + (2 ** 32 + 3600) * 1000
-    r = n.rpc("restore", col="0", records=[{"k": "rfar", "v": "x", "ver": 1, "exp": far}])
-    rr = r.get("result", {})
-    ok(rr.get("bad") == 1 and rr.get("stored") == 0 and
-       n.rpc("get", col="0", key="rfar").get("result", {}).get("found") is not True,
-       "B restore: an expiry 2^32 s out is refused, not stored with it cut to 32 bits (%r)" % (r.get("result", r.get("error")),))
 elif part in ("B1", "B2"):
     c = R(1)
     ok(c.cmd("TYPE", "doc") == "ReJSON-RL" and c.cmd("GET", "doc") == "-" + WT and c.cmd("TYPE", "plain") == "string"

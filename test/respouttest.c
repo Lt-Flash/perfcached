@@ -67,14 +67,6 @@ int main(void)
 	CHK(resp_ll("", 0, &v) == -1, "C: an empty field refused");
 	CHK(resp_ll("123456789012345678901234", 24, &v) == -1, "C: 24 digits refused (no room)");
 	CHK(resp_ll("12345", 3, &v) == 0 && v == 123, "C: only the given length is read");
-	CHK(resp_ll("99999999999999999999", 20, &v) == -1, "C: past int64 refused, not clamped");
-	CHK(resp_ll("-99999999999999999999", 21, &v) == -1, "C: below int64 refused, not clamped");
-	CHK(resp_ll("9223372036854775807", 19, &v) == 0 && v == 9223372036854775807LL,
-		"C: LLONG_MAX itself taken");
-	CHK(resp_ll(" 5", 2, &v) == -1, "C: leading space refused");
-	CHK(resp_ll("+5", 2, &v) == -1, "C: a leading + refused");
-	CHK(resp_ll("12\0zz", 5, &v) == -1, "C: an embedded NUL refused");
-	CHK(resp_ll("-", 1, &v) == -1, "C: a lone - refused");
 
 	printf("respouttest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

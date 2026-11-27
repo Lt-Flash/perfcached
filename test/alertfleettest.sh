@@ -1,7 +1,6 @@
 #!/bin/sh
 # alertfleettest.sh - a node without [mail] relays alerts to the elected mailer; a fleet event is mailed once
-# by it (test/fakesmtp.py); the SMTP password shows nowhere; a relayed clear is mailed whatever its level.
-# Usage: test/alertfleettest.sh [./perfcached]
+# by it (test/fakesmtp.py); the SMTP password shows nowhere.  Usage: test/alertfleettest.sh [./perfcached]
 set -u
 BIN=${1:-./perfcached}
 case "$BIN" in /*) ;; *) BIN=$(pwd)/$BIN;; esac
@@ -95,8 +94,8 @@ min_interval_s = 900
 EOF
 	chmod 600 "$D/n$1.conf"
 }
-start() { # start <n> <binary> - node n's test alert reads $D/cond<n> (PERFCACHED_ALERT_TEST_COND)
-	PERFCACHED_ALERT_TEST_COND="$D/cond$1" "$2" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & eval "P$1=\$!"
+start() { # start <n> <binary>
+	"$2" -f "$D/n$1.conf" >> "$D/n$1.log" 2>&1 & eval "P$1=\$!"
 	i=0; while [ $i -lt 150 ]; do grep -q "perfcached ready" "$D/n$1.log" && return 0; sleep 0.1; i=$((i+1)); done
 	return 1
 }
@@ -223,22 +222,4 @@ if [ -s "$D/stats1.json" ] && [ -s "$D/stats3.json" ] && [ -s "$D/page1.html" ];
 else
 	bad "d. nothing to search (stats/page not captured)"
 fi
-
-# ---- e. a relayed clear is mailed whatever level it ends at -------------------------------------
-# node 1 back with [mail] level = critical: node 3's test alert goes critical (mailed through node 1),
-# down to warning (below that level), then clears - the resolve must follow the CRITICAL mail
-sed -i 's/^min_interval_s = 900$/min_interval_s = 900\nlevel = critical/' "$D/n1.conf"
-start 1 "$MBIN"
-waitfor 30 '[ "$(st 1 mailer)" = "this node/$(st 1 node)" ] && [ "$(st 3 mailer)" = "node $(st 1 node)/$(st 1 node)" ]' ||
-	{ bad "e. node 1 is not node 3's mailer again: $(st 1 mailer) / $(st 3 mailer)"; summary; }
-echo "critical relay-clear-probe" > "$D/cond3"
-waitfor 20 '[ "$(mails "(?s)CRITICAL.*relay-clear-probe")" -ge 1 ]' &&
-	ok "e. node 3's critical test alert is mailed through node 1" ||
-	bad "e. no CRITICAL mail for node 3's test alert: $(st 1 from $N3)"
-echo "warning relay-clear-probe" > "$D/cond3"
-sleep 3
-echo "clear" > "$D/cond3"
-waitfor 20 '[ "$(mails "(?s)RESOLVED.*relay-clear-probe")" -ge 1 ]' &&
-	ok "e. its clear, relayed at warning, is mailed as resolved by node 1 ($(st 1 from $N3))" ||
-	bad "e. the clear never mailed: node 1's ring from node 3 '$(st 1 from $N3)'"
 summary
