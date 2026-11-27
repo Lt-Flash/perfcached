@@ -125,22 +125,17 @@ static int resp_cl_runs(const uint16_t *ownv, int who)
 static pthread_mutex_t clmap_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { unsigned long long key; char *buf; size_t len; } clmap_cache[2];
 
-/* FNV-1a over everything the reply depends on - the placement map's stamp, members, ids, doors,
- * state, in snapshot order (self first, so it differs per node) */
+/* FNV-1a over everything the reply depends on - the placement map's content, members, ids,
+ * doors, state, in snapshot order (self first, so it differs per node) */
 static unsigned long long resp_clmap_key(const struct pc_member *mem,
 		int nm, int shards)
 {
 	unsigned long long h = FNV1A64_BASIS;
 	int i;
 #define CLMAP_MIX(_x) do { h = fnv1a64_u64(h, (uint64_t)(_x)); } while (0)
-	unsigned int term = 0, seq = 0;
-	int valid = pc_cluster_map_stamp(&term, &seq);
-
 	CLMAP_MIX(nm);
 	CLMAP_MIX(shards);
-	CLMAP_MIX(valid);
-	CLMAP_MIX(term);
-	CLMAP_MIX(seq);
+	CLMAP_MIX(pc_cluster_map_place());
 	CLMAP_MIX(pc_cluster_map_usable());
 	for (i = 0; i < nm; i++) {
 		uint64_t id0, id1;

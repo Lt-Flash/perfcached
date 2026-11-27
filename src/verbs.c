@@ -1179,8 +1179,8 @@ static long long rel_ttl(unsigned int expires, unsigned int now)
 struct dump_keys {
 	char *buf;
 	size_t len, cap;
-	/* keys from the live table end here, the old table's follow */
-	size_t nlive;
+	/* the old table's keys, first in buf, end here */
+	size_t nold;
 	unsigned int slo, shi, now;
 	int full;
 };
@@ -4799,22 +4799,12 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			if (bounded && !(cursor & PCACHE_CURSOR_OVF) &&
 			        take > (unsigned int)endb - cursor)
 				take = (unsigned int)endb - cursor;
-			rc = pcache_ht_scan_ex(ht, &cursor, take, PCACHE_SCAN_NOVAL,
-				dump_key_cb, &dk);
-			if (rc < 0 || dk.full) {
-				free(dk.buf);
-				ERR("count too large for this table: halve it");
-			}
-			if (bounded && (cursor == 0 ||
-			        (!(cursor & PCACHE_CURSOR_OVF) &&
-			         cursor >= (unsigned int)endb)))
-				cursor = 0;            /* a bounded range: done at its end */
-			dk.nlive = dk.len;
-			/* the walker at bucket 0 also takes what a draining resize's old table still
-			 * holds, whole, in its first chunk; a record in both comes twice */
+			/* the walker at bucket 0 first takes what only a draining resize's old table
+			 * holds; a key the live table has by then is left to the live walk */
 			old = cur == 0 ? pc_store_draining(ht) : NULL;
 			if (old) {
 				unsigned int oc = 0;
+				size_t ro, wo = 0;
 
 				do {
 					rc = pcache_ht_scan_ex(old, &oc, 4096,
@@ -4825,7 +4815,35 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 					ERR("a draining resize holds too much for one "
 						"chunk: retry the collection in a moment");
 				}
+				for (ro = 0; ro < dk.len; ) {
+					unsigned long long hv;
+					uint32_t kl;
+					str rk;
+
+					memcpy(&kl, dk.buf + ro, 4);
+					rk.s = dk.buf + ro + 4;
+					rk.len = (int)kl;
+					if (pcache_ht_getver_here(ht, &rk, &hv) != 0) {
+						memmove(dk.buf + wo, dk.buf + ro, 4 + kl);
+						wo += 4 + kl;
+					}
+					ro += 4 + kl;
+				}
+				dk.len = dk.nold = wo;
 			}
+			rc = pcache_ht_scan_ex(ht, &cursor, take, PCACHE_SCAN_NOVAL,
+				dump_key_cb, &dk);
+			if (rc < 0 || dk.full) {
+				free(dk.buf);
+				if (old)
+					ERR("a draining resize holds too much for one "
+						"chunk: retry the collection in a moment");
+				ERR("count too large for this table: halve it");
+			}
+			if (bounded && (cursor == 0 ||
+			        (!(cursor & PCACHE_CURSOR_OVF) &&
+			         cursor >= (unsigned int)endb)))
+				cursor = 0;            /* a bounded range: done at its end */
 		}
 		/* the reply may grow: a chunk is bounded by buckets, not bytes,
 		 * and the dispatcher frees a heap buffer a verb swapped in */
@@ -4847,8 +4865,11 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			rk.s = dk.buf + off + 4;
 			rk.len = (int)kl;
 			off += 4 + kl;
-			frc = pcache_ht_fetch_full(off - 4 - kl < dk.nlive ? ht : old,
-				&rk, &rv, &rexp, &fl, &ver);
+			/* through the live table: it reads the drained one's copy too, the newer */
+			frc = pcache_ht_fetch_full(ht, &rk, &rv, &rexp, &fl, &ver);
+			/* the closing drain unhooks the old table before it moves its records */
+			if (frc == -2 && off - 4 - kl < dk.nold)
+				frc = pcache_ht_fetch_full(old, &rk, &rv, &rexp, &fl, &ver);
 			if (frc == -2)
 				continue;              /* gone since the scan */
 			if (frc != 0) {

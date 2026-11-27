@@ -194,6 +194,11 @@ int pc_cluster_map_usable(void)
 	return 0;
 }
 
+uint64_t pc_cluster_map_place(void)
+{
+	return 0;
+}
+
 const char *pc_cluster_gone_reason(int why)
 {
 	(void)why;

@@ -13,32 +13,23 @@ static int fails;
 #define CHK(c, ...) do { if (c) printf("  ok   " __VA_ARGS__); \
 	else { printf("  FAIL " __VA_ARGS__); fails++; } printf("\n"); } while (0)
 
-/* every close the code under test makes, by number; the armed one closes but reports EIO */
-static int closed[64], nclosed, fail_next;
+/* every close the code under test makes; the armed one closes but reports EIO.  A number is
+ * reused by the next open, so a second close shows as a close of a number not open (EBADF) */
+static int nclosed, nbad, fail_next;
 
 int close(int fd)
 {
 	int rc = (int)syscall(SYS_close, fd);
 
-	if (nclosed < 64)
-		closed[nclosed++] = fd;
+	nclosed++;
+	if (rc != 0 && errno == EBADF)
+		nbad++;
 	if (fail_next) {
 		fail_next = 0;
 		errno = EIO;
 		return -1;
 	}
 	return rc;
-}
-
-static int closed_twice(void)
-{
-	int i, j;
-
-	for (i = 0; i < nclosed; i++)
-		for (j = i + 1; j < nclosed; j++)
-			if (closed[i] == closed[j])
-				return 1;
-	return 0;
 }
 
 int main(void)
@@ -55,11 +46,11 @@ int main(void)
 
 	/* ---- A: the temp file's close fails: the save fails, nothing is closed twice */
 	pc_ack_capture();
-	nclosed = 0;
+	nclosed = nbad = 0;
 	fail_next = 1;
 	rc = pc_ack_save(dir, 5);
 	CHK(rc == -1, "A: a failed close fails the save (rc %d)", rc);
-	CHK(nclosed >= 1 && !closed_twice(), "A: %d close(s), no number closed twice", nclosed);
+	CHK(nclosed >= 1 && !nbad, "A: %d close(s), none of a number not open", nclosed);
 	snprintf(path, sizeof path, "%s/" PC_ACK_FILE ".tmp.%d", dir, (int)getpid());
 	CHK(stat(path, &st) != 0, "A: the temp file is removed");
 	snprintf(path, sizeof path, "%s/" PC_ACK_FILE, dir);
@@ -67,11 +58,11 @@ int main(void)
 
 	/* ---- B: a clean save lands the file */
 	pc_ack_capture();
-	nclosed = 0;
+	nclosed = nbad = 0;
 	rc = pc_ack_save(dir, 6);
 	CHK(rc == 0, "B: a clean save succeeds (rc %d)", rc);
 	CHK(stat(path, &st) == 0 && st.st_size > 0, "B: the watermark file is there");
-	CHK(!closed_twice(), "B: no number closed twice");
+	CHK(nclosed >= 2 && !nbad, "B: %d close(s), none of a number not open", nclosed);
 
 	unlink(path);
 	rmdir(dir);

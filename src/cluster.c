@@ -293,6 +293,7 @@ static struct {
 	 * placement is on the request path */
 	int map_usable;
 	unsigned int map_gen;          /* odd while map is rewritten (map_set) */
+	uint64_t map_place;            /* digest of what placement reads from map */
 	/* the master's record of identities this cluster has seen: NEW vs RETURNING is
 	 * no judgement a node can make about itself (a wiped state dir believes it is new) */
 	struct pc_clhist hist;
@@ -5816,12 +5817,31 @@ static void term_seen(uint32_t t)
  * fleet.  No standby = publish at once; a hung stage is abandoned and its seq never reused. */
 /* the workers rank by C.map with no lock: the copy runs between two generation bumps, and a reader
  * that saw the generation odd or changed reads again (cl_map_gen) */
+/* FNV-1a over the fields pc_clplace_owner reads; the seq a re-publication bumps is left out */
+static uint64_t clmap_place_digest(const struct pc_clmap *m)
+{
+	uint64_t h = fnv1a64_u64(FNV1A64_BASIS, m->nnodes);
+	unsigned int i;
+
+	for (i = 0; i < m->nnodes; i++) {
+		const struct pc_clmap_node *n = &m->node[i];
+
+		h = fnv1a64_u64(h, n->node_id);
+		h = fnv1a64_u64(h, n->addr);
+		h = fnv1a64_u64(h, n->cluster_port);
+		h = fnv1a64_u64(h, (uint64_t)pc_clmap_placeable(n));
+		h = fnv1a64_u64(h, pc_clmap_weight(n));
+	}
+	return h;
+}
+
 static void map_set(const struct pc_clmap *m)
 {
 	__atomic_store_n(&C.map_gen, C.map_gen + 1, __ATOMIC_RELAXED);
 	__atomic_thread_fence(__ATOMIC_RELEASE);
 	C.map = *m;
 	__atomic_store_n(&C.map_gen, C.map_gen + 1, __ATOMIC_RELEASE);
+	__atomic_store_n(&C.map_place, clmap_place_digest(m), __ATOMIC_RELAXED);
 }
 
 /* a mastership claim that could not be stored: no map until claim_term lands it */
@@ -12043,6 +12063,10 @@ int cl_master_id(void)  { return C.master_id; }
 const char *cl_state_dir(void) { return C.state_dir; }
 int cl_map_usable(void) { return C.map_usable; }
 int pc_cluster_map_usable(void) { return cl_map_usable(); }
+uint64_t pc_cluster_map_place(void)
+{
+	return C.st.map_valid ? __atomic_load_n(&C.map_place, __ATOMIC_RELAXED) : 0;
+}
 const struct pc_clmap *cl_map(void) { return &C.map; }
 unsigned int cl_map_gen(void) { return __atomic_load_n(&C.map_gen, __ATOMIC_ACQUIRE); }
 pc_addr cl_self_addr(void) { return C.self_addr; }

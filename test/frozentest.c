@@ -118,8 +118,8 @@ int main(int argc, char **argv)
 		OK(rc != 0 && strstr(perfd_error(w), "NOT replayed"), "a set on the frozen node: no reply, "
 			"not replayed (rc %d: %s)", rc, rc ? perfd_error(w) : "applied elsewhere");
 		rc = perfd_get_buf(w, "c", "k", gb, sizeof gb, &gl, NULL);
-		OK(rc == 0 && gl == 1 && gb[0] == 'v', "and the next call is answered by a live member "
-			"(rc %d: %s)", rc, rc ? perfd_error(w) : "v");
+		OK(rc == 1 && gl == 1 && gb[0] == 'v', "and the next call is answered by a live member "
+			"(rc %d: %s)", rc, rc < 0 ? perfd_error(w) : rc ? "v" : "absent");
 		perfd_free(w);
 	} else {
 		OK(0, "a handle on node 3 before the freeze: %s", perfd_error(NULL));

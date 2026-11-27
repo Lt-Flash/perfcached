@@ -35,14 +35,12 @@ int pc_cluster_members(struct pc_member *out, int max)
 	return n;
 }
 
-static unsigned int map_term, map_seq;
+static uint64_t map_place;
 static int map_usable;
 
-int pc_cluster_map_stamp(unsigned int *term, unsigned int *seq)
+uint64_t pc_cluster_map_place(void)
 {
-	*term = map_term;
-	*seq = map_seq;
-	return map_term != 0;
+	return map_place;
 }
 
 int pc_cluster_map_usable(void)
@@ -185,10 +183,9 @@ int main(void)
 	fleet[0].ident[3] = 0xEE;
 	cluster("SLOTS", NULL);
 	CHK(pc_resp_slots_builds == 5, "C: a new identity - built afresh");
-	map_term = 1;
-	map_seq = 7;
+	map_place = 0x1234;
 	cluster("SLOTS", NULL);
-	CHK(pc_resp_slots_builds == 6, "C: the placement map's stamp moved - built afresh");
+	CHK(pc_resp_slots_builds == 6, "C: the placement map's content moved - built afresh");
 	map_usable = 1;
 	cluster("SLOTS", NULL);
 	CHK(pc_resp_slots_builds == 7, "C: placement switched to the map - built afresh");

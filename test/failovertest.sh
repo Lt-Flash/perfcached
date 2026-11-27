@@ -69,6 +69,18 @@ formed() { # formed <n>...: up to 30 s
 	return 1
 }
 formed 1 2 3
+# kill -9 returns before the kernel lets go of the dead daemon's listeners: restart only once its
+# pid is reaped and its address binds without SO_REUSEPORT (up to 10 s)
+freed() { # freed <pid> <host> <port>
+	[ -n "$1" ] && wait "$1" 2>/dev/null
+	i=0
+	while [ $i -lt 100 ]; do
+		python3 -c 'import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((sys.argv[1], int(sys.argv[2])))' "$2" "$3" 2>/dev/null && return 0
+		sleep 0.1; i=$((i+1))
+	done
+	echo "  $2:$3 still held 10 s after its node was killed"
+	return 1
+}
 
 # ---- the main leg: run the client, kill the node it names ----------
 "$FT" 127.0.9.1 17501 17502 17503 "$SECRET" > "$D/ft.out" 2>&1 &
@@ -253,6 +265,7 @@ RSPID=$!
 if cue "$D/rs.out" RESTART-ALL 20; then
 	for pv in S1 S2 S3; do eval "kill -9 \$$pv 2>/dev/null"; done
 	sleep 1
+	freed "$S1" 127.0.10.4 17504; freed "$S2" 127.0.10.5 17505; freed "$S3" 127.0.10.6 17506
 	start 4 S1; start 5 S2; start 6 S3
 	ok
 else
@@ -297,7 +310,9 @@ MBPID=$!
 if cue "$D/mb.out" "BOUNCE-PORT [0-9]*" 20; then
 	BP=$(sed -n 's/^BOUNCE-PORT //p' "$D/mb.out" | head -1)
 	PV=$(pidvar "$BP"); NN=$(nodeof "$BP")
-	eval "kill -9 \$$PV 2>/dev/null"
+	eval "KP=\$$PV"
+	kill -9 $KP 2>/dev/null
+	freed "$KP" 127.0.10.$NN "$BP"
 	start "$NN" "$PV"
 	ok
 else

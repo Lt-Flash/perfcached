@@ -573,6 +573,9 @@ void pc_cluster_autoscale_announce(const char *name, size_t nlen, int mode,
 int pc_cluster_map_stamp(unsigned int *term, unsigned int *seq);
 /* 1 while placement reads the map, 0 while it falls back to the peers' liveness */
 int pc_cluster_map_usable(void);
+/* a digest of what placement reads from the map (nodes, addresses, weights), 0 with no valid
+ * map; a re-publication that moves only the seq keeps it */
+uint64_t pc_cluster_map_place(void);
 /* announce a collection SET/DROP/RESIZE (@op, CLCOL_OP_*) to every live peer, re-sent in full to
  * a newly seen one; returns the generation sent (0 = not); a RESIZE is re-sent 1, 3 and 7 s on */
 unsigned long long pc_cluster_col_announce(const char *name, size_t nlen,

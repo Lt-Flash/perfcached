@@ -66,7 +66,7 @@ R=$(pc add c ctr 5)
 echo "$R" | grep -q '"value":5' && ok || bad "add: $R"
 R=$(pc add c ctr)
 echo "$R" | grep -q '"value":6' && ok || bad "add default: $R"
-R=$(pc -j '{"method":"sub","params":{"col":"c","key":"ctr","by":-9223372036854775808}}')
+R=$(pc -j '{"method":"sub","params":{"col":"c","key":"ctr","by":-9223372036854775808}}' 2>&1)
 echo "$R" | grep -q 'by out of range' && pc get c ctr | grep -Eq '"value":"?6"?[,}]' && ok \
 	|| bad "sub by LLONG_MIN not refused, or the counter moved: $R / $(pc get c ctr)"
 R=$(pc exists c k1)
@@ -114,8 +114,9 @@ sys.exit(0 if n["conns"] > 0 and b["conns"] > 0 and b["requests"] > 0 else 1)' 2
 # jsonrpc/id are ignored
 R=$(pc -j '{"jsonrpc":"2.0","id":9,"method":"exists","params":{"col":"c","key":"a"}}')
 echo "$R" | grep -q '"exists":true' && ok || bad "raw json: $R"
-# an empty key is refused at the CMD door, as at the binary door and RESP
-R=$(pc -j '{"method":"set","params":{"col":"c","key":"","value":"x"}}')
+# an empty key is refused at the CMD door, as at the binary door and RESP;
+# perfcli prints a refusal on stderr
+R=$(pc -j '{"method":"set","params":{"col":"c","key":"","value":"x"}}' 2>&1)
 echo "$R" | grep -q 'missing or bad key' && ok || bad "set of an empty key not refused: $R"
 R=$(pc -j '{"method":"mset","params":{"col":"c","items":[{"key":"","value":"x"},{"key":"e1","value":"y"}]}}')
 echo "$R" | grep -q '"stored":1' && echo "$R" | grep -q '"dropped":1' && ok \
