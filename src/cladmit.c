@@ -645,10 +645,8 @@ int cladmit_hold(const unsigned char *pt, size_t n, const pc_addr *from, uint64_
 	struct admitq *q;
 	long long now = cl_now_ms();
 
-	if (admitting)
+	if (admitting || n > sizeof aq[0].frame)
 		return 0;
-	if (n > sizeof aq[0].frame)
-		return 1;                      /* dropped, never past the queue: it asks again */
 	q = aq_find(from);
 	if (q && q->state == AQ_ADMITTED)
 		return 0;
@@ -817,9 +815,6 @@ static void publish_members(const unsigned char *pt, size_t n, int count, long l
 		memset(&pa, 0, sizeof pa);
 		pc_addr_from_v4(&pa, mr.addr.s_addr, ntohs(mr.port));
 		if (pc_addr_eq(&pa, &self))
-			continue;
-		/* a master hands out 1..PC_CL_NODE_MAX: another id is no member it made */
-		if (mr.node < 1 || mr.node > PC_CL_NODE_MAX)
 			continue;
 		if ((p = clpeers_by_addr(cl_peers(), &pa)) != NULL &&
 		        (clpeers_live(p, now) || (p->gone_ms && now - p->gone_ms < MEMBERS_REVIVE_MS)))

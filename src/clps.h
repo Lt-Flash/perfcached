@@ -59,9 +59,6 @@ void clps_forget(struct peer *p);
 /* the datagrams, from the cluster receive loop (and M_PUBLISH also from
  * the relay port's threads) */
 void clps_handle_publish(const unsigned char *pt, size_t n);
-/* the same from the relay port, whose senders no cluster-port gate has seen: only from the
- * member holding the id the frame names, at the address it came from; 0 refused */
-int clps_handle_relay_publish(const unsigned char *pt, size_t n, const pc_addr *from);
 void clps_handle_probe_ack(const unsigned char *pt, size_t n,
 		const pc_addr *from);
 void clps_handle_int_add(const unsigned char *pt, size_t n,

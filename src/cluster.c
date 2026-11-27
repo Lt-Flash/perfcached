@@ -43,7 +43,6 @@
 #include "upgrade.h"
 #include <sodium.h>
 #include "cluster.h"
-#include "verbs.h"
 #include "alerts.h"                     /* the link in the ALIVE */
 #include "clrpt.h"
 #include "clcodec.h"                 /* the LE wire codec */
@@ -187,8 +186,7 @@ static int rec_held(unsigned int wtick);
 /* the digest-gated sweep's two messages (defined with the sweep) */
 static void handle_sweep_dig(const unsigned char *pt, size_t n,
 		const pc_addr *from);
-static void handle_sweep_dig_r(const unsigned char *pt, size_t n,
-		const pc_addr *from);
+static void handle_sweep_dig_r(const unsigned char *pt, size_t n);
 /* the reconcile's digest round (defined with the sweep's) */
 static int reconcile_digest_step(void);
 static const unsigned char *reconcile_digest_filter(int c);
@@ -293,7 +291,6 @@ static struct {
 	 * placement is on the request path */
 	int map_usable;
 	unsigned int map_gen;          /* odd while map is rewritten (map_set) */
-	uint64_t map_place;            /* digest of what placement reads from map */
 	/* the master's record of identities this cluster has seen: NEW vs RETURNING is
 	 * no judgement a node can make about itself (a wiped state dir believes it is new) */
 	struct pc_clhist hist;
@@ -1568,8 +1565,6 @@ int pc_cluster_members(struct pc_member *out, int max)
 
 	if (!C.enabled || max < 1)
 		return 0;
-	/* every field the self entry does not set reads 0, as the departed ones do */
-	memset(&out[n], 0, sizeof out[n]);
 	out[n].addr = C.self_addr.in4.sin_addr;
 	out[n].client_port = C.cfg_client_port;
 	out[n].resp_port = C.cfg_resp_port;
@@ -1860,7 +1855,7 @@ static size_t build_fwd_op(unsigned char *msg, uint32_t req, int op,
 		unsigned int ttl_rel, long long delta, const char *col,
 		size_t collen, const char *key, size_t klen, const char *val,
 		size_t vlen);
-static size_t build_pull_req(unsigned char *msg, size_t cap, uint32_t req,
+static size_t build_pull_req(unsigned char *msg, uint32_t req,
 		const char *col, size_t collen, const char *key, size_t klen);
 static void post_done(int worker, uint32_t req, int found,
 		unsigned int ttl_left, const unsigned char *val, int vlen);
@@ -2155,10 +2150,7 @@ static void forget_tick(void)
 
 void pc_cluster_worker_register(int worker, int efd)
 {
-	if (clpend_cq_register(&C.pd, worker, efd) != 0)
-		LM_ERR("cluster: no completion queue for worker %d (out of memory?) - its "
-			"pulls and forwards are answered only by their deadline, counted in "
-			"pend_cq_dropped\n", worker);
+	clpend_cq_register(&C.pd, worker, efd);
 }
 
 static void post_done_ex(int worker, uint32_t req, int kind, int found,
@@ -2276,10 +2268,10 @@ static uint32_t pend_alloc(int kind, int expect, int extra_ms,
 	return req;
 }
 
-static size_t build_pull_req(unsigned char *msg, size_t cap, uint32_t req,
+static size_t build_pull_req(unsigned char *msg, uint32_t req,
 		const char *col, size_t collen, const char *key, size_t klen)
 {
-	return clpull_req_frame(msg, cap, req, C.node_id, col, collen, key, klen);
+	return clpull_req_frame(msg, req, C.node_id, col, collen, key, klen);
 }
 
 /* ask ONE designated holder whether it HAS @key, over the ordinary pull with its own completion
@@ -2366,13 +2358,11 @@ static uint32_t possess_probe(const char *col, size_t collen,
 		clpend_release(&C.pd, slot);
 		return 0;
 	}
-	{
-		struct clpend_fill f = { .col = col, .collen = collen, .key = key, .klen = klen };
-
-		if (!clpend_fill(&C.pd, slot, req, &f))
-			return 0;
-	}
-	n = build_pull_req(msg, sizeof msg, req, col, collen, key, klen);
+	memcpy(slot->col, col, collen);
+	slot->collen = (unsigned char)collen;
+	memcpy(slot->key, key, klen);
+	slot->klen = (unsigned short)klen;
+	n = build_pull_req(msg, req, col, collen, key, klen);
 	seal_send(&pr->addr, msg, n);
 	__atomic_fetch_add(&C.st.pull_sent, 1, __ATOMIC_RELAXED);
 	return req;
@@ -2927,6 +2917,12 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 	extern void pc_wal_upsert(const char *, const char *, int,
 		const char *, int, unsigned int, unsigned long long);
 	extern void pc_wal_del(const char *, const char *, int);
+	extern int pc_op_expire_apply(const char *, size_t, const char *,
+		size_t, unsigned int);
+	extern int pc_op_setcond_apply(const char *, size_t, const char *,
+		size_t, const char *, size_t, long long, int);
+	extern int pc_op_cmp_apply(const char *, size_t, const char *, size_t,
+		const char *, size_t, const char *, size_t, long long, int);
 	pcache_htable_t *ht;
 	unsigned char ack[16];
 	uint32_t req, ttl_rel;
@@ -3056,7 +3052,7 @@ static void handle_fwd_op(const unsigned char *pt, size_t n,
 					ttl_rel == PCACHE_EXP_PRESERVE ? 0 :
 					(long long)ttl_rel, op - 5);
 
-				if (r == PC_OP_ERR_TYPE) {
+				if (r == -11) {        /* PC_OP_ERR_TYPE */
 					newval = PC_FWD_E_TYPE;
 				} else {
 					ok = r >= 0;
@@ -3149,11 +3145,10 @@ static void handle_demote(const unsigned char *pt, size_t n)
 	}
 }
 
-/* 1 when it removed this node's copy, 0 for a numbered one; either is logged to the WAL here,
- * the numbered one whether or not a copy went */
+/* 1 when it removed this node's copy (the caller logs that to the WAL);
+ * 0 for a numbered one, which is logged here */
 static int handle_tombstone(const unsigned char *pt, size_t n)
 {
-	extern void pc_wal_del(const char *, const char *, int);
 	pcache_htable_t *ht;
 	unsigned int cn, kn;
 	str k;
@@ -3202,14 +3197,6 @@ static int handle_tombstone(const unsigned char *pt, size_t n)
 				num.incarn, num.seq);
 			(void)pc_ack_applied(num.oid, num.incarn, num.seq, ws);
 			return 0;
-		}
-		/* an unnumbered one only when a copy went, or a restart replays it back */
-		if (removed) {
-			char colz[256];
-
-			memcpy(colz, fk.col, cn);
-			colz[cn] = 0;
-			pc_wal_del(colz, fk.key, (int)kn);
 		}
 		return removed;
 	}
@@ -3319,9 +3306,8 @@ static void peer_gone(struct peer *p, int why)
 		clients_membership("expelled", p, p->told_node);
 	}
 	/* logged here, not in clres, and before the store below clears p->node */
-	if (clres_note(&reserved, p->node, p->addr.in4.sin_addr,
-			p->addr.in4.sin_port, p->ident, p->has_ident, now,
-			RESERVE_MS)) {
+	if (clres_note(&reserved, p->node, p->addr.in4.sin_addr, p->ident,
+			p->has_ident, now, RESERVE_MS)) {
 		clres_why(&reserved, p->node, why, silent_s);
 		if (why == CLRES_GONE_SILENT)
 			LM_WARN("cluster: node %d (%s) went silent %d s ago and "
@@ -3360,7 +3346,7 @@ struct peer *peer_upsert(const pc_addr *addr)
 	struct peer *p;
 	int created;
 
-	p = clpeers_upsert(&C.pt, addr, now_ms(), &created);
+	p = clpeers_upsert(&C.pt, addr, &created);
 	if (created)
 		shard_note_change();
 	return p;
@@ -4020,17 +4006,6 @@ void pc_cluster_set_cfgsig(const struct pc_cfgsig *e, int n)
 	ncfgsig = n;
 }
 
-void pc_cluster_set_cfgsig_one(const struct pc_cfgsig *e)
-{
-	int i;
-
-	for (i = 0; i < ncfgsig; i++)
-		if (cfgsig[i].name_h == e->name_h && !strcmp(cfgsig[i].name, e->name)) {
-			memcpy(cfgsig[i].val, e->val, sizeof cfgsig[i].val);
-			__atomic_store_n(&cfgsig[i].val_h, e->val_h, __ATOMIC_RELEASE);
-		}
-}
-
 int pc_cluster_cfgsig(const struct pc_cfgsig **e)
 {
 	*e = cfgsig;
@@ -4334,11 +4309,11 @@ static int hq_add(const char *col, size_t collen, const char *key,
 	req = cl_pend_alloc(PC_DONE_RECONCILE, up, 0, &slot);
 	if (!req)
 		return 0;
-	{
-		struct clpend_fill f = { .col = col, .collen = collen, .key = key, .klen = klen };
-
-		if (!clpend_fill(&C.pd, slot, req, &f))
-			return 0;
+	if (collen < sizeof slot->col && klen < sizeof slot->key) {
+		memcpy(slot->col, col, collen);
+		slot->collen = (unsigned char)collen;
+		memcpy(slot->key, key, klen);
+		slot->klen = (unsigned short)klen;
 	}
 	if (!hq.n) {
 		hq_t0 = now_ms();
@@ -5417,6 +5392,7 @@ static void fp_finish(void)
 static void handle_tomb_rpl(const unsigned char *pt, size_t n,
 		const pc_addr *from)
 {
+	extern void pc_wal_del(const char *, const char *, int);
 	struct peer *p = clpeers_by_addr(&C.pt, from);
 	uint32_t req, seq;
 
@@ -5425,8 +5401,18 @@ static void handle_tomb_rpl(const unsigned char *pt, size_t n,
 	req = fp_get32(pt + 1);
 	seq = fp_get32(pt + 5);
 	/* applied whatever became of the request, as a broadcast would be, and logged
-	 * (handle_tombstone) so a second restart does not bring it back */
-	(void)handle_tombstone(pt + 9, n - 9);
+	 * so a second restart does not bring it back */
+	if (handle_tombstone(pt + 9, n - 9)) {
+		struct clfwd_key fk;
+		uint64_t ver;
+		char colz[256];
+
+		if (clfwd_tomb_parse(pt + 9, n - 9, &fk, &ver)) {
+			memcpy(colz, fk.col, fk.collen);
+			colz[fk.collen] = 0;
+			pc_wal_del(colz, fk.key, (int)fk.klen);
+		}
+	}
 	if (!p || !clrecon_fp_mine(&C.fp, req,
 	        __atomic_load_n(&p->node, __ATOMIC_ACQUIRE), now_ms()))
 		return;
@@ -5817,31 +5803,12 @@ static void term_seen(uint32_t t)
  * fleet.  No standby = publish at once; a hung stage is abandoned and its seq never reused. */
 /* the workers rank by C.map with no lock: the copy runs between two generation bumps, and a reader
  * that saw the generation odd or changed reads again (cl_map_gen) */
-/* FNV-1a over the fields pc_clplace_owner reads; the seq a re-publication bumps is left out */
-static uint64_t clmap_place_digest(const struct pc_clmap *m)
-{
-	uint64_t h = fnv1a64_u64(FNV1A64_BASIS, m->nnodes);
-	unsigned int i;
-
-	for (i = 0; i < m->nnodes; i++) {
-		const struct pc_clmap_node *n = &m->node[i];
-
-		h = fnv1a64_u64(h, n->node_id);
-		h = fnv1a64_u64(h, n->addr);
-		h = fnv1a64_u64(h, n->cluster_port);
-		h = fnv1a64_u64(h, (uint64_t)pc_clmap_placeable(n));
-		h = fnv1a64_u64(h, pc_clmap_weight(n));
-	}
-	return h;
-}
-
 static void map_set(const struct pc_clmap *m)
 {
 	__atomic_store_n(&C.map_gen, C.map_gen + 1, __ATOMIC_RELAXED);
 	__atomic_thread_fence(__ATOMIC_RELEASE);
 	C.map = *m;
 	__atomic_store_n(&C.map_gen, C.map_gen + 1, __ATOMIC_RELEASE);
-	__atomic_store_n(&C.map_place, clmap_place_digest(m), __ATOMIC_RELAXED);
 }
 
 /* a mastership claim that could not be stored: no map until claim_term lands it */
@@ -6010,8 +5977,6 @@ static int sender_gate(int type, const pc_addr *from)
 	case M_PUBLISH:
 	case M_DEMOTE:
 	case M_ASKFILL:
-	case M_TOMB_RPL:
-	case M_TOMB_DONE:
 		/* ... except on a joiner: restarted inside the purge window it knows nobody,
 		 * yet the map still forwards its keys' writes to it; refused, each times out */
 		return C.role == PC_ROLE_JOINING || sender_known(from);
@@ -6044,9 +6009,6 @@ static int ident_elsewhere(const unsigned char *ident, unsigned int incarn,
 	return 0;
 }
 
-/* handle_clsync's decode scratch: the peer thread only */
-static struct pc_clhist sync_hist;
-
 static void handle_clsync(const unsigned char *pt, size_t n,
 		const pc_addr *from)
 {
@@ -6067,38 +6029,8 @@ static void handle_clsync(const unsigned char *pt, size_t n,
 		goto bad;
 	if (pc_clmap_decode(mp, ml, &m, &why) != 0)
 		goto bad;
-	/* only the master the map names, as handle_clmap; a deposed master's term is below the
-	 * fleet's, and one term has one master */
-	{
-		struct peer *sp = clpeers_by_addr(&C.pt, from);
-		int sid = sp ? __atomic_load_n(&sp->node, __ATOMIC_ACQUIRE) : 0;
-
-		if (!sid && C.master_id && addr_eq(from, &C.master_addr))
-			sid = C.master_id;
-		if ((int)m.master_id != sid) {
-			C.st.sender_refused++;
-			why = "the sender is not the master it names";
-			goto bad;
-		}
-	}
-	if (!pc_term_plausible(m.term)) {
-		why = "implausible term";
+	if (pc_clhist_decode(hp, hl, &C.held_hist, &why) != 0)
 		goto bad;
-	}
-	if (C.map_valid && (pc_term_cmp(C.map.term, m.term) == PC_TERM_STALE ||
-	        (m.term == C.map.term && m.master_id != C.map.master_id))) {
-		why = "not the master of the fleet's term";
-		goto bad;
-	}
-	if (C.held_valid && pc_clmap_epoch_cmp(m.term, m.seq,
-	        C.held_term, C.held_seq) < 0) {
-		why = "older than the state held";
-		goto bad;
-	}
-	/* into a scratch: a refused history must not leave the held one half-written */
-	if (pc_clhist_decode(hp, hl, &sync_hist, &why) != 0)
-		goto bad;
-	C.held_hist = sync_hist;
 
 	/* held, not adopted: a copy kept for a failover; this node still places from the
 	 * broadcast map, so a standby never acts on state the fleet has not been told */
@@ -6881,7 +6813,7 @@ void handle_join_req(const unsigned char *pt, size_t n,
 			}
 			rid = clres_take(&reserved,
 				(jq.have & CLMEMB_J_IDENT) ? jq.ident : NULL,
-				&from->in4.sin_addr, from->in4.sin_port, now_ms(), &how);
+				&from->in4.sin_addr, now_ms(), &how);
 
 			if (rid && !id_taken(rid)) {
 				id = rid;
@@ -6961,8 +6893,7 @@ static void handle_assign(const unsigned char *pt, size_t n,
 		return;
 	/* a master hands out 1..PC_CL_NODE_MAX (alloc_node_id); an id outside
 	 * that is not an assignment it made - 0 reads as "no id" everywhere */
-	if (as.your_id < 1 || as.your_id > PC_CL_NODE_MAX ||
-	        as.master_id < 1 || as.master_id > PC_CL_NODE_MAX)
+	if (as.your_id < 1 || as.your_id > PC_CL_NODE_MAX)
 		return;
 	/* the cluster this node now belongs to is the master's */
 	if (rx_hdr)
@@ -6980,8 +6911,7 @@ static void handle_assign(const unsigned char *pt, size_t n,
 
 		memset(&pa, 0, sizeof pa);
 		pc_addr_from_v4(&pa, mr.addr.s_addr, ntohs(mr.port));
-		if (addr_eq(&pa, &C.self_addr) || mr.node < 1 ||
-		        mr.node > PC_CL_NODE_MAX)
+		if (addr_eq(&pa, &C.self_addr))
 			continue;
 		if (cl_unicast)
 			clmesh_heard(&pa, now_ms(), 0);   /* the master's word */
@@ -8599,7 +8529,7 @@ static int dispatch_dgram(unsigned char *buf, size_t r,
 	switch (pt[0]) {
 	case M_COL_SET:   handle_col_set(pt, ptlen); break;
 	case M_SWEEP_DIG:   handle_sweep_dig(pt, ptlen, from); break;
-	case M_SWEEP_DIG_R: handle_sweep_dig_r(pt, ptlen, from); break;
+	case M_SWEEP_DIG_R: handle_sweep_dig_r(pt, ptlen); break;
 	case M_PUBLISH:   clps_handle_publish(pt, ptlen); break;
 	case M_PULL_REQ:  handle_pull_req(pt, ptlen, from); break;
 	case M_PULL_RSP:  handle_pull_rsp(pt, ptlen); break;
@@ -8919,9 +8849,15 @@ void pc_cluster_thread(volatile int *stop)
 
 /* ---- forwarded JSON path ops (proxy mode) ------------------------------- */
 
+extern const char pc_json_wrongtype_msg[];      /* verbs.c */
+
 static void handle_fwd_json(const unsigned char *pt, size_t n,
 		const pc_addr *from)
 {
+	extern int pc_json_rmw(pcache_htable_t *, const char *, int, int,
+		const char *, int, const char *, int, long long, int,
+		long long, int, int, int, char **, int *, long long *,
+		int *, const char **);
 	unsigned char ack[24 + MAX_FWD_VAL];
 	pcache_htable_t *ht;
 	uint32_t req, ttl;
@@ -9243,7 +9179,6 @@ static int mig_cb(const str *key, const str *val,
 struct age_hist {
 	unsigned long long bytes[32];  /* age is 32-bit: floor(log2) is 0..31 */
 	unsigned int now;
-	unsigned int scanned;
 };
 
 static int age_cb(const str *key, const str *val,
@@ -9252,9 +9187,6 @@ static int age_cb(const str *key, const str *val,
 	struct age_hist *h = arg;
 	unsigned int age, b;
 
-	/* a whole-table walk on the cluster thread: beat and stamp progress as the others do */
-	if ((h->scanned++ & 511) == 0)
-		beat_pump();
 	if (key->len > 4096)
 		return 0;
 	age = (!mt->wtick || h->now < mt->wtick) ? 0xffffffffu
@@ -10002,7 +9934,6 @@ struct rdg_col {
 	unsigned char diff[PC_SLOTS / 8];
 };
 static struct rdg_col *rdg_c[PC_MAX_COLLECTIONS];
-static pc_addr rdg_asked;              /* the witness the digests went to */
 static int rdg_phase;                  /* 0 not asked, 1 asked, 2 narrowed,
                                         * 3 probe everything */
 static long long rdg_deadline_ms;
@@ -10020,7 +9951,7 @@ static void rdg_drop(void)
 
 /* the answer to one part of the reconcile's question; 1 = it was ours */
 static int rdg_answer(uint32_t req, unsigned int part,
-		const unsigned char *slots, unsigned int cnt, const pc_addr *from)
+		const unsigned char *slots, unsigned int cnt)
 {
 	unsigned int k;
 	int c;
@@ -10032,9 +9963,6 @@ static int rdg_answer(uint32_t req, unsigned int part,
 
 		if (!r || r->req != req)
 			continue;
-		/* a part past those asked, or another sender's: no answer to this question */
-		if (part >= r->parts || !addr_eq(from, &rdg_asked))
-			return 1;
 		if (SG_BIT(r->got_part, part))
 			return 1;
 		SG_SET(r->got_part, part);
@@ -10067,7 +9995,6 @@ static int reconcile_digest_step(void)
 			rdg_phase = 3;
 			return 1;
 		}
-		rdg_asked = w->addr;
 		for (c = 0; c < pc_store_count(); c++) {
 			pcache_htable_t *ht;
 			struct sg_walk sw;
@@ -10227,8 +10154,7 @@ static void handle_sweep_dig(const unsigned char *pt, size_t n,
 }
 
 /* the sender side: the answer to one part */
-static void handle_sweep_dig_r(const unsigned char *pt, size_t n,
-		const pc_addr *from)
+static void handle_sweep_dig_r(const unsigned char *pt, size_t n)
 {
 	uint32_t req;
 	unsigned int cnt, k;
@@ -10241,7 +10167,7 @@ static void handle_sweep_dig_r(const unsigned char *pt, size_t n,
 	cnt = (unsigned int)pt[6] << 8 | pt[7];
 	if (n < 8 + (size_t)cnt * 2)
 		return;
-	if (rdg_answer(req, pt[5], pt + 8, cnt, from))
+	if (rdg_answer(req, pt[5], pt + 8, cnt))
 		return;                        /* the reconcile's round */
 	for (i = 0; i < PC_CL_MAXPEER; i++) {
 		struct sg_peer *sp = sg_tab[i];
@@ -10253,9 +10179,6 @@ static void handle_sweep_dig_r(const unsigned char *pt, size_t n,
 
 			if (!g || g->st != 1 || g->req != req)
 				continue;
-			if (pt[5] >= g->parts ||
-			        !addr_eq(from, &C.pt.peers[i].addr))
-				return;            /* not a part asked, or not the peer asked */
 			if (SG_BIT(g->got_part, pt[5]))
 				return;            /* a duplicate of an answered part */
 			SG_SET(g->got_part, pt[5]);
@@ -11503,9 +11426,8 @@ static void bulk_pull(void)
 					__ATOMIC_RELEASE);
 				__atomic_store_n(&C.rejoin_src, node[k],
 					__ATOMIC_RELEASE);
-			} else
-				(void)pc_node_state_move(PC_NST_RECOVERING,
-					PC_NST_READY);
+			} else if (pc_node_state() == PC_NST_RECOVERING)
+				pc_node_state_set(PC_NST_READY);
 			return;
 		}
 		__atomic_fetch_add(&C.px.boot_failed, 1, __ATOMIC_RELAXED);
@@ -11732,11 +11654,6 @@ int pc_cluster_stage_relay(const void *data, size_t len,
 		        !(f & CLMEMB_FEAT_STAGE)) {
 			(*older)++;
 			pc_upg_relay_note(m[i].addr.s_addr, PC_UPG_RELAY_OLDER);
-			continue;
-		}
-		/* the copy is the whole build: made only when the queue can take it */
-		if (!clbulk_room(&C.bk)) {
-			pc_upg_relay_note(m[i].addr.s_addr, PC_UPG_RELAY_BUSY);
 			continue;
 		}
 		b = malloc(tot);
@@ -12062,11 +11979,6 @@ int cl_role(void)       { return C.role; }
 int cl_master_id(void)  { return C.master_id; }
 const char *cl_state_dir(void) { return C.state_dir; }
 int cl_map_usable(void) { return C.map_usable; }
-int pc_cluster_map_usable(void) { return cl_map_usable(); }
-uint64_t pc_cluster_map_place(void)
-{
-	return C.st.map_valid ? __atomic_load_n(&C.map_place, __ATOMIC_RELAXED) : 0;
-}
 const struct pc_clmap *cl_map(void) { return &C.map; }
 unsigned int cl_map_gen(void) { return __atomic_load_n(&C.map_gen, __ATOMIC_ACQUIRE); }
 pc_addr cl_self_addr(void) { return C.self_addr; }
@@ -12114,16 +12026,6 @@ uint32_t cl_pend_alloc(int kind, int expect, int extra_ms,
 		struct pending **out)
 {
 	return pend_alloc(kind, expect, extra_ms, out);
-}
-
-int cl_pend_fill(struct pending *slot, uint32_t req, const struct clpend_fill *f)
-{
-	return clpend_fill(&C.pd, slot, req, f);
-}
-
-int cl_pend_sent(struct pending *slot, uint32_t req, int asked, int sent)
-{
-	return clpend_sent(&C.pd, slot, req, asked, sent);
 }
 
 void cl_pend_release(struct pending *slot)
@@ -12515,7 +12417,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 		if (getsockopt(C.fd, SOL_SOCKET, SO_RCVBUF, &got, &gl) == 0) {
 			/* the kernel reports twice the usable payload budget */
 			C.rcvbuf = got;
-			if ((long long)got < 2LL * rb)
+			if (got < rb)
 				LM_WARN("cluster: receive buffer is %d KB, asked "
 					"for %d KB - the kernel clamped it to "
 					"net.core.rmem_max.  Bursts of large "
@@ -12523,7 +12425,7 @@ int pc_cluster_init(const char *mcast_addr, int mcast_port,
 					"writes refused; raise "
 					"net.core.rmem_max to at least %d or "
 					"grant CAP_NET_ADMIN\n",
-					got / 2 / 1024, rb / 1024, rb);
+					got / 1024, rb / 1024, rb);
 		}
 	}
 	/* the mcast rx socket shares this port, so both need REUSEADDR; SO_REUSEPORT is
@@ -12805,7 +12707,6 @@ void pc_cluster_get_stats(struct pc_cl_stats *out)
 	out->pend_peak = clpend_peak(&C.pd);
 	out->pend_peak_win = clpend_peak_win(&C.pd);
 	out->pend_exhausted = clpend_exhausted(&C.pd);
-	out->pend_cq_dropped = clpend_cq_dropped(&C.pd);
 	out->neg_hits = clloc_neg_hits(&C.lc);
 	out->neg_displaced = clloc_neg_displaced(&C.lc);
 	out->tomb_displaced = clloc_tomb_displaced(&C.lc);

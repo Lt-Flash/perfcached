@@ -99,15 +99,6 @@ echo "$O" | grep -q '^replies 0' \
 	&& ok "counted as refused (sender_refused $R0 -> $(st 2 'r["cluster"]["sender_refused"]'))" \
 	|| bad "sender_refused $R0 -> $(st 2 'r["cluster"]["sender_refused"]')"
 
-echo "--- 2b: a stranger's replayed delete"
-R0=$(st 2 'r["cluster"]["sender_refused"]')
-inj tombrpl 0 dk >/dev/null
-sleep 0.5
-V=$(getv 2 dk)
-[ "$(st 2 'r["cluster"]["sender_refused"]')" -gt "$R0" ] 2>/dev/null && echo "$V" | grep -q '"held-by-2"' \
-	&& ok "TOMB_RPL for dk from 127.0.142.9 (unknown) - refused, dk still held ($V)" \
-	|| bad "a stranger's TOMB_RPL was taken: dk now $V, sender_refused $R0 -> $(st 2 'r["cluster"]["sender_refused"]')"
-
 echo "--- 3: the same address, known"
 A=$(inj alive 88)
 sleep 0.5

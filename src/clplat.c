@@ -182,40 +182,36 @@ int clplat_in_container(const char **what)
 	return 0;
 }
 
-int clplat_keep_smallest(char (*names)[CLPLAT_IFNAME], int n, int max, const char *name)
-{
-	size_t l = strlen(name);
-	int j;
-
-	if (l >= CLPLAT_IFNAME || max <= 0)
-		return n;                      /* not an interface name */
-	if (n == max && strcmp(names[n - 1], name) <= 0)
-		return n;
-	if (n < max)
-		n++;
-	for (j = n - 1; j > 0 && strcmp(names[j - 1], name) > 0; j--)
-		memcpy(names[j], names[j - 1], CLPLAT_IFNAME);
-	memcpy(names[j], name, l + 1);
-	return n;
-}
-
 /* the first non-loopback interface with a non-zero MAC, by name, so the
  * choice is stable across boots rather than whatever enumerated first */
 static int first_mac(char *buf, size_t cap)
 {
-	char names[16][CLPLAT_IFNAME], path[128];
+	char names[16][IFNAMSIZ], path[128];
 	DIR *d = opendir(NET_DIR);
 	struct dirent *e;
-	int n = 0, i;
+	int n = 0, i, j;
 
 	if (!d)
 		return -1;
-	while ((e = readdir(d))) {
+	while ((e = readdir(d)) && n < 16) {
+		size_t l = strlen(e->d_name);
+
 		if (e->d_name[0] == '.' || !strcmp(e->d_name, "lo"))
 			continue;
-		n = clplat_keep_smallest(names, n, 16, e->d_name);
+		if (l >= sizeof names[0])
+			continue;              /* not an interface name */
+		memcpy(names[n], e->d_name, l + 1);
+		n++;
 	}
 	closedir(d);
+	for (i = 1; i < n; i++) {
+		char t[IFNAMSIZ];
+
+		memcpy(t, names[i], sizeof t);
+		for (j = i; j > 0 && strcmp(names[j - 1], t) > 0; j--)
+			memcpy(names[j], names[j - 1], sizeof t);
+		memcpy(names[j], t, sizeof t);
+	}
 	for (i = 0; i < n; i++) {
 		if (snprintf(path, sizeof path, "%s/%s/address", NET_DIR,
 		        names[i]) >= (int)sizeof path)

@@ -44,9 +44,9 @@ size_t clpull_req_write(unsigned char *buf, size_t cap, unsigned char type,
 size_t clpull_rsp_write(unsigned char *buf, size_t cap, unsigned char type,
 		const struct clpull_rsp *r);
 
-/* this node's PULL_REQ as a whole frame under M_PULL_REQ (clmsg.h) into @msg of @cap bytes;
- * 0 when it does not fit, or col/key are longer than the header can say */
-size_t clpull_req_frame(unsigned char *msg, size_t cap, uint32_t req, int node,
+/* this node's PULL_REQ as a whole frame under M_PULL_REQ (clmsg.h); @msg must hold
+ * clpull_req_size(collen, klen) */
+size_t clpull_req_frame(unsigned char *msg, uint32_t req, int node,
 		const char *col, size_t collen, const char *key, size_t klen);
 
 /* Parse: 0 on a frame too short for its header; the request also refuses declared col+key

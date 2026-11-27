@@ -219,9 +219,6 @@ unsigned int compat_ticks_deadline(long long ms)
 	clock_gettime(CLOCK_MONOTONIC_COARSE, &now);
 	/* a tick starts where the clock's seconds roll over: the deadline's
 	 * whole seconds past this one are the ticks it reaches */
-	/* clamped before the addition, which could overflow near LLONG_MAX */
-	if (ms > 0x7fffffffLL * 1000)
-		ms = 0x7fffffffLL * 1000;
 	f = (long long)(now.tv_nsec / 1000000) + (ms > 0 ? ms : 0);
 	if (f / 1000 > 0x7fffffffLL)
 		f = 0x7fffffffLL * 1000;

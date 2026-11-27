@@ -120,10 +120,10 @@ void acks_boot_floors(const int *ids, int n)
  * tomb_mark (when it was last heard) again, as versioned tombstones - a later write survives */
 static unsigned long long tomb_catchup_total;
 /* the members back after a silence the table did not cover - for
- * the alerts (cluster.peer_absent), the last few lines kept */
+ * the alerts (cluster.peer_absent), the last one's line kept */
 static pthread_mutex_t tomb_gap_mx = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long long tomb_gaps;
-static char tomb_gap_text[PC_TOMB_GAP_KEEP][256];
+static char tomb_gap_text[256];
 
 int pc_cluster_tomb_alert(struct pc_tomb_alert *out)
 {
@@ -455,9 +455,8 @@ void acks_forget_tick(unsigned int now_s)
 #define GAP_SPAN_MAX  4096u                /* seqs a request asks for */
 #define GAP_SEND_MAX  4096u                /* deletes an answer re-sends */
 #define GAP_DEAD_MS   30000                /* asked of the peers this long */
-/* seen_ms: the hole appeared or moved; last_ms: the last tick that still listed it */
 struct gapst { uint64_t oid; uint32_t incarn; uint64_t from;
-	long long seen_ms, last_ms, asked_ms, over_ms; int tries; };
+	long long seen_ms, asked_ms, over_ms; int tries; };
 static struct gapst gapv[64];
 static struct pc_ack_hole holev[64];
 /* an origin's own announced mark of its own space - what it has
@@ -564,19 +563,14 @@ void acks_gap_tick(long long now)
 				g = &gapv[j];
 				break;
 			}
-		if (g)
-			g->last_ms = now;
 		if (!g || g->from != h->from) {    /* a new hole, or it moved on */
-			/* a free slot first, else one no tick has listed for a minute */
-			for (j = 0; j < 64 && !g; j++)
-				if (!gapv[j].seen_ms)
-					g = &gapv[j];
-			for (j = 0; j < 64 && !g; j++)
-				if (now - gapv[j].last_ms > 60000)
-					g = &gapv[j];
+			if (!g)
+				for (j = 0; j < 64 && !g; j++)
+					if (!gapv[j].seen_ms ||
+					    now - gapv[j].seen_ms > 60000)
+						g = &gapv[j];
 			if (!g)
 				continue;
-			g->last_ms = now;
 			g->oid = h->oid;
 			g->incarn = h->incarn;
 			g->from = h->from;
@@ -835,8 +829,8 @@ void acks_back_check(struct peer *p, uint64_t member,
 		"the cap");
 	/* and to the alerts, with what happens now */
 	pthread_mutex_lock(&tomb_gap_mx);
-	snprintf(tomb_gap_text[tomb_gaps % PC_TOMB_GAP_KEEP], sizeof tomb_gap_text[0],
-		"node %d back after %lld s - deletes made meanwhile are no longer all held here, "
+	snprintf(tomb_gap_text, sizeof tomb_gap_text, "node %d back after "
+		"%lld s - deletes made meanwhile are no longer all held here, "
 		"so it was asked to rebuild: it reconciles what it stored "
 		"before the absence with the fleet", p->node, away_s);
 	tomb_gaps++;
@@ -931,10 +925,10 @@ void tomb_catchup_tick(void)
 						p->node, away, why);
 					/* and to the alerts */
 					pthread_mutex_lock(&tomb_gap_mx);
-					snprintf(tomb_gap_text[tomb_gaps % PC_TOMB_GAP_KEEP],
-						sizeof tomb_gap_text[0], "node %d back after %u s, "
-						"%s - deletes made meanwhile may come back; "
-						"re-issue the ones that matter", p->node, away, why);
+					snprintf(tomb_gap_text, sizeof tomb_gap_text,
+						"node %d back after %u s, %s - deletes made "
+						"meanwhile may come back; re-issue the ones "
+						"that matter", p->node, away, why);
 					tomb_gaps++;
 					pthread_mutex_unlock(&tomb_gap_mx);
 				}

@@ -281,20 +281,6 @@ EOF
 )
 [ "$R" = "BINOK" ] && ok || bad "binary value roundtrip: $R"
 
-# ---- a command of the largest bulk, a PING behind it in the same write: both answered ----------
-R=$(timeout 10 python3 - <<'EOF'
-import socket
-s = socket.create_connection(("127.0.0.1", 17091), timeout=8)
-f = s.makefile("rwb")
-big = b"x" * (1 << 20)
-s.sendall(b"*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n$%d\r\n%s\r\n*1\r\n$4\r\nPING\r\n" % (len(big), big))
-first = f.readline()
-second = f.readline()
-print("BIGOK" if first[:1] in (b"+", b"-") and second == b"+PONG\r\n" else "BIGBAD %r %r" % (first[:60], second))
-EOF
-)
-[ "$R" = "BIGOK" ] && ok || bad "a 1 MB bulk with a PING pipelined behind it: $R"
-
 # ---- INFO carries a replication role: rtpengine refuses to start without one ----------
 R=$(timeout 5 python3 - <<'EOF'
 import socket
@@ -361,34 +347,6 @@ print(s.recv(4096).decode("latin1").replace("\r\n", "/"))
 EOF
 )
 case "$R" in "+PONG/\$2/v1/"*) ok;; *) bad "inline: $R";; esac
-# an HTTP request sent to the RESP port (a browser's cross-site POST) is dropped at its request
-# line: none of its lines runs, the SET in its body included
-R=$(timeout 5 python3 - <<'EOF'
-import socket, time
-s = socket.create_connection(("127.0.0.1", 17091), timeout=5)
-s.sendall(b"POST / HTTP/1.1\r\nHost: 127.0.0.1:17091\r\nContent-Type: text/plain\r\n\r\nSET httpk v\r\n")
-try:
-    d = s.recv(4096)
-except ConnectionResetError:
-    # closed with the request's tail unread: a reset
-    d = b""
-t = socket.create_connection(("127.0.0.1", 17091), timeout=5)
-t.sendall(b"GET httpk\r\n")
-time.sleep(0.3)
-print("closed" if d == b"" else "answered:" + d.decode("latin1"), t.recv(64).decode("latin1").replace("\r\n", "/"))
-EOF
-)
-[ "$R" = "closed \$-1/" ] && ok || bad "an HTTP POST on the RESP port: $R"
-# a command name holding CR LF is echoed on one line, so the next reply stays the next
-R=$(timeout 5 python3 - <<'EOF'
-import socket, time
-s = socket.create_connection(("127.0.0.1", 17091), timeout=5)
-s.sendall(b"*1\r\n$10\r\nx\r\n+OK\r\nab\r\n*1\r\n$4\r\nPING\r\n")
-time.sleep(0.3)
-print(s.recv(4096).decode("latin1").replace("\r\n", "/"))
-EOF
-)
-[ "$R" = "-ERR unknown command 'x  +OK  ab'/+PONG/" ] && ok || bad "a CR LF in an unknown command's name: $R"
 
 # ---- QUIT closes after +OK ---------------------------------------------
 R=$(python3 - <<'EOF'

@@ -35,23 +35,6 @@ static void cb(char *res, size_t len, const char *e, void *ctx)
 	r->len = len;
 }
 
-/* the first of two pipelined replies frees the handle from its callback */
-static perfd_t *freed_in_cb;
-static int n_after_free;
-
-static void cb_free(char *res, size_t len, const char *e, void *ctx)
-{
-	(void)len;
-	(void)e;
-	free(res);
-	if (ctx) {
-		perfd_free(freed_in_cb);
-		freed_in_cb = NULL;
-	} else {
-		n_after_free++;
-	}
-}
-
 /* drive the handle until @done() says stop, or the budget runs out */
 static int pump(perfd_t *p, const int *done, int budget_ms)
 {
@@ -184,29 +167,7 @@ int main(int argc, char **argv)
 	}
 	free(rm.res);
 
-	/* 5. both replies wait in the socket; one read_ready takes them, the first callback frees the handle */
-	freed_in_cb = p;
-	if (perfd_submit_kv(p, PERFD_V_GET, col, "abk", NULL, 0, 0, 0, cb_free, p) != 0 ||
-	    perfd_submit_kv(p, PERFD_V_GET, col, "abk", NULL, 0, 0, 0, cb_free, NULL) != 0 ||
-	    perfd_push(p) < 0) {
-		bad("two pipelined GETs could not be submitted");
-		perfd_free(p);
-	} else {
-		struct pollfd pfd = { .fd = perfd_fd(p), .events = POLLIN };
-
-		poll(NULL, 0, 300);
-		if (poll(&pfd, 1, 5000) == 1)
-			(void)perfd_read_ready(p);
-		if (freed_in_cb) {
-			bad("the replies to two pipelined GETs never came");
-			perfd_free(p);
-		} else if (n_after_free) {
-			bad("a callback ran on a handle freed by the callback before it");
-		} else {
-			ok("a handle freed inside a reply callback is released after the read, its other reply dropped");
-		}
-	}
-
+	perfd_free(p);
 	printf("asyncbintest: %d passed, %d failed\n", pass, fail);
 	return fail ? 1 : 0;
 }

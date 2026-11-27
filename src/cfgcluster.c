@@ -25,8 +25,8 @@ int cfg_kv_cluster(struct pstate *ps, char *key, char *val)
 
 	if (!strcasecmp(key, "cluster_id")) {
 		free(cfg->cl_cluster_id);
-		cfg->cl_cluster_id = cfg_dup(ps, val);
-		return cfg->cl_cluster_id ? 0 : -1;
+		cfg->cl_cluster_id = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "max_members"))
 		return parse_int(ps, val, 0, 257, &cfg->cl_max_members);
@@ -45,8 +45,8 @@ int cfg_kv_cluster(struct pstate *ps, char *key, char *val)
 	}
 	if (!strcasecmp(key, "seeds")) {
 		free(cfg->cl_seeds);
-		cfg->cl_seeds = cfg_dup(ps, val);
-		return cfg->cl_seeds ? 0 : -1;
+		cfg->cl_seeds = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "identity_source")) {
 		static const char *n[] = { "auto", "dmi", "mac", "env", "file" };
@@ -103,15 +103,15 @@ int cfg_kv_cluster(struct pstate *ps, char *key, char *val)
 	}
 	if (!strcasecmp(key, "advertise")) {
 		free(cfg->cl_advertise);
-		cfg->cl_advertise = cfg_dup(ps, val);
-		return cfg->cl_advertise ? 0 : -1;
+		cfg->cl_advertise = strdup(val);
+		return 0;
 	}
 	/* mixed into a platform-derived identity so one machine in two fleets is two members; not
 	 * the cluster PSK, so rotating a secret does not re-mint identities.  Unset = file/random. */
 	if (!strcasecmp(key, "site_salt")) {
 		free(cfg->cl_site_salt);
-		cfg->cl_site_salt = cfg_dup(ps, val);
-		return cfg->cl_site_salt ? 0 : -1;
+		cfg->cl_site_salt = strdup(val);
+		return 0;
 	}
 	/* the cluster owns mode + the clustered collection set */
 	if (!strcasecmp(key, "mode")) {
@@ -150,8 +150,8 @@ int cfg_kv_cluster(struct pstate *ps, char *key, char *val)
 			PERR(ps, "duplicate [cluster] collections\n");
 			return -1;
 		}
-		cfg->cl_collections = cfg_dup(ps, val);
-		dup = cfg_dup(ps, val);
+		cfg->cl_collections = strdup(val);
+		dup = strdup(val);
 		if (!dup || !cfg->cl_collections) {
 			free(dup);
 			free(cfg->cl_collections);
@@ -178,20 +178,7 @@ int cfg_kv_cluster(struct pstate *ps, char *key, char *val)
 				free(dup);
 				return -1;
 			}
-			if (!pc_col_name_ok(tok, strlen(tok))) {
-				char pb[160];
-
-				PERR(ps, "[cluster] collections: '%s' is not a "
-					"collection name (" PC_COL_NAME_RULE ")\n",
-					pc_col_name_print(pb, sizeof pb, tok, strlen(tok)));
-				free(dup);
-				return -1;
-			}
-			if (!(cfg->cl_colname[cfg->n_cl_col] = cfg_dup(ps, tok))) {
-				free(dup);
-				return -1;
-			}
-			cfg->n_cl_col++;
+			cfg->cl_colname[cfg->n_cl_col++] = strdup(tok);
 		}
 		free(dup);
 		return 0;
@@ -375,9 +362,9 @@ int cfg_kv_collection(struct pstate *ps, char *key, char *val)
 			p = e + 1;
 		}
 		free(ps->col->upstream);
-		ps->col->upstream = cfg_dup(ps, val);
+		ps->col->upstream = strdup(val);
 		ps->col->up_tls = tls;
-		return ps->col->upstream ? 0 : -1;
+		return 0;
 	}
 	if (!strncasecmp(key, "upstream_tls_", 13) && strcasecmp(key, "upstream_tls_verify")) {
 		char **dst = !strcasecmp(key + 13, "ca") ? &ps->col->up_tls_ca :
@@ -393,8 +380,8 @@ int cfg_kv_collection(struct pstate *ps, char *key, char *val)
 			PERR(ps, "%s: %s\n", key, *dst ? "given twice" : "empty");
 			return -1;
 		}
-		*dst = cfg_dup(ps, val);
-		return *dst ? 0 : -1;
+		*dst = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "upstream_tls_verify")) {
 		if (!strcasecmp(val, "yes") || !strcasecmp(val, "no")) {
@@ -444,8 +431,8 @@ int cfg_kv_collection(struct pstate *ps, char *key, char *val)
 	}
 	if (!strcasecmp(key, "upstream_primary")) {
 		free(ps->col->up_primary);
-		ps->col->up_primary = cfg_dup(ps, val);
-		return ps->col->up_primary ? 0 : -1;
+		ps->col->up_primary = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "durable")) {
 		if (!strcasecmp(val, "yes"))
@@ -495,8 +482,8 @@ int cfg_kv_collection(struct pstate *ps, char *key, char *val)
 			PERR(ps, "empty upstream_password\n");
 			return -1;
 		}
-		ps->col->up_password = cfg_dup(ps, val);
-		return ps->col->up_password ? 0 : -1;
+		ps->col->up_password = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "upstream_write_user") ||
 	    !strcasecmp(key, "upstream_write_password")) {
@@ -511,13 +498,13 @@ int cfg_kv_collection(struct pstate *ps, char *key, char *val)
 			PERR(ps, "empty %s\n", key);
 			return -1;
 		}
-		*dst = cfg_dup(ps, val);
-		return *dst ? 0 : -1;
+		*dst = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "upstream_prefixes")) {
 		free(ps->col->up_prefixes);
-		ps->col->up_prefixes = cfg_dup(ps, val);
-		return ps->col->up_prefixes ? 0 : -1;
+		ps->col->up_prefixes = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "upstream_negative_ms"))
 		return parse_int(ps, val, 0, 3600000,
@@ -530,15 +517,14 @@ int cfg_kv_collection(struct pstate *ps, char *key, char *val)
 			&ps->col->up_echo_ms);
 	if (!strcasecmp(key, "upstream_sentinel_master") ||
 	    !strcasecmp(key, "upstream_sentinel_password")) {
-		char **dst = !strcasecmp(key, "upstream_sentinel_master") ?
-			&ps->col->up_smaster : &ps->col->up_spassword;
+		char **dst = key[18] == 'm' ? &ps->col->up_smaster : &ps->col->up_spassword;
 
 		if (*dst || !*val) {
 			PERR(ps, "%s: %s\n", key, *dst ? "given twice" : "empty");
 			return -1;
 		}
-		*dst = cfg_dup(ps, val);
-		return *dst ? 0 : -1;
+		*dst = strdup(val);
+		return 0;
 	}
 	if (!strcasecmp(key, "upstream_discover")) {
 		if (!strcasecmp(val, "auto"))

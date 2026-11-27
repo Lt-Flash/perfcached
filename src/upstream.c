@@ -306,27 +306,16 @@ static void relay_free(struct pcache_relay *r)
 	}
 }
 
-/* a completion that cannot be posted: what it owns freed; a dropped invalidation becomes
- * a drop of every record written through at the next drain */
-static void post_drop(const struct up_done *d)
-{
-	if ((d->kind == UPD_INV || d->kind == UPD_INVALL) && d->col >= 0 &&
-	    d->col < ncols)
-		__atomic_store_n(&up_cols[d->col].inv_all_pending, 1, __ATOMIC_RELEASE);
-	free(d->key);
-	free(d->val);
-	free(d->fwd);
-	rb_free(d->rb, d->nrb);
-	relay_free(d->relay);
-}
-
 static void post_done(int worker, const struct up_done *d)
 {
 	struct up_wq *w;
 	uint64_t one = 1;
 
 	if (worker < 0 || worker >= wq_n) {
-		post_drop(d);
+		free(d->key);
+		free(d->val);
+		rb_free(d->rb, d->nrb);
+		relay_free(d->relay);
 		return;
 	}
 	w = &wq[worker];
@@ -341,7 +330,10 @@ static void post_done(int worker, const struct up_done *d)
 			pthread_mutex_unlock(&w->mx);
 			LM_ERR("upstream: no memory to post a completion - a "
 				"client connection stays held\n");
-			post_drop(d);
+			free(d->key);
+			free(d->val);
+			rb_free(d->rb, d->nrb);
+			relay_free(d->relay);
 			return;
 		}
 		w->q = nq;
@@ -422,10 +414,8 @@ static void inv_post(struct up_col *uc, const char *k, size_t kl)
 	d.kind = UPD_INV;
 	d.col = uc->idx;
 	d.key = malloc(kl ? kl : 1);
-	if (!d.key) {
-		post_drop(&d);
+	if (!d.key)
 		return;
-	}
 	memcpy(d.key, k, kl);
 	d.klen = kl;
 	post_done(w, &d);
@@ -1949,10 +1939,13 @@ static __thread struct up_col *lost_uc;
 static __thread struct up_col *spent_uc;   /* the collection a lost read was last found in */
 static __thread unsigned long long lost_end0;
 
-/* the armed read, taken once: its collection when a removal overlapped it, else NULL */
-static struct up_col *lost_take(void)
+/* did a read the gate let through lose a key before its handler read it (no lock between: an
+ * invalidation or a flush can land there)?  1: a read key is now unknown and a removal overlapped */
+int pc_upstream_resp_lost(pcache_htable_t *ht, const char *col, size_t collen,
+		char *const *argv, const size_t *argl, int nargs)
 {
 	struct up_col *uc = lost_uc;
+	int cls, del, all, n, i;
 	static int off = -1;
 
 	lost_uc = NULL;
@@ -1963,31 +1956,27 @@ static struct up_col *lost_take(void)
 			LM_WARN("upstream: PERFCACHED_TEST_LOST_OFF - a read that "
 				"lost its key answers what it read (a test setting)\n");
 	}
-	if (!uc || off)
-		return NULL;
+	if (!uc || nargs < 2 || off)
+		return 0;
 	if (__atomic_load_n(&uc->rm_begin, __ATOMIC_SEQ_CST) == lost_end0)
-		return NULL;                   /* nothing went meanwhile */
-	return uc;
-}
-
-/* 1: one of @keys the read used is unknown here now (counted) */
-static int lost_keys(struct up_col *uc, pcache_htable_t *ht, const char *col,
-		size_t collen, const char *const *keys, const size_t *kl, int n)
-{
-	int i;
-
-	for (i = 0; i < n; i++) {
+		return 0;                      /* nothing went meanwhile */
+	cls = pc_upstream_cmd_class(argv[0], argl[0], argv, argl, nargs, &del,
+		&all);
+	if ((cls != UPC_READ && cls != UPC_PROBE) || del)
+		return 0;
+	n = all ? nargs - 1 : 1;
+	for (i = 1; i <= n; i++) {
 		unsigned char fl = 0, mark = 0;
 		unsigned int exp = 0;
 		int m;
 		str k;
 
 		/* the gate's own skips: outside the prefixes, another node's */
-		if (!allowed(uc, keys[i], kl[i]) ||
-		    through_elsewhere(ht, col, collen, keys[i], kl[i]))
+		if (!allowed(uc, argv[i], argl[i]) ||
+		    through_elsewhere(ht, col, collen, argv[i], argl[i]))
 			continue;
-		k.s = (char *)keys[i];
-		k.len = (int)kl[i];
+		k.s = argv[i];
+		k.len = (int)argl[i];
 		/* a "t" mark alone is a record an echo is dropping, not the key */
 		m = nofall_mark(uc, &k);
 		if (pcache_ht_probe_main(ht, &k, NULL) == 0 || (m && m != 't') ||
@@ -1999,46 +1988,6 @@ static int lost_keys(struct up_col *uc, pcache_htable_t *ht, const char *col,
 		return 1;
 	}
 	return 0;
-}
-
-/* did a read the gate let through lose a key before its handler read it (no lock between: an
- * invalidation or a flush can land there)?  1: a read key is now unknown and a removal overlapped */
-int pc_upstream_resp_lost(pcache_htable_t *ht, const char *col, size_t collen,
-		char *const *argv, const size_t *argl, int nargs)
-{
-	struct up_col *uc = lost_take();
-	int cls, del, all;
-
-	if (!uc || nargs < 2)
-		return 0;
-	cls = pc_upstream_cmd_class(argv[0], argl[0], argv, argl, nargs, &del,
-		&all);
-	if ((cls != UPC_READ && cls != UPC_PROBE) || del)
-		return 0;
-	return lost_keys(uc, ht, col, collen, (const char *const *)argv + 1,
-		argl + 1, all ? nargs - 1 : 1);
-}
-
-int pc_upstream_lost(pcache_htable_t *ht, const char *col, size_t collen,
-		const char *const *keys, const size_t *kl, int n)
-{
-	struct up_col *uc = lost_take();
-
-	return uc ? lost_keys(uc, ht, col, collen, keys, kl, n) : 0;
-}
-
-unsigned long long pc_upstream_rm_mark(const char *col, size_t collen)
-{
-	struct up_col *uc = ncols ? col_of(col, collen) : NULL;
-
-	return uc ? __atomic_load_n(&uc->rm_end, __ATOMIC_ACQUIRE) : 0;
-}
-
-void pc_upstream_lost_arm(const char *col, size_t collen,
-		unsigned long long end0)
-{
-	lost_uc = ncols ? col_of(col, collen) : NULL;
-	lost_end0 = end0;
 }
 
 /* the lost read just found is not gated again: its retries are spent */
@@ -2143,21 +2092,6 @@ int pc_upstream_resp_gate(pcache_htable_t *ht, const char *col, size_t collen,
 						break;
 					}
 				if (ex > 0) {
-					long long t = 0;
-					size_t q;
-
-					/* the door's own check: the command does not run here */
-					for (q = 0; q < argl[ex + 1] && q < 11 &&
-					     argv[ex + 1][q] >= '0' && argv[ex + 1][q] <= '9'; q++)
-						t = t * 10 + (argv[ex + 1][q] - '0');
-					if (!argl[ex + 1] || q != argl[ex + 1] || t <= 0 ||
-					    t > INT_MAX) {
-						if (kidx != kidx64)
-							free(kidx);
-						pc_jw_lit(out, "-ERR invalid expire time in "
-							"'json.set' command\r\n");
-						return PC_UPG_ANSWERED;
-					}
 					av = malloc((size_t)nargs * sizeof *av);
 					al = malloc((size_t)nargs * sizeof *al);
 					if (!av || !al) {
@@ -2626,9 +2560,6 @@ static int fetch(struct uconn *c, struct up_key *e)
 
 	k.s = (char *)kp;
 	k.len = (int)kl;
-	memset(&ty, 0, sizeof ty);
-	memset(&tt, 0, sizeof tt);
-	memset(&gv, 0, sizeof gv);
 	e->fetched = UPF_FINAL;
 	relay_free(e->unkept);             /* an earlier round's */
 	e->unkept = NULL;
@@ -2662,6 +2593,9 @@ static int fetch(struct uconn *c, struct up_key *e)
 		    send_ask(c, dl, ask, 2, a3, l3) != 0)
 			goto io;
 	}
+	memset(&ty, 0, sizeof ty);
+	memset(&tt, 0, sizeof tt);
+	memset(&gv, 0, sizeof gv);
 	if ((rc = read_ask(c, &ty, dl, ask)) != 0)
 		goto io_rc;
 	/* not here, or not now.  A redirect is followed in a cluster only: a perfcached door with
@@ -2699,15 +2633,13 @@ static int fetch(struct uconn *c, struct up_key *e)
 		return -6;
 	}
 
-	exp = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;
 	if (tt.t == ':' && tt.n == -2) {
-		rv_free(&tt);
 		put_mark(s, &k, PCACHE_UPMARK_ABSENT);  /* gone meanwhile */
 		ST_ADD(uc->absent, 1);
 		rv_free(&gv);
 		goto done;
 	}
-	rv_free(&tt);                      /* an integer; an upstream may send anything */
+	exp = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;
 
 	if (!strcmp(tname, "none")) {
 		put_mark(s, &k, PCACHE_UPMARK_ABSENT);
@@ -2814,7 +2746,6 @@ done:
 io:
 	rc = -1;
 io_rc:
-	rv_free(&tt);
 	uc_close(c);
 	if (rc == -3) {
 		/* a value larger than any record: marked so it is not read
@@ -3073,13 +3004,11 @@ int pc_upstream_fwd_through(const char *col, size_t collen, int op,
 		guess = UPWG_GONE;
 		break;
 	case 2:
-		/* LLONG_MIN has no positive twin: it goes as a negative increment */
-		av[ac] = delta < 0 && delta != LLONG_MIN ? "DECRBY" : "INCRBY";
-		al[ac++] = 6;
+		av[ac] = delta < 0 ? "DECRBY" : "INCRBY"; al[ac++] = 6;
 		av[ac] = key; al[ac++] = klen;
 		av[ac] = db;
 		al[ac++] = (size_t)snprintf(db, sizeof db, "%lld",
-			delta < 0 && delta != LLONG_MIN ? -delta : delta);
+			delta < 0 ? -delta : delta);
 		if (ttl_rel != PCACHE_EXP_PRESERVE) {
 			a2[0] = ttl_rel ? "EXPIRE" : "PERSIST";
 			l2[0] = ttl_rel ? 6 : 7;
@@ -3287,8 +3216,6 @@ static int bcast_prefixes(const struct up_col *uc, const char **pv, size_t *pl,
 	return i < uc->npat ? 0 : n;
 }
 
-static void inv_down(struct up_srv *s, struct uconn *c);
-
 /* this connection hears every change Redis makes under the collection's prefixes, not only
  * the keys fetched through it */
 static void bcast_on(struct up_srv *s, struct uconn *c, long long dl)
@@ -3310,24 +3237,19 @@ static void bcast_on(struct up_srv *s, struct uconn *c, long long dl)
 		av[n] = "PREFIX"; al[n++] = 6;
 		av[n] = pv[i]; al[n++] = pl[i];
 	}
-	if (send_cmd(c, dl, n, av, al) != 0 || read_reply(c, &v, dl) != 0) {
-		/* no answer is no refusal: a late +OK would leave Redis broadcasting unseen */
-		LM_WARN("collection '%s': %s did not answer CLIENT TRACKING ON BCAST in "
-			"time - the tracking connection is dialled again\n", uc->name,
-			s->addr);
-		inv_down(s, c);
-		return;
+	ok = send_cmd(c, dl, n, av, al) == 0 && read_reply(c, &v, dl) == 0;
+	if (ok) {
+		ok = is_ok(&v);
+		if (!ok)
+			LM_WARN("collection '%s': %s refused broadcast tracking "
+				"(%.*s) - a change another Redis client makes to a "
+				"key written through here is NOT seen until the key "
+				"expires.  Allow CLIENT TRACKING for the upstream user "
+				"(Redis 6+)\n", uc->name, s->addr,
+				(int)(v.s ? (v.len < 120 ? v.len : 120) : 1),
+				v.s ? v.s : "?");
+		rv_free(&v);
 	}
-	ok = is_ok(&v);
-	if (!ok)
-		LM_WARN("collection '%s': %s refused broadcast tracking "
-			"(%.*s) - a change another Redis client makes to a "
-			"key written through here is NOT seen until the key "
-			"expires.  Allow CLIENT TRACKING for the upstream user "
-			"(Redis 6+)\n", uc->name, s->addr,
-			(int)(v.s ? (v.len < 120 ? v.len : 120) : 1),
-			v.s ? v.s : "?");
-	rv_free(&v);
 	__atomic_store_n(&s->bcast, ok ? 1 : -1, __ATOMIC_RELAXED);
 	if (ok)
 		LM_NOTICE("collection '%s': broadcast tracking on %s - %s\n",
@@ -3390,7 +3312,7 @@ static void *inv_loop(void *arg)
 				int w;
 
 				if (__atomic_load_n(&s->is_sentinel, __ATOMIC_RELAXED))
-					goto out;          /* a sentinel: no data to track */
+					return NULL;       /* a sentinel: no data to track */
 				for (w = 0; w < 10 && !uc->stop; w++)
 					nap_ms(100);
 				continue;
@@ -3400,7 +3322,8 @@ static void *inv_loop(void *arg)
 					"- no tracking: a fetched copy lives at most "
 					"upstream_negative_ms (%d ms)\n", uc->name,
 					uc->neg_ms);
-				goto out;
+				uc_close(&c);
+				return NULL;
 			}
 			if (!c.run_id[0]) {
 				LM_WARN("collection '%s': the upstream does not say "
@@ -3410,17 +3333,17 @@ static void *inv_loop(void *arg)
 					"a fetched copy lives at most upstream_negative_ms "
 					"(%d ms).  Allow +info for the upstream user and "
 					"restart\n", uc->name, uc->neg_ms);
-				goto out;
+				uc_close(&c);
+				return NULL;
 			}
-			memset(&v, 0, sizeof v);
 			if (send_cmd(&c, dl, 2, av, al) != 0 ||
 			    read_reply(&c, &v, dl) != 0 || v.t != ':') {
 				if (!said++)
 					LM_NOTICE("collection '%s': the upstream does "
 						"not answer CLIENT ID - no tracking\n",
 						uc->name);
-				rv_free(&v);
-				goto out;
+				uc_close(&c);
+				return NULL;
 			}
 			/* the server first, then the id: a fetch connection that
 			 * sees the id compares against this server */
@@ -3436,8 +3359,6 @@ static void *inv_loop(void *arg)
 				"%.12s\n", uc->name, s->addr, s->inv_id, c.run_id);
 			if (uc->through)
 				bcast_on(s, &c, now_ms() + uc->timeout_ms);
-			if (c.fd < 0)
-				continue;          /* no answer to BCAST: dialled again */
 		}
 		rc = read_reply(&c, &v, now_ms() + 1000);
 		rewarm_tick(uc);               /* at most once a second when quiet */
@@ -3452,7 +3373,6 @@ static void *inv_loop(void *arg)
 		}
 		rv_free(&v);                   /* not a push: nothing asked */
 	}
-out:
 	uc_close(&c);
 	free(c.buf);
 	return NULL;
@@ -3660,11 +3580,9 @@ static void *conn_main(void *arg)
 				ST_ADD(uc->cl_moved, 1);
 				cl_kick(uc);
 			}
-			if (e->redirs < 3 && !uc->stop) {
-				k = cl_redirect_to(uc, e->rhost, e->rport);
-				if (k < 0)
-					cl_kick(uc);       /* a node the map lacks: asked again */
-			}
+			if (e->redirs < 3 && !uc->stop)
+				k = uc->discover == PC_UP_DISC_NO ? cl_srv_find(uc, e->rhost, e->rport)
+					: srv_add(uc, e->rhost, e->rport, UPO_CLUSTER);
 			pthread_mutex_lock(&uc->mx);
 			unbusy(s);
 			if (k >= 0) {
@@ -4346,8 +4264,6 @@ static int rb_read_at(struct uconn *c, long long dl, const char *k, size_t kl,
 	if (!rb->key) {
 		free(rb->val);
 		rb->val = NULL;
-		rb->vlen = 0;
-		rb->what = UPRB_RELEASE;
 		return 0;                      /* nothing applied for it */
 	}
 	memcpy(rb->key, k, kl);
@@ -4946,10 +4862,6 @@ static int wt_get(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 	for (k = 0; k < n2; k++) {
 		if ((rc = read_reply(c, &v2, dl)) != 0)
 			goto io_rc;
-		if ((v2.t == '-' || v2.t == '!') && v2.s)
-			/* the first applied, its trailing EXPIRE or PERSIST refused */
-			wt_err_add(uc, "redis", j->argv[0], j->argl[0], NULL, 0,
-				v2.s, v2.len);
 		rv_free(&v2);
 	}
 	if (nk) {
@@ -4976,10 +4888,9 @@ static int wt_get(struct up_col *uc, struct uconn *c, struct up_wjob *j,
 		}
 		ST_ADD(uc->upf_answered, 1);
 	}
-	if (iserr || (isnil && !j->upfill && !j->unk)) {
+	if (iserr || (isnil && !j->upfill)) {
 		/* refused or not applied: the fleet keeps what it had - but an upfill's NX that
-		 * Redis declined reads the key back all the same: Redis's value wins.  A passed
-		 * command's nil may be an old value (GETSET): its read-back stands */
+		 * Redis declined reads the key back all the same: Redis's value wins */
 		rb_free(rb, nk);
 		rb = NULL;
 		nk = 0;
@@ -5173,42 +5084,14 @@ static struct uconn *wr_conn(struct up_col *uc, struct uconn *wc, int m)
 	return c;
 }
 
-/* RedisJSON asked again on the open master connections while it is missing: one answer
- * that has it lets JSON writes through again */
-static void wr_json_recheck(struct up_col *uc, struct uconn *wc)
-{
-	int m, n = srv_n(uc);
-
-	for (m = 0; m < n; m++) {
-		struct uconn *c = &wc[m];
-		int js;
-
-		if (!c->uc || c->fd < 0)
-			continue;
-		js = wt_json_check(c);
-		if (js < 0)
-			uc_close(c);
-		else if (js > 0) {
-			__atomic_store_n(&uc->w_json, 1, __ATOMIC_RELAXED);
-			LM_NOTICE("collection '%s': the master %s has RedisJSON now - JSON "
-				"writes are forwarded\n", uc->name, c->s->addr);
-			return;
-		}
-	}
-}
-
 /* a job a MOVED sent back, run once on the node it names */
 static void wr_moved(struct up_col *uc, struct uconn *wc, struct up_wjob *j)
 {
-	int k = cl_redirect_to(uc, j->mhost, j->mport);
+	int k = uc->discover == PC_UP_DISC_NO ? cl_srv_find(uc, j->mhost, j->mport)
+		: srv_add(uc, j->mhost, j->mport, UPO_CLUSTER);
 	struct uconn *c = k >= 0 ? wr_conn(uc, wc, k) : NULL;
 
 	j->moved = 2;
-	if (k < 0) {
-		wt_fail(uc, j, "upstream: the Redis Cluster moved the key's slot to a node its "
-			"map does not list yet - write not applied, retry");
-		return;
-	}
 	if (!c) {
 		wt_fail(uc, j, "upstream: the node the Redis Cluster moved the key's slot "
 			"to is not reachable - write not applied");
@@ -5554,17 +5437,9 @@ static int wt_gate(struct up_col *uc, const char *const *keys,
 	if (!fw->unk) {
 		for (i = 0; i < nkeys; i++)
 			if (allowed(uc, keys[i], kl[i]))
-				any++;
+				any = 1;
 		if (!any)
 			return PC_UPG_PROCEED;     /* not the upstream's keys: here */
-		if (any < nkeys) {
-			/* sent whole it would write the keys outside the prefixes at Redis */
-			g->err = "upstream_writes = through: this command mixes keys "
-				"inside and outside upstream_prefixes - send them apart";
-			wt_refused_note(uc, fw->argc > 0 ? fw->argv[0] : NULL,
-				fw->argc > 0 ? fw->argl[0] : 0, g->err);
-			return PC_UPG_ANSWERED;
-		}
 	}
 	if (wt_too_big(fw)) {
 		g->err = "value too large";        /* as on any collection */
@@ -5642,7 +5517,6 @@ int pc_upstream_gate_fw(pcache_htable_t *ht, const char *col, size_t collen,
 	struct up_col *uc;
 
 	memset(g, 0, sizeof *g);
-	lost_uc = NULL;                    /* armed again by the door after a read */
 	relay_drop();                      /* one re-run's, never the next command's */
 	if (rl_cur && verdict != PC_UPV_NONE) {
 		rl_live = rl_cur;
@@ -5939,10 +5813,6 @@ static void *wr_main(void *arg)
 				next_own = now + wt_owned_ms();
 				wt_count_owned(uc);
 			}
-			if (now >= next_json && !__atomic_load_n(&uc->w_json, __ATOMIC_RELAXED)) {
-				next_json = now + WT_JSON_MS;
-				wr_json_recheck(uc, wc);
-			}
 			wr_cluster(uc, batch, nb, wc);
 			__atomic_store_n(&uc->w_inflight, 0, __ATOMIC_RELAXED);
 			continue;
@@ -6065,12 +5935,7 @@ static void *wr_main(void *arg)
 				wt_job_free(j);
 				continue;
 			}
-			if (j->unk && !uk) {
-				wt_fail(uc, j, "upstream: out of memory - the command is not "
-					"passed");
-				wt_job_free(j);
-				continue;
-			} else if (j->unk)
+			if (j->unk)
 				rc = wt_unknown(uc, &c, uk, j);
 			else
 				rc = wt_run(uc, &c, j, j->kidx, j->nkeys);
@@ -6330,7 +6195,6 @@ static int drain_batch(struct uconn *c, char **ks, size_t *kl, int n, int *big)
 		struct rv ty, tt, gv;
 		char tname[32];
 		size_t tn;
-		int gone;
 
 		if ((rc = read_reply(c, &ty, dl)) != 0)
 			goto fail;
@@ -6345,15 +6209,12 @@ static int drain_batch(struct uconn *c, char **ks, size_t *kl, int n, int *big)
 			goto fail;
 		}
 		ST_ADD(uc->dr_scanned, 1);
-		gone = tt.t == ':' && tt.n == -2;
-		exps[i] = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;
-		rv_free(&tt);                  /* an integer; an upstream may send anything */
-		if (!strcmp(tname, "none") || gone) {
-			exps[i] = 0;
+		if (!strcmp(tname, "none") || (tt.t == ':' && tt.n == -2)) {
 			ST_ADD(uc->dr_absent, 1);
 			rv_free(&gv);
 			continue;
 		}
+		exps[i] = tt.t == ':' && tt.n >= 0 ? pttl_ticks(tt.n) : 0;
 		if (!strcmp(tname, "string")) {
 			if (gv.t == '$' || gv.t == '+')
 				pull_post(uc, ks[i], kl[i], gv.s, gv.len, exps[i], 0);
@@ -7251,12 +7112,10 @@ static int drain_ctl(struct up_col *uc, int stop, const char **msg)
  * rediss:// the same, over TLS */
 static int parse_url(struct up_srv *s, const char *url)
 {
-	const char *p, *at, *slash;
+	const char *p = url + (strncmp(url, "rediss://", 9) ? 8 : 9), *at = strchr(p, '@'), *slash;
 
 	if (strncmp(url, "redis://", 8) && strncmp(url, "rediss://", 9))
 		return -1;
-	p = url + (strncmp(url, "rediss://", 9) ? 8 : 9);
-	at = strchr(p, '@');
 	if (at) {
 		size_t ul = (size_t)(at - p);
 
@@ -7525,20 +7384,11 @@ int srv_add(struct up_col *uc, const char *host, int port, int origin)
 	}
 	pthread_cond_init(&s->cv, NULL);
 	pthread_mutex_init(&s->run_mx, NULL);
-	for (j = 0; j < uc->conns; j++)
-		if (pthread_create(&s->thr[s->nthr], NULL, conn_main, s) == 0)
-			s->nthr++;
-	if (!s->nthr) {
-		/* nothing would serve its queue: not published (the next add takes the slot) */
-		LM_ERR("collection '%s': cannot start a connection thread for %s - it is not "
-			"used\n", uc->name, s->addr);
-		pthread_cond_destroy(&s->cv);
-		pthread_mutex_destroy(&s->run_mx);
-		pthread_mutex_unlock(&uc->add_mx);
-		return -1;
-	}
 	if (uc->tracking && pthread_create(&s->inv_thr, NULL, inv_main, s) == 0)
 		s->has_inv = 1;
+	for (j = 0; j < uc->conns; j++)
+		if (pthread_create(&s->thr[j], NULL, conn_main, s) == 0)
+			s->nthr++;
 	pcache_ht_set_shadow(uc->srv[n - 1].shadow, s->shadow);
 	__atomic_store_n(&uc->nsrv, n + 1, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&uc->add_mx);
@@ -7916,15 +7766,6 @@ void pc_upstream_shutdown(void)
 				pthread_join(s->inv_thr, NULL);
 				s->has_inv = 0;
 			}
-		}
-		/* the topology threads, after every thread that may start them */
-		if (uc->sen_joinable) {
-			pthread_join(uc->sen_thr, NULL);
-			uc->sen_joinable = 0;
-		}
-		if (uc->cl_joinable) {
-			pthread_join(uc->cl_thr, NULL);
-			uc->cl_joinable = 0;
 		}
 	}
 }

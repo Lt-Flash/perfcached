@@ -52,7 +52,7 @@ static void tell(struct rd *r, int cmd)
 int main(void)
 {
 	struct rd a = { 0 }, b = { 0 };
-	unsigned long long s0, s1, s2, s3, s4, s5;
+	unsigned long long s0, s1, s2, s3, s4;
 	unsigned int lines, inside;
 
 	pthread_create(&a.t, NULL, reader, &a);
@@ -101,16 +101,6 @@ int main(void)
 	tell(&a, CMD_EXIT);
 	CHK(pc_qs_clear(s4), "an unattached thread's enter is not a hold");
 	pc_qs_exit();
-
-	/* nested: an inner pair keeps the outer section's epoch and does not end it */
-	tell(&b, CMD_ENTER);
-	s5 = pc_qs_stamp();
-	tell(&b, CMD_ENTER);
-	CHK(!pc_qs_clear(s5), "B entered again inside: its outer epoch still holds s5");
-	tell(&b, CMD_EXIT);
-	CHK(!pc_qs_clear(s5), "the inner exit does not park B: s5 still held");
-	tell(&b, CMD_EXIT);
-	CHK(pc_qs_clear(s5), "the outer exit does: s5 clear");
 
 	tell(&a, CMD_QUIT);
 	tell(&b, CMD_QUIT);

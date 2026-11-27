@@ -185,25 +185,5 @@ else
 	for n in 9 10 11; do eval "kill \$PR$n" 2>/dev/null; done
 fi
 
-echo "--- 6: what a restart reads from the file"
-conf d12 12 239.255.77.99
-mkdir -p "$D/state-d12"
-printf 'perfcached-cluster-id 1\nnot-a-uuid\n' > "$D/state-d12/cluster-id"
-start d12; P12=$P
-wait_for 30 'I12=$(stat 12 cluster_id); [ -n "$I12" ] && [ "$I12" != "?" ]'
-grep -q "cluster-id is unreadable" "$D/d12.log" && python3 -c 'import sys,uuid
-sys.exit(0 if uuid.UUID(sys.argv[1]).version==7 else 1)' "$I12" 2>/dev/null \
-	&& ok "a damaged file is unreadable: ignored, and a new id founded ($I12)" \
-	|| bad "a damaged file was read as an id (${I12:-none}) - its second line hashed into one"
-kill $P12; wait $P12 2>/dev/null
-PROV=0190a1b2-c3d4-7e5f-8a6b-1c2d3e4f5a6b
-printf 'perfcached-cluster-id 1\n%s\nprovisional\n' "$PROV" > "$D/state-d12/cluster-id"
-start d12; P12=$P
-wait_for 15 '[ "$(stat 12 cluster_id)" = "$PROV" ]' || bad "the provisional id was not loaded ($(stat 12 cluster_id))"
-[ "$(stat 12 cluster_id_state)" = provisional ] \
-	&& ok "an id written inside its grace loads provisional: two founders restarted then still settle" \
-	|| bad "an id written inside its grace loaded as $(stat 12 cluster_id_state) - two founders restarted in grace stay split"
-kill $P12; wait $P12 2>/dev/null
-
 echo "clusteridtest: $pass passed, $fail failed"
 [ $fail -eq 0 ]

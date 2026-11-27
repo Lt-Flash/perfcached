@@ -72,7 +72,7 @@ void clboot_handoff(struct clboot *b, pthread_mutex_t *mx,
 		b->cand[i] = addr[i];
 		b->cand_node[i] = id[i];
 	}
-	b->ncand = i;
+	b->ncand = n;
 	b->pending = 1;
 	pthread_mutex_unlock(mx);
 }

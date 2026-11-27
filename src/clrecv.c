@@ -61,12 +61,13 @@ void handle_migrate(const unsigned char *pt, size_t n,
 	struct clmig_single sg;
 	uint32_t req, ttl_left;
 	unsigned int cn, kn, vlen, exp = 0;
-	unsigned long long tv;
 	int ok = 0;
 	str k, v;
 	char colz[256];
 
-	if (!clmig_single_parse(pt, n, &sg))
+	/* CLMIG_RHDR, deliberately: this frame's own header is 14, but 19 is what a peer has always
+	 * seen required here */
+	if (n < CLMIG_RHDR || !clmig_single_parse(pt, n, &sg))
 		return;
 	req = sg.req;
 	ttl_left = sg.ttl_left;
@@ -77,15 +78,14 @@ void handle_migrate(const unsigned char *pt, size_t n,
 	colz[cn] = 0;
 
 	ht = pc_store_find(colz, cn);
-	/* the frame carries no version: never over a copy held here, nor past a delete seen */
-	if (ht && kn && kn <= 4096 && !(pc_neg_ver(colz, cn, sg.key, kn, &tv) && tv)) {
+	if (ht) {
 		k.s = (char *)sg.key;
 		k.len = (int)kn;
 		v.s = (char *)sg.val;
 		v.len = (int)vlen;
 		if (ttl_left)                   /* as apply_rec's */
 			exp = pc_upstream_copy_exp(sg.col, cn, ttl_left);
-		ok = pcache_ht_store_ver(ht, &k, &v, exp, 0, 1) == 0;
+		ok = pcache_ht_store(ht, &k, &v, exp) == 0;
 		if (ok) {
 			pc_wal_upsert(colz, k.s, k.len, v.s, v.len, exp,
 				pcache_last_ver);
@@ -102,9 +102,7 @@ void handle_migrate(const unsigned char *pt, size_t n,
 /* the version each dropped copy was dropped FOR, so an OLDER copy taking the freed cell is refused;
  * lossy and never expired, as a copy older than a written version is stale whatever follows */
 #define DROPFLOOR_SLOTS  65536
-/* (h, ver) change as one under the slot's sequence: odd while a writer holds it, and the
- * writers are many (apply threads, relay receive, the peer and bulk threads) */
-static struct { uint32_t seq; uint64_t h, ver; } dropfloor[DROPFLOOR_SLOTS];
+static struct { uint64_t h, ver; } dropfloor[DROPFLOOR_SLOTS];
 static int dropfloor_any;
 
 static void dropfloor_note(const char *col, size_t cn, const str *k,
@@ -112,20 +110,15 @@ static void dropfloor_note(const char *col, size_t cn, const str *k,
 {
 	uint64_t h = clloc_hash(col, cn, k->s, (size_t)k->len) | 1;
 	size_t i = (size_t)(h & (DROPFLOOR_SLOTS - 1));
-	uint32_t s = __atomic_load_n(&dropfloor[i].seq, __ATOMIC_RELAXED);
 
-	for (;;) {
-		if (s & 1)
-			s = __atomic_load_n(&dropfloor[i].seq, __ATOMIC_RELAXED);
-		else if (__atomic_compare_exchange_n(&dropfloor[i].seq, &s, s + 1, 0,
-		        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-			break;
-	}
-	if (dropfloor[i].h != h || dropfloor[i].ver < ver) {
-		__atomic_store_n(&dropfloor[i].h, h, __ATOMIC_RELAXED);
-		__atomic_store_n(&dropfloor[i].ver, (uint64_t)ver, __ATOMIC_RELAXED);
-	}
-	__atomic_store_n(&dropfloor[i].seq, s + 2, __ATOMIC_RELEASE);
+	if (__atomic_load_n(&dropfloor[i].h, __ATOMIC_ACQUIRE) == h &&
+	        __atomic_load_n(&dropfloor[i].ver, __ATOMIC_ACQUIRE) >= ver)
+		return;
+	/* ver cleared first: a reader that sees the new h with the old
+	 * key's version re-reads h after it, and a 0 floor refuses nothing */
+	__atomic_store_n(&dropfloor[i].ver, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&dropfloor[i].h, h, __ATOMIC_RELEASE);
+	__atomic_store_n(&dropfloor[i].ver, (uint64_t)ver, __ATOMIC_RELEASE);
 	__atomic_store_n(&dropfloor_any, 1, __ATOMIC_RELEASE);
 }
 
@@ -134,20 +127,16 @@ int dropfloor_refuses(const char *col, size_t cn, const char *key,
 		size_t kn, unsigned long long ver)
 {
 	uint64_t h, v;
-	uint32_t s;
 	size_t i;
 
 	if (!__atomic_load_n(&dropfloor_any, __ATOMIC_RELAXED))
 		return 0;
 	h = clloc_hash(col, cn, key, kn) | 1;
 	i = (size_t)(h & (DROPFLOOR_SLOTS - 1));
-	/* a slot mid-write reads as no floor, which refuses nothing */
-	s = __atomic_load_n(&dropfloor[i].seq, __ATOMIC_ACQUIRE);
-	if (s & 1 || __atomic_load_n(&dropfloor[i].h, __ATOMIC_RELAXED) != h)
+	if (__atomic_load_n(&dropfloor[i].h, __ATOMIC_ACQUIRE) != h)
 		return 0;
-	v = __atomic_load_n(&dropfloor[i].ver, __ATOMIC_RELAXED);
-	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	if (__atomic_load_n(&dropfloor[i].seq, __ATOMIC_RELAXED) != s)
+	v = __atomic_load_n(&dropfloor[i].ver, __ATOMIC_ACQUIRE);
+	if (__atomic_load_n(&dropfloor[i].h, __ATOMIC_ACQUIRE) != h)
 		return 0;
 	if (!v || ver >= v)
 		return 0;
@@ -312,9 +301,6 @@ void handle_migrate_many(const unsigned char *pt, size_t n,
 		 * the datagram; what was stored is still acked */
 		if (!clmig_rec_parse(pt, n, &off, &r))
 			break;
-		/* the key limit every other plane assumes, as the bulk receive refuses it */
-		if (!r.klen || r.klen > 4096)
-			continue;
 		cn = r.collen;
 		ar.col = (const unsigned char *)r.col;
 		ar.collen = cn;

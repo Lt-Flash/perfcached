@@ -35,8 +35,8 @@ static void resp_cl_id(char *out, const struct pc_member *m)
 	} else {
 		for (i = 0; i < 40; i++)
 			out[i] = '0';
-		for (i = 0; i < 4; i++)
-			out[36 + i] = hx[(m->node >> ((3 - i) * 4)) & 0xF];
+		out[38] = hx[(m->node >> 4) & 0xF];
+		out[39] = hx[m->node & 0xF];
 	}
 }
 
@@ -89,30 +89,28 @@ static int resp_cl_owner(const struct pc_member *mem, int nm, unsigned slot)
 	return -1;
 }
 
-#define CL_NOOWN 0xFFFF
-
-/* the owning member INDEX for every slot (CL_NOOWN: none), once per reply: SLOTS and SHARDS walk
- * the same array, so they cannot disagree */
+/* the owning member INDEX for every slot (0xFF: none), once per reply: SLOTS and SHARDS walk the
+ * same array, so they cannot disagree */
 static void resp_cl_ownmap(const struct pc_member *mem, int nm,
-		uint16_t *ownv)
+		unsigned char *ownv)
 {
 	int s;
 
 	for (s = 0; s < PC_SLOTS; s++) {
 		int o = resp_cl_owner(mem, nm, (unsigned)s);
 
-		ownv[s] = o < 0 ? CL_NOOWN : (uint16_t)o;
+		ownv[s] = o < 0 ? 0xFF : (unsigned char)o;
 	}
 }
 
 /* number of maximal equal-owner runs, counting only @who when it is
  * >= 0 (SHARDS asks per member) or every owner when it is -1 */
-static int resp_cl_runs(const uint16_t *ownv, int who)
+static int resp_cl_runs(const unsigned char *ownv, int who)
 {
 	int s, n = 0;
 
 	for (s = 0; s < PC_SLOTS; s++) {
-		if (ownv[s] == CL_NOOWN || (who >= 0 && ownv[s] != who))
+		if (ownv[s] == 0xFF || (who >= 0 && ownv[s] != who))
 			continue;
 		if (!s || ownv[s - 1] != ownv[s])
 			n++;
@@ -125,8 +123,8 @@ static int resp_cl_runs(const uint16_t *ownv, int who)
 static pthread_mutex_t clmap_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { unsigned long long key; char *buf; size_t len; } clmap_cache[2];
 
-/* FNV-1a over everything the reply depends on - the placement map's content, members, ids,
- * doors, state, in snapshot order (self first, so it differs per node) */
+/* FNV-1a over everything the reply depends on - members, doors, state, in snapshot order (self
+ * first, so it differs per node); placement reads the same table, so a moved slot changes it */
 static unsigned long long resp_clmap_key(const struct pc_member *mem,
 		int nm, int shards)
 {
@@ -135,17 +133,7 @@ static unsigned long long resp_clmap_key(const struct pc_member *mem,
 #define CLMAP_MIX(_x) do { h = fnv1a64_u64(h, (uint64_t)(_x)); } while (0)
 	CLMAP_MIX(nm);
 	CLMAP_MIX(shards);
-	CLMAP_MIX(pc_cluster_map_place());
-	CLMAP_MIX(pc_cluster_map_usable());
 	for (i = 0; i < nm; i++) {
-		uint64_t id0, id1;
-
-		memcpy(&id0, mem[i].ident, 8);
-		memcpy(&id1, mem[i].ident + 8, 8);
-		CLMAP_MIX(mem[i].has_ident);
-		CLMAP_MIX(id0);
-		CLMAP_MIX(id1);
-		CLMAP_MIX(mem[i].incarn);
 		CLMAP_MIX(mem[i].addr.s_addr);
 		CLMAP_MIX(mem[i].node);
 		CLMAP_MIX(mem[i].state);
@@ -260,13 +248,13 @@ int rh_cluster(struct resp_ctx *c)
 		/* the LEGACY text topology redis-benchmark --cluster opens with: no cluster bus, so cport
 		 * repeats the port; no replicas, so flags are master (myself) and the master field "-" */
 		struct pc_jw tw;
-		uint16_t *ownv;
+		unsigned char *ownv;
 		int i, s;
 
 		/* tw is a STACK local: pc_jw_init_heap() refuses a writer
 		 * whose len is nonzero, and dirty stack reads as exactly that */
 		memset(&tw, 0, sizeof tw);
-		ownv = malloc(PC_SLOTS * sizeof *ownv);
+		ownv = malloc(PC_SLOTS);
 		if (!ownv) {
 			resp_err(c->out, "out of memory building the "
 				"slot map");
@@ -330,7 +318,7 @@ int rh_cluster(struct resp_ctx *c)
 		int is_shards = resp_is(sub, subl, "SHARDS");
 		unsigned long long key = resp_clmap_key(mem, nm, is_shards);
 		struct pc_jw tw;
-		uint16_t *ownv;
+		unsigned char *ownv;
 		int i, s, nr;
 
 		/* serve the last build while the membership
@@ -343,7 +331,7 @@ int rh_cluster(struct resp_ctx *c)
 		memset(&tw, 0, sizeof tw);
 		/* per call, not a static: workers are THREADS, and a shared
 		 * buffer would mix one reply into another's walk */
-		ownv = malloc(PC_SLOTS * sizeof *ownv);
+		ownv = malloc(PC_SLOTS);
 		if (!ownv) {
 			resp_err(c->out, "out of memory building the "
 				"slot map");
@@ -364,7 +352,7 @@ int rh_cluster(struct resp_ctx *c)
 			for (s = 0; s < PC_SLOTS; s++) {
 				int e;
 
-				if (ownv[s] == CL_NOOWN)
+				if (ownv[s] == 0xFF)
 					continue;
 				if (s && ownv[s - 1] == ownv[s])
 					continue;

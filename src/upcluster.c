@@ -198,11 +198,6 @@ static int cl_seed_of(struct up_col *uc, const char *host, int port)
 	return k;
 }
 
-int cl_redirect_to(struct up_col *uc, const char *host, int port)
-{
-	return cl_seed_of(uc, host, port);
-}
-
 static int ask(struct uconn *c, int argc, const char **av, struct rv *v)
 {
 	size_t al[4];
@@ -220,18 +215,12 @@ static int cl_ask(struct up_col *uc, const struct up_srv *s, struct cl_shard *sh
 {
 	struct uconn c;
 	struct rv v;
-	int rc = -1, port;
-	char host[sizeof s->host];
+	int rc = -1;
 
 	memset(&c, 0, sizeof c);
 	c.uc = uc;
 	c.fd = -1;
-	/* a reused slot rewrites its address under run_mx */
-	pthread_mutex_lock((pthread_mutex_t *)&s->run_mx);
-	memcpy(host, s->host, sizeof host);
-	port = s->port;
-	pthread_mutex_unlock((pthread_mutex_t *)&s->run_mx);
-	if (uc_open(&c, host, port, now_ms() + CL_TIMEOUT_MS) != 0)
+	if (uc_open(&c, s->host, s->port, now_ms() + CL_TIMEOUT_MS) != 0)
 		return -1;
 	if (uc->password) {
 		const char *av[3] = { "AUTH", s->user[0] ? s->user : uc->password,
@@ -407,7 +396,7 @@ void cl_start(struct up_col *uc)
 		__atomic_store_n(&uc->cl_started, 0, __ATOMIC_RELEASE);
 		return;
 	}
-	uc->cl_joinable = 1;
+	pthread_detach(uc->cl_thr);
 }
 
 uint32_t cl_key_nodes(const struct up_col *uc, const char *k, size_t kl, int *master)

@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -335,13 +334,10 @@ torn:
 struct tomb {
 	struct tomb *next;
 	unsigned long long ver;
-	unsigned int exp;                  /* a pending touch's expiry */
 	int len;                           /* col '\0' key */
 	char k[];
 };
 static struct tomb **tombs;
-/* a touch read before its key's upsert (another ring): applied when an older upsert lands */
-static struct tomb **touches;
 
 static unsigned int tomb_hash(const char *s, int n)
 {
@@ -363,58 +359,40 @@ static int tomb_key(char *out, const char *col, int collen, const char *key,
 	return collen + 1 + klen;
 }
 
-static unsigned long long tab_get(struct tomb **tab, const char *k, int n,
-		unsigned int *exp)
+static unsigned long long tomb_get(const char *k, int n)
 {
 	struct tomb *t;
 
-	if (!tab)
+	if (!tombs)
 		return 0;
-	for (t = tab[tomb_hash(k, n)]; t; t = t->next)
-		if (t->len == n && !memcmp(t->k, k, (size_t)n)) {
-			if (exp)
-				*exp = t->exp;
+	for (t = tombs[tomb_hash(k, n)]; t; t = t->next)
+		if (t->len == n && !memcmp(t->k, k, (size_t)n))
 			return t->ver;
-		}
 	return 0;
 }
 
-static void tab_note(struct tomb ***tabp, const char *k, int n,
-		unsigned long long ver, unsigned int exp)
+static void tomb_note(const char *k, int n, unsigned long long ver)
 {
 	struct tomb *t;
 	unsigned int h;
 
-	if (!*tabp && !(*tabp = calloc(TOMB_BUCKETS, sizeof **tabp)))
+	if (!tombs && !(tombs = calloc(TOMB_BUCKETS, sizeof *tombs)))
 		return;                        /* no memory: file order it is */
 	h = tomb_hash(k, n);
-	for (t = (*tabp)[h]; t; t = t->next)
+	for (t = tombs[h]; t; t = t->next)
 		if (t->len == n && !memcmp(t->k, k, (size_t)n)) {
-			if (ver > t->ver) {
+			if (ver > t->ver)
 				t->ver = ver;
-				t->exp = exp;
-			}
 			return;
 		}
 	t = malloc(sizeof *t + (size_t)n);
 	if (!t)
 		return;
 	t->ver = ver;
-	t->exp = exp;
 	t->len = n;
 	memcpy(t->k, k, (size_t)n);
-	t->next = (*tabp)[h];
-	(*tabp)[h] = t;
-}
-
-static unsigned long long tomb_get(const char *k, int n)
-{
-	return tab_get(tombs, k, n, NULL);
-}
-
-static void tomb_note(const char *k, int n, unsigned long long ver)
-{
-	tab_note(&tombs, k, n, ver, 0);
+	t->next = tombs[h];
+	tombs[h] = t;
 }
 
 /* the tombstone key's buffer, grown to fit: the store takes keys to 64 KB */
@@ -434,26 +412,20 @@ static char *tk_get(size_t need)
 	return tk_buf;
 }
 
-static void tab_free(struct tomb ***tabp)
+static void tomb_free(void)
 {
 	unsigned int i;
 	struct tomb *t, *n;
 
-	if (!*tabp)
+	if (!tombs)
 		return;
 	for (i = 0; i < TOMB_BUCKETS; i++)
-		for (t = (*tabp)[i]; t; t = n) {
+		for (t = tombs[i]; t; t = n) {
 			n = t->next;
 			free(t);
 		}
-	free(*tabp);
-	*tabp = NULL;
-}
-
-static void tomb_free(void)
-{
-	tab_free(&tombs);
-	tab_free(&touches);
+	free(tombs);
+	tombs = NULL;
 	free(tk_buf);
 	tk_buf = NULL;
 	tk_cap = 0;
@@ -475,7 +447,6 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 	str k, v;
 	unsigned int exp;
 	unsigned long long tv = 0;          /* a touch meets this */
-	int trc = 0;
 
 	/* a newer build's record, bounded by the next known one: at or under the marker
 	 * the snapshot holds what it did; above, or last in the log, pc_recover refuses */
@@ -593,16 +564,9 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 			if (rc == -2)
 				pcache_ht_drop_older(ht, &k, ver);
 			if (rc == 0) {
-				unsigned int texp = 0;
-				unsigned long long ptv = tk ? tab_get(touches, tk,
-					tomb_key(tk, col, collen, key, klen), &texp) : 0;
-
 				if (ver > c->st->ver_high)
 					c->st->ver_high = ver;
 				c->st->wal_applied++;
-				/* a newer touch read before this upsert: its expiry wins */
-				if (ptv > ver && pcache_ht_touch(ht, &k, texp) == 1)
-					pcache_ht_setver(ht, &k, ptv);
 			}
 			return 0;
 		}
@@ -669,19 +633,10 @@ static int replay_cb(int type, const char *col, int collen, const char *key,
 		           tv >= ver) {
 			c->st->wal_older++;        /* an older touch */
 			return 0;
-		} else if ((trc = pcache_ht_touch(ht, &k, exp)) == 1 && ver) {
+		} else if (pcache_ht_touch(ht, &k, exp) == 1 && ver) {
 			/* put back the version the touch ticked when logged,
 			 * not the fresh tick the replay just made */
 			pcache_ht_setver(ht, &k, ver);
-			if (ver > c->st->ver_high)
-				c->st->ver_high = ver;
-		} else if (trc == 0 && ver) {
-			/* no key yet: its upsert may follow from another ring */
-			char *tk = tk_get((size_t)collen + 1 + (size_t)klen);
-
-			if (tk)
-				tab_note(&touches, tk, tomb_key(tk, col, collen, key, klen),
-					ver, exp);
 			if (ver > c->st->ver_high)
 				c->st->ver_high = ver;
 		}
@@ -731,19 +686,9 @@ int pc_recover(const char *dir, struct pc_recover_stats *st)
 	} else if (rc < 0) {
 		/* a cache starts cold rather than refusing: replay everything
 		 * the WAL still holds (marker 0) and say so LOUDLY */
-		char bad[512], aside[560];
-
 		LM_CRIT("recover: the snapshot in %s is missing pieces or "
 			"corrupt - starting from the WAL alone\n", dir);
 		st->marker = 0;
-		/* kept for a look: the checkpoint after recovery would overwrite it */
-		snprintf(bad, sizeof bad, "%s/" PC_RDB_FILE, dir);
-		snprintf(aside, sizeof aside, "%s.bad.%lld", bad, (long long)time(NULL));
-		if (rename(bad, aside) == 0)
-			LM_CRIT("recover: the unreadable snapshot is kept as %s\n", aside);
-		else
-			LM_WARN("recover: could not keep the unreadable snapshot aside "
-				"(%s)\n", strerror(errno));
 	}
 
 	/* the marks that go with the snapshot just loaded, before

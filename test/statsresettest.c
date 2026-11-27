@@ -58,7 +58,6 @@ static int doors, unknowns, sizes, upstreams, httpc, mails, iostats, alerts, mge
 static int cl_on = 1, cl_gets, px_gets, wal_gets, sent_n;
 static long long sent_at;
 static unsigned long long cl_hb, cl_rxq, px_pl, wal_app, wal_seq;
-static unsigned long long cl_tdg, px_srec, px_sga, wal_heals, wal_rw;
 static char tables[3];
 static int ht_resets[3], live[3] = { 1, 0, 1 };
 static int in_reset, overlaps;
@@ -92,7 +91,6 @@ void pc_cluster_get_stats(struct pc_cl_stats *out)
 	memset(out, 0, sizeof *out);
 	out->hb_sent = cl_hb;
 	out->rx_queue = (unsigned int)cl_rxq;
-	out->tomb_dgrams = cl_tdg;
 	cl_gets++;
 }
 
@@ -100,8 +98,6 @@ void pc_proxy_get_stats(struct pc_proxy_stats *out)
 {
 	memset(out, 0, sizeof *out);
 	out->placed_local = px_pl;
-	out->spread_reclaimed = px_srec;
-	out->sweep_gate_asked = px_sga;
 	px_gets++;
 }
 
@@ -110,8 +106,6 @@ void pc_wal_get_stats(struct pc_wal_stats *out)
 	memset(out, 0, sizeof *out);
 	out->appended = wal_app;
 	out->last_seq = wal_seq;
-	out->heals = wal_heals;
-	out->ring_waits = wal_rw;
 	wal_gets++;
 }
 
@@ -266,42 +260,6 @@ int main(void)
 		CHK(doors == r0 + 100 && overlaps == 0,
 			"E: 100 resets from two threads, none overlapping another (S358)");
 	}
-
-	/* F: a reading taken before a reset, subtracted after it stored a newer baseline, reads 0 */
-	cl_on = 1;
-	cl_hb = 40; px_pl = 30; wal_app = 900;
-	pc_stats_reset_at(9000);
-	memset(&cs, 0, sizeof cs);
-	cs.hb_sent = 38;
-	since_cl(&cs);
-	memset(&px, 0, sizeof px);
-	px.placed_local = 29;
-	since_px(&px);
-	memset(&ws, 0, sizeof ws);
-	ws.appended = 899;
-	since_wal(&ws);
-	CHK(cs.hb_sent == 0 && px.placed_local == 0 && ws.appended == 0,
-		"F: readings older than the baseline read 0, not a wrapped figure (%llu, %llu, %llu)",
-		cs.hb_sent, px.placed_local, ws.appended);
-
-	/* G: the counters the tree publishes as running totals all start again (the lists had drifted) */
-	cl_tdg = 70; px_srec = 11; px_sga = 5; wal_heals = 7; wal_rw = 3;
-	pc_stats_reset_at(9500);
-	memset(&cs, 0, sizeof cs);
-	cs.tomb_dgrams = 75;
-	since_cl(&cs);
-	memset(&px, 0, sizeof px);
-	px.spread_reclaimed = 12;
-	px.sweep_gate_asked = 9;
-	since_px(&px);
-	memset(&ws, 0, sizeof ws);
-	ws.heals = 7;
-	ws.ring_waits = 4;
-	since_wal(&ws);
-	CHK(cs.tomb_dgrams == 5 && px.spread_reclaimed == 1 && px.sweep_gate_asked == 4 &&
-		ws.heals == 0 && ws.ring_waits == 1, "G: tomb_dgrams %llu, spread_reclaimed %llu, "
-		"sweep_gate_asked %llu, heals %llu, ring_waits %llu since the reset",
-		cs.tomb_dgrams, px.spread_reclaimed, px.sweep_gate_asked, ws.heals, ws.ring_waits);
 
 	printf("statsresettest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;

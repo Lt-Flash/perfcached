@@ -108,7 +108,6 @@ struct pc_thread {
 	pthread_mutex_t mx;                 /* guards rq */
 	struct pc_rpcq rq;
 	int live;
-	int drains;                         /* runs rpc_drain: a broadcast queues to it */
 	int up;                             /* created: joined if start-up gives up */
 	struct pc_conn **conns;             /* this worker's client list, read on this worker only */
 };
@@ -209,21 +208,19 @@ const struct pc_psk_ctx *pc_psk_current(void)
 }
 
 /* apply a reload: reload.c refused it unless every changed key is a PC_RL_* one, so the new
- * snapshot is simply @nc's.  Both halves are built before either is published: 0, or -1 with
- * @msg set and nothing changed. */
+ * snapshot is simply @nc's.  0, or -1 with @msg set. */
 int pc_live_reload(const struct pc_config *nc, unsigned int what,
 		char *msg, size_t ml)
 {
-	struct pc_psk_ctx *t = NULL;
-	struct pc_live *nl = NULL;
+	struct pc_live *nl;
 
 	if (what & PC_RL_CLIENT) {
 		if (!have_psk) {
 			snprintf(msg, ml, "client secrets: no encrypted door here, nothing to derive");
 		} else {
+			struct pc_psk_ctx *t = malloc(sizeof *t);
 			int i;
 
-			t = malloc(sizeof *t);
 			if (!t) {
 				snprintf(msg, ml, "out of memory for the new client keys");
 				return -1;
@@ -240,26 +237,18 @@ int pc_live_reload(const struct pc_config *nc, unsigned int what,
 					return -1;
 				}
 			t->n_client = nc->n_client_secrets;
+			__atomic_store_n(&PSK_CUR, t, __ATOMIC_RELEASE);
 		}
 	}
 	if (what & (PC_RL_RESP_ALLOW | PC_RL_HTTP_ALLOW | PC_RL_HTTP_TOKEN |
 	            PC_RL_RESP_PASSWORD | PC_RL_ENABLE | PC_RL_AUTH_TLS)) {
 		nl = live_from(nc);
 		if (!nl) {
-			if (t) {
-				sodium_memzero(t, sizeof *t);
-				free(t);
-			}
 			snprintf(msg, ml, "out of memory for the new settings");
 			return -1;
 		}
-	}
-	if (t)
-		__atomic_store_n(&PSK_CUR, t, __ATOMIC_RELEASE);
-	if (nl)
 		live_install(nl);
-	if (what & PC_RL_HTTP_TOKEN)
-		cfgsig_reloaded(nc);
+	}
 	return 0;
 }
 
@@ -307,20 +296,13 @@ static void thread_name(const char *name)
 #endif
 }
 
-/* @drains: the thread runs rpc_drain, so broadcasts are queued to it (set before live publishes it) */
-static void slot_attach_ex(struct pc_thread *t, int drains)
+static void slot_attach(struct pc_thread *t)
 {
 	self_slot = t;
 	t->tid = pthread_self();
-	t->drains = drains;
 	compat_thread_register(t->idx);
 	pc_qs_attach();                     /* a quiescence line */
 	__atomic_store_n(&t->live, 1, __ATOMIC_RELEASE);
-}
-
-static void slot_attach(struct pc_thread *t)
-{
-	slot_attach_ex(t, 0);
 }
 
 int pc_worker_id(void)
@@ -358,8 +340,6 @@ static void pc_broadcast(void (*fn)(int sender, void *param), void *param)
 			fn(t->idx, param);
 			continue;
 		}
-		if (!t->drains)                 /* it would never run there */
-			continue;
 		pthread_mutex_lock(&t->mx);
 		(void)pc_rpcq_put(&t->rq, fn, param);
 		pthread_mutex_unlock(&t->mx);
@@ -623,7 +603,7 @@ static void *worker_main(void *p)
 	int use_uring = 0;
 	unsigned long long t_wake, t_wait;
 
-	slot_attach_ex(wa->slot, 1);
+	slot_attach(wa->slot);
 	{
 		char wn[16];
 
@@ -905,7 +885,7 @@ static void *maint_main(void *p)
 	long long gleft;
 	int i, k, n;
 
-	slot_attach_ex(p, 1);
+	slot_attach(p);
 	thread_name("pc-maint");
 	while (!stop_flag) {
 		pc_qs_exit();                  /* parked across the sleep */
@@ -1081,7 +1061,7 @@ static void *wal_main(void *p)
 	struct pollfd pf;
 	int timeout = 200;
 
-	slot_attach_ex(p, 1);
+	slot_attach(p);
 	thread_name("pc-wal");
 	pc_wal_set_wakeup(self_slot->efd);
 	pf.fd = self_slot->efd;
@@ -1391,15 +1371,11 @@ int pc_daemon_run(struct pc_config *cfg)
 				cfg->col[i].name);
 			return 1;
 		}
-		if (pc_store_register(cfg->col[i].name, cols[i].ht,
-		        cfg->col[i].pull,
-		        cfg->col[i].mode == PC_MODE_PROXY,
-		        cfg->col[i].mode == PC_MODE_SHARD,
-		        cfg->col[i].eager, cfg->col[i].buckets_log2)) {
-			LM_ERR("collection '%s': cannot register it\n",
-				cfg->col[i].name);
-			return 1;
-		}
+		pc_store_register(cfg->col[i].name, cols[i].ht,
+			cfg->col[i].pull,
+			cfg->col[i].mode == PC_MODE_PROXY,
+			cfg->col[i].mode == PC_MODE_SHARD,
+			cfg->col[i].eager, cfg->col[i].buckets_log2);
 		if (cfg->col[i].has_autoscale)
 			pc_store_set_autoscale_idx(i, cfg->col[i].autoscale);
 		if (cfg->col[i].has_redis_types)
@@ -1419,7 +1395,6 @@ int pc_daemon_run(struct pc_config *cfg)
 	if (pc_dir_lock(cfg->state_dir, "state_dir", 1) != 0 ||
 	        pc_dir_lock(cfg->wal_dir, "wal dir", 0) != 0)
 		return 1;
-	pc_reload_started();
 	/* the collections clients created, BEFORE the replay and the snapshot import: both drop
 	 * records for a collection name they cannot resolve */
 	if (pc_store_load(cfg->state_dir) != 0)
@@ -1459,10 +1434,7 @@ int pc_daemon_run(struct pc_config *cfg)
 		LM_ERR("observability init failed\n");
 		return 1;
 	}
-	if (pc_pubsub_init(cfg->workers + 8) != 0) {  /* worker ids are 1-based */
-		LM_ERR("pub/sub: out of memory for its tables\n");
-		return 1;
-	}
+	pc_pubsub_init(cfg->workers + 8);             /* worker ids are 1-based */
 	/* read-through: the collections exist, the workers do not */
 	if (pc_upstream_init(cfg, cfg->workers + 8) != 0)
 		return 1;
@@ -1477,7 +1449,8 @@ int pc_daemon_run(struct pc_config *cfg)
 	 * the reserve covers listeners, threads, cluster, WAL/RDB and a few HTTP doors for /stats */
 	{
 		struct rlimit rl;
-		long reserve = pc_config_fd_reserve(cfg);
+		long reserve = 64 + 2L * (cfg->workers + 8) + cfg->n_listen
+			+ (cfg->cl_enabled ? 16 : 0) + 16;
 		long want = cfg->max_clients ? cfg->max_clients + reserve : 0;
 		long avail;
 
@@ -2115,7 +2088,6 @@ int pc_daemon_run(struct pc_config *cfg)
 		pthread_join(wargs[i].slot->tid, NULL);
 	pc_upstream_shutdown();                       /* no gate runs now */
 	pthread_join(mt->tid, NULL);
-	pc_alerts_stop();                             /* the last digest, while mail is up */
 	pc_mail_stop();                               /* after the alert source */
 	if (rt)
 		pthread_join(rt->tid, NULL);

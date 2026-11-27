@@ -692,10 +692,6 @@ int rh_expire(struct resp_ctx *c)
 	rc = op_expire(c->ht, &k, ttl, c->park_req);
 	if (op_failed(c->out, rc))
 		return 0;
-	if (rc == PC_OP_ERR_FULL) {
-		resp_err(c->out, "cache full");
-		return 0;
-	}
 	if (rc == PC_OP_PARKED)
 		resp_int(c->out, 0);           /* park fallback only */
 	else

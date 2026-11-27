@@ -27,8 +27,6 @@ file.
      "tracking": true (answer CLIENT ID / CLIENT TRACKING),
      "redirect_refused": true (CLIENT TRACKING ... REDIRECT answered -NOPERM, as
          for a user without that command; CLIENT ID still served),
-     "bcast_delay_ms": 0, "bcast_delay_n": N (the first N CLIENT TRACKING ... BCAST
-         answered this late; every one without bcast_delay_n),
      "client_id_delay_ms": 0 (CLIENT ID answered this late - only a
          client's invalidation connection asks it, so its tracking comes up
          that much after its fetch connections can serve),
@@ -132,7 +130,6 @@ CMDS = {
     "del": (-2, ["write"], 1, -1, 1, ["@keyspace", "@write", "@slow"]),
     "persist": (2, ["write", "fast"], 1, 1, 1, ["@keyspace", "@write", "@fast"]),
     "append": (3, ["write", "denyoom", "fast"], 1, 1, 1, ["@write", "@string", "@fast"]),
-    "getset": (3, ["write", "denyoom", "fast"], 1, 1, 1, ["@write", "@string", "@fast"]),
     "lpush": (-3, ["write", "denyoom", "fast"], 1, 1, 1, ["@write", "@list", "@fast"]),
     "lrange": (4, ["readonly"], 1, 1, 1, ["@read", "@list", "@slow"]),
     "blpop": (-3, ["write", "blocking"], 1, -2, 1, ["@write", "@list", "@slow", "@blocking"]),
@@ -145,7 +142,7 @@ CMDS = {
 }
 WRITES = {b"SET", b"SETEX", b"DEL", b"UNLINK", b"EXPIRE", b"PEXPIRE", b"PERSIST",
           b"INCR", b"INCRBY", b"DECRBY", b"APPEND", b"HSET", b"LPUSH",
-          b"JSON.SET", b"JSON.DEL", b"MSET", b"HDEL", b"HINCRBY", b"GETSET"}
+          b"JSON.SET", b"JSON.DEL", b"MSET", b"HDEL", b"HINCRBY"}
 lock = threading.Lock()
 rep_lock = threading.Lock()          # S423: delayed copies to the replicas land in order
 # one write at a time, as Redis applies them: load, change, save here and to the replicas;
@@ -157,7 +154,6 @@ born = time.time()
 conns = {}                 # id -> (socket, send lock)
 targets = set()            # ids named by CLIENT TRACKING ... REDIRECT
 bcast = {}                 # AR1: id -> [prefixes] (empty: every key)
-bcast_asked = [0]          # CLIENT TRACKING ... BCAST requests seen, for bcast_delay_n
 next_id = [100]
 
 
@@ -357,11 +353,7 @@ def apply_write(cmd, ctl):
     now = time.time() * 1000
     up = [c.upper() for c in cmd]
     rep = b"+OK\r\n"
-    if name == b"GETSET":                 # the old value, nil when there was none
-        old = ent["value"].encode("latin-1") if ent and ent.get("type") == "string" else None
-        data[k] = {"type": "string", "value": cmd[2].decode("latin-1")}
-        rep = b"$-1\r\n" if old is None else b"$%d\r\n%s\r\n" % (len(old), old)
-    elif name in (b"SET", b"SETEX"):
+    if name in (b"SET", b"SETEX"):
         if name == b"SETEX":
             val, exp = cmd[3], now + int(cmd[2]) * 1000
             nx = xx = False
@@ -791,10 +783,6 @@ def serve(conn):
                                if c == b"PREFIX" and i + 1 < len(cmd)]
                         with lock:
                             bcast[cid] = pre
-                            bcast_asked[0] += 1
-                            nth = bcast_asked[0]
-                        if ctl.get("bcast_delay_ms") and nth <= ctl.get("bcast_delay_n", nth):
-                            time.sleep(ctl["bcast_delay_ms"] / 1000.0)
                     if b"REDIRECT" in up and ctl.get("redirect_refused"):
                         note("counts", "TRACKING REFUSED")
                         conn.sendall(b"-NOPERM this user has no permissions to run the "

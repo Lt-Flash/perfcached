@@ -90,12 +90,6 @@ int rh_json(struct resp_ctx *c)
 		resp_err(c->out, "wrong number of arguments for this JSON command");
 		return 0;
 	}
-	/* one path only: more paths or GET's formatting options are not implemented */
-	if ((op == PC_JOP_GET || op == PC_JOP_DEL) && c->nargs > 3) {
-		resp_err(c->out, op == PC_JOP_GET ? "unsupported JSON.GET option"
-			: "unsupported JSON.DEL option");
-		return 0;
-	}
 	if (c->argl[1] == 0 || c->argl[1] > KEY_MAX) {
 		resp_err(c->out, "key too long");
 		return 0;
@@ -106,7 +100,7 @@ int rh_json(struct resp_ctx *c)
 	*c->klenp = c->argl[1];
 	/* the path: `$...` is v2 (array-shaped reply); `.x`, `x` and `.`
 	 * are the legacy spelling (bare reply); absent = the root */
-	if (c->nargs >= 3) {
+	if (c->nargs >= 3 && !(op == PC_JOP_GET && c->nargs == 2)) {
 		const char *pp = c->argv[2];
 		size_t pl = c->argl[2];
 

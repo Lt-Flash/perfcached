@@ -123,10 +123,9 @@ int pc_ack_save(const char *dir, uint64_t marker)
 	snprintf(fin, sizeof fin, "%s/" PC_ACK_FILE, dir);
 	fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0600);
 	if (fd >= 0) {
-		int ok = write(fd, buf, len) == (ssize_t)len && fdatasync(fd) == 0;
-
-		/* a failed close has still released the number: never close it twice */
-		if (close(fd) == 0 && ok) {
+		if (write(fd, buf, len) == (ssize_t)len && fdatasync(fd) == 0 &&
+		    close(fd) == 0) {
+			fd = -1;
 			if (rename(tmp, fin) == 0) {
 				dfd = open(dir, O_RDONLY | O_DIRECTORY);
 				if (dfd >= 0 && fsync(dfd) == 0)
@@ -135,6 +134,8 @@ int pc_ack_save(const char *dir, uint64_t marker)
 					close(dfd);
 			}
 		}
+		if (fd >= 0)
+			close(fd);
 		if (rc)
 			unlink(tmp);
 	}

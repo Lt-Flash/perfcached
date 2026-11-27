@@ -190,24 +190,6 @@ if start link; then
 else
 	bad "4. did not start: $(tail -3 "$D/link.log")"
 fi
-
-# ---- 5. a threshold of 5% or less clears: the hysteresis under it stops at 1% -------------------
-echo 10 > "$H/sys/class/net/fk0/speed"
-conf link5 "link_warn_pct = 5" "link_crit_pct = 6"
-sed -i 's/^\[daemon\]$/[daemon]\nlink_monitor = fk0/' "$D/link5.conf"
-if start link5; then
-	( b=$(cat "$H/sys/class/net/fk0/statistics/rx_bytes"); while :; do b=$((b + 250000))
-		echo $b > "$H/sys/class/net/fk0/statistics/rx_bytes"; sleep 0.2; done ) & L=$!
-	v=$(until_active host.link 15)
-	kill $L 2>/dev/null; wait $L 2>/dev/null; L=
-	n=0; while [ $n -lt 100 ] && [ "$(active host.link)" != none ]; do sleep 0.25; n=$((n+1)); done
-	[ "$v" = critical ] && [ "$(active host.link)" = none ] &&
-		ok "5. link_warn_pct = 5, link_crit_pct = 6: raised critical, cleared once the link went idle" ||
-		bad "5. warn 5 / crit 6: raised '$v', 25 s after the traffic stopped host.link is '$(active host.link)'"
-	stop
-else
-	bad "5. did not start: $(tail -3 "$D/link5.log")"
-fi
 unset PERFCACHED_HOSTLINK_ROOT
 
 # a raised critical alert is logged CRIT by design (alerts.c) - anything else is not

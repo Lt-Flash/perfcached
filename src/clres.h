@@ -5,7 +5,6 @@
 #ifndef PC_CLRES_H
 #define PC_CLRES_H
 
-#include <stdint.h>
 #include <netinet/in.h>
 
 #define CLRES_MAX        256       /* = PC_CL_MAXPEER, the peer table's bound */
@@ -21,7 +20,6 @@ enum {
 
 struct clres_ent {
 	struct in_addr addr;
-	uint16_t port;                     /* the cluster port, network order */
 	unsigned char ident[CLRES_IDENT_LEN];
 	int has_ident;
 	int id;                            /* 0 = the slot is unused */
@@ -34,10 +32,9 @@ struct clres {
 	struct clres_ent e[CLRES_MAX];
 };
 
-/* Remember @id for @addr:@port / @ident (CLRES_IDENT_LEN bytes even without @has_ident)
- * until now + ttl_ms; the same address and port refresh in place.  1 if recorded, 0 if @id 0.
- * The port tells co-hosted members apart. */
-int clres_note(struct clres *r, int id, struct in_addr addr, uint16_t port,
+/* Remember @id for @addr / @ident (CLRES_IDENT_LEN bytes even without @has_ident)
+ * until now + ttl_ms; the same address refreshes in place.  1 if recorded, 0 if @id 0. */
+int clres_note(struct clres *r, int id, struct in_addr addr,
 		const unsigned char *ident, int has_ident,
 		long long now, long long ttl_ms);
 
@@ -53,9 +50,9 @@ const char *clres_why_name(int why);
 int clres_holds(const struct clres *r, int id, long long now);
 
 /* Claim and CONSUME a reservation: IDENTITY first (it survives a move), then
- * address and port; @ident NULL matches by address only.  *how says which; 0 if none. */
+ * address; @ident NULL matches by address only.  *how says which; 0 if none. */
 int clres_take(struct clres *r, const unsigned char *ident,
-		const struct in_addr *addr, uint16_t port, long long now, const char **how);
+		const struct in_addr *addr, long long now, const char **how);
 
 /* How many reservations are live - the stats surface. */
 int clres_count(const struct clres *r, long long now);

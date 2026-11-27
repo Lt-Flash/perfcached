@@ -77,7 +77,6 @@
 #define BV_HCMD     18                 /* any H command, never replayed */
 #define BV_CMD      19                 /* [mlen u8][method][tree?] */
 #define BIN_MAX_RSP (16u << 20)        /* reply payload sanity ceiling */
-#define PERFD_KEEP_BUF (1u << 20)      /* a reply buffer larger than this is not kept */
 
 /* the keys whose JSON value is a DOCUMENT at the API edge: it travels as one bulk of its JSON
  * text, whatever its type (jset's and jarrappend's val) */
@@ -125,8 +124,6 @@ struct perfd {
 	char *conn_name;               /* opts.name, NULL = unnamed */
 	int name_due;                  /* ...to send before the next call */
 	int io_ms;
-	int call_ms;                   /* opts.call_timeout_ms normalised, 0 = no bound */
-	long long deadline_ms;         /* the blocking collect's, 0 = none running */
 	struct pc_cipherstate cs_send, cs_recv;
 	char err[256];
 	int err_kind;                  /* PERFD_E_* of err */
@@ -215,7 +212,6 @@ struct perfd {
 	long long next_ping_ms;            /* the idle-ping scan runs <= 1/s */
 	unsigned long long pings, pings_failed;
 	int io_silent;                     /* a read or write ran out its timeout */
-	int reply_late;                    /* the last one-shot went out and its reply did not come */
 	/* per-key routing: route_ok only when the cluster declared an algorithm we implement AND
 	 * a mode worth routing */
 	int route_ok, route_want, route_cport;
@@ -265,8 +261,6 @@ struct perfd {
 		                        * JSON text (perfd_submit); 0 = the raw payload */
 	} *calls;
 	int ncalls, callcap;
-	/* library calls under way that can run the caller's callbacks; perfd_free inside one only marks */
-	int disp, free_req;
 	char ahost[256];
 	int aport;
 	struct pd_udp *udp;            /* pushes over UDP, or NULL */
@@ -309,7 +303,6 @@ static int state_usable(const char *s, int sl);
 static void spread_leave(perfd_t *p);
 static void udp_drop(perfd_t *p, int pruned);
 static void fleet_seen(perfd_t *p);
-static long long now_ms_lib(void);
 /* async connect/handshake progression */
 #define PD_HS_TCP     0            /* connect() outstanding */
 #define PD_HS_SEND    1            /* msg1 built, still going out */

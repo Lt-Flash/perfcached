@@ -71,7 +71,7 @@ static double drive(perfd_t **h, int n, double secs, int *errs, int *wrong)
 int main(int argc, char **argv)
 {
 	const char *sec[3] = { NULL, NULL, NULL };
-	perfd_t *h[NH], *n, *w;
+	perfd_t *h[NH], *n;
 	int port, i, errs = 0, wrong = 0, spares = 0, back = 0, kind;
 	unsigned long long rec = 0;
 	double worst, t, deadline;
@@ -101,29 +101,11 @@ int main(int argc, char **argv)
 		spares += perfd_spare_count(h[i]);
 	OK(errs == 0 && wrong == 0 && spares == NH * 2, "before: %d standbys on %d handles, one on the list's other secret, slowest call %.1f ms", spares, NH, worst);
 
-	/* a handle whose active link is the node about to freeze */
-	w = dial(argv[2], port, sec, 0, 0);
 	kill(frozen, SIGSTOP);
 	errs = wrong = 0;
 	worst = drive(h, NH, SETTLE_S, &errs, &wrong);
 	OK(worst < HOLD_MS, "live handles, %.0f s with a standby's node frozen: slowest call %.0f ms", SETTLE_S, worst);
 	OK(errs == 0 && wrong == 0, "and %d calls failed, %d read wrong", errs, wrong);
-
-	/* a write whose reply never came may still land: not replayed on a standby; the next call moves */
-	if (w) {
-		int rc = perfd_set(w, "c", "k", "v", 1, 0);
-		static char gb[16];
-		size_t gl = 0;
-
-		OK(rc != 0 && strstr(perfd_error(w), "NOT replayed"), "a set on the frozen node: no reply, "
-			"not replayed (rc %d: %s)", rc, rc ? perfd_error(w) : "applied elsewhere");
-		rc = perfd_get_buf(w, "c", "k", gb, sizeof gb, &gl, NULL);
-		OK(rc == 1 && gl == 1 && gb[0] == 'v', "and the next call is answered by a live member "
-			"(rc %d: %s)", rc, rc < 0 ? perfd_error(w) : rc ? "v" : "absent");
-		perfd_free(w);
-	} else {
-		OK(0, "a handle on node 3 before the freeze: %s", perfd_error(NULL));
-	}
 
 	worst = 0;
 	for (i = 0; i < 5; i++) {

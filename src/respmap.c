@@ -116,9 +116,9 @@ static int resolve_in(const char *list, int idx, char *out, size_t cap)
 
 /* ---- the effective list ------------------------------------------------ */
 
-/* under mx: the file's list with each overridden index replaced, or NULL when nothing is
- * overridden and the file has no list, into @out; -1 = out of memory, @out untouched */
-static int build(char **out)
+/* under mx: the file's list with each overridden index replaced, or NULL
+ * when nothing is overridden and the file has no list */
+static char *build(void)
 {
 	size_t cap = 2, used = 0;
 	const char *p, *s;
@@ -131,17 +131,12 @@ static int build(char **out)
 			any = 1;
 			cap += strlen(OV[i].col) + 8;
 		}
-	if (!any) {
-		b = file_list ? strdup(file_list) : NULL;
-		if (file_list && !b)
-			return -1;
-		*out = b;
-		return 0;
-	}
+	if (!any)
+		return file_list ? strdup(file_list) : NULL;
 	cap += file_list ? strlen(file_list) + 2 : 2;
 	b = malloc(cap);
 	if (!b)
-		return -1;
+		return NULL;
 	b[0] = 0;
 #define ADD(str, n) do { if (used) b[used++] = ','; \
 		memcpy(b + used, (str), (n)); used += (n); b[used] = 0; } while (0)
@@ -167,8 +162,7 @@ static int build(char **out)
 			ADD(s, len);
 	}
 #undef ADD
-	*out = b;
-	return 0;
+	return b;
 }
 
 /* under mx: free what no worker can still hold */
@@ -185,18 +179,15 @@ static void reap(void)
 	nretired = j;
 }
 
-/* under mx: publish a new effective list; the old one is retired.  -1: no memory to build it,
- * the old one stays (NULL would read as every collection visible) */
-static int publish(void)
+/* under mx: publish a new effective list; the old one is retired */
+static void publish(void)
 {
-	char *n, *old;
+	char *n = build(), *old;
 
-	if (build(&n) != 0)
-		return -1;
 	old = __atomic_exchange_n(&cur, n, __ATOMIC_ACQ_REL);
 	reap();
 	if (!old)
-		return 0;
+		return;
 	if (nretired == RETIRE_MAX) {
 		/* a pipeline of maps in one worker turn holds its own line, so waiting
 		 * never ends: leak the oldest (a few dozen bytes), never free under a reader */
@@ -208,7 +199,6 @@ static int publish(void)
 	retired[nretired].p = old;
 	retired[nretired].stamp = pc_qs_stamp();
 	nretired++;
-	return 0;
 }
 
 int pc_respmap_ready(void)
@@ -244,7 +234,7 @@ static int col_ok(const char *c, size_t n)
 int pc_respmap_apply(int index, const char *col, size_t cl, uint64_t gen,
 		int set, char *was, size_t wcap)
 {
-	struct ov *o, prev;
+	struct ov *o;
 	char nc[PC_COL_NAME_MAX] = "";
 
 	if (index < 0 || index >= PC_RESPMAP_MAX)
@@ -266,16 +256,11 @@ int pc_respmap_apply(int index, const char *col, size_t cl, uint64_t gen,
 	}
 	if (was && wcap)
 		resolve_in(cur, index, was, wcap);
-	prev = *o;
 	o->held = 1;
 	o->set = (unsigned char)(set ? 1 : 0);
 	o->gen = gen;
 	snprintf(o->col, sizeof o->col, "%s", nc);
-	if (publish() != 0) {
-		*o = prev;
-		pthread_mutex_unlock(&mx);
-		return -2;
-	}
+	publish();
 	pthread_mutex_unlock(&mx);
 	return 1;
 }
@@ -476,11 +461,7 @@ int pc_respmap_init(const char *list, const char *dir)
 		pc_lamport_restore(high);
 	}
 	free(cur);                         /* before the workers: no reader yet */
-	cur = NULL;
-	if ((list && !file_list) || build(&cur) != 0) {
-		LM_ERR("resp: out of memory building the RESP collection map\n");
-		rc = -1;
-	}
+	cur = build();
 	__atomic_store_n(&inited, 1, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&mx);
 	if (rc == 0 && pc_respmap_overrides() > 0)

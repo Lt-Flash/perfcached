@@ -30,8 +30,7 @@ static struct evslot {
 static const char *const kind_name[EV_KINDS] = { "miss", "expired", "store", "remove" };
 
 static __thread const char *ev_door = "-";
-/* a copy: the connection the peer text came from may be gone by the next event */
-static __thread char ev_peer[48] = "-";
+static __thread const char *ev_peer = "-";
 
 static void recompute_any(void)
 {
@@ -134,14 +133,8 @@ void pc_ev_configure(int slot, unsigned int mask)
 
 void pc_ev_set_origin(const char *door, const char *peer)
 {
-	size_t n;
-
 	ev_door = door ? door : "-";
-	if (!peer)
-		peer = "-";
-	n = strnlen(peer, sizeof ev_peer - 1);
-	memcpy(ev_peer, peer, n);
-	ev_peer[n] = 0;
+	ev_peer = peer ? peer : "-";
 }
 
 /* the key as it goes on the line: bounded, printable, or a hash */

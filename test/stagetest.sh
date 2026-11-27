@@ -206,11 +206,6 @@ r=$(up stage-enable "$D/c.tar.gz" "$D/c.sig" 0.6.7)
 head -c 500000 /dev/urandom > "$D/d.tar.gz"
 openssl pkeyutl -sign -inkey "$D/k.pem" -rawin -in "$D/d.tar.gz" -out "$D/d.tar.gz.sig" 2> /dev/null
 DS=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$D/d.tar.gz")
-r=$(up stage-enable "$D/d.tar.gz" "$D/d.tar.gz.sig" 0.6.8 "$SHA")
-echo "$r" | grep -q '"error": "sha256 mismatch - refused", "op": "end"' && [ "$(ls "$STG" | grep -c '\.tar\.gz$')" = 2 ] &&
-	[ "$(status '[e["version"] for e in s["staged"]]')" = "['0.6.7', '0.6.6']" ] &&
-	ok "S6. an upload refused at its end: nothing pruned for it, both staged builds kept" ||
-	bad "S6. refused upload pruned: $r; staged $(ls "$STG" | tr '\n' ' ')"
 r=$("$CLI" -q -h 127.0.0.1 -p 16598 -E stage-enable upgrade-stage "$D/d.tar.gz" 0.6.8 2>&1); rc=$?
 [ $rc -eq 0 ] && echo "$r" | grep -q "$DS" && echo "$r" | grep -q 'trusted_keys\[0\]' && cmp -s "$D/d.tar.gz" "$STG/$DS.tar.gz" &&
 	ok "S7. perfcli upgrade-stage: staged byte for byte, the signer named" || bad "S7. perfcli: exit $rc: $r"

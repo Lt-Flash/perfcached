@@ -39,8 +39,7 @@ void (*clps_idle_fn)(void);
 static ssize_t relay_sendto(int fd, const void *buf, size_t n,
 		const pc_addr *to)
 {
-	/* never blocks the publishing worker: a full socket falls back to the cluster path */
-	ssize_t r = sendto(fd, buf, n, MSG_DONTWAIT, &to->sa, pc_addr_len(to));
+	ssize_t r = sendto(fd, buf, n, 0, &to->sa, pc_addr_len(to));
 
 	pc_iostat_udp_tx(PC_UDP_RELAY, 1, r >= 0);
 	return r;
@@ -325,14 +324,6 @@ void clps_handle_publish(const unsigned char *pt, size_t n)
 		(const char *)pt + 17 + clen, dlen, 1);
 }
 
-int clps_handle_relay_publish(const unsigned char *pt, size_t n, const pc_addr *from)
-{
-	if (n < 3 || !clpeers_by_id_from(cl_peers(), ps_get16(pt + 1), from))
-		return 0;
-	clps_handle_publish(pt, n);
-	return 1;
-}
-
 /* ---- the dedicated relay plane ---- a port of its own, so a publish flood cannot
  * delay heartbeats: SO_REUSEPORT threads, used once a probe there is answered */
 
@@ -500,10 +491,9 @@ static void ps_rx_one(void *vctx, const unsigned char *buf, size_t r,
 		}
 	}
 	__atomic_add_fetch(&ps_rx_dgrams, 1, __ATOMIC_RELAXED);
-	if (pt[0] == M_PUBLISH) {
-		if (!clps_handle_relay_publish(pt, ptlen, from))
-			__atomic_add_fetch(&ps_rx_other, 1, __ATOMIC_RELAXED);
-	} else if (pt[0] == M_PSPROBE)
+	if (pt[0] == M_PUBLISH)
+		clps_handle_publish(pt, ptlen);
+	else if (pt[0] == M_PSPROBE)
 		ps_answer_probe(x->fd, pt, ptlen, from, M_PSPROBE_ACK);
 	else if (pt[0] == M_REPL_MANY)
 		clrp_rx(pt, ptlen, from);

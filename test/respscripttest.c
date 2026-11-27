@@ -150,20 +150,6 @@ int main(void)
 	CHK(is("-ERR ARGV[1] is not a time\r\n") && got.calls == 0, "B: ARGV[1] that is not a time");
 	RUN(rh_eval, "EVALSHA", SHA_SAVE_ARGV, "1", "lk", "-1", "tok", "1");
 	CHK(is("-ERR ARGV[1] is not a time\r\n"), "B: nor a negative one");
-	{
-		static const char *const bad[] = { "inf", "nan", "1e300", "-nan", "12abc", "1.5 " };
-		size_t i;
-		int all = 1;
-
-		for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-			RUN(rh_eval, "EVALSHA", SHA_SAVE_ARGV, "1", "lk", bad[i], "tok", "1");
-			if (!is("-ERR ARGV[1] is not a time\r\n") || got.calls) {
-				all = 0;
-				printf("    taken: '%s'\n", bad[i]);
-			}
-		}
-		CHK(all, "B: inf, nan, out of range and trailing bytes - not a time");
-	}
 	RUN(rh_eval, "EVALSHA", SHA_SAVE, "1", "lk", "1", "tok", "1.5");
 	CHK(is("-ERR the lock ttl (ARGV[3]) must be a whole number of milliseconds\r\n") &&
 		got.calls == 0, "B: a ttl that is not whole milliseconds");

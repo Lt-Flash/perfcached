@@ -306,7 +306,7 @@ int main(void)
 		struct sockaddr_in cs;
 		socklen_t cl = sizeof cs;
 		int closed = socket(AF_INET, SOCK_STREAM, 0), queued = 0, again = -1, k;
-		unsigned long long stale0 = figs().dropped_stale, cf0 = figs().connect_fail, c1, c2;
+		unsigned long long stale0 = figs().dropped_stale, c1, c2;
 		unsigned char fr[32];
 		pc_addr to;
 
@@ -329,9 +329,6 @@ int main(void)
 			queued, figs().dropped_stale - stale0);
 		CHK(n && c2 == c1, "G: and with nothing left for them, no more connects (%llu in 6 s)",
 			c2 - c1);
-		CHK(n && figs().connect_fail - cf0 >= (unsigned long long)queued,
-			"G: each refused connect is counted as a connect failure (%llu for %d peers)",
-			figs().connect_fail - cf0, queued);
 		if (n) {
 			pc_addr_from_v4(&to, htonl(0x7f020001u), ntohs(cs.sin_port));
 			again = clane_send(&to, fr, sizeof fr);

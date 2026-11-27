@@ -27,8 +27,7 @@ const char *pc_respmap_config(void);
 const char *pc_respmap_effective(void);
 
 /* @set 1 maps @index to @col, 0 unmaps; 1 = applied, 0 = a newer generation is held (equal: the
- * larger name wins), -1 = bad index or name, -2 = out of memory (nothing changed); @was (may be
- * NULL) gets the prior collection or "" */
+ * larger name wins), -1 = bad index or name; @was (may be NULL) gets the prior collection or "" */
 int pc_respmap_apply(int index, const char *col, size_t cl, uint64_t gen,
 		int set, char *was, size_t wcap);
 

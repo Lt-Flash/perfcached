@@ -1,14 +1,3 @@
-perfcached (0.7.5.3-1) unstable; urgency=medium
-
-  * 0.7.5.3 (libperfd 0.7.6.3): the minor findings of the 0.7.5 code
-    review - stricter config checks (shared secrets, [cluster]
-    collections names, save, '#' in a secret, one unix listener), a
-    mixed multi-key write refused under write-through, a whole-call
-    deadline in libperfd (call_timeout_ms) and many smaller fixes.
-    Rolls from 0.7.5.x node by node.
-
- -- Yury Kirsanov <yury@kfi.net.au>  Fri, 27 Nov 2026 10:00:00 +1100
-
 perfcached (0.7.5.2-1) unstable; urgency=medium
 
   * 0.7.5.2 (libperfd 0.7.6.2): a node restarted from its WAL gets a diff

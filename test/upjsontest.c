@@ -1,7 +1,6 @@
 /* upjsontest.c - the upfill sweep's document comparison (upjson.c): values compared by meaning, and
  * an object whose last member is a key with no value never read past the parsed tokens */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include "upjson.h"
 
@@ -26,18 +25,6 @@ int main(void)
 	CHK(same("{\"a\":1}", "{\"a\":2}") == 0, "A: another value - not the same");
 	CHK(same("[1,2]", "[2,1]") == 0, "A: elements in another order - not the same");
 	CHK(same("{\"a\":-0}", "{\"a\":0}") == 1, "A: -0 and 0 - the same number");
-	{
-		/* a bare one-byte number in a buffer of its size: nothing read past it (ASan) */
-		char *five = malloc(1);
-		int w;
-
-		if (five) {
-			five[0] = '5';
-			CHK(up_json_same("10", 2, five, 1, &w) == 0,
-				"A: 10 against a bare 5 - not the same, read within its byte");
-			free(five);
-		}
-	}
 
 	/* B: {"k":1,"k"} - its last token is a key; the walk takes token 4 as its value, which this
 	 * parse never wrote: the thread's buffer still holds an earlier document's (planted here) */

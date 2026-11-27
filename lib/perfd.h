@@ -25,8 +25,8 @@
 #define PERFD_VERSION_MAJOR 0
 #define PERFD_VERSION_MINOR 7
 #define PERFD_VERSION_PATCH 6
-#define PERFD_VERSION_TWEAK 3          /* the fourth number; 0: none */
-#define PERFD_VERSION "0.7.6.3"
+#define PERFD_VERSION_TWEAK 2          /* the fourth number; 0: none */
+#define PERFD_VERSION "0.7.6.2"
 /* the oldest daemon this binary wire works with: an older one answers the first request
  * with "unknown verb", which perfd_error() names */
 #define PERFD_NEEDS_PERFCACHED "0.4.5"
@@ -96,10 +96,6 @@ typedef struct perfd_opts {
 	/* the most perfd_apool_get waits on a new handle's dial, ms: 0 = 500, -1 = all of
 	 * connect_timeout; a dial still going then fails the get and is finished unblocked */
 	int dial_wait_ms;
-	/* the most one blocking call waits for its whole reply, ms: 0 = 4 x io_timeout_ms, -1 = no
-	 * bound.  io_timeout_ms bounds each read, so a reply that drips in, or a stream of
-	 * notifications on a subscribed handle, could otherwise hold a call for ever */
-	int call_timeout_ms;
 } perfd_opts;
 /* designated, so -Wextra's missing-field-initializers stays quiet; C++ and
  * FFI callers use perfd_opts_init_sz() with their own struct's size */
@@ -408,11 +404,7 @@ int perfd_unsubscribe(perfd_t *p, const char *channel);
 int perfd_punsubscribe(perfd_t *p, const char *pattern);
 
 /* ---- pub/sub over UDP (lib/perfd_push.h): deliveries as sealed datagrams to the same hook; call
- * _ready on readability AND once a second - 15 s without an ack drops every subscription.  The
- * stream's key arrives in perfd_pubsub_udp's reply, so the seal is only as private as the link:
- * on a plaintext one (opts.encrypt = 0, the default) whoever reads the connection can read and
- * forge the datagrams - open the handle with encrypt = 1 where that matters (the first such call
- * in a process logs a warning) ---- */
+ * _ready on readability AND once a second - 15 s without an ack drops every subscription ---- */
 PERFD_MUST_CHECK int perfd_pubsub_udp(perfd_t *p, int port, int timeout_ms);
 int perfd_pubsub_udp_fd(const perfd_t *p);
 int perfd_pubsub_udp_ready(perfd_t *p);

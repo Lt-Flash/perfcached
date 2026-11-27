@@ -77,22 +77,6 @@ for k, ph in (("pz:pre", "before the swap"), ("pz:post", "after the swap")):
         print("FAIL the copier never paused on %s (%s): %s" % (k, ph, "no hook line"))
         os.unlink(D + "/pause." + k[3:])
         continue
-    if k == "pz:post":
-        # held after the swap, pz:post is in the old table only: a dump walked to its end
-        # still carries it, from the walker at bucket 0
-        seen, cur, n = set(), 0, 0
-        while n < 200:
-            r = call(f, "dump", col="0", cursor=cur, count=4096)
-            res = r.get("result") or {}
-            if not res:
-                print("FAIL dump during the drain: %s" % json.dumps(r)[:200])
-                break
-            seen.update(x.get("k") for x in res.get("records", []))
-            cur, n = res.get("cursor", 0), n + 1
-            if not res.get("more"):
-                break
-        print(("ok  " if "pz:post" in seen and "other" in seen else "FAIL") +
-              " a dump while the resize drains carries the record only its old table holds (saw %s)" % sorted(seen))
     got = {}
     def delete():
         g = conn()

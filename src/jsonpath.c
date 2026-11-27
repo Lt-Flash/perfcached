@@ -521,9 +521,8 @@ int pc_jp_set(const char *doc, size_t dlen, const char *path, size_t plen,
 		at = t[cur].end - 1;
 		nonempty = t[cur].size > 0;
 		/* prefix: ,"r1":{"r2":{...  suffix: }}} */
-		need = dlen + vlen + (size_t)nonempty;
-		for (k = (size_t)si; k < (size_t)ns; k++)
-			need += (size_t)st[k].namelen + (k + 1 < (size_t)ns ? 5 : 3);
+		need = (size_t)at + vlen + (dlen - (size_t)at) +
+			(size_t)(ns - si) * (JP_NAME_MAX + 4) + 2;
 		if (need > cap)
 			return PC_JP_E_SIZE;
 		{

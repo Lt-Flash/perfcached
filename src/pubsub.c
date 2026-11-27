@@ -14,11 +14,9 @@
 #include "psinterest.h"
 #include "pubsub.h"
 #include "quiesce.h"
-#define PS_MAX_WORKERS    513              /* ids 1..512: the config's most workers, 1-based */
-#define PS_OWNER_WORDS    9                /* 576 owner bits, id 512 among them */
-#define PS_NAME_MAX       PC_PUBSUB_NAME_MAX
-/* the daemon's own keyspace channels: "__keyspace@" + a 256-byte name + "__:" + a key */
-#define PS_EVENT_NAME_MAX (PS_NAME_MAX + 512)
+#define PS_MAX_WORKERS    512
+#define PS_OWNER_WORDS    8                /* 512 owner bits */
+#define PS_NAME_MAX       4096
 #define PS_SHARED_BUCKETS 65536            /* shared tables cannot grow */
 #define PS_SHARD_BUCKETS  64               /* private tables grow */
 #define PS_CONN_BUCKETS   256
@@ -180,20 +178,6 @@ static void reclaim(void)
 	}
 }
 
-/* a fresh epoch, never 0 and never the one in use: peers read the old views as foreign and
- * ask for the full state, as after a restart.  ps_wlk held */
-static uint16_t int_new_epoch(void)
-{
-	uint16_t epoch = 0;
-
-	while ((!epoch || epoch == ps_int_epoch) &&
-	       getrandom(&epoch, sizeof epoch, 0) == sizeof epoch)
-		;
-	if (!epoch || epoch == ps_int_epoch)
-		epoch = (uint16_t)(ps_int_epoch + 1) ? (uint16_t)(ps_int_epoch + 1) : 1;
-	return epoch;
-}
-
 static struct ps_shared *shared_join(const char *name, size_t nlen,
 		int pattern, int worker)
 {
@@ -223,12 +207,6 @@ static struct ps_shared *shared_join(const char *name, size_t nlen,
 			if (!pattern) {
 				psb_hash(name, nlen, &h1, &h2);
 				psb_add(ps_int_bloom, h1, h2);
-			}
-			/* the update counter is compared as a plain number: it never wraps
-			 * inside an epoch */
-			if (ps_int_adds == UINT32_MAX) {
-				ps_int_epoch = int_new_epoch();
-				ps_int_adds = 0;
 			}
 			told = psv_make(ps_int_epoch, ps_int_rebuild, ++ps_int_adds);
 			__atomic_store_n(&ps_int_version, told, __ATOMIC_RELEASE);
@@ -804,7 +782,7 @@ int pc_pubsub_publish(const char *chan, size_t clen, const char *data,
 	struct ps_msg *m;
 	int locked, nw = 0, w, i, me = pc_worker_id();
 
-	if (clen == 0 || clen > (relayed == 2 ? PS_EVENT_NAME_MAX : PS_NAME_MAX))
+	if (clen == 0 || clen > PS_NAME_MAX)
 		return 0;
 	__atomic_fetch_add(&ps_published, 1, __ATOMIC_RELAXED);
 	if (relayed == 2) {

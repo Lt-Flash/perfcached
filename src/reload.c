@@ -47,8 +47,6 @@ static volatile sig_atomic_t RLASK;
 static unsigned long long RLGEN, RLOK, RLREFUSED;
 static long long RLLAST;
 static char RLMSG[512];
-/* RLMSG's own: a /stats reader must not wait out a reload under RLMX */
-static pthread_mutex_t RLMSGMX = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *result_dir(const char *state_dir)
 {
@@ -101,14 +99,12 @@ void pc_reload_tick(void)
 }
 
 void pc_reload_stats(unsigned long long *ok, unsigned long long *refused,
-		long long *last_unix, char *last_msg, size_t ml)
+		long long *last_unix, const char **last_msg)
 {
 	*ok = __atomic_load_n(&RLOK, __ATOMIC_RELAXED);
 	*refused = __atomic_load_n(&RLREFUSED, __ATOMIC_RELAXED);
 	*last_unix = __atomic_load_n(&RLLAST, __ATOMIC_RELAXED);
-	pthread_mutex_lock(&RLMSGMX);
-	snprintf(last_msg, ml, "%s", RLMSG);
-	pthread_mutex_unlock(&RLMSGMX);
+	*last_msg = RLMSG;
 }
 
 /* the outcome for -H: "gen=<n> ok=<0|1> pid=<pid>" then the words */
@@ -126,13 +122,6 @@ static void write_result(int ok, const char *msg)
 	fprintf(f, "gen=%llu ok=%d pid=%ld\n%s\n", RLGEN, ok, (long)getpid(), msg);
 	if (fclose(f) != 0 || rename(tmp, RLFILE) != 0)
 		unlink(tmp);
-}
-
-void pc_reload_started(void)
-{
-	pthread_mutex_lock(&RLMX);
-	write_result(1, "started, no reload yet");
-	pthread_mutex_unlock(&RLMX);
 }
 
 static int same_key(const struct pc_km_ent *a, const struct pc_km_ent *b)
@@ -330,9 +319,7 @@ out:
 	else
 		__atomic_add_fetch(&RLREFUSED, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&RLLAST, (long long)time(NULL), __ATOMIC_RELAXED);
-	pthread_mutex_lock(&RLMSGMX);
 	snprintf(RLMSG, sizeof RLMSG, "%s", msg);
-	pthread_mutex_unlock(&RLMSGMX);
 	if (rc == 0)
 		LM_NOTICE("%s\n", msg);
 	else

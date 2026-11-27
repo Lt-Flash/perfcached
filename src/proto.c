@@ -111,14 +111,9 @@ static __thread int in_hold_serve;
 
 int in_append(struct pc_conn *c, const char *p, size_t n)
 {
-	/* a zero-length memcpy to a NULL buffer is undefined */
-	if (!n)
-		return 0;
-	/* a whole read (at most one Noise record) lands before the parse: room for it behind
-	 * the largest request, which may arrive with the head of the next one */
 	if (buf_reserve(&c->in, &c->in_cap, c->in_len, n, in_hold_serve ?
 	        PC_MAX_REQ + 4 * PC_NOISE_MAXMSG + PC_UR_HOLD_MAX :
-	        PC_MAX_REQ + PC_BIN_HDR + PC_NOISE_MAXMSG) < 0)
+	        PC_MAX_REQ + PC_BIN_HDR) < 0)
 		return -1;
 	bufs_mark(c);
 	memcpy(c->in + c->in_len, p, n);
@@ -386,12 +381,10 @@ struct up_frame {
 	char *frame;                       /* header + payload, a copy */
 	size_t len;
 	int cmd;                           /* a CMD method, else a data verb */
-	unsigned long long mark;           /* the removal count when it parked */
 };
 
 static __thread unsigned int up_frame_pending;   /* set by the verb */
 static __thread int up_frame_verdict;            /* on a re-dispatch */
-static __thread unsigned long long up_frame_pmark, up_frame_mark;
 static __thread struct up_frame *up_frames;
 static __thread int up_frames_n, up_frames_cap;
 
@@ -416,21 +409,6 @@ int pc_conn_rt_fetcher(void *conn)
 int pc_conn_upstream_frame_verdict(void)
 {
 	return up_frame_verdict;
-}
-
-void pc_conn_upstream_park_frame_mark(unsigned long long m)
-{
-	up_frame_pmark = m;
-}
-
-unsigned long long pc_conn_upstream_frame_mark(void)
-{
-	return up_frame_mark;
-}
-
-void pc_conn_upstream_frame_regate(void)
-{
-	up_frame_verdict = 0;
 }
 
 /* park the frame at @base (@plen payload bytes) under the pending id:
@@ -460,8 +438,6 @@ static int up_frame_park(struct pc_conn *c, const char *base, size_t plen,
 	up_frames[up_frames_n].frame = cp;
 	up_frames[up_frames_n].len = PC_BIN_HDR + plen;
 	up_frames[up_frames_n].cmd = cmd;
-	up_frames[up_frames_n].mark = up_frame_pmark;
-	up_frame_pmark = 0;
 	up_frames_n++;
 	return 0;
 }
@@ -524,12 +500,6 @@ static inline int conn_input_off(const struct pc_conn *c)
 {
 	return c->ps_paused || c->out_paused || c->wal_paused ||
 		c->enum_active || c->up_hold || c->park_hold;
-}
-
-/* the epoll read interest: none while input is off or a handshake is parked */
-static inline uint32_t conn_ev_in(const struct pc_conn *c)
-{
-	return conn_input_off(c) || c->hs_parked ? 0 : EPOLLIN;
 }
 
 static inline size_t out_pending(const struct pc_conn *c)
@@ -783,9 +753,6 @@ void conn_destroy(struct pc_conn *c)
 	c->wire = c->raw = NULL;
 	pc_tls_free(c->tls);
 	c->tls = NULL;
-	sodium_memzero(&c->hs, sizeof c->hs);
-	sodium_memzero(&c->send_cs, sizeof c->send_cs);
-	sodium_memzero(&c->recv_cs, sizeof c->recv_cs);
 	c->dead = 1;
 	c->prev = NULL;
 	c->list = NULL;
@@ -1023,8 +990,8 @@ static void conn_log_open(struct pc_conn *c, const char *dialect)
 		"authenticated, plaintext" : "plaintext");
 }
 
-/* refused peers, the refusal sent and write side shut, drained a turn at a time so close() sends
- * a FIN, not a RST that loses it; closed at EOF or after DENY_MS.  Per worker, no lock */
+/* refused HTTP peers, 403 sent and write side shut, drained a turn at a time so close() sends
+ * a FIN, not a RST that loses the 403; closed at EOF or after DENY_MS.  Per worker, no lock */
 #define DENY_MAX 32
 #define DENY_MS  1000
 static __thread struct { int fd; long long until; } deny_q[DENY_MAX];
@@ -1198,10 +1165,7 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 							MSG_DONTWAIT);
 					if (write(fd, full, sizeof full - 1) < 0)
 						{ /* the close is the message */ }
-					/* parked as the HTTP refusals are: bytes the client sends
-					 * after a plain close would turn it into a reset */
-					shutdown(fd, SHUT_WR);
-					deny_park(fd);
+					close(fd);
 					continue;
 				}
 				refused = full ? 1 : 2;
@@ -1278,11 +1242,7 @@ int pc_conn_accept(int ep, int lfd, int plaintext_ok, int kind,
 		}
 		ev.events = EPOLLIN;
 		ev.data.ptr = c;
-		/* no event could ever name it, so nothing would close it */
-		if (epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) != 0) {
-			c->why = "epoll registration failed";
-			conn_destroy(c);
-		}
+		epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
 	}
 }
 
@@ -1411,7 +1371,7 @@ int conn_flush(struct pc_conn *c)
 				c->want_write = 1;
 				ur_events(c);
 			} else if (!c->want_write) {
-				ev.events = conn_ev_in(c) | EPOLLOUT;
+				ev.events = (conn_input_off(c) ? 0 : EPOLLIN) | EPOLLOUT;
 				ev.data.ptr = c;
 				epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &ev);
 				c->want_write = 1;
@@ -1432,7 +1392,7 @@ int conn_flush(struct pc_conn *c)
 	if (c->want_write && c->ep < 0)    /* its poll may still fire, */
 		c->want_write = 0;         /* and finds nothing to write */
 	else if (c->want_write) {
-		ev.events = conn_ev_in(c);
+		ev.events = conn_input_off(c) ? 0 : EPOLLIN;
 		ev.data.ptr = c;
 		epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &ev);
 		c->want_write = 0;
@@ -2231,11 +2191,9 @@ void pc_proto_upstream_complete(unsigned int req, int status)
 			up_frames[i] = up_frames[--up_frames_n];
 			c = f.c;
 			up_frame_verdict = status;
-			up_frame_mark = f.mark;
 			rc = f.cmd ? cmd_frame(c, b, id, b + PC_BIN_HDR, plen)
 				: bin_dispatch(c, b, id, b + PC_BIN_HDR, plen);
 			up_frame_verdict = 0;
-			up_frame_mark = 0;
 			up_frame_pending = 0;
 			free(b);
 			if (rc < 0) {
@@ -2887,8 +2845,6 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 					bin_reply_ex(c, id, flags, pb,
 						5 + (size_t)d->vlen, trail, tn);
 					free(pb);
-				} else {
-					bin_reply(c, id, PC_BIN_F_ERR, "out of memory", 13);
 				}
 			} else {
 				pay[0] = 0;
@@ -2917,13 +2873,8 @@ static void pull_complete_body(const struct pc_pull_done *d, int rd)
 		size_t tn = 0;
 		int flags = 0;
 
-		if (!tb) {
-			/* the frame's id is answered, whatever else is short */
-			bin_reply(c, id, PC_BIN_F_ERR, "out of memory", 13);
-			if (conn_flush(c) < 0)
-				conn_destroy(c);
+		if (!tb)
 			goto done;
-		}
 		if (pull_uperr || busy) {
 			/* as the same read's local upstream failure answers; a read
 			 * nobody answered in time, as a busy cluster does */
@@ -3565,7 +3516,7 @@ static void pause_set_events(struct pc_conn *c)
 		ur_events(c);
 		return;
 	}
-	ev.events = conn_ev_in(c) | (c->want_write ? EPOLLOUT : 0);
+	ev.events = (conn_input_off(c) ? 0 : EPOLLIN) | (c->want_write ? EPOLLOUT : 0);
 	ev.data.ptr = c;
 	epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &ev);
 }
@@ -4003,13 +3954,12 @@ void pc_conn_hs_park(struct pc_conn *c)
 
 	if (c->hs_parked || c->dead)
 		return;
-	c->hs_parked = 1;
 	if (c->ep >= 0) {
-		/* its bytes wait in the socket; staged output still goes */
-		ev.events = conn_ev_in(c) | (c->want_write ? EPOLLOUT : 0);
+		ev.events = 0;             /* its bytes wait in the socket */
 		ev.data.ptr = c;
 		epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &ev);
 	}
+	c->hs_parked = 1;
 	c->hs_next = NULL;
 	c->hs_prev = hs_tail;
 	if (hs_tail)
@@ -4036,7 +3986,7 @@ int pc_conn_hs_run(int budget)
 			n++;
 			continue;
 		}
-		ev.events = conn_ev_in(c) | (c->want_write ? EPOLLOUT : 0);
+		ev.events = EPOLLIN;
 		ev.data.ptr = c;
 		epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &ev);
 		pc_conn_event(c, EPOLLIN);     /* may destroy it: not touched after */
@@ -4087,8 +4037,6 @@ static int tls_wire(void *ctx, const char *p, size_t n)
  * serves what is buffered.  -1 drop (c->why says why), 1 handshake needs more, 0 done */
 static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 {
-	int tls_closed = 0;
-
 	if (c->encrypted) {
 		int st;
 
@@ -4156,10 +4104,9 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 				return -1;
 		}
 	} else if (c->tls) {               /* records in, plaintext to the parser */
-		int rc;
-
 		if (c->raw_len) {          /* records held while paused or parked (ur_hold) */
 			size_t hl = c->raw_len;
+			int rc;
 
 			c->raw_len = 0;
 			in_hold_serve = c->ep < 0;
@@ -4167,12 +4114,9 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 			in_hold_serve = 0;
 			if (rc < 0)
 				return -1;
-			tls_closed = rc > 0;
 		}
-		rc = pc_tls_input(c->tls, buf, n, tls_plain, tls_wire, c, &c->why);
-		if (rc < 0)
+		if (pc_tls_input(c->tls, buf, n, tls_plain, tls_wire, c, &c->why) < 0)
 			return -1;
-		tls_closed |= rc > 0;
 		if (c->wire_off < c->wire_len && conn_flush(c) < 0)
 			return -1;
 		if (!pc_tls_up(c->tls))
@@ -4183,9 +4127,6 @@ static int conn_take(struct pc_conn *c, const char *buf, size_t n)
 	}
 	if (process_plaintext(c) < 0)
 		return -1;
-	/* the client's close_notify: what it sent before is served, then the connection goes */
-	if (tls_closed)
-		c->close_after = 1;
 	return 0;
 }
 

@@ -60,9 +60,6 @@ struct pending;
 uint32_t cl_pend_alloc(int kind, int expect, int extra_ms,
 		struct pending **out);
 void cl_pend_release(struct pending *slot);
-struct clpend_fill;
-int cl_pend_fill(struct pending *slot, uint32_t req, const struct clpend_fill *f);
-int cl_pend_sent(struct pending *slot, uint32_t req, int asked, int sent);
 void cl_set_fail(int reason);
 /* the pull behind pc_pull_begin, with the answer's kind: PC_DONE_PULL for
  * a client's miss, PC_DONE_RECONCILE for the reconcile probe (clwork.c) */

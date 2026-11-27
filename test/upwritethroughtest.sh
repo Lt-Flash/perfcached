@@ -199,15 +199,6 @@ r=$(resp JSON.SET d:1 '$' '{"x":1}' EX 50)
 [ "$r" = "'+OK'" ] && grep -q '^JSON.SET d:1 \$ {"x":1}$' "$D/upm/writes" && grep -q '^EXPIRE d:1 50$' "$D/upm/writes" &&
 	ok "3. JSON.SET ... EX 50: the document, then EXPIRE 50 (RedisJSON has no EX)" ||
 	bad "3. JSON.SET: $r; M writes: $(grep 'd:1' "$D/upm/writes" | tr '\n' ' ')"
-# a bad EX is the door's error, as without the upstream - not a document left with no expiry
-for t in abc 0 -5 99999999999999999999999999; do
-	r=$(resp JSON.SET d:3 '$' '{"z":3}' EX "$t")
-	case "$r" in *"invalid expire time"*)
-		grep -q '^JSON.SET d:3 ' "$D/upm/writes" &&
-			bad "3. JSON.SET ... EX $t: $r, but the document went to the master" ||
-			ok "3. JSON.SET ... EX $t: refused ($r), nothing sent";;
-		*) bad "3. JSON.SET ... EX $t: $r - the bad TTL was not refused";; esac
-done
 # the document lands here with the write's read-back, which can trail the +OK on a loaded
 # ASan runner
 i=0; while [ $i -lt 20 ] && [ "$(resp JSON.GET d:1)" != "'{\"x\":1}'" ]; do sleep 0.25; i=$((i+1)); done
@@ -323,12 +314,6 @@ d={(r["dialect"], r["verb"]): r["calls"] for r in s["commands"]}
 print(d.get(("resp","set")), d.get(("cmd","set")), d.get(("cmd","setnx")))')
 [ "$c" = "3 1 1" ] && ok "5b. a write that waited for the master is one call in the commands table (resp set 3, cmd set 1, setnx 1)" ||
 	bad "5b. commands table calls (resp set, cmd set, cmd setnx): $c - a parked write counted twice?"
-# a passed write's nil is its old value, not "not applied": GETSET after a DEL - the read-back stands
-resp SET g:1 old > /dev/null; resp DEL g:1 > /dev/null
-r=$(resp GETSET g:1 new); r2=$(resp GET g:1)
-[ "$r" = None ] && [ "$r2" = "'new'" ] && [ "$(mdata m g:1 value)" = new ] &&
-	ok "5b. GETSET (passed) on a key just deleted: nil, and GET reads 'new' here at once" ||
-	bad "5b. GETSET after DEL: $r, then GET $r2 (M $(mdata m g:1 value)) - the read-back dropped for the nil"
 stop
 conf b "upstream_unknown = refuse"
 start b || bad "5. the node with upstream_unknown = refuse did not start"
@@ -481,32 +466,6 @@ echo "$r" | grep -q 'mixes keys inside and outside' && [ "$(mdata m o:7 value)" 
 r=$(native '{"method": "mset", "params": {"items": [{"key": "x:8", "value": "c"}, {"key": "x:9", "value": "d"}]}}')
 echo "$r" | grep -q '"stored": 2' && [ "$(resp GET x:8)" = "'c'" ] && [ "$(mdata m x:8 value)" = None ] &&
 	ok "11. AR5: an mset of the fleet's own keys (outside upstream_prefixes) is stored here only" || bad "11. own mset: $r, M x:8 $(mdata m x:8 value)"
-# a DEL naming one key inside and one outside the prefixes is refused whole: sent, it would
-# delete the fleet's own key at Redis too
-resp SET o:5 keep > /dev/null; resp SET x:5 ours > /dev/null
-r=$(resp DEL o:5 x:5)
-case "$r" in *"mixes keys inside and outside"*)
-	[ "$(mdata m o:5 value)" = keep ] && [ "$(resp GET x:5)" = "'ours'" ] &&
-	! grep -q '^DEL .*x:5' "$D/upm/writes" 2>/dev/null &&
-	ok "11. DEL o:5 x:5 (one key outside upstream_prefixes): refused, nothing sent, both kept" ||
-	bad "11. DEL o:5 x:5: $r but M o:5 $(mdata m o:5 value), x:5 $(resp GET x:5), writes: $(grep '^DEL' "$D/upm/writes" | tr '\n' '|')";;
-	*) bad "11. DEL o:5 x:5 (one key outside upstream_prefixes): $r - forwarded whole";; esac
-stop
-unfake
-
-# a BCAST answered past upstream_timeout_ms is asked again on a new connection, not taken as refused
-fakes
-# the tracking connection goes to a replica (R1 above): there the first BCAST is answered late
-ctl 1 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "bcast_delay_ms": 1500, "bcast_delay_n": 1}'
-ctl 2 '{"role": "replica", "master_host": "127.0.0.1", "master_port": '$PM', "bcast_delay_ms": 1500, "bcast_delay_n": 1}'
-conf o "upstream_prefixes = o:*"
-sed -i 's/^upstream_prefixes = \*$//' "$D/o.conf"
-start o || bad "11. start (slow BCAST): $(grep -m2 -E 'ERROR|CRIT' "$D/o.log")"
-waitfor 10 '[ "$(wt "w[\"bcast\"]")" = on ]'
-nb=$(cat "$D"/up1/counts "$D"/up2/counts 2>/dev/null | grep -c 'TRACKING ON BCAST')
-[ "$(wt 'w["bcast"]')" = on ] && [ "$nb" -ge 2 ] && grep -q "did not answer CLIENT TRACKING ON BCAST in time" "$D/o.log" &&
-	ok "11. the first BCAST answered after the timeout: asked again on a new connection, on" ||
-	bad "11. slow BCAST: bcast $(wt 'w["bcast"]'), the replicas heard $nb BCAST(s), log: $(grep -m2 'CLIENT TRACKING' "$D/o.log" | tr '\n' '|')"
 stop
 unfake
 

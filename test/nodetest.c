@@ -41,17 +41,6 @@ static void mid(void)
 
 int main(void)
 {
-	/* 0: a move from a state the node is not in leaves it; from that state it moves */
-	pc_node_state_set(PC_NST_CONNECTING);
-	CHK(!pc_node_state_move(PC_NST_RECOVERING, PC_NST_READY) &&
-		pc_node_state() == PC_NST_CONNECTING,
-		"0: RECOVERING -> READY on a CONNECTING node: left CONNECTING (%s)",
-		pc_node_state_name(pc_node_state()));
-	pc_node_state_set(PC_NST_RECOVERING);
-	CHK(pc_node_state_move(PC_NST_RECOVERING, PC_NST_READY) &&
-		pc_node_state() == PC_NST_READY, "0: and on a RECOVERING node: READY (%s)",
-		pc_node_state_name(pc_node_state()));
-
 	/* A: RECOVERING -> READY on this thread, the WAL's FAILED inside its window */
 	pc_node_state_set(PC_NST_RECOVERING);
 	pc_node_test_mid = mid;

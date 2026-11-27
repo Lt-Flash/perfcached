@@ -341,8 +341,8 @@ static int seg_activate(int idx, uint32_t gen)
 }
 
 /* ---- CONTROL: the durable half of the recycling rule ------------------- */
-/* single pwrite, CRC-checked: a torn or absent CONTROL reads as unknown, which leaves
- * seg_first 0, and seg_hot then reads that segment as cold */
+/* single pwrite, CRC-checked: a torn or absent CONTROL reads as unknown,
+ * so every segment is judged hot - the conservative direction */
 #define PC_WAL_CTRL_MAGIC 0x50435743u          /* "PCWC" */
 #define PC_WAL_CTRL_FMT   1u
 #define CTRL_HDR  24

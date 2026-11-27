@@ -28,28 +28,16 @@ struct pc_winmax {
 	unsigned long long m[PC_WIN_SLOTS];
 };
 
-#define PC_WIN_CLAIM  (~0u)          /* a slot's minute while one thread starts it */
-
 static inline void pc_winmax_note(struct pc_winmax *w, unsigned int now,
 		unsigned long long v)
 {
-	unsigned int mi = now / 60, s = mi % PC_WIN_SLOTS, cm, spin;
+	unsigned int mi = now / 60, s = mi % PC_WIN_SLOTS;
 	unsigned long long cur;
 
-	/* one thread claims a new minute and starts its slot at its value; the others wait out
-	 * the claim (a few instructions) and raise the slot as usual */
-	for (spin = 0;; spin++) {
-		cm = __atomic_load_n(&w->mi[s], __ATOMIC_ACQUIRE);
-		if (cm == mi)
-			break;
-		if (spin >= 1000 || (cm != PC_WIN_CLAIM && cm > mi))
-			return;            /* a claim that stalls, or a slot newer than @now */
-		if (cm != PC_WIN_CLAIM && __atomic_compare_exchange_n(&w->mi[s], &cm,
-		        PC_WIN_CLAIM, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-			__atomic_store_n(&w->m[s], v, __ATOMIC_RELAXED);
-			__atomic_store_n(&w->mi[s], mi, __ATOMIC_RELEASE);
-			return;
-		}
+	if (__atomic_load_n(&w->mi[s], __ATOMIC_RELAXED) != mi) {
+		__atomic_store_n(&w->m[s], v, __ATOMIC_RELAXED);
+		__atomic_store_n(&w->mi[s], mi, __ATOMIC_RELEASE);
+		return;
 	}
 	cur = __atomic_load_n(&w->m[s], __ATOMIC_RELAXED);
 	while (v > cur && !__atomic_compare_exchange_n(&w->m[s], &cur, v, 0,

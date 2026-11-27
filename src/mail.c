@@ -26,25 +26,19 @@ struct mitem {
 	unsigned int test_gen;             /* nonzero: the mailtest waiting on it */
 };
 
-#define MAIL_TESTS 8                  /* mailtest answers kept */
-
 static struct {
 	pthread_mutex_t mx;
 	pthread_cond_t cv;                 /* the thread: work arrived, or stop */
 	pthread_cond_t test_cv;            /* mailtest: its answer arrived */
 	struct pc_mail_conf c;
 	int started, stopping;
-	long long drain_until;             /* a stop sends what is queued until then (monotonic ms) */
 	pthread_t tid;
 	struct mitem *head, *tail;
 	int nq;
-	/* mailtests: the last generation handed out, and the last few answers, each by its own */
-	unsigned int test_gen;
-	struct {
-		unsigned int gen;
-		int rc;
-		char reply[PC_MAIL_REPLY_MAX];
-	} test_res[MAIL_TESTS];
+	/* the one mailtest at a time */
+	unsigned int test_gen, test_done_gen;
+	int test_rc;
+	char test_reply[PC_MAIL_REPLY_MAX];
 	struct pc_mail_stats st;
 	unsigned long long base_sent, base_failed, base_dropped;
 	char host[128];
@@ -59,14 +53,6 @@ static long long wall_ms(void)
 	struct timespec ts;
 
 	clock_gettime(CLOCK_REALTIME, &ts);
-	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static long long mono_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
@@ -174,50 +160,6 @@ static void name_put(FILE *f, const char *n)
 	fputc('"', f);
 }
 
-/* a byte RFC 2047's Q encoding writes as itself (a space is written as '_') */
-static int q_plain(unsigned char c)
-{
-	return c > 32 && c < 127 && c != '=' && c != '?' && c != '_';
-}
-
-/* the Subject (RFC 2047): as it is when it is all printable ASCII, else as utf-8 Q encoded-words,
- * folded so each line stays within 78 and no character is split between two words */
-static void subj_put(FILE *f, const char *s)
-{
-	const unsigned char *p = (const unsigned char *)s;
-	int col = 0, n, k, need;
-
-	while (*p >= 32 && *p < 127)
-		p++;
-	if (!*p) {
-		fputs(s, f);
-		return;
-	}
-	fputs("=?utf-8?Q?", f);
-	for (p = (const unsigned char *)s; *p; p += n) {
-		n = 1;
-		if (*p >= 0xc0)
-			while (n < 4 && (p[n] & 0xc0) == 0x80)
-				n++;
-		for (k = 0, need = 0; k < n; k++)
-			need += q_plain(p[k]) || p[k] == ' ' ? 1 : 3;
-		if (col + need > 56) {
-			fputs("?=\r\n =?utf-8?Q?", f);
-			col = 0;
-		}
-		for (k = 0; k < n; k++) {
-			if (p[k] == ' ')
-				fputc('_', f);
-			else if (q_plain(p[k]))
-				fputc(p[k], f);
-			else
-				fprintf(f, "=%02X", p[k]);
-		}
-		col += need;
-	}
-	fputs("?=", f);
-}
-
 /* the length name_put() writes */
 static size_t name_len(const char *n)
 {
@@ -286,9 +228,7 @@ static int send_one(const struct mitem *it, char *reply, size_t cap)
 			ll += al;
 		}
 	}
-	fputs("\r\nSubject: ", f);
-	subj_put(f, it->subject);
-	fputs("\r\n", f);
+	fprintf(f, "\r\nSubject: %s\r\n", it->subject);
 	if (it->msgid)
 		fprintf(f, "Message-ID: %s\r\n", it->msgid);
 	else
@@ -401,8 +341,7 @@ static void *mail_main(void *arg)
 
 		while (!M.head && !M.stopping)
 			pthread_cond_wait(&M.cv, &M.mx);
-		/* a stop still sends what was queued before it, for one timeout */
-		if (M.stopping && (!M.head || mono_ms() >= M.drain_until))
+		if (M.stopping)
 			break;
 		it = M.head;
 		M.head = it->next;
@@ -429,12 +368,10 @@ static void *mail_main(void *arg)
 			M.st.last_err_ms = wall_ms();
 			snprintf(M.st.last_error, sizeof M.st.last_error, "%s", reply);
 		}
-		if (it->test_gen) {
-			unsigned int ti = it->test_gen % MAIL_TESTS;
-
-			M.test_res[ti].gen = it->test_gen;
-			M.test_res[ti].rc = ok;
-			snprintf(M.test_res[ti].reply, sizeof M.test_res[ti].reply, "%s", reply);
+		if (it->test_gen && it->test_gen == M.test_gen) {
+			M.test_rc = ok;
+			snprintf(M.test_reply, sizeof M.test_reply, "%s", reply);
+			M.test_done_gen = it->test_gen;
 			pthread_cond_broadcast(&M.test_cv);
 		}
 		item_free(it);
@@ -497,7 +434,6 @@ void pc_mail_stop(void)
 		return;
 	pthread_mutex_lock(&M.mx);
 	M.stopping = 1;
-	M.drain_until = mono_ms() + (long long)M.c.timeout_s * 1000;
 	pthread_cond_broadcast(&M.cv);
 	pthread_mutex_unlock(&M.mx);
 	pthread_join(M.tid, NULL);
@@ -621,12 +557,12 @@ int pc_mail_test(char *reply, size_t cap)
 	clock_gettime(CLOCK_REALTIME, &until);
 	until.tv_sec += M.c.timeout_s + 5;
 	pthread_mutex_lock(&M.mx);
-	while (M.test_res[gen % MAIL_TESTS].gen != gen &&
+	while (M.test_done_gen != gen &&
 	       pthread_cond_timedwait(&M.test_cv, &M.mx, &until) != ETIMEDOUT)
 		;
-	if (M.test_res[gen % MAIL_TESTS].gen == gen) {
-		rc = M.test_res[gen % MAIL_TESTS].rc;
-		snprintf(reply, cap, "%s", M.test_res[gen % MAIL_TESTS].reply);
+	if (M.test_done_gen == gen) {
+		rc = M.test_rc;
+		snprintf(reply, cap, "%s", M.test_reply);
 	} else {
 		rc = 0;
 		snprintf(reply, cap, "no answer within %d s - the mail is still "

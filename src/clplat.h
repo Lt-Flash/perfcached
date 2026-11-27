@@ -40,11 +40,6 @@ uint64_t clplat_uuid_v7_ms(const unsigned char id[CLPLAT_ID_LEN]);
 /* canonical 8-4-4-4-12 plus NUL; @out needs 37 bytes */
 void clplat_uuid_str(const unsigned char id[CLPLAT_ID_LEN], char *out);
 
-#define CLPLAT_IFNAME    16            /* IFNAMSIZ */
-/* @name into @names (@n held, sorted), keeping the @max smallest whatever the order read: the
- * new count; a name of CLPLAT_IFNAME or more is skipped */
-int clplat_keep_smallest(char (*names)[CLPLAT_IFNAME], int n, int max, const char *name);
-
 /* ---- the /sys reads ---- */
 
 /* DMI product_uuid, else the primary NIC MAC (LXC has no DMI): the source, or CLPLAT_NONE; *why on

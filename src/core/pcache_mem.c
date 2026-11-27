@@ -454,14 +454,11 @@ void *pcache_mem_reserve(size_t size, size_t commit, enum pcache_mem_tier *tier,
 		*tier = PCACHE_MEM_4K;         /* S167: asked for, not fallen to */
 	} else if (range_is_huge((unsigned long)base, pc_thp_sz)) {
 		*tier = PCACHE_MEM_THP_ADVISE;
+	} else if (madvise(base, asize, MADV_COLLAPSE) == 0 &&
+	           range_is_huge((unsigned long)base, pc_thp_sz)) {
+		*tier = PCACHE_MEM_THP_COLLAPSE;
 	} else {
-		/* only the commit is populated: the lazy tail cannot collapse and would fail the
-		 * whole call, so the commit is asked and the result read from the mapping */
-		if (commit)
-			(void)madvise(base, commit, MADV_COLLAPSE);
-		*tier = commit && range_is_huge((unsigned long)base, pc_thp_sz)
-			? PCACHE_MEM_THP_COLLAPSE
-			: PCACHE_MEM_4K;       /* reserved+pinned but 4K */
+		*tier = PCACHE_MEM_4K;         /* reserved+pinned but 4K */
 	}
 	return base;
 }

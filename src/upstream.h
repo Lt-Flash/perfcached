@@ -161,14 +161,6 @@ int pc_upstream_resp_gate(pcache_htable_t *ht, const char *col, size_t collen,
  * - drop the reply and gate the command again (pc_conn_upstream_retry bounds it) */
 int pc_upstream_resp_lost(pcache_htable_t *ht, const char *col, size_t collen,
 		char *const *argv, const size_t *argl, int nargs);
-/* the native doors' form: @keys the read used, after the read pc_upstream_lost_arm armed */
-int pc_upstream_lost(pcache_htable_t *ht, const char *col, size_t collen,
-		const char *const *keys, const size_t *kl, int n);
-/* @col's removal count now - taken before the gate, armed after it (the run after a fetch
- * arms the count taken when it parked) */
-unsigned long long pc_upstream_rm_mark(const char *col, size_t collen);
-void pc_upstream_lost_arm(const char *col, size_t collen,
-		unsigned long long end0);
 /* that lost read is answered as it stands - its re-gates are spent (counted) */
 void pc_upstream_lost_spent(void);
 /* tests only: PERFCACHED_TEST_GATE_DELAY_US holds a read the gate let

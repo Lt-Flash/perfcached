@@ -33,9 +33,6 @@ unsigned long long pc_cluster_bad_col_names(void)
 	return __atomic_load_n(&cl_bad_col_names, __ATOMIC_RELAXED);
 }
 
-/* announces of an op this build does not know: the cluster thread only */
-static unsigned long long cl_unknown_ops;
-
 static int col_name_refused(const char *what, const char *s, size_t n)
 {
 	unsigned long long c;
@@ -128,13 +125,8 @@ void rz_again_tick(long long now)
 unsigned long long pc_cluster_col_announce(const char *name, size_t nlen,
 		int buckets_log2, int op)
 {
-	return pc_cluster_col_announce_gen(name, nlen, buckets_log2, op, 0);
-}
-
-unsigned long long pc_cluster_col_announce_gen(const char *name, size_t nlen,
-		int buckets_log2, int op, unsigned long long gen)
-{
 	unsigned char msg[16 + PC_COL_NAME_MAX];
+	unsigned long long gen;
 	long long now = cl_now_ms();
 
 	if (!cl_enabled() || nlen == 0 || nlen >= PC_COL_NAME_MAX)
@@ -149,8 +141,7 @@ unsigned long long pc_cluster_col_announce_gen(const char *name, size_t nlen,
 	}
 	/* a resize TICKS for its generation: two resizes read off an idle clock could
 	 * share one, and their order is what lets a receiver drop the older */
-	if (!gen)
-		gen = op == CLCOL_OP_RESIZE ? pc_lamport_tick() : pc_lamport_now();
+	gen = op == CLCOL_OP_RESIZE ? pc_lamport_tick() : pc_lamport_now();
 	(void)clsend_live(cl_peers(), msg, col_ann_build(msg, sizeof msg, name, nlen,
 		buckets_log2, op, gen), now);
 	if (op == CLCOL_OP_RESIZE)
@@ -399,15 +390,6 @@ void handle_col_set(const unsigned char *pt, size_t n)
 			LM_NOTICE("collection '%s': the fleet's resize to 2^%d "
 				"is held until the one running here finishes\n",
 				name, bl);
-	} else if (a.op != CLCOL_OP_SET) {
-		/* an op from a newer build: skipped, never read as the create it is not */
-		unsigned long long c = ++cl_unknown_ops;
-
-		if (c <= 8 || !(c & (c - 1)))
-			LM_WARN("collection '%s': a peer announced op %d, which "
-				"this build does not know - ignored (%llu so far)\n",
-				name, a.op, c);
-		return;
 	} else if (!pc_store_find(name, nl)) {
 		int rc;
 

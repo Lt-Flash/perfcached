@@ -249,14 +249,6 @@ static int call_add(perfd_t *p, unsigned long long id, perfd_reply_cb cb,
 	return 0;
 }
 
-/* the outermost library call that ran callbacks frees a handle perfd_free was called on meanwhile */
-static int disp_leave(perfd_t *p, int rc)
-{
-	if (--p->disp == 0 && p->free_req)
-		free_now(p);
-	return rc;
-}
-
 /* arrival order, not request order: a slow KEYS must not hold up the gets behind it.
  * A perfd_submit() caller (render) gets the reply tree as NUL-terminated JSON. */
 static void call_fire(perfd_t *p, unsigned long long id, char *result,
@@ -296,7 +288,7 @@ static void call_fire(perfd_t *p, unsigned long long id, char *result,
  * never silently loses a request it issued */
 static void call_fail_all(perfd_t *p, const char *why)
 {
-	while (p->ncalls && !p->free_req) {
+	while (p->ncalls) {
 		struct pd_call c = p->calls[--p->ncalls];
 
 		if (c.cb)
@@ -490,10 +482,9 @@ static int submit_framed(perfd_t *p, perfd_reply_cb cb, void *ctx,
 		return 0;              /* batched; goes out on write-readiness */
 	if (wbuf_push(p) < 0) {
 		p->ncalls--;
-		p->st = PERFD_ST_FAILED;
-		p->disp++;
 		call_fail_all(p, p->err);
-		return disp_leave(p, -1);
+		p->st = PERFD_ST_FAILED;
+		return -1;
 	}
 	return 0;
 }
@@ -550,7 +541,7 @@ int perfd_submit_kv(perfd_t *p, int verb, const char *col, const char *key,
 
 /* NOT perfd_flush, which is the SYNC path's (p->q, send_bytes); this
  * pushes the async write buffer */
-static int perfd_push_in(perfd_t *p)
+int perfd_push(perfd_t *p)
 {
 	if (!p->async)
 		return errk(p, PERFD_E_STATE, "not an async handle");
@@ -569,7 +560,7 @@ static int perfd_push_in(perfd_t *p)
 	return 0;
 }
 
-static int perfd_write_ready_in(perfd_t *p)
+int perfd_write_ready(perfd_t *p)
 {
 	if (!p->async)
 		return errk(p, PERFD_E_STATE, "not an async handle");
@@ -612,7 +603,7 @@ static int perfd_write_ready_in(perfd_t *p)
 	return 0;
 }
 
-static int perfd_read_ready_in(perfd_t *p)
+int perfd_read_ready(perfd_t *p)
 {
 	int rc;
 
@@ -650,8 +641,6 @@ static int perfd_read_ready_in(perfd_t *p)
 	if (p->hs_stage != PD_HS_DONE)
 		return 0;
 	if (cin_drain(p) != 0) {
-		if (p->free_req)
-			return 0;
 		p->st = PERFD_ST_FAILED;
 		call_fail_all(p, p->err);
 		return -1;
@@ -678,27 +667,7 @@ static int perfd_read_ready_in(perfd_t *p)
 			return -1;
 		}
 		call_fire(p, got, result, rlen, result ? NULL : ebuf);
-		if (p->free_req)
-			return 0;
 	}
 	learn_members_async(p);        /* due at refresh_ms, or now after a push counted another fleet */
 	return 0;
-}
-
-int perfd_push(perfd_t *p)
-{
-	p->disp++;
-	return disp_leave(p, perfd_push_in(p));
-}
-
-int perfd_write_ready(perfd_t *p)
-{
-	p->disp++;
-	return disp_leave(p, perfd_write_ready_in(p));
-}
-
-int perfd_read_ready(perfd_t *p)
-{
-	p->disp++;
-	return disp_leave(p, perfd_read_ready_in(p));
 }

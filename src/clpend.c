@@ -38,7 +38,6 @@ int clpend_init(struct clpend *p, int cap)
 	p->peak = 0;
 	p->exhausted = 0;
 	p->reconcile_expired = 0;
-	p->cq_dropped = 0;
 	memset(p->used_kind, 0, sizeof p->used_kind);
 	pthread_mutex_init(&p->mx, NULL);
 	for (i = 0; i < WORKERS_MAX; i++)
@@ -150,57 +149,6 @@ uint32_t clpend_alloc(struct clpend *p, int kind, int expect, int extra_ms,
 	return req;
 }
 
-int clpend_fill(struct clpend *p, struct pending *slot, uint32_t req,
-		const struct clpend_fill *f)
-{
-	pthread_mutex_lock(&p->mx);
-	if (slot->req != req) {
-		pthread_mutex_unlock(&p->mx);
-		return 0;
-	}
-	if (f->col && f->collen < sizeof slot->col &&
-	    (f->key_long || f->klen < sizeof slot->key)) {
-		memcpy(slot->col, f->col, f->collen);
-		slot->collen = (unsigned char)f->collen;
-		if (f->key_long)
-			slot->key_long = f->key_long;
-		else
-			memcpy(slot->key, f->key, f->klen);
-		slot->klen = (unsigned short)f->klen;
-	}
-	slot->jop = f->jop;
-	slot->probe_op = f->probe_op;
-	slot->stash = f->stash;
-	slot->stash_len = f->stash_len;
-	slot->by = f->by;
-	slot->ttl_rel = f->ttl_rel;
-	pthread_mutex_unlock(&p->mx);
-	return 1;
-}
-
-int clpend_sent(struct clpend *p, struct pending *slot, uint32_t req, int asked,
-		int sent)
-{
-	int n = asked - sent, rc = 1;
-
-	if (n <= 0)
-		return 1;
-	pthread_mutex_lock(&p->mx);
-	if (slot->req == req) {
-		if (slot->expect > n)
-			slot->expect -= n;
-		else if (!slot->answered && !slot->probe_fwd) {
-			/* every peer asked has said no already, or none was reached */
-			free(slot->stash);
-			slot->stash = NULL;
-			clpend_release_locked(p, slot);
-			rc = 0;
-		}
-	}
-	pthread_mutex_unlock(&p->mx);
-	return rc;
-}
-
 int clpend_used(const struct clpend *p) { return p->used; }
 int clpend_peak(const struct clpend *p) { return p->peak; }
 int clpend_peak_win(const struct clpend *p)
@@ -212,27 +160,20 @@ unsigned long long clpend_exhausted(const struct clpend *p)
 	return p->exhausted;
 }
 
-unsigned long long clpend_cq_dropped(const struct clpend *p)
-{
-	return __atomic_load_n(&p->cq_dropped, __ATOMIC_RELAXED);
-}
-
 /* ---- completion queues --------------------------------------------- */
 
-int clpend_cq_register(struct clpend *p, int worker, int efd)
+void clpend_cq_register(struct clpend *p, int worker, int efd)
 {
 	if (worker < 0 || worker >= WORKERS_MAX)
-		return -1;
+		return;
 	if (!p->cq[worker].q)
 	{
 		p->cq[worker].q = calloc((size_t)p->qmask + 1,
 			sizeof *p->cq[worker].q);
-		if (p->cq[worker].q)
-			pc_touch_pages(p->cq[worker].q,
-				((size_t)p->qmask + 1) * sizeof *p->cq[worker].q);
+		pc_touch_pages(p->cq[worker].q,
+			((size_t)p->qmask + 1) * sizeof *p->cq[worker].q);
 	}
 	p->cq[worker].efd = efd;
-	return p->cq[worker].q ? 0 : -1;
 }
 
 void clpend_cq_post(struct clpend *p, int worker, uint32_t req, int kind,
@@ -271,8 +212,6 @@ void clpend_cq_post(struct clpend *p, int worker, uint32_t req, int kind,
 				d->found = 0;
 		}
 		q->tail++;
-	} else {
-		__atomic_fetch_add(&p->cq_dropped, 1, __ATOMIC_RELAXED);
 	}
 	pthread_mutex_unlock(&q->mx);
 	if (q->efd > 0)
@@ -427,15 +366,6 @@ int clpend_answer(struct clpend *p, uint32_t req, int positive, int from_node,
 		return r;
 	}
 
-	if (from_node > 0 && from_node < CLPEND_NODE_WORDS * 64) {
-		uint64_t bit = 1ull << (from_node & 63), *w = &s->neg_from[from_node >> 6];
-
-		if (*w & bit) {
-			pthread_mutex_unlock(&p->mx);
-			return CLPEND_ANS_IGNORE;  /* that node's no is counted already */
-		}
-		*w |= bit;
-	}
 	if (--s->expect <= 0 && !s->answered) {
 		out->worker = s->worker;
 		if (s->probe_op) {

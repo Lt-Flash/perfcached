@@ -52,17 +52,6 @@ unsigned long long pc_cluster_col_announce(const char *name, size_t nlen, int bu
 	return 0;
 }
 
-unsigned long long pc_cluster_col_announce_gen(const char *name, size_t nlen, int buckets_log2,
-		int op, unsigned long long gen)
-{
-	(void)name;
-	(void)nlen;
-	(void)buckets_log2;
-	(void)op;
-	(void)gen;
-	return 0;
-}
-
 void pc_cluster_col_announce2(const char *from, size_t flen, const char *to, size_t tlen)
 {
 	(void)from;
@@ -186,16 +175,6 @@ int pc_cluster_map_stamp(unsigned int *term, unsigned int *seq)
 		*term = 0;
 	if (seq)
 		*seq = 0;
-	return 0;
-}
-
-int pc_cluster_map_usable(void)
-{
-	return 0;
-}
-
-uint64_t pc_cluster_map_place(void)
-{
 	return 0;
 }
 
@@ -524,11 +503,6 @@ void pc_cluster_set_cfgsig(const struct pc_cfgsig *e, int n)
 	(void)n;
 }
 
-void pc_cluster_set_cfgsig_one(const struct pc_cfgsig *e)
-{
-	(void)e;
-}
-
 int pc_cluster_cfgsig(const struct pc_cfgsig **e)
 {
 	*e = NULL;
@@ -779,7 +753,7 @@ int pc_spread_in_set(unsigned slot, int node_id, int k)
 	(void)slot;
 	(void)node_id;
 	(void)k;
-	return 0;                          /* the clustered build's answer with the cluster off */
+	return 1;
 }
 
 int pc_spread_pick_peer(unsigned slot, int k)

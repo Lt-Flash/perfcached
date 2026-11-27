@@ -5,7 +5,7 @@
 
 #include "clres.h"
 
-int clres_note(struct clres *r, int id, struct in_addr addr, uint16_t port,
+int clres_note(struct clres *r, int id, struct in_addr addr,
 		const unsigned char *ident, int has_ident,
 		long long now, long long ttl_ms)
 {
@@ -15,8 +15,7 @@ int clres_note(struct clres *r, int id, struct in_addr addr, uint16_t port,
 	if (!id)
 		return 0;
 	for (i = 0; i < CLRES_MAX; i++) {
-		if (r->e[i].id && r->e[i].addr.s_addr == addr.s_addr &&
-		    r->e[i].port == port) {
+		if (r->e[i].id && r->e[i].addr.s_addr == addr.s_addr) {
 			slot = i;              /* the same address: refresh */
 			break;
 		}
@@ -35,7 +34,6 @@ int clres_note(struct clres *r, int id, struct in_addr addr, uint16_t port,
 	if (slot < 0)
 		slot = 0;
 	r->e[slot].addr = addr;
-	r->e[slot].port = port;
 	r->e[slot].why = CLRES_GONE_UNKNOWN;     /* the caller says */
 	r->e[slot].silent_s = 0;
 	r->e[slot].has_ident = has_ident;
@@ -56,7 +54,7 @@ int clres_holds(const struct clres *r, int id, long long now)
 }
 
 int clres_take(struct clres *r, const unsigned char *ident,
-		const struct in_addr *addr, uint16_t port, long long now, const char **how)
+		const struct in_addr *addr, long long now, const char **how)
 {
 	int i, id = 0;
 
@@ -70,7 +68,7 @@ int clres_take(struct clres *r, const unsigned char *ident,
 		}
 	for (i = 0; i < CLRES_MAX && !id; i++)
 		if (r->e[i].id && r->e[i].until_ms > now &&
-		    r->e[i].addr.s_addr == addr->s_addr && r->e[i].port == port) {
+		    r->e[i].addr.s_addr == addr->s_addr) {
 			id = r->e[i].id;
 			*how = "address";
 			r->e[i].id = 0;

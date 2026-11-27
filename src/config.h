@@ -383,9 +383,6 @@ PC_MUST_CHECK int pc_config_load(const char *path, struct pc_config *cfg);
 
 /* print the normalized effective config to stdout; secrets are masked */
 void pc_config_dump(const struct pc_config *cfg);
-/* the descriptors held apart from clients: listeners (one a worker for each TCP one), the
- * threads' own, the cluster's, WAL/RDB and a few HTTP doors */
-long pc_config_fd_reserve(const struct pc_config *cfg);
 
 void pc_config_free(struct pc_config *cfg);
 

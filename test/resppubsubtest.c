@@ -1,6 +1,5 @@
 /* resppubsubtest.c - the RESP door's pub/sub (resppubsub.c) with the engine stubbed: every reply
  * checked byte for byte. */
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
 #include "json.h"
@@ -92,7 +91,6 @@ int pc_pubsub_numpat(void) { return 1; }
 
 /* ---- the harness ------------------------------------------------------- */
 static char outbuf[4096];
-static size_t out_cap = sizeof outbuf;
 static struct pc_jw out;
 
 static void run(int (*h)(struct resp_ctx *), const char *a0, const char *a1,
@@ -113,9 +111,7 @@ static void run(int (*h)(struct resp_ctx *), const char *a0, const char *a1,
 	c.nargs = n;
 	c.out = &out;
 	c.conn = &out;                     /* any non-NULL connection */
-	/* a heap writer the last handler took */
-	pc_jw_free(&out);
-	pc_jw_init(&out, outbuf, out_cap);
+	pc_jw_init(&out, outbuf, sizeof outbuf);
 	h(&c);
 }
 
@@ -160,38 +156,6 @@ int main(void)
 	CHK(is("*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:0\r\n"),
 		"C: and with none left, a bare nil confirmation");
 
-	/* C2: confirmations that outgrow the request's writer - every one answered, none lost
-	 * behind "reply too large" */
-	{
-		char nm[16][64];
-		int i, conf = 0;
-		const char *p;
-
-		nsubs = 0;
-		for (i = 0; i < 16; i++) {
-			memset(nm[i], 'a' + i, 62);
-			nm[i][62] = 0;
-			subs[i].len = 62;
-			memcpy(subs[i].name, nm[i], 62);
-			subs[i].pattern = 0;
-		}
-		nsubs = 16;
-		out_cap = 256;
-		run(rh_unsubscribe, "UNSUBSCRIBE", NULL, NULL, NULL);
-		for (p = out.buf; p && (p = memmem(p, out.len - (size_t)(p - out.buf),
-		        "$11\r\nunsubscribe\r\n", 18)); p += 18)
-			conf++;
-		CHK(!out.overflow && conf == 16 && nsubs == 0 && out.len > 6 &&
-			!memcmp(out.buf + out.len - 4, ":0\r\n", 4),
-			"C2: UNSUBSCRIBE of 16 into a 256-byte writer - 16 confirmations, down to 0 (%d)",
-			conf);
-		run(rh_subscribe, "SUBSCRIBE", nm[0], nm[1], nm[2]);
-		CHK(!out.overflow && nsubs == 3 && memmem(out.buf, out.len, ":3\r\n", 4),
-			"C2: SUBSCRIBE of three 62-byte names into it - all confirmed");
-		out_cap = sizeof outbuf;
-		nsubs = 0;
-	}
-
 	/* D: PUBLISH - receivers counted, the reserved __pc. prefix refused, the arity checked */
 	run(rh_publish, "PUBLISH", "ch", "msg", NULL);
 	CHK(is(":2\r\n") && !strcmp(pub_chan, "ch") && !strcmp(pub_data, "msg"),
@@ -199,14 +163,6 @@ int main(void)
 	run(rh_publish, "PUBLISH", "__pc.events", "x", NULL);
 	CHK(is("-ERR channel prefix __pc. is reserved for the daemon's own events\r\n"),
 		"D: the reserved prefix refused");
-	run(rh_publish, "PUBLISH", "__keyevent@0__:expired", "k", NULL);
-	CHK(is("-ERR channel prefix __keyevent@ is reserved for the daemon's own events\r\n"),
-		"D: a keyspace event's channel refused");
-	run(rh_publish, "PUBLISH", "__keyspace@0__:k", "set", NULL);
-	CHK(is("-ERR channel prefix __keyspace@ is reserved for the daemon's own events\r\n"),
-		"D: and the other keyspace shape");
-	run(rh_publish, "PUBLISH", "__keys", "x", NULL);
-	CHK(is(":2\r\n"), "D: a channel shorter than the prefixes is published");
 	run(rh_publish, "PUBLISH", "ch", NULL, NULL);
 	CHK(is("-ERR wrong number of arguments for 'publish' command\r\n"),
 		"D: PUBLISH without a message refused");
@@ -214,13 +170,6 @@ int main(void)
 	/* E: PUBSUB CHANNELS / NUMSUB / NUMPAT, and an unknown subcommand counted and refused */
 	run(rh_pubsub, "PUBSUB", "CHANNELS", NULL, NULL);
 	CHK(is("*2\r\n$4\r\nnews\r\n$6\r\nsports\r\n"), "E: PUBSUB CHANNELS");
-	{
-		static char longpat[4098];
-
-		memset(longpat, '*', 4097);
-		run(rh_pubsub, "PUBSUB", "CHANNELS", longpat, NULL);
-		CHK(is("-ERR pattern too long\r\n"), "E: PUBSUB CHANNELS with a 4097-byte pattern refused");
-	}
 	run(rh_pubsub, "PUBSUB", "NUMSUB", "news", "x");
 	CHK(is("*4\r\n$4\r\nnews\r\n:3\r\n$1\r\nx\r\n:0\r\n"), "E: PUBSUB NUMSUB news x");
 	run(rh_pubsub, "PUBSUB", "numpat", NULL, NULL);

@@ -286,43 +286,6 @@ int main(void)
 		CHK(frame_at(runaway, sizeof runaway, 0) == -1, "B: 64 KB and no newline - -1");
 	}
 
-	/* B2: an HTTP request on the RESP port - its request line or a header line drops the
-	 * connection before anything runs; the commands in its body never get read */
-	CHK(FRAME("POST / HTTP/1.1\r\nHost: x\r\n\r\nSET k v\r\n") == -1 && verb_calls == 0,
-		"B2: POST / HTTP/1.1 - -1, nothing run");
-	CHK(FRAME("post /x\r\n") == -1 && verb_calls == 0, "B2: post, any case - -1");
-	CHK(FRAME("PUT / HTTP/1.1\r\n") == -1 && FRAME("OPTIONS * HTTP/1.1\r\n") == -1,
-		"B2: PUT and OPTIONS - -1");
-	CHK(FRAME("Host: 10.0.0.1:6379\r\n") == -1 && verb_calls == 0, "B2: a Host: line - -1");
-	CHK(FRAME("GET / HTTP/1.1\r\n") == -1 && verb_calls == 0,
-		"B2: GET / HTTP/1.1 - -1, not run as GET");
-	rc = FRAME("GET k\r\n");
-	CHK(rc == 7 && verb_calls == 1, "B2: an inline GET k still runs");
-
-	/* B3: an inline line of more words than PC_RESP_MAXARGS - refused whole, not run cut */
-	{
-		static char many[PC_RESP_MAXARGS * 2 + 16];
-		size_t n = 0;
-		int i;
-
-		for (i = 0; i < PC_RESP_MAXARGS + 1; i++) {
-			many[n++] = 'k';
-			many[n++] = ' ';
-		}
-		many[n++] = '\r';
-		many[n++] = '\n';
-		rc = frame_at(many, n, 0);
-		CHK(rc == (int)n && verb_calls == 0 && staged("-ERR too many arguments\r\n"),
-			"B3: %d words - the line consumed, refused, nothing run", PC_RESP_MAXARGS + 1);
-		n = (size_t)PC_RESP_MAXARGS * 2;
-		many[n++] = '\t';
-		many[n++] = '\r';
-		many[n++] = '\n';
-		rc = frame_at(many, n, 0);
-		CHK(rc == (int)n && verb_calls == 1 && verb_nargs == PC_RESP_MAXARGS,
-			"B3: exactly %d words, trailing blanks - run", PC_RESP_MAXARGS);
-	}
-
 	/* C: the outcomes - staged, QUIT, too large, -1 drops, parked, walk, hold, a waiting MGET */
 	rc = FRAME("*1\r\n$4\r\nQUIT\r\n");
 	CHK(rc == 14 && c.close_after == 1 && staged("+PONG\r\n"), "C: QUIT - answered, then closed");

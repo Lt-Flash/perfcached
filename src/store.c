@@ -301,27 +301,15 @@ static void colst_reset(int i)
 	__atomic_store_n(&hll_gen[i], 0, __ATOMIC_RELEASE);   /* a new slot has no walk */
 }
 
-/* @ht's slot, or -1: a resize's other table counts too, since a request may hold the
- * pointer it resolved before the swap (as pc_store_scan matches) */
-static int slot_any(const pcache_htable_t *ht)
-{
-	int i, n = __atomic_load_n(&reg_n, __ATOMIC_ACQUIRE);
-
-	if (!ht)
-		return -1;
-	for (i = 0; i < n; i++)
-		if (__atomic_load_n(&reg[i].ht, __ATOMIC_ACQUIRE) == ht ||
-		    __atomic_load_n(&reg[i].rs_to, __ATOMIC_ACQUIRE) == ht)
-			return i;
-	return -1;
-}
-
 void pc_store_note_set(pcache_htable_t *ht, size_t klen, size_t vlen)
 {
-	int i = slot_any(ht), c = 0, s = colst_mine;
+	int i, c = 0, s = colst_mine;
 	size_t v = vlen;
 
-	if (i < 0)
+	for (i = 0; i < reg_n; i++)
+		if (reg[i].ht == ht)
+			break;
+	if (i == reg_n)
 		return;
 	/* classes: <=64, <=256, <=1K, <=4K, <=16K, <=64K, <=256K, more */
 	while (c < 7 && v > (64u << (2 * c)))
@@ -572,32 +560,44 @@ int pc_store_register(const char *name, pcache_htable_t *ht, int pull,
 
 int pc_store_eager_enabled(pcache_htable_t *ht)
 {
-	int i = slot_any(ht);
+	int i;
 
-	return i >= 0 ? reg[i].eager : 0;
+	for (i = 0; i < reg_n; i++)
+		if (reg[i].ht == ht)
+			return reg[i].eager;
+	return 0;
 }
 
 int pc_store_shard_enabled(pcache_htable_t *ht)
 {
-	int i = slot_any(ht);
+	int i;
 
-	return i >= 0 ? reg[i].shard : 0;
+	for (i = 0; i < reg_n; i++)
+		if (reg[i].ht == ht)
+			return reg[i].shard;
+	return 0;
 }
 
 int pc_store_proxy_enabled(pcache_htable_t *ht)
 {
-	int i = slot_any(ht);
+	int i;
 
-	return i >= 0 ? reg[i].proxy : 0;
+	for (i = 0; i < reg_n; i++)
+		if (reg[i].ht == ht)
+			return reg[i].proxy;
+	return 0;
 }
 
 /* an eager collection always pulls, whatever its mode: restarted after a crash it lacks every
  * copy it received (they are off its WAL) until the sweep re-sends them */
 int pc_store_pull_enabled(pcache_htable_t *ht)
 {
-	int i = slot_any(ht);
+	int i;
 
-	return i >= 0 ? reg[i].pull || reg[i].eager : 0;
+	for (i = 0; i < reg_n; i++)
+		if (reg[i].ht == ht)
+			return reg[i].pull || reg[i].eager;
+	return 0;
 }
 
 pcache_htable_t *pc_store_find(const char *name, size_t nlen)
@@ -699,7 +699,12 @@ int pc_store_slot_pub(pcache_htable_t *ht, unsigned long long *pub)
 
 int pc_store_slot_of(pcache_htable_t *ht)
 {
-	return slot_any(ht);
+	int i, n = pc_store_count();
+
+	for (i = 0; i < n; i++)
+		if (reg[i].ht == ht)
+			return i;
+	return -1;
 }
 int pc_store_live(int i)              { return __atomic_load_n(&reg[i].live, __ATOMIC_ACQUIRE); }
 int pc_store_buckets_log2(int i)      { return reg[i].buckets_log2; }
@@ -779,18 +784,17 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 {
 	pcache_htable_t *ht;
 	unsigned long rg0;
-	char *nm;
 	int i, fresh;
 
 	if (nlen == 0 || nlen >= PC_COL_NAME_MAX || buckets_log2 < 4 ||
 	        buckets_log2 > 24)
 		return -1;
 	pthread_mutex_lock(&reg_mx);
-	/* a drop this node already knows about, stamped no earlier than this
-	 * create: the create is the stale news of the two (a drop outranks its create) */
+	/* a drop this node already knows about, stamped later than this
+	 * create: the create is the stale news of the two */
 	for (i = 0; i < reg_n; i++)
 		if (!reg[i].live && strlen(reg[i].name) == nlen &&
-		        !memcmp(reg[i].name, name, nlen) && reg[i].gen >= gen) {
+		        !memcmp(reg[i].name, name, nlen) && reg[i].gen > gen) {
 			pthread_mutex_unlock(&reg_mx);
 			return -4;
 		}
@@ -799,23 +803,22 @@ int pc_store_create_gen(const char *name, size_t nlen, int buckets_log2,
 		pthread_mutex_unlock(&reg_mx);
 		return i == -2 ? -2 : -1;
 	}
-	/* the name first: a table carved and then not registered would stay carved */
-	nm = malloc(nlen + 1);
-	if (!nm) {
-		pthread_mutex_unlock(&reg_mx);
-		return -3;
-	}
 	/* always a fresh carve - the arena serves it from retired
 	 * slots before it moves the frontier */
 	fresh = 1;
 	rg0 = pcache_arena_regions_bytes();
 	ht = pcache_htable_new((unsigned int)buckets_log2);
 	if (!ht) {
-		free(nm);
 		pthread_mutex_unlock(&reg_mx);
 		return -3;
 	}
 	{
+		char *nm = malloc(nlen + 1);
+
+		if (!nm) {
+			pthread_mutex_unlock(&reg_mx);
+			return -3;
+		}
 		memcpy(nm, name, nlen);
 		nm[nlen] = '\0';
 		if (i == reg_n)
@@ -1257,21 +1260,6 @@ void pc_store_walk_begin(int i, pcache_htable_t **live, pcache_htable_t **old)
 	pthread_mutex_unlock(&reg_mx);
 }
 
-pcache_htable_t *pc_store_draining(pcache_htable_t *ht)
-{
-	pcache_htable_t *old = NULL;
-	int i, n = pc_store_count();
-
-	pthread_mutex_lock(&reg_mx);
-	for (i = 0; i < n; i++)
-		if (reg[i].ht == ht) {
-			old = reg[i].rs_swapped ? reg[i].rs_to : NULL;
-			break;
-		}
-	pthread_mutex_unlock(&reg_mx);
-	return old;
-}
-
 void pc_store_walk_end(void)
 {
 	pthread_mutex_lock(&reg_mx);
@@ -1613,8 +1601,7 @@ void pc_store_note_drop(const char *name, size_t nlen, unsigned long long gen)
 	for (i = 0; i < reg_n; i++)
 		if (strlen(reg[i].name) == nlen &&
 		        !memcmp(reg[i].name, name, nlen)) {
-			/* a live name is no tombstone: its generation stays its own */
-			if (!reg[i].live && reg[i].gen <= gen)
+			if (reg[i].gen <= gen)
 				reg[i].gen = gen;
 			pthread_mutex_unlock(&reg_mx);
 			return;
@@ -1897,11 +1884,12 @@ void pc_store_set_types_idx(int i, int m)
 
 int pc_store_types_strict(pcache_htable_t *ht)
 {
-	int i = slot_any(ht);
+	int i;
 
-	if (i >= 0)
-		return __atomic_load_n(&reg[i].redis_types,
-			__ATOMIC_RELAXED) == PC_TYPES_STRICT;
+	for (i = 0; i < reg_n; i++)
+		if (reg[i].ht == ht)
+			return __atomic_load_n(&reg[i].redis_types,
+				__ATOMIC_RELAXED) == PC_TYPES_STRICT;
 	return pc_types_default == PC_TYPES_STRICT;
 }
 

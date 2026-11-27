@@ -14,17 +14,6 @@
 #include "upstream.h"
 #include "upstreamint.h"
 
-/* a server's host:port; a gone slot may be taking another address under run_mx */
-static void tw_addr(struct pc_tw *out, const struct up_srv *s)
-{
-	char addr[sizeof s->addr];
-
-	pthread_mutex_lock((pthread_mutex_t *)&s->run_mx);
-	memcpy(addr, s->addr, sizeof addr);
-	pthread_mutex_unlock((pthread_mutex_t *)&s->run_mx);
-	pc_tw_str(out, addr);
-}
-
 void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 {
 	struct up_col *uc = col_of(col, collen);
@@ -83,10 +72,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 			pc_tw_key(out, "preempt_hold_s");
 			pc_tw_i64(out, uc->hold_ms / 1000);
 			pc_tw_key(out, "active");
-			if (act >= 0)
-				tw_addr(out, &uc->srv[act]);
-			else
-				pc_tw_str(out, "");
+			pc_tw_str(out, act >= 0 ? uc->srv[act].addr : "");
 			pc_tw_key(out, "active_since_ms");
 			pc_tw_i64(out, since);
 			pc_tw_key(out, "failovers");
@@ -302,7 +288,7 @@ void pc_upstream_stats_tree(struct pc_tw *out, const char *col, size_t collen)
 		pthread_mutex_unlock(&uc->mx);
 		pc_tw_key(out, "target");
 		if (wm >= 0 && wm < srv_n(uc))
-			tw_addr(out, &uc->srv[wm]);
+			pc_tw_str(out, uc->srv[wm].addr);
 		else
 			pc_tw_nil(out);
 		pc_tw_key(out, "state");

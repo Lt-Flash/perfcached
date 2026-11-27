@@ -2,7 +2,6 @@
  * Copyright (c) 2026 Yury Kirsanov - see COPYING */
 /* resppubsub.c - the RESP door's pub/sub over RESP2 (SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE,
  * PUNSUBSCRIBE, PUBLISH, PUBSUB); it reaches verbs.c through verbsint.h. */
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,7 +26,6 @@ static void ps_confirm(struct pc_jw *out, const char *what, const char *name,
 static int ps_subscribe(struct resp_ctx *c, int pattern)
 {
 	const char *what = pattern ? "psubscribe" : "subscribe";
-	size_t need = 0;
 	int i;
 
 	if (c->nargs < 2) {
@@ -36,12 +34,6 @@ static int ps_subscribe(struct resp_ctx *c, int pattern)
 			: "wrong number of arguments for 'subscribe' command");
 		return 0;
 	}
-	/* confirmations that outgrow the request's writer go to a heap one: a subscription made
-	 * is never answered by "reply too large" alone */
-	for (i = 1; i < c->nargs; i++)
-		need += c->argl[i] + 48;
-	if (need > c->out->cap - c->out->len)
-		(void)pc_jw_init_heap(c->out, need + 64);
 	for (i = 1; i < c->nargs; i++) {
 		int n = pc_pubsub_subscribe(c->conn, pc_worker_id(), c->argv[i],
 			c->argl[i], pattern);
@@ -64,16 +56,11 @@ static int ps_unsubscribe(struct resp_ctx *c, int pattern)
 	if (c->nargs < 2) {
 		/* no names: every subscription of this kind goes, one
 		 * confirmation each, and a bare nil when there were none */
-		char name[PC_PUBSUB_NAME_MAX];
-		size_t nlen, lim;
+		char name[4096];
+		size_t nlen;
 		int left, any = 0;
 
-		/* a heap writer, and a pop only while the longest confirmation still fits: what is
-		 * dropped is confirmed, what is not stays subscribed */
-		(void)pc_jw_init_heap(c->out, 65536);
-		lim = c->out->owned ? JW_HEAP_MAX : c->out->cap;
-		while (c->out->len + sizeof name + 64 <= lim &&
-		        pc_pubsub_pop(c->conn, pattern, name, sizeof name,
+		while (pc_pubsub_pop(c->conn, pattern, name, sizeof name,
 		        &nlen, &left)) {
 			ps_confirm(c->out, what, name, nlen, left);
 			any = 1;
@@ -96,19 +83,14 @@ int rh_punsubscribe(struct resp_ctx *c) { return ps_unsubscribe(c, 1); }
 
 int rh_publish(struct resp_ctx *c)
 {
-	const char *pfx;
-
 	if (c->nargs != 3) {
 		resp_err(c->out, "wrong number of arguments for 'publish' command");
 		return 0;
 	}
-	pfx = pc_pubsub_reserved(c->argv[1], c->argl[1]);
-	if (pfx) {
-		char m[96];
-
-		snprintf(m, sizeof m, "channel prefix %s is reserved for the "
-			"daemon's own events", pfx);
-		resp_err(c->out, m);
+	if (c->argl[1] >= sizeof PC_PUBSUB_RESERVED - 1 &&
+	    !memcmp(c->argv[1], PC_PUBSUB_RESERVED, sizeof PC_PUBSUB_RESERVED - 1)) {
+		resp_err(c->out, "channel prefix " PC_PUBSUB_RESERVED
+			" is reserved for the daemon's own events");
 		return 0;
 	}
 	resp_int(c->out, pc_pubsub_publish(c->argv[1], c->argl[1],
@@ -116,7 +98,7 @@ int rh_publish(struct resp_ctx *c)
 	return 0;
 }
 
-struct ps_names { char **v; size_t *l; int n, cap, oom; };
+struct ps_names { char **v; size_t *l; int n, cap; };
 
 static int ps_collect(const char *name, size_t nlen, int nsubs, void *arg)
 {
@@ -130,19 +112,19 @@ static int ps_collect(const char *name, size_t nlen, int nsubs, void *arg)
 		size_t *nl;
 
 		if (!nv)
-			return ns->oom = -1;
+			return -1;
 		/* kept at once: realloc has released the old block, and the
 		 * caller frees what ns->v holds */
 		ns->v = nv;
 		nl = realloc(ns->l, sizeof *nl * (size_t)ncap);
 		if (!nl)
-			return ns->oom = -1;
+			return -1;
 		ns->l = nl;
 		ns->cap = ncap;
 	}
 	cp = malloc(nlen ? nlen : 1);
 	if (!cp)
-		return ns->oom = -1;
+		return -1;
 	memcpy(cp, name, nlen);
 	ns->v[ns->n] = cp;
 	ns->l[ns->n] = nlen;
@@ -157,22 +139,13 @@ int rh_pubsub(struct resp_ctx *c)
 	int i;
 
 	if (resp_is(sub, subl, "CHANNELS")) {
-		struct ps_names ns = { NULL, NULL, 0, 0, 0 };
+		struct ps_names ns = { NULL, NULL, 0, 0 };
 
-		if (c->nargs > 2 && c->argl[2] > PC_PUBSUB_NAME_MAX) {
-			resp_err(c->out, "pattern too long");
-			return 0;
-		}
 		pc_pubsub_channels(c->nargs > 2 ? c->argv[2] : NULL,
 			c->nargs > 2 ? c->argl[2] : 0, ps_collect, &ns);
-		/* a walk cut short is said, never answered as the whole list */
-		if (ns.oom)
-			resp_err(c->out, "out of memory listing the channels");
-		else
-			resp_arr(c->out, ns.n);
+		resp_arr(c->out, ns.n);
 		for (i = 0; i < ns.n; i++) {
-			if (!ns.oom)
-				resp_bulk(c->out, ns.v[i], ns.l[i]);
+			resp_bulk(c->out, ns.v[i], ns.l[i]);
 			free(ns.v[i]);
 		}
 		free(ns.v);

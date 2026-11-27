@@ -96,10 +96,6 @@ st = json.load(urllib.request.urlopen("http://127.0.0.1:18501/stats", timeout=5)
 ok(st.get("keyspace_events") == 10 and st.get("relay_sent") == 0, "/stats counts 10 keyspace events and no relay (got %r)" % {k: st.get(k) for k in ("keyspace_events", "relay_sent")})
 m = urllib.request.urlopen("http://127.0.0.1:18501/metrics", timeout=5).read().decode()
 ok("perfcached_pubsub_keyspace_events_total 10" in m, "/metrics carries the counter")
-lk = "L" * 4090
-ok(C.cmd("SELECT", "0") == "OK" and C.cmd("SET", lk, "v") == "OK", "SET of a 4090-byte key on db 0")
-ev = two()
-ok(ev[0][2:] == ["__keyevent@0__:set", lk] and ev[1][2:] == ["__keyspace@0__:" + lk, "set"], "a key near KEY_MAX is notified on both channels, the keyspace one past 4096 bytes (got %r)" % ([e[:3] if isinstance(e, list) else e for e in ev],))
 for k, m_ in res: print("  %-4s %s" % (k, m_))
 print("PYDONE %d" % sum(1 for k, _ in res if k == "FAIL"))
 PY

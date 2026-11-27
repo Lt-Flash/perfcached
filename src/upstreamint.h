@@ -328,7 +328,6 @@ struct up_col {
 	unsigned long long tls_hs, tls_failed;
 	char tls_last[200], tls_said[200]; /* the last failure, for /stats; the last one logged */
 	int sen_started;                   /* the topology thread, once */
-	int sen_joinable;                  /* sen_thr runs; joined at the shutdown */
 	pthread_t sen_thr;
 	pthread_mutex_t sen_mx;            /* sen_text, sen_known */
 	char sen_text[256];                /* what the sentinels said, for /stats */
@@ -344,7 +343,6 @@ struct up_col {
 	int cluster;                       /* a seed said redis_mode:cluster */
 	struct up_cmap *cmap;              /* under mx; NULL until the first answer */
 	int cl_started, cl_kick, cl_over_said;
-	int cl_joinable;                   /* cl_thr runs; joined at the shutdown */
 	pthread_t cl_thr;
 	char cl_text[256];                 /* what the cluster said, under sen_mx */
 	unsigned long long cl_moved, cl_asked, cl_unserved, cl_rounds;
@@ -618,9 +616,6 @@ void cl_start(struct up_col *uc);
 void cl_kick(struct up_col *uc);
 uint32_t cl_key_nodes(const struct up_col *uc, const char *k, size_t kl, int *master);
 int cl_srv_find(struct up_col *uc, const char *host, int port);
-/* the server a MOVED or ASK names, among those the topology knows; -1 none (never dialled: it
- * would get the collection's credentials) */
-int cl_redirect_to(struct up_col *uc, const char *host, int port);
 /* the two names reach one host (a name and its address, two addresses of one host) */
 int same_host(const char *a, const char *b);
 void topo_save(struct up_col *uc);

@@ -784,9 +784,9 @@ void pc_stats_tree(struct pc_tw *out, const char *only_col)
 	{                                      /* config reloads */
 		unsigned long long rok, rref;
 		long long rlast;
-		char rlm[512];
+		const char *rlm;
 
-		pc_reload_stats(&rok, &rref, &rlast, rlm, sizeof rlm);
+		pc_reload_stats(&rok, &rref, &rlast, &rlm);
 		pc_tw_key(out, "reload");
 		pc_tw_map(out);
 		pc_tw_key(out, "applied");

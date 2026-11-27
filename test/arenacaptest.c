@@ -2,10 +2,8 @@
  * and is room again, so it must not read as used; an odd-MB arena's top group is tracked; a
  * record above 64 KB has a cell size; the reclaim tick leaves a chunk a free is announcing; a thread's
  * private stack of large cells is bounded in bytes, and a carve refused at the ceiling asks every
- * thread to send its hoard home; a thread that exits sends its cells home; a page given back stays
- * mapped. */
+ * thread to send its hoard home; a thread that exits sends its cells home. */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -243,62 +241,6 @@ static int thread_exit(void)
 	return fails ? 1 : 0;
 }
 
-/* H: a page given back loses its memory, not its mapping - a reader holding a stale pointer
- * into it reads mapped bytes, as anywhere in the reservation */
-/* a stale read on purpose: not one ASan's poisoning of a freed cell should report */
-__attribute__((no_sanitize_address)) static unsigned char stale_read(const void *p)
-{
-	return *(const volatile unsigned char *)p;
-}
-
-static int page_back(void)
-{
-	struct pcache_arena_pressure pr;
-	void **cell;
-	unsigned int i, n, t;
-
-	compat_thread_register(0);
-	pcache_mem_probe();
-	pcache_backing_policy = "own";
-	pcache_arena_hugepage_mb = 8;
-	if (pcache_arena_init() != 0) {
-		printf("arena init failed\n");
-		return 2;
-	}
-	pcache_reclaim_giveback = 1;
-	pcache_reclaim_keep = 0;
-	pcache_reclaim_quiet_s = 0;
-	pcache_reclaim_cooloff_s = 0;
-	pcache_arena_pressure(&pr);
-	/* one cell a slot: the reservation full, then two whole pages and one more */
-	n = (unsigned int)(pr.reserved_bytes / (256 * 1024)) + 33;
-	cell = calloc(n, sizeof *cell);
-	if (!cell)
-		return 2;
-	for (i = 0; i < n; i++)
-		if (!(cell[i] = pcache_cell_alloc(CSIZE)))
-			return 2;
-	for (i = 0; i < n; i++)
-		pcache_cell_free_global(cell[i]);
-	pcache_arena_flush_private();
-	for (t = 0; t < 30; t++) {
-		pcache_arena_reclaim_tick();
-		pcache_arena_pressure(&pr);
-		if (pr.pages_freed)
-			break;
-	}
-	if (!pr.pages_freed) {
-		printf("  ..   H no page was given back on this host - not counted\n");
-		return 0;
-	}
-	/* the last cell came from a page; read through the stale pointer */
-	(void)stale_read(cell[n - 1]);
-	printf("  ok   H a page given back (%lu so far) is still mapped: a stale read does not fault\n",
-		pr.pages_freed);
-	free(cell);
-	return fails ? 1 : 0;
-}
-
 int main(void)
 {
 	struct pcache_arena_pressure pr;
@@ -308,19 +250,6 @@ int main(void)
 	pid_t pid;
 	int st = 0;
 
-	/* before any arena: the figures read as none, nothing is dereferenced */
-	fflush(stdout);
-	pid = fork();
-	if (pid == 0) {
-		pcache_arena_pressure(&pr);
-		_exit(strcmp(pr.tier, "none") || pr.commits_ahead || pr.pin_lost ? 1 : 0);
-	}
-	if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) ||
-	    WEXITSTATUS(st) != 0) {
-		printf("  FAIL G pcache_arena_pressure before the arena exists (status %d)\n", st);
-		fails++;
-	} else
-		printf("  ok   G pcache_arena_pressure before the arena exists reads none\n");
 	fflush(stdout);
 	pid = fork();
 	if (pid == 0) {
@@ -355,18 +284,6 @@ int main(void)
 	if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) ||
 	    WEXITSTATUS(st) != 0) {
 		printf("  FAIL F the cells of a thread that exits (status %d)\n", st);
-		fails++;
-	}
-	fflush(stdout);
-	pid = fork();
-	if (pid == 0) {
-		st = page_back();
-		fflush(stdout);
-		_exit(st);
-	}
-	if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) ||
-	    WEXITSTATUS(st) != 0) {
-		printf("  FAIL H a page given back faulted on a stale read (status %d)\n", st);
 		fails++;
 	}
 	fflush(stdout);

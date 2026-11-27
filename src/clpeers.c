@@ -69,28 +69,19 @@ int clpeers_count_live(struct clpeers *pt, long long now)
 }
 
 struct peer *clpeers_upsert(struct clpeers *pt, const pc_addr *addr,
-		long long now, int *created)
+		int *created)
 {
-	struct peer *freep = NULL, *gracep = NULL;
+	struct peer *freep = NULL;
 	int i;
 
 	*created = 0;
 	for (i = 0; i < pt->n_peers; i++) {
-		struct peer *q = &pt->peers[i];
-
-		if (pc_addr_eq(&q->addr, addr))
-			return q;
-		if (__atomic_load_n(&q->node, __ATOMIC_ACQUIRE))
-			continue;
-		/* a purged slot inside its placement grace still holds its slots: the last choice */
-		if (q->gone_ms && now - q->gone_ms < PEER_SLOT_GRACE_MS) {
-			if (!gracep || q->gone_ms < gracep->gone_ms)
-				gracep = q;
-		} else if (!freep)
-			freep = q;
+		if (pc_addr_eq(&pt->peers[i].addr, addr))
+			return &pt->peers[i];
+		if (!freep && !__atomic_load_n(&pt->peers[i].node,
+		        __ATOMIC_ACQUIRE))
+			freep = &pt->peers[i];
 	}
-	if (!freep && pt->n_peers >= PC_CL_MAXPEER)
-		freep = gracep;
 	if (!freep) {
 		if (pt->n_peers >= PC_CL_MAXPEER)
 			return NULL;
@@ -114,10 +105,6 @@ struct peer *clpeers_upsert(struct clpeers *pt, const pc_addr *addr,
 		return freep;
 	}
 	/* a slot reused for a new address inherits nothing from its last occupant */
-	freep->last_seen_ms = 0;
-	freep->gone_ms = 0;
-	freep->has_ident = 0;
-	freep->incarn = 0;
 	memset(freep->repl_mark, 0, sizeof freep->repl_mark);
 	memset(freep->repl_cursor, 0, sizeof freep->repl_cursor);
 	memset(freep->repl_bfcycle, 0, sizeof freep->repl_bfcycle);

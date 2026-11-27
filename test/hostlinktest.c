@@ -260,21 +260,6 @@ int main(void)
 			HL.irqs);
 	}
 
-	/* E: the device made again under the same name - its new counters are read, not the old ones */
-	nic("eth9", 1000);
-	hl_init("eth9", 0, NULL);
-	rx = tx = dr = 0;
-	t = run("eth9", t + HL_RESOLVE_MS, 3, &rx, &tx, &dr, &ue, 12500000, 0, 0);
-	snprintf(cmd, sizeof cmd, "rm -rf '%s/sys/class/net/eth9/statistics'", R);
-	if (system(cmd) != 0)
-		printf("  (could not remove eth9's counters)\n");
-	nic("eth9", 1000);
-	rx = 0;
-	t = run("eth9", t + HL_RESOLVE_MS, 4, &rx, &tx, &dr, &ue, 25000000, 0, 0);
-	CHK(!strcmp(HL.phys, "eth9") && HL.rx_pct == 20,
-		"E: eth9 unregistered and registered again - its new counters read, rx %d%%",
-		HL.rx_pct);
-
 	snprintf(cmd, sizeof cmd, "rm -rf '%s'", R);
 	if (system(cmd) != 0)
 		printf("  (could not remove %s)\n", R);

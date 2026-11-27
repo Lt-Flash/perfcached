@@ -87,11 +87,6 @@ int main(void)
 		"B: ::ffff:127.0.0.9 is loopback");
 	CHK(pc_addr_parse("10.0.0.300", 1, &a) == -1 && pc_addr_parse("host", 1, &a) == -1,
 		"B: '10.0.0.300' and a name are not numeric addresses");
-	/* musl's inet_pton writes octets before it fails: "200" of this address must not land
-	 * in the union where sin6_flowinfo lives */
-	CHK(pc_addr_parse("2001:db8::1", 1, &a) == 0 && a.in6.sin6_flowinfo == 0,
-		"B: an IPv6 address after a failed IPv4 attempt carries flowinfo 0 (%u)",
-		(unsigned)a.in6.sin6_flowinfo);
 
 	/* C: host:port - the config's forms (last colon), [v6]:port, and what is refused */
 	CHK(pc_hostport_split("0.0.0.0:6479", host, sizeof host, &port) == 0 &&

@@ -385,20 +385,14 @@ uint32_t pc_pull_begin_at(const char *col, size_t collen, const char *key,
 		&slot);                    /* the owner may be fetching it */
 	if (!req)
 		return 0;
-	{
-		struct clpend_fill f = { .col = col, .collen = collen, .key = key, .klen = klen };
-
-		if (!cl_pend_fill(slot, req, &f))
-			return 0;
+	if (collen < sizeof slot->col && klen < sizeof slot->key) {
+		memcpy(slot->col, col, collen);
+		slot->collen = (unsigned char)collen;
+		memcpy(slot->key, key, klen);
+		slot->klen = (unsigned short)klen;
 	}
-	n = clpull_req_frame(msg, sizeof msg, req, cl_node_id(), col, collen, key, klen);
-	if (clsend_seal(&pr->addr, msg, n) != 0) {
-		cl_pend_release(slot);
-		cl_set_fail(PC_CLFAIL_SEND);
-		cl_st_fwd_send_fail();
-		cl_st_fwd_send_errno(errno);
-		return 0;
-	}
+	n = clpull_req_frame(msg, req, cl_node_id(), col, collen, key, klen);
+	clsend_seal(&pr->addr, msg, n);
 	cl_st_pull_sent(1);
 	fwd_target_req = req;          /* a unicast pull's target */
 	fwd_target_node = holder_node;
@@ -430,19 +424,15 @@ uint32_t pc_pull_begin_kind(const char *col, size_t collen,
 	req = cl_pend_alloc(kind, up, 0, &slot);
 	if (!req)
 		return 0;                      /* saturated: answer local miss */
-	{
-		struct clpend_fill f = { .col = col, .collen = collen, .key = key, .klen = klen };
-
-		if (!cl_pend_fill(slot, req, &f))
-			return 0;
+	if (collen < sizeof slot->col && klen < sizeof slot->key) {
+		memcpy(slot->col, col, collen);
+		slot->collen = (unsigned char)collen;
+		memcpy(slot->key, key, klen);
+		slot->klen = (unsigned short)klen;
 	}
 
-	n = clpull_req_frame(msg, sizeof msg, req, cl_node_id(), col, collen, key, klen);
-	if (!cl_pend_sent(slot, req, up, clsend_live(cl_peers(), msg, n, cl_now_ms()))) {
-		cl_set_fail(PC_CLFAIL_SEND);
-		cl_st_fwd_send_fail();
-		return 0;
-	}
+	n = clpull_req_frame(msg, req, cl_node_id(), col, collen, key, klen);
+	(void)clsend_live(cl_peers(), msg, n, cl_now_ms());
 	cl_st_pull_sent(1);
 	return req;
 }
@@ -548,28 +538,22 @@ uint32_t pc_probe_fwd_begin(int op, const char *col, size_t collen,
 		free(klong);
 		return 0;
 	}
-	/* fields land BEFORE the datagrams leave: no answer can race them; once stored, the slot
-	 * owns key_long and the stash */
-	{
-		struct clpend_fill f = {
-			.col = col, .collen = collen, .key = key, .klen = klen,
-			.key_long = klong, .probe_op = op == 2 ? 2 : op == 3 ? 3 : op == 1 ? 4 : 1,
-			.stash = stash, .stash_len = (int)vlen, .by = by, .ttl_rel = ttl_rel,
-		};
+	/* fields land BEFORE the datagrams leave: no answer can race them */
+	memcpy(slot->col, col, collen);
+	slot->collen = (unsigned char)collen;
+	if (klong)
+		slot->key_long = klong;    /* the slot's release frees it */
+	else
+		memcpy(slot->key, key, klen);
+	slot->klen = (unsigned short)klen;
+	slot->probe_op = op == 2 ? 2 : op == 3 ? 3 : op == 1 ? 4 : 1;
+	slot->stash = stash;
+	slot->stash_len = (int)vlen;
+	slot->by = by;
+	slot->ttl_rel = ttl_rel;
 
-		if (!cl_pend_fill(slot, req, &f)) {
-			free(stash);
-			free(klong);
-			return 0;
-		}
-	}
-
-	n = clpull_req_frame(msg, sizeof msg, req, cl_node_id(), col, collen, key, klen);
-	if (!cl_pend_sent(slot, req, up, clsend_live(cl_peers(), msg, n, cl_now_ms()))) {
-		cl_set_fail(PC_CLFAIL_SEND);
-		cl_st_fwd_send_fail();
-		return 0;
-	}
+	n = clpull_req_frame(msg, req, cl_node_id(), col, collen, key, klen);
+	(void)clsend_live(cl_peers(), msg, n, cl_now_ms());
 	cl_st_pull_sent(1);
 	return req;
 }
@@ -586,21 +570,13 @@ uint32_t pc_fwd_json_begin(int node, int jop, const char *col,
 	uint32_t req;
 	size_t n;
 
-	cl_set_fail(PC_CLFAIL_NONE);
 	if (!cl_enabled() || !pr || collen > 255 || klen > 4096 || plen > 511 ||
-	        vlen > PC_MAX_FWD_VAL) {
-		cl_set_fail(PC_CLFAIL_ROUTE);
+	        vlen > PC_MAX_FWD_VAL)
 		return 0;
-	}
 	req = cl_pend_alloc(PC_DONE_JSON, 1, 700, &slot);
 	if (!req)
 		return 0;
-	{
-		struct clpend_fill f = { .jop = (unsigned char)jop };
-
-		if (!cl_pend_fill(slot, req, &f))
-			return 0;
-	}
+	slot->jop = (unsigned char)jop;
 	{
 		struct clfwd_json j = {
 			.req = req, .node = (unsigned int)cl_node_id(),
@@ -619,14 +595,7 @@ uint32_t pc_fwd_json_begin(int node, int jop, const char *col,
 
 		n = clfwd_json_build(msg, M_FWD_JSON, &j);
 	}
-	if (clsend_seal(&pr->addr, msg, n) != 0) {
-		cl_pend_release(slot);
-		cl_px_fwd_fails();
-		cl_set_fail(PC_CLFAIL_SEND);
-		cl_st_fwd_send_fail();
-		cl_st_fwd_send_errno(errno);
-		return 0;
-	}
+	clsend_seal(&pr->addr, msg, n);
 	return req;
 }
 

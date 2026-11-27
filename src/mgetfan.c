@@ -249,7 +249,7 @@ void pc_mget_tree(const struct pc_mget *m, struct pc_tw *w)
 			pc_tw_key(w, "value");
 			pc_tw_bulk(w, k->val, (size_t)k->vlen);
 			pc_tw_key(w, "ttl");
-			pc_tw_i64(w, !k->exp ? -1 : ttl > 0 ? ttl : 0);
+			pc_tw_i64(w, ttl < -1 ? 0 : ttl);
 		} else if (k->st == PC_MK_UNANSWERED) {
 			pc_tw_key(w, "unanswered");
 			pc_tw_bool(w, 1);

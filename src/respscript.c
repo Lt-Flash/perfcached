@@ -117,9 +117,7 @@ static int slock_run(struct resp_ctx *c, int ai)
 			memcpy(nb, c->argv[4], l);
 			nb[l] = 0;
 			d = strtod(nb, &end);
-			/* the whole argument, a number of seconds whose milliseconds fit (nan and inf
-			 * fail the range test) */
-			if (l != c->argl[4] || end == nb || *end || !(d >= 0 && d < 9e15)) {
+			if (end == nb || d < 0) {
 				resp_err(c->out, "ARGV[1] is not a time");
 				return 0;
 			}

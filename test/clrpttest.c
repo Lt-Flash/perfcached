@@ -339,36 +339,6 @@ int main(void)
 			close(l);
 	}
 
-	printf("  ..   case I\n");
-	/* I: a sending thread's table full of peers that refuse (gone): a new peer still gets an
-	 * entry, and its frame arrives */
-	{
-		pc_addr d, n;
-		int l, c, k, r = -1, got_n = 0;
-
-		frame(b, 0, 100);
-		for (k = 1; k <= CLRPT_PEERS; k++) {
-			memset(&d, 0, sizeof d);
-			d.in4.sin_family = AF_INET;
-			d.in4.sin_addr.s_addr = htonl(0x7f030000u | (unsigned)k);
-			pc_addr_set_port(&d, 1);   /* nobody listens on port 1 */
-			(void)clrpt_send(&d, b, 100);
-			(void)clrpt_send(&d, b, 100);
-		}
-		l = plain_listener(&n, 8);
-		if (l >= 0) {
-			r = clrpt_send(&n, b, 100);
-			if (r == 0 && (c = accept_wait(l)) >= 0) {
-				got_n = read_frames(c, 1);
-				close(c);
-			}
-			close(l);
-		}
-		CHK(l >= 0 && r == 0 && got_n == 1,
-			"I: %d refusing peers fill the table - a new peer is still sent to (%d, arrived %d)",
-			CLRPT_PEERS, r, got_n);
-	}
-
 	printf("clrpttest: %s\n", fails ? "FAILED" : "passed");
 	return fails ? 1 : 0;
 }

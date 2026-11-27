@@ -3,15 +3,12 @@
 /* obstest.c - what the command rows and the query log keep of a client's bytes: a row's name is
  * printable whatever the dialect sent (INFO prints it raw); AUTH's password is never the query
  * log's key, hashed or in full; the five-minute window's max includes the minute in progress; the
- * slow log's newest entry is shown whatever worker logged it; the last worker has a row of its own. */
+ * slow log's newest entry is shown whatever worker logged it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include "compat/compat.h"
-#include "compat/timer.h"
 #include "json.h"
 #include "obs.h"
 
@@ -89,15 +86,6 @@ int main(void)
 	CHK(strstr(qbuf, "query:") && !strstr(qbuf, "key="),
 		"B: auth, keys hashed - no hash of the password (%.*s)", (int)strcspn(qbuf, "\n"), qbuf);
 
-	/* B2: a verb and a key holding LF make one line; a long verb is cut, the outcome stays on it */
-	qlog_line(2, "x\nNov 17 12:00:00 [1] CRITICAL: forged", "k\nforged");
-	CHK(strstr(qbuf, "query:") && strchr(qbuf, '\n') == qbuf + strlen(qbuf) - 1 &&
-		strstr(qbuf, "x\\x0aNov") && strstr(qbuf, "key=k\\x0aforged"),
-		"B2: LF in the verb and the key - one line, escaped (%.*s)", (int)strcspn(qbuf, "\n"), qbuf);
-	qlog_line(2, "a-verb-far-longer-than-forty-seven-bytes-0123456789-0123456789", "k1");
-	CHK(strstr(qbuf, "a-verb-far-longer-than-forty-seven-bytes-012345... ") &&
-		strstr(qbuf, " ok 5 us"), "B2: a 62-byte verb cut to 47 - %.*s", (int)strcspn(qbuf, "\n"), qbuf);
-
 	/* C: past five minute rolls the window's max still covers the minute in progress */
 	compat_ticks_offset += 1000;            /* a tick of 0 reads as "no minute yet" */
 	pc_obs_tick_1hz();                      /* the first tick starts the minute */
@@ -137,66 +125,6 @@ int main(void)
 		jb[jw.len < sizeof jb ? jw.len : sizeof jb - 1] = 0;
 		CHK(strstr(jb, "newest") != NULL, "D: SLOWLOG GET 1 is the newest entry, worker 6's "
 			"behind four full rings - %.60s", jb);
-	}
-
-	/* E: workers are 1..N - the last worker's ring is its own, not the non-workers' spare */
-	if (pc_obs_init(2, 0) != 0) {
-		printf("obs init failed\n");
-		return 2;
-	}
-	{
-		char *av[2] = { "GET", "w2" };
-		size_t al[2] = { 3, 2 };
-		long long l0 = pc_obs_slowlog_len();
-
-		wid = 2;
-		for (i = 0; i < 128; i++)
-			pc_obs_slow(av, al, 2, 10, NULL);
-		wid = -1;
-		av[1] = "nw";
-		pc_obs_slow(av, al, 2, 10, NULL);
-		wid = 0;
-		CHK(pc_obs_slowlog_len() - l0 == 129, "E: worker 2 of 2 fills its ring, a non-worker "
-			"logs one more - %lld kept, none overwritten", pc_obs_slowlog_len() - l0);
-	}
-
-	/* F: an INFO commandstats line past its buffer - cut there, no byte from beyond it */
-	if (pc_obs_init(1, -1) != 0) {
-		printf("obs init failed\n");
-		return 2;
-	}
-	{
-		char jb[1024];
-		struct pc_jw jw;
-
-		pc_obs_cmd("a-command-name-of-forty-seven-bytes-0123456789x", 47,
-			10000000000000000000ULL);
-		pc_jw_init(&jw, jb, sizeof jb);
-		pc_obs_cmdstats(&jw);
-		CHK(jw.len == 127 && !memchr(jb, 0, jw.len), "F: a 129-byte cmdstat line is cut to its "
-			"127, nothing read past it - %zu bytes", jw.len);
-	}
-
-	/* G: a connection accepted after the reader took its tick is 0 s old, not 136 years */
-	{
-		struct sockaddr_in sa;
-		char jb[1024];
-		struct pc_jw jw;
-		unsigned int t0 = get_ticks();
-		void *cr;
-
-		memset(&sa, 0, sizeof sa);
-		sa.sin_family = AF_INET;
-		sa.sin_addr.s_addr = htonl(0x7f000001);
-		sa.sin_port = htons(4321);
-		compat_ticks_offset += 1;
-		cr = pc_obs_conn_add((const struct sockaddr *)&sa, sizeof sa, 9, 0);
-		pc_jw_init(&jw, jb, sizeof jb);
-		pc_obs_client_list(&jw, t0);
-		jb[jw.len < sizeof jb ? jw.len : sizeof jb - 1] = 0;
-		CHK(cr && strstr(jb, " age=0 idle=0 "), "G: accepted a tick after the reader's tick - "
-			"%.*s", (int)strcspn(jb, "\n"), jb);
-		pc_obs_conn_del(cr);
 	}
 
 	printf("obstest: %s\n", fails ? "FAILED" : "passed");

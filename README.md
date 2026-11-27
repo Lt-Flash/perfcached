@@ -37,61 +37,10 @@ $ redis-cli -p 6380 -a resp-password-example --no-auth-warning GET user:42
 alice
 ```
 
-**Current release: 0.7.5.3** (2026-11-27), with libperfd 0.7.6.3 and
+**Current release: 0.7.5.2** (2026-11-30), with libperfd 0.7.6.2 and
 php-perfcached 0.2.0.  [GUIDE.md](GUIDE.md) shows how to install it,
 build a cluster, take over from Redis, upgrade, back up and watch it,
 with real output.
-
-## Why perfcached
-
-- **More work from every core.**  Every core serves requests: a pool of worker threads,
-  not one event loop.  Given the same 20 hardware threads, one perfcached process answered
-  **1.9x the SETs and 1.8x the GETs of a 20-instance Valkey Cluster**, and 3.6x Dragonfly's
-  ([How it compares](#how-it-compares)).
-- **A cluster that builds itself.**  Run the same binary on several machines: they find
-  each other, elect a master and rejoin after a crash.  No slots or node ids to assign,
-  no operator tooling.  Five placement modes, from every key on every node to one owner per key.
-- **Move off Redis without a migration day.**  Put perfcached in front of the Redis you run
-  now: a missing key is read from Redis on first use, or every write goes through to it,
-  until perfcached holds the keyspace.
-- **Redis clients work unchanged.**  `redis-cli`, hiredis and most Redis client libraries
-  talk to its Redis door.  Its own protocol authenticates every client at connect (a Noise
-  handshake) and routes each key to the node that owns it.
-- **Durable when you want it.**  An optional write-ahead log and snapshots, with a storage
-  probe that recommends an fsync policy for your disks.
-- **Easy to run.**  A dashboard, Prometheus metrics with a Grafana dashboard, alerts by
-  mail, and collections created, resized and dropped while it serves.
-- **A client library for any licence.**  The daemon is GPL; libperfd, the C client, is MIT.
-
-**When not to use it:** if you need lists, sets, sorted sets, streams, transactions or Lua
-scripts (beyond the Symfony lock scripts), values over 256 KB, or a platform other than
-Linux.  See [Known limits](#known-limits).
-
-## How it compares
-
-Each server got the same hardware: one NUMA node (10 cores, 20 hardware threads) of a
-bare-metal 2x Xeon E5-2690 v2 server on 10 Gbit/s, and 20 threads to fill it.  Every server
-installed from its package, persistence off, measured one at a time through the Redis
-protocol with `redis-benchmark` 8.0.2 from three client hosts (pipeline 32, 1,000,000 keys).
-The rate is the server's own count over 15 seconds.
-
-| 20 threads each | SET/s, 32 B | GET/s, 32 B | p99 SET / GET | SET/s, 200 B | GET/s, 200 B |
-|---|---|---|---|---|---|
-| **perfcached 0.7.5**, one process, 20 workers | **11.05M** | **13.86M** | **1.8 / 1.3 ms** | 5.00M | 5.92M |
-| Valkey 8.1.1 Cluster, 20 instances | 5.78M | 7.56M | 2.3 / 1.8 ms | 4.94M | 5.91M |
-| Dragonfly 2.1, 20 threads | 3.10M | 3.79M | 6.0 / 5.1 ms | 2.93M | 3.19M |
-
-At 32 bytes every server had all 20 threads busy, so the CPU decided.  At 200 bytes the
-10 Gbit/s link capped perfcached and Valkey at the same rate; Dragonfly ran out of CPU first.
-
-A three-node perfcached fleet in `shard` mode, through its own protocol and a client that
-sends each key to its owner, answered **23.9M SET/s and 31.4M GET/s** at 32 bytes; the
-network link and the clients set that ceiling, not the servers.
-
-Valkey is Debian 13's package (8.1.1); Valkey 9 was not measured.  Valkey's I/O threads made
-one process slower on this machine (0.46M SET/s with 12 I/O threads, 0.57M with none), so it
-runs here in its best layout, one instance per hardware thread.  The method, every run and how
-to repeat it: [doc/benchmarks.md](doc/benchmarks.md).
 
 ## What it does
 
@@ -171,7 +120,7 @@ to repeat it: [doc/benchmarks.md](doc/benchmarks.md).
   `resp_allow` and `[secrets] resp`, or on TLS.
 - **Upgrading from 0.7.4.x is a whole-fleet stop**: 0.7.5 and later
   speak cluster wire epoch 4 alone and refuse an older node.  Stop
-  every node (`perfcli -E <enable> fleetstop`), install 0.7.5.3, start
+  every node (`perfcli -E <enable> fleetstop`), install 0.7.5.2, start
   them all; the state is kept ([GUIDE.md](GUIDE.md#upgrade)).  Use
   libperfd 0.7.6 or later with it: an older libperfd does not route by
   key against 0.7.5 and later (every request takes a forward hop) and
@@ -201,15 +150,6 @@ for a new connection.  It rolls node by node from 0.7.5 and 0.7.5.1.
 JSON documents are read strictly: one stored before 0.7.5.1 that is not
 valid JSON now fails to read instead of being guessed at.
 
-**0.7.5.3** carries the remaining fixes of that code review.  It rolls
-node by node from any 0.7.5.x, but its config check is stricter: one
-secret shared by two principals, a bad name in `[cluster] collections`,
-`save` given twice or in Redis's one-line form, an unquoted `#` inside
-a secret and a second `unix =` listener are refused at start - run
-`perfcached -C` on each node's config before restarting it.  Under
-`upstream_writes = through` a multi-key write mixing keys inside and
-outside `upstream_prefixes` is refused.
-
 Report anything odd as an
 [issue](https://github.com/Lt-Flash/perfcached/issues), with `perfcached
 -V`, the config (secrets removed) and the log around the event.  A
@@ -224,13 +164,13 @@ security problem goes privately, as [SECURITY.md](SECURITY.md) says.
 node only) - they install the same files and replace each other - and
 `perfcached-dashboard` (Debian 13 and 12, Ubuntu 24.04).  On Alpine all
 three come as signed `.apk` files; a release tarball installs under
-`/opt/perfcached-0.7.5.3`.
+`/opt/perfcached-0.7.5.2`.
 
 ```
-sudo apt install ./perfcached_0.7.5.3-1+deb13_amd64.deb
+sudo apt install ./perfcached_0.7.5.2-1+deb13_amd64.deb
 ```
 
-**libperfd** 0.7.6.3: `libperfd0` (the shared library) and
+**libperfd** 0.7.6.2: `libperfd0` (the shared library) and
 `libperfd-dev` (header, static archive, pkg-config file) as `.deb`,
 `libperfd` / `libperfd-dev` as `.apk`.  A program built against
 `libperfd-dev` links the shared library, so a libperfd update with the
@@ -304,18 +244,11 @@ key, and which.
 
 | mode | copies of a key | memory per node | when a node dies |
 |---|---|---|---|
-| `eager` | every node | the whole keyspace | nothing is lost, while replication keeps up (below) |
+| `eager` | every node | the whole keyspace | nothing is lost |
 | `spread` | K nodes (you pick K) | K/P of the keyspace | survives K-1 failures |
 | `shard` | one owner, by hash | 1/P | its share is unavailable |
 | `proxy` | one holder, by free memory | 1/P | its share is unavailable |
 | `store` | nodes that read it | what each node reads | keys read only there are lost |
-
-Under a saturated network an `eager` fleet can drop replication
-traffic, and a node then holds fewer keys than its peers until the
-background sweep has copied the rest: after a three-node fleet was
-driven past its 10 Gbit/s link with 1,000,000 keys, the nodes held
-793,602, 964,513 and 1,000,000 keys at once, and all three held
-1,000,000 within four minutes ([doc/benchmarks.md](doc/benchmarks.md)).
 
 Use `eager` for three nodes that must not lose anything, `spread` for
 four or more where you want a fixed redundancy, and `shard` for
@@ -361,8 +294,8 @@ pipelining perfcached's workers pull ahead, at a third of Redis's tail.
 The lead comes from the workers, not from a cheaper command: per core, a
 SET and its write-ahead log record cost perfcached more than a SET costs
 a Redis that persists nothing, so a node with two workers can trail one
-Redis thread on SET.  A three-node fleet through a routing client
-reached 31 million GET/s on bare metal ([How it compares](#how-it-compares)).  A `KEYS` that walks 74,000 keys 50 times a
+Redis thread on SET.  Three-node fleets through routing clients reach
+3.7 to 6.7 million GET/s.  A `KEYS` that walks 74,000 keys 50 times a
 second costs Redis's other clients a quarter of their GET rate;
 perfcached's keep theirs - the `KEYS` caller waits longer instead.
 Every table, its method and how to reproduce it:
@@ -371,11 +304,9 @@ Every table, its method and how to reproduce it:
 
 ## Upgrading
 
-- **0.7.4.x to 0.7.5.3**: a whole-fleet stop (above).
-- **0.7.5, 0.7.5.1 or 0.7.5.2 to 0.7.5.3**: a rolling restart, as
-  below; no collection create, drop or rename while the fleet is mixed.
-  Check the config with `perfcached -C` first: 0.7.5.3 refuses some
-  forms older releases took ([ChangeLog](ChangeLog)).
+- **0.7.4.x to 0.7.5.2**: a whole-fleet stop (above).
+- **0.7.5 or 0.7.5.1 to 0.7.5.2**: a rolling restart, as below; no
+  collection create, drop or rename while the fleet is mixed.
 - **Within the support window** - from 0.7.5 to a later 0.7.5.x patch or
   to the next minor's releases - a rolling restart: members first, the master last,
   one node at a time, each only once its `stats.cluster.restart.safe`

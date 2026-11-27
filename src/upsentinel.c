@@ -16,7 +16,6 @@
 
 #define SEN_REFRESH_MS 10000
 #define SEN_TIMEOUT_MS 2000
-#define SEN_SLICE_MS 100                /* how soon the thread sees the shutdown */
 #define SEN_MAX        8                /* sentinels remembered (uc->sen_known) */
 
 struct sen_addr {
@@ -375,24 +374,17 @@ static int sen_wait(struct up_col *uc, struct uconn *sc)
 	struct pollfd pf;
 	struct rv v;
 	char what[208] = "";
-	int more = 0, t;
+	int more = 0;
 
 	if (sc->fd < 0) {
-		for (t = 0; t < SEN_REFRESH_MS && !uc->stop; t += SEN_SLICE_MS)
-			usleep(SEN_SLICE_MS * 1000);
+		usleep(SEN_REFRESH_MS * 1000);
 		return 0;
 	}
 	pf.fd = sc->fd;
 	pf.events = POLLIN;
 	pf.revents = 0;
-	if (!uc_buffered(sc)) {
-		int r = 0;
-
-		for (t = 0; t < SEN_REFRESH_MS && !uc->stop && r == 0; t += SEN_SLICE_MS)
-			r = poll(&pf, 1, SEN_SLICE_MS);
-		if (r <= 0)
-			return 0;
-	}
+	if (!uc_buffered(sc) && poll(&pf, 1, SEN_REFRESH_MS) <= 0)
+		return 0;
 	memset(&v, 0, sizeof v);
 	if (read_reply(sc, &v, now_ms() + SEN_TIMEOUT_MS) != 0) {
 		sen_unsubscribe(sc);   /* closed: the next round dials it again */
@@ -437,18 +429,10 @@ static void *sen_main(void *arg)
 		pthread_mutex_lock(&uc->sen_mx);
 		for (i = 0; i < n; i++)
 			if (__atomic_load_n(&uc->srv[i].is_sentinel, __ATOMIC_RELAXED)) {
-				char host[sizeof uc->srv[i].host];
-				int port;
-
-				/* a reused slot rewrites its address under run_mx */
-				pthread_mutex_lock(&uc->srv[i].run_mx);
-				memcpy(host, uc->srv[i].host, sizeof host);
-				port = uc->srv[i].port;
-				pthread_mutex_unlock(&uc->srv[i].run_mx);
-				known_add(uc, host, port);
-				if (nknown < SEN_MAX && strlen(host) < sizeof known[0].host) {
-					strcpy(known[nknown].host, host);
-					known[nknown++].port = port;
+				known_add(uc, uc->srv[i].host, uc->srv[i].port);
+				if (nknown < SEN_MAX && strlen(uc->srv[i].host) < sizeof known[0].host) {
+					strcpy(known[nknown].host, uc->srv[i].host);
+					known[nknown++].port = uc->srv[i].port;
 				}
 			}
 		for (i = 0; i < uc->sen_n && nknown < SEN_MAX; i++) {
@@ -462,7 +446,7 @@ static void *sen_main(void *arg)
 			}
 		}
 		pthread_mutex_unlock(&uc->sen_mx);
-		for (k = 0; k < nknown && !ok && !uc->stop; k++)
+		for (k = 0; k < nknown && !ok; k++)
 			ok = sen_round(uc, &known[k]) == 0;
 		/* subscribed to the one that answers - one that stopped answering
 		 * (frozen, or half-open) sends no events */
@@ -502,21 +486,11 @@ void topo_save(struct up_col *uc)
 		bl += (size_t)snprintf(buf + bl, sizeof buf - bl, "sentinel %s %d\n",
 			uc->sen_known[i].host, uc->sen_known[i].port);
 	pthread_mutex_unlock(&uc->sen_mx);
-	for (i = 0; i < n && bl < sizeof buf; i++) {
-		char host[sizeof uc->srv[i].host];
-		int port;
-
-		if (uc->srv[i].origin == UPO_CONFIG || __atomic_load_n(&uc->srv[i].gone,
-		        __ATOMIC_ACQUIRE))
-			continue;
-		pthread_mutex_lock(&uc->srv[i].run_mx);
-		memcpy(host, uc->srv[i].host, sizeof host);
-		port = uc->srv[i].port;
-		pthread_mutex_unlock(&uc->srv[i].run_mx);
-		if (!bad_host(host))
+	for (i = 0; i < n && bl < sizeof buf; i++)
+		if (uc->srv[i].origin != UPO_CONFIG && !__atomic_load_n(&uc->srv[i].gone,
+		        __ATOMIC_ACQUIRE) && !bad_host(uc->srv[i].host))
 			bl += (size_t)snprintf(buf + bl, sizeof buf - bl, "server %s %d %d\n",
-				host, port, uc->srv[i].origin);
-	}
+				uc->srv[i].host, uc->srv[i].port, uc->srv[i].origin);
 	if (bl >= sizeof buf)
 		return;                        /* cut short: not written */
 	for (i = 0; i < (int)bl; i++)
@@ -591,5 +565,5 @@ void sen_start(struct up_col *uc)
 		__atomic_store_n(&uc->sen_started, 0, __ATOMIC_RELEASE);
 		return;
 	}
-	uc->sen_joinable = 1;
+	pthread_detach(uc->sen_thr);
 }

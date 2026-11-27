@@ -109,27 +109,18 @@ void cl_pend_release(struct pending *slot)
 	clpend_release_locked(&PD, slot);
 	clpend_unlock(&PD);
 }
-int cl_pend_fill(struct pending *slot, uint32_t req, const struct clpend_fill *f)
-{
-	return clpend_fill(&PD, slot, req, f);
-}
-int cl_pend_sent(struct pending *slot, uint32_t req, int asked, int sent)
-{
-	return clpend_sent(&PD, slot, req, asked, sent);
-}
 
 /* ---- the capture -------------------------------------------------------- */
 static const uint8_t KEY[32] = { 4, 2 };
 /* clwire_open takes no capacity: a slot holds the largest datagram */
 static struct { unsigned last; unsigned char pt[65536]; unsigned long long n; } out[8];
 static int nout, refuse;
-static unsigned refuse_last;        /* refuse only the datagrams to 127.0.16.<this> */
 
 static long capture(int fd, const void *buf, size_t n,
 		const pc_addr *to)
 {
 	(void)fd;
-	if (refuse || (refuse_last && (ntohl(to->in4.sin_addr.s_addr) & 0xff) == refuse_last)) {
+	if (refuse) {
 		errno = EHOSTUNREACH;
 		return -1;
 	}
@@ -155,7 +146,6 @@ static void reset(void)
 {
 	nout = 0;
 	refuse = 0;
-	refuse_last = 0;
 	fail_reason = -1;
 	no_route = pull_sent = send_fail = fwd_sent = fwd_fails = 0;
 	send_errno = 0;
@@ -326,51 +316,6 @@ int main(void)
 	chk(pc_pull_begin_at("c", 1, "k", 1, 9) == 0 && nout == 0 && fail_reason == PC_CLFAIL_ROUTE,
 		"pull_at a dead holder: 0, nothing sent, reason ROUTE");
 
-	/* ---- a send that fails releases the slot, as the forward's does ------- */
-	reset();
-	refuse = 1;
-	used = clpend_used(&PD);
-	chk(pc_pull_begin_at("c", 1, "k", 1, 5) == 0 && clpend_used(&PD) == used &&
-	    fail_reason == PC_CLFAIL_SEND && send_fail == 1,
-		"pull_at, send fails: 0, the slot released, reason SEND");
-	reset();
-	refuse = 1;
-	used = clpend_used(&PD);
-	chk(pc_fwd_json_begin(7, 1, "c", 1, "doc", 3, "$.a", 3, "1", 1, 0, 0, 0, 0, 0, 0) == 0 &&
-	    clpend_used(&PD) == used && fail_reason == PC_CLFAIL_SEND && fwd_fails == 1,
-		"json fwd, send fails: 0, the slot released, reason SEND");
-	reset();
-	refuse = 1;
-	used = clpend_used(&PD);
-	chk(pc_pull_begin("c", 1, "k", 1) == 0 && clpend_used(&PD) == used &&
-	    fail_reason == PC_CLFAIL_SEND,
-		"pull, no peer reached: 0, the slot released, reason SEND");
-	reset();
-	refuse_last = 7;
-	req = pc_pull_begin("c", 1, "half", 4);
-	{
-		struct pending *s;
-
-		clpend_lock(&PD);
-		s = clpend_find(&PD, req);
-		chk(req && s && s->expect == 1,
-			"pull reaching one of two live peers: it waits for that one answer, not two");
-		clpend_unlock(&PD);
-	}
-	reset();
-	refuse_last = 5;
-	used = clpend_used(&PD);
-	req = pc_probe_fwd_begin(1, "c", 1, "pk", 2, "vv", 2, 0, 0);
-	{
-		struct pending *s;
-
-		clpend_lock(&PD);
-		s = clpend_find(&PD, req);
-		chk(req && s && s->expect == 1 && clpend_used(&PD) == used + 1,
-			"probe reaching one of two live peers: one answer awaited");
-		clpend_unlock(&PD);
-	}
-
 	/* ---- no live peer, no pull ------------------------------------------- */
 	PT.peers[0].last_seen_ms = PT.peers[1].last_seen_ms = NOW - PEER_UP_MS - 1;
 	reset();
@@ -399,13 +344,6 @@ int main(void)
 	chk(req && nout == 1 && out[0].last == 7 && out[0].pt[0] == M_FWD_JSON &&
 	    clfwd_json_parse(out[0].pt, out[0].n, &j) && j.req == req && j.node == 42 && j.plen == 3,
 		"json fwd: one FWD_JSON to the holder, our req and node, the path");
-	chk(fail_reason == PC_CLFAIL_NONE, "json fwd: sent, no failure reason");
-	reset();
-	/* an earlier begin's reason on this thread */
-	fail_reason = PC_CLFAIL_BUSY;
-	chk(pc_fwd_json_begin(9, 1, "c", 1, "doc", 3, "$.a", 3, "1", 1, 0, 0, 0, 0, 0, 0) == 0 &&
-	    nout == 0 && fail_reason == PC_CLFAIL_ROUTE,
-		"json fwd to a dead holder: 0, reason ROUTE, not the earlier BUSY");
 
 	/* ---- the cluster off, and arguments too large ------------------------ */
 	reset();

@@ -132,8 +132,13 @@ static void append(struct clpush *p, int tidx, int i,
 	if (g->qcount && (g->qlen + n > p->cap ||
 	        now - g->qopen_ms >= p->flush_ms))
 		send(g, ctx);
-	/* grow rather than trust the geometry: this write must fit what was actually
-	 * allocated; and before a group is counted open, so a dropped record opens none */
+	if (!g->qcount) {
+		g->qopen_ms = now;
+		g->to = *to;
+		__atomic_fetch_add(&p->open, 1, __ATOMIC_RELAXED);
+	}
+	/* grow rather than trust the geometry: whatever the guards above
+	 * decided, this write must fit what was actually allocated */
 	if (g->qlen + n > g->qcap) {
 		size_t want = g->qlen + n + p->flush_bytes;
 		unsigned char *bigger = realloc(g->q, want);
@@ -142,11 +147,6 @@ static void append(struct clpush *p, int tidx, int i,
 			return;            /* the record is dropped, not written */
 		g->q = bigger;
 		g->qcap = want;
-	}
-	if (!g->qcount) {
-		g->qopen_ms = now;
-		g->to = *to;
-		__atomic_fetch_add(&p->open, 1, __ATOMIC_RELAXED);
 	}
 	memcpy(g->q + g->qlen, rec, n);
 	g->qlen += n;

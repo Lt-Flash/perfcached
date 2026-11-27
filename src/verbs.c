@@ -7,7 +7,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
-#include <limits.h>
 #include <strings.h>                        /* strncasecmp */
 #include <time.h>
 
@@ -455,8 +454,7 @@ static void eager_push(pcache_htable_t *ht, const str *k, const char *val,
 }
 
 /* a TTL re-arm (client's or forwarded) that ADOPTS a passive copy: it goes to the WAL whole and
- * travels as authored, bytes, expiry and version from one read.  1 = re-armed, 0 = absent,
- * -2 = the arena is full */
+ * travels as authored, bytes, expiry and version from one read.  1 = re-armed, 0 = absent */
 static int op_expire_local(pcache_htable_t *ht, const str *k,
 		unsigned int exp)
 {
@@ -465,11 +463,10 @@ static int op_expire_local(pcache_htable_t *ht, const str *k,
 	unsigned int e = 0;
 	unsigned char fl = 0;
 	unsigned long long ver = 0, tver;
-	int was_passive = 0, rc;
+	int was_passive = 0;
 
-	rc = pcache_ht_touch_adopt(ht, k, exp, &was_passive);
-	if (rc != 1)
-		return rc == -2 ? -2 : 0;
+	if (pcache_ht_touch_adopt(ht, k, exp, &was_passive) != 1)
+		return 0;
 	/* the touch's OWN version, stamped under the bucket lock: a SET landing before the unlocked
 	 * fetch below must not lend the touch its version, or replay refuses the SET as older */
 	tver = pcache_last_ver;
@@ -665,7 +662,6 @@ int op_expire(pcache_htable_t *ht, str *k, long long ttl,
 {
 	unsigned int ttl_rel = fwd_ttl(ttl);
 	const char *cn;
-	int rc;
 	HOT(ht, k->s, k->len);
 
 	if (op_refused(ht))
@@ -731,8 +727,8 @@ int op_expire(pcache_htable_t *ht, str *k, long long ttl,
 		}
 		return PC_OP_ABSENT;
 	}
-	rc = op_expire_local(ht, k, ttl_to_abs(ttl));
-	return rc == -2 ? PC_OP_ERR_FULL : rc ? PC_OP_OK : PC_OP_ABSENT;
+	return op_expire_local(ht, k, ttl_to_abs(ttl)) ? PC_OP_OK
+		: PC_OP_ABSENT;
 }
 
 /* add/sub (by pre-negated for sub): PC_OP_OK fills *nv */
@@ -920,19 +916,18 @@ int op_set(pcache_htable_t *ht, str *k, str *v, long long ttl,
 static int set_local(pcache_htable_t *ht, const str *k, const str *v,
 		long long ttl)
 {
-	unsigned int exp = ttl_to_abs(ttl);
 	int rc;
 
 	pc_store_test_set_pause(k);
-	rc = pcache_ht_store(ht, k, v, exp);
+	rc = pcache_ht_store(ht, k, v, ttl_to_abs(ttl));
 
 	if (rc == 0) {
 		const char *cn = col_name_of(ht);
 
-		pc_wal_upsert(cn, k->s, k->len, v->s, v->len, exp,
+		pc_wal_upsert(cn, k->s, k->len, v->s, v->len, ttl_to_abs(ttl),
 			pcache_last_ver);
 		pc_ev_store(ht, k, (unsigned int)v->len, ttl);
-		eager_push(ht, k, v->s, (size_t)v->len, exp,
+		eager_push(ht, k, v->s, (size_t)v->len, ttl_to_abs(ttl),
 			pcache_last_ver, 0);
 		if (pc_cluster_enabled())
 			pc_neg_clear(cn, strlen(cn), k->s, (size_t)k->len);
@@ -1179,8 +1174,6 @@ static long long rel_ttl(unsigned int expires, unsigned int now)
 struct dump_keys {
 	char *buf;
 	size_t len, cap;
-	/* the old table's keys, first in buf, end here */
-	size_t nold;
 	unsigned int slo, shi, now;
 	int full;
 };
@@ -1232,10 +1225,6 @@ static int scan_cb(const str *key, const str *val, unsigned int exp,
 	return 0;
 }
 
-/* what keys writes after its last key: the closing fields and, for a collection glob, a
- * header and a truncated entry for every other collection */
-#define KEYS_TAIL (256 + PC_MAX_COLLECTIONS * 2 * (PC_COL_NAME_MAX + 16))
-
 /* keys: a flat array of keys, each as its bytes */
 static int keys_cb(const str *key, const str *val, unsigned int exp,
 		void *p)
@@ -1249,10 +1238,7 @@ static int keys_cb(const str *key, const str *val, unsigned int exp,
 		return 0;
 	if (sc->w->over)
 		return -1;
-	/* a key that would leave no room for the reply's tail stops the walk: truncated, not
-	 * "reply too large" */
-	if (sc->emitted >= sc->limit || sc->w->n + (size_t)key->len + 16 +
-	        KEYS_TAIL > (sc->w->owned ? PT_HEAP_MAX : sc->w->cap)) {
+	if (sc->emitted >= sc->limit) {
 		sc->stopped = 1;
 		return -1;
 	}
@@ -1434,7 +1420,7 @@ static int rl_hit_local(pcache_htable_t *ht, const char *key, int klen,
 }
 
 /* the gate's refusal, with the member that holds it back */
-static __thread char rl_gate_msg[160];
+static char rl_gate_msg[160];
 
 const char *rl_gate_text(int lacking)
 {
@@ -2494,7 +2480,7 @@ out:
 static const char hc_mode_msg[] = "ERR hash commands need a shard or eager "
 	"collection in a cluster: this collection has no node that decides a key";
 
-static __thread char hc_gate_msg[160];
+static char hc_gate_msg[160];
 
 static const char *hc_gate_text(int lacking)
 {
@@ -3038,7 +3024,8 @@ static int col_persist(const char *nm, const char *what)
 static void write_hit(struct pc_tw *w, const char *v, size_t vn,
 		unsigned int expires)
 {
-	long long ttl = rel_ttl(expires, get_ticks());
+	long long ttl = expires ? (long long)expires - (long long)get_ticks()
+		: -1;
 
 	pc_tw_map(w);
 	pc_tw_key(w, "found");
@@ -3046,7 +3033,7 @@ static void write_hit(struct pc_tw *w, const char *v, size_t vn,
 	pc_tw_key(w, "value");
 	pc_tw_bulk(w, v, vn);
 	pc_tw_key(w, "ttl");
-	pc_tw_i64(w, ttl);
+	pc_tw_i64(w, ttl < -1 ? 0 : ttl);
 	pc_tw_end(w);
 }
 
@@ -3311,7 +3298,6 @@ struct up_ans {
 static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		const struct pc_tv *v, int params, const char **errmsg,
 		struct up_ans *ans);
-static int up_get_lost(pcache_htable_t *ht, const str *k, int *tries);
 /* the gate answered a write-through write with Redis's success; the
  * door renders the verb's own reply from ans->ival */
 #define UPG_REPLY 3
@@ -3327,7 +3313,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	pcache_htable_t *ht;
 	str k, v_;
 	long long by, ttl;
-	int rc, lost_tries = 0;
+	int rc;
 	unsigned int exp;
 
 	*outcome = 0;
@@ -3337,7 +3323,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	 * cores take spans, and nothing below outlives the request */
 #define NEEDKEY() do { \
 	const char *kp_; size_t kn_; \
-	if (get_bytes(v, params, "key", &kp_, &kn_, KEY_MAX) != 0 || !kn_) \
+	if (get_bytes(v, params, "key", &kp_, &kn_, KEY_MAX) != 0) \
 		ERR("missing or bad key"); \
 	k.s = (char *)kp_; k.len = (int)kn_; } while (0)
 
@@ -3423,7 +3409,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		return 0;
 	}
 	if (m_is(method, mlen, "publish")) {
-		static __thread char why[64];
 		char chan[4096];
 		const char *pay;
 		size_t plen;
@@ -3434,11 +3419,9 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		clen = pc_tv_get_str(v, params, "channel", chan, sizeof chan);
 		if (clen <= 0)
 			ERR("missing or bad channel");
-		if (pc_pubsub_reserved(chan, (size_t)clen)) {
-			snprintf(why, sizeof why, "channel prefix %s is reserved",
-				pc_pubsub_reserved(chan, (size_t)clen));
-			ERR(why);
-		}
+		if ((size_t)clen >= sizeof PC_PUBSUB_RESERVED - 1 &&
+		    !memcmp(chan, PC_PUBSUB_RESERVED, sizeof PC_PUBSUB_RESERVED - 1))
+			ERR("channel prefix __pc. is reserved");
 		if (get_bytes(v, params, "payload", &pay, &plen, VAL_MAX) != 0)
 			ERR("missing or bad payload");
 		pc_tw_map(out);
@@ -3680,9 +3663,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		int rc2;
 
 		pc_tv_get_int(v, params, "timeout_ms", &tmo);
-		/* the wait holds this worker: a stalled device never holds it longer than 10 s */
-		if (tmo < 0 || tmo > 10000)
-			tmo = tmo < 0 ? 0 : 10000;
 		rc2 = pc_wal_sync((int)tmo);
 		if (rc2 == 1)
 			ERR("persistence is not configured");
@@ -3743,7 +3723,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	if (m_is(method, mlen, "create")) {
 		char nm[PC_COL_NAME_MAX];
 		long long bl = PC_COL_DEFAULT_LOG2;
-		unsigned long long gen;
 		int nl, rc2, saved;
 
 		if (!allow_create)
@@ -3763,8 +3742,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		pc_tv_get_int(v, params, "buckets_log2", &bl);
 		if (bl < 4 || bl > 24)
 			ERR("buckets_log2 is 4..24");
-		gen = pc_lamport_tick();
-		rc2 = pc_store_create_gen(nm, (size_t)nl, (int)bl, gen);
+		rc2 = pc_store_create(nm, (size_t)nl, (int)bl);
 		if (rc2 == -2)
 			ERR("the collection limit is reached");
 		if (rc2 == -3) {
@@ -3779,7 +3757,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		 * the WAL's ordering settles a disagreement between them */
 		pc_wal_col_create(nm, (int)bl);
 		saved = col_persist(nm, "created");
-		pc_cluster_col_announce_gen(nm, (size_t)nl, (int)bl, CLCOL_OP_SET, gen);
+		pc_cluster_col_announce(nm, (size_t)nl, (int)bl, CLCOL_OP_SET);
 		LM_NOTICE("collection '%s' created by a client: 2^%d buckets, "
 			"%s mode\n", nm, (int)bl, pc_cluster_mode_name());
 		pc_tw_map(out);
@@ -3799,7 +3777,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	if (m_is(method, mlen, "drop")) {
 		char nm[PC_COL_NAME_MAX];
 		pcache_ht_totals_t tot;
-		unsigned long long gen;
 		long long n = 0;
 		int nl, force, saved;
 
@@ -3830,13 +3807,12 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			pc_tw_end(out);
 			return 0;
 		}
-		gen = pc_lamport_tick();
-		n = pc_store_drop_gen(nm, (size_t)nl, gen);
+		n = pc_store_drop(nm, (size_t)nl);
 		if (n < 0)
 			ERR("no such collection");
 		pc_wal_col_drop(nm);
 		saved = col_persist(nm, "dropped");
-		pc_cluster_col_announce_gen(nm, (size_t)nl, 0, CLCOL_OP_DROP, gen);
+		pc_cluster_col_announce(nm, (size_t)nl, 0, CLCOL_OP_DROP);
 		LM_NOTICE("collection '%s' dropped by a client: %lld record(s) "
 			"freed\n", nm, n);
 		pc_tw_map(out);
@@ -3959,8 +3935,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		gen = pc_lamport_tick();
 		r = pc_respmap_apply((int)idx, col, (size_t)cl, gen, set, was,
 			sizeof was);
-		if (r == -2)
-			ERR("out of memory - the map is unchanged");
 		if (r < 0)
 			ERR("a collection name the RESP map cannot hold (',', ':', "
 				"'*' or a space)");
@@ -4733,7 +4707,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 	 * perfdump.  `count` is BUCKETS: a bucket-bounded key scan never repeats a record */
 	if (m_is(method, mlen, "dump")) {
 		struct dump_keys dk;
-		pcache_htable_t *old = NULL;
 		long long cur = 0, count = 1024, slo = 0, shi = PC_SLOTS - 1, endb = -1;
 		unsigned int cursor;
 		size_t off;
@@ -4799,45 +4772,10 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			if (bounded && !(cursor & PCACHE_CURSOR_OVF) &&
 			        take > (unsigned int)endb - cursor)
 				take = (unsigned int)endb - cursor;
-			/* the walker at bucket 0 first takes what only a draining resize's old table
-			 * holds; a key the live table has by then is left to the live walk */
-			old = cur == 0 ? pc_store_draining(ht) : NULL;
-			if (old) {
-				unsigned int oc = 0;
-				size_t ro, wo = 0;
-
-				do {
-					rc = pcache_ht_scan_ex(old, &oc, 4096,
-						PCACHE_SCAN_NOVAL, dump_key_cb, &dk);
-				} while (rc == 0 && oc && !dk.full);
-				if (rc < 0 || dk.full) {
-					free(dk.buf);
-					ERR("a draining resize holds too much for one "
-						"chunk: retry the collection in a moment");
-				}
-				for (ro = 0; ro < dk.len; ) {
-					unsigned long long hv;
-					uint32_t kl;
-					str rk;
-
-					memcpy(&kl, dk.buf + ro, 4);
-					rk.s = dk.buf + ro + 4;
-					rk.len = (int)kl;
-					if (pcache_ht_getver_here(ht, &rk, &hv) != 0) {
-						memmove(dk.buf + wo, dk.buf + ro, 4 + kl);
-						wo += 4 + kl;
-					}
-					ro += 4 + kl;
-				}
-				dk.len = dk.nold = wo;
-			}
 			rc = pcache_ht_scan_ex(ht, &cursor, take, PCACHE_SCAN_NOVAL,
 				dump_key_cb, &dk);
 			if (rc < 0 || dk.full) {
 				free(dk.buf);
-				if (old)
-					ERR("a draining resize holds too much for one "
-						"chunk: retry the collection in a moment");
 				ERR("count too large for this table: halve it");
 			}
 			if (bounded && (cursor == 0 ||
@@ -4859,25 +4797,13 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 			unsigned long long ver = 0;
 			unsigned char fl = 0;
 			uint32_t kl;
-			int frc;
 
 			memcpy(&kl, dk.buf + off, 4);
 			rk.s = dk.buf + off + 4;
 			rk.len = (int)kl;
 			off += 4 + kl;
-			/* through the live table: it reads the drained one's copy too, the newer */
-			frc = pcache_ht_fetch_full(ht, &rk, &rv, &rexp, &fl, &ver);
-			/* the closing drain unhooks the old table before it moves its records */
-			if (frc == -2 && off - 4 - kl < dk.nold)
-				frc = pcache_ht_fetch_full(old, &rk, &rv, &rexp, &fl, &ver);
-			if (frc == -2)
+			if (pcache_ht_fetch_full(ht, &rk, &rv, &rexp, &fl, &ver) != 0)
 				continue;              /* gone since the scan */
-			if (frc != 0) {
-				/* a record that could not be read is never left out silently */
-				free(dk.buf);
-				pc_tw_rollback(out, mark);
-				ERR("out of memory reading a record: retry the chunk");
-			}
 			if (rexp && rexp <= dk.now) {
 				free(rv.s);
 				continue;
@@ -4993,7 +4919,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				bad++;
 				continue;
 			}
-			if (get_bytes(v, r, "k", &kp, &kl, KEY_MAX) != 0 ||
+			if (get_bytes(v, r, "k", &kp, &kl, PCACHE_CELL_MAX) != 0 ||
 			        !kl ||
 			        get_bytes(v, r, "v", &vp, &vl, PCACHE_CELL_MAX) != 0 ||
 			        pc_tv_get_int(v, r, "ver", &ver) != 0) {
@@ -5148,7 +5074,7 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 				sc.stopped = 0;
 				sc.limit = (int)limit;
 				do {
-					rc2 = pc_store_scan(pc_store_ht(i), &cursor,
+					rc2 = pcache_ht_scan_ex(pc_store_ht(i), &cursor,
 						1024, PCACHE_SCAN_NOVAL, keys_cb, &sc);
 				} while (rc2 == 0 && cursor && !out->over);
 				pc_tw_end(out);
@@ -5180,7 +5106,6 @@ int pc_verb_cmd(const char *method, size_t mlen, const struct pc_tv *v,
 		ERR(PC_TTL_MSG);
 	/* an upstream-backed collection: the gate may park the frame, refuse it, or answer
 	 * with Redis's reply */
-regate:
 	if (ht->shadow && conn) {
 		struct up_ans ans;
 		int g;
@@ -5243,8 +5168,6 @@ regate:
 
 			if (!gb)
 				ERR("get failed");
-			if (ht->shadow && conn)
-				pc_upstream_test_pause();
 			rc = op_get_buf(ht, &k, gb, VAL_MAX, &gl, &exp,
 				park_req);
 			if (rc == PC_OP_OK) {
@@ -5255,9 +5178,6 @@ regate:
 		}
 		if (rc == PC_OP_ERR_TYPE)
 			ERR(pc_wrongtype_msg);
-		if (rc != PC_OP_ERR_GET && ht->shadow && conn &&
-		    !(park_req && *park_req) && up_get_lost(ht, &k, &lost_tries))
-			goto regate;
 		if (rc == PC_OP_ERR_GET) {
 			ERR("get failed");
 		} else {
@@ -5301,8 +5221,6 @@ regate:
 		rc = op_expire(ht, &k, ttl, park_req);
 		if (op_fail_text(rc))
 			ERR(op_fail_text(rc));
-		if (rc == PC_OP_ERR_FULL)
-			ERR("cache full");
 		pc_tw_map(out);
 		pc_tw_key(out, "updated");
 		pc_tw_bool(out, rc == PC_OP_OK);   /* parked falls back to false */
@@ -5319,8 +5237,6 @@ regate:
 			by = 1;
 		ttl = 0;
 		pc_tv_get_int(v, params, "ttl", &ttl);
-		if (method[0] == 's' && by == LLONG_MIN)
-			ERR("sub: by out of range");
 		if (method[0] == 's')
 			by = -by;
 		rc = op_addsub(ht, &k, by, ttl, &nv, park_req, 0);
@@ -5951,7 +5867,7 @@ jlocal:
 
 			if (v->n[it].type != 'm')
 				continue;
-			if (get_bytes(v, it, "key", &kp, &kl, KEY_MAX) != 0 || !kl ||
+			if (get_bytes(v, it, "key", &kp, &kl, KEY_MAX) != 0 ||
 			        get_bytes(v, it, "value", &vp, &vl, VAL_MAX) != 0) {
 				dropped++;
 				continue;
@@ -6085,21 +6001,12 @@ static int up_native(pcache_htable_t *ht, int cls, int del,
 		const char **errmsg, const struct pc_upfw *fw, struct up_ans *ans)
 {
 	struct pc_upg g;
-	const char *cn = col_name_of(ht);
-	size_t cl = strlen(cn);
-	int rc, verdict = pc_conn_upstream_frame_verdict();
-	int rd = (cls == PC_UPC_READ || cls == PC_UPC_PROBE) && !del;
-	unsigned long long end0 = rd ? pc_upstream_rm_mark(cn, cl) : 0;
+	int rc;
 
-	rc = pc_upstream_gate_fw(ht, cn, cl, cls, del, keys, kl, n, verdict, &g,
-		fw);
-	if (rc == PC_UPG_HELD) {
+	rc = pc_upstream_gate_fw(ht, col_name_of(ht), strlen(col_name_of(ht)),
+		cls, del, keys, kl, n, pc_conn_upstream_frame_verdict(), &g, fw);
+	if (rc == PC_UPG_HELD)
 		pc_conn_upstream_park_frame(g.req);
-		pc_conn_upstream_park_frame_mark(end0);
-	} else if (rc == PC_UPG_PROCEED && rd && verdict != PC_UPV_ERROR)
-		/* for pc_upstream_lost: on the run after a fetch, what went since it parked */
-		pc_upstream_lost_arm(cn, cl, verdict == PC_UPV_OK ?
-			pc_conn_upstream_frame_mark() : end0);
 	else if (rc == PC_UPG_ANSWERED && g.done && ans && ans->want_tree) {
 		up_reply_tree(&ans->tree, &g);
 		return UPG_TREE;
@@ -6110,24 +6017,6 @@ static int up_native(pcache_htable_t *ht, int cls, int del,
 	} else if (rc == PC_UPG_ANSWERED)
 		*errmsg = g.rerr ? g.rerr : g.wrongtype ? pc_wrongtype_msg : g.err;
 	return rc;
-}
-
-/* a native get that missed: 1 its key went between the gate and the read - gate it again
- * (twice at most), the verdict cleared so it fetches */
-static int up_get_lost(pcache_htable_t *ht, const str *k, int *tries)
-{
-	const char *cn = col_name_of(ht), *kp = k->s;
-	size_t kn = (size_t)k->len;
-
-	if (!pc_upstream_lost(ht, cn, strlen(cn), &kp, &kn, 1))
-		return 0;
-	if (*tries >= 2) {
-		pc_upstream_lost_spent();
-		return 0;
-	}
-	(*tries)++;
-	pc_conn_upstream_frame_regate();
-	return 1;
 }
 
 /* the verbs upstream_writes = through forwards; the rest (conditional sets and
@@ -6372,7 +6261,7 @@ static int up_mset_fw(pcache_htable_t *ht, const struct pc_tv *v, int ta,
 
 		if (v->n[e].type != 'm')
 			continue;
-		if (get_bytes(v, e, "key", &kp, &kn, KEY_MAX) != 0 || !kn ||
+		if (get_bytes(v, e, "key", &kp, &kn, KEY_MAX) != 0 ||
 		        get_bytes(v, e, "value", &vp, &vn, VAL_MAX) != 0 ||
 		        (pc_tv_get_int(v, e, "ttl", &ttl) == 0 && ttl > PC_TTL_MAX)) {
 			ans->dropped++;            /* as the handler drops it */
@@ -6512,13 +6401,11 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 		if (!ks || !kl) {
 			free(ks);
 			free(kl);
-			*errmsg = "upstream: out of memory";
-			return PC_UPG_ANSWERED;
+			return PC_UPG_PROCEED;
 		}
 		for (i = 0, e = ta + 1; i < v->n[ta].len; i++, e = v->n[e].next) {
 			if (ism) {
-				if (get_bytes(v, e, "key", &kp, &kn, KEY_MAX) != 0 ||
-				        !kn)
+				if (get_bytes(v, e, "key", &kp, &kn, KEY_MAX) != 0)
 					continue;
 			} else {
 				if (v->n[e].type != 'b' || v->n[e].len > KEY_MAX)
@@ -6545,7 +6432,7 @@ static int up_cmd_gate(pcache_htable_t *ht, const char *method, size_t mlen,
 	}
 	if (cls == PC_UPC_NONE)
 		return PC_UPG_PROCEED;
-	if (get_bytes(v, params, "key", &kp, &kn, KEY_MAX) != 0 || !kn)
+	if (get_bytes(v, params, "key", &kp, &kn, KEY_MAX) != 0)
 		return PC_UPG_PROCEED;          /* the method refuses it below */
 	if ((cls == PC_UPC_PLAIN || cls == PC_UPC_MUTATE || del) &&
 	    pc_upstream_through(col_name_of(ht), strlen(col_name_of(ht)))) {
@@ -6713,7 +6600,7 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 	str k, v;
 	long long by = 1, ttl = 0, nv = 0;
 	unsigned int exp;
-	int rc, lost_tries = 0;
+	int rc;
 
 	(void)conn;
 	if (!plen)
@@ -6759,7 +6646,6 @@ int pc_verb_bin(const char *pl, size_t plen, struct pc_jw *out, int *flags,
 	*keyp = k.s;
 	*klenp = klen;
 
-regate:
 	if (ht->shadow && conn) {
 		struct up_ans ans;
 		int g;
@@ -6799,26 +6685,17 @@ regate:
 
 			if (!gb)
 				ERRB("get failed");
-			if (ht->shadow && conn)
-				pc_upstream_test_pause();
 			rc = op_get_buf(ht, &k, gb, VAL_MAX, &gl, &exp,
 				park_req);
 			if (rc == PC_OP_OK) {
-				unsigned int now = get_ticks();
-
-				/* 0 is "no expiry" on this wire: a record past its
-				 * expiry since the fetch has 1 s left, never 0 */
 				bw_u8(out, 1);
-				bw_u32(out, !exp ? 0 : exp > now ? exp - now : 1);
+				bw_u32(out, exp ? exp - get_ticks() : 0);
 				pc_jw_raw(out, gb, (size_t)gl);
 				return 0;
 			}
 		}
 		if (rc == PC_OP_ERR_TYPE)
 			ERRB(pc_wrongtype_msg);
-		if (rc != PC_OP_ERR_GET && ht->shadow && conn &&
-		    !(park_req && *park_req) && up_get_lost(ht, &k, &lost_tries))
-			goto regate;
 		if (rc == PC_OP_ERR_GET) {
 			ERRB("get failed");
 		} else {
@@ -6844,8 +6721,6 @@ regate:
 		rc = op_expire(ht, &k, ttl, park_req);
 		if (op_fail_text(rc))
 			ERRB(op_fail_text(rc));
-		if (rc == PC_OP_ERR_FULL)
-			ERRB("cache full");
 		bw_u8(out, rc == PC_OP_OK);       /* parked falls back to 0 */
 		return 0;
 
@@ -6853,8 +6728,6 @@ regate:
 	case PC_VERB_SUB:
 		by = br_i64(pl + 4);
 		ttl = br_i64(pl + 12);
-		if (verb == PC_VERB_SUB && by == LLONG_MIN)
-			ERRB("sub: by out of range");
 		if (verb == PC_VERB_SUB)
 			by = -by;
 		rc = op_addsub(ht, &k, by, ttl, &nv, park_req, 0);
@@ -6913,17 +6786,10 @@ regate:
 		pc_tw_init(&t, NULL, 0);
 		rc = op_hcmd(ht, ci, hargc + 1, hargv, hargl, &t, park_req,
 			&lacking);
-		if (rc == PC_OP_OK && (pc_tw_done(&t) != 0 || !t.n)) {
-			pc_tw_free(&t);
-			ERRB("internal reply error");
-		}
-		if (rc == PC_OP_OK) {
+		if (rc == PC_OP_OK)
 			pc_jw_raw(out, (const char *)t.b, t.n);
-		} else if (rc == PC_OP_PARKED) {
-			/* the park-failure fallback is an error frame */
-			*flags = PC_BIN_F_ERR;
-			pc_jw_raw(out, "cluster busy", 12);
-		}
+		else if (rc == PC_OP_PARKED)
+			pc_jw_raw(out, "cluster busy", 12);  /* park fallback */
 		pc_tw_free(&t);
 		if (rc == PC_OP_OK || rc == PC_OP_PARKED)
 			return 0;
@@ -6955,9 +6821,7 @@ regate:
 			bw_i64(out, cnt);
 			bw_u8(out, al ? 1 : 0);
 		} else if (rc == PC_OP_PARKED) {
-			/* the park-failure fallback is an error frame */
-			*flags = PC_BIN_F_ERR;
-			pc_jw_raw(out, "cluster busy", 12);
+			pc_jw_raw(out, "cluster busy", 12);   /* park fallback */
 		} else if (rc == PC_OP_ERR_GATE) {
 			ERRB(rl_gate_text(lacking));
 		} else if (rc == PC_OP_ERR_MODE) {
@@ -7473,10 +7337,8 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 		char lc[64];
 		size_t i, n = cl < sizeof lc - 1 ? cl : sizeof lc - 1;
 
-		/* a control byte in the name would split the one-line error */
 		for (i = 0; i < n; i++)
-			lc[i] = (unsigned char)cmd[i] < 0x20 || cmd[i] == 0x7f ? ' '
-				: (char)tolower((unsigned char)cmd[i]);
+			lc[i] = (char)tolower((unsigned char)cmd[i]);
 		lc[n] = 0;
 		pc_jw_lit(out, "-ERR Can't execute '");
 		pc_jw_lit(out, lc);
@@ -7537,14 +7399,7 @@ int pc_verb_resp(char *const *argv, const size_t *argl, int nargs,
 				        out, conn) != PC_UPG_PROCEED)
 					return 0;
 			}
-			{
-				size_t i;
-
-				/* a control byte in the name would split the one-line error */
-				for (i = 0; i < n; i++)
-					nb[i] = (unsigned char)cmd[i] < 0x20 || cmd[i] == 0x7f
-						? ' ' : cmd[i];
-			}
+			memcpy(nb, cmd, n);
 			nb[n] = 0;
 			pc_obs_unknown(CLUNK_RESP, cmd, cl, NULL, 0, obs);
 			pc_jw_lit(out, "-ERR unknown command '");

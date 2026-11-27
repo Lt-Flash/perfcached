@@ -87,13 +87,10 @@ void pc_iostat_get(struct pc_iostat *out, int since_reset)
 {
 	int i;
 
-	if (!since_reset) {
-		raw(out);
-		return;
-	}
-	/* read under the lock the reset takes, so the baseline is never newer than the reading */
-	pthread_mutex_lock(&base_mx);
 	raw(out);
+	if (!since_reset)
+		return;
+	pthread_mutex_lock(&base_mx);
 	out->ep_waits -= base.ep_waits;
 	out->ep_events -= base.ep_events;
 	out->reads -= base.reads;
@@ -113,8 +110,11 @@ void pc_iostat_get(struct pc_iostat *out, int since_reset)
 
 void pc_iostat_reset(void)
 {
+	struct pc_iostat now;
+
+	raw(&now);
 	pthread_mutex_lock(&base_mx);
-	raw(&base);
+	base = now;
 	pthread_mutex_unlock(&base_mx);
 }
 

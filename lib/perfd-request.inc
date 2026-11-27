@@ -54,10 +54,7 @@ static char *tree_to_json(perfd_t *p, const unsigned char *tree, size_t n,
  * keeps and grows it) - in place of pc_tv_free */
 static void tv_put(perfd_t *p, struct pc_tv *v)
 {
-	if ((size_t)v->cap * sizeof *v->n > PERFD_KEEP_BUF) {
-		if (v->n != p->tvn)            /* one large reply's array is not kept */
-			free(v->n);
-	} else if (!p->tvn || p->tvcap < v->cap) {
+	if (!p->tvn || p->tvcap < v->cap) {
 		free(p->tvn);
 		p->tvn = v->n;
 		p->tvcap = v->cap;

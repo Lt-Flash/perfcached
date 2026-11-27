@@ -162,14 +162,13 @@ int clsync_env_parse(const unsigned char *p, size_t n,
 	ml = pc_ru32(&c);
 	/* the map must be wholly present AND leave room for the history's
 	 * own length prefix */
-	if (n < (size_t)CLSYNC_ENV_MAP_AT + 4 ||
-	        ml > n - CLSYNC_ENV_MAP_AT - 4)
+	if ((size_t)CLSYNC_ENV_MAP_AT + ml + 4 > n)
 		return 0;
 	hat = clsync_env_hist_at(ml);
 	hl = pc_g32(p + hat - 4);
 	/* EXACTLY the end: a trailing byte means the frame is not what it
 	 * says it is */
-	if (hl != n - hat)
+	if (hat + hl != n)
 		return 0;
 	*map = p + CLSYNC_ENV_MAP_AT;
 	*maplen = ml;

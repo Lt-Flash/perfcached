@@ -158,7 +158,7 @@ static void *resolver_main(void *arg)
 		struct timespec until;
 
 		resolve_all();
-		clock_gettime(CLOCK_MONOTONIC, &until);
+		clock_gettime(CLOCK_REALTIME, &until);
 		until.tv_sec += CLMESH_RESOLVE_MS / 1000;
 		pthread_mutex_lock(&M.mx);
 		while (!M.wake &&
@@ -174,7 +174,6 @@ int clmesh_start(const char *seeds, int default_port)
 {
 	pthread_t t;
 	pthread_attr_t at;
-	pthread_condattr_t ca;
 
 	if (seeds && parse_seeds(seeds, default_port) != 0)
 		return -1;
@@ -184,13 +183,6 @@ int clmesh_start(const char *seeds, int default_port)
 	resolve_all();                     /* the first answer before any beat */
 	if (!M.nseed)
 		return 0;
-	/* the resolver's wait on the monotonic clock, as its deadline is: a wall-clock step
-	 * must not stretch or skip it; no thread waits on it yet */
-	pthread_condattr_init(&ca);
-	pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-	pthread_cond_destroy(&M.cv);
-	pthread_cond_init(&M.cv, &ca);
-	pthread_condattr_destroy(&ca);
 	pthread_attr_init(&at);
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
 	if (pthread_create(&t, &at, resolver_main, NULL) != 0) {
