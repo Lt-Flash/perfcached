@@ -237,16 +237,20 @@ int main(void)
 		fleet[i].live = 1;
 	}
 	fleet_n = 300;
+	/* an owner moves only with the placement map's content, which keys the cache */
 	owner_node = fleet[255].node;
+	map_place++;
 	cluster("SLOTS", NULL);
-	CHK(!strncmp(out.buf, "*1\r\n*3\r\n:0\r\n:16383\r\n", 22) && has("10.0.0.255"),
+	CHK(!strncmp(out.buf, "*1\r\n*3\r\n:0\r\n:16383\r\n", 20) && has("10.0.0.255"),
 		"F: every slot owned by member 255 - one range, its address");
 	CHK(has("$40\r\n00000000000000000000000000000000000004e7\r\n"),
 		"F: node 1255's id keeps all its digits (04e7)");
 	owner_node = fleet[256].node;
+	map_place++;
 	cluster("SLOTS", NULL);
 	CHK(has("10.0.1.0") && !has("127.0.0.1"), "F: member 256 - its own address, not member 0's");
 	owner_node = 0;
+	map_place++;
 	fleet_n = 3;
 
 	printf("respcltest: %s\n", fails ? "FAILED" : "passed");

@@ -150,6 +150,8 @@ else:
 PY
 }
 subj() { mpart "$1" subject; }
+mailwith() { # mailwith <after n> <text> - the first later mail whose body has it
+	for i in $(seq $(($1 + 1)) $(mails)); do body $i | grep -qF "$2" && { echo $i; return; }; done; }
 findmail() { # findmail <after n> <subject regex> - the first such mail's number
 	python3 - "$D/m" "$1" "$2" <<'PY' 2>/dev/null
 import email, json, re, sys
@@ -398,11 +400,12 @@ PY
 		export PERFCACHED_ALERT_TEST_EVENT='status link check'
 		start "$MBIN" "$D/f.conf"
 		unset PERFCACHED_ALERT_TEST_EVENT
-		waitfor 12 '[ -n "$(findmail $n0 "^WARNING: test event on ")" ]'
-		F=$(findmail $n0 "^WARNING: test event on ")
+		# found by its text: another entry in the same digest may lead the subject
+		waitfor 12 '[ -n "$(mailwith $n0 "status link check")" ]'
+		F=$(mailwith $n0 "status link check")
 		[ -n "$F" ] && ! body $F | grep -q 'http://::' &&
 			ok "F. http on [::]: the mail carries no 'http://:::' link ($(body $F | grep -o 'Status page.*' || echo 'no status page link'))" ||
-			bad "F. http on [::]: mail '$F', $(body ${F:-$((n0 + 1))} | grep -o 'Status page.*')"
+			bad "F. http on [::]: mail '$F', $(body ${F:-$((n0 + 1))} | grep -o 'Status page.*'); subjects since: $(for i in $(seq $((n0 + 1)) $(mails)); do subj $i; done | tr '\n' '|'); ring '$(al recent test.event)'; log: $(grep -E 'WARNING|ERROR|CRIT|alert|mail' "$D/n.log" | tail -8 | tr '\n' '|')"
 		stop -TERM
 	else
 		skp "F. no IPv6 socket here - the [::] status link"
